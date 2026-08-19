@@ -1061,11 +1061,15 @@ impl IntegrationRegistry {
     /// Collect static attributes for the publisher TSJS bundle tag.
     #[must_use]
     pub fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
-        self.inner
-            .head_injectors
-            .iter()
-            .flat_map(|injector| injector.tsjs_script_tag_attributes())
-            .collect()
+        let mut attributes = Vec::new();
+        for injector in &self.inner.head_injectors {
+            for attribute in injector.tsjs_script_tag_attributes() {
+                if !attributes.iter().any(|(name, _)| *name == attribute.0) {
+                    attributes.push(attribute);
+                }
+            }
+        }
+        attributes
     }
 
     /// Provide a snapshot of registered integrations and their hooks.
@@ -1367,6 +1371,25 @@ mod tests {
         }
     }
 
+    struct ConflictingMetadataHeadInjector;
+
+    impl IntegrationHeadInjector for ConflictingMetadataHeadInjector {
+        fn integration_id(&self) -> &'static str {
+            "conflicting-metadata"
+        }
+
+        fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
+            vec![
+                ("data-ts-gam-attribution", "false"),
+                ("data-third-attribute", "third"),
+            ]
+        }
+    }
+
     #[test]
     fn tsjs_script_tag_attributes_preserve_registration_order_and_default_empty() {
         let registry = IntegrationRegistry::from_rewriters_with_head_injectors(
@@ -1375,6 +1398,7 @@ mod tests {
             vec![
                 Arc::new(DefaultMetadataHeadInjector),
                 Arc::new(StaticMetadataHeadInjector),
+                Arc::new(ConflictingMetadataHeadInjector),
             ],
         );
 
@@ -1383,8 +1407,9 @@ mod tests {
             vec![
                 ("data-ts-gam-attribution", "true"),
                 ("data-test-order", "second"),
+                ("data-third-attribute", "third"),
             ],
-            "should omit default-empty metadata and preserve registered attribute order"
+            "should keep the first value for duplicate names and preserve attribute order"
         );
     }
 
