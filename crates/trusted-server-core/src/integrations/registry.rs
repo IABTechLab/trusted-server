@@ -577,6 +577,18 @@ pub trait IntegrationHeadInjector: Send + Sync {
     fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String>;
 }
 
+/// Trait for integration-provided outbound response header mutations.
+///
+/// Lets an integration add headers (for example `Accept-CH` or detection result
+/// headers) to outbound responses. Applied on the platform-neutral
+/// [`http::Response`] before it is handed to the host adapter.
+pub trait IntegrationResponseMutator: Send + Sync {
+    /// Identifier for logging/diagnostics.
+    fn integration_id(&self) -> &'static str;
+    /// Add headers to an outbound response.
+    fn add_response_headers(&self, headers: &mut http::HeaderMap);
+}
+
 /// Registration payload returned by integration builders.
 pub struct IntegrationRegistration {
     pub integration_id: &'static str,
@@ -588,6 +600,7 @@ pub struct IntegrationRegistration {
     pub html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
     pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    pub response_mutators: Vec<Arc<dyn IntegrationResponseMutator>>,
 }
 
 impl IntegrationRegistration {
@@ -614,6 +627,7 @@ impl IntegrationRegistrationBuilder {
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                response_mutators: Vec::new(),
             },
         }
     }
@@ -657,6 +671,12 @@ impl IntegrationRegistrationBuilder {
     #[must_use]
     pub fn with_request_filter(mut self, filter: Arc<dyn IntegrationRequestFilter>) -> Self {
         self.registration.request_filters.push(filter);
+        self
+    }
+
+    #[must_use]
+    pub fn with_response_mutator(mut self, mutator: Arc<dyn IntegrationResponseMutator>) -> Self {
+        self.registration.response_mutators.push(mutator);
         self
     }
 
@@ -704,6 +724,7 @@ struct IntegrationRegistryInner {
     html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
     head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    response_mutators: Vec<Arc<dyn IntegrationResponseMutator>>,
     /// JS module IDs to include in the bundle that come from a source other than
     /// a registered integration, for example a module tied to the selected Edge
     /// Cookie provider. Populated in [`IntegrationRegistry::new`] from settings.
@@ -729,6 +750,7 @@ impl Default for IntegrationRegistryInner {
             html_post_processors: Vec::new(),
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
+            response_mutators: Vec::new(),
             extra_js_module_ids: Vec::new(),
         }
     }
@@ -859,6 +881,9 @@ impl IntegrationRegistry {
                     .extend(registration.html_post_processors);
                 inner.head_injectors.extend(registration.head_injectors);
                 inner.request_filters.extend(registration.request_filters);
+                inner
+                    .response_mutators
+                    .extend(registration.response_mutators);
                 if registration.js_disabled {
                     inner.disabled_js_ids.push(registration.integration_id);
                 } else if registration.js_deferred {
@@ -1067,6 +1092,14 @@ impl IntegrationRegistry {
         inserts
     }
 
+    /// Apply each registered integration's response-header mutations to an
+    /// outbound response's headers.
+    pub fn apply_response_headers(&self, headers: &mut http::HeaderMap) {
+        for mutator in &self.inner.response_mutators {
+            mutator.add_response_headers(headers);
+        }
+    }
+
     /// Provide a snapshot of registered integrations and their hooks.
     #[must_use]
     pub fn registered_integrations(&self) -> Vec<IntegrationMetadata> {
@@ -1210,6 +1243,7 @@ impl IntegrationRegistry {
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                response_mutators: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
                 extra_js_module_ids: Vec::new(),
@@ -1240,6 +1274,7 @@ impl IntegrationRegistry {
                 html_post_processors: Vec::new(),
                 head_injectors,
                 request_filters: Vec::new(),
+                response_mutators: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
                 extra_js_module_ids: Vec::new(),
@@ -1266,6 +1301,7 @@ impl IntegrationRegistry {
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters,
+                response_mutators: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
                 extra_js_module_ids: Vec::new(),
@@ -1332,6 +1368,7 @@ impl IntegrationRegistry {
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                response_mutators: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
                 extra_js_module_ids: Vec::new(),
@@ -1346,6 +1383,39 @@ mod tests {
     use crate::constants::COOKIE_TS_EC;
     use crate::platform::test_support::noop_services;
     use http::{HeaderValue, StatusCode, header};
+
+    struct TestResponseMutator;
+
+    impl IntegrationResponseMutator for TestResponseMutator {
+        fn integration_id(&self) -> &'static str {
+            "test"
+        }
+
+        fn add_response_headers(&self, headers: &mut http::HeaderMap) {
+            headers.insert("x-test-mutator", HeaderValue::from_static("applied"));
+        }
+    }
+
+    #[test]
+    fn apply_response_headers_runs_registered_mutators() {
+        let registry = IntegrationRegistry {
+            inner: Arc::new(IntegrationRegistryInner {
+                response_mutators: vec![Arc::new(TestResponseMutator)],
+                ..Default::default()
+            }),
+        };
+        let mut headers = http::HeaderMap::new();
+        registry.apply_response_headers(&mut headers);
+        assert_eq!(
+            headers
+                .get("x-test-mutator")
+                .expect("should add the mutator header")
+                .to_str()
+                .expect("header value should be valid ASCII"),
+            "applied",
+            "registered response mutator should add its header"
+        );
+    }
 
     // Mock integration proxy for testing
     struct MockProxy;

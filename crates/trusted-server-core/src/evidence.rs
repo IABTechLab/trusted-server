@@ -6,11 +6,27 @@
 //! a service the host does not supply cannot be built, so the request stops
 //! rather than silently degrading.
 //!
-//! These traits are the service interfaces. Request-scoped data outlives the
-//! live request only when snapshotted, so an implementation owns its data where
-//! needed ([`OwnedRequestInfo`] is the built-in owned snapshot).
+//! These traits are the service interfaces. Concrete implementations live with
+//! the host or vendor that supplies them (for example `FastlyHostSignals` in
+//! `trusted-server-device-fastly`). An injected service outlives the borrow of
+//! the live request, so an implementation owns its data ([`OwnedRequestInfo`] is
+//! the built-in owned snapshot).
 
 use http::HeaderMap;
+
+/// Host-computed client fingerprints that are not carried in request headers.
+///
+/// A host that can compute them supplies an implementation (Fastly exposes the
+/// TLS JA4 and HTTP/2 fingerprints). A provider that needs them takes
+/// `Arc<dyn HostSignals>` in its constructor; on a host that supplies none, the
+/// provider cannot be built and the request stops.
+pub trait HostSignals: Send + Sync + core::fmt::Debug {
+    /// The full JA4 TLS fingerprint, or `None` when unavailable.
+    fn ja4(&self) -> Option<&str>;
+
+    /// The raw HTTP/2 SETTINGS fingerprint, or `None` when unavailable.
+    fn h2(&self) -> Option<&str>;
+}
 
 /// Read-only access to the current request's basic information.
 ///
@@ -214,20 +230,6 @@ impl RequestInfo for BorrowedRequestInfo<'_> {
     fn query(&self) -> &str {
         self.query
     }
-}
-
-/// Host-computed client fingerprints that are not carried in request headers.
-///
-/// A host that can compute them supplies an implementation (Fastly exposes the
-/// TLS JA4 and HTTP/2 fingerprints). A provider that needs them takes
-/// `Arc<dyn HostSignals>` in its constructor; on a host that supplies none, the
-/// provider cannot be built and the request stops.
-pub trait HostSignals: Send + Sync + core::fmt::Debug {
-    /// The full JA4 TLS fingerprint, or `None` when unavailable.
-    fn ja4(&self) -> Option<&str>;
-
-    /// The raw HTTP/2 SETTINGS fingerprint, or `None` when unavailable.
-    fn h2(&self) -> Option<&str>;
 }
 
 #[cfg(test)]

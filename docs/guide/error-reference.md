@@ -69,7 +69,7 @@ proxy_secret = "change-me-to-random-string"
 - `publisher.domain`
 - `publisher.origin_url`
 - `publisher.proxy_secret`
-- `ec.passphrase`
+- `ec.providers.hmac.passphrase` (when `ec.provider = "hmac"`)
 
 ---
 
@@ -141,17 +141,21 @@ Failed to generate EC ID: HMAC error
 
 **Solution:**
 
-1. Ensure `passphrase` is set in `trusted-server.toml`:
+1. Ensure the `hmac` provider is selected and its `passphrase` is set in `trusted-server.toml`:
 
 ```toml
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "replace-with-32-plus-byte-random-secret"
 ```
 
 2. Or set via environment variable:
 
 ```bash
-TRUSTED_SERVER__EC__PASSPHRASE=replace-with-32-plus-byte-random-secret
+TRUSTED_SERVER__EC__PROVIDER=hmac
+TRUSTED_SERVER__EC__PROVIDERS__HMAC__PASSPHRASE=replace-with-32-plus-byte-random-secret
 ```
 
 ---
