@@ -88,6 +88,7 @@ function token(...parts) {
 
 const oldRuntimePrefix = token('__', 'tsjs', '_');
 const oldCreativeGlobal = token('ts', 'creative');
+const oldIntegrationConfigTransport = token('_', 'integration', 'Config');
 const legacyPublicTokens = [
   token('Legacy', 'TsjsApi'),
   token('TsjsApi', 'V1'),
@@ -109,6 +110,11 @@ forbid(
   legacySurfaceFiles,
   'legacy creative global',
   new RegExp(`(?:globalThis\\.)?${oldCreativeGlobal}|tsCreativeConfig`, 'g')
+);
+forbid(
+  [...legacySurfaceFiles, ...productionRustFiles],
+  'legacy mutable integration config transport',
+  new RegExp(oldIntegrationConfigTransport, 'g')
 );
 for (const name of legacyPublicTokens) {
   forbid(
@@ -261,8 +267,8 @@ for (const file of forbiddenFiles) {
 }
 
 const requiredReplacements = [
-  ['crates/trusted-server-core/src/integrations/mod.rs', '_integrationConfig'],
-  ['crates/trusted-server-js/lib/src/core/index.ts', '_integrationConfig'],
+  ['crates/trusted-server-core/src/tsjs.rs', 'IntegrationConfigsV1'],
+  ['crates/trusted-server-js/lib/src/core/index.ts', '_claimBootSnapshot'],
   ['crates/trusted-server-js/lib/src/integrations/didomi/module.ts', 'proxyPath'],
   ['crates/trusted-server-js/lib/src/integrations/prebid/module.ts', 'clientSideBidders'],
   ['crates/trusted-server-js/lib/src/integrations/sourcepoint/module.ts', 'rewriteSdk'],
