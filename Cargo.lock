@@ -5346,6 +5346,7 @@ dependencies = [
  "tokio-rustls",
  "toml",
  "toml_edit",
+ "tracing",
  "trusted-server-core",
  "url",
  "webpki-roots",

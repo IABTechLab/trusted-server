@@ -235,7 +235,8 @@ pub(super) fn merge_render_slots_with_diagnostics(
             };
             format!(
                 "configured slot `{}` with div_id prefix `{}` matched {} discovered divs \
-                 ({sample}{suffix}); review whether they are distinct placements",
+                 ({sample}{suffix}); runtime can resolve this configured slot to at most one \
+                 active element, so review whether they are distinct placements",
                 slot.id,
                 slot.div_id.as_deref().unwrap_or_default(),
                 divs.len(),
@@ -305,25 +306,22 @@ pub(super) fn render_slots(slots: &[RenderSlot]) -> String {
         if let Some(path) = &slot.gam_unit_path {
             out.push_str(&format!("gam_unit_path = {}\n", toml_string(path)));
         }
-        let patterns = slot
-            .page_patterns
-            .iter()
-            .map(|pattern| toml_string(pattern))
-            .collect::<Vec<_>>()
-            .join(", ");
-        out.push_str(&format!("page_patterns = [{patterns}]\n"));
-        let formats = slot
-            .formats
-            .iter()
-            .map(|(width, height, media_type)| match media_type {
+        out.push_str("page_patterns = [\n");
+        for pattern in &slot.page_patterns {
+            out.push_str(&format!("  {},\n", toml_string(pattern)));
+        }
+        out.push_str("]\n");
+        out.push_str("formats = [\n");
+        for (width, height, media_type) in &slot.formats {
+            let rendered = match media_type {
                 Some(kind) => {
                     format!("{{ width = {width}, height = {height}, media_type = \"{kind}\" }}")
                 }
                 None => format!("{{ width = {width}, height = {height} }}"),
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        out.push_str(&format!("formats = [{formats}]\n"));
+            };
+            out.push_str(&format!("  {rendered},\n"));
+        }
+        out.push_str("]\n");
         if let Some(floor) = slot.floor_price {
             // `f64` Display prints `NaN`, which is not valid TOML (`nan` is);
             // normalize non-finite values so the spliced config stays parseable.
@@ -1207,6 +1205,37 @@ slot_id = "sidebar"
     }
 
     #[test]
+    fn render_slots_formats_long_arrays_across_indented_lines() {
+        let slot = RenderSlot {
+            id: "header".to_string(),
+            div_id: Some("div-gpt-ad-header".to_string()),
+            gam_unit_path: Some("/222/homepage/header".to_string()),
+            page_patterns: vec!["/".to_string(), "/news".to_string(), "/news/*".to_string()],
+            formats: vec![(728, 90, None), (970, 250, None), (300, 250, None)],
+            floor_price: None,
+            targeting: BTreeMap::new(),
+            aps_slot_id: None,
+            prebid_bidders: None,
+        };
+
+        let rendered = render_slots(&[slot]);
+
+        assert!(
+            rendered.contains("page_patterns = [\n  \"/\",\n  \"/news\",\n  \"/news/*\",\n]\n"),
+            "page patterns should be readable one-per-line"
+        );
+        assert!(
+            rendered.contains(
+                "formats = [\n  { width = 728, height = 90 },\n  \
+                 { width = 970, height = 250 },\n  \
+                 { width = 300, height = 250 },\n]\n"
+            ),
+            "formats should be readable one-per-line"
+        );
+        toml::from_str::<toml::Value>(&rendered).expect("formatted slots are valid TOML");
+    }
+
+    #[test]
     fn splice_creates_section_when_absent() {
         // Config with no [creative_opportunities] at all — generate should append it.
         let existing = "[publisher]\ndomain = \"x\"\n\n[auction]\nenabled = true\n";
@@ -1493,6 +1522,10 @@ slot_id = "sidebar"
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].contains("matched 2 discovered divs"));
         assert!(diagnostics[0].contains("ad-footer"));
+        assert!(
+            diagnostics[0].contains("runtime can resolve this configured slot to at most one"),
+            "diagnostic should explain the runtime consequence"
+        );
         assert!(diagnostics[0].contains("ad-header"));
     }
 

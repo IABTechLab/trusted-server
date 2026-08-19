@@ -107,6 +107,7 @@ tokio-rustls = "0.26"
 toml = "1.1"
 toml_edit = "0.23.10"
 tower = "0.4"
+tracing = "0.1"
 trusted-server-core = { path = "crates/trusted-server-core" }
 trusted-server-js = { path = "crates/trusted-server-js" }
 trusted-server-openrtb = { path = "crates/trusted-server-openrtb" }

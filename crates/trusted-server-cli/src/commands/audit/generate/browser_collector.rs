@@ -422,17 +422,40 @@ async fn with_browser(
         .await
         .map_err(|_| report_error("timed out closing browser after audit"))
         .and_then(|closed| {
-            closed.map_err(|error| {
+            closed.map(|_| ()).map_err(|error| {
                 report_error(format!("failed to close browser after audit: {error}"))
+            })
+        });
+    // Reap the child even when the CDP close request failed or timed out. Give
+    // waiting its own budget so a slow close cannot consume the entire teardown
+    // window and leave chromiumoxide's drop handler to kill the process.
+    let wait_result = timeout(BROWSER_CLOSE_TIMEOUT, browser.wait())
+        .await
+        .map_err(|_| report_error("timed out waiting for browser process to exit after audit"))
+        .and_then(|waited| {
+            waited.map(|_| ()).map_err(|error| {
+                report_error(format!(
+                    "failed waiting for browser process to exit after audit: {error}"
+                ))
             })
         });
     handler_task.abort();
     let _ = handler_task.await;
 
-    match (result, close_result) {
+    let teardown_result = combine_browser_teardown_results(close_result, wait_result);
+
+    match (result, teardown_result) {
         (Ok(()), Ok(_)) => Ok(()),
         (Ok(()), Err(error)) | (Err(error), _) => Err(error),
     }
+}
+
+/// Combines already-attempted browser teardown phases, preserving the first error.
+fn combine_browser_teardown_results(
+    close_result: CliResult<()>,
+    wait_result: CliResult<()>,
+) -> CliResult<()> {
+    close_result.and(wait_result)
 }
 
 /// Collects one page on an already-launched browser.
@@ -1073,6 +1096,31 @@ mod tests {
         assert!(candidates.contains(&"google-chrome"));
         assert!(candidates.contains(&"chromium"));
         assert!(candidates.contains(&"Google Chrome for Testing"));
+    }
+
+    #[test]
+    fn browser_teardown_reports_close_error_before_wait_error() {
+        let result = combine_browser_teardown_results(
+            Err("close failed".to_string()),
+            Err("wait failed".to_string()),
+        );
+
+        assert_eq!(
+            result.expect_err("should preserve teardown error"),
+            "close failed",
+            "the close failure is the first teardown failure"
+        );
+    }
+
+    #[test]
+    fn browser_teardown_reports_wait_error_when_close_succeeds() {
+        let result = combine_browser_teardown_results(Ok(()), Err("wait failed".to_string()));
+
+        assert_eq!(
+            result.expect_err("should preserve wait error"),
+            "wait failed",
+            "a wait failure must not be mislabeled as a close failure"
+        );
     }
 
     fn navigation_response_with_status(status: i64, status_text: &str) -> ArcHttpRequest {
