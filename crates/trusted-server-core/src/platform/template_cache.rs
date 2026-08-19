@@ -1,4 +1,4 @@
-//! The shared transformed-template cache (C2) for the #1009 ESI validation spike.
+//! The shared transformed-template cache for the #1009 ESI validation spike.
 //!
 //! Three caches are in play and conflating them is what produced the original wrong
 //! conclusion in the design doc, so this module names which one it is:
@@ -6,10 +6,10 @@
 //! | Cache | Contents                          | Owner                          |
 //! | ----- | --------------------------------- | ------------------------------ |
 //! | C1    | raw origin bytes                  | Fastly read-through. Not this. |
-//! | C2    | post-`lol_html`, pre-assembly     | **This module.**               |
-//! | C3    | final per-user assembled response | **Must never exist.**          |
+//! | Template cache | post-`lol_html`, pre-assembly     | **This module.**       |
+//! | Final response | final per-user assembled response | **Must never exist.** |
 //!
-//! C2 holds a *shared template*: no per-user bytes, and no decisions that depend on
+//! The template cache holds a *shared template*: no per-user bytes, and no decisions that depend on
 //! the request. What may and may not live in it is
 //! [§6.7 of the design doc](../../../../docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md),
 //! and the invariant is enforced by the rendered-document byte-identity tests in
@@ -36,7 +36,7 @@ use crate::creative_opportunities::AssemblyMode;
 /// | 4       | Marker is the shorter, accurate [`AD_ASSEMBLY_SEAM`](crate::publisher::AD_ASSEMBLY_SEAM) |
 pub const TEMPLATE_SCHEMA_VERSION: u32 = 4;
 
-/// Surrogate key attached to every template so an incident can purge C2 globally.
+/// Surrogate key attached to every template so an incident can purge the template cache globally.
 pub const TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY: &str = "ts-template";
 
 /// Inputs that select one cached template.
@@ -89,7 +89,7 @@ impl TemplateCacheKey {
         }
 
         let mut canonical = Vec::new();
-        push(&mut canonical, b"ts-c2");
+        push(&mut canonical, b"ts-template-cache");
         push(&mut canonical, &self.schema_version.to_be_bytes());
         push(
             &mut canonical,
@@ -122,7 +122,11 @@ impl TemplateCacheKey {
         }
 
         let digest = sha2::Sha256::digest(canonical);
-        format!("ts-c2-v{}-{}", self.schema_version, hex::encode(digest))
+        format!(
+            "ts-template-cache-v{}-{}",
+            self.schema_version,
+            hex::encode(digest)
+        )
     }
 
     /// Surrogate keys to attach at insert, for purge-based rollback.
@@ -196,7 +200,7 @@ pub const REPLAYABLE_POLICY_HEADERS: &[&str] = &[
 /// reader input. This assumes those origin variants differ only by HTTP content coding;
 /// operators must leave ESI disabled if an origin changes document semantics instead.
 /// Without this carve-out, the ordinary declaration sent by any compressing origin reads
-/// as an uncovered gap and disqualifies the response, so **C2 would never cache anything
+/// as an uncovered gap and disqualifies the response, so **the template cache would never store anything
 /// against a real origin** unless the operator redundantly listed a header the transform
 /// already normalizes. Found by review before it could make the spike measure a hit rate
 /// of approximately zero and read that as a result.
@@ -331,7 +335,7 @@ impl VarySpec {
 /// safe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateMetadata {
-    /// Encoding of the stored bytes. C2 writes only `identity`; retaining the field in
+    /// Encoding of the stored bytes. The template cache writes only `identity`; retaining the field in
     /// metadata makes corrupt or stale representations fail validation on read.
     pub content_encoding: String,
     /// Content type to rebuild the response with.
@@ -587,7 +591,7 @@ impl Drop for TemplateCacheReservation {
         if let Some(inner) = self.inner.take()
             && let Err(err) = inner.cancel()
         {
-            log::warn!("c2_template_cache reservation cancellation failed: {err}");
+            log::warn!("template_cache reservation cancellation failed: {err}");
         }
     }
 }
@@ -635,7 +639,7 @@ pub trait PlatformTemplateCache: Send + Sync {
     ///
     /// This compatibility default exists for implementations with no transactional
     /// reservation support. It reports ordinary cold misses as `Unsupported`; an
-    /// adapter that supports C2 reservations must override it so cold requests can
+    /// adapter that supports template-cache reservations must override it so cold requests can
     /// return [`TemplateCacheLookup::Reserved`].
     async fn lookup_or_reserve(
         &self,
@@ -656,7 +660,7 @@ pub trait PlatformTemplateCache: Send + Sync {
 
     /// Store a template.
     ///
-    /// Callers must not call this without having consulted the C2 eligibility gate
+    /// Callers must not call this without having consulted the template-cache eligibility gate
     /// first: this method stores what it is given and cannot tell a shared template
     /// from a per-user one.
     async fn put(
@@ -876,9 +880,11 @@ mod tests {
     fn rendered_key_is_fixed_size_and_contains_no_request_material() {
         let rendered = key().to_cache_key();
         assert_eq!(
-            rendered.len(),
-            format!("ts-c2-v{TEMPLATE_SCHEMA_VERSION}-").len() + 64
+            rendered,
+            "ts-template-cache-v4-54431eb4ea82644d6378717a8c3f18302fafbf739e684598da79e392b16900a6"
         );
+        assert!(rendered.starts_with("ts-template-cache-v4-"));
+        assert_eq!(rendered.len(), 85);
         for sensitive in ["example.com", "/news/article", "rsc", "abc123"] {
             assert!(
                 !rendered.contains(sensitive),
