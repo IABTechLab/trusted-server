@@ -26,6 +26,7 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt as _};
 
 use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EC, COOKIE_TS_EIDS};
+use crate::cookies::extract_cookie_value;
 use crate::error::TrustedServerError;
 use crate::openrtb::Eid;
 
@@ -544,22 +545,6 @@ pub fn handle_admin_eids_lookup(
             message: "failed to serialize admin EIDs response".to_owned(),
         })?;
     Ok(json_response(StatusCode::OK, body))
-}
-
-fn extract_cookie_value(req: &Request<EdgeBody>, name: &str) -> Option<String> {
-    let cookie_header = req
-        .headers()
-        .get(header::COOKIE)
-        .and_then(|value| value.to_str().ok())?;
-    for pair in cookie_header.split(';') {
-        let pair = pair.trim();
-        if let Some((key, value)) = pair.split_once('=')
-            && key.trim() == name
-        {
-            return Some(value.trim().to_owned());
-        }
-    }
-    None
 }
 
 fn json_error(status: StatusCode, message: &str) -> Response<EdgeBody> {
