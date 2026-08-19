@@ -56,6 +56,14 @@ enum ReadFoundError {
     Backend(TemplateCacheError),
 }
 
+fn read_cache_body(mut reader: impl std::io::Read) -> Result<Vec<u8>, ReadFoundError> {
+    let mut body = Vec::new();
+    reader
+        .read_to_end(&mut body)
+        .map_err(|_| ReadFoundError::Invalid(TemplateCacheMiss::Truncated))?;
+    Ok(body)
+}
+
 fn read_found(found: &Found, key: &TemplateCacheKey) -> Result<TemplateEntry, ReadFoundError> {
     if found.is_stale() {
         return Err(ReadFoundError::Invalid(TemplateCacheMiss::NotFound));
@@ -74,14 +82,14 @@ fn read_found(found: &Found, key: &TemplateCacheKey) -> Result<TemplateEntry, Re
         return Err(ReadFoundError::Invalid(TemplateCacheMiss::Truncated));
     }
 
-    let body = found
+    let stream = found
         .to_stream()
         .map_err(|error| {
             ReadFoundError::Backend(backend_error(format!(
                 "opening cached template body failed: {error:?}"
             )))
-        })?
-        .into_bytes();
+        })?;
+    let body = read_cache_body(stream)?;
     if body.len() as u64 != metadata.body_len {
         return Err(ReadFoundError::Invalid(TemplateCacheMiss::Truncated));
     }
@@ -226,6 +234,7 @@ impl PlatformTemplateCache for FastlyTemplateCache {
         let mut writer = tx
             .insert(max_age)
             .surrogate_keys(surrogate_keys.iter().map(String::as_str))
+            .known_length(body.len() as u64)
             .user_metadata(metadata.encode().into())
             .execute()
             .map_err(|e| backend_error(format!("cache insert failed: {e:?}")))?;
@@ -259,8 +268,24 @@ impl PlatformTemplateCache for FastlyTemplateCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     use trusted_server_core::creative_opportunities::AssemblyMode;
     use trusted_server_core::platform::TEMPLATE_SCHEMA_VERSION;
+
+    struct FailingReader {
+        returned_prefix: bool,
+    }
+
+    impl io::Read for FailingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.returned_prefix {
+                return Err(io::Error::other("abandoned cache stream"));
+            }
+            self.returned_prefix = true;
+            buffer[..3].copy_from_slice(b"abc");
+            Ok(3)
+        }
+    }
 
     /// Distinct per test, so tests sharing the process cache cannot collide.
     fn key(url: &str) -> TemplateCacheKey {
@@ -297,6 +322,22 @@ mod tests {
 
     fn cache() -> FastlyTemplateCache {
         FastlyTemplateCache::new()
+    }
+
+    #[test]
+    fn cache_body_read_error_is_a_truncated_miss() {
+        let error = read_cache_body(FailingReader {
+            returned_prefix: false,
+        })
+        .expect_err("should reject an abandoned cache stream");
+
+        assert!(
+            matches!(
+                error,
+                ReadFoundError::Invalid(TemplateCacheMiss::Truncated)
+            ),
+            "should classify a cache stream read failure as truncated"
+        );
     }
 
     #[test]
