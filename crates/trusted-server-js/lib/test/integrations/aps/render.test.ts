@@ -4,17 +4,33 @@ import envelope from '../../fixtures/aps-renderer-v1.json';
 import type { ApsRendererV1 } from '../../../src/core/types';
 import { log } from '../../../src/core/log';
 import {
+  APS_NATIVE_RENDERER_ACK_TIMEOUT_MS,
   APS_RENDERER_PATH,
   APS_RENDERER_SANDBOX,
+  APS_RENDERING_MODE_META_NAME,
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
   apsRendererUrl,
+  dispatchApsRendering,
   getApsPrebidRenderer,
   parseApsRendererDescriptor,
   registerApsPrebidRenderer,
   renderApsCreative,
   validateApsRenderer,
 } from '../../../src/integrations/aps/render';
+
+function enablePublisherNativeMode(): void {
+  const marker = document.createElement('meta');
+  marker.name = APS_RENDERING_MODE_META_NAME;
+  marker.content = 'publisher_native';
+  document.head.appendChild(marker);
+}
+
+function disablePublisherNativeMode(): void {
+  document.head
+    .querySelectorAll(`meta[name="${APS_RENDERING_MODE_META_NAME}"]`)
+    .forEach((marker) => marker.remove());
+}
 
 function encodeBytes(bytes: Uint8Array): string {
   let binary = '';
@@ -258,6 +274,256 @@ describe('Prebid APS renderer registry', () => {
       )
     ).toBe(false);
     expect(window.tsjs?.apsPrebidRenderers).toBeUndefined();
+  });
+});
+
+describe('publisher-native APS hook contract tests', () => {
+  beforeEach(() => {
+    document.body.innerHTML = '<div id="fictional-slot"><span>existing</span></div>';
+    enablePublisherNativeMode();
+  });
+
+  afterEach(() => {
+    disablePublisherNativeMode();
+    delete window.tsjs;
+    vi.restoreAllMocks();
+    document.body.innerHTML = '';
+  });
+
+  it('contract test: sends the exact frozen descriptor to an accepting publisher hook without an iframe', async () => {
+    const render = vi.fn().mockResolvedValue({ accepted: true });
+    window.tsjs = { apsNativeRenderer: { render } } as typeof window.tsjs;
+    const unrelatedMarker = document.createElement('meta');
+    unrelatedMarker.name = APS_RENDERING_MODE_META_NAME;
+    unrelatedMarker.content = 'trusted_server';
+    document.head.appendChild(unrelatedMarker);
+
+    const accepted = await dispatchApsRendering({
+      slotId: 'fictional-slot',
+      renderer: descriptor(),
+      trustedServer: () => {
+        throw new Error('trusted renderer must not run');
+      },
+    });
+
+    expect(accepted).toBe(true);
+    expect(render).toHaveBeenCalledTimes(1);
+    expect(render).toHaveBeenCalledWith({
+      version: 1,
+      slotId: 'fictional-slot',
+      renderer: descriptor(),
+    });
+    const payload = render.mock.calls[0][0];
+    expect(Object.keys(payload).sort()).toEqual(['renderer', 'slotId', 'version']);
+    expect(Object.isFrozen(payload.renderer)).toBe(true);
+    expect(document.querySelector('iframe')).toBeNull();
+  });
+
+  it('contract test: declines missing, throwing, rejecting, and malformed hooks without fallback', async () => {
+    const trustedServer = vi.fn(() => true);
+    await expect(
+      dispatchApsRendering({ slotId: 'fictional-slot', renderer: descriptor(), trustedServer })
+    ).resolves.toBe(false);
+
+    window.tsjs = {
+      apsNativeRenderer: {
+        render: () => {
+          throw new Error('fictional');
+        },
+      },
+    } as typeof window.tsjs;
+    await expect(
+      dispatchApsRendering({ slotId: 'fictional-slot', renderer: descriptor(), trustedServer })
+    ).resolves.toBe(false);
+
+    window.tsjs = {
+      apsNativeRenderer: { render: () => Promise.reject(new Error('fictional')) },
+    } as typeof window.tsjs;
+    await expect(
+      dispatchApsRendering({ slotId: 'fictional-slot', renderer: descriptor(), trustedServer })
+    ).resolves.toBe(false);
+
+    window.tsjs = {
+      apsNativeRenderer: { render: () => ({ accepted: false }) },
+    } as typeof window.tsjs;
+    await expect(
+      dispatchApsRendering({ slotId: 'fictional-slot', renderer: descriptor(), trustedServer })
+    ).resolves.toBe(false);
+
+    window.tsjs = {
+      apsNativeRenderer: { render: () => ({ accepted: 'yes' }) },
+    } as typeof window.tsjs;
+    await expect(
+      dispatchApsRendering({ slotId: 'fictional-slot', renderer: descriptor(), trustedServer })
+    ).resolves.toBe(false);
+
+    expect(trustedServer).not.toHaveBeenCalled();
+    expect(document.querySelector('iframe')).toBeNull();
+  });
+
+  it('contract test: ignores a stale acknowledgement after a replacement dispatch', async () => {
+    let resolveFirst: ((value: { accepted: boolean }) => void) | undefined;
+    const render = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirst = resolve;
+          })
+      )
+      .mockResolvedValueOnce({ accepted: true });
+    window.tsjs = { apsNativeRenderer: { render } } as typeof window.tsjs;
+
+    const first = dispatchApsRendering({
+      slotId: 'fictional-slot',
+      renderer: descriptor(),
+      trustedServer: () => true,
+    });
+    const second = dispatchApsRendering({
+      slotId: 'fictional-slot',
+      renderer: descriptor(),
+      trustedServer: () => true,
+    });
+    resolveFirst!({ accepted: true });
+
+    await expect(first).resolves.toBe(false);
+    await expect(second).resolves.toBe(true);
+  });
+
+  it('contract test: a missing hook supersedes an older pending dispatch', async () => {
+    let resolveFirst: ((value: { accepted: boolean }) => void) | undefined;
+    const render = vi.fn(
+      () =>
+        new Promise<{ accepted: boolean }>((resolve) => {
+          resolveFirst = resolve;
+        })
+    );
+    window.tsjs = { apsNativeRenderer: { render } } as typeof window.tsjs;
+
+    const first = dispatchApsRendering({
+      slotId: 'fictional-slot',
+      renderer: descriptor(),
+      trustedServer: () => true,
+    });
+    delete window.tsjs!.apsNativeRenderer;
+    const second = dispatchApsRendering({
+      slotId: 'fictional-slot',
+      renderer: descriptor(),
+      trustedServer: () => true,
+    });
+    resolveFirst!({ accepted: true });
+
+    await expect(second).resolves.toBe(false);
+    await expect(first).resolves.toBe(false);
+  });
+
+  it('contract test: a trusted-server dispatch supersedes an older native dispatch', async () => {
+    let resolveFirst: ((value: { accepted: boolean }) => void) | undefined;
+    window.tsjs = {
+      apsNativeRenderer: {
+        render: () =>
+          new Promise<{ accepted: boolean }>((resolve) => {
+            resolveFirst = resolve;
+          }),
+      },
+    } as typeof window.tsjs;
+    const first = dispatchApsRendering({
+      slotId: 'fictional-slot',
+      renderer: descriptor(),
+      trustedServer: () => true,
+    });
+
+    disablePublisherNativeMode();
+    const trustedServer = vi.fn(() => true);
+    const second = dispatchApsRendering({
+      slotId: 'fictional-slot',
+      renderer: descriptor(),
+      trustedServer,
+    });
+    resolveFirst!({ accepted: true });
+
+    expect(second).toBe(true);
+    expect(trustedServer).toHaveBeenCalledOnce();
+    await expect(first).resolves.toBe(false);
+  });
+
+  it('contract test: contains throwing hook and acknowledgement accessors', async () => {
+    const tsjs = {} as NonNullable<typeof window.tsjs>;
+    Object.defineProperty(tsjs, 'apsNativeRenderer', {
+      get: () => {
+        throw new Error('fictional hook lookup failure');
+      },
+    });
+    window.tsjs = tsjs;
+
+    await expect(
+      dispatchApsRendering({
+        slotId: 'fictional-slot',
+        renderer: descriptor(),
+        trustedServer: () => true,
+      })
+    ).resolves.toBe(false);
+
+    window.tsjs = {
+      apsNativeRenderer: {
+        render: () =>
+          new Proxy(
+            { accepted: true },
+            {
+              ownKeys: () => {
+                throw new Error('fictional acknowledgement inspection failure');
+              },
+            }
+          ),
+      },
+    } as typeof window.tsjs;
+    await expect(
+      dispatchApsRendering({
+        slotId: 'fictional-slot',
+        renderer: descriptor(),
+        trustedServer: () => true,
+      })
+    ).resolves.toBe(false);
+  });
+
+  it('contract test: times out a hook and ignores its late acknowledgement', async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveHook: ((value: { accepted: boolean }) => void) | undefined;
+      window.tsjs = {
+        apsNativeRenderer: {
+          render: () =>
+            new Promise<{ accepted: boolean }>((resolve) => {
+              resolveHook = resolve;
+            }),
+        },
+      } as typeof window.tsjs;
+
+      const result = dispatchApsRendering({
+        slotId: 'fictional-slot',
+        renderer: descriptor(),
+        trustedServer: () => true,
+      });
+      await vi.advanceTimersByTimeAsync(APS_NATIVE_RENDERER_ACK_TIMEOUT_MS);
+
+      await expect(result).resolves.toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+      resolveHook!({ accepted: true });
+      await Promise.resolve();
+
+      window.tsjs = {
+        apsNativeRenderer: { render: () => ({ accepted: true }) },
+      } as typeof window.tsjs;
+      await expect(
+        dispatchApsRendering({
+          slotId: 'fictional-slot',
+          renderer: descriptor(),
+          trustedServer: () => true,
+        })
+      ).resolves.toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
