@@ -1467,7 +1467,7 @@ pub(crate) fn classify_response_route(
 pub struct OwnedProcessResponseParams {
     /// Where to store the transformed template, or [`None`] to store nothing.
     ///
-    /// `Some` only when [`c2_bypass_reason`] cleared the response, so the key's
+    /// `Some` only when `c2_bypass_reason` cleared the response, so the key's
     /// presence *is* the decision — there is no second place that could disagree with
     /// the gate, and no way to reach the store without having passed it.
     ///
@@ -1662,7 +1662,7 @@ pub async fn buffer_publisher_response_async(
                     }
                 })?;
             }
-            let store_outcome = store_template_if_authorized(services, &mut params, &bytes).await;
+            let store_outcome = store_template_if_authorized(&mut params, &bytes).await;
             if was_authorized {
                 set_c2_response_state(
                     &mut response,
@@ -1997,16 +1997,8 @@ fn build_cached_template_response(
         HeaderValue::from_str(&entry.metadata.content_type)
             .change_context_lazy(|| invalid("content type"))?,
     );
-    // Stored templates are identity bytes; final reader negotiation is applied after
-    // assembly rather than replaying the origin's representation.
-    if !entry.metadata.content_encoding.is_empty() && entry.metadata.content_encoding != "identity"
-    {
-        response.headers_mut().insert(
-            header::CONTENT_ENCODING,
-            HeaderValue::from_str(&entry.metadata.content_encoding)
-                .change_context_lazy(|| invalid("content encoding"))?,
-        );
-    }
+    // Metadata decoding accepts only identity templates. Reader encoding is selected
+    // after assembly rather than replaying the origin's representation.
     // No `Content-Length`. The assembled length is not known until bids resolve, and on
     // this adapter headers commit before the first body byte — so a length guessed here
     // could not be corrected later.
@@ -2037,7 +2029,7 @@ fn build_cached_template_response(
 /// Writes the transformed template to the shared cache, if the gate authorized it.
 ///
 /// The key's presence is the authorization: it is `Some` only when
-/// [`c2_bypass_reason`] cleared the response, so this cannot store something the gate
+/// `c2_bypass_reason` cleared the response, so this cannot store something the gate
 /// rejected. Takes the key rather than borrowing it, so a second call for the same
 /// request stores nothing.
 ///
@@ -2047,7 +2039,6 @@ fn build_cached_template_response(
 ///
 /// Spike-only, for the #1009 ESI validation.
 async fn store_template_if_authorized(
-    _services: &RuntimeServices,
     params: &mut OwnedProcessResponseParams,
     bytes: &[u8],
 ) -> Option<TemplateStoreOutcome> {
@@ -5086,6 +5077,9 @@ pub(crate) fn build_seam_script(
     slots_json: &str,
     bid_map: &serde_json::Map<String, serde_json::Value>,
 ) -> String {
+    // `scripts/c2-local-test.sh` probes the minified `var a=JSON.parse`,
+    // `var b=JSON.parse`, and `s(b,a)` literals below. Update the harness with any
+    // semantically equivalent rewrite so its black-box checks keep matching output.
     let bids = serde_json::to_string(bid_map)
         .expect("serde_json::to_string of Map<String,Value> should be infallible");
     format!(
@@ -5937,30 +5931,6 @@ fn page_bids_unknown_format() -> Response<EdgeBody> {
 /// The SPA hook sends `location.pathname`, but the parameter is
 /// client-controlled: strip any query string or fragment and force a leading
 /// `/` so slot `page_patterns` always match against a canonical path shape.
-/// How the page-bids endpoint serializes its answer.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum PageBidsFormat {
-    /// `application/json`. What the SPA navigation hook consumes.
-    #[default]
-    Json,
-}
-
-impl PageBidsFormat {
-    /// Parse the `format` query parameter.
-    ///
-    /// # Errors
-    ///
-    /// Returns the offending value if it names no known format. Unknown values are
-    /// rejected rather than defaulting so callers cannot silently negotiate a response
-    /// representation the endpoint no longer supports.
-    fn parse(raw: Option<&str>) -> Result<Self, String> {
-        match raw {
-            None | Some("json") => Ok(Self::Json),
-            Some(other) => Err(other.to_string()),
-        }
-    }
-}
-
 fn normalize_page_bids_path(raw: &str) -> String {
     let path = raw.split(['?', '#']).next().unwrap_or("");
     if path.starts_with('/') {
@@ -6070,22 +6040,18 @@ pub async fn handle_page_bids(
         })
         .unwrap_or_else(|| "/".to_string());
 
-    let format = match PageBidsFormat::parse(
-        req.uri()
-            .query()
-            .and_then(|query| {
-                url::form_urlencoded::parse(query.as_bytes())
-                    .find(|(k, _)| k == "format")
-                    .map(|(_, v)| v.into_owned())
-            })
-            .as_deref(),
-    ) {
-        Ok(format) => format,
-        Err(unknown) => {
-            log::warn!("page-bids: rejecting unknown format `{unknown}`");
-            return Ok(page_bids_unknown_format());
-        }
-    };
+    let format = req.uri().query().and_then(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .find(|(key, _)| key == "format")
+            .map(|(_, value)| value.into_owned())
+    });
+    if !matches!(format.as_deref(), None | Some("json")) {
+        log::warn!(
+            "page-bids: rejecting unknown format `{}`",
+            format.as_deref().unwrap_or_default()
+        );
+        return Ok(page_bids_unknown_format());
+    }
 
     let matched_slots = match_renderable_slots(auction.slots, co_config, &path_param);
 
@@ -6279,7 +6245,6 @@ pub async fn handle_page_bids(
         Vec::new()
     };
 
-    debug_assert_eq!(format, PageBidsFormat::Json);
     let body = serde_json::json!({
         "slots": slots_json,
         "bids": bid_map,
@@ -7214,32 +7179,6 @@ mod tests {
         use super::*;
 
         #[test]
-        fn an_absent_format_is_json_so_existing_clients_are_unaffected() {
-            assert_eq!(PageBidsFormat::parse(None), Ok(PageBidsFormat::Json));
-            assert_eq!(
-                PageBidsFormat::parse(Some("json")),
-                Ok(PageBidsFormat::Json)
-            );
-        }
-
-        #[test]
-        fn the_removed_fragment_format_is_rejected() {
-            assert_eq!(
-                PageBidsFormat::parse(Some("fragment")),
-                Err("fragment".to_string())
-            );
-        }
-
-        #[test]
-        fn an_unknown_format_is_rejected_rather_than_defaulting_to_json() {
-            assert_eq!(
-                PageBidsFormat::parse(Some("scrpit")),
-                Err("scrpit".to_string())
-            );
-            assert_eq!(PageBidsFormat::parse(Some("")), Err(String::new()));
-        }
-
-        #[test]
         fn an_unknown_format_response_is_not_storable() {
             // Every response from this endpoint is per-user. An error is no exception:
             // a cached 400 would be replayed to clients asking correctly.
@@ -7261,10 +7200,6 @@ mod tests {
         //! storing twice for one request.
 
         use super::*;
-        use crate::platform::ClientInfo;
-        use crate::platform::test_support::{
-            NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend,
-        };
 
         /// Records what was stored, so the assertions are about behaviour rather than
         /// about a call not returning an error.
@@ -7367,19 +7302,6 @@ mod tests {
             }
         }
 
-        fn services_with(cache: Arc<RecordingCache>) -> RuntimeServices {
-            RuntimeServices::builder()
-                .config_store(Arc::new(NoopConfigStore))
-                .secret_store(Arc::new(NoopSecretStore))
-                .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-                .backend(Arc::new(StubBackend))
-                .geo(Arc::new(NoopGeo))
-                .http_client(Arc::new(StubHttpClient::new()))
-                .client_info(ClientInfo::default())
-                .template_cache(cache)
-                .build()
-        }
-
         #[tokio::test]
         async fn an_unauthorized_response_stores_nothing() {
             // `None` is what the gate leaves behind on every bypass, and it is also the
@@ -7390,12 +7312,7 @@ mod tests {
             let mut params = make_stream_params(&settings, "identity");
             params.template_cache_key = None;
 
-            let _ = store_template_if_authorized(
-                &services_with(Arc::clone(&cache)),
-                &mut params,
-                b"body",
-            )
-            .await;
+            let _ = store_template_if_authorized(&mut params, b"body").await;
 
             assert!(
                 cache.recorded().is_empty(),
@@ -7410,12 +7327,7 @@ mod tests {
             let mut params = make_stream_params(&settings, "identity");
             params.template_cache_key = Some(authorization(&cache));
 
-            let _ = store_template_if_authorized(
-                &services_with(Arc::clone(&cache)),
-                &mut params,
-                b"<html>transformed</html>",
-            )
-            .await;
+            let _ = store_template_if_authorized(&mut params, b"<html>transformed</html>").await;
 
             assert_eq!(
                 cache.recorded(),
@@ -7433,10 +7345,8 @@ mod tests {
             let settings = create_test_settings();
             let mut params = make_stream_params(&settings, "identity");
             params.template_cache_key = Some(authorization(&cache));
-            let services = services_with(Arc::clone(&cache));
-
-            let _ = store_template_if_authorized(&services, &mut params, b"first").await;
-            let _ = store_template_if_authorized(&services, &mut params, b"second").await;
+            let _ = store_template_if_authorized(&mut params, b"first").await;
+            let _ = store_template_if_authorized(&mut params, b"second").await;
 
             assert_eq!(
                 cache.recorded().len(),
@@ -7454,12 +7364,7 @@ mod tests {
             expired.expires_at = Instant::now();
             params.template_cache_key = Some(expired);
 
-            let outcome = store_template_if_authorized(
-                &services_with(Arc::clone(&cache)),
-                &mut params,
-                b"body",
-            )
-            .await;
+            let outcome = store_template_if_authorized(&mut params, b"body").await;
 
             assert_eq!(outcome, Some(TemplateStoreOutcome::Expired));
             assert!(
@@ -17139,6 +17044,51 @@ mod tests {
 
         fn make_page_bids_request(path: &str) -> Request<EdgeBody> {
             make_page_bids_request_on(PAGE_BIDS_PATH, path)
+        }
+
+        #[tokio::test]
+        async fn page_bids_format_absent_or_json_returns_json() {
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            for path_and_format in ["/2024/article", "/2024/article&format=json"] {
+                let response = run_page_bids_response(
+                    &settings,
+                    &orchestrator,
+                    &[],
+                    make_page_bids_request(path_and_format),
+                )
+                .await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "should accept page-bids format in `{path_and_format}`"
+                );
+                assert_eq!(
+                    response.headers().get(header::CONTENT_TYPE),
+                    Some(&HeaderValue::from_static("application/json")),
+                    "should return JSON for `{path_and_format}`"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn page_bids_format_rejects_removed_unknown_and_empty_values() {
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            for format in ["fragment", "scrpit", ""] {
+                let response = run_page_bids_response(
+                    &settings,
+                    &orchestrator,
+                    &[],
+                    make_page_bids_request(&format!("/2024/article&format={format}")),
+                )
+                .await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "should reject page-bids format `{format}`"
+                );
+            }
         }
 
         /// Builds a page-bids request against an explicit endpoint path, so the

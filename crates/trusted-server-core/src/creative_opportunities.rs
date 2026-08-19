@@ -372,9 +372,6 @@ impl CreativeOpportunitiesConfig {
                 .unwrap_or(DEFAULT_TEMPLATE_CACHE_MAX_AGE_SECONDS),
         ))
     }
-}
-
-impl CreativeOpportunitiesConfig {
     /// Derives the `{section}` value for `path` under this config's section
     /// policy ([`section_root`](Self::section_root) and
     /// [`section_segment`](Self::section_segment)).

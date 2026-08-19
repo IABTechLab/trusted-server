@@ -112,16 +112,12 @@ impl GptDiagnosticsRequestDecision {
             )
         })
     }
-}
-
-impl GptDiagnosticsRequestDecision {
     /// An active decision, for tests in other modules that need one.
     ///
     /// The fields are private and built by `prepare_request` from a cookie or query
     /// parameter; there is no other way to obtain an active decision across a module
     /// boundary.
     #[cfg(test)]
-    #[must_use]
     pub(crate) fn active_for_tests() -> Self {
         Self {
             active: true,
@@ -182,8 +178,16 @@ mod head_seam_invariant_tests {
     #[test]
     fn a_default_decision_injects_nothing() {
         let decision = GptDiagnosticsRequestDecision::default();
-        assert_eq!(decision.bootstrap_script(), None);
-        assert_eq!(decision.module_script_tag(), None);
+        assert_eq!(
+            decision.bootstrap_script(),
+            None,
+            "should not inject a bootstrap for an inert decision"
+        );
+        assert_eq!(
+            decision.module_script_tag(),
+            None,
+            "should not inject a module for an inert decision"
+        );
         assert!(
             !decision.requires_private_no_store(),
             "an inert decision should not force the response private"
