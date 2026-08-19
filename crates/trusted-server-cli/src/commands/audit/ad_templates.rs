@@ -165,7 +165,11 @@ fn build_report(
 }
 
 /// Whether navigation left the requested URL's origin (scheme, host, or port).
-fn origin_changed(requested: &url::Url, final_url: &url::Url) -> bool {
+///
+/// A same-host default-port `http:80` to `https:443` redirect is *not* a change:
+/// the host is the cookie boundary, and that upgrade is the ordinary canonical
+/// redirect. Host changes, port changes, and HTTPS downgrades all are.
+pub(super) fn origin_changed(requested: &url::Url, final_url: &url::Url) -> bool {
     if requested.host_str() != final_url.host_str() {
         return true;
     }

@@ -20,6 +20,7 @@ use trusted_server_core::creative_opportunities::{
 };
 use url::Url;
 
+use crate::commands::audit::ad_templates::origin_changed;
 use crate::commands::audit::generate::collector::AuditCollector;
 use crate::commands::audit::generate::slot_toml::{
     render_slots, replace_key_in_section, resolve_network_id, splice_creative_slots, toml_string,
@@ -556,7 +557,7 @@ pub(crate) fn run_update_slots(
             &mut report_progress,
             &mut |_, root| {
                 root_url = root.final_url().unwrap_or_else(|_| target_url.clone());
-                if root_url.origin() != target_url.origin() {
+                if origin_changed(&target_url, &root_url) {
                     return cli_error(format!(
                         "refusing cross-origin root redirect from {} to {}; the requested origin is the audit and cookie trust boundary",
                         target_url, root_url
@@ -2037,6 +2038,86 @@ mod tests {
             fs::read_to_string(&config_path).expect("should read config"),
             original,
             "foreign evidence must not rewrite the config"
+        );
+    }
+
+    #[test]
+    fn update_slots_accepts_a_same_host_https_upgrade() {
+        // The ordinary canonical redirect: an operator types the bare http URL
+        // and the site upgrades it. The host is unchanged, so the cookie and
+        // audit trust boundary is unchanged, and generation must not stall on it.
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        fs::write(
+            &config_path,
+            "[creative_opportunities]\ngam_network_id = \"111\"\n",
+        )
+        .expect("should write config");
+        let mut collected = collected_page_with_header_slot();
+        collected.requested_url = "http://publisher.example/".to_string();
+        collected.final_url = "https://publisher.example/".to_string();
+        let collector = FakeCollector::new(collected);
+
+        run_update_slots(
+            &UpdateSlotsRequest {
+                url: "http://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[("session".to_string(), "secret".to_string())],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &collector)],
+            &mut std::io::sink(),
+            &mut std::io::sink(),
+        )
+        .expect("a same-host HTTPS upgrade should not be treated as cross-origin");
+
+        let written = fs::read_to_string(&config_path).expect("should read config");
+        let value = toml::from_str::<toml::Value>(&written).expect("should parse config");
+        assert_eq!(
+            value["creative_opportunities"]["slot"][0]["div_id"].as_str(),
+            Some("div-gpt-ad-header"),
+            "evidence from the upgraded root should be written"
+        );
+    }
+
+    #[test]
+    fn update_slots_rejects_an_https_downgrade_root_redirect() {
+        // The mirror image of the accepted upgrade: same host, but dropping TLS
+        // leaves the requested trust boundary and must still be refused.
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        let original = "[creative_opportunities]\ngam_network_id = \"111\"\n";
+        fs::write(&config_path, original).expect("should write config");
+        let mut collected = collected_page_with_header_slot();
+        collected.final_url = "http://publisher.example/".to_string();
+        let collector = FakeCollector::new(collected);
+
+        let error = run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[("session".to_string(), "secret".to_string())],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &collector)],
+            &mut std::io::sink(),
+            &mut std::io::sink(),
+        )
+        .expect_err("an HTTPS downgrade must leave the requested trust boundary");
+
+        assert!(format!("{error:?}").contains("cross-origin"));
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("should read config"),
+            original,
+            "downgraded evidence must not rewrite the config"
         );
     }
 
