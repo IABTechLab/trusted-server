@@ -67,12 +67,10 @@ impl FinalizeResponseMiddleware {
 #[async_trait(?Send)]
 impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        let client_ip = ctx
-            .request()
-            .extensions()
-            .get::<ClientInfo>()
-            .and_then(|info| info.client_ip)
-            .or_else(|| FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip));
+        let client_ip = ctx.request().extensions().get::<ClientInfo>().map_or_else(
+            || FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip),
+            |info| info.client_ip,
+        );
 
         let mut response = match next.run(ctx).await {
             Ok(r) => r,
@@ -556,6 +554,41 @@ mod tests {
             *lookups.lock().expect("should lock recorded geo lookups"),
             vec![Some(reader_ip)],
             "should look up geo using the resolved ClientInfo IP"
+        );
+    }
+
+    #[test]
+    fn finalize_handle_preserves_none_from_present_client_info() {
+        let peer_ip = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9));
+        let settings = settings_with_response_headers(vec![]);
+        let lookups = Arc::new(Mutex::new(Vec::new()));
+        let middleware = FinalizeResponseMiddleware::new(
+            Arc::new(settings),
+            Arc::new(RecordingGeo {
+                lookups: Arc::clone(&lookups),
+            }),
+        );
+        let mut ctx = empty_ctx();
+        ctx.request_mut()
+            .extensions_mut()
+            .insert(ClientInfo::default());
+        FastlyRequestContext::insert(
+            ctx.request_mut(),
+            FastlyRequestContext {
+                client_ip: Some(peer_ip),
+            },
+        );
+        let handler =
+            Arc::new(
+                |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
+            );
+
+        block_on(middleware.handle(ctx, Next::new(&[], &*handler))).expect("should succeed");
+
+        assert_eq!(
+            *lookups.lock().expect("should lock recorded geo lookups"),
+            vec![None],
+            "should preserve no IP from the authoritative ClientInfo"
         );
     }
 
