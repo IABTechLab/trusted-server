@@ -14,19 +14,24 @@ const RECORDED_RETIRED_SNAPSHOT = '905984e62a0858c53d9f0ff6dd3a1bf190cf311d';
 const RECORDED_INVENTORY_SHA256 =
   'b1e28c8b30f0b8d95e38c0f8f57394df4ad43f760ae7abf5631e2054228aef08';
 const RECORDED_MAIN_AUDIT_SHA = 'f6a2fb85ce623bf8a574e3941e1ee349acc3412d';
+const RECORDED_RC_BASELINE_SHA = 'f0825604ec6740111e99dd8a178e3b880e7d772b';
+const RECORDED_HISTORICAL_MAIN_ROWS_SHA256 =
+  'c9cd93ee97e61a5765a7a569b2ea5693cbbb671484120afe4726d3b05fdced68';
 const HISTORICAL_PERFORMANCE_SHA256 =
   'fe5d7f52dc47dc9608ca6b92b036c6b971845e6424b157768dc9403a62d2d6b4';
-const CLASSIFICATIONS = new Set(['main-owned', 'implementation-gap']);
+const HISTORICAL_CLASSIFICATIONS = new Set(['main-owned', 'implementation-gap']);
+const RC_CLASSIFICATIONS = new Set(['baseline-owned', 'implementation-gap']);
 const RESULTS = new Set(['pass', 'fail']);
-const IMPLEMENTATION_GAP_IDS = new Set([
+const HISTORICAL_IMPLEMENTATION_GAP_IDS = new Set([
   'RCJ-APS-03',
   'RCJ-APS-04',
   'RCJ-GPT-04',
   'RCJ-QUAL-01',
   'RCJ-TRACE-01',
 ]);
+const RC_IMPLEMENTATION_GAP_IDS = new Set(HISTORICAL_IMPLEMENTATION_GAP_IDS);
 const DISPOSITIONS = new Set(['preserve', 'rebuild', 'supersede', 'exclude']);
-const CLASSIFICATION_KEYS = [
+const HISTORICAL_CLASSIFICATION_KEYS = [
   'classification',
   'command',
   'disposition',
@@ -36,6 +41,19 @@ const CLASSIFICATION_KEYS = [
   'result',
   'testPath',
 ];
+const RC_CLASSIFICATION_KEYS = [
+  'baselineSha',
+  'classification',
+  'command',
+  'disposition',
+  'id',
+  'ownerPaths',
+  'result',
+  'testPath',
+];
+const AUDIT_FIXTURE_KEYS = ['historicalMain', 'rcBaseline', 'version'];
+const HISTORICAL_MAIN_LAYER_KEYS = ['mainSha', 'rows'];
+const RC_BASELINE_LAYER_KEYS = ['baselineSha', 'rows'];
 const RETIRED_SOURCE_REFERENCE = /(?:rc[/-]july|905984e62a0858c53d9f0ff6dd3a1bf190cf311d)/i;
 const EXECUTABLE_SHELL_FENCE =
   /^ {0,3}```(?:bash|sh|shell)(?:[ \t][^\n]*)?\r?\n([\s\S]*?)^ {0,3}```[ \t]*$/gim;
@@ -213,23 +231,37 @@ function mappingIdsForFile(file, mappings) {
   return ids;
 }
 
-function auditClassifications({ auditFixturePath, ledgerIds, mainAuditSha }) {
-  if (mainAuditSha !== RECORDED_MAIN_AUDIT_SHA) {
-    throw new Error(`MAIN_AUDIT_SHA must equal the recorded current-main SHA`);
-  }
-  if (!SHA_40.test(mainAuditSha ?? '')) {
-    throw new Error('MAIN_AUDIT_SHA must be the recorded lowercase 40-character current-main SHA');
-  }
-  const classifications = JSON.parse(fs.readFileSync(auditFixturePath, 'utf8'));
-  if (!Array.isArray(classifications)) {
-    throw new Error('current-main concept audit fixture must be an array');
-  }
+function hasExactKeys(value, expectedKeys) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const keys = Object.keys(value).sort(codePointCompare);
+  return (
+    keys.length === expectedKeys.length && keys.every((key, index) => key === expectedKeys[index])
+  );
+}
 
+function auditEvidenceRows({
+  rows,
+  ledgerIds,
+  layerLabel,
+  shaKey,
+  expectedSha,
+  exactKeys,
+  classifications,
+  ownedClassification,
+  implementationGapIds,
+}) {
   const failures = [];
-  if (classifications.length !== 23) {
-    failures.push(`expected exactly 23 classification rows, found ${classifications.length}`);
+  if (!Array.isArray(rows)) {
+    return {
+      classifications: [],
+      classificationCounts: { implementationGap: 0, owned: 0 },
+      classificationFailures: [`${layerLabel} rows must be an array`],
+    };
   }
-  const ids = classifications.map((row) => row?.id).filter((id) => typeof id === 'string');
+  if (rows.length !== 23) {
+    failures.push(`${layerLabel} expected exactly 23 classification rows, found ${rows.length}`);
+  }
+  const ids = rows.map((row) => row?.id).filter((id) => typeof id === 'string');
   const seen = new Set();
   const duplicateClassificationIds = sorted([
     ...new Set(ids.filter((id) => (seen.has(id) ? true : !seen.add(id)))),
@@ -247,28 +279,30 @@ function auditClassifications({ auditFixturePath, ledgerIds, mainAuditSha }) {
     failures.push(`extraClassificationIds: ${JSON.stringify(extraClassificationIds)}`);
   }
 
-  for (const [index, row] of classifications.entries()) {
+  for (const [index, row] of rows.entries()) {
     if (row === null || typeof row !== 'object' || Array.isArray(row)) {
-      failures.push(`classification row ${index} must be an object`);
+      failures.push(`${layerLabel} classification row ${index} must be an object`);
       continue;
     }
     const keys = Object.keys(row).sort(codePointCompare);
     if (
-      keys.length !== CLASSIFICATION_KEYS.length ||
-      keys.some((key, keyIndex) => key !== CLASSIFICATION_KEYS[keyIndex])
+      keys.length !== exactKeys.length ||
+      keys.some((key, keyIndex) => key !== exactKeys[keyIndex])
     ) {
-      failures.push(`classification row ${index} must contain the exact required fields`);
+      failures.push(
+        `${layerLabel} classification row ${index} must contain the exact required fields`
+      );
     }
     const label = typeof row.id === 'string' ? row.id : `row ${index}`;
     if (typeof row.id !== 'string' || !/^RCJ-[A-Z]+-[0-9]+$/.test(row.id)) {
-      failures.push(`classification row ${index} must contain a valid RCJ id`);
+      failures.push(`${layerLabel} classification row ${index} must contain a valid RCJ id`);
     }
-    if (row.mainSha !== mainAuditSha) {
-      failures.push(`${label} mainSha must equal ${mainAuditSha}`);
+    if (row[shaKey] !== expectedSha) {
+      failures.push(`${label} ${shaKey} must equal ${expectedSha}`);
     }
-    if (!CLASSIFICATIONS.has(row.classification)) {
+    if (!classifications.has(row.classification)) {
       failures.push(
-        `${label} classification must be main-owned or implementation-gap, not ${JSON.stringify(row.classification)}`
+        `${label} classification must be ${[...classifications].join(' or ')}, not ${JSON.stringify(row.classification)}`
       );
     }
     if (!Array.isArray(row.ownerPaths) || row.ownerPaths.length === 0) {
@@ -283,7 +317,7 @@ function auditClassifications({ auditFixturePath, ledgerIds, mainAuditSha }) {
       )
     ) {
       failures.push(
-        `${label} ownerPaths must name exact current-main paths without historical source`
+        `${label} ownerPaths must name exact ${layerLabel} paths without historical source`
       );
     }
     if (
@@ -292,7 +326,7 @@ function auditClassifications({ auditFixturePath, ledgerIds, mainAuditSha }) {
       path.isAbsolute(row.testPath) ||
       RETIRED_SOURCE_REFERENCE.test(row.testPath)
     ) {
-      failures.push(`${label} testPath must name an exact focused current-main test path`);
+      failures.push(`${label} testPath must name an exact focused ${layerLabel} test path`);
     }
     if (
       typeof row.command !== 'string' ||
@@ -304,20 +338,20 @@ function auditClassifications({ auditFixturePath, ledgerIds, mainAuditSha }) {
     if (!RESULTS.has(row.result)) {
       failures.push(`${label} result must be pass or fail, not ${JSON.stringify(row.result)}`);
     }
-    const expectedClassification = IMPLEMENTATION_GAP_IDS.has(row.id)
+    const expectedClassification = implementationGapIds.has(row.id)
       ? 'implementation-gap'
-      : 'main-owned';
-    const expectedResult = IMPLEMENTATION_GAP_IDS.has(row.id) ? 'fail' : 'pass';
+      : ownedClassification;
+    const expectedResult = implementationGapIds.has(row.id) ? 'fail' : 'pass';
     if (row.classification !== expectedClassification || row.result !== expectedResult) {
       failures.push(
-        `${label} authoritative classification/result must be ${expectedClassification}/${expectedResult}`
+        `${label} authoritative classification/result for ${layerLabel} must be ${expectedClassification}/${expectedResult}`
       );
     }
     if (!DISPOSITIONS.has(row.disposition)) {
       failures.push(`${label} disposition is invalid`);
     }
-    if (row.classification === 'main-owned' && row.result !== 'pass') {
-      failures.push(`${label} main-owned classification must record result pass`);
+    if (row.classification === ownedClassification && row.result !== 'pass') {
+      failures.push(`${label} ${ownedClassification} classification must record result pass`);
     }
     if (row.classification === 'implementation-gap' && row.result !== 'fail') {
       failures.push(`${label} implementation-gap classification must record result fail`);
@@ -333,17 +367,106 @@ function auditClassifications({ auditFixturePath, ledgerIds, mainAuditSha }) {
   }
 
   const classificationCounts = {
-    implementationGap: classifications.filter((row) => row?.classification === 'implementation-gap')
-      .length,
-    mainOwned: classifications.filter((row) => row?.classification === 'main-owned').length,
+    implementationGap: rows.filter((row) => row?.classification === 'implementation-gap').length,
+    owned: rows.filter((row) => row?.classification === ownedClassification).length,
   };
-  if (classificationCounts.mainOwned !== 18 || classificationCounts.implementationGap !== 5) {
+  const expectedImplementationGapCount = implementationGapIds.size;
+  const expectedOwnedCount = 23 - expectedImplementationGapCount;
+  if (
+    classificationCounts.owned !== expectedOwnedCount ||
+    classificationCounts.implementationGap !== expectedImplementationGapCount
+  ) {
     failures.push(
-      `authoritative classification counts must be main-owned=18 and implementation-gap=5, found ${classificationCounts.mainOwned}/${classificationCounts.implementationGap}`
+      `authoritative classification counts for ${layerLabel} must be ${ownedClassification}=${expectedOwnedCount} and implementation-gap=${expectedImplementationGapCount}, found ${classificationCounts.owned}/${classificationCounts.implementationGap}`
     );
   }
 
-  return { classifications, classificationCounts, classificationFailures: failures };
+  return { classifications: rows, classificationCounts, classificationFailures: failures };
+}
+
+function auditClassifications({ auditFixturePath, ledgerIds, mainAuditSha, rcBaselineSha }) {
+  if (mainAuditSha !== RECORDED_MAIN_AUDIT_SHA) {
+    throw new Error(`MAIN_AUDIT_SHA must equal the recorded current-main SHA`);
+  }
+  if (!SHA_40.test(mainAuditSha ?? '')) {
+    throw new Error('MAIN_AUDIT_SHA must be the recorded lowercase 40-character current-main SHA');
+  }
+  if (rcBaselineSha !== RECORDED_RC_BASELINE_SHA) {
+    throw new Error(`RC_BASELINE_SHA must equal the recorded rc baseline SHA`);
+  }
+  if (!SHA_40.test(rcBaselineSha ?? '')) {
+    throw new Error('RC_BASELINE_SHA must be the recorded lowercase 40-character rc baseline SHA');
+  }
+
+  const fixture = JSON.parse(fs.readFileSync(auditFixturePath, 'utf8'));
+  if (!hasExactKeys(fixture, AUDIT_FIXTURE_KEYS) || fixture.version !== 2) {
+    throw new Error('concept audit fixture must be an exact version 2 object');
+  }
+  if (!hasExactKeys(fixture.historicalMain, HISTORICAL_MAIN_LAYER_KEYS)) {
+    throw new Error('concept audit fixture historicalMain must contain exact mainSha and rows');
+  }
+  if (!hasExactKeys(fixture.rcBaseline, RC_BASELINE_LAYER_KEYS)) {
+    throw new Error('concept audit fixture rcBaseline must contain exact baselineSha and rows');
+  }
+  if (fixture.historicalMain.mainSha !== mainAuditSha) {
+    throw new Error(`historicalMain mainSha must equal ${mainAuditSha}`);
+  }
+  if (fixture.rcBaseline.baselineSha !== rcBaselineSha) {
+    throw new Error(`rcBaseline baselineSha must equal ${rcBaselineSha}`);
+  }
+
+  const historicalMain = auditEvidenceRows({
+    rows: fixture.historicalMain.rows,
+    ledgerIds,
+    layerLabel: 'historical-main',
+    shaKey: 'mainSha',
+    expectedSha: mainAuditSha,
+    exactKeys: HISTORICAL_CLASSIFICATION_KEYS,
+    classifications: HISTORICAL_CLASSIFICATIONS,
+    ownedClassification: 'main-owned',
+    implementationGapIds: HISTORICAL_IMPLEMENTATION_GAP_IDS,
+  });
+  const historicalRowsSha256 = createHash('sha256')
+    .update(JSON.stringify(fixture.historicalMain.rows))
+    .digest('hex');
+  if (historicalRowsSha256 !== RECORDED_HISTORICAL_MAIN_ROWS_SHA256) {
+    historicalMain.classificationFailures.push(
+      `immutable historical-main evidence must remain ${RECORDED_HISTORICAL_MAIN_ROWS_SHA256}`
+    );
+  }
+
+  const rcBaseline = auditEvidenceRows({
+    rows: fixture.rcBaseline.rows,
+    ledgerIds,
+    layerLabel: 'rc-baseline',
+    shaKey: 'baselineSha',
+    expectedSha: rcBaselineSha,
+    exactKeys: RC_CLASSIFICATION_KEYS,
+    classifications: RC_CLASSIFICATIONS,
+    ownedClassification: 'baseline-owned',
+    implementationGapIds: RC_IMPLEMENTATION_GAP_IDS,
+  });
+  historicalMain.classificationCounts = {
+    implementationGap: historicalMain.classificationCounts.implementationGap,
+    mainOwned: historicalMain.classificationCounts.owned,
+  };
+  rcBaseline.classificationCounts = {
+    baselineOwned: rcBaseline.classificationCounts.owned,
+    implementationGap: rcBaseline.classificationCounts.implementationGap,
+  };
+
+  return {
+    fixtureVersion: fixture.version,
+    historicalMain: {
+      mainSha: mainAuditSha,
+      rowsSha256: historicalRowsSha256,
+      ...historicalMain,
+    },
+    rcBaseline: {
+      baselineSha: rcBaselineSha,
+      ...rcBaseline,
+    },
+  };
 }
 
 export function auditRetiredConceptAudit({
@@ -351,6 +474,7 @@ export function auditRetiredConceptAudit({
   auditFixturePath,
   historicalPerformanceFixturePath,
   mainAuditSha = RECORDED_MAIN_AUDIT_SHA,
+  rcBaselineSha = RECORDED_RC_BASELINE_SHA,
   planPath,
 }) {
   const specSource = fs.readFileSync(specPath, 'utf8');
@@ -390,7 +514,10 @@ export function auditRetiredConceptAudit({
     ledgerOnlyIds,
   };
   if (auditFixturePath !== undefined) {
-    Object.assign(result, auditClassifications({ auditFixturePath, ledgerIds, mainAuditSha }));
+    Object.assign(
+      result,
+      auditClassifications({ auditFixturePath, ledgerIds, mainAuditSha, rcBaselineSha })
+    );
   }
   if (planPath !== undefined) {
     result.retiredPlanCommandViolations = auditRetiredPlanCommands(
@@ -428,7 +555,8 @@ export function assertRetiredConceptAudit(result) {
   ]) {
     if (result[key].length > 0) failures.push(`${key}: ${JSON.stringify(result[key])}`);
   }
-  failures.push(...(result.classificationFailures ?? []));
+  failures.push(...(result.historicalMain?.classificationFailures ?? []));
+  failures.push(...(result.rcBaseline?.classificationFailures ?? []));
   if ((result.retiredPlanCommandViolations ?? []).length > 0) {
     failures.push(
       `retiredPlanCommandViolations: ${JSON.stringify(result.retiredPlanCommandViolations)}`
@@ -466,11 +594,13 @@ if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) {
     'crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json'
   );
   const configuredMainAuditSha = process.env.MAIN_AUDIT_SHA ?? RECORDED_MAIN_AUDIT_SHA;
+  const configuredRcBaselineSha = process.env.RC_BASELINE_SHA ?? RECORDED_RC_BASELINE_SHA;
   const result = auditRetiredConceptAudit({
     specPath,
     auditFixturePath,
     historicalPerformanceFixturePath,
     mainAuditSha: configuredMainAuditSha,
+    rcBaselineSha: configuredRcBaselineSha,
     planPath,
   });
   assertRetiredConceptAudit(result);

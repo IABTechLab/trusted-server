@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { JSDOM } from 'jsdom';
 import { createServer } from 'vite';
 
-const libRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const defaultLibRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const libRoot = path.resolve(process.env.TSJS_CONCEPT_PROOF_LIB_ROOT ?? defaultLibRoot);
 
 const GLOBAL_NAMES = [
   'CustomEvent',
