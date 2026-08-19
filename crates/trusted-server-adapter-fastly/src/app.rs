@@ -2281,6 +2281,19 @@ mod tests {
     }
 
     #[test]
+    fn admin_ec_route_without_credentials_returns_401() {
+        let router = test_router();
+
+        let response = route(&router, empty_request(Method::GET, "/_ts/admin/ec"));
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            response.headers().contains_key(header::WWW_AUTHENTICATE),
+            "admin EC 401 should include the Basic authentication challenge"
+        );
+    }
+
+    #[test]
     fn dispatch_head_on_named_get_route_falls_through_to_publisher_fallback() {
         // Regression guard: HEAD /first-party/proxy must reach the publisher
         // fallback, not return a router-level 405. Legacy route_request proxies

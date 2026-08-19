@@ -113,7 +113,8 @@ struct AdminEcLookupResponse {
     /// Store generation marker for the entry.
     generation: u64,
     /// `true` when the entry is a consent-withdrawal tombstone
-    /// (`consent.ok = false`). Absent when the body failed to parse.
+    /// (`consent.ok = false`). Absent when the body failed to parse as JSON or
+    /// deserialize as a [`KvEntry`].
     #[serde(skip_serializing_if = "Option::is_none")]
     tombstone: Option<bool>,
     /// The stored entry, preserved as raw JSON except for derived
@@ -557,6 +558,7 @@ fn json_response(status: StatusCode, body: String) -> Response<EdgeBody> {
         .status(status)
         .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
         .header(header::CACHE_CONTROL, "no-store")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(EdgeBody::from(body.into_bytes()))
         .expect("should build admin EC lookup response")
 }
@@ -1070,6 +1072,10 @@ mod tests {
             response.headers().get(header::CACHE_CONTROL),
             Some(&HeaderValue::from_static("no-store"))
         );
+        assert_eq!(
+            response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
         assert!(
             response_json(response)["error"]
                 .as_str()
@@ -1099,6 +1105,10 @@ mod tests {
             handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
         let json = response_json(response);
         assert_eq!(json["cookie_present"], false);
         assert_eq!(json["sharedid_present"], false);

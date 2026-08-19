@@ -315,6 +315,29 @@ async fn authenticated_admin_ec_routes_return_501() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_ec_route_without_credentials_returns_401() {
+    let mut svc = make_service();
+    let req = Request::builder()
+        .method("GET")
+        .uri("/_ts/admin/ec")
+        .body(AxumBody::empty())
+        .expect("should build unauthenticated admin EC request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+
+    assert_eq!(resp.status().as_u16(), 401);
+    assert!(
+        resp.headers().contains_key("www-authenticate"),
+        "admin EC 401 should include the Basic authentication challenge"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authenticated_admin_eids_route_returns_200() {
     // The EIDs echo is pure request inspection (no KV), so the dev server
     // serves the real handler.

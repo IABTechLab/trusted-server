@@ -317,6 +317,22 @@ async fn authenticated_admin_ec_routes_return_501() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_ec_route_without_credentials_returns_401() {
+    let req = request_builder()
+        .method("GET")
+        .uri("/_ts/admin/ec")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build unauthenticated admin EC request");
+    let resp = route(test_router(), req).await;
+
+    assert_eq!(resp.status().as_u16(), 401);
+    assert!(
+        resp.headers().contains_key("www-authenticate"),
+        "admin EC 401 should include the Basic authentication challenge"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authenticated_admin_eids_route_returns_200() {
     // The EIDs echo is pure request inspection (no KV), so this adapter
     // serves the real handler.
