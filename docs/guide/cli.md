@@ -87,7 +87,7 @@ without launching a browser:
 | `match <path-or-url> [--details]`        | List matching slots; `--details` includes divs, paths, formats/providers. |
 | `check <path-or-url> --expected-slot ID` | Assert the exact matching slot set; repeat `--expected-slot`.             |
 | `check <path-or-url> --expect-no-slots`  | Assert that no slots match.                                               |
-| `explain <path-or-url>`                  | Print every runtime ad-stack gate and its final yes/no/unknown verdict.   |
+| `explain <path-or-url>`                  | Print every runtime ad-stack gate and its final yes/no verdict.           |
 
 `check --allow-extra-slots` permits matches beyond the repeated
 `--expected-slot` values. It conflicts with `--expect-no-slots`.
@@ -233,8 +233,8 @@ exist, so the command prefers a narrow literal path over a plausible guess.
 | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | Only one page was crawled                                                               | Literal path. One observation cannot distinguish a literal from a template.                                                             |
 | The ad unit never varied by section                                                     | Literal path.                                                                                                                           |
-| A section's slug is not derivable from its URL (`/site-news` requesting `.../sitenews`) | Literal path; the round-trip check catches it.                                                                                          |
-| No root page was seen, so `section_root` is unknown                                     | Literal path rather than a guessed fallback.                                                                                            |
+| A section's slug is not derivable from its URL (`/site-news` requesting `.../sitenews`) | The slot is omitted and the reason is reported.                                                                                         |
+| No root page was seen, so `section_root` is unknown                                     | The slot is omitted rather than writing a guessed fallback.                                                                             |
 | Two path segments could both be the section                                             | No template; the ambiguity is reported.                                                                                                 |
 | The ad unit varies by device, geo, or anything the URL cannot supply                    | The refused slot is omitted and the reason is written as a note.                                                                        |
 | Crawled pages report different GAM network ids                                          | The run fails; the pages are not one property.                                                                                          |
@@ -418,7 +418,8 @@ Browser-backed ad-template generation and verification share `--chrome`,
 `--danger-accept-invalid-certs`. Verification also accepts
 `--browser-profile desktop|mobile`; generation uses
 `--profiles desktop,mobile` to compare both profiles. `--cookie NAME=VALUE` is
-repeatable and creates host-only, root-path cookies. The quiet settle window
+repeatable and creates host-only, root-path cookies; HTTPS targets also mark
+them Secure. Verification refuses cookies when URLs span multiple origins. The quiet settle window
 must not exceed the maximum.
 
 `ts audit` is not an EdgeZero adapter command. It has no `--adapter` option and

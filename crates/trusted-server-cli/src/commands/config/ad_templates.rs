@@ -77,7 +77,7 @@ pub struct AdTemplatesExplainArgs {
     /// Page path or full URL to evaluate.
     pub path_or_url: String,
     /// HTTP method to model.
-    #[arg(long, default_value = "GET")]
+    #[arg(long, default_value = "GET", value_parser = parse_http_method)]
     pub method: Method,
     /// Model a non-navigation request.
     #[arg(long)]
@@ -91,6 +91,12 @@ pub struct AdTemplatesExplainArgs {
     /// Model consent denying server-side auction.
     #[arg(long)]
     pub consent_denied: bool,
+}
+
+fn parse_http_method(raw: &str) -> Result<Method, String> {
+    let normalized = raw.to_ascii_uppercase();
+    Method::from_bytes(normalized.as_bytes())
+        .map_err(|error| format!("invalid HTTP method `{raw}`: {error}"))
 }
 
 /// Run an ad-template CLI command.
@@ -145,7 +151,12 @@ fn run_lint(args: &AdTemplatesLintArgs, out: &mut dyn Write) -> Result<(), Strin
         plural(config.slot.len())
     )
     .map_err(output_error)?;
-    writeln!(out, "gam_network_id: {}", config.gam_network_id).map_err(output_error)?;
+    writeln!(
+        out,
+        "gam_network_id: {}",
+        escape_terminal_text(&config.gam_network_id)
+    )
+    .map_err(output_error)?;
     writeln!(
         out,
         "auction_timeout_ms: {}",
@@ -170,7 +181,7 @@ fn run_lint(args: &AdTemplatesLintArgs, out: &mut dyn Write) -> Result<(), Strin
         if loaded.settings.auction.providers.is_empty() {
             "(none)".to_string()
         } else {
-            loaded.settings.auction.providers.join(", ")
+            escape_terminal_text(&loaded.settings.auction.providers.join(", ")).into_owned()
         }
     )
     .map_err(output_error)?;
@@ -296,28 +307,27 @@ fn run_explain(args: &AdTemplatesExplainArgs, out: &mut dyn Write) -> Result<(),
     let path = normalize_path_or_url(&args.path_or_url)?;
     writeln!(out, "path: {path}").map_err(output_error)?;
 
-    let Some(config) = &loaded.settings.creative_opportunities else {
+    let has_matches = if let Some(config) = &loaded.settings.creative_opportunities {
+        let matched = match_slots(&config.slot, &path);
+        write_match_result(
+            out,
+            &path,
+            &matched,
+            &config.gam_network_id,
+            &config.section_for_path(&path),
+            true,
+        )?;
+        !matched.is_empty()
+    } else {
         writeln!(out, "creative_opportunities: not configured").map_err(output_error)?;
-        writeln!(out, "server-side ad stack: no").map_err(output_error)?;
-        return Ok(());
+        false
     };
-
-    let matched = match_slots(&config.slot, &path);
-    write_match_result(
-        out,
-        &path,
-        &matched,
-        &config.gam_network_id,
-        &config.section_for_path(&path),
-        true,
-    )?;
 
     let method_pass = args.method == Method::GET;
     let navigation_pass = !args.non_navigation;
     let consent_pass = !args.consent_denied;
     let auction_enabled = loaded.settings.auction.enabled;
     let providers_configured = !loaded.settings.auction.providers.is_empty();
-    let has_matches = !matched.is_empty();
 
     let gate = evaluate_ad_stack_gate(AdStackGateInput {
         method_get: method_pass,
@@ -389,16 +399,16 @@ fn write_match_result(
     details: bool,
 ) -> Result<(), String> {
     if matched.is_empty() {
-        writeln!(out, "{path}: no slots matched").map_err(output_error)?;
+        writeln!(out, "{}: no slots matched", escape_terminal_text(path)).map_err(output_error)?;
         return Ok(());
     }
 
     let ids = matched
         .iter()
-        .map(|slot| slot.id.as_str())
+        .map(|slot| escape_terminal_text(&slot.id).into_owned())
         .collect::<Vec<_>>()
         .join(", ");
-    writeln!(out, "{path}: matched {ids}").map_err(output_error)?;
+    writeln!(out, "{}: matched {ids}", escape_terminal_text(path)).map_err(output_error)?;
 
     if details {
         for slot in matched {
@@ -433,10 +443,10 @@ fn format_slot(slot: &CreativeOpportunitySlot, gam_network_id: &str, section: &s
         .unwrap_or_else(|| "<unrenderable: exceeds GAM unit-path byte limit>".to_string());
     format!(
         "{} div={} gam={} patterns=[{}] formats=[{}] providers=[{}]",
-        slot.id,
-        slot.resolved_div_id(),
-        gam_unit_path,
-        slot.page_patterns.join(", "),
+        escape_terminal_text(&slot.id),
+        escape_terminal_text(slot.resolved_div_id()),
+        escape_terminal_text(&gam_unit_path),
+        escape_terminal_text(&slot.page_patterns.join(", ")),
         formats,
         providers,
     )
@@ -710,5 +720,14 @@ mod tests {
         .expect("assertion drift should not be a tool error");
 
         assert_eq!(outcome, RunOutcome::AssertionFailed);
+    }
+
+    #[test]
+    fn http_method_parser_normalizes_standard_methods() {
+        assert_eq!(
+            parse_http_method("get").expect("should parse lowercase GET"),
+            Method::GET,
+            "lowercase GET must evaluate the same runtime gate as uppercase GET"
+        );
     }
 }

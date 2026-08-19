@@ -49,7 +49,19 @@ const NOISE_SEGMENTS: &[&str] = &[
 /// File extensions that are assets rather than pages.
 const NON_PAGE_EXTENSIONS: &[&str] = &[
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg", ".ico", ".css", ".js", ".json",
-    ".xml", ".pdf", ".zip", ".mp4", ".mp3", ".rss", ".html", ".htm", ".php",
+    ".xml", ".pdf", ".zip", ".mp4", ".mp3", ".rss",
+];
+
+const DIRECTORY_INDEX_NAMES: &[&str] = &[
+    "index.html",
+    "index.htm",
+    "index.php",
+    "default.html",
+    "default.htm",
+    "default.php",
+    "home.html",
+    "home.htm",
+    "home.php",
 ];
 
 /// Bounds on how much of a site a single run will load.
@@ -73,7 +85,7 @@ impl Default for CrawlBudget {
 /// One section selected for sampling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PlannedSection {
-    /// The first path segment identifying the section (`news`).
+    /// The path segment at [`CrawlPlan::section_segment`] identifying the section.
     pub(super) segment: String,
     /// The section landing page, when one was observed.
     pub(super) landing: Option<Url>,
@@ -148,12 +160,12 @@ pub(super) fn plan_crawl(
     sitemap_locs: &[String],
     budget: CrawlBudget,
 ) -> CrawlPlan {
-    let section_segment = usize::from(segment_count(root) == 1);
+    let section_segment = usize::from(root_is_locale_prefix(root));
     let mut candidates: BTreeMap<String, SectionCandidate> = BTreeMap::new();
     let mut notes = Vec::new();
 
     for link in links {
-        let Some(url) = same_origin_page_url(root, &link.url) else {
+        let Some(url) = same_origin_page_url(root, &link.url, section_segment) else {
             continue;
         };
         let Some(segment) = section_at(&url, section_segment) else {
@@ -167,7 +179,7 @@ pub(super) fn plan_crawl(
 
     let mut sitemap_pages = 0_usize;
     for loc in sitemap_locs {
-        let Some(url) = same_origin_page_url(root, loc) else {
+        let Some(url) = same_origin_page_url(root, loc, section_segment) else {
             continue;
         };
         let Some(segment) = section_at(&url, section_segment) else {
@@ -270,7 +282,7 @@ fn record_url(entry: &mut SectionCandidate, url: &Url, section_segment: usize) {
 /// Rejects other origins, non-HTTP schemes, asset extensions, and paginated or
 /// utility paths. Query and fragment are dropped so `/news?page=2` and
 /// `/news#top` collapse onto `/news`.
-fn same_origin_page_url(root: &Url, raw: &str) -> Option<Url> {
+fn same_origin_page_url(root: &Url, raw: &str, section_segment: usize) -> Option<Url> {
     let mut url = root.join(raw).ok()?;
     if !matches!(url.scheme(), "http" | "https") || url.origin() != root.origin() {
         return None;
@@ -289,8 +301,21 @@ fn same_origin_page_url(root: &Url, raw: &str) -> Option<Url> {
     if segments.is_empty() {
         return None;
     }
-    if NOISE_SEGMENTS.contains(&segments[0]) {
+    if DIRECTORY_INDEX_NAMES.contains(&segments.last().copied().unwrap_or_default()) {
         return None;
+    }
+    if NOISE_SEGMENTS.contains(&segments.get(section_segment).copied().unwrap_or_default()) {
+        return None;
+    }
+    if section_segment > 0 {
+        let root_path = percent_decode_for_filtering(root.path()).to_ascii_lowercase();
+        let root_segments: Vec<&str> = root_path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect();
+        if !segments.starts_with(&root_segments) {
+            return None;
+        }
     }
     // `/news/page/2` is the same inventory as `/news`, so it is not a second
     // sample worth spending a page load on.
@@ -300,15 +325,35 @@ fn same_origin_page_url(root: &Url, raw: &str) -> Option<Url> {
     Some(url)
 }
 
-/// The first non-empty path segment, lowercased.
+/// The non-empty path segment at `index`, percent-decoded and lowercased.
 fn section_at(url: &Url, index: usize) -> Option<String> {
-    url.path()
+    percent_decode_for_filtering(url.path())
         .split('/')
         .filter(|part| !part.is_empty())
         .nth(index)
         .map(str::to_ascii_lowercase)
 }
 
+fn root_is_locale_prefix(root: &Url) -> bool {
+    let segments: Vec<&str> = root
+        .path()
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    matches!(segments.as_slice(), [locale] if is_locale_segment(locale))
+}
+
+fn is_locale_segment(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    matches!(bytes, [a, b] if a.is_ascii_alphabetic() && b.is_ascii_alphabetic())
+        || matches!(bytes, [a, b, b'-', c, d]
+            if a.is_ascii_alphabetic()
+                && b.is_ascii_alphabetic()
+                && c.is_ascii_alphabetic()
+                && d.is_ascii_alphabetic())
+}
+
+/// Decodes percent escapes solely for normalized path classification.
 fn percent_decode_for_filtering(path: &str) -> String {
     let bytes = path.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -329,6 +374,7 @@ fn percent_decode_for_filtering(path: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
+/// Converts one ASCII hexadecimal digit to its numeric value.
 fn hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -593,7 +639,49 @@ mod tests {
             CrawlBudget::default(),
         );
 
-        assert_eq!(segments(&plan), ["news"]);
+        assert_eq!(
+            segments(&plan),
+            ["archive.htm", "news", "story.php"],
+            "only directory-index documents should be excluded by extension"
+        );
+    }
+
+    #[test]
+    fn locale_root_rejects_candidates_outside_its_path_prefix() {
+        let locale_root = Url::parse("https://publisher.example/en").expect("should parse root");
+        let plan = plan_crawl(
+            &locale_root,
+            &[nav("/en/news"), nav("/fr/deals")],
+            &[],
+            CrawlBudget::default(),
+        );
+
+        assert_eq!(
+            segments(&plan),
+            ["news"],
+            "a locale-root crawl must not mix another locale on the same origin"
+        );
+    }
+
+    #[test]
+    fn a_section_root_does_not_treat_article_slugs_as_sections() {
+        let section_root = Url::parse("https://publisher.example/news").expect("should parse root");
+        let plan = plan_crawl(
+            &section_root,
+            &[nav("/news/story-one"), nav("/news/story-two")],
+            &[],
+            CrawlBudget::default(),
+        );
+
+        assert_eq!(
+            plan.section_segment, 0,
+            "a generic one-segment root is a section, not necessarily a locale"
+        );
+        assert_eq!(
+            segments(&plan),
+            ["news"],
+            "articles below a section root should remain one section"
+        );
     }
 
     #[test]

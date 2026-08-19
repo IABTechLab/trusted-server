@@ -240,12 +240,12 @@ pub(crate) fn resolve_chrome(
 
 /// Builds a host-only cookie that applies to every path on `url`'s host.
 pub(crate) fn host_cookie(name: &str, value: &str, url: &url::Url) -> Result<CookieParam, String> {
-    let host = url
-        .host_str()
+    url.host_str()
         .ok_or_else(|| format!("cannot scope cookie `{name}` because {} has no host", url))?;
     let mut cookie = CookieParam::new(name.to_string(), value.to_string());
-    cookie.domain = Some(host.to_string());
+    cookie.url = Some(url.to_string());
     cookie.path = Some("/".to_string());
+    cookie.secure = Some(url.scheme() == "https");
     Ok(cookie)
 }
 
@@ -382,11 +382,6 @@ impl AuditCollector for BrowserCollector {
             max: self.settle_max,
         };
 
-        // chromiumoxide logs unparseable CDP events at WARN (its bundled CDP schema
-        // lags newer Chrome). These are benign; quiet them for the browser session
-        // so audit output stays clean, then restore the prior threshold.
-        let previous_level = log::max_level();
-        log::set_max_level(log::LevelFilter::Error);
         let accept_invalid_certs = self.accept_invalid_certs;
         let headful = self.headful;
         let assume_consent = self.assume_consent;
@@ -407,7 +402,6 @@ impl AuditCollector for BrowserCollector {
             };
             collect(requests, &options).await
         });
-        log::set_max_level(previous_level);
         match result {
             Ok(results) => results,
             Err(error) => vec![Err(error); request_count],
@@ -511,6 +505,10 @@ async fn collect_open_page(
         page.evaluate_on_new_document(CONSENT_STUB_SCRIPT)
             .await
             .map_err(|error| format!("failed to install consent init script: {error}"))?;
+        warnings.push(Warning {
+            code: "consent_stub_active".to_string(),
+            message: "audit consent APIs were stubbed; re-run with --no-assume-consent to observe the publisher CMP without substitution".to_string(),
+        });
     }
     page.evaluate_on_new_document("performance.setResourceTimingBufferSize(100000)")
         .await
@@ -904,7 +902,7 @@ mod tests {
 
     /// Skips optional local runs, but makes the scripted/CI contract fail loudly.
     fn browser_fixture_available() -> bool {
-        if find_chrome().is_ok() {
+        if resolve_chrome(None).is_ok() {
             return true;
         }
         assert!(
@@ -939,12 +937,14 @@ mod tests {
             url::Url::parse("https://publisher.example/news/story").expect("should parse test URL");
         let cookie = host_cookie("clearance", "token", &url).expect("should build cookie");
 
-        assert_eq!(cookie.domain.as_deref(), Some("publisher.example"));
+        assert!(cookie.domain.is_none(), "host-only cookies omit Domain");
         assert_eq!(cookie.path.as_deref(), Some("/"));
-        assert!(
-            cookie.url.is_none(),
-            "domain/path and URL must not be combined"
+        assert_eq!(
+            cookie.url.as_deref(),
+            Some("https://publisher.example/news/story"),
+            "the URL scopes a host-only cookie before first navigation"
         );
+        assert_eq!(cookie.secure, Some(true), "HTTPS cookies must be Secure");
     }
 
     #[test]
@@ -1092,7 +1092,6 @@ mod tests {
 
         let script = build_ad_template_init_script(&AdTemplateCollectorConfig {
             div_prefixes: vec!["ad-atf-".to_string()],
-            aps_slot_ids: Vec::new(),
         })
         .expect("should build init script");
 
@@ -1139,7 +1138,6 @@ mod tests {
 
         let script = build_ad_template_init_script(&AdTemplateCollectorConfig {
             div_prefixes: vec!["ad-atf-".to_string()],
-            aps_slot_ids: Vec::new(),
         })
         .expect("should build init script");
 

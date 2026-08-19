@@ -305,7 +305,7 @@ pub fn compare_page_evidence(
                     ),
                 ));
                 (
-                    SlotStatus::Unconfirmable,
+                    SlotStatus::Partial,
                     dom_id,
                     Some(gpt.clone()),
                     Some(gpt.phase),
@@ -733,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn out_of_page_gpt_slot_warns_and_does_not_confirm() {
+    fn sizeless_live_slot_is_partial_when_config_declares_banner_sizes() {
         let expected = expected_slot(
             "interstitial",
             "ad-oop-",
@@ -753,7 +753,7 @@ mod tests {
             RuntimeGateSummary::unknown_allowed(),
         );
 
-        assert_eq!(result.slots[0].status, SlotStatus::Unconfirmable);
+        assert_eq!(result.slots[0].status, SlotStatus::Partial);
         assert!(
             result.slots[0]
                 .warnings
@@ -761,8 +761,8 @@ mod tests {
                 .any(|w| w.code == "out_of_page_slot")
         );
         assert!(
-            !result.strict_failed(),
-            "out-of-page slots are not confirmable by this checker"
+            result.strict_failed(),
+            "a live sizeless slot drifting from configured banner sizes must fail strict"
         );
     }
 

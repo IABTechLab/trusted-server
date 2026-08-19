@@ -313,35 +313,31 @@ Size compatibility is defined for Phase 1 as follows:
 - If ad unit path and div match but no numeric size overlap exists, the slot is
   `partial`, not `confirmed`.
 - Configured `video` and `native` formats are not used for Phase 1 GPT size
-  confirmation. If a matched slot has only non-banner formats, the verifier
-  reports it as `partial` with an unsupported-format warning unless a later
-  phase defines video/native verification.
-- Out-of-page GPT slots are not confirmed in Phase 1 because the current
-  server-side ad-template path is slot/div based. They are reported as warnings
-  when observed.
+  confirmation. A matched slot with only non-banner formats is `unconfirmable`
+  with an unsupported-format warning and does not fail `--strict`.
+- A sizeless live GPT slot is `partial` when the config declares banner sizes,
+  because that is observable drift and must fail `--strict`.
 
 ### 5.5 APS Evidence
 
-When a configured slot has `providers.aps.slot_id`, the collector records
-`apstag.fetchBids` calls and compares configured slot IDs and sizes with the APS
-payload.
-
-APS evidence is a provider-level signal. Missing or ambiguous APS evidence
-creates a provider warning, but it does not by itself make an otherwise GPT-
-confirmed slot fail `--strict` in Phase 1.
+Phase 1 does not wrap or collect `apstag.fetchBids`: APS is server-side provider
+configuration and client-side calls are neither required nor authoritative for
+the runtime ad-template decision.
 
 ### 5.6 Statuses
 
-| Status      | Meaning                                                                                                                                                                                                                                                                          |
-| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `confirmed` | GPT evidence matches the configured GAM unit path, div resolution, and compatible sizes.                                                                                                                                                                                         |
-| `partial`   | The page has some evidence for the configured slot, but not enough to confirm it. This includes DOM-only evidence, GPT path/div matches with incompatible sizes, GPT path/div matches for unsupported non-banner-only configured formats, and other non-confirming GPT evidence. |
-| `missing`   | No DOM or GPT evidence confirms the configured slot.                                                                                                                                                                                                                             |
+| Status          | Meaning                                                                                                                                                                                                                                                                          |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `confirmed`     | GPT evidence matches the configured GAM unit path, div resolution, and compatible sizes.                                                                                                                                                                                         |
+| `partial`       | The page has some evidence for the configured slot, but not enough to confirm it. This includes DOM-only evidence, GPT path/div matches with incompatible sizes, GPT path/div matches for unsupported non-banner-only configured formats, and other non-confirming GPT evidence. |
+| `missing`       | No DOM or GPT evidence confirms the configured slot.                                                                                                                                                                                                                             |
+| `unconfirmable` | The checker cannot evaluate the configured format with Phase 1 evidence, such as a non-banner-only slot. This is reported but does not fail strict mode.                                                                                                                         |
 
 In `--strict` mode:
 
 - `missing` fails.
 - `partial` fails.
+- `unconfirmable` does not fail.
 
 Provider issues are not statuses. They are warnings attached to the slot result.
 For example, a slot can be `confirmed` and still carry a warning that configured
@@ -594,7 +590,7 @@ Extra live evidence is structured:
 }
 ```
 
-Allowed `kind` values for Phase 1 are `dom`, `gpt`, and `aps`.
+Allowed `kind` values for Phase 1 are `dom` and `gpt`.
 
 Strict-mode failures with page results use the same shape and set `ok` to
 `false`. Example partial slot:
@@ -695,7 +691,7 @@ Browser verification fails when:
 - at least one page-level error occurs in a multi-URL run;
 - command output cannot be written;
 - `--strict` is set, runtime verification is not skipped by a known gate, and
-  at least one matched slot is missing or partial.
+  at least one matched slot is missing or partial. `unconfirmable` is excluded.
 
 Browser collection can still produce a page result with warnings when:
 
@@ -703,9 +699,7 @@ Browser collection can still produce a page result with warnings when:
 - a navigation redirects before final URL matching;
 - scroll evidence is incomplete;
 - GPT is not loaded;
-- APS is not observed;
-- provider evidence is ambiguous;
-- extra live DOM/GPT/APS ad-slot evidence has no matched configured slot;
+- extra live DOM/GPT ad-slot evidence has no matched configured slot;
 - no slots match the URL.
 
 ## 10. Testing

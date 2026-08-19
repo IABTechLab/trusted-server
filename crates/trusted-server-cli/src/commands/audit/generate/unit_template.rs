@@ -6,7 +6,7 @@
 //! against inventory that does not exist, which is worse than a narrow literal.
 //! So this module is built to refuse rather than guess.
 //!
-//! Three rules do the load-bearing work:
+//! The inference applies three evidence rules:
 //!
 //! 1. **Positional binding.** `{network_id}` is bound to unit segment 0 and only
 //!    if that segment is the resolved network id. Substring replacement would
@@ -14,8 +14,8 @@
 //! 2. **Exactly one varying segment.** Zero means nothing was proven and the
 //!    path stays literal; two means the unit varies along a dimension the
 //!    request path cannot supply (device, geo, experiment), so it is refused.
-//! 3. **The witness rule.** Two pages must show *different* derived sections
-//!    *and* different unit segments. Without it a single-page crawl is
+//! 3. **Cross-page variation.** Two pages must show *different* derived sections
+//!    and different unit segments. A single-page crawl is
 //!    indistinguishable from a static path — literal, `{network_id}`-only and
 //!    `{section}` all reproduce one observation equally well, and round-trip
 //!    verification cannot tell them apart. Only variation can.
@@ -146,7 +146,7 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
                 .collect();
             diagnostics.push(format!(
                 "more than one section_segment ({}) explains the observed ad-unit paths \
-                 equally well, so no template can be chosen safely; keeping literal paths",
+                 equally well, so no template can be chosen safely; slots without one safe literal path are omitted",
                 indices.join(", ")
             ));
             None
@@ -187,7 +187,7 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
                     Err(reason) => {
                         diagnostics.push(format!(
                             "slot `{}` template `{template}` did not reproduce the observed \
-                             ad-unit paths ({reason}); keeping the literal path",
+                             ad-unit paths ({reason}); refusing any unsafe fallback",
                             slot.id
                         ));
                         literal_decision(slot)
@@ -613,10 +613,10 @@ mod tests {
     }
 
     #[test]
-    fn a_slug_the_path_cannot_reproduce_stays_literal() {
+    fn a_slug_the_path_cannot_reproduce_is_refused() {
         // `/site-news` requests `.../sitenews`: the derived section and
         // the observed segment differ, so the template would render the wrong
-        // unit. Round-trip verification is what catches this.
+        // unit. Candidate analysis rejects the inconsistent section mapping.
         let table = table_for(
             "ad-header",
             &[
@@ -639,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unwitnessed_root_does_not_template() {
+    fn an_unwitnessed_root_is_refused() {
         // Every crawled page had a section, so `section_root` would be a guess
         // that silently mis-renders the homepage.
         let table = table_for(

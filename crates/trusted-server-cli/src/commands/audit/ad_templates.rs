@@ -37,6 +37,7 @@ use crate::run::RunOutcome;
 /// surfaces a page-level error or a `--strict` failure (after writing output).
 pub(crate) fn run_verify(args: &AuditAdTemplatesVerifyArgs) -> Result<RunOutcome, String> {
     args.browser.validate()?;
+    validate_cookie_scope(&args.urls, &args.cookies)?;
     let loaded = crate::app_config::load_settings(&args.config)?;
     let collector = crate::commands::audit::browser::BrowserCollector::from_opts(&args.browser);
     let report = build_report(
@@ -50,7 +51,7 @@ pub(crate) fn run_verify(args: &AuditAdTemplatesVerifyArgs) -> Result<RunOutcome
             allow_cross_origin_redirect: args.allow_cross_origin_redirect,
         },
         &args.cookies,
-    );
+    )?;
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -67,6 +68,23 @@ pub(crate) fn run_verify(args: &AuditAdTemplatesVerifyArgs) -> Result<RunOutcome
     } else {
         Ok(RunOutcome::AssertionFailed)
     }
+}
+
+fn validate_cookie_scope(urls: &[url::Url], cookies: &[(String, String)]) -> Result<(), String> {
+    if cookies.is_empty() {
+        return Ok(());
+    }
+    let origins: std::collections::BTreeSet<String> = urls
+        .iter()
+        .map(|url| url.origin().ascii_serialization())
+        .collect();
+    if origins.len() > 1 {
+        return Err(
+            "--cookie may be used only when every verification URL has one origin; split this run so credentials are never copied to another origin"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Run-level verification switches.
@@ -91,14 +109,14 @@ fn build_report(
     urls: &[url::Url],
     options: VerifyOptions,
     cookies: &[(String, String)],
-) -> VerificationReport {
-    let init_script = build_init_script(creative);
+) -> Result<VerificationReport, String> {
+    let init_script = build_init_script(creative)?;
 
     let requests: Vec<_> = urls
         .iter()
         .map(|url| BrowserCollectRequest {
             url: url.clone(),
-            init_scripts: init_script.clone().into_iter().collect(),
+            init_scripts: vec![init_script.clone()],
             scroll: options.scroll,
             collect_ad_evidence: true,
             cookies: cookies.to_vec(),
@@ -138,12 +156,12 @@ fn build_report(
     }
 
     let ok = !(any_error || (options.strict && any_strict_fail));
-    VerificationReport {
+    Ok(VerificationReport {
         ok,
         strict: options.strict,
         pages,
         warnings: Vec::new(),
-    }
+    })
 }
 
 /// Whether navigation left the requested URL's origin (scheme, host, or port).
@@ -168,7 +186,7 @@ fn origin_changed(requested: &url::Url, final_url: &url::Url) -> bool {
 }
 
 /// Builds the read-only collector init script from the configured slots.
-fn build_init_script(creative: Option<&CreativeOpportunitiesConfig>) -> Option<String> {
+fn build_init_script(creative: Option<&CreativeOpportunitiesConfig>) -> Result<String, String> {
     let config = AdTemplateCollectorConfig {
         div_prefixes: creative
             .map(|creative| {
@@ -179,17 +197,8 @@ fn build_init_script(creative: Option<&CreativeOpportunitiesConfig>) -> Option<S
                     .collect()
             })
             .unwrap_or_default(),
-        aps_slot_ids: creative
-            .map(|creative| {
-                creative
-                    .slot
-                    .iter()
-                    .filter_map(|slot| slot.providers.aps.as_ref().map(|aps| aps.slot_id.clone()))
-                    .collect()
-            })
-            .unwrap_or_default(),
     };
-    build_ad_template_init_script(&config).ok()
+    build_ad_template_init_script(&config)
 }
 
 /// Assembles a successful page result, returning the wire `PageJson` and whether
@@ -228,11 +237,14 @@ fn build_page(
     let strict_failed = result.strict_failed();
 
     let mut warnings: Vec<Warning> = collected.warnings.to_vec();
-    warnings.extend(evidence.warnings.iter().cloned());
-    if requested_path != final_path {
+    warnings.extend(evidence.warnings.iter().map(|warning| Warning {
+        code: format!("page_{}", warning.code),
+        message: warning.message.clone(),
+    }));
+    if requested != final_url {
         warnings.push(Warning {
             code: "redirected".to_string(),
-            message: format!("navigation redirected from {requested_path} to {final_path}"),
+            message: format!("navigation redirected from {requested} to {final_url}"),
         });
     }
 
@@ -669,6 +681,7 @@ mod tests {
             options,
             &[],
         )
+        .expect("typed collector configuration should serialize")
     }
 
     #[test]
@@ -842,7 +855,7 @@ mod tests {
             report.pages[0]
                 .warnings
                 .iter()
-                .any(|warning| warning.code == "fluid_size_ignored"),
+                .any(|warning| warning.code == "page_fluid_size_ignored"),
             "collector warning should be visible in the page report"
         );
     }
@@ -950,5 +963,32 @@ mod tests {
         let json = serde_json::to_value(&report).expect("should serialize");
         assert_eq!(json["pages"][1]["error"]["code"], "navigation_failed");
         assert!(json["pages"][1]["final_url"].is_null());
+    }
+
+    #[test]
+    fn supplied_cookies_are_rejected_for_multiple_origins() {
+        let urls = [
+            url::Url::parse("https://a.example/x").expect("should parse first URL"),
+            url::Url::parse("https://b.example/y").expect("should parse second URL"),
+        ];
+
+        let error = validate_cookie_scope(&urls, &[("session".to_string(), "secret".to_string())])
+            .expect_err("should not replicate one cookie across origins");
+
+        assert!(
+            error.contains("one origin"),
+            "the refusal should explain cookie scope, got {error}"
+        );
+    }
+
+    #[test]
+    fn supplied_cookies_are_allowed_for_same_origin_urls() {
+        let urls = [
+            url::Url::parse("https://a.example/x").expect("should parse first URL"),
+            url::Url::parse("https://a.example/y").expect("should parse second URL"),
+        ];
+
+        validate_cookie_scope(&urls, &[("session".to_string(), "secret".to_string())])
+            .expect("same-origin URLs share the intended cookie scope");
     }
 }

@@ -20,5 +20,14 @@ fi
 
 cargo test --package trusted-server-cli --target "$HOST_TARGET"
 export TS_AUDIT_BROWSER_TESTS=1
+AUDIT_BROWSER_TEST_FILTER="commands::audit::browser::tests::"
+AUDIT_BROWSER_TEST_COUNT="$({
+  cargo test --package trusted-server-cli --target "$HOST_TARGET" \
+    "$AUDIT_BROWSER_TEST_FILTER" -- --ignored --list
+} | awk '/: test$/ { count += 1 } END { print count + 0 }')"
+if [ "$AUDIT_BROWSER_TEST_COUNT" -eq 0 ]; then
+  echo "No ignored browser audit fixtures matched $AUDIT_BROWSER_TEST_FILTER" >&2
+  exit 1
+fi
 cargo test --package trusted-server-cli --target "$HOST_TARGET" \
-  commands::audit::browser::tests:: -- --ignored --test-threads=1
+  "$AUDIT_BROWSER_TEST_FILTER" -- --ignored --test-threads=1

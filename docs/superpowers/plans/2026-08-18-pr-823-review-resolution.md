@@ -571,7 +571,7 @@ Restore the `audit` no-`--adapter` parser test. Add a script contract that sets 
 
 - [ ] **Step 2: Replace sensitive-looking fixtures and stale assertions**
 
-Replace `88059007`, `autoblog`, `car-research`/`carresearch`, and distinctive div tokens introduced by this PR with `123456789`, `publisher`, `/site-news`/`sitenews`, and neutral `ex_...` values. Update comments to describe shapes rather than customers.
+Replace sensitive or customer-shaped fixtures introduced by this PR with fictional network IDs, publisher names, URL shapes, and neutral div tokens. Update comments to describe shapes rather than customers.
 
 Correct all touched `expect` messages to start with `should`, remove redundant crate/file `dead_code` allowances and annotate only genuinely deferred fields, reorder `Audit`, simplify the Prebid query parser so keys—not substrings—are matched, and bind legacy URLs directly without an impossible `expect`.
 

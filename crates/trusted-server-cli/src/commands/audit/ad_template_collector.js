@@ -13,17 +13,16 @@ const __ts_ev = (window.__tsAdTemplateEvidence = window.__tsAdTemplateEvidence |
   dom_ids: [],
   gpt_slots: [],
   aps_calls: [],
-  warnings: [],
+  warnings: []
 })
 
 const __ts_phase = () => (window.__tsScrollPhase ? "scroll" : "initial_load")
 
 // Hard cap per evidence list so a hostile page cannot grow the store without
 // bound; the page controls how many slots/elements/warnings it produces.
-const __ts_max_entries = 1024
+const __ts_max_entries = 128
 const __ts_max_string_length = 512
 const __ts_wrapped_googletags = new WeakSet()
-const __ts_wrapped_apstags = new WeakSet()
 
 function __ts_text(value) {
   return String(value).slice(0, __ts_max_string_length)
@@ -47,6 +46,16 @@ function __ts_size_pair(width, height) {
   return [width, height]
 }
 
+function __ts_warn_ignored_size(width, height) {
+  const numeric = Number.isInteger(width) && Number.isInteger(height)
+  const outOfRange =
+    numeric && (width < 0 || height < 0 || width > 4294967295 || height > 4294967295)
+  __ts_push(__ts_ev.warnings, {
+    code: outOfRange ? "size_out_of_range" : "fluid_size_ignored",
+    message: outOfRange ? "GPT size outside u32 range ignored" : "non-numeric GPT size ignored"
+  })
+}
+
 function __ts_normalize_sizes(sizes) {
   const out = []
   if (!Array.isArray(sizes)) return out
@@ -58,10 +67,10 @@ function __ts_normalize_sizes(sizes) {
     if (pair) {
       out.push(pair)
     } else {
-      __ts_push(__ts_ev.warnings, {
-        code: "fluid_size_ignored",
-        message: "non-numeric GPT size ignored",
-      })
+      __ts_warn_ignored_size(
+        Array.isArray(size) ? size[0] : undefined,
+        Array.isArray(size) ? size[1] : undefined
+      )
     }
   }
   return out
@@ -72,7 +81,7 @@ function __ts_record_define_slot(adUnitPath, sizes, divId) {
     gam_unit_path: __ts_text(adUnitPath),
     div_id: __ts_text(divId),
     sizes: __ts_normalize_sizes(sizes),
-    phase: __ts_phase(),
+    phase: __ts_phase()
   })
 }
 
@@ -87,9 +96,10 @@ function __ts_wrap_googletag(googletag) {
   const originalDefineSlot = googletag.defineSlot
   if (typeof originalDefineSlot === "function") {
     try {
+      const descriptor = Object.getOwnPropertyDescriptor(googletag, "defineSlot")
       Object.defineProperty(googletag, "defineSlot", {
         configurable: true,
-        enumerable: false,
+        enumerable: descriptor ? descriptor.enumerable : true,
         writable: true,
         value: function (adUnitPath, sizes, divId) {
           const slot = originalDefineSlot.apply(this, arguments)
@@ -99,47 +109,13 @@ function __ts_wrap_googletag(googletag) {
             __ts_warn("define_slot_capture_failed", error)
           }
           return slot
-        },
+        }
       })
     } catch (error) {
       __ts_warn("define_slot_wrap_failed", error)
     }
   }
   return googletag
-}
-
-function __ts_wrap_apstag(apstag) {
-  if (!apstag || (typeof apstag !== "object" && typeof apstag !== "function")) return apstag
-  if (__ts_wrapped_apstags.has(apstag)) return apstag
-  __ts_wrapped_apstags.add(apstag)
-  const originalFetchBids = apstag.fetchBids
-  if (typeof originalFetchBids === "function") {
-    try {
-      Object.defineProperty(apstag, "fetchBids", {
-        configurable: true,
-        enumerable: false,
-        writable: true,
-        value: function (config, callback) {
-          try {
-            const slots = (config && config.slots) || []
-            for (const slot of slots) {
-              __ts_push(__ts_ev.aps_calls, {
-                slot_id: __ts_text(slot.slotID || slot.slotName || ""),
-                sizes: __ts_normalize_sizes(slot.sizes),
-                phase: __ts_phase(),
-              })
-            }
-          } catch (error) {
-            __ts_warn("aps_capture_failed", error)
-          }
-          return originalFetchBids.apply(this, arguments)
-        },
-      })
-    } catch (error) {
-      __ts_warn("aps_wrap_failed", error)
-    }
-  }
-  return apstag
 }
 
 // Wrap an existing global or intercept a later assignment of it.
@@ -165,12 +141,11 @@ function __ts_install(name, wrap) {
       } catch (error) {
         __ts_warn(name + "_wrap_failed", error)
       }
-    },
+    }
   })
 }
 
 __ts_install("googletag", __ts_wrap_googletag)
-__ts_install("apstag", __ts_wrap_apstag)
 
 // On-demand DOM + getSlots scrape, invoked by the collector after settle/scroll.
 window.__tsCollectAdTemplateEvidence = function () {
@@ -197,7 +172,11 @@ window.__tsCollectAdTemplateEvidence = function () {
           for (const size of rawSizes) {
             if (sizes.length >= __ts_max_entries) break
             let pair = null
-            if (size && typeof size.getWidth === "function" && typeof size.getHeight === "function") {
+            if (
+              size &&
+              typeof size.getWidth === "function" &&
+              typeof size.getHeight === "function"
+            ) {
               // A fluid GPT size answers getWidth()/getHeight() with a
               // non-numeric value rather than throwing.
               pair = __ts_size_pair(size.getWidth(), size.getHeight())
@@ -207,10 +186,19 @@ window.__tsCollectAdTemplateEvidence = function () {
             if (pair) {
               sizes.push(pair)
             } else {
-              __ts_push(__ts_ev.warnings, {
-                code: "fluid_size_ignored",
-                message: "non-numeric GPT size ignored",
-              })
+              const width =
+                size && typeof size.getWidth === "function"
+                  ? size.getWidth()
+                  : Array.isArray(size)
+                    ? size[0]
+                    : undefined
+              const height =
+                size && typeof size.getHeight === "function"
+                  ? size.getHeight()
+                  : Array.isArray(size)
+                    ? size[1]
+                    : undefined
+              __ts_warn_ignored_size(width, height)
             }
           }
           const exists = __ts_ev.gpt_slots.some(
@@ -221,7 +209,7 @@ window.__tsCollectAdTemplateEvidence = function () {
               gam_unit_path: __ts_text(path),
               div_id: __ts_text(divId),
               sizes,
-              phase: __ts_phase(),
+              phase: __ts_phase()
             })
           }
         } catch (error) {

@@ -481,15 +481,6 @@ fn render_discovered_slots(target_url: &Url, slots: &gpt_slots::DiscoveredSlots)
     out
 }
 
-/// Runs `ts audit ad-templates generate`: scrape the live page's GPT slots and
-/// rewrite only the `[creative_opportunities]` slot array in `config_path` in
-/// place, preserving every other section and comment.
-///
-/// # Errors
-///
-/// Returns an error when the config cannot be read, the page cannot be
-/// collected, no slots are discovered, or the config has no
-/// `[creative_opportunities]` section to update.
 /// Everything one `ts audit ad-templates generate` invocation needs.
 pub(crate) struct UpdateSlotsRequest<'a> {
     /// Page URL to start from; also bounds the crawl to its origin.
@@ -557,6 +548,12 @@ pub(crate) fn run_update_slots(
         request.cookies,
         &mut |_, root| {
             root_url = root.final_url().unwrap_or_else(|_| target_url.clone());
+            if root_url.origin() != target_url.origin() {
+                return cli_error(format!(
+                    "refusing cross-origin root redirect from {} to {}; the requested origin is the audit and cookie trust boundary",
+                    target_url, root_url
+                ));
+            }
             let plan =
                 crawl_plan::plan_crawl(&root_url, &root.links, &root.sitemap_locs, request.budget);
             let targets = plan.targets();
@@ -573,8 +570,7 @@ pub(crate) fn run_update_slots(
                     }
                 }
                 Err(error) => {
-                    fold_error = Some(error);
-                    return Ok(collector::ControlFlow::Stop);
+                    notes.push(format!("skipped `{url}` on {first_label}: {error}"));
                 }
             }
             Ok(collector::ControlFlow::Continue)
@@ -594,7 +590,7 @@ pub(crate) fn run_update_slots(
     // disagree about a slot's ad-unit path, that shows up as two observations of
     // one page, which inference already refuses to represent.
     for (label, collector) in collectors.iter().skip(1) {
-        crawl_sections(
+        let successful_pages = crawl_sections(
             *collector,
             &root_url,
             &plan,
@@ -603,6 +599,11 @@ pub(crate) fn run_update_slots(
             &mut notes,
             label,
         )?;
+        if successful_pages == 0 {
+            return cli_error(format!(
+                "the selected {label} device profile did not collect any required page; refusing to generate from incomplete profile coverage"
+            ));
+        }
     }
     if collectors.len() > 1 {
         notes.push(format!(
@@ -648,6 +649,7 @@ pub(crate) fn run_update_slots(
     let policy = inference
         .as_ref()
         .and_then(|outcome| outcome.policy.clone());
+    validate_merge_policy(request.existing_creative, policy.as_ref(), request.replace)?;
 
     // Slots that are one placement wearing a per-render div id cannot be
     // written: the ids never match at runtime. Report them so the operator can
@@ -673,6 +675,7 @@ pub(crate) fn run_update_slots(
         inference.as_ref(),
         policy.as_ref(),
         request,
+        plan.section_segment,
         &fragmented,
         &mut notes,
     )?;
@@ -682,6 +685,12 @@ pub(crate) fn run_update_slots(
         request.replace,
     );
     notes.extend(merge_diagnostics);
+    if merged.is_empty() {
+        emit_notes(err, &mut notes)?;
+        return cli_error(
+            "refusing to write zero generated slots after the crawl discovered slot evidence; review the refused-slot notes and keep the existing configuration",
+        );
+    }
     let rendered_slots = render_slots(&merged);
     let updated = splice_creative_slots(
         &existing,
@@ -715,6 +724,12 @@ pub(crate) fn run_update_slots(
         let old_managed = managed_creative_projection(&existing)?;
         let new_managed = managed_creative_projection(&updated)?;
         let diff = similar::TextDiff::from_lines(&old_managed, &new_managed);
+        if old_managed == new_managed {
+            writeln!(out, "No managed creative-opportunity changes.").map_err(|error| {
+                report_error(format!("failed to write preview output: {error}"))
+            })?;
+            return Ok(());
+        }
         writeln!(
             out,
             "{}",
@@ -812,8 +827,12 @@ fn looks_like_an_interstitial(artifact: &AuditArtifact) -> Option<String> {
 /// Writes and clears the pending notes, so each is reported exactly once.
 fn emit_notes(out: &mut dyn Write, notes: &mut Vec<String>) -> CliResult<()> {
     for note in notes.drain(..) {
-        writeln!(out, "note: {note}")
-            .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
+        writeln!(
+            out,
+            "note: {}",
+            crate::ad_templates::output::escape_terminal_text(&note)
+        )
+        .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
     }
     Ok(())
 }
@@ -849,6 +868,7 @@ fn fold_collected(
         &collected.network_requests,
         page_has_prebid,
     );
+    notes.extend(discovered.warnings.iter().cloned());
     table.fold_page(url.path(), &discovered);
     Ok(())
 }
@@ -867,7 +887,7 @@ fn crawl_sections(
     table: &mut evidence::EvidenceTable,
     notes: &mut Vec<String>,
     profile_label: &str,
-) -> CliResult<()> {
+) -> CliResult<usize> {
     let additional_targets = plan.targets();
     if additional_targets.is_empty() {
         notes.push(
@@ -883,9 +903,11 @@ fn crawl_sections(
     targets.extend(additional_targets);
 
     let mut fold_error = None;
+    let mut successful_pages = 0_usize;
     collector.collect_pages(&targets, cookies, &mut |url, collected| {
         match collected {
             Ok(page) => {
+                successful_pages += 1;
                 let final_url = page.final_url().unwrap_or_else(|_| url.clone());
                 if let Err(error) = fold_collected(table, &final_url, &page, notes) {
                     fold_error = Some(error);
@@ -898,7 +920,7 @@ fn crawl_sections(
     })?;
     match fold_error {
         Some(error) => Err(error),
-        None => Ok(()),
+        None => Ok(successful_pages),
     }
 }
 
@@ -918,12 +940,43 @@ fn guard_challenge_rate(table: &evidence::EvidenceTable) -> CliResult<()> {
     ))
 }
 
+fn validate_merge_policy(
+    existing: Option<&CreativeOpportunitiesConfig>,
+    inferred: Option<&unit_template::SectionPolicy>,
+    replace: bool,
+) -> CliResult<()> {
+    if replace {
+        return Ok(());
+    }
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    let preserves_template = existing.slot.iter().any(|slot| {
+        slot.gam_unit_path
+            .as_deref()
+            .is_some_and(|path| path.contains("{section}"))
+    });
+    let Some(inferred) = inferred.filter(|_| preserves_template) else {
+        return Ok(());
+    };
+    let configured_root = existing.section_root.as_deref().unwrap_or_default();
+    let configured_segment = existing.section_segment.unwrap_or(0);
+    if configured_root != inferred.section_root || configured_segment != inferred.section_segment {
+        return cli_error(format!(
+            "refusing to change the section policy used by preserved templated slots during merge: configured section_root={configured_root:?}, section_segment={configured_segment}; inferred section_root={:?}, section_segment={}. Re-run with --replace only for an intentional migration",
+            inferred.section_root, inferred.section_segment
+        ));
+    }
+    Ok(())
+}
+
 /// Turns the evidence table into slots ready to render.
 fn build_render_slots(
     table: &evidence::EvidenceTable,
     inference: Option<&unit_template::InferenceOutcome>,
     policy: Option<&unit_template::SectionPolicy>,
     request: &UpdateSlotsRequest<'_>,
+    fallback_section_segment: usize,
     fragmented: &[evidence::FragmentGroup],
     notes: &mut Vec<String>,
 ) -> CliResult<Vec<slot_toml::RenderSlot>> {
@@ -937,7 +990,7 @@ fn build_render_slots(
     if explicit {
         validate_page_patterns(request.page_patterns)?;
     }
-    let section_segment = policy.map_or(0, |policy| policy.section_segment);
+    let section_segment = policy.map_or(fallback_section_segment, |policy| policy.section_segment);
 
     let mut slots = Vec::with_capacity(table.slot_count());
     for slot in table.slots() {
@@ -978,7 +1031,7 @@ fn build_render_slots(
 }
 /// Rejects any page pattern the runtime's glob compiler would not accept.
 ///
-/// Uses [`compile_page_pattern`] so the accepted set is exactly what
+/// Uses [`validate_page_pattern`] so the accepted set is exactly what
 /// `CreativeOpportunitySlot::compile_patterns` accepts at startup, including the
 /// `**`→`*` normalisation. All patterns are reported at once so an operator
 /// passing several `--page-pattern` values fixes them in one pass.
@@ -1060,6 +1113,18 @@ mod tests {
     struct SiteCollector {
         pages: std::collections::HashMap<String, CollectedPage>,
         visited: std::cell::RefCell<Vec<String>>,
+    }
+
+    struct FailingCollector;
+
+    impl AuditCollector for FailingCollector {
+        fn collect_page(
+            &self,
+            target_url: &Url,
+            _cookies: &[(String, String)],
+        ) -> CliResult<CollectedPage> {
+            cli_error(format!("simulated navigation failure for {target_url}"))
+        }
     }
 
     impl SiteCollector {
@@ -1179,6 +1244,28 @@ mod tests {
                 "should explain scheme restriction"
             );
         }
+    }
+
+    #[test]
+    fn merge_refuses_to_change_policy_used_by_preserved_templates() {
+        let existing: CreativeOpportunitiesConfig = toml::from_str(
+            "gam_network_id = \"123\"\nsection_root = \"home\"\nsection_segment = 0\n\
+             [[slot]]\nid = \"header\"\ndiv_id = \"ad-header\"\n\
+             gam_unit_path = \"/{network_id}/site/{section}\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 728, height = 90 }]\n",
+        )
+        .expect("should parse creative config");
+        let inferred = unit_template::SectionPolicy {
+            section_root: "homepage".to_string(),
+            section_segment: 1,
+        };
+
+        let error = validate_merge_policy(Some(&existing), Some(&inferred), false)
+            .expect_err("merge must preserve the existing template policy");
+
+        assert!(format!("{error:?}").contains("--replace"));
+        validate_merge_policy(Some(&existing), Some(&inferred), true)
+            .expect("replace is an explicit policy migration");
     }
 
     #[test]
@@ -1528,6 +1615,133 @@ mod tests {
     }
 
     #[test]
+    fn static_locale_root_slot_uses_the_planned_section_depth_for_patterns() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        fs::write(
+            &config_path,
+            "[creative_opportunities]\ngam_network_id = \"123456789\"\n",
+        )
+        .expect("should write config");
+        let nav = ["/en/news"];
+        let mut root_page = site_page("https://publisher.example/en", "/123456789/site/root", &nav);
+        root_page.gpt_slots[0].div_id = "ad-root-only".to_string();
+        let collector = SiteCollector::new(vec![
+            ("https://publisher.example/en", root_page),
+            (
+                "https://publisher.example/en/news",
+                site_page(
+                    "https://publisher.example/en/news",
+                    "/123456789/site/static",
+                    &nav,
+                ),
+            ),
+        ]);
+
+        run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/en",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &collector)],
+            &mut std::io::sink(),
+            &mut std::io::sink(),
+        )
+        .expect("should write static locale-root slot");
+
+        let written = fs::read_to_string(&config_path).expect("should read config");
+        let value = toml::from_str::<toml::Value>(&written).expect("should parse config");
+        let slots = value["creative_opportunities"]["slot"]
+            .as_array()
+            .expect("should have slots");
+        let target = slots
+            .iter()
+            .find(|slot| slot["div_id"].as_str() == Some("ad-header-0"))
+            .expect("should have the section slot");
+        let patterns = target["page_patterns"]
+            .as_array()
+            .expect("should have patterns")
+            .iter()
+            .map(|pattern| pattern.as_str().expect("should be string"))
+            .collect::<Vec<_>>();
+        assert_eq!(patterns, ["/en/news", "/en/news/*"]);
+    }
+
+    #[test]
+    fn update_slots_rejects_a_cross_origin_root_redirect() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        let original = "[creative_opportunities]\ngam_network_id = \"111\"\n";
+        fs::write(&config_path, original).expect("should write config");
+        let mut collected = collected_page_with_header_slot();
+        collected.final_url = "https://foreign.example/news".to_string();
+        let collector = FakeCollector::new(collected);
+
+        let error = run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[("session".to_string(), "secret".to_string())],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &collector)],
+            &mut std::io::sink(),
+            &mut std::io::sink(),
+        )
+        .expect_err("cross-origin redirect must leave the requested trust boundary");
+
+        assert!(format!("{error:?}").contains("cross-origin"));
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("should read config"),
+            original,
+            "foreign evidence must not rewrite the config"
+        );
+    }
+
+    #[test]
+    fn update_slots_requires_evidence_from_every_selected_profile() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        let original = loadable_config();
+        fs::write(&config_path, &original).expect("should write config");
+        let desktop = FakeCollector::new(collected_page_with_header_slot());
+
+        let error = run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &desktop), ("mobile", &FailingCollector)],
+            &mut std::io::sink(),
+            &mut std::io::sink(),
+        )
+        .expect_err("a selected profile with no usable page must refuse generation");
+
+        assert!(format!("{error:?}").contains("mobile"));
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("should read config"),
+            original,
+            "incomplete profile coverage must not rewrite the config"
+        );
+    }
+
+    #[test]
     fn update_slots_rejects_invalid_page_pattern_without_touching_config() {
         let temp = TempDir::new().expect("should create temp dir");
         let config_path = temp.path().join("trusted-server.toml");
@@ -1675,7 +1889,8 @@ mod tests {
         // infer `{section}`, and write a config the runtime loads.
         let temp = TempDir::new().expect("should create temp dir");
         let config_path = temp.path().join("trusted-server.toml");
-        fs::write(&config_path, loadable_config()).expect("should write config");
+        let original = loadable_config();
+        fs::write(&config_path, &original).expect("should write config");
 
         let nav = ["/news", "/deals"];
         let collector = SiteCollector::new(vec![
@@ -1770,7 +1985,8 @@ mod tests {
         // would be correct for one device and silently wrong for the other.
         let temp = TempDir::new().expect("should create temp dir");
         let config_path = temp.path().join("trusted-server.toml");
-        fs::write(&config_path, loadable_config()).expect("should write config");
+        let original = loadable_config();
+        fs::write(&config_path, &original).expect("should write config");
 
         let nav = ["/news"];
         let desktop = SiteCollector::new(vec![
@@ -1812,7 +2028,7 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
 
-        run_update_slots(
+        let error = run_update_slots(
             &UpdateSlotsRequest {
                 url: "https://publisher.example/",
                 config_path: &config_path,
@@ -1827,29 +2043,18 @@ mod tests {
             &mut out,
             &mut err,
         )
-        .expect("the run should complete and report the conflict");
+        .expect_err("an all-refused crawl must not write an empty slot array");
 
-        let written = fs::read_to_string(&config_path).expect("read config");
-        let value = toml::from_str::<toml::Value>(&written).expect("valid TOML");
-        let creative = &value["creative_opportunities"];
-        assert!(
-            creative.get("section_root").is_none(),
-            "a device split must not produce a section template"
-        );
-        assert!(
-            creative
-                .get("slot")
-                .and_then(toml::Value::as_array)
-                .is_none_or(Vec::is_empty),
-            "a refused device-split slot must be omitted, got:\n{written}"
-        );
+        assert!(format!("{error:?}").contains("zero generated slots"));
         assert!(
             String::from_utf8_lossy(&err).contains("skipped refused slot"),
             "the refusal reason should be reported"
         );
-        // What was written must still load.
-        trusted_server_core::settings::Settings::from_toml(&written)
-            .expect("a config with the refused slot omitted should still load");
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("read config"),
+            original,
+            "a refused crawl must preserve the operator config"
+        );
     }
 
     #[test]
@@ -1860,7 +2065,8 @@ mod tests {
         // every device agreed with it.
         let temp = TempDir::new().expect("should create temp dir");
         let config_path = temp.path().join("trusted-server.toml");
-        fs::write(&config_path, loadable_config()).expect("should write config");
+        let original = loadable_config();
+        fs::write(&config_path, &original).expect("should write config");
 
         let desktop = SiteCollector::new(vec![(
             "https://publisher.example/",
@@ -1880,7 +2086,7 @@ mod tests {
         )]);
         let mut out = Vec::new();
 
-        run_update_slots(
+        let error = run_update_slots(
             &UpdateSlotsRequest {
                 url: "https://publisher.example/",
                 config_path: &config_path,
@@ -1895,24 +2101,19 @@ mod tests {
             &mut out,
             &mut std::io::sink(),
         )
-        .expect("the run should complete and report the conflict");
+        .expect_err("an all-refused crawl must not write an empty slot array");
 
         assert_eq!(
             mobile.visited.borrow().as_slice(),
             ["https://publisher.example/"],
             "the mobile profile must load the root even when there is nothing else to crawl"
         );
-        let written = fs::read_to_string(&config_path).expect("read config");
-        let value = toml::from_str::<toml::Value>(&written).expect("valid TOML");
-        assert!(
-            value["creative_opportunities"]
-                .get("slot")
-                .and_then(toml::Value::as_array)
-                .is_none_or(Vec::is_empty),
-            "a root-only device split must omit the refused slot, got:\n{written}"
+        assert!(format!("{error:?}").contains("zero generated slots"));
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("read config"),
+            original,
+            "a root-only refusal must preserve the operator config"
         );
-        trusted_server_core::settings::Settings::from_toml(&written)
-            .expect("a config with the refused slot omitted should still load");
     }
 
     #[test]

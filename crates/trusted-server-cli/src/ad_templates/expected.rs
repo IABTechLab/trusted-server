@@ -136,7 +136,7 @@ pub fn normalize_path_or_url(input: &str) -> Result<String, String> {
         .expect("should parse static path normalization base");
     let relative = input.trim_start_matches('/');
     let normalized = base
-        .join(relative)
+        .join(&format!("./{relative}"))
         .map_err(|error| format!("invalid path `{input}`: {error}"))?;
     Ok(normalized.path().to_string())
 }
@@ -256,8 +256,8 @@ mod tests {
     #[test]
     fn expected_slots_omit_dynamic_template_the_runtime_cannot_render() {
         // A `{section}` template that renders past GAM's 100-byte unit-path
-        // limit. `validate_runtime` rejects this config, so the verifier reports
-        // the slot as unconfirmable rather than matching a truncated path.
+        // limit. The runtime omits this slot for the request path, so diagnostics
+        // must not match it against a truncated or otherwise different path.
         let toml = "gam_network_id = \"99999\"\n\
              section_root = \"homepage\"\n\
              \n\
@@ -320,6 +320,17 @@ mod tests {
             normalize_path_or_url("/r?to=https://example.com")
                 .expect("query URL should not change input classification"),
             "/r"
+        );
+        assert_eq!(
+            normalize_path_or_url("/news:latest").expect("colon should stay in bare path"),
+            "/news:latest",
+            "a colon in the first segment must not be parsed as a URL scheme"
+        );
+        assert_eq!(
+            normalize_path_or_url("https://example.com/news:latest")
+                .expect("colon should stay in URL path"),
+            "/news:latest",
+            "bare and absolute forms should normalize identically"
         );
     }
 }

@@ -14,7 +14,7 @@ pub mod page;
 use clap::{Args, Subcommand};
 
 use crate::app_config::AppConfigArgs;
-use crate::commands::audit::collector::BrowserOpts;
+use crate::commands::audit::collector::{BrowserOpts, GenerateBrowserOpts};
 use crate::commands::audit::page::PageAuditArgs;
 use crate::run::RunOutcome;
 
@@ -167,7 +167,7 @@ pub(crate) struct AuditAdTemplatesGenerateArgs {
     #[arg(long, default_value_t = 750)]
     pub page_delay_ms: u64,
     #[command(flatten)]
-    pub browser: BrowserOpts,
+    pub browser: GenerateBrowserOpts,
 }
 
 impl AuditAdTemplatesGenerateArgs {
@@ -249,7 +249,11 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
         }
         Some(AuditSubcommand::AdTemplates(AuditAdTemplatesCommand::Generate(gen_args))) => {
             gen_args.browser.validate()?;
-            let loaded = crate::app_config::load_file_settings(&gen_args.config)?;
+            let app_config_path = crate::app_config::resolve_app_config_file(&gen_args.config)?;
+            let raw_config = std::fs::read_to_string(&app_config_path).map_err(|error| {
+                format!("failed to read {}: {error}", app_config_path.display())
+            })?;
+            let existing_creative = best_effort_creative_config(&raw_config);
             let profiles = gen_args.profiles()?;
             let collectors: Vec<generate::browser_collector::BrowserAuditCollector> = profiles
                 .iter()
@@ -276,8 +280,8 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
             generate::run_update_slots(
                 &generate::UpdateSlotsRequest {
                     url: gen_args.url.as_str(),
-                    config_path: &loaded.app_config_path,
-                    existing_creative: loaded.settings.creative_opportunities.as_ref(),
+                    config_path: &app_config_path,
+                    existing_creative: existing_creative.as_ref(),
                     page_patterns: &gen_args.page_patterns,
                     replace: gen_args.replace,
                     cookies: &gen_args.cookies,
@@ -316,6 +320,15 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
     }
 }
 
+fn best_effort_creative_config(
+    document: &str,
+) -> Option<trusted_server_core::creative_opportunities::CreativeOpportunitiesConfig> {
+    toml::from_str::<toml::Value>(document)
+        .ok()
+        .and_then(|value| value.get("creative_opportunities").cloned())
+        .and_then(|value| value.try_into().ok())
+}
+
 fn legacy_generate_args(args: &AuditArgs, url: &url::Url) -> generate::GenerateArgs {
     generate::GenerateArgs {
         url: url.to_string(),
@@ -347,6 +360,17 @@ mod tests {
         let (name, value) = parse_cookie("session=").expect("should parse empty value");
         assert_eq!(name, "session");
         assert!(value.is_empty(), "empty value should be allowed");
+    }
+
+    #[test]
+    fn invalid_baseline_still_yields_best_effort_creative_config() {
+        let document = "unknown_runtime_key = true\n\
+            [creative_opportunities]\ngam_network_id = \"123\"\n";
+
+        let creative = best_effort_creative_config(document)
+            .expect("an unrelated invalid setting must not hide creative config");
+
+        assert_eq!(creative.gam_network_id, "123");
     }
 
     #[test]

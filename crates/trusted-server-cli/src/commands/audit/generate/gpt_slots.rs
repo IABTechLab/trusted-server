@@ -87,6 +87,8 @@ pub(crate) struct DiscoveredSlots {
     pub(crate) gam_network_id: Option<String>,
     /// The reconstructed slots, deduplicated by div id in first-seen order.
     pub(crate) slots: Vec<DiscoveredSlot>,
+    /// Diagnostics for placements whose normalized stable stems collided.
+    pub(crate) warnings: Vec<String>,
 }
 
 /// Reconstructs GPT slots from the page's live registry and ad requests.
@@ -105,24 +107,39 @@ pub(crate) fn discover_gpt_slots(
     page_has_prebid: bool,
 ) -> DiscoveredSlots {
     let mut slots = Vec::new();
+    let mut warnings = Vec::new();
     let mut gam_network_id = None;
-    let mut seen_divs: BTreeMap<String, String> = BTreeMap::new();
+    let mut registry_divs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     for entry in registry {
         let Some(slot) = slot_from_registry(entry, page_has_prebid) else {
             continue;
         };
-        push_slot_preserving_collisions(&mut slots, &mut seen_divs, slot, &entry.div_id);
+        if push_slot_preserving_collisions(&mut slots, &mut registry_divs, slot, &entry.div_id) {
+            warnings.push(format!(
+                "normalized div-id collision retained raw volatile id `{}`; it may not match a later render",
+                entry.div_id
+            ));
+        }
         if gam_network_id.is_none() {
             gam_network_id = network_id_from_unit_path(&entry.gam_unit_path);
         }
     }
 
+    let registry_stems: BTreeSet<String> = registry_divs.keys().cloned().collect();
+    let mut request_divs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for request in requests {
         let Some((network_id, slot, raw_div)) = parse_gampad_request(&request.url) else {
             continue;
         };
-        push_slot_preserving_collisions(&mut slots, &mut seen_divs, slot, &raw_div);
+        if registry_stems.contains(&slot.div_id) {
+            continue;
+        }
+        if push_slot_preserving_collisions(&mut slots, &mut request_divs, slot, &raw_div) {
+            warnings.push(format!(
+                "normalized request div-id collision retained raw volatile id `{raw_div}`; it may not match a later render"
+            ));
+        }
         if gam_network_id.is_none() {
             gam_network_id = Some(network_id);
         }
@@ -132,31 +149,43 @@ pub(crate) fn discover_gpt_slots(
     DiscoveredSlots {
         gam_network_id,
         slots,
+        warnings,
     }
 }
 
+/// Adds one source-local slot while retaining distinct raw div IDs that share a stem.
+///
+/// Returns whether a normalized collision forced raw, potentially volatile IDs
+/// to be retained for both placements.
 fn push_slot_preserving_collisions(
     slots: &mut Vec<DiscoveredSlot>,
-    seen_divs: &mut BTreeMap<String, String>,
+    seen_divs: &mut BTreeMap<String, BTreeSet<String>>,
     mut slot: DiscoveredSlot,
     raw_div: &str,
-) {
+) -> bool {
     let normalized = slot.div_id.clone();
     let raw_div = raw_div.strip_suffix("-container").unwrap_or(raw_div);
-    match seen_divs.get(&normalized) {
+    match seen_divs.get_mut(&normalized) {
         None => {
-            seen_divs.insert(normalized, raw_div.to_string());
+            seen_divs.insert(normalized, BTreeSet::from([raw_div.to_string()]));
             slots.push(slot);
+            false
         }
-        Some(previous_raw) if previous_raw == raw_div => {}
-        Some(previous_raw) => {
+        Some(raw_divs) if raw_divs.contains(raw_div) => false,
+        Some(raw_divs) => {
+            let previous_raw = raw_divs
+                .first()
+                .expect("should have a first raw div after initial insertion")
+                .clone();
             if let Some(previous) = slots.iter_mut().find(|entry| entry.div_id == normalized) {
-                previous.div_id.clone_from(previous_raw);
-                previous.id = slot_id_from_div(previous_raw);
+                previous.div_id.clone_from(&previous_raw);
+                previous.id = slot_id_from_div(&previous_raw);
             }
             slot.div_id = raw_div.to_string();
             slot.id = slot_id_from_div(raw_div);
+            raw_divs.insert(raw_div.to_string());
             slots.push(slot);
+            true
         }
     }
 }
@@ -232,14 +261,14 @@ fn normalize_div_stem(div_id: &str) -> String {
     if let Some(matched) = REACT_USE_ID.find(stem) {
         cut = cut.min(matched.start());
     }
-    if let Some(matched) = UUID_SEGMENT.find(stem).or_else(|| {
-        HEX_HASH_SEGMENT.find_iter(stem).find(|matched| {
-            matched
-                .as_str()
-                .bytes()
-                .any(|byte| matches!(byte, b'a'..=b'f'))
-        })
-    }) {
+    let uuid = UUID_SEGMENT.find(stem);
+    let hex = HEX_HASH_SEGMENT.find_iter(stem).find(|matched| {
+        matched
+            .as_str()
+            .bytes()
+            .any(|byte| matches!(byte, b'a'..=b'f'))
+    });
+    if let Some(matched) = uuid.into_iter().chain(hex).min_by_key(regex::Match::start) {
         cut = cut.min(matched.start());
     }
     stem[..cut].trim_end_matches('-').to_string()
@@ -910,5 +939,49 @@ mod tests {
         );
         assert_eq!(discovered.slots[0].formats, vec![(300, 250)]);
         assert_ne!(discovered.slots[0].id, discovered.slots[1].id);
+        assert_eq!(
+            discovered.warnings.len(),
+            1,
+            "writing raw volatile IDs must be diagnosable"
+        );
+    }
+
+    #[test]
+    fn repeated_raw_div_after_a_normalization_collision_is_deduplicated() {
+        let first = "ad-x-aaaaaaaaaaaaaaaa-0";
+        let second = "ad-x-bbbbbbbbbbbbbbbb-1";
+        let registry = vec![
+            registry_slot("/123456789/site/home", first, &[(300, 250)]),
+            registry_slot("/123456789/site/home", second, &[(300, 250)]),
+            registry_slot("/123456789/site/home", second, &[(300, 250)]),
+        ];
+
+        let discovered = discover_gpt_slots(&registry, &[], false);
+
+        assert_eq!(
+            discovered.slots.len(),
+            2,
+            "an exact raw div repeat must remain first-seen deduplicated"
+        );
+    }
+
+    #[test]
+    fn request_rerender_does_not_rewrite_a_stable_registry_slot() {
+        let registry = vec![registry_slot(
+            "/123456789/site/home",
+            "ad-x-aaaaaaaaaaaaaaaa-0",
+            &[(300, 250)],
+        )];
+        let requests = vec![request(
+            "https://securepubads.g.doubleclick.net/gampad/ads?iu_parts=123456789%2Csite%2Chome&dids=ad-x-bbbbbbbbbbbbbbbb-1&prev_iu_szs=300x250",
+        )];
+
+        let discovered = discover_gpt_slots(&registry, &requests, false);
+
+        assert_eq!(discovered.slots.len(), 1, "registry evidence should win");
+        assert_eq!(
+            discovered.slots[0].div_id, "ad-x",
+            "request fallback must not destabilize a registry-derived prefix"
+        );
     }
 }

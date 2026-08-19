@@ -67,9 +67,9 @@ impl RenderSlot {
 
     /// Builds a slot from cross-page evidence and the inferred unit path.
     ///
-    /// `gam_unit_path` is `None` when inference refused to represent the slot;
-    /// the slot is still written so its div and formats are not lost, and the
-    /// runtime falls back to the default `/<network_id>/<id>` path.
+    /// Refused inference decisions are filtered before this constructor. A
+    /// `None` path therefore means inference was unavailable and deliberately
+    /// leaves the runtime's configured default-path behavior in effect.
     pub(super) fn from_evidence(
         id: &str,
         div_id: &str,
@@ -144,6 +144,8 @@ fn media_type_label(media_type: &MediaType) -> Option<&'static str> {
 /// - Otherwise existing slots are preserved (covering other pages / hand-tuned
 ///   fields); a slot re-seen this run has its page patterns and formats unioned;
 ///   slots seen only this run are appended.
+/// - Format identity includes media type, so equal dimensions observed for two
+///   media types remain two intentional entries.
 #[cfg(test)]
 pub(super) fn merge_slots(
     existing: Option<&CreativeOpportunitiesConfig>,
@@ -161,7 +163,7 @@ pub(super) fn merge_slots(
 
 /// Merges already-built slots into the existing set.
 ///
-/// Same reconciliation as [`merge_slots`], but the caller supplies the slots —
+/// Same reconciliation as the single-page test helper, but the caller supplies the slots —
 /// the crawl path builds them from cross-page evidence rather than from one
 /// page's discoveries. A slot re-seen this run keeps its configured fields and
 /// gains this run's patterns; a genuinely new slot is appended with a
@@ -285,9 +287,7 @@ fn matching_slot_index(existing: &[RenderSlot], discovered: &RenderSlot) -> Opti
     existing.iter().position(|slot| slot.key() == key)
 }
 
-/// Header comment emitted above the managed slot array. Stripped from the
-/// preserved scalar block on re-splice (see [`is_managed_comment_line`]) so
-/// repeated `generate` runs don't accumulate duplicate copies.
+/// Header comment emitted above the structurally replaced managed slot array.
 const MANAGED_SLOTS_COMMENT: &str = "# Slots managed by `ts audit ad-templates generate`.";
 /// Second line of the managed-slot header comment.
 const MANAGED_SLOTS_REVIEW_COMMENT: &str =
@@ -541,7 +541,7 @@ pub(super) fn splice_creative_slots(
 
     let mut result = document.to_string();
     if uses_crlf(existing) {
-        result = result.replace("\r\n", "\n").replace('\n', "\r\n");
+        result = convert_document_lf_to_crlf(&result);
     }
     ensure_only_managed_fields_changed(existing, &result)?;
     Ok(result)
@@ -582,7 +582,60 @@ fn ensure_only_managed_fields_changed(before: &str, after: &str) -> CliResult<()
 
 /// Whether `document` uses CRLF line endings (so edits preserve them).
 fn uses_crlf(document: &str) -> bool {
-    document.contains("\r\n")
+    let mut multiline: Option<u8> = None;
+    let bytes = document.as_bytes();
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        if let Some(quote) = multiline {
+            if bytes[index..].starts_with(&[quote, quote, quote]) {
+                multiline = None;
+                index += 3;
+                continue;
+            }
+        } else if bytes[index..].starts_with(b"\"\"\"") {
+            multiline = Some(b'\"');
+            index += 3;
+            continue;
+        } else if bytes[index..].starts_with(b"'''") {
+            multiline = Some(b'\'');
+            index += 3;
+            continue;
+        } else if bytes[index] == b'\n' {
+            return index > 0 && bytes[index - 1] == b'\r';
+        }
+        index += 1;
+    }
+    false
+}
+
+/// Converts document line terminators while leaving multiline-string content intact.
+fn convert_document_lf_to_crlf(document: &str) -> String {
+    let mut output = String::with_capacity(document.len());
+    let mut multiline: Option<char> = None;
+    let mut chars = document.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if matches!(ch, '\"' | '\'') {
+            let mut probe = chars.clone();
+            if probe.next() == Some(ch) && probe.next() == Some(ch) {
+                output.push(ch);
+                output.push(chars.next().expect("should have second quote"));
+                output.push(chars.next().expect("should have third quote"));
+                multiline = if multiline == Some(ch) {
+                    None
+                } else if multiline.is_none() {
+                    Some(ch)
+                } else {
+                    multiline
+                };
+                continue;
+            }
+        }
+        if ch == '\n' && multiline.is_none() && !output.ends_with('\r') {
+            output.push('\r');
+        }
+        output.push(ch);
+    }
+    output
 }
 
 /// Strips a trailing inline `# comment` from a candidate table-header line.
@@ -595,14 +648,6 @@ fn strip_inline_comment(line: &str) -> &str {
         Some(position) => line[..position].trim_end(),
         None => line,
     }
-}
-
-/// Whether `line` is exactly the `section_header` table header (for example
-/// `[creative_opportunities]`), tolerating surrounding whitespace and a
-/// trailing inline `# comment` — both valid TOML.
-#[cfg(test)]
-fn is_table_header(line: &str, section_header: &str) -> bool {
-    strip_inline_comment(line.trim()) == section_header
 }
 
 pub(super) fn replace_key_in_section(
@@ -655,52 +700,6 @@ pub(super) fn replace_key_in_section(
     Ok(output)
 }
 
-/// Sets `key` in `section`, replacing an existing assignment or inserting one.
-///
-/// [`replace_key_in_section`] can only rewrite a key that is already present, so
-/// it cannot add `section_root` or `section_segment` to a config that predates
-/// them — which is every config a first templated run touches. This inserts
-/// immediately after the section header instead, keeping the new key inside the
-/// section's scalar block rather than stranding it after a subtable, where TOML
-/// would read it as belonging to that subtable.
-///
-/// # Errors
-///
-/// Returns an error when `section` is not present in the document.
-#[cfg(test)]
-pub(super) fn upsert_key_in_section(
-    document: &str,
-    section: &str,
-    key: &str,
-    replacement_line: &str,
-) -> CliResult<String> {
-    if let Ok(replaced) = replace_key_in_section(document, section, key, replacement_line) {
-        return Ok(replaced);
-    }
-
-    let section_header = format!("[{section}]");
-    let Some(header_index) = document
-        .lines()
-        .position(|line| is_table_header(line, &section_header))
-    else {
-        return cli_error(format!(
-            "failed to update config because section `{section_header}` was not found"
-        ));
-    };
-
-    let mut lines: Vec<String> = document.lines().map(str::to_string).collect();
-    lines.insert(header_index + 1, replacement_line.to_string());
-
-    let mut output = lines.join("\n");
-    if document.ends_with('\n') {
-        output.push('\n');
-    }
-    if uses_crlf(document) {
-        output = output.replace("\r\n", "\n").replace('\n', "\r\n");
-    }
-    Ok(output)
-}
-
 fn is_key_line(trimmed_line: &str, key: &str) -> bool {
     trimmed_line
         .strip_prefix(key)
@@ -713,7 +712,7 @@ fn is_key_line(trimmed_line: &str, key: &str) -> bool {
 /// The existing id is kept only when a real merge preserves existing slots.
 /// On `--replace`, or when the config had no slots (e.g. a placeholder
 /// `[creative_opportunities]` section), the discovered id wins — mirroring
-/// [`merge_slots`], which returns discovered-only in those cases.
+/// the slot merge, which returns discovered-only in those cases.
 pub(super) fn resolve_network_id(
     existing: Option<&CreativeOpportunitiesConfig>,
     discovered_network_id: Option<&str>,
@@ -1039,30 +1038,6 @@ slot_id = "sidebar"
     }
 
     #[test]
-    fn upsert_keeps_an_inserted_key_inside_the_section_scalar_block() {
-        // Appending at the end of the section would land the key after a
-        // subtable, where TOML reads it as part of that subtable instead.
-        let document = "[creative_opportunities]\ngam_network_id = \"111\"\n\n\
-             [[creative_opportunities.slot]]\nid = \"a\"\n\
-             page_patterns = [\"/\"]\nformats = [{ width = 1, height = 1 }]\n";
-
-        let out = upsert_key_in_section(
-            document,
-            "creative_opportunities",
-            "section_root",
-            "section_root = \"homepage\"",
-        )
-        .expect("should insert");
-
-        let value = toml::from_str::<toml::Value>(&out).expect("valid TOML");
-        assert_eq!(
-            value["creative_opportunities"]["section_root"].as_str(),
-            Some("homepage"),
-            "the key must belong to the section, not the slot subtable"
-        );
-    }
-
-    #[test]
     fn splice_refuses_fresh_section_without_a_network_id() {
         // Reachable whenever the scraped unit path has no all-digit leading
         // segment (MCM/child-network paths). Writing the section anyway produces
@@ -1177,6 +1152,38 @@ slot_id = "sidebar"
     }
 
     #[test]
+    fn splice_does_not_infer_document_endings_from_multiline_string_content() {
+        let existing = "[publisher]\nother = \"\"\"a\r\nb\"\"\"\n\n\
+             [creative_opportunities]\ngam_network_id = \"111\"\n";
+
+        let out = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
+            .expect("should splice LF document");
+
+        assert!(
+            out.contains("[publisher]\nother"),
+            "an embedded CRLF must not convert document line endings"
+        );
+        assert!(
+            out.contains("a\r\nb"),
+            "an unrelated multiline string value must remain byte-identical"
+        );
+    }
+
+    #[test]
+    fn splice_does_not_rewrite_bare_lf_inside_crlf_multiline_string() {
+        let existing = "[publisher]\r\nother = \"\"\"a\nb\"\"\"\r\n\r\n\
+             [creative_opportunities]\r\ngam_network_id = \"111\"\r\n";
+
+        let out = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
+            .expect("should splice CRLF document");
+
+        assert!(
+            out.contains("a\nb"),
+            "a bare LF inside an unrelated multiline value must remain unchanged"
+        );
+    }
+
+    #[test]
     fn render_slots_writes_non_finite_floor_price_as_valid_toml() {
         let slot = RenderSlot {
             id: "header".to_string(),
@@ -1262,7 +1269,7 @@ slot_id = "sidebar"
 
         assert_eq!(
             out.lines()
-                .filter(|line| is_table_header(line, "[creative_opportunities]"))
+                .filter(|line| { strip_inline_comment(line.trim()) == "[creative_opportunities]" })
                 .count(),
             1,
             "commented header must not be duplicated"

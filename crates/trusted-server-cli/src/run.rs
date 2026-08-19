@@ -438,21 +438,57 @@ mod tests {
             let Command::Audit(audit) = args.command else {
                 panic!("expected audit command");
             };
-            let browser = match audit.command.expect("should parse audit subcommand") {
-                crate::commands::audit::AuditSubcommand::AdTemplates(
-                    crate::commands::audit::AuditAdTemplatesCommand::Generate(args),
-                ) => args.browser,
-                crate::commands::audit::AuditSubcommand::AdTemplates(
-                    crate::commands::audit::AuditAdTemplatesCommand::Verify(args),
-                ) => args.browser,
-                _ => panic!("expected ad-template mode"),
-            };
-            assert_eq!(browser.chrome, Some(PathBuf::from("/tmp/test-chrome")));
-            assert!(browser.headful);
-            assert!(browser.no_assume_consent);
-            assert_eq!(browser.browser_proxy.as_deref(), Some("127.0.0.1:8080"));
-            browser.validate().expect("should validate settle bounds");
+            let (chrome, headful, no_assume_consent, browser_proxy, validation) =
+                match audit.command.expect("should parse audit subcommand") {
+                    crate::commands::audit::AuditSubcommand::AdTemplates(
+                        crate::commands::audit::AuditAdTemplatesCommand::Generate(args),
+                    ) => {
+                        let validation = args.browser.validate();
+                        (
+                            args.browser.chrome,
+                            args.browser.headful,
+                            args.browser.no_assume_consent,
+                            args.browser.browser_proxy,
+                            validation,
+                        )
+                    }
+                    crate::commands::audit::AuditSubcommand::AdTemplates(
+                        crate::commands::audit::AuditAdTemplatesCommand::Verify(args),
+                    ) => {
+                        let validation = args.browser.validate();
+                        (
+                            args.browser.chrome,
+                            args.browser.headful,
+                            args.browser.no_assume_consent,
+                            args.browser.browser_proxy,
+                            validation,
+                        )
+                    }
+                    _ => panic!("expected ad-template mode"),
+                };
+            assert_eq!(chrome, Some(PathBuf::from("/tmp/test-chrome")));
+            assert!(headful);
+            assert!(no_assume_consent);
+            assert_eq!(browser_proxy.as_deref(), Some("127.0.0.1:8080"));
+            validation.expect("should validate settle bounds");
         }
+    }
+
+    #[test]
+    fn audit_generate_does_not_expose_the_ignored_browser_profile_flag() {
+        assert!(
+            Args::try_parse_from([
+                "ts",
+                "audit",
+                "ad-templates",
+                "generate",
+                "https://www.example.com/",
+                "--browser-profile",
+                "mobile",
+            ])
+            .is_err(),
+            "generation device selection must use --profiles"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-(() => {
+;(() => {
   const tcData = {
     tcString: "",
     tcfPolicyVersion: 2,
@@ -14,14 +14,14 @@
     publisherCC: "US",
     purpose: { consents: {}, legitimateInterests: {} },
     vendor: { consents: {}, legitimateInterests: {} },
-    specialFeatureOptins: {},
+    specialFeatureOptins: {}
   }
   for (let index = 1; index <= 10; index += 1) {
     tcData.purpose.consents[index] = true
     tcData.purpose.legitimateInterests[index] = true
   }
 
-  const tcfapi = (command, version, callback) => {
+  const tcfapi = (command, version, callback, _parameter) => {
     if (typeof callback !== "function") return
     switch (command) {
       case "ping":
@@ -32,7 +32,7 @@
             cmpStatus: "loaded",
             displayStatus: "hidden",
             apiVersion: "2.0",
-            cmpId: 0,
+            cmpId: 0
           },
           true
         )
@@ -57,9 +57,12 @@
   const pin = (name, value) => {
     try {
       Object.defineProperty(window, name, {
-        value,
-        writable: false,
-        configurable: false,
+        get: () => value,
+        // Some CMP bundles assign these globals in strict mode. A no-op setter
+        // keeps the deterministic audit answer without throwing and aborting
+        // the publisher's CMP initialization.
+        set: () => {},
+        configurable: false
       })
     } catch (error) {
       // The page installed an earlier value; leave it untouched.

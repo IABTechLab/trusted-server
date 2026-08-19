@@ -41,9 +41,9 @@ pub(crate) trait AuditCollector {
     /// crawl — a fresh launch per page dominates the cost of a multi-page run,
     /// and a shared profile carries bot-protection clearance cookies site-wide.
     ///
-    /// Results are streamed rather than returned as a `Vec` so the caller can
-    /// fold each page into its evidence and drop the page's HTML immediately,
-    /// instead of holding every DOM serialization at once.
+    /// Collectors may buffer results until the browser session closes so CPU-heavy
+    /// HTML analysis cannot starve a single-threaded CDP event pump. The sink API
+    /// keeps that buffering policy private and lets simple collectors stream.
     ///
     /// # Errors
     ///

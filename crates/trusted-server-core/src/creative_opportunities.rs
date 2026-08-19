@@ -554,14 +554,14 @@ impl CreativeOpportunitySlot {
             .iter()
             .filter_map(|pattern| match compile_page_pattern(pattern) {
                 Ok(compiled) => Some(compiled),
-                Err(_) => {
+                Err(error) => {
                     // Build-time validation only requires *one* valid pattern
                     // per slot, so a mixed valid/invalid set passes the build
                     // with the bad pattern silently dropped here. Warn so the
                     // operator can see the slot matches fewer pages than
                     // configured.
                     log::warn!(
-                        "slot `{}`: dropping page pattern '{}' — it does not compile as a glob",
+                        "slot `{}`: dropping page pattern '{}': {error}",
                         self.id,
                         pattern
                     );
@@ -834,15 +834,12 @@ pub struct PrebidSlotParams {
 /// This is the single definition of what the runtime accepts as a page glob:
 /// a direct [`Pattern::new`], falling back to the `**`→`*` rewrite that
 /// [`CreativeOpportunitySlot::compile_patterns`] and
-/// [`matches_path`](CreativeOpportunitySlot::matches_path) apply. Tooling that
-/// writes patterns into operator config validates them through this function so
-/// it cannot persist a pattern the runtime would silently drop.
+/// [`matches_path`](CreativeOpportunitySlot::matches_path) apply.
 ///
 /// # Errors
 ///
 /// Returns an error string when the pattern compiles neither directly nor after
 /// normalisation.
-///
 pub(crate) fn compile_page_pattern(pattern: &str) -> Result<Pattern, String> {
     Pattern::new(pattern)
         .or_else(|_| Pattern::new(&pattern.replace("**", "*")))
@@ -992,8 +989,7 @@ pub struct AdStackGateInput {
 }
 
 /// Result of [`evaluate_ad_stack_gate`]: the three-state expectation plus the
-/// list of gates that blocked the stack (empty unless `expected` is
-/// [`No`](RuntimeAdStackExpected::No)).
+/// original inputs used to derive per-gate diagnostics on demand.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct AdStackGateResult {
     /// The three-state ad-stack expectation.

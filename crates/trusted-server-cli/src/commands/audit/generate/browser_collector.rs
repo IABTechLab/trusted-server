@@ -15,7 +15,7 @@ use crate::commands::audit::browser::{
     BrowserLaunchOptions, CONSENT_STUB_SCRIPT as SHARED_CONSENT_STUB_SCRIPT, build_browser_config,
     resolve_chrome, set_browser_cookies,
 };
-use crate::commands::audit::collector::BrowserOpts;
+use crate::commands::audit::collector::GenerateBrowserOpts;
 use crate::commands::audit::generate::collector::{
     AuditCollector, CollectedGptSlot, CollectedLink, CollectedPage, CollectedRequest,
     CollectedScriptTag, ControlFlow, PageSink, RootPlanner,
@@ -33,9 +33,8 @@ const SETTLE_MAX_WAIT: Duration = Duration::from_secs(12);
 const NAVIGATION_LOAD_TIMEOUT: Duration = Duration::from_secs(12);
 const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const PAGE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
-const RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD: usize = 250;
-const RESOURCE_TIMING_BUFFER_WARNING: &str =
-    "browser resource timing buffer reached its default size; some network assets may be missing";
+const RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD: usize = 100_000;
+const RESOURCE_TIMING_BUFFER_WARNING: &str = "browser resource timing buffer reached its configured size; some network assets may be missing";
 
 /// A device the crawl can emulate.
 ///
@@ -154,7 +153,7 @@ impl Default for BrowserAuditCollector {
 impl BrowserAuditCollector {
     /// Applies the browser options shared by generate, verify, and page audit.
     #[must_use]
-    pub(crate) fn with_browser_options(mut self, options: &BrowserOpts) -> Self {
+    pub(crate) fn with_browser_options(mut self, options: &GenerateBrowserOpts) -> Self {
         self.chrome.clone_from(&options.chrome);
         self.headful = options.headful;
         self.assume_consent = !options.no_assume_consent;
@@ -374,13 +373,7 @@ async fn with_browser(
         ))
     })?;
 
-    let handler_task = tokio::spawn(async move {
-        while let Some(event) = handler.next().await {
-            if event.is_err() {
-                break;
-            }
-        }
-    });
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
     // Sitemap discovery is a whole-site fact, so only the first target pays for it.
     let mut result = Ok(());
@@ -433,9 +426,7 @@ async fn with_browser(
                 report_error(format!("failed to close browser after audit: {error}"))
             })
         });
-    if close_result.is_err() {
-        handler_task.abort();
-    }
+    handler_task.abort();
     let _ = handler_task.await;
 
     match (result, close_result) {
@@ -479,12 +470,19 @@ async fn collect_page_from_browser(
 
     match (result, close_result) {
         (Err(error), _) => Err(error),
-        (Ok(_), Err(_)) => Err(report_error(
-            "timed out closing browser tab after page collection",
-        )),
-        (Ok(_), Ok(Err(error))) => Err(report_error(format!(
-            "failed to close browser tab after page collection: {error}"
-        ))),
+        (Ok(mut collected), Err(_)) => {
+            collected.warnings.push(
+                "page_close_timeout: timed out closing browser tab after page collection"
+                    .to_string(),
+            );
+            Ok(collected)
+        }
+        (Ok(mut collected), Ok(Err(error))) => {
+            collected.warnings.push(format!(
+                "page_close_failed: failed to close browser tab after page collection: {error}"
+            ));
+            Ok(collected)
+        }
         (Ok(collected), Ok(Ok(_))) => Ok(collected),
     }
 }
@@ -498,6 +496,8 @@ async fn collect_open_page(
     settle_quiet: Duration,
     settle_max: Duration,
 ) -> CliResult<CollectedPage> {
+    let mut warnings = Vec::new();
+
     // Must run before any page script, so the consent platform finds the APIs
     // already answered rather than installing its own gate.
     if assume_consent {
@@ -506,6 +506,10 @@ async fn collect_open_page(
             .map_err(|error| {
                 report_error(format!("failed to install the consent stub: {error}"))
             })?;
+        warnings.push(
+            "consent_stub_active: audit consent APIs were stubbed; re-run with --no-assume-consent to observe the publisher CMP without substitution"
+                .to_string(),
+        );
     }
     page.evaluate_on_new_document("performance.setResourceTimingBufferSize(100000)")
         .await
@@ -514,8 +518,6 @@ async fn collect_open_page(
                 "failed to increase the resource timing buffer: {error}"
             ))
         })?;
-
-    let mut warnings = Vec::new();
 
     // Navigate, but don't hard-fail when the `load` event never fires. Ad-heavy
     // pages (video players, continuous ad refresh, anti-bot scripts) can keep

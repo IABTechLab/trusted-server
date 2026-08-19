@@ -130,6 +130,8 @@ pub(super) struct EvidenceTable {
     pages: BTreeSet<String>,
     /// Page paths that produced no slot evidence at all.
     empty_pages: BTreeSet<String>,
+    /// Page paths that produced slot evidence on at least one selected profile.
+    non_empty_pages: BTreeSet<String>,
 }
 
 impl EvidenceTable {
@@ -144,9 +146,12 @@ impl EvidenceTable {
             self.network_ids.insert(network_id.clone());
         }
         if discovered.slots.is_empty() {
-            self.empty_pages.insert(path.to_string());
+            if !self.non_empty_pages.contains(path) {
+                self.empty_pages.insert(path.to_string());
+            }
             return;
         }
+        self.non_empty_pages.insert(path.to_string());
         self.empty_pages.remove(path);
 
         for slot in &discovered.slots {
@@ -531,6 +536,21 @@ mod tests {
         );
 
         assert!(table.empty_pages().is_empty());
+    }
+
+    #[test]
+    fn a_later_empty_profile_does_not_re_mark_a_non_empty_page() {
+        let mut table = EvidenceTable::default();
+        table.fold_page(
+            "/news",
+            &page(&[("/99/site/news", "ad-atf", &[(300, 250)])], false),
+        );
+        table.fold_page("/news", &page(&[], false));
+
+        assert!(
+            table.empty_pages().is_empty(),
+            "emptiness is a page-level fact across all selected profiles"
+        );
     }
 
     #[test]
