@@ -459,7 +459,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let path = req.uri().path().to_owned();
             let method = req.method().clone();
             let result = if path.starts_with("/static/tsjs=") {
-                handle_tsjs_dynamic(&req, &state.registry)
+                handle_tsjs_dynamic(
+                    &req,
+                    &state.registry,
+                    EdgeCacheHeader::CloudflareCdnCacheControl,
+                )
             } else if state.registry.has_route(&method, &path) {
                 let mut ec_context = EcContext::default();
                 state
@@ -559,19 +563,22 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post("/_ts/admin/keys/deactivate", |_ctx: RequestContext| async {
                 Ok::<Response, EdgeError>(admin_key_management_not_supported())
             })
-            // Admin EC lookup routes. Registered explicitly (like the key
-            // routes above) so they never fall through to the publisher
-            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
-            // coverage. The EC identity graph is Fastly KV backed, so this
-            // adapter has no store to read.
             .get("/_ts/admin/ec", |_ctx: RequestContext| async {
                 Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
             })
             .get("/_ts/admin/ec/{id}", |_ctx: RequestContext| async {
                 Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
             })
-            // Admin EIDs echo: pure request inspection (no KV), so this
-            // adapter serves the real handler.
+            .get(
+                "/_ts/admin/eids",
+                make_handler(Arc::clone(&state), |s, _services, req| async move {
+                    let partner_registry = PartnerRegistry::from_config(&s.settings.ec.partners)?;
+                    handle_admin_eids_lookup(&partner_registry, &req)
+                }),
+            )
+            // Render-trace toggle: arms/disarms the ts-trace cookie and
+            // redirects to `/`. Gated by [debug] trace_route_enabled (404 when
+            // off).
             .get(
                 "/_ts/admin/eids",
                 make_handler(Arc::clone(&state), |s, _services, req| async move {
