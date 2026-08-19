@@ -235,16 +235,27 @@ mod tests {
     }
 
     #[test]
-    fn publisher_tsjs_script_tag_rejects_html_sensitive_attribute_values() {
-        for value in ["bad\"value", "bad&value", "bad<value", "bad>value"] {
-            let result = std::panic::catch_unwind(|| {
-                let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", value)]);
-            });
-            assert!(
-                result.is_err(),
-                "should reject HTML-sensitive value `{value}`"
-            );
-        }
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_double_quote_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad\"value")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_ampersand_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad&value")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_less_than_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad<value")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_greater_than_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad>value")]);
     }
 
     #[test]
