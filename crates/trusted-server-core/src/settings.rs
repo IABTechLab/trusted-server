@@ -2207,8 +2207,8 @@ impl Settings {
     /// admin routes to `crates/trusted-server-adapter-fastly/src/app.rs`.
     ///
     /// The `/_ts/admin/ec/{id}` entry is the canonical router pattern. Handler
-    /// coverage is checked against a representative concrete EC ID via
-    /// [`admin_auth_probe`](Self::admin_auth_probe), while validation errors
+    /// coverage is checked against representative concrete EC IDs via
+    /// [`admin_auth_probes`](Self::admin_auth_probes), while validation errors
     /// continue to report this operator-facing route template.
     pub(crate) const ADMIN_ENDPOINTS: &[&str] = &[
         "/_ts/admin/keys/rotate",
@@ -2218,16 +2218,23 @@ impl Settings {
         "/_ts/admin/eids",
     ];
 
-    const ADMIN_EC_ID_AUTH_PROBE: &str = concat!(
-        "/_ts/admin/ec/",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ".abc123",
-    );
+    const ADMIN_EC_ID_AUTH_PROBES: [&str; 2] = [
+        concat!(
+            "/_ts/admin/ec/",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ".abc123",
+        ),
+        concat!(
+            "/_ts/admin/ec/",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ".Ab12Z9",
+        ),
+    ];
 
-    fn admin_auth_probe(path: &'static str) -> &'static str {
+    fn admin_auth_probes(path: &'static str) -> [&'static str; 2] {
         match path {
-            "/_ts/admin/ec/{id}" => Self::ADMIN_EC_ID_AUTH_PROBE,
-            path => path,
+            "/_ts/admin/ec/{id}" => Self::ADMIN_EC_ID_AUTH_PROBES,
+            path => [path, path],
         }
     }
 
@@ -2245,12 +2252,16 @@ impl Settings {
     ) -> Result<Vec<&'static str>, Report<TrustedServerError>> {
         let mut uncovered = Vec::new();
         for &path in Self::ADMIN_ENDPOINTS {
-            let mut covered = false;
-            for h in &self.handlers {
-                if h.matches_path(Self::admin_auth_probe(path))? {
-                    covered = true;
-                    break;
+            let mut covered = true;
+            for probe in Self::admin_auth_probes(path) {
+                let mut probe_covered = false;
+                for handler in &self.handlers {
+                    if handler.matches_path(probe)? {
+                        probe_covered = true;
+                        break;
+                    }
                 }
+                covered &= probe_covered;
             }
             if !covered {
                 uncovered.push(path);
@@ -2284,10 +2295,15 @@ impl Settings {
         for handler in &self.handlers {
             let covers_admin = Self::ADMIN_ENDPOINTS
                 .iter()
-                .try_fold(false, |covered, path| {
-                    handler
-                        .matches_path(Self::admin_auth_probe(path))
-                        .map(|matches| covered || matches)
+                .try_fold(false, |covers_any_endpoint, path| {
+                    Self::admin_auth_probes(path).iter().try_fold(
+                        covers_any_endpoint,
+                        |covers_any_probe, probe| {
+                            handler
+                                .matches_path(probe)
+                                .map(|matches| covers_any_probe || matches)
+                        },
+                    )
                 })?;
 
             if covers_admin && is_admin_placeholder_password(handler.password.expose()) {
@@ -4982,7 +4998,7 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
-    fn from_toml_rejects_placeholder_password_for_concrete_admin_ec_handler() {
+    fn from_toml_rejects_lowercase_only_dynamic_admin_ec_auth_coverage() {
         let toml_str = crate_test_settings_str().replace(
             r#"path = "^/_ts/admin"
             username = "admin"
@@ -4993,6 +5009,31 @@ origin_host_header_overide = "www.example.com""#,
 
             [[handlers]]
             path = "^/_ts/admin/ec/[a-f0-9]{64}[.][a-z0-9]{6}$"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject lowercase-only dynamic EC auth coverage");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("/_ts/admin/ec/{id}"),
+            "should identify the mixed-case EC route as uncovered, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_placeholder_password_for_concrete_admin_ec_handler() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/[a-f0-9]{64}[.][A-Za-z0-9]{6}$"
             username = "admin"
             password = "change-me-admin-password""#,
         );
