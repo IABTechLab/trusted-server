@@ -119,6 +119,22 @@ describe('gpt_bootstrap.js fallback', () => {
     expect(adInit).toHaveBeenCalledTimes(1);
   });
 
+  it('fallback scheduler accepts only the first schedule call', () => {
+    runBootstrap();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    ts.scheduleInitialAdInit!({ first: { hb_pb: '1.00' } });
+    ts.scheduleInitialAdInit!({ second: { hb_pb: '2.00' } });
+    expect(ts.bids).toEqual({ first: { hb_pb: '1.00' } });
+
+    window.dispatchEvent(new Event('load'));
+    flushFrame();
+    flushFrame();
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
   it('fallback scheduler rides animation frames in a hidden document, holding adInit until first view', () => {
     // Mirrors the bundle scheduler's intended hidden-tab behavior: rAF is not
     // serviced while hidden, so a background-tab load holds the initial

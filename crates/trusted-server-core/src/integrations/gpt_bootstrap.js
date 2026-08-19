@@ -94,13 +94,15 @@
   // and deliberately identical to the bundle scheduler — the impression is
   // spent on a viewed tab, and the post-hydration guarantee holds whenever
   // the request is actually issued.
+  var initialAdInitScheduled = false;
   ts.scheduleInitialAdInit = function (initialBids, initialSlots) {
-    if ((ts.navGeneration || 0) !== 0) return;
+    if ((ts.navGeneration || 0) !== 0 || initialAdInitScheduled) return;
+    initialAdInitScheduled = true;
     // Slots are generation-guarded for the same reason the bids are: the
     // shared-template seam sends both, and an assignment made before this call
     // would overwrite a committed SPA navigation's slots.
-    if (initialSlots) ts.adSlots = initialSlots;
-    if (initialBids) ts.bids = initialBids;
+    if (initialSlots !== undefined) ts.adSlots = initialSlots;
+    if (initialBids !== undefined) ts.bids = initialBids;
     var fire = function () {
       if ((ts.navGeneration || 0) !== 0) return;
       if (typeof ts.adInit === "function") ts.adInit();

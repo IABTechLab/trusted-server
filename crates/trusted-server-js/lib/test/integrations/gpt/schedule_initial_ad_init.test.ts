@@ -148,6 +148,22 @@ describe('scheduleInitialAdInit', () => {
     expect(adInit).toHaveBeenCalledTimes(1);
   });
 
+  it('accepts only the first schedule call', async () => {
+    await importGptModule();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    ts.scheduleInitialAdInit!({ first: { hb_pb: '1.00' } });
+    ts.scheduleInitialAdInit!({ second: { hb_pb: '2.00' } });
+    expect(ts.bids).toEqual({ first: { hb_pb: '1.00' } });
+
+    window.dispatchEvent(new Event('load'));
+    flushFrame();
+    flushFrame();
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
   it('still runs after a query-only history change before load', async () => {
     // The SPA auction hook identifies routes by pathname only, so a query-only
     // replaceState is not a navigation: it must neither trigger an auction nor
@@ -328,6 +344,41 @@ describe('scheduleInitialAdInit', () => {
 
     expect(ts.adSlots).toEqual([ssrSlot]);
     expect(ts.bids).toEqual({ ssr_slot: { hb_pb: '1.00' } });
+  });
+
+  it('preserves head-injected slots when initialSlots is omitted', async () => {
+    await importGptModule();
+    const ts = (window as TestWindow).tsjs!;
+    ts.adInit = vi.fn();
+    const headSlot = {
+      id: 'head_slot',
+      gam_unit_path: '/123/head',
+      div_id: 'div-head',
+      formats: [[300, 250]] as Array<[number, number]>,
+    };
+    ts.adSlots = [headSlot];
+
+    ts.scheduleInitialAdInit!({ head_slot: { hb_pb: '1.00' } });
+
+    expect(ts.adSlots).toEqual([headSlot]);
+  });
+
+  it('replaces existing slots when initialSlots is explicitly empty', async () => {
+    await importGptModule();
+    const ts = (window as TestWindow).tsjs!;
+    ts.adInit = vi.fn();
+    ts.adSlots = [
+      {
+        id: 'stale_slot',
+        gam_unit_path: '/123/stale',
+        div_id: 'div-stale',
+        formats: [[300, 250]],
+      },
+    ];
+
+    ts.scheduleInitialAdInit!({}, []);
+
+    expect(ts.adSlots).toEqual([]);
   });
 
   it('drops the SSR slot definitions when a navigation has already committed', async () => {
