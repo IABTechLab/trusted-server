@@ -58,4 +58,3 @@ Changes will be made test-first where behavior changes:
 3. Run focused Rust and JavaScript tests after each implementation step.
 4. Run repository formatting, JavaScript formatting/tests, target-matched Rust tests,
    clippy aliases, parity tests, and CLI tests before handoff.
-
