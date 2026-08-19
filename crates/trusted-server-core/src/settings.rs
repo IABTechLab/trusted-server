@@ -1887,7 +1887,16 @@ pub struct DebugConfig {
 
     /// Content and verbosity of the `auction_html_comment` dump. Ignored
     /// when `auction_html_comment` is false.
-    #[serde(default)]
+    ///
+    /// The default table must stay omitted from serialized config blobs:
+    /// [`DebugConfig`] denies unknown fields, so an older binary rejects a blob
+    /// carrying this table during a mixed-version deployment or rollback. Any
+    /// non-default table still serializes and requires restoring a compatible
+    /// blob before rolling back.
+    #[serde(
+        default,
+        skip_serializing_if = "is_default_auction_debug_comment_options"
+    )]
     pub auction_html_comment_options: AuctionDebugCommentOptions,
 
     /// Enable the testing-only direct GAM-replace path and the verbose per-bid
@@ -1942,6 +1951,11 @@ fn default_auction_debug_metadata_keys() -> Vec<String> {
         .collect()
 }
 
+// This predicate preserves rollback compatibility by omitting the default table.
+fn is_default_auction_debug_comment_options(value: &AuctionDebugCommentOptions) -> bool {
+    *value == AuctionDebugCommentOptions::default()
+}
+
 /// Behavior of the `<!-- ts-debug: ... -->` auction dump. Only consulted when
 /// [`DebugConfig::auction_html_comment`] is true.
 ///
@@ -1949,7 +1963,7 @@ fn default_auction_debug_metadata_keys() -> Vec<String> {
 /// structs in this file, including the `DebugConfig` this struct nests
 /// under: an operator typo (e.g. `metadata_key` instead of `metadata_keys`)
 /// must fail config load loudly, not be silently ignored.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuctionDebugCommentOptions {
     /// Include the `provider_responses` section at all.
@@ -1965,9 +1979,15 @@ pub struct AuctionDebugCommentOptions {
     pub include_bids: bool,
 
     /// Subset of [`AUCTION_DEBUG_METADATA_ALLOWLIST`] to surface in
-    /// [`AuctionDebugCommentVerbosity::Redacted`] mode. Keys outside the
-    /// fixed allowlist are always dropped, config or not. This selector cannot
-    /// unlock provider diagnostics. Ignored when `verbosity` is `Full`.
+    /// [`AuctionDebugCommentVerbosity::Redacted`] mode. This selector cannot
+    /// unlock provider diagnostics, and entries outside the fixed allowlist are
+    /// rejected at config load by
+    /// [`validate_metadata_keys`](Self::validate_metadata_keys).
+    ///
+    /// [`AuctionDebugCommentVerbosity::Upstream`] builds on the redacted
+    /// metadata, so this subset still gates those three keys there; the six
+    /// upstream diagnostics are unlocked by `verbosity` alone. Ignored entirely
+    /// when `verbosity` is [`AuctionDebugCommentVerbosity::Full`].
     #[serde(default = "default_auction_debug_metadata_keys")]
     pub metadata_keys: Vec<String>,
 
@@ -2011,6 +2031,39 @@ impl AuctionDebugCommentOptions {
             .map(|key| key.trim().to_string())
             .filter(|key| !key.is_empty())
             .collect();
+    }
+
+    /// Reject [`Self::metadata_keys`] entries outside
+    /// [`AUCTION_DEBUG_METADATA_ALLOWLIST`].
+    ///
+    /// Render time intersects the configured list with the allowlist, so an
+    /// entry outside it is dead config that silently renders `metadata: {}`.
+    /// Fail the load loudly instead, matching the `deny_unknown_fields`
+    /// contract on this struct. The render-time intersection stays as
+    /// defense-in-depth for config paths that bypass this check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] naming every unknown key.
+    pub(crate) fn validate_metadata_keys(&self) -> Result<(), Report<TrustedServerError>> {
+        let unknown: Vec<&str> = self
+            .metadata_keys
+            .iter()
+            .map(String::as_str)
+            .filter(|key| !AUCTION_DEBUG_METADATA_ALLOWLIST.contains(key))
+            .collect();
+
+        if unknown.is_empty() {
+            return Ok(());
+        }
+
+        Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "debug.auction_html_comment_options.metadata_keys contains unsupported keys [{}]; supported keys are [{}]",
+                unknown.join(", "),
+                AUCTION_DEBUG_METADATA_ALLOWLIST.join(", ")
+            ),
+        }))
     }
 }
 
@@ -2180,12 +2233,16 @@ impl Settings {
     /// # Errors
     ///
     /// Returns a configuration error if any cached runtime artifact cannot be
-    /// prepared, if any handler path regex does not compile, or if a creative
-    /// opportunity slot is invalid.
+    /// prepared, if any handler path regex does not compile, if a creative
+    /// opportunity slot is invalid, or if
+    /// [`AuctionDebugCommentOptions::metadata_keys`] names an unsupported key.
     pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.image_optimizer.prepare_runtime()?;
         self.proxy.prepare_runtime()?;
         self.tinybird.prepare_runtime()?;
+        self.debug
+            .auction_html_comment_options
+            .validate_metadata_keys()?;
         self.validate_asset_image_optimizer_profile_sets()?;
 
         for handler in &self.handlers {
@@ -2807,6 +2864,90 @@ mod tests {
         assert!(
             result.is_err(),
             "unrecognized verbosity must fail to deserialize, not silently fall back"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_unknown_metadata_key_fails_config_load() {
+        let toml = format!(
+            "{}\n[debug]\nauction_html_comment = true\n\n[debug.auction_html_comment_options]\nmetadata_keys = [\"http_staus\", \"errors\"]\n",
+            crate_test_settings_str()
+        );
+        let error = Settings::from_toml(&toml)
+            .expect_err("should reject metadata keys outside the fixed allowlist");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("http_staus") && rendered.contains("errors"),
+            "error should name every unsupported key, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_allowlisted_metadata_keys_load() {
+        let toml = format!(
+            "{}\n[debug]\nauction_html_comment = true\n\n[debug.auction_html_comment_options]\nmetadata_keys = [\" message \"]\n",
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml).expect("should accept an allowlisted key");
+        assert_eq!(
+            settings.debug.auction_html_comment_options.metadata_keys,
+            vec!["message".to_string()],
+            "normalize should trim before validation runs"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_unknown_field_fails_config_load() {
+        let result: Result<AuctionDebugCommentOptions, _> =
+            toml::from_str(r#"metadata_key = ["message"]"#);
+        assert!(
+            result.is_err(),
+            "a misspelled field must fail config load, not be silently ignored"
+        );
+    }
+
+    #[test]
+    fn default_auction_debug_comment_options_stay_out_of_serialized_config() {
+        // Rollback contract: `DebugConfig` denies unknown fields, so the
+        // previous binary rejects a config blob carrying a table it does not
+        // know. Defaults must therefore serialize to nothing.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyDebugConfig {
+            #[serde(default)]
+            ja4_endpoint_enabled: bool,
+            #[serde(default)]
+            auction_html_comment: bool,
+            #[serde(default)]
+            inject_adm_for_testing: bool,
+        }
+
+        let value = serde_json::to_value(DebugConfig::default())
+            .expect("should serialize the default debug config");
+        assert!(
+            value.get("auction_html_comment_options").is_none(),
+            "default options table should not be serialized, got {value}"
+        );
+
+        let legacy: LegacyDebugConfig = serde_json::from_value(value)
+            .expect("legacy schema should accept the default debug payload");
+        assert!(!legacy.ja4_endpoint_enabled);
+        assert!(!legacy.auction_html_comment);
+        assert!(!legacy.inject_adm_for_testing);
+
+        let configured = DebugConfig {
+            auction_html_comment: true,
+            auction_html_comment_options: AuctionDebugCommentOptions {
+                include_bids: false,
+                ..AuctionDebugCommentOptions::default()
+            },
+            ..DebugConfig::default()
+        };
+        let value =
+            serde_json::to_value(&configured).expect("should serialize a configured debug config");
+        assert!(
+            value.get("auction_html_comment_options").is_some(),
+            "non-default options must still serialize, got {value}"
         );
     }
 

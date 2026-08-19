@@ -39,7 +39,9 @@ use crate::auction::endpoints::{
 };
 use crate::auction::formats::sanitize_publisher_page_url;
 use crate::auction::orchestrator::{
-    AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction,
+    AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction, ERROR_TYPE_ALL,
+    ERROR_TYPE_HTTP_STATUS, ERROR_TYPE_LAUNCH_FAILED, ERROR_TYPE_PARSE_RESPONSE,
+    ERROR_TYPE_TIMEOUT, ERROR_TYPE_TRANSPORT,
 };
 use crate::auction::telemetry::{
     AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
@@ -1892,15 +1894,14 @@ fn truncate_with_marker(value: &str, max: usize) -> String {
 }
 
 /// Return a recognized server-owned provider error classification.
+///
+/// Validates against [`ERROR_TYPE_ALL`] rather than a local literal list so a
+/// classification added in the orchestrator cannot drift out of the dump.
 fn validated_error_type(
     metadata: &std::collections::HashMap<String, serde_json::Value>,
 ) -> Option<&str> {
     let value = metadata.get("error_type")?.as_str()?;
-    matches!(
-        value,
-        "parse_response" | "launch_failed" | "transport" | "timeout" | "http_status"
-    )
-    .then_some(value)
+    ERROR_TYPE_ALL.contains(&value).then_some(value)
 }
 
 /// Return a valid HTTP response status from provider metadata.
@@ -1914,13 +1915,17 @@ fn validated_http_status(
 }
 
 /// Generate public diagnostic wording without copying provider-controlled text.
+///
+/// Every [`ERROR_TYPE_ALL`] entry must map to wording here; the
+/// `redacted_metadata_covers_every_orchestrator_error_type` test fails when a
+/// new orchestrator classification is added without one.
 fn safe_error_message(error_type: &str, http_status: Option<u64>) -> Option<String> {
     match error_type {
-        "parse_response" => Some("Provider response could not be parsed".to_string()),
-        "launch_failed" => Some("Provider launch failed".to_string()),
-        "transport" => Some("Provider request failed".to_string()),
-        "timeout" => Some("Provider request timed out".to_string()),
-        "http_status" => Some(http_status.map_or_else(
+        ERROR_TYPE_PARSE_RESPONSE => Some("Provider response could not be parsed".to_string()),
+        ERROR_TYPE_LAUNCH_FAILED => Some("Provider launch failed".to_string()),
+        ERROR_TYPE_TRANSPORT => Some("Provider request failed".to_string()),
+        ERROR_TYPE_TIMEOUT => Some("Provider request timed out".to_string()),
+        ERROR_TYPE_HTTP_STATUS => Some(http_status.map_or_else(
             || "Provider returned an HTTP error".to_string(),
             |status| format!("Provider returned HTTP {status}"),
         )),
@@ -4718,6 +4723,28 @@ mod tests {
             let rendered = response_metadata_from_comment(&comment);
             assert_eq!(rendered["message"], serde_json::json!(expected));
             assert!(!comment.contains("raw-example-user-123"));
+        }
+    }
+
+    #[test]
+    fn redacted_metadata_covers_every_orchestrator_error_type() {
+        // Drift guard: adding a classification to ERROR_TYPE_ALL without wiring
+        // wording into safe_error_message would make it vanish from redacted
+        // dumps through the catch-all match arm.
+        for error_type in ERROR_TYPE_ALL {
+            let metadata = std::collections::HashMap::from([(
+                "error_type".to_string(),
+                serde_json::json!(error_type),
+            )]);
+            assert_eq!(
+                validated_error_type(&metadata),
+                Some(*error_type),
+                "{error_type} should be a recognized classification"
+            );
+            assert!(
+                safe_error_message(error_type, None).is_some(),
+                "{error_type} should map to safe diagnostic wording"
+            );
         }
     }
 

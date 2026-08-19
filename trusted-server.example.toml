@@ -181,6 +181,8 @@ auction_html_comment = false
 include_provider_responses = true
 include_mediator_response = true
 include_bids = true
+# Subset of the fixed validated metadata keys shown in "redacted" (and, for
+# these three keys, "upstream") mode. Any other key fails config load.
 metadata_keys = ["error_type", "http_status", "message"]
 # "redacted" (default), "upstream", or "full".
 # "upstream" exposes six untyped provider diagnostic values that may contain
