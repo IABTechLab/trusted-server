@@ -82,7 +82,7 @@ mod tests {
         TrustedClientIpConfig {
             ip_header: ip_header.to_owned(),
             auth_header: "x-trusted-client-auth".to_owned(),
-            shared_secret: Redacted::new("fictional-shared-secret".to_owned()),
+            shared_secret: Redacted::new("fictional-shared-secret-0123456789".to_owned()),
         }
     }
 
@@ -126,7 +126,10 @@ mod tests {
         let config = trusted_client_ip_config("x-trusted-client-ip");
         let mut req = fastly::Request::get("https://example.com/");
         req.set_header("x-trusted-client-ip", "198.51.100.7");
-        req.set_header("x-trusted-client-auth", "fictional-shared-secret");
+        req.set_header(
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        );
         req.set_header("host", "example.com");
 
         sanitize_fastly_forwarded_headers(&mut req, Some(&config));
@@ -147,7 +150,10 @@ mod tests {
         let config = trusted_client_ip_config("fastly-client-ip");
         let mut req = fastly::Request::get("https://example.com/");
         req.set_header("fastly-client-ip", "198.51.100.7");
-        req.set_header("x-trusted-client-auth", "fictional-shared-secret");
+        req.set_header(
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        );
 
         sanitize_fastly_forwarded_headers(&mut req, Some(&config));
 

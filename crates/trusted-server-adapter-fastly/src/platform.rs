@@ -788,13 +788,16 @@ mod tests {
         TrustedClientIpConfig {
             ip_header: "fastly-client-ip".to_owned(),
             auth_header: "x-trusted-client-auth".to_owned(),
-            shared_secret: Redacted::new("fictional-shared-secret".to_owned()),
+            shared_secret: Redacted::new("fictional-shared-secret-0123456789".to_owned()),
         }
     }
 
     fn authenticated_request(ip: impl AsRef<[u8]>) -> Request {
         let mut req = Request::get("https://example.com/");
-        req.set_header("x-trusted-client-auth", "fictional-shared-secret");
+        req.set_header(
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        );
         req.set_header("fastly-client-ip", ip.as_ref());
         req
     }
@@ -859,7 +862,10 @@ mod tests {
     #[test]
     fn resolve_client_ip_uses_peer_when_auth_is_duplicated() {
         let mut req = authenticated_request("198.51.100.7");
-        req.append_header("x-trusted-client-auth", "fictional-shared-secret");
+        req.append_header(
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        );
 
         let resolved = resolve_client_ip(&req, Some(PEER_IP), Some(&trusted_client_ip_config()));
 
@@ -871,7 +877,7 @@ mod tests {
         let mut req = Request::get("https://example.com/");
         req.set_header(
             "x-trusted-client-auth",
-            HeaderValue::from_bytes(b"fictional-shared-secret\xff")
+            HeaderValue::from_bytes(b"fictional-shared-secret-0123456789\xff")
                 .expect("should build non-UTF-8 auth header"),
         );
         req.set_header("fastly-client-ip", "198.51.100.7");
@@ -884,7 +890,10 @@ mod tests {
     #[test]
     fn resolve_client_ip_uses_peer_when_ip_is_missing() {
         let mut req = Request::get("https://example.com/");
-        req.set_header("x-trusted-client-auth", "fictional-shared-secret");
+        req.set_header(
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        );
 
         let resolved = resolve_client_ip(&req, Some(PEER_IP), Some(&trusted_client_ip_config()));
 

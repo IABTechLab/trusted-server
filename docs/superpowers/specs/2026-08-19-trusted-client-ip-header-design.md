@@ -50,8 +50,11 @@ shared_secret = "replace-with-a-random-shared-secret"
 
 All three fields are required when the section is present. `shared_secret` uses
 the existing `Redacted<String>` type so debug representations do not disclose
-it. Configuration validation rejects empty secrets, invalid header names, and
-identical header names.
+it. Configuration validation rejects invalid header names, identical header
+names, and secrets shorter than the 32-character minimum already applied to
+`ec.passphrase`. The shared `reject_placeholder_secrets` startup gate also
+rejects the placeholder secret published in the example configuration and
+guides, so a copied config cannot ship a publicly known secret.
 
 To ensure request entry can remove the fields without deleting a required HTTP
 field, `ip_header` must either be `fastly-client-ip` or begin with `x-`, and
