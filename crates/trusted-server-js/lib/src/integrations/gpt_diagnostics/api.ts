@@ -143,6 +143,32 @@ export class GptDiagnosticsApiController {
       show: () => this.presentation.show(),
       hide: () => this.presentation.hide(),
     });
+    const recorder: GptDiagnosticsRecorder = {
+      recordTrustedServerOpportunity: (
+        slot,
+        auctionSlotId,
+        opportunity,
+        trustedServerAuctionId,
+        requestedSlotSizes
+      ) =>
+        safelyRecord(() => {
+          this.store.recordTrustedServerOpportunity(
+            slot,
+            auctionSlotId,
+            opportunity,
+            trustedServerAuctionId,
+            requestedSlotSizes
+          );
+        }),
+      recordPrebidRefresh: (slots) => safelyRecord(() => this.store.recordPrebidRefresh(slots)),
+      recordTrustedServerCreativeRequest: (auctionSlotId) =>
+        safelyCreateAttempt(() => this.store.recordTrustedServerCreativeRequest(auctionSlotId)),
+      recordTrustedServerCreativeResponse: (attemptId) =>
+        safelyRecord(() => this.store.recordTrustedServerCreativeResponse(attemptId)),
+      recordTrustedServerCreativeFailure: (attemptId, reason) =>
+        safelyRecord(() => this.store.recordTrustedServerCreativeFailure(attemptId, reason)),
+    };
+    this.recorder = Object.freeze(recorder);
   }
 
   snapshot(): GptDiagnosticsExportV1 {
@@ -161,7 +187,29 @@ export class GptDiagnosticsApiController {
               Object.freeze({
                 ...cycle,
                 durations: Object.freeze({ ...cycle.durations }),
+                requestedSlotSizes: cycle.requestedSlotSizes
+                  ? Object.freeze(
+                      cycle.requestedSlotSizes.map((size) => Object.freeze([...size]))
+                    )
+                  : undefined,
                 size: cycle.size ? Object.freeze([...cycle.size]) : undefined,
+                observedSlotSize: cycle.observedSlotSize
+                  ? Object.freeze([...cycle.observedSlotSize])
+                  : undefined,
+                adManager: cycle.adManager
+                  ? Object.freeze({
+                      ...cycle.adManager,
+                      yieldGroupIds: cycle.adManager.yieldGroupIds
+                        ? Object.freeze([...cycle.adManager.yieldGroupIds])
+                        : undefined,
+                      companyIds: cycle.adManager.companyIds
+                        ? Object.freeze([...cycle.adManager.companyIds])
+                        : undefined,
+                    })
+                  : undefined,
+                trustedServerCreativeFailures: cycle.trustedServerCreativeFailures
+                  ? Object.freeze([...cycle.trustedServerCreativeFailures])
+                  : undefined,
               })
             )
           ),

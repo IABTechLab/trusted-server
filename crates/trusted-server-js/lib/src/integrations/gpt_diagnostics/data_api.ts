@@ -205,7 +205,29 @@ export class GptDiagnosticsDataApiController {
                 Object.freeze({
                   ...cycle,
                   durations: Object.freeze({ ...cycle.durations }),
+                  requestedSlotSizes: cycle.requestedSlotSizes
+                    ? Object.freeze(
+                        cycle.requestedSlotSizes.map((size) => Object.freeze([...size]))
+                      )
+                    : undefined,
                   size: cycle.size ? Object.freeze([...cycle.size]) : undefined,
+                  observedSlotSize: cycle.observedSlotSize
+                    ? Object.freeze([...cycle.observedSlotSize])
+                    : undefined,
+                  adManager: cycle.adManager
+                    ? Object.freeze({
+                        ...cycle.adManager,
+                        yieldGroupIds: cycle.adManager.yieldGroupIds
+                          ? Object.freeze([...cycle.adManager.yieldGroupIds])
+                          : undefined,
+                        companyIds: cycle.adManager.companyIds
+                          ? Object.freeze([...cycle.adManager.companyIds])
+                          : undefined,
+                      })
+                    : undefined,
+                  trustedServerCreativeFailures: cycle.trustedServerCreativeFailures
+                    ? Object.freeze([...cycle.trustedServerCreativeFailures])
+                    : undefined,
                 })
               )
             ),

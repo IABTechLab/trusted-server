@@ -91,13 +91,77 @@ impl GptDiagnosticsRequestDecision {
         self.active
             || self.cookie_action != GptDiagnosticsCookieAction::None
             || self.reserved_directive
+            || self.clean_browser_path_and_query.is_some()
     }
 
     /// Build the one-time inline URL-cleanup tag after reserved input was consumed.
     #[must_use]
     pub fn url_cleanup_script_tag(&self) -> Option<String> {
-        self.cleanup_browser_url
-            .then(|| format!("<script>{GPT_DIAGNOSTICS_BOOTSTRAP_SOURCE}</script>"))
+        let clean_path = serde_json::to_string(self.clean_browser_path_and_query.as_ref()?).ok()?;
+        Some(format!(
+            "<script>try{{history.replaceState(history.state,'',{clean_path}+location.hash)}}catch(_error){{}}</script>"
+        ))
+    }
+}
+
+#[cfg(test)]
+mod head_seam_invariant_tests {
+    use super::*;
+
+    /// Every combination of the three fields the decision carries.
+    fn all_decisions() -> Vec<GptDiagnosticsRequestDecision> {
+        let mut out = Vec::new();
+        for active in [false, true] {
+            for clean in [None, Some("/clean".to_string())] {
+                for cookie_action in [
+                    GptDiagnosticsCookieAction::None,
+                    GptDiagnosticsCookieAction::SetSession,
+                    GptDiagnosticsCookieAction::ClearSession,
+                ] {
+                    for reserved_directive in [false, true] {
+                        out.push(GptDiagnosticsRequestDecision {
+                            active,
+                            clean_browser_path_and_query: clean.clone(),
+                            cookie_action,
+                            reserved_directive,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn requires_private_no_store_is_a_superset_of_injection() {
+        // Load-bearing relationship, not an incidental one. Whenever this decision
+        // injects anything into `<head>`, the response must also be stamped
+        // `private, no-store` — which is what keeps request-scoped diagnostics out
+        // of a shared cache if the explicit assembly-mode gate in
+        // `create_html_stream_processor` is ever removed or bypassed.
+        //
+        // If a future change makes a script emit without also requiring the stamp,
+        // this fails here rather than silently in a cached template.
+        for decision in all_decisions() {
+            let injects = decision.url_cleanup_script_tag().is_some();
+            if injects {
+                assert!(
+                    decision.requires_private_no_store(),
+                    "decision injects into <head> but does not require private/no-store: \
+                     {decision:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_default_decision_injects_nothing() {
+        let decision = GptDiagnosticsRequestDecision::default();
+        assert_eq!(decision.url_cleanup_script_tag(), None);
+        assert!(
+            !decision.requires_private_no_store(),
+            "an inert decision should not force the response private"
+        );
     }
 }
 

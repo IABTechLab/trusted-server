@@ -2558,7 +2558,7 @@ pub struct DebugConfig {
 /// `metadata_keys` is a subset selector against this const, never a way to
 /// add new keys.
 pub(crate) const AUCTION_DEBUG_METADATA_ALLOWLIST: &[&str] =
-    &["error_type", "http_status", "message"];
+    &["drop_reasons", "error_type", "http_status", "message"];
 
 /// Provider-controlled diagnostic keys exposed only by `Upstream` or `Full`.
 ///
@@ -4244,6 +4244,7 @@ mod tests {
         assert_eq!(
             opts.metadata_keys,
             vec![
+                "drop_reasons".to_string(),
                 "error_type".to_string(),
                 "http_status".to_string(),
                 "message".to_string(),
@@ -7454,6 +7455,7 @@ proxy_secret = "secret"
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
+enabled = true
 gam_network_id = "21765378893"
 auction_timeout_ms = 500
 section_root = "home"
@@ -7495,6 +7497,7 @@ proxy_secret = "secret"
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
+enabled = true
 gam_network_id = "21765378893"
 
 [[creative_opportunities.slot]]
@@ -7531,6 +7534,7 @@ proxy_secret = "secret"
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
+enabled = true
 gam_network_id = "21765378893"
 "#;
         let slot_key = format!(
@@ -7573,6 +7577,7 @@ proxy_secret = "secret"
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
+enabled = true
 gam_network_id = "21765378893"
 
 [[creative_opportunities.slot]]

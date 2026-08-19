@@ -180,10 +180,7 @@ describe('GPT diagnostics public types', () => {
     expectTypeOf(evidenceCycle.requestedSlotSizes).toEqualTypeOf<ReadonlyArray<Size> | undefined>();
     expectTypeOf(evidenceCycle.observedSlotSize).toEqualTypeOf<Size | undefined>();
     expectTypeOf(evidenceSnapshot.attributionIssues).toEqualTypeOf<
-      GptDiagnosticsAttributionIssue[] | undefined
-    >();
-    expectTypeOf(evidenceSnapshot.metadata.droppedAttributionIssues).toEqualTypeOf<
-      number | undefined
+      readonly Readonly<GptDiagnosticsAttributionIssue>[]
     >();
     expectTypeOf<GptDiagnosticsAttributionIssueReason>().toEqualTypeOf<
       | 'creative_request_without_slot'

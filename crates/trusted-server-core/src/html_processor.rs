@@ -5,8 +5,13 @@ use std::cell::Cell;
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use lol_html::{Settings as RewriterSettings, element, html_content::ContentType, text};
+use lol_html::{
+    EndTagHandler, Settings as RewriterSettings, doc_comments, element, end,
+    html_content::{ContentType, EndTag},
+    text,
+};
 
 use crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision;
 use crate::integrations::{
@@ -17,8 +22,6 @@ use crate::integrations::{
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
-
-const EMPTY_AUCTION_PROJECTION_JSON: &str = r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[]}"#;
 
 /// Wraps [`HtmlRewriterAdapter`] with optional post-processing.
 ///
@@ -162,12 +165,9 @@ impl StreamProcessor for HtmlWithPostProcessing {
 /// §6.7.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum BodyCloseInjection {
-    /// Emit nothing because no slots matched under the inline path.
+    /// Emit nothing on the inline path.
     #[default]
     None,
-    /// Read the auction result from `ad_bids_state` and inject it, falling back to
-    /// an empty payload. Today's shipped behaviour.
-    InlineBids,
     /// Emit this markup verbatim — an inert marker the assembly step splits on.
     /// Must be identical for every request that reaches the transform, or the
     /// cached template is not shared-safe.
@@ -194,6 +194,8 @@ pub struct HtmlProcessorConfig {
     pub max_buffered_body_bytes: usize,
     /// Request-scoped conditional diagnostics delivery decision.
     pub gpt_diagnostics: Option<GptDiagnosticsRequestDecision>,
+    /// What the `</body>` seam injects for shared-template assembly.
+    pub body_close: BodyCloseInjection,
     /// Server-owned request-scoped render-trace overlay decision.
     pub render_trace_overlay: bool,
 }
@@ -217,6 +219,7 @@ impl HtmlProcessorConfig {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: settings.publisher.max_buffered_body_bytes,
             gpt_diagnostics: None,
+            body_close: BodyCloseInjection::None,
             render_trace_overlay: false,
         }
     }
@@ -340,10 +343,12 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     });
 
     let injected_tsjs = Rc::new(Cell::new(false));
+    let injected_body_close = Arc::new(AtomicBool::new(false));
     let integration_registry = config.integrations.clone();
     let script_rewriters = integration_registry.script_rewriters();
     let ad_bids_state = config.ad_bids_state.clone();
     let gpt_diagnostics = config.gpt_diagnostics.clone();
+    let body_close = config.body_close.clone();
     let render_trace_overlay = config.render_trace_overlay;
 
     // No source-comment neutralization here: rewriting a publisher comment that happens
@@ -353,13 +358,13 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let mut document_content_handlers = Vec::new();
     if let BodyCloseInjection::Marker(marker) = &body_close {
         let marker = marker.clone();
-        let injected_bids = Arc::clone(&injected_bids);
+        let injected_body_close = Arc::clone(&injected_body_close);
         document_content_handlers.push(end!(move |document_end| {
             // HTML fragments and malformed-but-renderable documents may never expose a
             // body end tag. Always mint a transform-owned terminal seam in that case;
             // otherwise source bytes equal to the reserved marker could be mistaken for
             // ownership by the post-transform exact-count validator.
-            if !injected_bids.swap(true, Ordering::SeqCst) {
+            if !injected_body_close.swap(true, Ordering::SeqCst) {
                 document_end.append(&marker, ContentType::Html);
             }
             Ok(())
@@ -375,8 +380,15 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let document_state = document_state.clone();
             let ad_bids_state = ad_bids_state.clone();
             let gpt_diagnostics = gpt_diagnostics.clone();
+            let body_close = body_close.clone();
             move |el| {
                 if !injected_tsjs.get() {
+                    // A shared C2 template must contain no request-scoped boot
+                    // data. Its single inert marker receives the complete boot
+                    // fragment during per-reader assembly at the body seam.
+                    if matches!(body_close, BodyCloseInjection::Marker(_)) {
+                        return Ok(());
+                    }
                     let mut snippet = String::new();
                     // The server has already interpreted and removed the reserved
                     // directive. This request-scoped inline cleanup only updates the
@@ -413,12 +425,12 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     let (debug_comment, projection_json) = match state_value {
                         Some(value) if value.starts_with("<!-- ts-debug:") => {
                             value.rsplit_once('\n').map_or(
-                                (Some(value), EMPTY_AUCTION_PROJECTION_JSON),
+                                (Some(value), tsjs::EMPTY_AUCTION_PROJECTION_JSON_V1),
                                 |(debug, json)| (Some(debug), json),
                             )
                         }
                         Some(value) => (None, value),
-                        None => (None, EMPTY_AUCTION_PROJECTION_JSON),
+                        None => (None, tsjs::EMPTY_AUCTION_PROJECTION_JSON_V1),
                     };
                     if let Some(debug_comment) = debug_comment {
                         snippet.push_str(debug_comment);
@@ -445,7 +457,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         tsjs::tsjs_bootstrap_fragment_v1(
                             tsjs::TsjsBootScriptConfigV1 {
                                 module_ids: &manifest_ids,
-                                auction_projection_json: EMPTY_AUCTION_PROJECTION_JSON,
+                                auction_projection_json: tsjs::EMPTY_AUCTION_PROJECTION_JSON_V1,
                                 creative,
                                 render_trace_overlay,
                                 gpt_diagnostics_active: diagnostics_active,
@@ -457,6 +469,30 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     snippet.push_str(&boot);
                     el.prepend(&snippet, ContentType::Html);
                     injected_tsjs.set(true);
+                }
+                Ok(())
+            }
+        }),
+        // Emit the shared-template marker immediately before the first body end
+        // tag. A document-end handler above provides the malformed-HTML fallback.
+        element!("body", {
+            let body_close = body_close.clone();
+            let injected_body_close = Arc::clone(&injected_body_close);
+            move |el| {
+                let BodyCloseInjection::Marker(marker) = &body_close else {
+                    return Ok(());
+                };
+                if let Some(handlers) = el.end_tag_handlers() {
+                    let marker = marker.clone();
+                    let injected_body_close = Arc::clone(&injected_body_close);
+                    let handler: EndTagHandler<'static> =
+                        Box::new(move |end_tag: &mut EndTag<'_>| {
+                            if !injected_body_close.swap(true, Ordering::SeqCst) {
+                                end_tag.before(&marker, ContentType::Html);
+                            }
+                            Ok(())
+                        });
+                    handlers.push(handler);
                 }
                 Ok(())
             }
@@ -999,6 +1035,92 @@ mod tests {
             "URL cleanup behavior must remain in its external request-scoped asset"
         );
         assert!(processed.contains(r#""gpt":{"active":true}"#));
+    }
+
+    #[test]
+    fn shared_template_is_reader_neutral_across_request_scoped_boot_inputs() {
+        const MARKER: &str = "<!--ts-ad-seam-->";
+        const HTML: &[u8] =
+            b"<html><head><title>Test</title></head><body><p>content</p></body></html>";
+
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt_diagnostics", &json!({ "enabled": true }))
+            .expect("should insert GPT diagnostics config");
+        settings
+            .integrations
+            .insert_config("gpt", &json!({}))
+            .expect("should insert the GPT event provider config");
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should build integration registry");
+
+        let mut request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://publisher.example/page?ts_console=1")
+            .header("sec-fetch-dest", "document")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build activation request");
+        let diagnostics =
+            crate::integrations::gpt_diagnostics::prepare_request(&settings, &mut request)
+                .expect("should prepare diagnostics request");
+
+        let render = |ad_slots_script: Option<String>,
+                      projection: Option<String>,
+                      diagnostics: Option<GptDiagnosticsRequestDecision>,
+                      render_trace_overlay: bool| {
+            let config = HtmlProcessorConfig {
+                body_close: BodyCloseInjection::Marker(MARKER.to_string()),
+                origin_host: "origin.example.com".to_string(),
+                request_host: "example.com".to_string(),
+                request_scheme: "https".to_string(),
+                integrations: registry.clone(),
+                ad_slots_script,
+                ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(projection)),
+                max_buffered_body_bytes: 16 * 1024 * 1024,
+                gpt_diagnostics: diagnostics,
+                render_trace_overlay,
+                suppress_datadome_client_side_tag: false,
+            };
+            let mut processor = create_html_processor(config);
+            String::from_utf8(
+                processor
+                    .process_chunk(HTML, true)
+                    .expect("should process shared template"),
+            )
+            .expect("shared template should be UTF-8")
+        };
+
+        let baseline = render(None, None, None, false);
+        let varied = render(
+            Some("request-specific-slot-data".to_string()),
+            Some(
+                r#"{"version":1,"auction":{"version":1,"auctionId":"request-specific-auction","results":[]},"slots":[],"bids":[]}"#
+                    .to_string(),
+            ),
+            Some(diagnostics),
+            true,
+        );
+
+        assert_eq!(
+            varied, baseline,
+            "shared template bytes must not depend on request-scoped boot inputs"
+        );
+        assert_eq!(baseline.matches(MARKER).count(), 1);
+        for forbidden in [
+            "request-specific-slot-data",
+            "request-specific-auction",
+            "__TSJS_SERVER_BOOT_INPUT_V1__",
+            "trustedserver-js",
+            "history.replaceState",
+            ".adSlots",
+            ".bids=",
+        ] {
+            assert!(
+                !baseline.contains(forbidden),
+                "shared template must not contain request-scoped `{forbidden}`: {baseline}"
+            );
+        }
     }
 
     #[test]
@@ -1736,6 +1858,7 @@ mod tests {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(Some(projection.to_owned()))),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            body_close: BodyCloseInjection::None,
             render_trace_overlay: false,
         };
         let mut processor = create_html_processor(config);
@@ -1772,8 +1895,7 @@ mod tests {
         let projection = r#"{"version":1,"auction":{"version":1,"auctionId":"auction-body","results":[]},"slots":[],"bids":[]}"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(projection.to_owned())));
         let config = HtmlProcessorConfig {
-            csp_nonce_observed: None,
-            body_close: BodyCloseInjection::InlineBids,
+            body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
@@ -1810,8 +1932,7 @@ mod tests {
         let projection = r#"{"version":1,"auction":{"version":1,"auctionId":"auction-many-bodies","results":[]},"bids":[]}"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(projection.to_owned())));
         let config = HtmlProcessorConfig {
-            csp_nonce_observed: None,
-            body_close: BodyCloseInjection::InlineBids,
+            body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
@@ -1906,8 +2027,7 @@ mod tests {
     fn injects_safe_empty_projection_when_auction_returned_nothing() {
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
-            csp_nonce_observed: None,
-            body_close: BodyCloseInjection::InlineBids,
+            body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
@@ -2109,6 +2229,7 @@ mod tests {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            render_trace_overlay: false,
             suppress_datadome_client_side_tag: false,
         };
         let source =

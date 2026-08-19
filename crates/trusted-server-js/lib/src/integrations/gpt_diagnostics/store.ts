@@ -105,9 +105,9 @@ type RequestIntentSource = 'trusted_server_direct' | 'prebid_refresh' | 'publish
 
 interface PendingSourceEvidence {
   observedAtMs: number;
-  trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity;
-  trustedServerAuctionId?: string;
-  requestedSlotSizes?: ReadonlyArray<Size>;
+  trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity | undefined;
+  trustedServerAuctionId?: string | undefined;
+  requestedSlotSizes?: ReadonlyArray<Size> | undefined;
 }
 
 interface PendingRequestIntent {
@@ -704,6 +704,46 @@ export class GptDiagnosticsStore {
         }
       }
     );
+  }
+
+  /**
+   * Retain an outer CSS box only when this exact slot and request cycle still
+   * identify the latest filled render. Async DOM measurements use this guard so
+   * a prior render cannot alter a later refresh cycle.
+   */
+  recordObservedSlotSize(runtimeSlotNumber: number, requestNumber: number, size: Size): void {
+    if (
+      !Number.isSafeInteger(requestNumber) ||
+      requestNumber <= 0 ||
+      !Number.isFinite(size[0]) ||
+      !Number.isFinite(size[1]) ||
+      size[0] < 0 ||
+      size[1] < 0
+    ) {
+      return;
+    }
+
+    const record = this.slots.get(runtimeSlotNumber);
+    const cycle = record?.requests.find((candidate) => candidate.requestNumber === requestNumber);
+    if (
+      !record ||
+      !cycle ||
+      record.requests[record.requests.length - 1] !== cycle ||
+      cycle.isEmpty !== false ||
+      cycle.renderAtMs === undefined
+    ) {
+      return;
+    }
+
+    const observedSlotSize: Size = [size[0], size[1]];
+    if (
+      cycle.observedSlotSize?.[0] === observedSlotSize[0] &&
+      cycle.observedSlotSize[1] === observedSlotSize[1]
+    ) {
+      return;
+    }
+    cycle.observedSlotSize = observedSlotSize;
+    this.notify();
   }
 
   recordSlotOnload(slot: GptDiagnosticsSlotLike, observedAtMs?: number): void {

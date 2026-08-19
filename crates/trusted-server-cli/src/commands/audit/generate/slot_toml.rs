@@ -507,21 +507,35 @@ pub(super) fn splice_creative_slots(
         );
     }
 
-    let generated = format!(
-        "[creative_opportunities]\n{}\n",
-        rendered_slots.trim_matches('\n')
-    );
-    let mut generated = generated
-        .parse::<DocumentMut>()
-        .map_err(|error| report_error(format!("failed to parse generated slot tables: {error}")))?;
-    let mut generated_slots = generated["creative_opportunities"]
-        .as_table_mut()
-        .and_then(|table| table.remove("slot"))
-        .unwrap_or_else(|| Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
-    if let Item::ArrayOfTables(array) = &mut generated_slots {
-        for table in array.iter_mut() {
-            set_table_position_recursive(table, section_position);
+    // No section yet — append a fresh explicitly enabled one with the network id and slots.
+    if !has_canonical_header {
+        // `enabled` and `gam_network_id` are required fields. Enablement is known
+        // because this command was explicitly asked to create discovered slots;
+        // a missing network id would still write a config that cannot load. This is reachable: the
+        // network id is only recovered when the scraped unit path starts with an
+        // all-digit segment, which an MCM/child-network path like
+        // `/1234,5678/home/header` does not.
+        let Some(network_id) = network_id else {
+            return cli_error(
+                "refusing to create a `[creative_opportunities]` section without a \
+                 GAM network id: none could be determined from the audited page, and \
+                 the key is required. Add `[creative_opportunities]` with a \
+                 `gam_network_id` to the config and re-run",
+            );
+        };
+        let _ = network_id;
+        let mut result = existing;
+        if !result.is_empty() && !result.ends_with('\n') {
+            result.push('\n');
         }
+        result.push_str("\n[creative_opportunities]\nenabled = true\n");
+        for (_, line) in keys.lines() {
+            result.push_str(&line);
+            result.push('\n');
+        }
+        result.push_str(rendered);
+        result.push('\n');
+        return Ok(result);
     }
 
     if !had_section {
@@ -821,7 +835,8 @@ slot_id = "sidebar"
     }
 
     fn existing_config(toml_str: &str) -> CreativeOpportunitiesConfig {
-        toml::from_str::<CreativeOpportunitiesConfig>(toml_str).expect("valid creative config")
+        toml::from_str::<CreativeOpportunitiesConfig>(&format!("enabled = true\n{toml_str}"))
+            .expect("valid creative config")
     }
 
     #[test]
@@ -839,6 +854,10 @@ slot_id = "sidebar"
         assert!(
             out.contains("gam_network_id = \"222\""),
             "network id updated"
+        );
+        assert!(
+            out.contains("enabled = true"),
+            "hard-cutover enablement should be preserved"
         );
         assert!(!out.contains("id = \"old\""), "old slot removed");
         assert!(

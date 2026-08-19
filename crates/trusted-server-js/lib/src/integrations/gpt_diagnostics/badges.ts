@@ -96,6 +96,33 @@ function formatMilliseconds(value: number | undefined): string | undefined {
   return `${Math.round(value)} ms`;
 }
 
+/** Use the store's evidence ladder verbatim; presentation never re-derives ownership. */
+function deliveryLabel(cycle: GptDiagnosticsRequestCycle): string | undefined {
+  switch (cycle.delivery) {
+    case 'trusted_server_response_sent':
+      return 'TS response sent';
+    case 'trusted_server_selected':
+      return 'TS selected';
+    case 'pending':
+      return 'TS candidate (pending)';
+    case 'candidate_unconfirmed':
+      return 'TS unconfirmed';
+    case 'no_candidate':
+      return 'No TS candidate';
+    case 'unknown':
+      return 'Delivery unknown';
+    case 'not_applicable':
+    case undefined:
+      return undefined;
+    default:
+      return unhandledCase(cycle.delivery);
+  }
+}
+
+function formatSizes(sizes: ReadonlyArray<readonly [number, number]>): string {
+  return sizes.map((size) => `${size[0]}×${size[1]}`).join(', ');
+}
+
 /** Format one observed GPT request cycle for both badge and accessible text surfaces. */
 export function formatGptDiagnosticsBadgeText(cycle: GptDiagnosticsRequestCycle): string {
   const firstLine: string[] = [];
