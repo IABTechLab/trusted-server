@@ -131,6 +131,20 @@ pub const HMAC_PROVIDER_KEY: &str = "hmac";
 /// arm when the host-signal provider becomes a module of its own.
 pub const HOST_SIGNALS_PROVIDER_KEY: &str = "host-signals";
 
+/// The configuration name of the client-fixed demonstration provider.
+///
+/// An ordinary name in the same open-ended namespace as [`HMAC_PROVIDER_KEY`],
+/// and nothing branches on it outside the resolution in [`build_provider`]. It
+/// is also `ClientFixedProvider`'s `id`, and it goes with that resolution arm
+/// when the demonstration provider becomes a module of its own. The provider
+/// type is not linked here because it is compiled in only under the
+/// `client-fixed-demo` cargo feature, while this name is always spelled.
+///
+/// The name is spelled here whether or not the provider is compiled in,
+/// because a build without it still has to recognize the name to reject the
+/// selection at startup rather than at the first request.
+pub const CLIENT_FIXED_PROVIDER_KEY: &str = "client-fixed";
+
 /// The provider names core supplies itself.
 ///
 /// A name in this list is already taken, so an adapter that injects a provider
@@ -140,7 +154,15 @@ pub const HOST_SIGNALS_PROVIDER_KEY: &str = "host-signals";
 /// shrinks with them, and it empties when the providers still built into core
 /// become modules like every other provider, at which point no name is
 /// reserved and every provider is injected.
-const BUILTIN_PROVIDER_KEYS: &[&str] = &[HMAC_PROVIDER_KEY, HOST_SIGNALS_PROVIDER_KEY];
+///
+/// [`CLIENT_FIXED_PROVIDER_KEY`] is listed whether or not the demonstration
+/// provider is compiled in, for the same reason the name itself is always
+/// spelled, which is that a build without it still owns the name.
+const BUILTIN_PROVIDER_KEYS: &[&str] = &[
+    HMAC_PROVIDER_KEY,
+    HOST_SIGNALS_PROVIDER_KEY,
+    CLIENT_FIXED_PROVIDER_KEY,
+];
 
 /// The registry code of the built-in HMAC provider.
 ///
@@ -170,6 +192,30 @@ pub struct IdentityInput<'a> {
     /// The request's consent context, when available, for provider-specific
     /// logic. The core gates on permissions, not consent, so a provider reads
     /// this only to forward or record consent. [`HmacProvider`] ignores it.
+    pub consent: Option<&'a ConsentContext>,
+}
+
+/// Inputs available to [`EdgeCookieProvider::resolve_from_client`].
+///
+/// Carries the value a client produced and posted to the Edge Cookie resolve
+/// endpoint, alongside the same gating context as [`IdentityInput`]. Request data
+/// reaches the provider through its injected services. Unlike trusted edge-derived
+/// data, [`payload`](Self::payload) arrives from the browser, so an
+/// implementation must verify it before deriving an identifier from it.
+pub struct ClientResolveInput<'a> {
+    /// The raw body the client posted to the resolve endpoint. For a vendor
+    /// provider this is its own JSON envelope; for the built-in
+    /// [`ClientFixedProvider`] demo it is the fixed known word the page script
+    /// posts.
+    pub payload: &'a [u8],
+
+    /// The permissions resolved for the resolve request. The endpoint has
+    /// already confirmed the provider's required permissions are set, so a
+    /// provider reads this only for behavior beyond gating.
+    pub permissions: Option<&'a PermissionState>,
+
+    /// The resolve request's consent context, for provider-specific logic. The
+    /// core gates on permissions, not consent.
     pub consent: Option<&'a ConsentContext>,
 }
 
@@ -614,6 +660,11 @@ impl<'a> AcceptedProviders<'a> {
 /// - **Server-side** (for example [`HmacProvider`]): derives the identifier at
 ///   the edge in [`generate`](Self::generate), and the page response sets the
 ///   cookie. Nothing client-side is involved.
+/// - **Client-side** (for example [`ClientFixedProvider`]): defers in
+///   [`generate`](Self::generate) (returns `id: None`), runs its own JavaScript
+///   in the browser, and mints from the value the page posts back in
+///   [`resolve_from_client`](Self::resolve_from_client), whose response sets the
+///   cookie.
 ///
 /// A provider that cannot derive an identifier at the edge returns a
 /// [`GeneratedEdgeCookie`] whose [`id`](GeneratedEdgeCookie::id) is `None`, so
@@ -653,6 +704,10 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
     /// Derives an Edge Cookie identifier from the request evidence in
     /// `request_info` and the gating context in `input`.
     ///
+    /// A server-side provider mints here. A client-side provider defers here
+    /// (returns `id: None`) and mints later in
+    /// [`resolve_from_client`](Self::resolve_from_client) from the value the page
+    /// posts back.
     ///
     /// # Errors
     ///
@@ -702,6 +757,30 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
     /// signal rules can gate it.
     fn required_permissions(&self) -> PermissionSet {
         PermissionSet::none()
+    }
+
+    /// Derives an Edge Cookie identifier from a value the client produced and
+    /// posted to the resolve endpoint (`POST /_ts/api/v1/ec/resolve`).
+    ///
+    /// This is the client-side counterpart to [`generate`](Self::generate). A
+    /// provider that cannot derive an identifier at the edge defers from
+    /// `generate` (returning `id: None`, optionally with response headers that
+    /// trigger client-side work), and the page posts its result back here. The
+    /// payload arrives from the browser, so an implementation MUST verify it
+    /// (for example checking a signature) before trusting it. The default
+    /// returns no identifier, so a provider that mints entirely server-side
+    /// (such as [`HmacProvider`]) need not implement it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::EdgeCookie`] when processing the payload
+    /// fails. A payload that is merely unverified or absent yields `id: None`
+    /// rather than an error, so the request proceeds without an Edge Cookie.
+    fn resolve_from_client(
+        &self,
+        _input: &ClientResolveInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        Ok(GeneratedEdgeCookie::default())
     }
 }
 
@@ -834,6 +913,91 @@ impl EdgeCookieProvider for HostSignalProvider {
     fn required_permissions(&self) -> PermissionSet {
         // Writes the Edge Cookie to the device, so it requires necessary.operations.storage
         // (TCF Purpose 1), the same gate as the HMAC provider.
+        PermissionSet::none().with(Permission::StoreOnDevice)
+    }
+}
+
+/// The fixed, known word shared by [`ClientFixedProvider`] and its page script.
+///
+/// Kept cookie-safe (no characters [`set_provider_ec_cookie`] would reject) so
+/// it can be used as the Edge Cookie value verbatim. The page script posts this
+/// exact string; the provider mints only when the posted value matches. The
+/// client copy lives in
+/// `crates/trusted-server-js/lib/src/integrations/ec_client_fixed`.
+///
+/// [`set_provider_ec_cookie`]: super::cookies::set_provider_ec_cookie
+#[cfg(any(test, feature = "client-fixed-demo"))]
+const EXPECTED_VALUE: &str = "an-ec";
+
+/// A demonstration client-side provider, with no vendor coupling.
+///
+/// Client and server share one fixed, known word (`EXPECTED_VALUE`). When no
+/// Edge Cookie is present the page script (delivered through the tsjs bundle)
+/// posts that word to `POST /_ts/api/v1/ec/resolve`, and this provider mints the
+/// Edge Cookie only when the posted value matches. It defers from
+/// [`generate`](EdgeCookieProvider::generate) so the page renders with no Edge
+/// Cookie until the client reports back, then verifies and mints in
+/// [`resolve_from_client`](EdgeCookieProvider::resolve_from_client).
+///
+/// The value is verifiable precisely because it is a known constant, which is
+/// the point of the demo: it exercises verify-before-mint. It is useless in
+/// production, because a fixed value is not an identity and every client posts
+/// the same word, so it is for demonstration and testing only. A real
+/// client-side provider verifies a real payload (for example an OWID signature)
+/// instead of a shared constant.
+#[derive(Debug, Clone)]
+#[cfg(any(test, feature = "client-fixed-demo"))]
+pub struct ClientFixedProvider;
+
+#[cfg(any(test, feature = "client-fixed-demo"))]
+impl EdgeCookieProvider for ClientFixedProvider {
+    fn id(&self) -> &'static str {
+        CLIENT_FIXED_PROVIDER_KEY
+    }
+
+    fn code(&self) -> ProviderCode {
+        crate::provider_code!("cfix")
+    }
+
+    fn generate(
+        &self,
+        _request_info: &dyn RequestInfo,
+        _input: &IdentityInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        // No identifier is derived at the edge: the value comes from the page
+        // script, which posts it to the resolve endpoint.
+        Ok(GeneratedEdgeCookie::default())
+    }
+
+    fn resolve_from_client(
+        &self,
+        input: &ClientResolveInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        // Verify the posted value against the known shared word, then mint it as
+        // the Edge Cookie. A value that does not match yields no Edge Cookie.
+        // This stands in for a real provider's verification (for example
+        // checking a signature) before it trusts a client-supplied value.
+        let matches = core::str::from_utf8(input.payload)
+            .map(str::trim)
+            .is_ok_and(|value| value == EXPECTED_VALUE);
+
+        Ok(GeneratedEdgeCookie {
+            id: matches.then(|| EXPECTED_VALUE.to_owned()),
+            response_headers: Vec::new(),
+        })
+    }
+
+    fn normalize_id_for_kv(&self, value: &str) -> String {
+        // The fixed word has no dot separator, so the built-in default (which
+        // normalizes the HMAC `<hash>.<suffix>` shape) would corrupt it as a
+        // KV key. Like any opaque-identifier provider, the value is the key.
+        value.to_owned()
+    }
+
+    fn required_permissions(&self) -> PermissionSet {
+        // The provider writes the resolved value to the device as the Edge
+        // Cookie, so it requires necessary.operations.storage (TCF Purpose 1), the same gate
+        // as the HMAC provider.
         PermissionSet::none().with(Permission::StoreOnDevice)
     }
 }
@@ -988,6 +1152,24 @@ fn resolve_named_provider(
         )));
     }
 
+    // The client-fixed demonstration provider takes no configuration block and
+    // no services, so it is built whenever it is selected. A fixed shared word
+    // is not an identity, so it is compiled only into test and demonstration
+    // builds and a build without it refuses the name rather than substituting
+    // anything. `check_named_provider_configuration` refuses the same name at
+    // startup, so reaching this error means the two have drifted apart.
+    if key == CLIENT_FIXED_PROVIDER_KEY {
+        #[cfg(any(test, feature = "client-fixed-demo"))]
+        return Ok(Box::new(ClientFixedProvider));
+        #[cfg(not(any(test, feature = "client-fixed-demo")))]
+        return Err(Report::new(TrustedServerError::EdgeCookie {
+            message: "The client-fixed demo Edge Cookie provider is not compiled into this \
+                      build. It is for demonstration and testing only; enable the \
+                      trusted-server-core `client-fixed-demo` cargo feature to use it"
+                .to_owned(),
+        }));
+    }
+
     injected
         .filter(|provider| provider.id() == key)
         .map(|provider| Box::new(SharedProvider(provider)) as Box<dyn EdgeCookieProvider>)
@@ -999,6 +1181,62 @@ fn resolve_named_provider(
                 ),
             })
         })
+}
+
+/// Checks that `key` names a provider this deployment could build, as far as
+/// the configuration on its own can answer.
+///
+/// The startup counterpart to [`resolve_named_provider`], and the reason
+/// configuration validation does not ask the settings whether a
+/// `[ec.providers.<name>]` block is present. Whether a name needs a block is
+/// the resolution's knowledge, not the settings', because a provider built from
+/// nothing (the client-fixed demonstration provider) is configured correctly
+/// with no block at all, while a build that does not compile that provider in
+/// cannot honor the name however it is configured. Both arms live here beside
+/// the resolution they belong to, and both go with it when these providers
+/// become modules.
+///
+/// Whether the host supplies a capability a provider needs is not answerable
+/// from configuration, so it is not asked here. [`ensure_provider_available`]
+/// asks that, with the services the adapter injects.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the name is not compiled
+/// into this build, or when it needs an `[ec.providers.<name>]` block that is
+/// absent.
+pub(crate) fn check_named_provider_configuration(
+    key: &str,
+    ec: &Ec,
+) -> Result<(), Report<TrustedServerError>> {
+    // The one name built from nothing, so a block lookup would reject the
+    // correctly configured case, and the one name a production build does not
+    // supply at all, which no amount of configuration can fix. Rejecting it
+    // here rather than when the provider is built means an operator finds out
+    // at startup instead of on the first request.
+    if key == CLIENT_FIXED_PROVIDER_KEY {
+        #[cfg(any(test, feature = "client-fixed-demo"))]
+        return Ok(());
+        #[cfg(not(any(test, feature = "client-fixed-demo")))]
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: "[ec] provider = \"client-fixed\" selects the demonstration provider, \
+                      which is not compiled into this build. Enable the trusted-server-core \
+                      `client-fixed-demo` cargo feature for demonstrations"
+                .to_owned(),
+        }));
+    }
+
+    // Every other name, whether core builds it or the adapter injects it, is
+    // configured by the `[ec.providers.<name>]` block carrying its own name.
+    if ec.providers.has_block(key) {
+        Ok(())
+    } else {
+        Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "Edge Cookie provider `{key}` is selected but has no `[ec.providers.{key}]` configuration"
+            ),
+        }))
+    }
 }
 
 /// Checks once, at startup, that this deployment can build the provider named
@@ -1162,6 +1400,13 @@ impl EdgeCookieProvider for SharedProvider {
 
     fn required_permissions(&self) -> PermissionSet {
         self.0.required_permissions()
+    }
+
+    fn resolve_from_client(
+        &self,
+        input: &ClientResolveInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        self.0.resolve_from_client(input)
     }
 }
 
@@ -1825,7 +2070,104 @@ mod tests {
     }
 
     #[test]
-    fn host_signal_provider_defers_without_signals() {
+    fn client_fixed_defers_in_generate() {
+        let request_info = test_request_info();
+        let generated = ClientFixedProvider
+            .generate(&request_info, &IdentityInput::default())
+            .expect("should generate");
+        assert!(
+            generated.id.is_none(),
+            "client-fixed should defer in generate, deriving no edge identifier"
+        );
+    }
+
+    #[test]
+    fn client_fixed_mints_when_posted_word_matches() {
+        let input = ClientResolveInput {
+            payload: EXPECTED_VALUE.as_bytes(),
+            permissions: None,
+            consent: None,
+        };
+        let generated = ClientFixedProvider
+            .resolve_from_client(&input)
+            .expect("should resolve");
+        assert_eq!(
+            generated.id.as_deref(),
+            Some(EXPECTED_VALUE),
+            "the known shared word should verify and mint the Edge Cookie"
+        );
+    }
+
+    #[test]
+    fn client_fixed_rejects_unknown_word() {
+        let input = ClientResolveInput {
+            payload: b"not-the-word",
+            permissions: None,
+            consent: None,
+        };
+        let generated = ClientFixedProvider
+            .resolve_from_client(&input)
+            .expect("should resolve");
+        assert!(
+            generated.id.is_none(),
+            "a value that does not match the known word should mint no Edge Cookie"
+        );
+    }
+
+    #[test]
+    fn client_fixed_requires_store_on_device() {
+        assert!(
+            ClientFixedProvider
+                .required_permissions()
+                .contains(Permission::StoreOnDevice),
+            "client-fixed writes a cookie, so it requires necessary.operations.storage"
+        );
+    }
+
+    #[test]
+    fn server_side_provider_inherits_no_op_resolve_from_client() {
+        // HmacProvider does not override resolve_from_client, so it inherits the
+        // no-op default: a server-side provider does not participate in the
+        // client cycle.
+        let provider = HmacProvider::new(test_passphrase());
+        let input = ClientResolveInput {
+            payload: b"anything",
+            permissions: None,
+            consent: None,
+        };
+        let generated = provider
+            .resolve_from_client(&input)
+            .expect("should resolve");
+        assert!(
+            generated.id.is_none(),
+            "a server-side provider inherits the no-op resolve_from_client default"
+        );
+    }
+
+    #[test]
+    fn the_fixed_word_and_marker_name_match_the_page_script() {
+        // The demo page script and this provider share the fixed word by
+        // convention; the resolved-marker cookie name is likewise shared with
+        // the script. Assert against the script source so a rename on either
+        // side fails this test instead of silently breaking the round trip.
+        let script = include_str!(
+            "../../../trusted-server-js/lib/src/integrations/ec_client_fixed/index.ts"
+        );
+        assert!(
+            script.contains(&format!("const FIXED_WORD = '{EXPECTED_VALUE}'")),
+            "the page script's FIXED_WORD should match EXPECTED_VALUE"
+        );
+        assert!(
+            script.contains(&format!(
+                "const MARKER_COOKIE_NAME = '{}'",
+                crate::constants::COOKIE_TS_EC_RESOLVED
+            )),
+            "the page script's marker cookie name should match COOKIE_TS_EC_RESOLVED"
+        );
+    }
+
+    #[test]
+    fn host_signal_provider_defers_without_fingerprints() {
         let signals = Arc::new(TestHostSignals {
             ja4: None,
             h2: None,
@@ -2043,6 +2385,73 @@ mod tests {
         });
         ensure_provider_available(&selected, Some(signals), None).expect(
             "should pass on a host that injects host signals, whatever this request's signals are",
+        );
+    }
+
+    #[test]
+    fn the_configuration_check_and_the_resolution_agree_on_a_provider_with_no_block() {
+        // The demonstration provider is configured correctly with no
+        // `[ec.providers.*]` block at all, so a check that asked the settings
+        // whether a block was present rejected a valid deployment. The check
+        // asks the resolution instead, and the two must give the same answer,
+        // because a startup check that passes what the construction then
+        // refuses leaves the deployment failing on its first request.
+        let ec = Ec {
+            provider: Some(EcProviderSelection::from(CLIENT_FIXED_PROVIDER_KEY)),
+            ..Ec::default()
+        };
+
+        ec.validate_provider_selection()
+            .expect("client-fixed should validate with no configuration block");
+
+        let built = build_provider(&ec, None, None)
+            .expect("client-fixed should build with no configuration and no services")
+            .expect("client-fixed should yield a provider");
+        assert_eq!(
+            built.id(),
+            CLIENT_FIXED_PROVIDER_KEY,
+            "the built provider should be the one the selector names"
+        );
+    }
+
+    #[test]
+    fn a_name_that_needs_a_block_still_fails_without_one() {
+        // Taking the block question out of the settings must not weaken it for
+        // the names that do need a block.
+        let ec = Ec {
+            provider: Some(EcProviderSelection::from(HMAC_PROVIDER_KEY)),
+            ..Ec::default()
+        };
+
+        let err = ec
+            .validate_provider_selection()
+            .expect_err("hmac with no block should still fail at startup");
+        assert!(
+            err.to_string().contains("[ec.providers.hmac]"),
+            "the error should name the missing block, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_block_left_configured_alongside_a_blockless_provider_is_still_rejected() {
+        // The unreferenced-block rule does not soften for a provider that
+        // needs no block of its own: a stale block is still a mistake.
+        let mut providers = EcProviders::default();
+        providers.hmac = Some(HmacProviderConfig {
+            passphrase: test_passphrase(),
+        });
+        let ec = Ec {
+            provider: Some(EcProviderSelection::from(CLIENT_FIXED_PROVIDER_KEY)),
+            providers,
+            ..Ec::default()
+        };
+
+        let err = ec
+            .validate_provider_selection()
+            .expect_err("a stray hmac block should still be rejected");
+        assert!(
+            err.to_string().contains("hmac"),
+            "the error should name the unreferenced block, got: {err}"
         );
     }
 }

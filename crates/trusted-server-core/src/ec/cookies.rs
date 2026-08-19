@@ -16,7 +16,7 @@
 use edgezero_core::body::Body as EdgeBody;
 use http::{HeaderValue, Response, header};
 
-use crate::constants::COOKIE_TS_EC;
+use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_RESOLVED};
 use crate::settings::Settings;
 
 /// Maximum age for the EC cookie (1 year in seconds).
@@ -106,6 +106,48 @@ pub fn set_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>, ec_
     }
 }
 
+/// Sets an Edge Cookie minted by a client-cycle provider on the response.
+///
+/// Unlike [`set_ec_cookie`], the value is treated as opaque: it need not match
+/// the canonical HMAC id shape, because a client-cycle provider's identifier
+/// (for example a signed envelope, or the client-random demo's value) is not in
+/// that format. The value is still validated against the same identifier
+/// alphabet and length bound as every other identifier
+/// ([`ec_id_has_only_allowed_chars`]); a value outside the bounds is rejected
+/// (no cookie set) and logged, never rewritten, which prevents header
+/// injection. The same `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, and
+/// `Domain` attributes as [`set_ec_cookie`] apply.
+pub(crate) fn set_provider_ec_cookie(
+    settings: &Settings,
+    response: &mut Response<EdgeBody>,
+    value: &str,
+) {
+    if !ec_id_has_only_allowed_chars(value) {
+        log::error!(
+            "Rejecting provider Edge Cookie value of {} bytes: empty, over {} bytes, or              outside the identifier alphabet",
+            value.len(),
+            MAX_EC_ID_LEN,
+        );
+        return;
+    }
+
+    let cookie = format_set_cookie(
+        &settings.publisher.ec_cookie_domain(),
+        value,
+        COOKIE_MAX_AGE,
+    );
+    match HeaderValue::from_str(&cookie) {
+        Ok(val) => {
+            response.headers_mut().append(header::SET_COOKIE, val);
+        }
+        Err(e) => {
+            // Unreachable in practice: the identifier allowlist gates the value
+            // and format_set_cookie emits only controlled bytes.
+            log::warn!("Skipping provider EC Set-Cookie: invalid header value: {e}");
+        }
+    }
+}
+
 /// Expires the EC cookie by setting `Max-Age=0`.
 ///
 /// Used when a user revokes consent — the browser will delete the cookie
@@ -123,6 +165,46 @@ pub fn expire_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>) 
             // Unreachable in practice: format_set_cookie emits only
             // controlled bytes from operator-trusted configuration.
             log::warn!("Skipping EC cookie expiry Set-Cookie: invalid header value: {e}");
+        }
+    }
+    // Expire the resolved marker together with the Edge Cookie, so a page
+    // whose visitor later re-establishes the permission can resolve again.
+    let marker = format!(
+        "{COOKIE_TS_EC_RESOLVED}=; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age=0",
+        settings.publisher.ec_cookie_domain(),
+    );
+    match HeaderValue::from_str(&marker) {
+        Ok(val) => {
+            response.headers_mut().append(header::SET_COOKIE, val);
+        }
+        Err(e) => {
+            log::warn!("Skipping resolved-marker expiry Set-Cookie: invalid header value: {e}");
+        }
+    }
+}
+
+/// Sets the `non-HttpOnly` resolved-marker cookie alongside a client-cycle Edge
+/// Cookie.
+///
+/// The Edge Cookie itself is `HttpOnly`, so the page script cannot see it and
+/// would otherwise post to the resolve endpoint on every page view. The marker
+/// carries no identity (its value is `1`); it only signals that a resolve
+/// succeeded. It shares the Edge Cookie's `Domain`, `Path`, `Secure`,
+/// `SameSite`, and lifetime, and is expired together with it by
+/// [`expire_ec_cookie`].
+pub(crate) fn set_resolved_marker_cookie(settings: &Settings, response: &mut Response<EdgeBody>) {
+    let cookie = format!(
+        "{COOKIE_TS_EC_RESOLVED}=1; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={COOKIE_MAX_AGE}",
+        settings.publisher.ec_cookie_domain(),
+    );
+    match HeaderValue::from_str(&cookie) {
+        Ok(val) => {
+            response.headers_mut().append(header::SET_COOKIE, val);
+        }
+        Err(e) => {
+            // Unreachable in practice: the value is a constant and the domain
+            // comes from operator-trusted configuration.
+            log::warn!("Skipping resolved-marker Set-Cookie: invalid header value: {e}");
         }
     }
 }
@@ -326,6 +408,66 @@ foo=bar",
                 COOKIE_TS_EC, settings.publisher.domain,
             ),
             "expiry cookie should retain the same security attributes as the live cookie"
+        );
+    }
+
+    #[test]
+    fn set_provider_ec_cookie_sets_opaque_value_with_security_attributes() {
+        let settings = create_test_settings();
+        let mut response = empty_response();
+        // A client-cycle value that is not the canonical HMAC id shape.
+        set_provider_ec_cookie(&settings, &mut response, "8473625190");
+
+        let cookie_str = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("should set the EC cookie")
+            .to_str()
+            .expect("should be valid UTF-8");
+
+        assert_eq!(
+            cookie_str,
+            format!(
+                "{}=8473625190; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age={}; HttpOnly",
+                COOKIE_TS_EC, settings.publisher.domain, COOKIE_MAX_AGE,
+            ),
+            "an opaque provider value should be set verbatim with the standard security attributes"
+        );
+    }
+
+    #[test]
+    fn set_provider_ec_cookie_preserves_base64url_value() {
+        let settings = create_test_settings();
+        let mut response = empty_response();
+        // A base64url value (RFC 4648 section 5, unpadded) fits the identifier
+        // alphabet exactly and must be preserved verbatim. Standard base64
+        // (`+`, `/`, `=`) is outside the alphabet, so a provider that carries
+        // binary data re-encodes it as base64url before minting.
+        let value = "abcDEF123-_x";
+        set_provider_ec_cookie(&settings, &mut response, value);
+
+        let cookie_str = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("should set the EC cookie")
+            .to_str()
+            .expect("should be valid UTF-8");
+
+        assert!(
+            cookie_str.starts_with(&format!("{COOKIE_TS_EC}={value};")),
+            "a base64url provider value should be preserved verbatim, got {cookie_str}"
+        );
+    }
+
+    #[test]
+    fn set_provider_ec_cookie_rejects_unsafe_value() {
+        let settings = create_test_settings();
+        let mut response = empty_response();
+        set_provider_ec_cookie(&settings, &mut response, "evil; Domain=.attacker.com");
+
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "an unsafe value must not set a cookie, preventing header injection"
         );
     }
 }

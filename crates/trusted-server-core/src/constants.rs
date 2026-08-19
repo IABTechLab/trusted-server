@@ -1,6 +1,11 @@
 use http::header::HeaderName;
 
 pub const COOKIE_TS_EC: &str = "ts-ec";
+/// Non-`HttpOnly` companion to [`COOKIE_TS_EC`], set when a client-cycle
+/// resolve succeeds. It carries no identity (the value is `1`); it only lets
+/// the page script see that an Edge Cookie exists, which the `HttpOnly` cookie
+/// itself cannot, so the script does not re-post on every page view.
+pub const COOKIE_TS_EC_RESOLVED: &str = "ts-ecr";
 /// Cookie written by the Trusted Server JS SDK containing a standard-base64-encoded
 /// JSON array of Extended User IDs (`[{ source, uids }]`) from identity providers.
 pub const COOKIE_TS_EIDS: &str = "ts-eids";

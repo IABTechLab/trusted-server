@@ -20,7 +20,10 @@ use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
-use crate::ec::provider::{EcProviderSelection, HMAC_PROVIDER_KEY, HOST_SIGNALS_PROVIDER_KEY};
+use crate::ec::provider::{
+    EcProviderSelection, HMAC_PROVIDER_KEY, HOST_SIGNALS_PROVIDER_KEY,
+    check_named_provider_configuration,
+};
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
@@ -605,22 +608,27 @@ impl Ec {
         Ok(())
     }
 
-    /// Validates that the selected provider names a configured block.
+    /// Validates that the selected provider can be configured in this build.
     ///
-    /// When [`provider`](Self::provider) is set, the matching block under
+    /// When [`provider`](Self::provider) is set, this build must be able to
+    /// honor the name and whatever that name needs from
     /// [`providers`](Self::providers) must be present, so a deployment that
     /// selects a provider (in TOML or via the environment override) but has not
     /// configured it fails fast at startup rather than silently running
     /// stateless. When no provider is selected, Trusted Server runs statelessly
     /// and this check passes.
     ///
+    /// What a name needs is answered by `check_named_provider_configuration`
+    /// in [`crate::ec::provider`], beside the resolution it belongs to, rather
+    /// than by a block lookup here, because the settings cannot know which
+    /// names read a block, which are built from nothing, and which are compiled
+    /// out of this build. Only the resolution knows that.
+    ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::Configuration`] when the selected
-    /// provider's `[ec.providers.<key>]` block is absent, when a provider block
-    /// is configured with no selector or alongside `"none"`, or when a
-    /// configured block is not the selected one. Any selector name is accepted
-    /// so long as its block is present, so there is no unknown-key check.
+    /// Returns [`TrustedServerError::Configuration`] when the selected provider
+    /// is not compiled into this build, when the `[ec.providers.<key>]` block
+    /// it needs is absent, or when a configured block is not the selected one.
     pub fn validate_provider_selection(&self) -> Result<(), Report<TrustedServerError>> {
         let Some(selection) = self.provider.as_ref() else {
             if !self.providers.is_empty() {
@@ -649,18 +657,12 @@ impl Ec {
             return Ok(());
         };
 
-        // Every provider is configured by the `[ec.providers.<key>]` block that
-        // carries its own name, so the check is the same lookup for all of
-        // them. A provider the adapter injects has the contents of its block
-        // validated by that adapter when it builds the provider.
+        // Whether this deployment can honor the name is the resolution's
+        // question, not the settings', so it is asked there. A provider the
+        // adapter injects has the contents of its block validated by that
+        // adapter when it builds the provider.
         let key = key.as_str();
-        if !self.providers.has_block(key) {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "Edge Cookie provider `{key}` is selected but has no `[ec.providers.{key}]` configuration"
-                ),
-            }));
-        }
+        check_named_provider_configuration(key, self)?;
 
         // Every configured block must be the selected one. An unreferenced
         // block is almost always a mistake (a mistyped selector or a stale
