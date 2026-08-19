@@ -1,8 +1,8 @@
 //! Fastly cold-response assembly backed by the repaired `stackpop/esi` parser.
 //!
-//! C2 stores an inert marker. This module creates one synthetic ESI include only in a
-//! request-private working copy, resolves it from an already-built fragment, and never
-//! performs an HTTP request.
+//! The shared template cache stores an inert marker. This module creates one synthetic
+//! ESI include only in a request-private working copy, resolves it from an already-built
+//! fragment, and never performs an HTTP request.
 
 use std::io::Cursor;
 

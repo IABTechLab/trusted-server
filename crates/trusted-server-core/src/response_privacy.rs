@@ -44,8 +44,8 @@ fn strip_cdn_cache_headers(response: &mut Response) {
 /// `publisher::c2_bypass_reason` deliberately does **not** call this and keeps its own
 /// copy: it additionally treats `no-cache` as non-shareable, because "revalidate before
 /// reuse" is correct for an HTTP cache and too permissive for a spike-owned one. The
-/// duplicate is the stricter of the two, so consolidating them would loosen the shared-
-/// template gate rather than tidy it.
+/// duplicate is the stricter of the two, so consolidating them would loosen the shared
+/// template-cache gate rather than tidy it.
 ///
 /// Directives are case-insensitive (RFC 9111 §5.2), so `No-Store` and `Private`
 /// count. `no-cache` deliberately does **not**: it requires revalidation before

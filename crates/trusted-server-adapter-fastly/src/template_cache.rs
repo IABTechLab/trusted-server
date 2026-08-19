@@ -1,4 +1,4 @@
-//! Fastly Core Cache backing for the shared transformed-template cache (C2).
+//! Fastly Core Cache backing for the shared transformed-template cache.
 //!
 //! Only the Fastly adapter implements this; every other adapter uses
 //! `UnavailableTemplateCache`, so the ESI assembly mode stays portable and only
@@ -26,7 +26,7 @@ use trusted_server_core::platform::{
     TemplateMetadata,
 };
 
-/// Fastly Core Cache implementation of the C2 template cache.
+/// Fastly Core Cache implementation of the shared template cache.
 #[derive(Default)]
 pub struct FastlyTemplateCache;
 
@@ -182,7 +182,7 @@ impl PlatformTemplateCache for FastlyTemplateCache {
             ReadFoundError::Backend(error) => {
                 // This legacy method cannot expose a backend error. Production uses
                 // `lookup_or_reserve`, which preserves it for bounded diagnostics.
-                log::warn!("c2_template_cache legacy read failed: {error}");
+                log::warn!("template_cache legacy read failed: {error}");
                 TemplateCacheMiss::NotFound
             }
         })

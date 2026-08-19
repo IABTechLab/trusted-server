@@ -361,7 +361,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let gpt_diagnostics = config.gpt_diagnostics.clone();
 
     // A publisher can legitimately emit the same inert comment text as the reserved
-    // C2 seam, including after `</body>`. Neutralize source comments while they are
+    // template-cache seam, including after `</body>`. Neutralize source comments while they are
     // parsed; markup injected by the body end-tag handler is output, not reparsed, so
     // the transform-owned marker remains the only exact copy.
     let mut document_content_handlers = Vec::new();
@@ -1949,7 +1949,7 @@ mod tests {
 
     #[test]
     fn bodyless_marker_mode_emits_an_owned_terminal_seam_even_after_source_bytes() {
-        const MARKER: &str = "<!--reserved-c2-seam-->";
+        const MARKER: &str = "<!--reserved-template-cache-seam-->";
         let config = HtmlProcessorConfig {
             body_close: BodyCloseInjection::Marker(MARKER.to_string()),
             origin_host: "origin.example.com".to_string(),
@@ -1974,11 +1974,11 @@ mod tests {
         assert_eq!(
             html.matches(MARKER).count(),
             2,
-            "one source occurrence plus one transform-owned seam must reach normalization"
+            "one source occurrence plus one transform-owned template-cache seam must reach normalization"
         );
         assert!(
             html.ends_with(MARKER),
-            "the transform-owned fallback must be unambiguously terminal"
+            "the transform-owned template-cache fallback must be unambiguously terminal"
         );
     }
 
