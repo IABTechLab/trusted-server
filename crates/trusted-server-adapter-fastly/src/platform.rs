@@ -709,6 +709,10 @@ fn single_utf8_header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
 /// When no trusted-client-IP configuration is present, or when either header
 /// is missing, duplicated, malformed, or unauthenticated, this returns the
 /// Fastly SDK peer address unchanged.
+///
+/// Every fallback taken while a configuration *is* present logs at debug level
+/// so a rotated secret or renamed header is diagnosable. Debug rather than warn
+/// keeps a direct client from driving log volume by sending junk trust headers.
 #[must_use]
 pub(crate) fn resolve_client_ip(
     req: &Request,
@@ -719,16 +723,22 @@ pub(crate) fn resolve_client_ip(
         return peer_ip;
     };
     let Some(auth_candidate) = single_utf8_header(req, &config.auth_header) else {
+        log::debug!("Trusted client IP: auth header is missing, duplicated, or not UTF-8");
         return peer_ip;
     };
     if !config.authenticates(auth_candidate) {
+        log::debug!("Trusted client IP: auth header did not match the configured shared secret");
         return peer_ip;
     }
     let Some(ip_candidate) = single_utf8_header(req, &config.ip_header) else {
+        log::debug!("Trusted client IP: IP header is missing, duplicated, or not UTF-8");
         return peer_ip;
     };
 
-    ip_candidate.parse::<IpAddr>().ok().or(peer_ip)
+    ip_candidate.parse::<IpAddr>().ok().or_else(|| {
+        log::debug!("Trusted client IP: IP header is not a bare IPv4 or IPv6 address");
+        peer_ip
+    })
 }
 
 /// Extract [`ClientInfo`] from the original Fastly request and resolved client IP.

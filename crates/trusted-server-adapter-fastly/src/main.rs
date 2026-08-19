@@ -39,7 +39,7 @@ mod tinybird;
 use crate::app::{EcFinalizeState, TrustedServerApp, load_settings_from_config_store};
 use crate::ec_kv::FastlyEcKvStore;
 use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, resolve_geo_for_response};
-use crate::platform::{FastlyPlatformGeo, client_info_from_request, resolve_client_ip};
+use crate::platform::{FastlyPlatformGeo, client_info_from_request};
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
@@ -123,10 +123,11 @@ fn edgezero_main(mut req: FastlyRequest) {
     let trusted_client_ip = settings_snapshot
         .as_deref()
         .and_then(|settings| settings.trusted_client_ip.as_ref());
-    let resolved_client_ip = resolve_client_ip(&req, req.get_client_ip_addr(), trusted_client_ip);
 
-    // Strip client-spoofable forwarded headers before dispatch.
-    compat::sanitize_fastly_forwarded_headers(&mut req, trusted_client_ip);
+    // Resolve the trusted client IP, then strip client-spoofable forwarded
+    // headers before dispatch. One call keeps resolution ahead of the
+    // sanitization that removes the headers it reads.
+    let resolved_client_ip = compat::resolve_and_sanitize_client_ip(&mut req, trusted_client_ip);
 
     // Re-inject a trusted TLS scheme signal after sanitization has stripped any
     // client-sent fastly-ssl header. Setting it from Fastly's native TLS

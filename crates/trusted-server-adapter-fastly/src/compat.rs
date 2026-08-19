@@ -1,9 +1,13 @@
 //! Compatibility bridge between `fastly` SDK types and `http` crate types.
 
+use std::net::IpAddr;
+
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::Response as HttpResponse;
 use trusted_server_core::http_util::SPOOFABLE_FORWARDED_HEADERS;
 use trusted_server_core::settings::TrustedClientIpConfig;
+
+use crate::platform::resolve_client_ip;
 
 /// Convert an [`HttpResponse`] into a `fastly::Response`.
 pub(crate) fn to_fastly_response(resp: HttpResponse) -> fastly::Response {
@@ -71,6 +75,20 @@ pub(crate) fn sanitize_fastly_forwarded_headers(
             req.remove_header(name);
         }
     }
+}
+
+/// Resolve the trusted client IP, then strip every trust and spoofable header.
+///
+/// Resolution has to observe the trust headers *before* sanitization removes
+/// them. Both steps live behind this one call so that ordering is structural
+/// rather than a convention the entry point has to remember.
+pub(crate) fn resolve_and_sanitize_client_ip(
+    req: &mut fastly::Request,
+    config: Option<&TrustedClientIpConfig>,
+) -> Option<IpAddr> {
+    let client_ip = resolve_client_ip(req, req.get_client_ip_addr(), config);
+    sanitize_fastly_forwarded_headers(req, config);
+    client_ip
 }
 
 #[cfg(test)]
@@ -180,6 +198,33 @@ mod tests {
             "should strip client-supplied x-forwarded-for"
         );
         assert!(req.get_header("host").is_some(), "should preserve host");
+    }
+
+    #[test]
+    fn resolve_and_sanitize_client_ip_reads_trust_headers_before_stripping_them() {
+        let config = trusted_client_ip_config("x-trusted-client-ip");
+        let mut req = fastly::Request::get("https://example.com/");
+        req.set_header("x-trusted-client-ip", "198.51.100.7");
+        req.set_header(
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        );
+
+        let resolved = resolve_and_sanitize_client_ip(&mut req, Some(&config));
+
+        assert_eq!(
+            resolved,
+            Some(IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7))),
+            "should resolve the forwarded IP before sanitization removes the headers"
+        );
+        assert!(
+            req.get_header("x-trusted-client-ip").is_none(),
+            "should strip the configured IP header after resolving"
+        );
+        assert!(
+            req.get_header("x-trusted-client-auth").is_none(),
+            "should strip the configured auth header after resolving"
+        );
     }
 
     #[test]

@@ -92,7 +92,9 @@ loaded but before spoofable headers are sanitized:
    secret, a malformed header value, or a non-IP value all select the peer
    address without rejecting the request.
 6. Remove the configured IP and authentication headers, then run the existing
-   forwarded-header sanitizer.
+   forwarded-header sanitizer. Steps 1-6 sit behind a single
+   `resolve_and_sanitize_client_ip` call so resolution cannot be reordered
+   after the sanitization that removes the headers it reads.
 7. Pass the selected address into `client_info_from_request` and use the same
    value for entry-point geo response finalization.
 
