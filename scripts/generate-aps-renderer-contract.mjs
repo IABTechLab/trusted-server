@@ -25,6 +25,10 @@ const typescriptPath = path.join(
   repositoryRoot,
   "crates/trusted-server-js/lib/src/core/contracts/generated/renderer_validator_v1.ts",
 );
+const documentValidatorPath = path.join(
+  repositoryRoot,
+  "crates/trusted-server-js/lib/src/core/contracts/generated/renderer_validator_document_v1.ts",
+);
 
 const [schemaText, corpusText] = await Promise.all([
   readFile(schemaPath, "utf8"),
@@ -302,6 +306,12 @@ const typescriptOutput =
   ";\n" +
   applyTypeMarkers(validatorSource).trimStart();
 
+const documentValidatorOutput =
+  generatedHeader +
+  "export const APS_RENDERER_VALIDATOR_ES5_V1 = " +
+  JSON.stringify(es5Output) +
+  ";\n";
+
 const bootstrapOutput = String.raw`<!doctype html>
 <meta charset="utf-8">
 <script>
@@ -350,7 +360,7 @@ try{history.replaceState(null,'',location.pathname+location.search);}catch(_erro
 var consumed=false;
 function receive(event){
  if(consumed||event.source!==parent||event.origin!==origin||
-    (event.ports&&event.ports.length!==0)||typeof event.data!=='string'||
+    !event.ports||event.ports.length!==0||typeof event.data!=='string'||
     utf8Length(event.data)>MAX_NAVIGATION_BYTES)return;
  var value;
  try{value=JSON.parse(event.data);}catch(_error){return;}
@@ -374,6 +384,7 @@ const outputs = [
   [es5Path, es5Output],
   [bootstrapPath, bootstrapOutput],
   [typescriptPath, typescriptOutput],
+  [documentValidatorPath, documentValidatorOutput],
 ];
 const checkOnly = process.argv.slice(2).includes("--check");
 

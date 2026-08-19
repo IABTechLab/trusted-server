@@ -692,6 +692,11 @@ describe('browser messaging adapter', () => {
         ownerSettled: 'TS Owner Settled',
         admLoaded: 'TS ADM Loaded',
         admFailed: 'TS ADM Failed',
+        apsBootstrapReady: 'TS APS Bootstrap Ready',
+        apsBootstrapNavigate: 'TS APS Bootstrap Navigate',
+        apsInnerReady: 'TS APS Inner Ready',
+        apsInnerBind: 'TS APS Inner Bind',
+        apsContainerReady: 'TS APS Container Ready',
         apsDocumentAccepted: 'TS APS Document Accepted',
         apsRunnerLoaded: 'TS APS Runner Loaded',
         apsRenderCompleted: 'TS APS Render Completed',
@@ -762,6 +767,83 @@ describe('browser messaging adapter', () => {
     ]) {
       expect(adapter.parseProtocolMessage('ownerInserted', candidate)).toBeUndefined();
     }
+  });
+
+  it('parses the exact bounded bootstrap, inner, and container window channels', () => {
+    const adapter = createBrowserMessagingAdapter(createTarget());
+    const bootstrapNonce = `b1_${'b'.repeat(22)}`;
+    const rendererNonce = `n1_${'n'.repeat(22)}`;
+    const documentSource = '<!doctype html><p>container</p>';
+    const containerUrl = `data:text/html;charset=utf-8,${encodeURIComponent(documentSource)}#${bootstrapNonce}`;
+    const messages = [
+      ['apsBootstrapReady', { message: 'TS APS Bootstrap Ready', version: 1, bootstrapNonce }],
+      [
+        'apsBootstrapNavigate',
+        { message: 'TS APS Bootstrap Navigate', version: 1, bootstrapNonce, containerUrl },
+      ],
+      ['apsInnerReady', { message: 'TS APS Inner Ready', version: 1, rendererNonce }],
+      ['apsInnerBind', { message: 'TS APS Inner Bind', version: 1, rendererNonce }],
+      [
+        'apsContainerReady',
+        {
+          message: 'TS APS Container Ready',
+          version: 1,
+          bootstrapNonce,
+          rendererNonce,
+        },
+      ],
+    ] as const;
+    for (const [kind, value] of messages) {
+      expect(adapter.parseProtocolMessage(kind, JSON.stringify(value))).toEqual(value);
+      expect(
+        adapter.parseProtocolMessage(kind, JSON.stringify({ ...value, extra: true }))
+      ).toBeUndefined();
+    }
+    expect(
+      adapter.parseProtocolMessage(
+        'apsBootstrapNavigate',
+        `{"message":"TS APS Bootstrap Navigate","version":1,"bootstrapNonce":"${bootstrapNonce}","bootstrapNonce":"${bootstrapNonce}","containerUrl":${JSON.stringify(containerUrl)}}`
+      )
+    ).toBeUndefined();
+    expect(
+      adapter.parseProtocolMessage(
+        'apsBootstrapNavigate',
+        JSON.stringify({
+          message: 'TS APS Bootstrap Navigate',
+          version: 1,
+          bootstrapNonce,
+          containerUrl: `${containerUrl}x`,
+        })
+      )
+    ).toBeUndefined();
+    const dataPrefix = 'data:text/html;charset=utf-8,';
+    const nonceSuffix = `#${bootstrapNonce}`;
+    const boundaryUrl = `${dataPrefix}${'a'.repeat(
+      196_663 - dataPrefix.length - nonceSuffix.length
+    )}${nonceSuffix}`;
+    expect(new TextEncoder().encode(boundaryUrl)).toHaveLength(196_663);
+    expect(
+      adapter.parseProtocolMessage(
+        'apsBootstrapNavigate',
+        JSON.stringify({
+          message: 'TS APS Bootstrap Navigate',
+          version: 1,
+          bootstrapNonce,
+          containerUrl: boundaryUrl,
+        })
+      )
+    ).toBeDefined();
+    expect(
+      adapter.parseProtocolMessage(
+        'apsBootstrapNavigate',
+        JSON.stringify({
+          message: 'TS APS Bootstrap Navigate',
+          version: 1,
+          bootstrapNonce,
+          containerUrl: `${boundaryUrl.slice(0, -nonceSuffix.length)}a${nonceSuffix}`,
+        })
+      )
+    ).toBeUndefined();
   });
 
   it('inspects only own routing data before exact global-message parsing', () => {

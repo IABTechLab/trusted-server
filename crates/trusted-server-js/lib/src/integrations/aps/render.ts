@@ -72,6 +72,7 @@ const iframeSourceGetter = directDomAvailable
   : undefined;
 
 export { parseApsRendererDescriptor, validateApsRenderer } from '../../core/contracts/aps_renderer';
+export { APS_PERMANENT_SANDBOX, generateApsDataDocumentsV1 } from './documents';
 
 export const APS_RENDERER_V1_PATH = '/integrations/aps/renderer/v1';
 export const APS_RENDERER_SANDBOX =

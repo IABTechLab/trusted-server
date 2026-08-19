@@ -46,7 +46,7 @@ try{history.replaceState(null,'',location.pathname+location.search);}catch(_erro
 var consumed=false;
 function receive(event){
  if(consumed||event.source!==parent||event.origin!==origin||
-    (event.ports&&event.ports.length!==0)||typeof event.data!=='string'||
+    !event.ports||event.ports.length!==0||typeof event.data!=='string'||
     utf8Length(event.data)>MAX_NAVIGATION_BYTES)return;
  var value;
  try{value=JSON.parse(event.data);}catch(_error){return;}

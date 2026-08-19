@@ -122,6 +122,7 @@ const CURRENT_EXACT_SOURCE_OWNERS = Object.freeze({
   'src/integrations/aps/index.ts': 'aps',
   'src/integrations/aps/module.ts': 'aps',
   'src/integrations/aps/render.ts': 'aps',
+  'src/integrations/aps/documents.ts': 'aps',
   'src/integrations/creative/click.ts': 'creative',
   'src/integrations/creative/dynamic_src_guard.ts': 'creative',
   'src/integrations/creative/iframe.ts': 'creative',
@@ -188,6 +189,7 @@ const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
     'core',
     'aps',
   ]),
+  'src/core/contracts/generated/renderer_validator_document_v1.ts': Object.freeze(['aps']),
   'src/core/contracts/request_ads.ts': Object.freeze(['bootstrap', 'core']),
   'src/core/index.ts': Object.freeze(['core']),
   'src/core/log.ts': Object.freeze([

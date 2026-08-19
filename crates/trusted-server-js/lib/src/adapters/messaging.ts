@@ -34,17 +34,20 @@ interface ProtocolMessageSchema {
   readonly transport: 'global-json' | 'structured';
   readonly keys: readonly string[];
   readonly literals: Readonly<Record<string, unknown>>;
+  readonly maximumBytes?: number;
 }
 
 function schema(
   transport: ProtocolMessageSchema['transport'],
   keys: readonly string[],
-  literals: Readonly<Record<string, unknown>>
+  literals: Readonly<Record<string, unknown>>,
+  maximumBytes?: number
 ): ProtocolMessageSchema {
   return Object.freeze({
     transport,
     keys: Object.freeze([...keys]),
     literals: Object.freeze({ ...literals }),
+    ...(maximumBytes === undefined ? {} : { maximumBytes }),
   });
 }
 
@@ -128,6 +131,29 @@ export const PROTOCOL_MESSAGE_SCHEMAS_V1 = Object.freeze({
       version: 1,
       outcome: TSJS_MESSAGE_PROTOCOL_V1.outcome.cancelled,
     }
+  ),
+  apsBootstrapReady: schema('global-json', ['message', 'version', 'bootstrapNonce'], {
+    message: TSJS_MESSAGE_PROTOCOL_V1.message.apsBootstrapReady,
+    version: 1,
+  }),
+  apsBootstrapNavigate: schema(
+    'global-json',
+    ['message', 'version', 'bootstrapNonce', 'containerUrl'],
+    { message: TSJS_MESSAGE_PROTOCOL_V1.message.apsBootstrapNavigate, version: 1 },
+    196_800
+  ),
+  apsInnerReady: schema('global-json', ['message', 'version', 'rendererNonce'], {
+    message: TSJS_MESSAGE_PROTOCOL_V1.message.apsInnerReady,
+    version: 1,
+  }),
+  apsInnerBind: schema('global-json', ['message', 'version', 'rendererNonce'], {
+    message: TSJS_MESSAGE_PROTOCOL_V1.message.apsInnerBind,
+    version: 1,
+  }),
+  apsContainerReady: schema(
+    'global-json',
+    ['message', 'version', 'bootstrapNonce', 'rendererNonce'],
+    { message: TSJS_MESSAGE_PROTOCOL_V1.message.apsContainerReady, version: 1 }
   ),
   apsDocumentAccepted: schema('structured', ['message', 'version', 'nonce'], {
     message: TSJS_MESSAGE_PROTOCOL_V1.message.apsDocumentAccepted,
@@ -217,6 +243,7 @@ export interface MessagingValidationOptions {
 const capabilityPatterns = Object.freeze({
   reservation: /^r1_[A-Za-z0-9_-]{22}$/,
   ticket: /^t1_[A-Za-z0-9_-]{22}$/,
+  bootstrapNonce: /^b1_[A-Za-z0-9_-]{22}$/,
   nonce: /^n1_[A-Za-z0-9_-]{22}$/,
 });
 const apsRendererKeys = Object.freeze([
@@ -375,6 +402,25 @@ function rendererUrl(value: unknown, expected?: string): value is string {
   return true;
 }
 
+function apsContainerUrl(value: unknown, bootstrapNonce: unknown): value is string {
+  if (
+    !capability(bootstrapNonce, 'bootstrapNonce') ||
+    !boundedString(value, 196_663, { controls: true }) ||
+    !value.startsWith('data:text/html;charset=utf-8,')
+  ) {
+    return false;
+  }
+  const suffix = `#${bootstrapNonce}`;
+  if (!value.endsWith(suffix)) return false;
+  const encoded = value.slice('data:text/html;charset=utf-8,'.length, -suffix.length);
+  if (encoded.length === 0 || encoded.includes('#')) return false;
+  try {
+    return encodeURIComponent(decodeURIComponent(encoded)) === encoded;
+  } catch {
+    return false;
+  }
+}
+
 function skipWhitespace(source: string, start: number): number {
   let index = start;
   while (index < source.length && /\s/.test(source[index] ?? '')) index += 1;
@@ -450,10 +496,10 @@ function scanJsonValue(source: string, start: number): number | undefined {
   return match ? index + match[0].length : undefined;
 }
 
-function parseGlobalJson(candidate: unknown): unknown {
+function parseGlobalJson(candidate: unknown, maximumBytes = MAX_GLOBAL_MESSAGE_BYTES): unknown {
   if (
     typeof candidate !== 'string' ||
-    new TextEncoder().encode(candidate).byteLength > MAX_GLOBAL_MESSAGE_BYTES
+    new TextEncoder().encode(candidate).byteLength > maximumBytes
   ) {
     return undefined;
   }
@@ -660,6 +706,21 @@ function validProtocolFields(
         typeof record['reason'] === 'string' &&
         cancellationReasons.has(record['reason'])
       );
+    case 'apsBootstrapReady':
+      return capability(record['bootstrapNonce'], 'bootstrapNonce');
+    case 'apsBootstrapNavigate':
+      return (
+        capability(record['bootstrapNonce'], 'bootstrapNonce') &&
+        apsContainerUrl(record['containerUrl'], record['bootstrapNonce'])
+      );
+    case 'apsInnerReady':
+    case 'apsInnerBind':
+      return capability(record['rendererNonce'], 'nonce');
+    case 'apsContainerReady':
+      return (
+        capability(record['bootstrapNonce'], 'bootstrapNonce') &&
+        capability(record['rendererNonce'], 'nonce')
+      );
     case 'apsDocumentAccepted':
     case 'apsRunnerLoaded':
     case 'apsRenderCompleted':
@@ -731,7 +792,9 @@ function parseProtocolMessage(
     )[kind];
     if (!messageSchema) return undefined;
     const decoded =
-      messageSchema.transport === 'global-json' ? parseGlobalJson(candidate) : candidate;
+      messageSchema.transport === 'global-json'
+        ? parseGlobalJson(candidate, messageSchema.maximumBytes)
+        : candidate;
     const accepted = exactRecord(decoded, messageSchema.keys);
     if (!accepted) return undefined;
     for (const [key, literal] of Object.entries(messageSchema.literals)) {

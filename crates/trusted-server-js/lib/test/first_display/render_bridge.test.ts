@@ -118,6 +118,8 @@ function harness(kind: 'adm' | 'aps' = 'adm', onNativeMutation?: () => boolean) 
             rendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
             sandbox:
               'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation',
+            permanentSandbox:
+              'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts allow-top-navigation-by-user-activation',
             deadlines: Object.freeze({
               insertionMs: 1_000 as const,
               documentAcceptanceMs: 3_000 as const,
@@ -128,6 +130,8 @@ function harness(kind: 'adm' | 'aps' = 'adm', onNativeMutation?: () => boolean) 
               typeof candidate === 'string' && /^r1_[A-Za-z0-9_-]{22}$/.test(candidate),
             isLifecycleTicket: (candidate: unknown): candidate is string =>
               typeof candidate === 'string' && /^t1_[A-Za-z0-9_-]{22}$/.test(candidate),
+            isBootstrapNonce: (candidate: unknown): candidate is string =>
+              typeof candidate === 'string' && /^b1_[A-Za-z0-9_-]{22}$/.test(candidate),
             isRendererNonce: (candidate: unknown): candidate is string =>
               typeof candidate === 'string' && /^n1_[A-Za-z0-9_-]{22}$/.test(candidate),
             createRenderBridge: () => {
