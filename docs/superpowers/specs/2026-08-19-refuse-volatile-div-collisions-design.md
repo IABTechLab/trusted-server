@@ -31,13 +31,20 @@ mistaken for a bot challenge. Cross-page slot inference, merging, and
 `--replace` otherwise remain unchanged because ambiguous slots never enter
 those stages.
 
+The `rh-gam-kso_<render-token>_ei_<placement>` family is independently known
+to be volatile across consecutive crawls. Its render token begins with at least
+eight digits and continues with mixed alphanumeric entropy. Discovery refuses
+even a single otherwise usable registry or request observation of this narrow
+family, preserves the page/network evidence, and emits one site-wide diagnostic.
+Arbitrary IDs that merely begin with `rh-gam-kso` do not match this rule.
+
 ## Safety and Output
 
 The generator prefers omission over a configuration that cannot match future
 renders. For the observed Autoblog desktop crawl, replacement output should
 therefore contain the stable `ad-header-0` and `ad-fixed_bottom-0` slots, while
-the in-content collision group is explained in a note. The existing volatile
-`rh-gam-kso` group and section-varying sidebar refusal remain unchanged.
+the in-content collision group, known `rh-gam-kso` family, and section-varying
+sidebar are explained in notes.
 
 ## Tests
 
@@ -51,5 +58,8 @@ the in-content collision group is explained in a note. The existing volatile
   discovery survives when every collided slot is omitted.
 - A collision-only page is recorded as having evidence rather than as an empty
   challenge page.
+- Single registry- and request-derived `rh-gam-kso` render-token observations
+  are omitted while retaining evidence and any parseable network ID.
+- Stable/nonmatching IDs sharing only the vendor prefix are not omitted.
 - Existing normalization, request fallback, fragment detection, and full CLI
   tests remain green.

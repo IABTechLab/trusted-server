@@ -64,3 +64,15 @@
 - [ ] Run `cd docs && npm run format`.
 - [ ] Run `git diff --check` and inspect the scoped diff.
 - [ ] Commit and push the fix to `feature/ts-cli-ad-templates`.
+
+### Task 4: Refuse a known single-observation volatile family
+
+**Files:**
+
+- Modify: `crates/trusted-server-cli/src/commands/audit/generate/gpt_slots.rs`
+
+- [ ] Add failing registry and request tests for a single `rh-gam-kso_<render-token>_ei_<placement>` observation.
+- [ ] Add a narrow recognizer requiring the vendor prefix, an eight-or-more-digit mixed alphanumeric token, and a known placement suffix.
+- [ ] Omit matching slots while preserving evidence/network discovery and emit one deduplicated actionable diagnostic.
+- [ ] Add negative tests proving arbitrary stable IDs sharing only the prefix remain eligible.
+- [ ] Run the focused tests, then repeat Task 3 verification and delivery.

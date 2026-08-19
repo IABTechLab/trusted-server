@@ -58,6 +58,10 @@ const GAMPAD_HOSTS: &[&str] = &["securepubads.g.doubleclick.net", "pubads.g.doub
 /// Common GPT div-id prefix stripped when deriving a slot id.
 const GPT_DIV_PREFIX: &str = "div-gpt-ad-";
 
+/// Publisher integration whose div IDs include a per-render timestamp/random
+/// token before the placement kind (for example, `_ei_inarticle_1`).
+const RH_GAM_KSO_PREFIX: &str = "rh-gam-kso";
+
 /// Minimum width/height for a format to be treated as a real creative size.
 ///
 /// GPT encodes fluid/native aspect-ratio markers (e.g. `4x1`, `8x1`) alongside
@@ -120,13 +124,21 @@ pub(crate) fn discover_gpt_slots(
             continue;
         };
         had_slot_evidence = true;
+        if gam_network_id.is_none() {
+            gam_network_id = network_id_from_unit_path(&entry.gam_unit_path);
+        }
+        if let Some(prefix) = known_per_render_div_prefix(&entry.div_id) {
+            registry_divs
+                .entry(slot.div_id.clone())
+                .or_default()
+                .insert(entry.div_id.clone());
+            push_unique_warning(&mut warnings, known_per_render_warning(prefix));
+            continue;
+        }
         if let Some(prefix) =
             push_slot_refusing_collisions(&mut slots, &mut registry_divs, slot, &entry.div_id)
         {
             warnings.push(ambiguous_collision_warning(&prefix));
-        }
-        if gam_network_id.is_none() {
-            gam_network_id = network_id_from_unit_path(&entry.gam_unit_path);
         }
     }
 
@@ -137,16 +149,20 @@ pub(crate) fn discover_gpt_slots(
             continue;
         };
         had_slot_evidence = true;
+        if gam_network_id.is_none() {
+            gam_network_id = Some(network_id);
+        }
         if registry_stems.contains(&slot.div_id) {
+            continue;
+        }
+        if let Some(prefix) = known_per_render_div_prefix(&raw_div) {
+            push_unique_warning(&mut warnings, known_per_render_warning(prefix));
             continue;
         }
         if let Some(prefix) =
             push_slot_refusing_collisions(&mut slots, &mut request_divs, slot, &raw_div)
         {
             warnings.push(ambiguous_collision_warning(&prefix));
-        }
-        if gam_network_id.is_none() {
-            gam_network_id = Some(network_id);
         }
     }
     make_slot_ids_unique(&mut slots);
@@ -199,6 +215,36 @@ fn ambiguous_collision_warning(prefix: &str) -> String {
          across renders; expose distinct stable div ids in publisher markup before configuring \
          these placements"
     )
+}
+
+fn known_per_render_div_prefix(div_id: &str) -> Option<&'static str> {
+    let div_id = div_id.strip_suffix("-container").unwrap_or(div_id);
+    let remainder = div_id.strip_prefix("rh-gam-kso_")?;
+    let (token, placement) = remainder.split_once("_ei_")?;
+    let leading_digits = token.bytes().take_while(u8::is_ascii_digit).count();
+    let token_is_dynamic = leading_digits >= 8
+        && token.len() > leading_digits
+        && token.bytes().all(|byte| byte.is_ascii_alphanumeric());
+    let placement_index = placement
+        .strip_prefix("inarticle_")
+        .or_else(|| placement.strip_prefix("overlay_"))?;
+    let placement_is_known =
+        !placement_index.is_empty() && placement_index.bytes().all(|byte| byte.is_ascii_digit());
+    (token_is_dynamic && placement_is_known).then_some(RH_GAM_KSO_PREFIX)
+}
+
+fn known_per_render_warning(prefix: &str) -> String {
+    format!(
+        "skipped known per-render div-id family `{prefix}`: exact div ids change across renders \
+         and no distinct stable element prefix is available; expose distinct stable div ids in \
+         publisher markup before configuring these placements"
+    )
+}
+
+fn push_unique_warning(warnings: &mut Vec<String>, warning: String) {
+    if !warnings.contains(&warning) {
+        warnings.push(warning);
+    }
 }
 
 /// Converts a live-registry slot into a [`DiscoveredSlot`].
@@ -985,6 +1031,66 @@ mod tests {
     }
 
     #[test]
+    fn single_known_per_render_registry_slot_is_refused() {
+        let discovered = discover_gpt_slots(
+            &[registry_slot(
+                "/22558409563/autoblog.com_In-Article_Desktop_ESP_jfOmMslaux",
+                "rh-gam-kso_26332072TPTy2yC1wkhc_ei_inarticle_1",
+                &[(300, 250)],
+            )],
+            &[],
+            false,
+        );
+
+        assert!(discovered.had_slot_evidence);
+        assert!(
+            discovered.slots.is_empty(),
+            "one observation of a known per-render family must not be written literally"
+        );
+        assert_eq!(discovered.gam_network_id.as_deref(), Some("22558409563"));
+        assert_known_per_render_warning(&discovered);
+    }
+
+    #[test]
+    fn single_known_per_render_request_slot_is_refused() {
+        let discovered = from_requests(&[request(
+            "https://securepubads.g.doubleclick.net/gampad/ads?iu_parts=22558409563%2Cautoblog.com_In-Article_Desktop_ESP_jfOmMslaux&dids=rh-gam-kso_26332072TPTy2yC1wkhc_ei_inarticle_1&prev_iu_szs=300x250",
+        )]);
+
+        assert!(discovered.had_slot_evidence);
+        assert!(discovered.slots.is_empty());
+        assert_eq!(discovered.gam_network_id.as_deref(), Some("22558409563"));
+        assert_known_per_render_warning(&discovered);
+    }
+
+    #[test]
+    fn known_per_render_match_does_not_claim_arbitrary_vendor_ids() {
+        assert_eq!(
+            known_per_render_div_prefix("rh-gam-kso_26332072TPTy2yC1wkhc_ei_inarticle_1"),
+            Some("rh-gam-kso")
+        );
+        assert_eq!(
+            known_per_render_div_prefix("rh-gam-kso_26332072TPTy2yC1wkhc_ei_overlay_1-container"),
+            Some("rh-gam-kso")
+        );
+        for stable in [
+            "rh-gam-kso_stable_ei_inarticle_1",
+            "rh-gam-kso_26332072_ei_inarticle_1",
+            "rh-gam-kso_26332072TPTy2yC1wkhc_ei_sidebar_1",
+            "rh-gam-kso_26332072TPTy2yC1wkhc_ei_overlay_stable",
+            "rh-gam-kso_26332072TPTy2yC1wkhc_ei_overlay_",
+            "rh-gam-kso_26332072TPTy2yC1wkhc_ei_overlay_1_extra",
+            "rh-gam-kso-header",
+        ] {
+            assert_eq!(
+                known_per_render_div_prefix(stable),
+                None,
+                "`{stable}` should not match the narrow per-render family"
+            );
+        }
+    }
+
+    #[test]
     fn ambiguous_registry_stem_still_suppresses_request_fallback() {
         let registry = vec![
             registry_slot(
@@ -1049,5 +1155,13 @@ mod tests {
             warning.contains("distinct stable div ids"),
             "warning should tell the operator how to make the placements configurable"
         );
+    }
+
+    fn assert_known_per_render_warning(discovered: &DiscoveredSlots) {
+        assert_eq!(discovered.warnings.len(), 1);
+        let warning = &discovered.warnings[0];
+        assert!(warning.contains("rh-gam-kso"));
+        assert!(warning.contains("change across renders"));
+        assert!(warning.contains("distinct stable div ids"));
     }
 }
