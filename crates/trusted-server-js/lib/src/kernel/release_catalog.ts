@@ -1,5 +1,20 @@
 export type ReleasePhase = 'takeover' | 'deferred';
 export type ReleaseTrigger = 'first_display_or_idle';
+export type ReleaseConfigSourceV1 =
+  | 'aps'
+  | 'datadome'
+  | 'didomi'
+  | 'google_tag_manager'
+  | 'gpt'
+  | 'lockr'
+  | 'osano'
+  | 'permutive'
+  | 'prebid'
+  | 'sourcepoint'
+  | 'testlight'
+  | 'creative'
+  | 'diagnostics'
+  | null;
 export type ReleaseIncludePredicate =
   | 'always'
   | 'creative_guard'
@@ -26,6 +41,7 @@ export interface ReleaseCatalogEntry {
   readonly phase: ReleasePhase;
   readonly trigger: ReleaseTrigger | null;
   readonly include: ReleaseIncludePredicate;
+  readonly config: ReleaseConfigSourceV1;
   /** A conditional edge uses `<capability>?<predicate>` and no other grammar. */
   readonly consumes: readonly string[];
   readonly provides: readonly string[];
@@ -115,6 +131,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
       'shared/first_display_handoff',
       'shared/first_display_registration',
       'shared/first_display_transaction',
+      'shared/integration_config_validators',
       'first_display/adm_render_bridge',
       'first_display/driver',
       'first_display/leaf/projection',
@@ -367,6 +384,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'takeover',
     trigger: null,
     include: 'always',
+    config: null,
     provides: [
       'slots.v1',
       'auction.v1',
@@ -386,6 +404,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'takeover',
     trigger: null,
     include: 'integration:aps',
+    config: 'aps',
     provides: ['aps.v1'],
     consumes: ['runtime.v1', 'slots.v1', 'render.v1', 'messages.v1', 'trace.v1'],
     obligation: 'Any initial APS winner and PUC claim must render',
@@ -397,6 +416,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'takeover',
     trigger: null,
     include: 'creative_guard',
+    config: 'creative',
     provides: [],
     consumes: ['runtime.v1'],
     obligation: 'Guards must observe parser-time DOM/constructor activity',
@@ -408,6 +428,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'takeover',
     trigger: null,
     include: 'integration:datadome',
+    config: 'datadome',
     provides: [],
     consumes: ['runtime.v1'],
     obligation: 'Script/preload rewriting must precede publisher SDK insertion',
@@ -419,6 +440,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'takeover',
     trigger: null,
     include: 'integration:didomi',
+    config: 'didomi',
     provides: [],
     consumes: ['runtime.v1'],
     obligation: 'didomiConfig.sdkPath must exist before SDK evaluation',
@@ -430,6 +452,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'takeover',
     trigger: null,
     include: 'integration:google_tag_manager',
+    config: 'google_tag_manager',
     provides: [],
     consumes: ['runtime.v1'],
     obligation: 'Script/preload/beacon/fetch guards must precede matching traffic',
@@ -441,6 +464,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'takeover',
     trigger: null,
     include: 'integration:gpt',
+    config: 'gpt',
     provides: ['gpt.v1', 'gpt.events.v1', 'pbs_cache.baseline.v1'],
     consumes: ['runtime.v1', 'slots.v1', 'auction.v1', 'render.v1', 'messages.v1', 'trace.v1'],
     obligation:
@@ -453,6 +477,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'takeover',
     trigger: null,
     include: 'gpt_diagnostics_active',
+    config: 'diagnostics',
     provides: ['gpt_diag.v1'],
     consumes: ['runtime.v1', 'gpt.events.v1'],
     obligation:
@@ -465,6 +490,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'takeover',
     trigger: null,
     include: 'integration:lockr',
+    config: 'lockr',
     provides: [],
     consumes: ['runtime.v1'],
     obligation: 'Script guard/readiness/API-host rewrite may precede first display',
@@ -476,6 +502,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'takeover',
     trigger: null,
     include: 'integration:osano',
+    config: 'osano',
     provides: ['osano_consent.v1'],
     consumes: ['runtime.v1'],
     obligation: 'Initial USP/GPP/TCF mirror must precede consent-dependent auction work',
@@ -487,6 +514,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'takeover',
     trigger: null,
     include: 'integration:permutive',
+    config: 'permutive',
     provides: ['permutive_context.v1'],
     consumes: ['runtime.v1'],
     obligation: 'Guard/readiness and initial normalized segments feed first auction context',
@@ -498,6 +526,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'takeover',
     trigger: null,
     include: 'integration:sourcepoint',
+    config: 'sourcepoint',
     provides: ['sourcepoint_consent.v1'],
     consumes: ['runtime.v1'],
     obligation: 'Initial GPP/localStorage mirror and optional SDK guard precede consent use',
@@ -509,6 +538,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'takeover',
     trigger: null,
     include: 'integration:prebid',
+    config: 'prebid',
     provides: ['prebid.v1'],
     consumes: ['runtime.v1', 'slots.v1', 'render.v1', 'messages.v1', 'aps.v1?aps'],
     obligation:
@@ -521,6 +551,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'takeover',
     trigger: null,
     include: 'integration:testlight',
+    config: 'testlight',
     provides: [],
     consumes: ['runtime.v1'],
     obligation: 'Preexisting callbacks must bridge before publisher code can replace/drain them',
@@ -532,6 +563,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'deferred',
     trigger: 'first_display_or_idle',
     include: 'diagnostics_presentation',
+    config: null,
     provides: [],
     consumes: ['runtime.v1', 'trace.presentation.v1', 'gpt_diag.v1?gpt_diagnostics_active'],
     obligation: 'DOM overlay, badges, formatting, clipboard/download interaction',
@@ -543,6 +575,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'deferred',
     trigger: 'first_display_or_idle',
     include: 'integration:gpt',
+    config: 'gpt',
     provides: [],
     consumes: ['runtime.v1', 'slots.v1', 'auction.v1', 'render.v1', 'gpt.v1', 'trace.v1'],
     obligation: 'Post-first-display refresh, SPA navigation, and later reconciliation only',
@@ -554,6 +587,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'deferred',
     trigger: 'first_display_or_idle',
     include: 'integration:osano',
+    config: 'osano',
     provides: [],
     consumes: ['runtime.v1', 'osano_consent.v1'],
     obligation: 'Later retry/event/focus/visibility/clear maintenance',
@@ -565,6 +599,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'deferred',
     trigger: 'first_display_or_idle',
     include: 'integration:permutive',
+    config: 'permutive',
     provides: [],
     consumes: ['runtime.v1', 'permutive_context.v1'],
     obligation: 'Later SDK/segment refresh maintenance',
@@ -576,6 +611,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'deferred',
     trigger: 'first_display_or_idle',
     include: 'prebid_and_gpt',
+    config: 'prebid',
     provides: [],
     consumes: ['runtime.v1', 'slots.v1', 'gpt.v1', 'prebid.v1'],
     obligation: 'Synthetic refresh and GAM-path exclusion; never initial admission',
@@ -587,6 +623,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     phase: 'deferred',
     trigger: 'first_display_or_idle',
     include: 'integration:sourcepoint',
+    config: 'sourcepoint',
     provides: [],
     consumes: ['runtime.v1', 'sourcepoint_consent.v1'],
     obligation: 'Later retry/visibility/focus/update/safe-clear maintenance',
@@ -611,7 +648,8 @@ export function validateReleaseCatalog(entries: readonly ReleaseCatalogEntry[]):
       entry.id !== canonical.id ||
       entry.phase !== canonical.phase ||
       entry.trigger !== canonical.trigger ||
-      entry.include !== canonical.include
+      entry.include !== canonical.include ||
+      entry.config !== canonical.config
     ) {
       throw new TypeError('Release catalog id, phase override, trigger, or predicate is invalid');
     }

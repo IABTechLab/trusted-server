@@ -23,6 +23,7 @@ import type {
   BrowserAuctionProjectionV1,
   BrowserAuctionSlotV1,
 } from '../../core/types';
+import { isGptIntegrationConfigV1 } from '../../shared/integration_config_validators';
 import { log } from '../../core/log';
 import { DisposableStack } from '../../kernel/disposable';
 import type { RuntimeCapabilityV1 } from '../../kernel/runtime';
@@ -357,15 +358,11 @@ export interface GptCapabilityV1 {
   readonly slots: SlotService;
 }
 
-const MAX_CONFIG_DEPTH = 16;
-const MAX_CONFIG_NODES = 512;
-const MAX_CONFIG_MEMBERS = 256;
 const arrayIsArrayIntrinsic = Array.isArray;
 const numberIsFiniteIntrinsic = Number.isFinite;
 const objectGetOwnPropertyDescriptorIntrinsic = Object.getOwnPropertyDescriptor;
 const objectGetOwnPropertyNamesIntrinsic = Object.getOwnPropertyNames;
 const objectGetOwnPropertySymbolsIntrinsic = Object.getOwnPropertySymbols;
-const objectGetPrototypeOfIntrinsic = Object.getPrototypeOf;
 const objectIsFrozenIntrinsic = Object.isFrozen;
 const jsonParseIntrinsic = JSON.parse;
 const promiseThenIntrinsic = Promise.prototype.then;
@@ -1573,61 +1570,12 @@ export async function publishInitialGptProjection(
   ]);
 }
 
-function validFrozenConfig(candidate: unknown): boolean {
-  const seen = new Set<object>();
-  let nodes = 0;
-  const visit = (value: unknown, depth: number, topLevel: boolean): boolean => {
-    if (value === undefined) return topLevel;
-    if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
-    if (typeof value === 'number') return numberIsFiniteIntrinsic(value);
-    if (typeof value !== 'object' || depth > MAX_CONFIG_DEPTH || nodes >= MAX_CONFIG_NODES) {
-      return false;
-    }
-    if (seen.has(value) || !objectIsFrozenIntrinsic(value)) return false;
-    seen.add(value);
-    nodes += 1;
-
-    const array = arrayIsArrayIntrinsic(value);
-    const prototype = objectGetPrototypeOfIntrinsic(value);
-    if (
-      (!array && prototype !== Object.prototype && prototype !== null) ||
-      (array && prototype !== Array.prototype)
-    ) {
-      return false;
-    }
-    if (objectGetOwnPropertySymbolsIntrinsic(value).length !== 0) return false;
-    const names = objectGetOwnPropertyNamesIntrinsic(value);
-    if (names.length > MAX_CONFIG_MEMBERS + (array ? 1 : 0)) return false;
-    if (array) {
-      const length = objectGetOwnPropertyDescriptorIntrinsic(value, 'length');
-      if (!length || !('value' in length) || names.length !== length.value + 1) return false;
-      for (let index = 0; index < length.value; index += 1) {
-        const descriptor = objectGetOwnPropertyDescriptorIntrinsic(value, String(index));
-        if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return false;
-        if (!visit(descriptor.value, depth + 1, false)) return false;
-      }
-      return true;
-    }
-
-    for (const name of names) {
-      const descriptor = objectGetOwnPropertyDescriptorIntrinsic(value, name);
-      if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return false;
-      if (!visit(descriptor.value, depth + 1, false)) return false;
-    }
-    return true;
-  };
-
-  try {
-    return visit(candidate, 0, true);
-  } catch {
-    return false;
-  }
-}
-
 function prepareProductionGpt(context: IntegrationPrepareContext): PreparedIntegration {
   const runtime = exactCapability<RuntimeCapabilityV1>(context.interfaces, 'runtime.v1');
   if (!runtime) throw new TypeError('GPT requires runtime.v1');
-  if (!validFrozenConfig(context.config)) throw new TypeError('GPT integration config is invalid');
+  if (!isGptIntegrationConfigV1(context.config)) {
+    throw new TypeError('GPT integration config is invalid');
+  }
   const auction = exactCapability<ProductionAuctionCapability>(context.interfaces, 'auction.v1');
   const slotCapability = exactCapability<ProductionSlotsCapability>(context.interfaces, 'slots.v1');
   const render = exactCapability<ProductionRenderCapability>(context.interfaces, 'render.v1');

@@ -69,7 +69,7 @@ function presentationInterfaces(runtimeDocument: unknown) {
 function preparePresentation(runtimeDocument: unknown): PreparedIntegration {
   return createDiagnosticsPresentationIntegrationRegistration(RELEASE_ID).prepare(
     Object.freeze({
-      config: Object.freeze({}),
+      config: undefined,
       interfaces: presentationInterfaces(runtimeDocument),
       signal: new AbortController().signal,
       onDispose: vi.fn(),
@@ -109,7 +109,7 @@ describe('deferred GPT diagnostics presentation integration', () => {
     const releases: Array<() => void> = [];
     const prepared = createDiagnosticsPresentationIntegrationRegistration(RELEASE_ID).prepare(
       Object.freeze({
-        config: Object.freeze({}),
+        config: undefined,
         interfaces: Object.freeze({
           'runtime.v1': Object.freeze({
             boot: () =>
@@ -249,7 +249,7 @@ describe('deferred GPT diagnostics presentation integration', () => {
       });
       const prepared = createDiagnosticsPresentationIntegrationRegistration(RELEASE_ID).prepare(
         Object.freeze({
-          config: Object.freeze({}),
+          config: undefined,
           interfaces: Object.freeze({
             'runtime.v1': runtime,
             'trace.presentation.v1': Object.freeze({
@@ -360,7 +360,7 @@ describe('deferred GPT diagnostics presentation integration', () => {
     });
     const prepared = createDiagnosticsPresentationIntegrationRegistration(RELEASE_ID).prepare(
       Object.freeze({
-        config: Object.freeze({}),
+        config: undefined,
         interfaces: Object.freeze({
           'runtime.v1': runtime,
           'trace.presentation.v1': trace,
@@ -419,7 +419,7 @@ describe('deferred GPT diagnostics presentation integration', () => {
     const activationRelease: Array<() => void> = [];
     const prepared = createDiagnosticsPresentationIntegrationRegistration(RELEASE_ID).prepare(
       Object.freeze({
-        config: Object.freeze({}),
+        config: undefined,
         interfaces: Object.freeze({
           'runtime.v1': Object.freeze({
             boot: () =>

@@ -606,6 +606,9 @@ export function createRenderRuntimeIntegrationRegistration(
     phase: 'takeover' as const,
     releaseId,
     prepare: (context: IntegrationPrepareContext) => {
+      if (context.config !== undefined) {
+        throw new TypeError('render_runtime does not accept integration config');
+      }
       const runtime = exactRuntimeCapability(context.interfaces);
       const boot = acceptedBoot(runtime);
       const document = runtime.document;

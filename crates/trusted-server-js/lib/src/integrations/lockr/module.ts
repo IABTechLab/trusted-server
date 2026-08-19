@@ -1,4 +1,5 @@
 import type { IntegrationRegistration } from '../../kernel/integration_registry';
+import { isEmptyIntegrationConfigV1 } from '../../shared/integration_config_validators';
 import {
   createLifecycleIntegrationRegistration,
   type IntegrationLifecycleRuntime,
@@ -138,7 +139,7 @@ export function createLockrIntegrationRegistration(release: string): Integration
   return createLifecycleIntegrationRegistration(LOCKR_INTEGRATION_ID, release, {
     createOwnedRuntime: () => createLockrRuntime(),
     firstDisplaySliceId: 'lockr_initial',
-    validateConfig: (candidate) => candidate === undefined,
+    validateConfig: isEmptyIntegrationConfigV1,
     validateFirstDisplayState: (state) => {
       const readiness = state.values[1];
       return (

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { snapshotTsjsBootV1 } from '../../src/core/contracts/boot';
 import {
   buildFallbackBoot,
   buildKernelBoot,
@@ -58,7 +59,7 @@ function manifest(ids: readonly string[]) {
             id,
             phase: 'deferred' as const,
             trigger: 'first_display_or_idle' as const,
-            src: `/static/tsjs=integrations/${id}.min.js?v=${'d'.repeat(64)}`,
+            src: `/static/tsjs=tsjs-${id}.min.js?v=${'d'.repeat(64)}`,
           }
         : { id, phase: 'takeover' as const }
     ),
@@ -79,6 +80,7 @@ function boot(
       slots: [],
       bids: [],
     },
+    integrations: { version: 1, entries: [] },
     creative,
     diagnostics: {
       version: 1,
@@ -88,12 +90,28 @@ function boot(
   };
 }
 
+function completeBoot(
+  ids: readonly string[],
+  creative: unknown,
+  diagnostics?: Readonly<{ renderTraceOverlay: boolean; gptActive: boolean }>
+) {
+  return snapshotTsjsBootV1(
+    {
+      abi: 1,
+      releaseId: RELEASE_ID,
+      manifest: manifest(ids),
+      ...boot(creative, diagnostics),
+    },
+    RELEASE_ID
+  );
+}
+
 describe('kernel boot creative ABI', () => {
   it.each([
     { version: 1, enabled: false, clickGuard: true, renderGuard: false },
     { version: 1, enabled: false, clickGuard: false, renderGuard: true },
   ])('rejects disabled creative with an enabled guard bit', (creative) => {
-    expect(buildKernelBoot(RELEASE_ID, manifest([]), boot(creative))).toBeUndefined();
+    expect(completeBoot([], creative)).toBeUndefined();
   });
 
   it('rejects a null-prototype creative record', () => {
@@ -104,29 +122,29 @@ describe('kernel boot creative ABI', () => {
       renderGuard: false,
     });
 
-    expect(buildKernelBoot(RELEASE_ID, manifest([]), boot(creative))).toBeUndefined();
+    expect(completeBoot([], creative)).toBeUndefined();
   });
 
   it.each([
-    ['enabled creative without a manifest member', true, []],
+    ['enabled no-guard creative with a manifest member', true, ['creative']],
     ['enabled creative with duplicate manifest members', true, ['creative', 'creative']],
     ['disabled creative with a manifest member', false, ['creative']],
   ] as const)('rejects %s', (_caseName, enabled, ids) => {
     expect(
-      buildKernelBoot(
-        RELEASE_ID,
-        manifest(ids),
-        boot({ version: 1, enabled, clickGuard: false, renderGuard: false })
-      )
+      completeBoot(ids, { version: 1, enabled, clickGuard: false, renderGuard: false })
     ).toBeUndefined();
   });
 
-  it('accepts enabled creative with both guards false only with one manifest member', () => {
-    const accepted = buildKernelBoot(
-      RELEASE_ID,
-      manifest(['creative']),
-      boot({ version: 1, enabled: true, clickGuard: false, renderGuard: false })
-    ) as { readonly creative?: unknown } | undefined;
+  it('accepts enabled creative with both guards false without a manifest member', () => {
+    const snapshot = completeBoot([], {
+      version: 1,
+      enabled: true,
+      clickGuard: false,
+      renderGuard: false,
+    });
+    const accepted = snapshot
+      ? buildKernelBoot(RELEASE_ID, snapshot.manifest, snapshot)
+      : undefined;
 
     expect(accepted?.creative).toEqual({
       version: 1,
@@ -244,12 +262,10 @@ describe('kernel boot diagnostics presentation membership', () => {
         ...(presentation ? ['diagnostics_presentation'] : []),
       ];
 
+      const snapshot = completeBoot(ids, disabledCreative, { renderTraceOverlay, gptActive });
+      expect(snapshot).toBeDefined();
       expect(
-        buildKernelBoot(
-          RELEASE_ID,
-          manifest(ids),
-          boot(disabledCreative, { renderTraceOverlay, gptActive })
-        )
+        snapshot ? buildKernelBoot(RELEASE_ID, snapshot.manifest, snapshot) : undefined
       ).toBeDefined();
     }
   );
@@ -268,25 +284,25 @@ describe('kernel boot diagnostics presentation membership', () => {
       ];
 
       expect(
-        buildKernelBoot(
-          RELEASE_ID,
-          manifest(ids),
-          boot(disabledCreative, { renderTraceOverlay, gptActive })
-        )
+        completeBoot(ids, disabledCreative, { renderTraceOverlay, gptActive })
       ).toBeUndefined();
     }
   );
 
   it('accepts the complete server-shaped phase-aware boot manifest', () => {
     const expectedManifest = manifest(['render_runtime']);
-    const candidate = {
-      abi: 1,
-      releaseId: RELEASE_ID,
-      manifest: expectedManifest,
-      ...boot(disabledCreative),
-    };
+    const candidate = snapshotTsjsBootV1(
+      {
+        abi: 1,
+        releaseId: RELEASE_ID,
+        manifest: expectedManifest,
+        ...boot(disabledCreative),
+      },
+      RELEASE_ID
+    );
 
-    expect(buildKernelBoot(RELEASE_ID, expectedManifest, candidate)).toBeDefined();
+    expect(candidate).toBeDefined();
+    expect(buildKernelBoot(RELEASE_ID, candidate!.manifest, candidate)).toBeDefined();
   });
 
   it.each([
@@ -297,14 +313,19 @@ describe('kernel boot diagnostics presentation membership', () => {
     const expectedManifest = manifest(
       Array.from({ length: count }, (_, index) => `integration_${index + 1}`)
     );
-    const candidate = {
-      abi: 1,
-      releaseId: RELEASE_ID,
-      manifest: expectedManifest,
-      ...boot(disabledCreative),
-    };
+    const candidate = snapshotTsjsBootV1(
+      {
+        abi: 1,
+        releaseId: RELEASE_ID,
+        manifest: expectedManifest,
+        ...boot(disabledCreative),
+      },
+      RELEASE_ID
+    );
 
-    expect(buildKernelBoot(RELEASE_ID, expectedManifest, candidate) !== undefined).toBe(accepted);
+    expect(
+      candidate ? buildKernelBoot(RELEASE_ID, candidate.manifest, candidate) !== undefined : false
+    ).toBe(accepted);
   });
 
   it('rejects a complete boot whose phase-aware manifest differs from the accepted manifest', () => {
@@ -337,10 +358,16 @@ describe('kernel boot diagnostics presentation membership', () => {
             };
 
       expect(
-        buildKernelBoot(RELEASE_ID, manifest([]), {
-          ...candidate,
-          diagnostics,
-        })
+        snapshotTsjsBootV1(
+          {
+            abi: 1,
+            releaseId: RELEASE_ID,
+            manifest: manifest([]),
+            ...candidate,
+            diagnostics,
+          },
+          RELEASE_ID
+        )
       ).toBeUndefined();
     }
   );

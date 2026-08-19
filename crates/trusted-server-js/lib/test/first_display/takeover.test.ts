@@ -10,6 +10,7 @@ import { snapshotOutlinedFirstDisplayHandoffV1 } from '../../src/shared/first_di
 
 const RELEASE_ID = 'a'.repeat(64);
 const DIGEST = 'b'.repeat(64);
+const CONFIG_DIGEST = 'c'.repeat(64);
 const RESERVATION_ID = `r1_${'a'.repeat(22)}`;
 
 function handoff(revision = 0): Record<string, unknown> {
@@ -18,6 +19,7 @@ function handoff(revision = 0): Record<string, unknown> {
     releaseId: RELEASE_ID,
     generation: 1,
     projectionDigest: DIGEST,
+    integrationConfigDigest: CONFIG_DIGEST,
     slices: ['first_display', 'gpt_initial'],
     slots: [
       {
@@ -115,6 +117,7 @@ function outline(): Record<string, unknown> {
     releaseId: RELEASE_ID,
     generation: 1,
     projectionDigest: DIGEST,
+    integrationConfigDigest: CONFIG_DIGEST,
     slices: ['first_display', 'gpt_initial'],
     slotCount: 1,
     outcomeCount: 1,

@@ -1,30 +1,35 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { TsjsApi } from '../../src/core/types';
+import { snapshotTsjsBootV1 } from '../../src/core/contracts/boot';
+import type { TsjsApi, TsjsBootV1 } from '../../src/core/types';
 
 const RELEASE = 'a'.repeat(64);
 const RUNTIME_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
 
 function boot() {
-  return {
-    abi: 1,
-    releaseId: RELEASE,
-    manifest: {
-      version: 1,
+  return snapshotTsjsBootV1(
+    {
+      abi: 1,
       releaseId: RELEASE,
-      firstDisplay: null,
-      runtimeSrc: RUNTIME_SRC,
-      integrations: [{ id: 'render_runtime', phase: 'takeover' }],
+      manifest: {
+        version: 1,
+        releaseId: RELEASE,
+        firstDisplay: null,
+        runtimeSrc: RUNTIME_SRC,
+        integrations: [{ id: 'render_runtime', phase: 'takeover' }],
+      },
+      auctionProjection: {
+        version: 1,
+        auction: { version: 1, auctionId: 'initial', results: [] },
+        slots: [],
+        bids: [],
+      },
+      integrations: { version: 1, entries: [] },
+      creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+      diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
     },
-    auctionProjection: {
-      version: 1,
-      auction: { version: 1, auctionId: 'initial', results: [] },
-      slots: [],
-      bids: [],
-    },
-    creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
-    diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
-  };
+    RELEASE
+  )!;
 }
 
 async function loadMinimalProductionRuntime(): Promise<void> {
@@ -38,6 +43,20 @@ function installRuntimeScript(): void {
   script.src = new URL(RUNTIME_SRC, window.location.origin).href;
   document.head.append(script);
   Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
+}
+
+function installBootClaim(target: object, acceptedBoot: Readonly<TsjsBootV1>): void {
+  const claim = (source: unknown): Readonly<TsjsBootV1> | undefined => {
+    if (source !== document.currentScript) return undefined;
+    Reflect.deleteProperty(target, '_claimBootSnapshot');
+    return acceptedBoot;
+  };
+  Object.defineProperty(target, '_claimBootSnapshot', {
+    configurable: true,
+    enumerable: false,
+    value: claim,
+    writable: false,
+  });
 }
 
 describe('core production bootstrap', () => {
@@ -56,10 +75,10 @@ describe('core production bootstrap', () => {
     const preload = {
       boot: boot(),
       que: [queued],
-      _integrationConfig: {},
       renderAdUnit: vi.fn(),
       bids: { legacy: true },
     };
+    installBootClaim(preload, preload.boot);
     (window as unknown as { tsjs?: unknown }).tsjs = preload;
 
     await loadMinimalProductionRuntime();
@@ -79,7 +98,7 @@ describe('core production bootstrap', () => {
     expect(typeof api.requestAds).toBe('function');
     expect(api._registerIntegration({})).toBe(false);
     expect(queued).toHaveBeenCalledOnce();
-    expect(preload).not.toHaveProperty('_integrationConfig');
+    expect(preload).not.toHaveProperty('_claimBootSnapshot');
     expect(preload).not.toHaveProperty('renderAdUnit');
     expect(preload).not.toHaveProperty('bids');
     expect(preload).not.toHaveProperty('renderAllAdUnits');
@@ -89,7 +108,8 @@ describe('core production bootstrap', () => {
 
   it('starts installation in the combined bundle task without waiting for DOM readiness', async () => {
     const readyState = vi.spyOn(document, 'readyState', 'get').mockReturnValue('loading');
-    const preload = { boot: boot(), que: [], _integrationConfig: {} };
+    const preload = { boot: boot(), que: [] };
+    installBootClaim(preload, preload.boot);
     (window as unknown as { tsjs?: unknown }).tsjs = preload;
 
     try {
@@ -102,35 +122,37 @@ describe('core production bootstrap', () => {
     }
   });
 
-  it('publishes no terminal API when the transient integration-config transport is malformed', async () => {
-    const preload = {
-      boot: boot(),
-      que: [],
-      _integrationConfig: new (class Config {})(),
-    };
-    (window as unknown as { tsjs?: unknown }).tsjs = preload;
-
-    await import('../../src/composition/runtime_transport');
-    await Promise.resolve();
-
-    expect(preload).not.toHaveProperty('_integrationConfig');
-    expect(preload).not.toHaveProperty('_internal');
-    expect(preload).not.toHaveProperty('requestAds');
-  });
-
-  it('does not publish a fallback API over a non-configurable integration transport', async () => {
+  it('publishes no terminal API when the closure boot claim is malformed', async () => {
     const preload = { boot: boot(), que: [] };
-    Object.defineProperty(preload, '_integrationConfig', {
-      configurable: false,
+    Object.defineProperty(preload, '_claimBootSnapshot', {
+      configurable: true,
       enumerable: true,
-      value: {},
+      value: () => preload.boot,
     });
     (window as unknown as { tsjs?: unknown }).tsjs = preload;
 
     await import('../../src/composition/runtime_transport');
     await Promise.resolve();
 
-    expect(preload).toHaveProperty('_integrationConfig');
+    expect(preload).toHaveProperty('_claimBootSnapshot');
+    expect(preload).not.toHaveProperty('_internal');
+    expect(preload).not.toHaveProperty('requestAds');
+  });
+
+  it('does not publish a fallback API over a non-configurable boot claim', async () => {
+    const preload = { boot: boot(), que: [] };
+    Object.defineProperty(preload, '_claimBootSnapshot', {
+      configurable: false,
+      enumerable: false,
+      value: () => preload.boot,
+      writable: false,
+    });
+    (window as unknown as { tsjs?: unknown }).tsjs = preload;
+
+    await import('../../src/composition/runtime_transport');
+    await Promise.resolve();
+
+    expect(preload).toHaveProperty('_claimBootSnapshot');
     expect(preload).not.toHaveProperty('_internal');
     expect(preload).not.toHaveProperty('requestAds');
   });

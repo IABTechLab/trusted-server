@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -11,6 +12,10 @@ const manifest = JSON.parse(readFileSync(path.join(dist, 'tsjs-release-v1.json')
 const source = readFileSync(path.join(dist, 'tsjs-bootstrap.js'), 'utf8');
 const selectedSrc = `/static/tsjs=tsjs-first-display.min.js?m=0001&v=${'c'.repeat(64)}`;
 const runtimeSrc = `/static/tsjs=tsjs-unified.min.js?v=${'d'.repeat(64)}`;
+const EMPTY_INTEGRATION_CONFIGS = Object.freeze({ version: 1, entries: Object.freeze([]) });
+const EMPTY_INTEGRATION_CONFIG_DIGEST = createHash('sha256')
+  .update(JSON.stringify(EMPTY_INTEGRATION_CONFIGS))
+  .digest('hex');
 
 function createDocument() {
   const dom = new JSDOM(
@@ -49,9 +54,18 @@ function boot() {
         auctionId: 'initial',
         results: [{ slot: 'slot-1', outcome: 'no_bid' }],
       },
-      slots: [],
+      slots: [
+        {
+          slot: 'slot-1',
+          gamUnitPath: '/123/slot-1',
+          divId: 'slot-1',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
       bids: [],
     },
+    integrations: EMPTY_INTEGRATION_CONFIGS,
     creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
     diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
   };
@@ -63,6 +77,7 @@ function outline() {
     releaseId: manifest.releaseId,
     generation: 1,
     projectionDigest: 'e'.repeat(64),
+    integrationConfigDigest: EMPTY_INTEGRATION_CONFIG_DIGEST,
     slices: ['first_display'],
     slotCount: 1,
     outcomeCount: 1,

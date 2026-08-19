@@ -1,4 +1,5 @@
 import { EMBEDDED_RELEASE_ID } from '../../core/release';
+import { isEmptyIntegrationConfigV1 } from '../../shared/integration_config_validators';
 import type {
   IntegrationActivationContext,
   IntegrationPrepareContext,
@@ -22,7 +23,7 @@ export function createOsanoLifecycleIntegrationRegistration(
     prepare: ({ config, interfaces }: IntegrationPrepareContext) => {
       const capability = interfaces['osano_consent.v1'] as OsanoConsentCapabilityV1 | undefined;
       if (
-        config !== undefined ||
+        !isEmptyIntegrationConfigV1(config) ||
         !capability ||
         !Object.isFrozen(capability) ||
         typeof capability.activateLifecycle !== 'function' ||

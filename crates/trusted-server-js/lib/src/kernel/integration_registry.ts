@@ -5,6 +5,7 @@ import {
 } from '../shared/first_display_contracts';
 import { snapshotPersistentFirstDisplayAdoptionV1 } from '../shared/takeover';
 
+import type { ReleaseConfigSourceV1 } from './release_catalog';
 import { DisposableStack, type DisposeCallback } from './disposable';
 import { trustedArtifactOrigin, type BootFailureReason } from './fallback';
 
@@ -137,6 +138,7 @@ export interface IntegrationCatalogEntry {
   readonly id: string;
   readonly phase: 'takeover' | 'deferred';
   readonly trigger: 'first_display_or_idle' | null;
+  readonly config?: ReleaseConfigSourceV1;
   readonly consumes: readonly string[];
   readonly provides: readonly string[];
 }
@@ -307,13 +309,43 @@ function validateCatalog(
   let takeoverCount = 0;
   const providerIndex = new Map<string, number>();
   for (const entry of entries) {
-    const fields = readExactDataFields(entry, ['id', 'phase', 'trigger', 'consumes', 'provides']);
+    const keys = Reflect.ownKeys(entry as object);
+    const hasConfig = keys.includes('config');
+    const fields = readExactDataFields(entry, [
+      'id',
+      'phase',
+      'trigger',
+      ...(hasConfig ? ['config'] : []),
+      'consumes',
+      'provides',
+    ]);
     if (!fields || typeof fields.id !== 'string' || !knownIntegrationIds.has(fields.id)) {
       return undefined;
     }
     const consumes = validateCapabilityList(fields.consumes, true);
     const provides = validateCapabilityList(fields.provides, false);
     if (!consumes || !provides) return undefined;
+    if (
+      hasConfig &&
+      fields.config !== null &&
+      ![
+        'aps',
+        'datadome',
+        'didomi',
+        'google_tag_manager',
+        'gpt',
+        'lockr',
+        'osano',
+        'permutive',
+        'prebid',
+        'sourcepoint',
+        'testlight',
+        'creative',
+        'diagnostics',
+      ].includes(fields.config as string)
+    ) {
+      return undefined;
+    }
     if (seen.has(fields.id)) return undefined;
     seen.add(fields.id);
     if (fields.phase === 'takeover') {
@@ -334,6 +366,7 @@ function validateCatalog(
         id: fields.id,
         phase: fields.phase,
         trigger: fields.trigger,
+        ...(hasConfig ? { config: fields.config as ReleaseConfigSourceV1 } : {}),
         consumes,
         provides,
       }) as IntegrationCatalogEntry

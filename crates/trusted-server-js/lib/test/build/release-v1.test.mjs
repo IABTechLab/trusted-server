@@ -73,17 +73,14 @@ const EXPECTED_RELEASE_BUNDLE_ORDER = [
 const TAKEOVER_CONSENT_ARTIFACTS = Object.freeze([
   Object.freeze({
     id: 'osano_consent',
-    config: undefined,
     capability: 'osano_consent.v1',
   }),
   Object.freeze({
     id: 'permutive_context',
-    config: undefined,
     capability: 'permutive_context.v1',
   }),
   Object.freeze({
     id: 'sourcepoint_consent',
-    config: Object.freeze({ rewriteSdk: false }),
     capability: 'sourcepoint_consent.v1',
   }),
 ]);
@@ -419,21 +416,27 @@ test('generated first-display components self-register through one authenticated
         sliceBindings: function(id) {
           if (id === 'aps_initial') {
             return Object.freeze({
-              observe: function() {},
-              publisherOrigin: 'https://publisher.example',
-              register: function(protocol) {
-                window.__firstDisplayEvents.push('aps:' + protocol.id);
-                return function() {};
-              }
+              bindings: Object.freeze({
+                observe: function() {},
+                publisherOrigin: 'https://publisher.example',
+                register: function(protocol) {
+                  window.__firstDisplayEvents.push('aps:' + protocol.id);
+                  return function() {};
+                }
+              }),
+              config: Object.freeze({})
             });
           }
           if (id === 'gpt_initial') {
             return Object.freeze({
-              observe: function() {},
-              register: function(protocol) {
-                window.__firstDisplayEvents.push('gpt:' + protocol.id);
-                return function() {};
-              }
+              bindings: Object.freeze({
+                observe: function() {},
+                register: function(protocol) {
+                  window.__firstDisplayEvents.push('gpt:' + protocol.id);
+                  return function() {};
+                }
+              }),
+              config: Object.freeze({gamAttributionEnabled: false})
             });
           }
           return undefined;
@@ -695,6 +698,13 @@ test('co-bundled render_runtime and independent GPT start one branded display fl
           slots: freeze([placement]),
           bids: freeze([bid])
         }),
+        integrations: freeze({
+          version: 1,
+          entries: freeze([freeze({
+            id: 'gpt',
+            config: freeze({ gamAttributionEnabled: false })
+          })])
+        }),
         creative: freeze({
           version: 1,
           enabled: false,
@@ -726,6 +736,16 @@ test('co-bundled render_runtime and independent GPT start one branded display fl
     Object.defineProperties(dom.window.tsjs, {
       boot: { configurable: true, enumerable: true, value: boot, writable: true },
       que: { configurable: true, enumerable: true, value: [], writable: true },
+      _claimBootSnapshot: {
+        configurable: true,
+        enumerable: false,
+        value: (source) => {
+          if (source !== runtimeScript) return undefined;
+          Reflect.deleteProperty(dom.window.tsjs, '_claimBootSnapshot');
+          return boot;
+        },
+        writable: false,
+      },
     });
     Object.defineProperty(dom.window.document, 'currentScript', {
       configurable: true,
@@ -772,7 +792,7 @@ for (const fixture of TAKEOVER_CONSENT_ARTIFACTS) {
       const config =
         fixture.id === 'sourcepoint_consent'
           ? dom.window.eval('Object.freeze({ rewriteSdk: false })')
-          : fixture.config;
+          : dom.window.eval('Object.freeze({})');
       const prepared = registration.prepare(
         dom.window.Object.freeze({
           config,

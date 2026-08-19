@@ -1,4 +1,5 @@
 import { EMBEDDED_RELEASE_ID } from '../../core/release';
+import { isSourcepointIntegrationConfigV1 } from '../../shared/integration_config_validators';
 import type {
   IntegrationActivationContext,
   IntegrationPrepareContext,
@@ -23,7 +24,7 @@ export function createSourcepointLifecycleIntegrationRegistration(
       const capability = interfaces['sourcepoint_consent.v1'] as
         SourcepointConsentCapabilityV1 | undefined;
       if (
-        config !== undefined ||
+        !isSourcepointIntegrationConfigV1(config) ||
         !capability ||
         !Object.isFrozen(capability) ||
         typeof capability.activateLifecycle !== 'function' ||

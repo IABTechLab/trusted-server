@@ -117,6 +117,7 @@ function runtimeCatalog(ids: readonly string[]) {
           id,
           phase: canonical.phase,
           trigger: canonical.trigger,
+          config: canonical.config,
           consumes: canonical.consumes,
           provides: canonical.provides,
         });
@@ -125,6 +126,7 @@ function runtimeCatalog(ids: readonly string[]) {
         id,
         phase: DEFERRED_INTEGRATION_IDS.has(id) ? ('deferred' as const) : ('takeover' as const),
         trigger: DEFERRED_INTEGRATION_IDS.has(id) ? ('first_display_or_idle' as const) : null,
+        config: null,
         consumes: Object.freeze(
           id === BROWSER_TEST_DIAGNOSTICS_PROVIDER_ID
             ? ['runtime.v1']
@@ -1933,18 +1935,27 @@ describe('browser composition', () => {
   it('injects GPT and Prebid module boundaries with only server-frozen configuration', async () => {
     const releaseId = 'a'.repeat(64);
     const target = {};
-    const gptConfig = Object.freeze({ scriptUrl: '/integrations/gpt/script' });
-    const prebidConfig = Object.freeze({ clientSideBidders: Object.freeze(['rubicon']) });
+    const gptConfig = Object.freeze({ gamAttributionEnabled: false });
+    const prebidConfig = Object.freeze({
+      accountId: 'test',
+      timeout: 1_000,
+      debug: false,
+      bidders: Object.freeze(['rubicon']),
+      clientSideBidders: Object.freeze(['rubicon']),
+      excludedGamAdUnitPathSuffixes: Object.freeze<string[]>([]),
+    });
     const providedBindings = vi.fn((id: string) => ({
       config: id === 'prebid' ? prebidConfig : gptConfig,
       interfaces: Object.freeze({ publisherControlled: Object.freeze({}) }),
     }));
     const startGpt = vi.fn((received: unknown) => {
-      expect(received).toBe(gptConfig);
+      expect(received).toEqual(gptConfig);
+      expect(Object.isFrozen(received)).toBe(true);
       expect((target as { version?: unknown }).version).toBe('1.0.0');
     });
     const startPrebid = vi.fn((received: unknown) => {
-      expect(received).toBe(prebidConfig);
+      expect(received).toEqual(prebidConfig);
+      expect(Object.isFrozen(received)).toBe(true);
       expect((target as { version?: unknown }).version).toBe('1.0.0');
     });
     const composition = createTestBrowserRuntimeComposition(
@@ -1959,6 +1970,13 @@ describe('browser composition', () => {
             auction: { version: 1, auctionId: 'initial', results: [] },
             slots: [],
             bids: [],
+          },
+          integrations: {
+            version: 1,
+            entries: [
+              { id: 'gpt', config: gptConfig },
+              { id: 'prebid', config: prebidConfig },
+            ],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
           diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
@@ -2012,6 +2030,10 @@ describe('browser composition', () => {
     const gpt = synchronousGptAdapter();
     const prebid = synchronousPrebidAdapter();
     const prebidConfig = Object.freeze({
+      accountId: 'test',
+      timeout: 1_500,
+      debug: false,
+      bidders: Object.freeze(['client']),
       clientSideBidders: Object.freeze(['client']),
       excludedGamAdUnitPathSuffixes: Object.freeze<string[]>([]),
     });
@@ -2038,6 +2060,13 @@ describe('browser composition', () => {
             auction: { version: 1, auctionId: 'initial', results: [] },
             slots: [],
             bids: [],
+          },
+          integrations: {
+            version: 1,
+            entries: [
+              { id: 'gpt', config: { gamAttributionEnabled: false } },
+              { id: 'prebid', config: prebidConfig },
+            ],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
           diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
@@ -2327,8 +2356,8 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId,
-        manifest: runtimeManifest(releaseId, ['creative']),
-        knownIntegrationIds: Object.freeze(['creative']),
+        manifest: runtimeManifest(releaseId, []),
+        knownIntegrationIds: Object.freeze([]),
         boot: {
           auctionProjection: {
             version: 1,
@@ -2354,11 +2383,6 @@ describe('browser composition', () => {
     );
 
     expect(composition.runtime.start()).toBe(true);
-    expect(
-      composition.runtime.registerIntegration(
-        createLegacyCreativeIntegrationRegistration(releaseId)
-      )
-    ).toBe(true);
     await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
     expect(activateCreative).not.toHaveBeenCalled();
     expect(startCreative).not.toHaveBeenCalled();
@@ -2384,7 +2408,7 @@ describe('browser composition', () => {
     ],
     [
       'missing enabled creative manifest member',
-      { version: 1, enabled: true, clickGuard: false, renderGuard: false },
+      { version: 1, enabled: true, clickGuard: true, renderGuard: false },
       [],
     ],
   ] as const)('rejects creative ABI mismatch: %s', async (_caseName, creative, manifestIds) => {

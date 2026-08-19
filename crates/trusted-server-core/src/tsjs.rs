@@ -392,13 +392,18 @@ pub fn tsjs_bootstrap_fragment_v1(
         runtime_src,
         integrations.join(",")
     );
+    let integration_configs_json = serde_json::to_string(config.integration_configs)
+        .map_err(|_| integration_config_error("carrier serialization failed"))?;
+    let integration_config_digest =
+        hex::encode(Sha256::digest(integration_configs_json.as_bytes()));
     let outline = first_display.as_ref().map_or_else(
         || "null".to_owned(),
         |_| {
             format!(
-                r#"{{"version":1,"releaseId":"{}","generation":1,"projectionDigest":"{}","slices":[{}],"slotCount":{},"outcomeCount":{},"capabilities":[],"objectKinds":[{}]}}"#,
+                r#"{{"version":1,"releaseId":"{}","generation":1,"projectionDigest":"{}","integrationConfigDigest":"{}","slices":[{}],"slotCount":{},"outcomeCount":{},"capabilities":[],"objectKinds":[{}]}}"#,
                 release_id(),
                 projection_digest,
+                integration_config_digest,
                 slice_ids.join(","),
                 projection_value.slots.len(),
                 projection_value.auction.results.len(),
@@ -412,10 +417,7 @@ pub fn tsjs_bootstrap_fragment_v1(
     );
     let manifest = escape_json_for_inline_script(&manifest);
     let projection = escape_json_for_inline_script(&projection);
-    let integration_configs = escape_json_for_inline_script(
-        &serde_json::to_string(config.integration_configs)
-            .map_err(|_| integration_config_error("carrier serialization failed"))?,
-    );
+    let integration_configs = escape_json_for_inline_script(&integration_configs_json);
     let outline = escape_json_for_inline_script(&outline);
     let bootstrap = trusted_server_js::bootstrap_bundle();
     if bootstrap.to_ascii_lowercase().contains("</script") {
@@ -1181,6 +1183,38 @@ mod tests {
             }],
         })
         .expect("should serialize a canonical ADM projection")
+    }
+
+    #[test]
+    fn first_display_outline_binds_the_canonical_integration_config_digest() {
+        let configs = IntegrationConfigsV1::new(vec![(
+            "gpt",
+            serde_json::json!({ "gamAttributionEnabled": false }),
+        )])
+        .expect("GPT browser config should be admitted");
+        let canonical = serde_json::to_string(&configs).expect("carrier should serialize");
+        let expected_digest = hex::encode(Sha256::digest(canonical.as_bytes()));
+        let script = tsjs_bootstrap_fragment_v1(
+            TsjsBootScriptConfigV1 {
+                module_ids: &["render_runtime", "gpt"],
+                integration_configs: &configs,
+                auction_projection_json: &projection_with_adm("<main>ad</main>"),
+                creative: CreativeBootConfigV1 {
+                    enabled: false,
+                    click_guard: false,
+                    render_guard: false,
+                },
+                render_trace_overlay: false,
+                gpt_diagnostics_active: false,
+            },
+            "https://publisher.example",
+        )
+        .expect("first-display bootstrap should serialize");
+
+        assert!(
+            script.contains(&format!(r#""integrationConfigDigest":"{expected_digest}""#)),
+            "outline must bind the exact canonical carrier: {script}"
+        );
     }
 
     fn hash_query_value(src: &str) -> &str {

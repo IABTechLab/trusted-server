@@ -1,4 +1,5 @@
 import { EMBEDDED_RELEASE_ID } from '../../core/release';
+import { isEmptyIntegrationConfigV1 } from '../../shared/integration_config_validators';
 import type {
   IntegrationActivationContext,
   IntegrationPrepareContext,
@@ -23,7 +24,7 @@ export function createPermutiveLifecycleIntegrationRegistration(
       const capability = interfaces['permutive_context.v1'] as
         PermutiveContextCapabilityV1 | undefined;
       if (
-        config !== undefined ||
+        !isEmptyIntegrationConfigV1(config) ||
         !capability ||
         !Object.isFrozen(capability) ||
         typeof capability.activateLifecycle !== 'function' ||

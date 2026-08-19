@@ -39,6 +39,7 @@ import { createTargetingService } from '../../../src/services/targeting';
 
 const RELEASE_ID = 'a'.repeat(64);
 const RESERVATION_ID = `r1_${'a'.repeat(22)}`;
+const GPT_CONFIG = Object.freeze({ gamAttributionEnabled: false });
 
 describe('GPT first-display diagnostics adoption', () => {
   it('hydrates exact physical-slot cycle state before slot adoption', () => {
@@ -834,7 +835,7 @@ describe('transactional GPT integration module', () => {
         runtimeCapability: runtime,
         getBindings: (id) =>
           Object.freeze({
-            config: id === 'gpt' ? Object.freeze({}) : undefined,
+            config: id === 'gpt' ? GPT_CONFIG : undefined,
             interfaces: Object.freeze({}),
           }),
         onCapabilityStaged: (key, facade) => {
@@ -874,6 +875,7 @@ describe('transactional GPT integration module', () => {
                     releaseId: RELEASE_ID,
                     generation: 1,
                     projectionDigest: 'b'.repeat(64),
+                    integrationConfigDigest: 'c'.repeat(64),
                     slices,
                     slots: Object.freeze([
                       Object.freeze({
@@ -984,6 +986,7 @@ describe('transactional GPT integration module', () => {
                     releaseId: RELEASE_ID,
                     generation: 1,
                     projectionDigest: 'b'.repeat(64),
+                    integrationConfigDigest: 'c'.repeat(64),
                     slices,
                     slotCount: 1,
                     outcomeCount: 1,
@@ -1520,7 +1523,7 @@ describe('transactional GPT integration module', () => {
       startedAtMs: 0,
       now: () => 0,
       getBindings: () => ({
-        config: Object.freeze({}),
+        config: GPT_CONFIG,
         interfaces: Object.freeze({
           gpt: Object.freeze({ activate: () => vi.fn(), start }),
         }),
@@ -1554,7 +1557,7 @@ describe('transactional GPT integration module', () => {
       startedAtMs: 0,
       now: () => 0,
       getBindings: () => ({
-        config: Object.freeze({}),
+        config: GPT_CONFIG,
         interfaces: Object.freeze({
           gpt: Object.freeze({
             activate: () => {
@@ -1583,7 +1586,7 @@ describe('transactional GPT integration module', () => {
       knownIntegrationIds: Object.freeze(['gpt']),
       startedAtMs: 0,
       now: () => 0,
-      getBindings: () => ({ config: Object.freeze({}), interfaces: Object.freeze({}) }),
+      getBindings: () => ({ config: GPT_CONFIG, interfaces: Object.freeze({}) }),
     });
     registry.register(createGptIntegrationRegistration(RELEASE_ID));
 
@@ -1645,7 +1648,7 @@ describe('transactional GPT integration module', () => {
       now: () => 0,
       onRuntimeFailure: (failure) => runtimeFailures.push(failure),
       getBindings: () => ({
-        config: Object.freeze({}),
+        config: GPT_CONFIG,
         interfaces: Object.freeze({
           gpt: Object.freeze({ activate: () => vi.fn(), start }),
         }),

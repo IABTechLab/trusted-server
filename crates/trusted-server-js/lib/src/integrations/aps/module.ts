@@ -1,4 +1,5 @@
 import type { MessagingAdapter } from '../../adapters/messaging';
+import { isEmptyIntegrationConfigV1 } from '../../shared/integration_config_validators';
 import type {
   IntegrationActivationContext,
   IntegrationPrepareContext,
@@ -48,6 +49,9 @@ export function createApsIntegrationRegistration(releaseId: string): Integration
     phase: 'takeover' as const,
     releaseId,
     prepare: (context: IntegrationPrepareContext) => {
+      if (!isEmptyIntegrationConfigV1(context.config)) {
+        throw new TypeError('APS integration config is invalid');
+      }
       const render = capability<RenderCapability>(context.interfaces, 'render.v1');
       const messages = capability<MessagesCapability>(context.interfaces, 'messages.v1');
       if (

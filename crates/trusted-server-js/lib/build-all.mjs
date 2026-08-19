@@ -66,10 +66,11 @@ if (releaseCatalog.length !== 20) throw new Error('[build-all] Catalog must cont
 if (firstDisplayCatalog.length !== 13 || firstDisplayCatalog[0]?.id !== 'first_display') {
   throw new Error('[build-all] First-display catalog must contain its base and twelve slices');
 }
-const runtimeCatalog = releaseCatalog.map(({ id, phase, trigger, consumes, provides }) => ({
+const runtimeCatalog = releaseCatalog.map(({ id, phase, trigger, config, consumes, provides }) => ({
   id,
   phase,
   trigger,
+  config,
   consumes,
   provides,
 }));
