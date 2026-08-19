@@ -4,10 +4,12 @@ use error_stack::{Report, ResultExt};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
+use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::OnceLock;
+use subtle::ConstantTimeEq as _;
 use url::Url;
 use validator::{Validate, ValidationError};
 
@@ -1911,6 +1913,57 @@ pub struct TesterCookieConfig {
     pub enabled: bool,
 }
 
+/// Authenticated forwarding configuration for a trusted client IP header.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+#[validate(schema(function = validate_trusted_client_ip))]
+pub struct TrustedClientIpConfig {
+    /// Header containing the client IP address supplied by the trusted edge.
+    pub ip_header: String,
+    /// Header containing the shared-secret authentication value.
+    pub auth_header: String,
+    /// Shared secret required before accepting the forwarded client IP address.
+    #[validate(custom(function = validate_redacted_not_empty))]
+    pub shared_secret: Redacted<String>,
+}
+
+impl TrustedClientIpConfig {
+    /// Returns whether `candidate` exactly matches the configured shared secret.
+    #[must_use]
+    pub fn authenticates(&self, candidate: &str) -> bool {
+        let configured_digest = Sha256::digest(self.shared_secret.expose().as_bytes());
+        let candidate_digest = Sha256::digest(candidate.as_bytes());
+
+        configured_digest.ct_eq(&candidate_digest).into()
+    }
+}
+
+fn validate_trusted_client_ip(config: &TrustedClientIpConfig) -> Result<(), ValidationError> {
+    let ip_header = http::HeaderName::from_bytes(config.ip_header.as_bytes())
+        .map_err(|_| ValidationError::new("invalid_trusted_client_ip_header"))?;
+    let auth_header = http::HeaderName::from_bytes(config.auth_header.as_bytes())
+        .map_err(|_| ValidationError::new("invalid_trusted_client_ip_header"))?;
+
+    if ip_header == auth_header {
+        return Err(ValidationError::new("identical_trusted_client_ip_headers"));
+    }
+
+    for header in [&ip_header, &auth_header] {
+        if matches!(header.as_str(), "x-ts-tls-protocol" | "x-ts-tls-cipher") {
+            return Err(ValidationError::new("reserved_trusted_client_ip_header"));
+        }
+    }
+
+    if ip_header.as_str() != "fastly-client-ip" && !ip_header.as_str().starts_with("x-") {
+        return Err(ValidationError::new("unsafe_trusted_client_ip_header"));
+    }
+    if !auth_header.as_str().starts_with("x-") {
+        return Err(ValidationError::new("unsafe_trusted_client_ip_header"));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -1918,6 +1971,10 @@ pub struct Settings {
     pub publisher: Publisher,
     #[serde(default)]
     pub tester_cookie: TesterCookieConfig,
+    /// Optional authenticated trusted client IP forwarding configuration.
+    #[serde(default)]
+    #[validate(nested)]
+    pub trusted_client_ip: Option<TrustedClientIpConfig>,
     #[serde(default)]
     #[validate(nested)]
     pub ec: Ec,
@@ -2594,6 +2651,207 @@ mod tests {
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+
+    fn trusted_client_ip_toml(ip_header: &str, auth_header: &str, shared_secret: &str) -> String {
+        format!(
+            "{}\n[trusted_client_ip]\nip_header = \"{ip_header}\"\nauth_header = \"{auth_header}\"\nshared_secret = \"{shared_secret}\"\n",
+            crate_test_settings_str()
+        )
+    }
+
+    #[test]
+    fn trusted_client_ip_is_absent_by_default() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without trusted client IP configuration");
+
+        assert!(
+            settings.trusted_client_ip.is_none(),
+            "should leave trusted client IP configuration disabled by default"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_parses_and_redacts_shared_secret_in_debug_output() {
+        let settings = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            "fictional-shared-secret",
+        ))
+        .expect("should parse valid trusted client IP configuration");
+        let config = settings
+            .trusted_client_ip
+            .expect("should retain trusted client IP configuration");
+
+        assert_eq!(config.ip_header, "fastly-client-ip");
+        assert_eq!(config.auth_header, "x-trusted-client-auth");
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("[REDACTED]"),
+            "should redact trusted client IP shared secret in debug output"
+        );
+        assert!(
+            !debug.contains("fictional-shared-secret"),
+            "should not expose trusted client IP shared secret in debug output"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_accepts_x_prefixed_ip_header() {
+        let settings = Settings::from_toml(&trusted_client_ip_toml(
+            "x-trusted-client-ip",
+            "x-trusted-client-auth",
+            "fictional-shared-secret",
+        ))
+        .expect("should accept an x-prefixed trusted client IP header");
+        let config = settings
+            .trusted_client_ip
+            .expect("should retain trusted client IP configuration");
+
+        assert_eq!(
+            config.ip_header, "x-trusted-client-ip",
+            "should retain the x-prefixed trusted client IP header"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_authentication_requires_an_exact_match() {
+        let settings = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            "fictional-shared-secret",
+        ))
+        .expect("should parse valid trusted client IP configuration");
+        let config = settings
+            .trusted_client_ip
+            .expect("should retain trusted client IP configuration");
+
+        assert!(
+            config.authenticates("fictional-shared-secret"),
+            "should authenticate an exact shared secret match"
+        );
+        assert!(
+            !config.authenticates("fictional-wrong-secret"),
+            "should reject a different shared secret"
+        );
+        assert!(
+            !config.authenticates(" fictional-shared-secret"),
+            "should reject a leading-whitespace shared secret"
+        );
+        assert!(
+            !config.authenticates("fictional-shared-secret "),
+            "should reject a trailing-whitespace shared secret"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_identical_header_names() {
+        for (ip_header, auth_header) in [
+            ("x-trusted-client", "x-trusted-client"),
+            ("X-Trusted-Client", "x-trusted-client"),
+        ] {
+            let error = Settings::from_toml(&trusted_client_ip_toml(
+                ip_header,
+                auth_header,
+                "fictional-shared-secret",
+            ))
+            .expect_err("should reject identical trusted client IP header names");
+
+            assert!(
+                format!("{error:?}").contains("identical_trusted_client_ip_headers"),
+                "should identify duplicate trusted client IP header names"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_unsafe_header_names() {
+        for (ip_header, auth_header) in [
+            ("host", "x-trusted-client-auth"),
+            ("fastly-client-ip", "authorization"),
+        ] {
+            let error = Settings::from_toml(&trusted_client_ip_toml(
+                ip_header,
+                auth_header,
+                "fictional-shared-secret",
+            ))
+            .expect_err("should reject unsafe trusted client IP header names");
+            let message = format!("{error:?}");
+
+            assert!(
+                message.contains("unsafe_trusted_client_ip_header"),
+                "should identify unsafe trusted client IP header names"
+            );
+            assert!(
+                !message.contains("fictional-shared-secret"),
+                "should not include the shared secret in validation errors"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_reserved_tls_bridge_headers() {
+        for (ip_header, auth_header) in [
+            ("x-ts-tls-protocol", "x-trusted-client-auth"),
+            ("x-ts-tls-cipher", "x-trusted-client-auth"),
+            ("fastly-client-ip", "x-ts-tls-protocol"),
+            ("fastly-client-ip", "x-ts-tls-cipher"),
+        ] {
+            let error = Settings::from_toml(&trusted_client_ip_toml(
+                ip_header,
+                auth_header,
+                "fictional-shared-secret",
+            ))
+            .expect_err("should reject reserved TLS bridge headers");
+
+            assert!(
+                format!("{error:?}").contains("reserved_trusted_client_ip_header"),
+                "should identify reserved TLS bridge headers"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_empty_secret_malformed_names_and_incomplete_sections() {
+        let empty_secret = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            "",
+        ));
+        assert!(
+            empty_secret.is_err(),
+            "should reject an empty trusted client IP shared secret"
+        );
+
+        for (ip_header, auth_header) in [
+            ("invalid header", "x-trusted-client-auth"),
+            ("fastly-client-ip", "invalid header"),
+        ] {
+            let error = Settings::from_toml(&trusted_client_ip_toml(
+                ip_header,
+                auth_header,
+                "fictional-shared-secret",
+            ))
+            .expect_err("should reject malformed trusted client IP header names");
+            assert!(
+                format!("{error:?}").contains("invalid_trusted_client_ip_header"),
+                "should identify malformed trusted client IP header names"
+            );
+        }
+
+        for section in [
+            "[trusted_client_ip]\nauth_header = \"x-trusted-client-auth\"\nshared_secret = \"fictional-shared-secret\"",
+            "[trusted_client_ip]\nip_header = \"fastly-client-ip\"\nshared_secret = \"fictional-shared-secret\"",
+            "[trusted_client_ip]\nip_header = \"fastly-client-ip\"\nauth_header = \"x-trusted-client-auth\"",
+            "[trusted_client_ip]\nip_header = \"fastly-client-ip\"\nauth_header = \"x-trusted-client-auth\"\nshared_secret = \"fictional-shared-secret\"\nunknown_field = true",
+        ] {
+            let result =
+                Settings::from_toml(&format!("{}\n{section}\n", crate_test_settings_str()));
+            assert!(
+                result.is_err(),
+                "should reject incomplete or unknown trusted client IP configuration"
+            );
+        }
+    }
 
     #[test]
     fn tinybird_defaults_to_disabled_placeholders() {
