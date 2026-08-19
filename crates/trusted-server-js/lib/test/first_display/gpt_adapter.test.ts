@@ -258,6 +258,71 @@ describe('first-display GPT adapter', () => {
     ]);
   });
 
+  it('invalidates the delayed-owner binding when a publisher replaces the physical slot', () => {
+    const dom = new JSDOM('<!doctype html><div id="slot-1"></div>', {
+      url: 'https://publisher.example/',
+    });
+    const listeners = new Map<string, (event: unknown) => void>();
+    const slot = {
+      addService: () => slot,
+      getSlotElementId: () => 'slot-1',
+      setTargeting: () => slot,
+    };
+    const replacement = {
+      addService: () => replacement,
+      getSlotElementId: () => 'slot-1',
+      setTargeting: () => replacement,
+    };
+    const service = {
+      addEventListener: (name: string, listener: (event: unknown) => void) =>
+        listeners.set(name, listener),
+      getSlots: () => [],
+      removeEventListener: () => undefined,
+    };
+    const defineSlot = vi.fn().mockReturnValueOnce(slot).mockReturnValueOnce(replacement);
+    const destroySlots = vi.fn((_slots?: readonly object[]) => true);
+    const binding = {
+      cmd: { push: (command: () => void) => command() },
+      defineSlot,
+      destroySlots,
+      display: (_elementId: string) => undefined,
+      getConfig: () => ({ disableInitialLoad: false }),
+      pubads: () => service,
+    };
+    Object.defineProperty(dom.window, 'googletag', {
+      configurable: true,
+      value: binding,
+    });
+    const batch = snapshotFirstDisplayBatchV1(fixture())!;
+    let bound: { readonly isCurrent: () => boolean } | undefined;
+    const adapter = createFirstDisplayGoogletagBatch({
+      browser: dom.window as unknown as Window,
+      clearTimer: () => undefined,
+      document: dom.window.document,
+      projection: batch.projection,
+      protocol: protocol(),
+      setTimer: (callback) => callback,
+    });
+    adapter.start({
+      onBound: (cycle) => {
+        bound = cycle;
+      },
+      onFailure: () => undefined,
+      onFirstAction: () => true,
+      onRenderEnded: () => undefined,
+    });
+
+    expect(bound?.isCurrent()).toBe(true);
+    listeners.get('slotRequested')?.({ slot });
+    listeners.get('slotRenderEnded')?.({ slot, isEmpty: false });
+    expect(bound?.isCurrent()).toBe(true);
+
+    expect(binding.destroySlots([slot])).toBe(true);
+    expect(binding.defineSlot('/publisher/replacement', [[300, 250]], 'slot-1')).toBe(replacement);
+    binding.display('slot-1');
+    expect(bound?.isCurrent()).toBe(false);
+  });
+
   it('cancels a pending command and compare-restores an adapter-created GPT queue', () => {
     const dom = new JSDOM('<!doctype html><div id="slot-1"></div>', {
       url: 'https://publisher.example/',

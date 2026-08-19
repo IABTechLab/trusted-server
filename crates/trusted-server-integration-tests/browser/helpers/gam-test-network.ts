@@ -29,7 +29,7 @@ const PROTOCOL_MESSAGES = [
   "TS Render Owner Register",
   "TS Render Owner Registered",
   "TS Render Owner Refused",
-  "TS APS Start",
+  "TS APS Top Mount Started",
   "TS ADM Start",
   "TS Owner Inserted",
   "TS Owner Settled",

@@ -34,6 +34,7 @@ function validAdmCycle(cycle: FirstDisplayGptBoundCycleV1): boolean {
   try {
     return (
       cycle.bid.renderSource.type === 'adm' &&
+      cycle.isCurrent() &&
       cycle.slotId === cycle.bid.slot &&
       cycle.slotId === cycle.placement.slot &&
       cycle.element.ownerDocument.getElementById(cycle.element.id) === cycle.element &&

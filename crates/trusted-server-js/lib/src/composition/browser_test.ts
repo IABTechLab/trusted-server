@@ -47,7 +47,11 @@ import {
   serializeAuctionRequestBody,
 } from '../core/registry';
 import { prepareAdmIframe } from '../core/render';
-import { APS_RENDERER_V1_PATH, renderDirectApsAttempt } from '../integrations/aps/render';
+import {
+  APS_RENDERER_V1_PATH,
+  renderDirectApsAttempt,
+  renderPucApsAttempt,
+} from '../integrations/aps/render';
 import { installClickGuard } from '../integrations/creative/click';
 import { installDynamicIframeProxy } from '../integrations/creative/iframe';
 import { installDynamicImageProxy } from '../integrations/creative/image';
@@ -1792,14 +1796,20 @@ export function createTestBrowserRuntimeComposition(
       const pucBridge = createPucBridge({
         messaging: composition.adapters.messaging,
         mintLifecycleTicket: mintBrowserLifecycleTicket,
-        publisherOrigin: prepared.publisherOrigin,
+        mountAps: (input) =>
+          renderPucApsAttempt({
+            ...input,
+            bootstrapNonces: prepared.services.bootstrapNonces,
+            messaging: composition.adapters.messaging,
+            nonces: prepared.services.rendererNonces,
+            publisherOrigin: prepared.publisherOrigin,
+          }),
         ...(compositionOptions.pucSchedulerForTest
           ? { scheduler: compositionOptions.pucSchedulerForTest }
           : {}),
-        rendererNonces: prepared.services.rendererNonces,
-        rendererUrl: prepared.rendererUrl,
         reservations: prepared.services.reservations,
         resizeCollapsedShell: resizeCollapsedPucShell,
+        slots: prepared.services.slots,
       });
       context.onDispose(() => pucBridge.dispose());
       browserServices = Object.freeze({ ...prepared.services, pucBridge });

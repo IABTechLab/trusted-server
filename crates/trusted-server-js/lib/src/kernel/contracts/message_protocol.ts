@@ -1,14 +1,14 @@
 /** Every protocol literal shared by the version-1 browser message channels. */
 export const TSJS_MESSAGE_PROTOCOL_V1 = Object.freeze({
   version: 1 as const,
-  rendererVersion: '3' as const,
+  rendererVersion: '4' as const,
   message: Object.freeze({
     prebidRequest: 'Prebid Request' as const,
     prebidResponse: 'Prebid Response' as const,
     ownerRegister: 'TS Render Owner Register' as const,
     ownerRegistered: 'TS Render Owner Registered' as const,
     ownerRefused: 'TS Render Owner Refused' as const,
-    apsStart: 'TS APS Start' as const,
+    apsTopMountStarted: 'TS APS Top Mount Started' as const,
     admStart: 'TS ADM Start' as const,
     ownerInserted: 'TS Owner Inserted' as const,
     ownerSettled: 'TS Owner Settled' as const,

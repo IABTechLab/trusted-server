@@ -42,6 +42,8 @@ export type FirstDisplayGptFailureReason =
 export interface FirstDisplayGptBoundCycleV1 {
   readonly bid: FirstDisplayProjectionBidV1;
   readonly element: HTMLElement;
+  /** Closure-private physical-cycle validity; false after a later GPT request takes the slot. */
+  readonly isCurrent: () => boolean;
   readonly ownership: 'publisher' | 'trusted_server';
   readonly physicalSlot: object;
   readonly placement: FirstDisplayProjectionSlotV1;
@@ -116,6 +118,7 @@ interface FirstDisplayDiagnosticCycleRecord {
 }
 
 interface ActiveCycle extends FirstDisplayGptBoundCycleV1 {
+  readonly bindingState: { current: boolean };
   readonly diagnosticRecords: FirstDisplayDiagnosticCycleRecord[];
   readonly elementId: string;
   readonly operations: readonly ('display' | 'refresh')[];
@@ -333,6 +336,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         Object.freeze({
           bid: cycle.bid,
           element: cycle.element,
+          isCurrent: cycle.isCurrent,
           ownership: cycle.ownership,
           physicalSlot: cycle.physicalSlot,
           placement: cycle.placement,
@@ -539,11 +543,14 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       }
       const traceToken = `gt1_${traceTokenOrdinal.toString(36)}`;
       this.nextTraceTokenOrdinal += 1;
+      const bindingState = { current: true };
       const cycle: ActiveCycle = {
         bid: row.bid,
+        bindingState,
         diagnosticRecords: [],
         element,
         elementId: element.id,
+        isCurrent: () => bindingState.current,
         operations: plan.operations,
         ownership,
         physicalSlot: slot,
@@ -563,6 +570,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         Object.freeze({
           bid: cycle.bid,
           element: cycle.element,
+          isCurrent: cycle.isCurrent,
           ownership: cycle.ownership,
           physicalSlot: cycle.physicalSlot,
           placement: cycle.placement,
@@ -615,8 +623,12 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       this.notifyNativeMutation();
       const slot = physicalSlot(member(event, 'slot'));
       const cycle = slot ? this.cycles.get(slot) : undefined;
-      if (!cycle) return;
+      if (!cycle) {
+        if (slot) this.invalidateCyclesForElement(this.readPhysicalElementId(slot), slot);
+        return;
+      }
       if (cycle.settled) {
+        cycle.bindingState.current = false;
         this.captureDiagnosticFact('slotRequested', cycle, event);
         return;
       }
@@ -655,6 +667,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         Object.freeze({
           bid: cycle.bid,
           element: cycle.element,
+          isCurrent: cycle.isCurrent,
           ownership: cycle.ownership,
           physicalSlot: cycle.physicalSlot,
           placement: cycle.placement,
@@ -790,9 +803,14 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         if (typeof original !== 'function') continue;
         const prior = Object.getOwnPropertyDescriptor(receiver, key);
         const notify = (): void => this.notifyNativeMutation();
+        const invalidate = (arguments_: readonly unknown[], result: unknown): void =>
+          this.invalidateCyclesForPublisherCall(key, arguments_, result);
         const wrapper = function (this: unknown, ...arguments_: unknown[]): unknown {
           const result = Reflect.apply(original, this, arguments_);
-          if (this === receiver) notify();
+          if (this === receiver) {
+            invalidate(arguments_, result);
+            notify();
+          }
           return result;
         };
         if (
@@ -817,6 +835,58 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       throw error;
     }
     this.publisherCallRestorers.push(...installed);
+  }
+
+  private readPhysicalElementId(slot: object): string | undefined {
+    try {
+      const read = member(slot, 'getSlotElementId');
+      if (typeof read !== 'function') return undefined;
+      const value = Reflect.apply(read, slot, []);
+      return typeof value === 'string' && value.length > 0 ? value : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private invalidateCyclesForElement(elementId: string | undefined, replacement: object): void {
+    if (!elementId) return;
+    for (const cycle of this.cycles.values()) {
+      if (cycle.physicalSlot !== replacement && cycle.elementId === elementId) {
+        cycle.bindingState.current = false;
+      }
+    }
+  }
+
+  private invalidateCyclesForPublisherCall(
+    key: string,
+    arguments_: readonly unknown[],
+    result: unknown
+  ): void {
+    try {
+      if (key === 'destroySlots' && result === true) {
+        const targets = arguments_[0];
+        if (targets === undefined) {
+          for (const cycle of this.cycles.values()) cycle.bindingState.current = false;
+          return;
+        }
+        if (!Array.isArray(targets)) return;
+        for (let index = 0; index < targets.length; index += 1) {
+          const target = physicalSlot(targets[index]);
+          const cycle = target ? this.cycles.get(target) : undefined;
+          if (cycle) cycle.bindingState.current = false;
+        }
+        return;
+      }
+      if (key === 'defineSlot') {
+        const replacement = physicalSlot(result);
+        const elementId = arguments_[2];
+        if (replacement && typeof elementId === 'string') {
+          this.invalidateCyclesForElement(elementId, replacement);
+        }
+      }
+    } catch {
+      // The publisher call already completed; observation cannot alter its result.
+    }
   }
 
   private restorePublisherCalls(): void {

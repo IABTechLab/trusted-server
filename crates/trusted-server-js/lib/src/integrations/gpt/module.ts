@@ -34,7 +34,6 @@ import type {
   RenderAttempt,
   RenderAttemptCreationResult,
   RenderFailureReason,
-  RendererNonceRegistry,
   SlotOperationCreationResult,
   SlotOperationOptions,
 } from '../../services/render';
@@ -42,6 +41,7 @@ import { resizeCollapsedPucShell } from '../../core/puc_shell';
 import {
   createPucBridge,
   type PucBridge,
+  type PucBridgeOptions,
   type PucGamAttemptInput,
 } from '../../services/puc_bridge';
 import type { ReservationService } from '../../services/reservations';
@@ -416,6 +416,10 @@ interface ProductionSlotsCapability {
   readonly attachPhysicalService: (service: SlotService) => () => void;
 }
 
+interface ProductionApsCapability {
+  readonly renderPuc: NonNullable<PucBridgeOptions['mountAps']>;
+}
+
 interface ProductionRenderCapability {
   readonly attachPucGamAttemptRegistrar: (
     registrar: (input: PucGamAttemptInput) => boolean
@@ -435,8 +439,6 @@ interface ProductionRenderCapability {
     candidate: unknown
   ) => boolean;
   readonly mintLifecycleTicket: () => IdentityGenerationResult<string>;
-  readonly publisherOrigin: string;
-  readonly rendererNonces: RendererNonceRegistry;
   readonly renderWinner: (attempt: RenderAttempt) => boolean;
   readonly reservations: ReservationService;
 }
@@ -1578,6 +1580,7 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
   }
   const auction = exactCapability<ProductionAuctionCapability>(context.interfaces, 'auction.v1');
   const slotCapability = exactCapability<ProductionSlotsCapability>(context.interfaces, 'slots.v1');
+  const aps = exactCapability<ProductionApsCapability>(context.interfaces, 'aps.v1');
   const render = exactCapability<ProductionRenderCapability>(context.interfaces, 'render.v1');
   const messages = exactCapability<ProductionMessagesCapability>(context.interfaces, 'messages.v1');
   const trace = exactCapability<ProductionTraceCapability>(context.interfaces, 'trace.v1');
@@ -1598,7 +1601,7 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
     typeof render.commitPageBids !== 'function' ||
     typeof render.mintLifecycleTicket !== 'function' ||
     typeof render.renderWinner !== 'function' ||
-    typeof render.publisherOrigin !== 'string' ||
+    (aps !== undefined && typeof aps.renderPuc !== 'function') ||
     typeof trace.observations?.publish !== 'function'
   ) {
     throw new TypeError('GPT capability graph is malformed');
@@ -1633,7 +1636,6 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
   scope.onDispose(() => slots.dispose());
   const targeting = createTargetingService();
   scope.onDispose(() => targeting.dispose());
-  const rendererUrl = new URL('/integrations/aps/renderer/v1', render.publisherOrigin).href;
   const startup = createGptStartup({ googletag, slots: () => slots });
   const diagnosticsEnabled = gptDiagnosticsActive(runtime);
   const diagnosticsFacts = diagnosticsEnabled
@@ -1864,12 +1866,11 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
       const bridge = createPucBridge({
         messaging: messages.messaging,
         mintLifecycleTicket: render.mintLifecycleTicket,
+        ...(aps ? { mountAps: aps.renderPuc } : {}),
         now: () => document.defaultView!.performance.now(),
-        publisherOrigin: render.publisherOrigin,
-        rendererNonces: render.rendererNonces,
-        rendererUrl,
         reservations: render.reservations,
         resizeCollapsedShell: resizeCollapsedPucShell,
+        slots,
       });
       const ticketAdoption =
         adoptionCandidate === undefined

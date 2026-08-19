@@ -31,6 +31,7 @@ function harness() {
       }),
     }),
     element,
+    isCurrent: () => true,
     ownership: 'trusted_server',
     physicalSlot: {},
     placement: Object.freeze({
