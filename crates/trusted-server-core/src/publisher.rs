@@ -20,6 +20,7 @@
 
 use std::borrow::Cow;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -590,6 +591,8 @@ struct ProcessResponseParams<'a> {
         Option<&'a crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
     /// See [`HtmlStreamProcessorParams::shared_template_authorized`].
     shared_template_authorized: bool,
+    /// See [`HtmlStreamProcessorParams::csp_nonce_observed`].
+    csp_nonce_observed: Option<&'a Arc<AtomicBool>>,
 }
 
 struct PublisherBodyProcessor {
@@ -617,6 +620,7 @@ impl PublisherBodyProcessor {
                 suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
                 gpt_diagnostics: params.gpt_diagnostics.clone(),
                 shared_template_authorized: params.template_cache_key.is_some(),
+                csp_nonce_observed: params.csp_nonce_observed.clone(),
             })?)
         } else if is_rsc_flight {
             Box::new(RscFlightUrlRewriter::new(
@@ -697,6 +701,7 @@ fn process_response_streaming<W: Write>(
             suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
             gpt_diagnostics: params.gpt_diagnostics.cloned(),
             shared_template_authorized: params.shared_template_authorized,
+            csp_nonce_observed: params.csp_nonce_observed.cloned(),
         })?;
         StreamingPipeline::new(config, processor)
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
@@ -1196,6 +1201,8 @@ struct HtmlStreamProcessorParams<'a> {
     /// Carried rather than re-derived so both seams see the same answer. See
     /// [`effective_assembly_mode`].
     shared_template_authorized: bool,
+    /// Where the transform records a response-bound CSP nonce, when one matters.
+    csp_nonce_observed: Option<Arc<AtomicBool>>,
 }
 
 /// The diagnostics decision the template may carry.
@@ -1237,6 +1244,21 @@ pub(crate) fn template_gpt_diagnostics(
 /// receives, so nothing request-scoped may appear, and keeping a URL out also removes
 /// any escaping question at the seam.
 pub const AD_ASSEMBLY_SEAM: &str = "<!--ts-ad-seam-->";
+
+/// Transform-owned stand-in for the seam, emitted at the document's structural body end.
+///
+/// Deliberately *not* [`AD_ASSEMBLY_SEAM`]. The payload that ends up in the seam is not
+/// known until the completed transform has been checked for publisher collisions, and the
+/// position is not knowable from the output bytes: a reverse search for `</body>` selects
+/// a string literal in `<script>const marker = "</body>";</script>` when the document has
+/// no real close, and prefers a `</body>` sequence in trailing comment data over the real
+/// closing tag. Only the parser knows which one is structural, so the parser marks the
+/// spot and the substitution below fills it in.
+///
+/// Keeping it distinct from [`AD_ASSEMBLY_SEAM`] is what lets a publisher document that
+/// contains the seam bytes still receive correctly positioned bids: that collision
+/// revokes the shared reservation without disturbing this placeholder.
+pub(crate) const TEMPLATE_SEAM_PLACEHOLDER: &str = "<!--ts-seam-slot-->";
 
 /// The mode the operator asked for, before availability is taken into account.
 ///
@@ -1302,9 +1324,11 @@ fn effective_assembly_mode(settings: &Settings, shared_template_authorized: bool
 /// two independent decisions: once [`template_ad_slots_script`] stopped emitting a
 /// head script under a shared mode, body-close injection stopped with it.
 ///
-/// `Esi` emits nothing here. Its inert marker is inserted only after the completed
-/// transform has been checked for publisher collisions and ESI directives, so TS never
-/// has to guess which identical marker belongs to the publisher.
+/// `Esi` emits [`TEMPLATE_SEAM_PLACEHOLDER`], not the seam itself. What goes into the
+/// seam is still decided after the completed transform has been checked for publisher
+/// collisions and ESI directives — but *where* it goes has to be decided here, by the
+/// parser, because the output bytes cannot distinguish a structural `</body>` from one
+/// written inside a script string or a trailing comment.
 pub(crate) fn body_close_injection(
     mode: AssemblyMode,
     head_script_present: bool,
@@ -1318,7 +1342,7 @@ pub(crate) fn body_close_injection(
                 BodyCloseInjection::None
             }
         }
-        AssemblyMode::Esi => BodyCloseInjection::None,
+        AssemblyMode::Esi => BodyCloseInjection::Marker(TEMPLATE_SEAM_PLACEHOLDER.to_string()),
     }
 }
 
@@ -1340,10 +1364,18 @@ fn create_html_stream_processor(
 
     let gpt_diagnostics = template_gpt_diagnostics(assembly_mode, params.gpt_diagnostics);
 
+    // Only a response that can be stored has a consumer for the observation, so the
+    // handlers are not registered for ordinary inline traffic.
+    let csp_nonce_observed = params
+        .shared_template_authorized
+        .then_some(params.csp_nonce_observed)
+        .flatten();
+
     let config = config
         .with_ad_state(params.ad_slots_script, params.ad_bids_state)
         .with_gpt_diagnostics(gpt_diagnostics)
         .with_body_close(body_close)
+        .with_csp_nonce_observer(csp_nonce_observed)
         .with_datadome_client_tag_suppression(params.suppress_datadome_client_side_tag);
 
     Ok(create_html_processor(config))
@@ -1505,6 +1537,12 @@ pub struct OwnedProcessResponseParams {
     /// Request-scoped conditional diagnostics delivery decision.
     pub(crate) gpt_diagnostics:
         Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
+    /// Set by the transform when the document carries a response-bound CSP nonce.
+    ///
+    /// `None` wherever no transform runs. Recorded by the HTML parser rather than
+    /// rescanned from the output, which cannot tell a `nonce` attribute from the same
+    /// word inside a script.
+    pub(crate) csp_nonce_observed: Option<Arc<AtomicBool>>,
 }
 
 /// Response-authorized template cache insert inputs. The key is built before origin lookup; the
@@ -1620,32 +1658,43 @@ pub async fn buffer_publisher_response_async(
             // request cannot store twice, which would leave nothing for assembly to gate
             // on.
             let was_authorized = params.template_cache_key.is_some();
-            let contains_publisher_marker = was_authorized
-                && bytes
-                    .windows(AD_ASSEMBLY_SEAM.len())
-                    .any(|window| window == AD_ASSEMBLY_SEAM.as_bytes());
-            let contains_publisher_esi = was_authorized && contains_publisher_esi_directive(&bytes);
-            let bypasses_shared_template = contains_publisher_marker || contains_publisher_esi;
-            if bypasses_shared_template {
-                log::warn!(
-                    "template_cache bypass: transformed response contains publisher-authored {}",
-                    if contains_publisher_marker {
-                        "seam bytes"
-                    } else {
-                        "ESI"
-                    }
-                );
+            let shared_bypass_reason = was_authorized
+                .then(|| shared_template_bypass_reason(&bytes, params.csp_nonce_observed.as_ref()))
+                .flatten();
+            if let Some(reason) = shared_bypass_reason {
+                log::warn!("template_cache bypass: transformed response {reason}");
                 params.template_cache_key.take();
             }
-            let shared_response_authorized = was_authorized && !bypasses_shared_template;
-            let bytes = if shared_response_authorized {
-                insert_before_body_close(bytes, AD_ASSEMBLY_SEAM.as_bytes())
-            } else if was_authorized {
-                let seam = seam_script_for(&params);
-                insert_before_body_close(bytes, seam.as_bytes())
+            let mut shared_response_authorized = was_authorized && shared_bypass_reason.is_none();
+            // The parser marked the structural body end during the transform; this puts the
+            // right payload there. A shared response gets the inert seam every reader will
+            // split on, a bypassed one gets this reader's bids directly.
+            let bytes = if was_authorized {
+                let payload: Cow<'_, str> = if shared_response_authorized {
+                    Cow::Borrowed(AD_ASSEMBLY_SEAM)
+                } else {
+                    Cow::Owned(seam_script_for(&params))
+                };
+                match replace_seam_placeholder(bytes, payload.as_bytes()) {
+                    Ok(bytes) => bytes,
+                    Err((bytes, error)) => {
+                        // Publisher bytes collided with the transform's own placeholder, so
+                        // there is no position TS can claim. Serving the document untouched
+                        // costs this page its bids; guessing a position corrupts it and, if
+                        // stored, every later reader of it too.
+                        log::warn!(
+                            "template_cache bypass: {error}; serving the transformed document \
+                             without a seam"
+                        );
+                        params.template_cache_key.take();
+                        shared_response_authorized = false;
+                        bytes
+                    }
+                }
             } else {
                 bytes
             };
+            let bypasses_shared_template = was_authorized && !shared_response_authorized;
             // Validate before the store, not after.
             //
             // `assemble_if_shared` does the same split and would reject a malformed
@@ -1895,6 +1944,7 @@ fn build_template_assembly_params(
     ad_bids_state: AdBidsState,
 ) -> OwnedProcessResponseParams {
     OwnedProcessResponseParams {
+        csp_nonce_observed: None,
         // Already stored; storing again on a hit would be pointless work.
         template_cache_key: None,
         seam_ad_slots: None,
@@ -1926,32 +1976,79 @@ fn build_template_assembly_params(
 /// with either no bids or a visible marker in it.
 fn split_template_at_seam(template: &[u8]) -> Result<(&[u8], &[u8]), SeamError> {
     let marker = AD_ASSEMBLY_SEAM.as_bytes();
-    let mut found = template
-        .windows(marker.len())
+    let at = only_occurrence(template, marker)?;
+    Ok((&template[..at], &template[at + marker.len()..]))
+}
+
+/// Offset of the one and only occurrence of `needle`.
+///
+/// # Errors
+///
+/// Returns [`SeamError::Missing`] when `needle` is absent and [`SeamError::Repeated`]
+/// when it appears more than once — which, for a transform-owned marker, means publisher
+/// bytes collided with it and no occurrence can be claimed as ours.
+fn only_occurrence(haystack: &[u8], needle: &[u8]) -> Result<usize, SeamError> {
+    let mut found = haystack
+        .windows(needle.len())
         .enumerate()
-        .filter(|(_, w)| *w == marker)
+        .filter(|(_, window)| *window == needle)
         .map(|(at, _)| at);
     let at = found.next().ok_or(SeamError::Missing)?;
     if found.next().is_some() {
         return Err(SeamError::Repeated);
     }
-    Ok((&template[..at], &template[at + marker.len()..]))
+    Ok(at)
 }
 
-/// Insert a reader payload at the document's final body close, or append it to a fragment.
+/// Why the completed transform must not be stored as a shared template, if it must not.
 ///
-/// The final case-insensitive close matches the streaming pipeline's body-tail convention
-/// while avoiding an earlier `"</body>"` string in script data.
-fn insert_before_body_close(mut document: Vec<u8>, payload: &[u8]) -> Vec<u8> {
-    if payload.is_empty() {
-        return document;
+/// Every one of these is invisible before the transform runs. Publisher-authored seam
+/// bytes and ESI survive it, and a CSP nonce the origin delivered in a `<meta>` policy or
+/// on its own elements never appears in a response header, which is all the eligibility
+/// gate gets to inspect.
+fn shared_template_bypass_reason(
+    bytes: &[u8],
+    csp_nonce_observed: Option<&Arc<AtomicBool>>,
+) -> Option<&'static str> {
+    if bytes
+        .windows(AD_ASSEMBLY_SEAM.len())
+        .any(|window| window == AD_ASSEMBLY_SEAM.as_bytes())
+    {
+        return Some("contains publisher-authored seam bytes");
     }
-    let insertion_at = document
-        .windows(BODY_CLOSE_PREFIX.len())
-        .rposition(|window| window.eq_ignore_ascii_case(BODY_CLOSE_PREFIX))
-        .unwrap_or(document.len());
-    document.splice(insertion_at..insertion_at, payload.iter().copied());
-    document
+    if contains_publisher_esi_directive(bytes) {
+        return Some("contains publisher-authored ESI");
+    }
+    if csp_nonce_observed.is_some_and(|observed| observed.load(Ordering::SeqCst)) {
+        return Some("delivers a response-bound CSP nonce in its own markup");
+    }
+    None
+}
+
+/// Substitute `payload` for the transform-owned [`TEMPLATE_SEAM_PLACEHOLDER`].
+///
+/// The placeholder was written by the HTML parser at the document's structural body end,
+/// or appended at document end when the document has no body close at all — so this
+/// carries the parser's answer rather than re-deriving it from bytes that cannot express
+/// it.
+///
+/// # Errors
+///
+/// Returns the untouched document together with the reason when the placeholder is absent
+/// or appears more than once. Both mean publisher bytes collided with it, and inserting at
+/// a guessed position would corrupt the document and the template stored from it.
+fn replace_seam_placeholder(
+    mut document: Vec<u8>,
+    payload: &[u8],
+) -> Result<Vec<u8>, (Vec<u8>, SeamError)> {
+    let placeholder = TEMPLATE_SEAM_PLACEHOLDER.as_bytes();
+    match only_occurrence(&document, placeholder) {
+        Ok(at) => {
+            document.splice(at..at + placeholder.len(), payload.iter().copied());
+            Ok(document)
+        }
+        Err(error) => Err((document, error)),
+    }
 }
 
 /// Why a template could not be split at its seam.
@@ -2610,6 +2707,7 @@ pub fn stream_publisher_body<W: Write>(
         suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
         gpt_diagnostics: params.gpt_diagnostics.as_ref(),
         shared_template_authorized: params.template_cache_key.is_some(),
+        csp_nonce_observed: params.csp_nonce_observed.as_ref(),
     };
     let input_compression = Compression::from_content_encoding(&params.content_encoding);
     let output_compression = if params.template_cache_key.is_some() {
@@ -2711,6 +2809,7 @@ pub async fn stream_publisher_body_async<W: Write>(
         suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
         gpt_diagnostics: params.gpt_diagnostics.clone(),
         shared_template_authorized: params.template_cache_key.is_some(),
+        csp_nonce_observed: params.csp_nonce_observed.clone(),
     }) {
         Ok(processor) => processor,
         Err(err) => {
@@ -4548,6 +4647,10 @@ pub async fn handle_publisher_request(
                 response,
                 body,
                 params: Box::new(OwnedProcessResponseParams {
+                    // The transform writes here; the post-transform gate reads it. Always
+                    // present on the live path so no future caller has to remember to
+                    // supply it — the handlers themselves stay gated on authorization.
+                    csp_nonce_observed: Some(Arc::new(AtomicBool::new(false))),
                     template_cache_key,
                     seam_ad_slots,
                     policy_headers,
@@ -6616,6 +6719,7 @@ mod tests {
         content_encoding: &str,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -6894,6 +6998,7 @@ mod tests {
                 })));
 
             let config = HtmlProcessorConfig {
+                csp_nonce_observed: None,
                 origin_host: "origin.example.com".to_string(),
                 request_host: "example.com".to_string(),
                 request_scheme: "https".to_string(),
@@ -6936,12 +7041,15 @@ mod tests {
                 (4, "<!--ts-ad-seam-->"),
                 "the readable seam and its cache schema must move together"
             );
-            assert!(
-                matches!(
-                    body_close_injection(AssemblyMode::Esi, false),
-                    BodyCloseInjection::None
-                ),
-                "should insert the shared seam only after checking completed publisher bytes"
+            assert_eq!(
+                body_close_injection(AssemblyMode::Esi, false),
+                BodyCloseInjection::Marker(TEMPLATE_SEAM_PLACEHOLDER.to_string()),
+                "the seam's position must come from the parser, never from a byte search"
+            );
+            assert_ne!(
+                TEMPLATE_SEAM_PLACEHOLDER, AD_ASSEMBLY_SEAM,
+                "a publisher document carrying the seam bytes must still receive \
+                 correctly positioned bids, which a shared marker would make impossible"
             );
         }
 
@@ -8544,26 +8652,75 @@ mod tests {
         }
 
         #[test]
-        fn seam_payload_is_inserted_before_the_last_body_close() {
-            let document = br#"<script>const text = "</body>";</script><p>article</p></BoDy>"#;
+        fn the_seam_payload_replaces_the_transform_owned_placeholder() {
+            let document =
+                format!(r#"<p>article</p>{TEMPLATE_SEAM_PLACEHOLDER}</body>"#).into_bytes();
 
-            let inserted = insert_before_body_close(document.to_vec(), b"<script>seam</script>");
+            let replaced = replace_seam_placeholder(document, b"<script>seam</script>")
+                .expect("should substitute the placeholder the transform emitted");
 
             assert_eq!(
-                inserted,
-                br#"<script>const text = "</body>";</script><p>article</p><script>seam</script></BoDy>"#,
-                "should ignore body-close text inside an earlier script and preserve tag casing"
+                replaced, br#"<p>article</p><script>seam</script></body>"#,
+                "should splice the payload exactly where the parser marked the body end"
             );
         }
 
         #[test]
-        fn seam_payload_is_appended_when_the_document_has_no_body_close() {
-            let inserted =
-                insert_before_body_close(b"<div>fragment</div>".to_vec(), b"<script>seam</script>");
+        fn a_body_close_written_in_script_data_does_not_attract_the_seam() {
+            // The reverse byte search this replaced picked the string literal, spliced a
+            // `<script>` payload into it, and the emitted `</script>` terminated the
+            // publisher's script — in the served page and in the stored template alike.
+            let document = format!(
+                r#"<script>const marker = "</body>";</script><p>article</p>{TEMPLATE_SEAM_PLACEHOLDER}"#
+            )
+            .into_bytes();
+
+            let replaced = replace_seam_placeholder(document, b"<script>seam</script>")
+                .expect("should substitute the placeholder the transform emitted");
 
             assert_eq!(
-                inserted, b"<div>fragment</div><script>seam</script>",
-                "should append the seam payload to an HTML fragment"
+                replaced,
+                br#"<script>const marker = "</body>";</script><p>article</p><script>seam</script>"#,
+                "should leave a body-close sequence inside script data untouched"
+            );
+        }
+
+        #[test]
+        fn a_publisher_copy_of_the_placeholder_refuses_substitution() {
+            let document = format!(
+                "<p>{TEMPLATE_SEAM_PLACEHOLDER}</p><body>article{TEMPLATE_SEAM_PLACEHOLDER}</body>"
+            )
+            .into_bytes();
+
+            let (returned, error) =
+                replace_seam_placeholder(document.clone(), b"<script>x</script>")
+                    .expect_err("should refuse a document that collides with the placeholder");
+
+            assert!(
+                matches!(error, SeamError::Repeated),
+                "should name the collision rather than guess an occurrence"
+            );
+            assert_eq!(
+                returned, document,
+                "should hand back the publisher document byte for byte"
+            );
+        }
+
+        #[test]
+        fn a_document_without_the_placeholder_refuses_substitution() {
+            let document = b"<p>article</p></body>".to_vec();
+
+            let (returned, error) =
+                replace_seam_placeholder(document.clone(), b"<script>x</script>")
+                    .expect_err("should refuse a document the transform did not mark");
+
+            assert!(
+                matches!(error, SeamError::Missing),
+                "should name the absent placeholder rather than append blindly"
+            );
+            assert_eq!(
+                returned, document,
+                "should hand back the document unchanged"
             );
         }
 
@@ -10127,6 +10284,176 @@ mod tests {
                     .expect("should lock entries")
                     .is_empty()
             );
+        }
+
+        #[tokio::test]
+        async fn a_meta_delivered_nonce_policy_bypasses_the_shared_template_cache() {
+            // The response-header gate cannot see this policy at all. Storing the document
+            // would replay one response's nonce to every later reader — the exact thing the
+            // header check exists to prevent.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            for _ in 0..2 {
+                stub.push_response_with_headers(
+                    200,
+                    br#"<html><head><meta http-equiv="Content-Security-Policy" content="script-src 'nonce-reader-nonce'"><script nonce="reader-nonce"></script></head><body>origin</body></html>"#
+                        .to_vec(),
+                    vec![
+                        ("content-type", "text/html; charset=utf-8"),
+                        ("cache-control", "public, max-age=300"),
+                    ],
+                );
+            }
+
+            let cold = run(&settings, &services, navigation_request()).await;
+            assert_eq!(
+                cold.headers()
+                    .get(HEADER_X_TS_TEMPLATE_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("bypass-response"),
+                "the cold response must refuse to store a nonce-bearing document"
+            );
+            let _ = body_of(cold).await;
+            let _ = body_of(run(&settings, &services, navigation_request()).await).await;
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "the warm request must reach the origin, not a replayed nonce"
+            );
+            assert!(
+                cache
+                    .entries
+                    .lock()
+                    .expect("should lock entries")
+                    .is_empty(),
+                "nothing nonce-bearing may reach the shared cache"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_nonce_attribute_without_a_policy_bypasses_the_shared_template_cache() {
+            // Fail closed: the attributes say the document was written for a per-response
+            // policy, whether or not the policy itself survived to this scan.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            for _ in 0..2 {
+                stub.push_response_with_headers(
+                    200,
+                    br#"<html><head><script nonce="reader-nonce"></script></head><body>origin</body></html>"#
+                        .to_vec(),
+                    vec![
+                        ("content-type", "text/html; charset=utf-8"),
+                        ("cache-control", "public, max-age=300"),
+                    ],
+                );
+            }
+
+            let _ = body_of(run(&settings, &services, navigation_request()).await).await;
+            let _ = body_of(run(&settings, &services, navigation_request()).await).await;
+
+            assert_eq!(stub.recorded_request_uris().len(), 2);
+            assert!(
+                cache
+                    .entries
+                    .lock()
+                    .expect("should lock entries")
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_body_close_in_script_data_corrupts_neither_the_cold_nor_the_warm_document() {
+            // No structural `</body>` anywhere: a reverse byte search takes the string
+            // literal, and the payload's `</script>` then terminates the publisher's script
+            // — in the response served cold and in the template every warm reader gets.
+            const PUBLISHER_SCRIPT: &str = r#"<script>const marker = "</body>";</script>"#;
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            stub.push_response_with_headers(
+                200,
+                format!("<html><head></head>{PUBLISHER_SCRIPT}<p>article</p></html>").into_bytes(),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("cache-control", "public, max-age=300"),
+                ],
+            );
+
+            let cold = String::from_utf8(
+                body_of(run(&settings, &services, navigation_request()).await).await,
+            )
+            .expect("the cold document should be UTF-8");
+            let warm = String::from_utf8(
+                body_of(run(&settings, &services, navigation_request()).await).await,
+            )
+            .expect("the warm document should be UTF-8");
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "the document is otherwise shareable and must still be stored and reused"
+            );
+            for (label, document) in [("cold", &cold), ("warm", &warm)] {
+                assert!(
+                    document.contains(PUBLISHER_SCRIPT),
+                    "the {label} document must carry the publisher's script byte for byte: {document}"
+                );
+                assert!(
+                    !document.contains(AD_ASSEMBLY_SEAM),
+                    "the {label} document must not ship an unresolved seam: {document}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_body_close_in_trailing_comment_data_does_not_attract_the_seam() {
+            // The reverse search took the *last* `</body>` sequence, so the seam landed
+            // inside this comment and the assembled bids never executed.
+            const TRAILING_COMMENT: &str = "<!-- </body> -->";
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            stub.push_response_with_headers(
+                200,
+                format!("<html><head></head><body><p>article</p></body>{TRAILING_COMMENT}</html>")
+                    .into_bytes(),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("cache-control", "public, max-age=300"),
+                ],
+            );
+
+            let cold = String::from_utf8(
+                body_of(run(&settings, &services, navigation_request()).await).await,
+            )
+            .expect("the cold document should be UTF-8");
+            let warm = String::from_utf8(
+                body_of(run(&settings, &services, navigation_request()).await).await,
+            )
+            .expect("the warm document should be UTF-8");
+
+            assert_eq!(stub.recorded_request_uris().len(), 1);
+            for (label, document) in [("cold", &cold), ("warm", &warm)] {
+                assert!(
+                    document.contains(TRAILING_COMMENT),
+                    "the {label} document must leave the publisher comment intact: {document}"
+                );
+                assert!(
+                    !document.contains(AD_ASSEMBLY_SEAM),
+                    "the {label} document must not ship an unresolved seam: {document}"
+                );
+                assert!(
+                    !document.contains(TEMPLATE_SEAM_PLACEHOLDER),
+                    "the transform-owned placeholder must never reach a reader: {document}"
+                );
+            }
         }
 
         #[tokio::test]
@@ -13403,6 +13730,7 @@ mod tests {
 
         let body = EdgeBody::from(compressed);
         let params = OwnedProcessResponseParams {
+            csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -13455,6 +13783,7 @@ mod tests {
             IntegrationRegistry::new(&settings).expect("should create integration registry");
 
         let params = OwnedProcessResponseParams {
+            csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -13496,6 +13825,7 @@ mod tests {
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
         let params = OwnedProcessResponseParams {
+            csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -13615,6 +13945,7 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                csp_nonce_observed: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -13672,6 +14003,7 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                csp_nonce_observed: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -13732,6 +14064,7 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                csp_nonce_observed: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -13792,6 +14125,7 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                csp_nonce_observed: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -13852,6 +14186,7 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                csp_nonce_observed: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -13900,6 +14235,7 @@ mod tests {
 
     fn non_html_stream_params(content_encoding: &str) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -14092,6 +14428,7 @@ mod tests {
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
+                csp_nonce_observed: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -14160,6 +14497,7 @@ mod tests {
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
+                csp_nonce_observed: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -14230,6 +14568,7 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                csp_nonce_observed: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -14293,6 +14632,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build response");
         let params = OwnedProcessResponseParams {
+            csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -14430,6 +14770,7 @@ mod tests {
         dispatched_auction: Option<DispatchedAuction>,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -14779,6 +15120,7 @@ mod tests {
             let ec_context =
                 EcContext::new_for_test(None, crate::consent::types::ConsentContext::default());
             OwnedProcessResponseParams {
+                csp_nonce_observed: None,
                 template_cache_key: None,
                 seam_ad_slots: None,
                 policy_headers: Vec::new(),
@@ -14965,6 +15307,7 @@ mod tests {
             .map(bytes::Bytes::copy_from_slice)
             .collect();
         let params = OwnedProcessResponseParams {
+            csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -15039,6 +15382,7 @@ mod tests {
             r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{}");</script>"#;
         let state = AdBidsState::with_script(bids_script);
         let params = OwnedProcessResponseParams {
+            csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -15096,6 +15440,7 @@ mod tests {
         // Claim gzip encoding but feed non-gzip bytes. The GzDecoder will
         // error as soon as it tries to read the gzip header.
         let params = OwnedProcessResponseParams {
+            csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -15208,6 +15553,7 @@ mod tests {
         let body = EdgeBody::from(html.to_vec());
 
         let params = OwnedProcessResponseParams {
+            csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -15269,6 +15615,7 @@ mod tests {
         // Small, single-fragment RSC script — placeholder path (not fallback).
         let html = br#"<html><body><script>self.__next_f.push([1,"1:{\"link\":\"https://origin.example.com/page\"}"])</script></body></html>"#;
         let params = OwnedProcessResponseParams {
+            csp_nonce_observed: None,
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
