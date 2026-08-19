@@ -1027,17 +1027,18 @@ async fn wait_for_page_settle(
 }
 
 fn validate_navigation_response(navigation_response: ArcHttpRequest) -> CliResult<Option<String>> {
+    // These failures are recoverable during a multi-page crawl. The caller
+    // records them once as a profile-aware `note:`; using `report_error` here
+    // would also log an unscoped duplicate in the middle of progress output.
     let request = navigation_response
-        .ok_or_else(|| report_error("browser audit did not capture the main document response"))?;
+        .ok_or_else(|| "browser audit did not capture the main document response".to_string())?;
 
     if let Some(failure_text) = &request.failure_text {
-        return Err(report_error(format!(
-            "main document request failed: {failure_text}"
-        )));
+        return Err(format!("main document request failed: {failure_text}"));
     }
 
     let response = request.response.as_ref().ok_or_else(|| {
-        report_error("browser audit did not capture the main document HTTP response")
+        "browser audit did not capture the main document HTTP response".to_string()
     })?;
 
     if is_successful_navigation_status(response.status) {
@@ -1114,6 +1115,21 @@ mod tests {
             warning,
             "audit request returned HTTP 403 Forbidden for `https://example.com/`; results may be partial",
             "should warn and continue when the main document returns an HTTP error"
+        );
+    }
+
+    #[test]
+    fn navigation_response_reports_chromium_request_failure() {
+        let mut request =
+            HttpRequest::new(RequestId::new("request-1"), None, None, false, Vec::new());
+        request.failure_text = Some("net::ERR_BLOCKED_BY_ORB".to_string());
+
+        let error = validate_navigation_response(Some(Arc::new(request)))
+            .expect_err("should reject Chromium request failures");
+
+        assert_eq!(
+            error, "main document request failed: net::ERR_BLOCKED_BY_ORB",
+            "the crawl should retain the browser failure for its final skipped-page note"
         );
     }
 
