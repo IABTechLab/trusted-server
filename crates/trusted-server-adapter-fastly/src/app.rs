@@ -27,6 +27,7 @@
 //! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
 //! | GET | `/_ts/clear-tester` | [`handle_clear_tester`] |
 //! | OPTIONS | `/_ts/api/v1/identify` | [`cors_preflight_identify`] |
+//! | POST | `/_ts/api/v1/ec/resolve` | [`handle_ec_resolve`] |
 //! | POST | `/auction` | [`handle_auction`] |
 //! | GET | `/first-party/proxy` | [`handle_first_party_proxy`] |
 //! | GET | `/first-party/click` | [`handle_first_party_click`] |
@@ -105,6 +106,7 @@ use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::ec::resolve::handle_ec_resolve;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
@@ -114,8 +116,6 @@ use trusted_server_core::integrations::{
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, build_geo_provider,
 };
-use trusted_server_device_fastly::FastlyHostSignals;
-
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
@@ -134,6 +134,7 @@ use trusted_server_core::settings_data::{
     default_config_key, default_config_store_name, get_settings_from_config_store,
 };
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
+use trusted_server_device_fastly::FastlyHostSignals;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
@@ -624,6 +625,7 @@ async fn run_named_route(
         }
         NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
+        NamedRouteHandler::EcResolve => handle_ec_resolve(&state.settings, req, &ec.ec_context),
         NamedRouteHandler::Auction => {
             // The auction reads consent data, so the consent KV store must be
             // available — fail closed with 503 when it is configured but
@@ -1036,6 +1038,7 @@ enum NamedRouteHandler {
     Identify,
     SetTester,
     ClearTester,
+    EcResolve,
     Auction,
     PageBids,
     FirstPartyProxy,
@@ -1116,6 +1119,11 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/clear-tester",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::ClearTester,
+    },
+    NamedRoute {
+        path: "/_ts/api/v1/ec/resolve",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::EcResolve,
     },
     NamedRoute {
         path: "/auction",
@@ -1311,14 +1319,14 @@ mod tests {
                 [proxy]
                 allowed_domains = ["*.example", "*.example.com"]
 
+                [geo]
+                default_country = "FR"
+
                 [ec]
                 provider = "hmac"
 
                 [ec.providers.hmac]
                 passphrase = "test-passphrase-at-least-32-bytes!!"
-
-                [geo]
-                default_country = "FR"
 
                 [request_signing]
                 enabled = false
@@ -1386,14 +1394,14 @@ mod tests {
             [proxy]
             allowed_domains = ["*.example", "*.example.com"]
 
+            [geo]
+            default_country = "FR"
+
             [ec]
             provider = "hmac"
 
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
-
-            [geo]
-            default_country = "FR"
 
             [request_signing]
             enabled = false
@@ -1756,14 +1764,14 @@ mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [geo]
+            default_country = "FR"
+
             [ec]
             provider = "hmac"
 
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
-
-            [geo]
-            default_country = "FR"
             "#,
         )
         .expect("should parse production-shaped settings");
@@ -1925,6 +1933,25 @@ mod tests {
             set_cookie,
             "ts-tester=; Domain=.test-publisher.com; Path=/; Secure; SameSite=Lax; Max-Age=0",
             "tester cookie clear should use publisher.cookie_domain"
+        );
+    }
+
+    #[test]
+    fn dispatch_ec_resolve_routes_to_resolve_handler() {
+        // Parity guard: POST /_ts/api/v1/ec/resolve must reach the resolve
+        // handler, not the publisher fallback or a router-level 405. The test
+        // settings configure no client-cycle provider, so the handler returns
+        // 204, proving the request was handled here rather than proxied to the
+        // publisher origin (which would error without a live backend).
+        let router = test_router();
+        let response =
+            block_on(router.oneshot(empty_request(Method::POST, "/_ts/api/v1/ec/resolve")))
+                .expect("should route request");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NO_CONTENT,
+            "POST ec/resolve should reach the resolve handler and 204, not proxy to the publisher"
         );
     }
 
@@ -2217,14 +2244,14 @@ mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [geo]
+            default_country = "FR"
+
             [ec]
             provider = "hmac"
 
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
-
-            [geo]
-            default_country = "FR"
 
             [request_signing]
             enabled = false
@@ -2348,14 +2375,14 @@ mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [geo]
+            default_country = "FR"
+
             [ec]
             provider = "hmac"
 
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
-
-            [geo]
-            default_country = "FR"
 
             [request_signing]
             enabled = false

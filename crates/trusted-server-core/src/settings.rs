@@ -556,6 +556,8 @@ impl Ec {
 
         let configured = match key {
             "hmac" => self.providers.hmac.is_some(),
+            // The client-fixed demo provider takes no configuration block.
+            "client-fixed" => true,
             "host-signals" => self.providers.host_signals.is_some(),
             // A vendor or host provider the adapter injects is configured when
             // its `[ec.providers.<key>]` block is present. The adapter validates

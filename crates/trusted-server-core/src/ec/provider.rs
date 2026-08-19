@@ -45,6 +45,30 @@ pub struct IdentityInput<'a> {
     pub consent: Option<&'a ConsentContext>,
 }
 
+/// Inputs available to [`EdgeCookieProvider::resolve_from_client`].
+///
+/// Carries the value a client produced and posted to the Edge Cookie resolve
+/// endpoint, alongside the same gating context as [`IdentityInput`]. Request data
+/// reaches the provider through its injected services. Unlike trusted edge-derived
+/// data, [`payload`](Self::payload) arrives from the browser, so an
+/// implementation must verify it before deriving an identifier from it.
+pub struct ClientResolveInput<'a> {
+    /// The raw body the client posted to the resolve endpoint. For a vendor
+    /// provider this is its own JSON envelope; for the built-in
+    /// [`ClientFixedProvider`] demo it is the fixed known word the page script
+    /// posts.
+    pub payload: &'a [u8],
+
+    /// The permissions resolved for the resolve request. The endpoint has
+    /// already confirmed the provider's required permissions are set, so a
+    /// provider reads this only for behavior beyond gating.
+    pub permissions: Option<&'a PermissionState>,
+
+    /// The resolve request's consent context, for provider-specific logic. The
+    /// core gates on permissions, not consent.
+    pub consent: Option<&'a ConsentContext>,
+}
+
 /// The outcome of [`EdgeCookieProvider::generate`].
 ///
 /// Carries the derived identifier, if any, and any response headers the provider
@@ -69,6 +93,11 @@ pub struct GeneratedEdgeCookie {
 /// - **Server-side** (for example [`HmacProvider`]): derives the identifier at
 ///   the edge in [`generate`](Self::generate), and the page response sets the
 ///   cookie. Nothing client-side is involved.
+/// - **Client-side** (for example [`ClientFixedProvider`]): defers in
+///   [`generate`](Self::generate) (returns `id: None`), runs its own JavaScript
+///   in the browser, and mints from the value the page posts back in
+///   [`resolve_from_client`](Self::resolve_from_client), whose response sets the
+///   cookie.
 ///
 /// A provider returns `Ok(None)` from [`generate`](Self::generate) when it
 /// cannot derive an identifier at the edge, so the request proceeds without an
@@ -81,6 +110,10 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
     /// Derives an Edge Cookie identifier from the provider's injected services
     /// and the request's gating context.
     ///
+    /// A server-side provider mints here. A client-side provider defers here
+    /// (returns `id: None`) and mints later in
+    /// [`resolve_from_client`](Self::resolve_from_client) from the value the page
+    /// posts back.
     ///
     /// # Errors
     ///
@@ -143,6 +176,30 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
     /// signal rules can gate it.
     fn required_permissions(&self) -> PermissionSet {
         PermissionSet::none()
+    }
+
+    /// Derives an Edge Cookie identifier from a value the client produced and
+    /// posted to the resolve endpoint (`POST /_ts/api/v1/ec/resolve`).
+    ///
+    /// This is the client-side counterpart to [`generate`](Self::generate). A
+    /// provider that cannot derive an identifier at the edge defers from
+    /// `generate` (returning `id: None`, optionally with response headers that
+    /// trigger client-side work), and the page posts its result back here. The
+    /// payload arrives from the browser, so an implementation MUST verify it
+    /// (for example checking a signature) before trusting it. The default
+    /// returns no identifier, so a provider that mints entirely server-side
+    /// (such as [`HmacProvider`]) need not implement it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::EdgeCookie`] when processing the payload
+    /// fails. A payload that is merely unverified or absent yields `id: None`
+    /// rather than an error, so the request proceeds without an Edge Cookie.
+    fn resolve_from_client(
+        &self,
+        _input: &ClientResolveInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        Ok(GeneratedEdgeCookie::default())
     }
 }
 
@@ -249,6 +306,77 @@ impl EdgeCookieProvider for HostSignalProvider {
     }
 }
 
+/// The fixed, known word shared by [`ClientFixedProvider`] and its page script.
+///
+/// Kept cookie-safe (no characters [`set_provider_ec_cookie`] would reject) so
+/// it can be used as the Edge Cookie value verbatim. The page script posts this
+/// exact string; the provider mints only when the posted value matches. The
+/// client copy lives in
+/// `crates/trusted-server-js/lib/src/integrations/ec_client_fixed`.
+///
+/// [`set_provider_ec_cookie`]: super::cookies::set_provider_ec_cookie
+const EXPECTED_VALUE: &str = "an-ec";
+
+/// A demonstration client-side provider, with no vendor coupling.
+///
+/// Client and server share one fixed, known word (`EXPECTED_VALUE`). When no
+/// Edge Cookie is present the page script (delivered through the tsjs bundle)
+/// posts that word to `POST /_ts/api/v1/ec/resolve`, and this provider mints the
+/// Edge Cookie only when the posted value matches. It defers from
+/// [`generate`](EdgeCookieProvider::generate) so the page renders with no Edge
+/// Cookie until the client reports back, then verifies and mints in
+/// [`resolve_from_client`](EdgeCookieProvider::resolve_from_client).
+///
+/// The value is verifiable precisely because it is a known constant, which is
+/// the point of the demo: it exercises verify-before-mint. It is useless in
+/// production, because a fixed value is not an identity and every client posts
+/// the same word, so it is for demonstration and testing only. A real
+/// client-side provider verifies a real payload (for example an OWID signature)
+/// instead of a shared constant.
+#[derive(Debug, Clone)]
+pub struct ClientFixedProvider;
+
+impl EdgeCookieProvider for ClientFixedProvider {
+    fn id(&self) -> &'static str {
+        "client-fixed"
+    }
+
+    fn generate(
+        &self,
+        _request_info: &dyn RequestInfo,
+        _input: &IdentityInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        // No identifier is derived at the edge: the value comes from the page
+        // script, which posts it to the resolve endpoint.
+        Ok(GeneratedEdgeCookie::default())
+    }
+
+    fn resolve_from_client(
+        &self,
+        input: &ClientResolveInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        // Verify the posted value against the known shared word, then mint it as
+        // the Edge Cookie. A value that does not match yields no Edge Cookie.
+        // This stands in for a real provider's verification (for example
+        // checking a signature) before it trusts a client-supplied value.
+        let matches = core::str::from_utf8(input.payload)
+            .map(str::trim)
+            .is_ok_and(|value| value == EXPECTED_VALUE);
+
+        Ok(GeneratedEdgeCookie {
+            id: matches.then(|| EXPECTED_VALUE.to_owned()),
+            response_headers: Vec::new(),
+        })
+    }
+
+    fn required_permissions(&self) -> PermissionSet {
+        // The provider writes the resolved value to the device as the Edge
+        // Cookie, so it requires necessary.operations.storage (TCF Purpose 1), the same gate
+        // as the HMAC provider.
+        PermissionSet::none().with(Permission::StoreOnDevice)
+    }
+}
+
 /// Builds the Edge Cookie provider named by the `[ec] provider` selector,
 /// injecting the services it needs.
 ///
@@ -279,6 +407,10 @@ pub fn build_provider(
             .hmac
             .as_ref()
             .map(|config| Box::new(HmacProvider::new(config.passphrase.clone())) as _),
+        // The client-fixed demo provider takes no configuration or services, so
+        // it is built whenever it is selected. For demonstration and testing
+        // only (see [`ClientFixedProvider`]).
+        "client-fixed" => Some(Box::new(ClientFixedProvider) as _),
         "host-signals" => {
             let signals = host_signals.ok_or_else(|| {
                 Report::new(TrustedServerError::EdgeCookie {
@@ -353,6 +485,13 @@ impl EdgeCookieProvider for SharedProvider {
 
     fn required_permissions(&self) -> PermissionSet {
         self.0.required_permissions()
+    }
+
+    fn resolve_from_client(
+        &self,
+        input: &ClientResolveInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        self.0.resolve_from_client(input)
     }
 }
 
@@ -581,6 +720,81 @@ mod tests {
             maps.resolve(None, None, |p| p == Permission::StoreOnDevice)
                 .all_set(required),
             "the Edge Cookie provider runs once necessary.operations.storage is set"
+        );
+    }
+
+    #[test]
+    fn client_fixed_defers_in_generate() {
+        let request_info = test_request_info();
+        let generated = ClientFixedProvider
+            .generate(&request_info, &IdentityInput::default())
+            .expect("should generate");
+        assert!(
+            generated.id.is_none(),
+            "client-fixed should defer in generate, deriving no edge identifier"
+        );
+    }
+
+    #[test]
+    fn client_fixed_mints_when_posted_word_matches() {
+        let input = ClientResolveInput {
+            payload: EXPECTED_VALUE.as_bytes(),
+            permissions: None,
+            consent: None,
+        };
+        let generated = ClientFixedProvider
+            .resolve_from_client(&input)
+            .expect("should resolve");
+        assert_eq!(
+            generated.id.as_deref(),
+            Some(EXPECTED_VALUE),
+            "the known shared word should verify and mint the Edge Cookie"
+        );
+    }
+
+    #[test]
+    fn client_fixed_rejects_unknown_word() {
+        let input = ClientResolveInput {
+            payload: b"not-the-word",
+            permissions: None,
+            consent: None,
+        };
+        let generated = ClientFixedProvider
+            .resolve_from_client(&input)
+            .expect("should resolve");
+        assert!(
+            generated.id.is_none(),
+            "a value that does not match the known word should mint no Edge Cookie"
+        );
+    }
+
+    #[test]
+    fn client_fixed_requires_store_on_device() {
+        assert!(
+            ClientFixedProvider
+                .required_permissions()
+                .contains(Permission::StoreOnDevice),
+            "client-fixed writes a cookie, so it requires necessary.operations.storage"
+        );
+    }
+
+    #[test]
+    fn server_side_provider_inherits_no_op_resolve_from_client() {
+        // HmacProvider does not override resolve_from_client, so it inherits the
+        // no-op default: a server-side provider does not participate in the
+        // client cycle.
+        let provider = HmacProvider::new(test_passphrase());
+        let input = ClientResolveInput {
+            payload: b"anything",
+            permissions: None,
+            consent: None,
+        };
+        let generated = provider
+            .resolve_from_client(&input)
+            .expect("should resolve");
+        assert!(
+            generated.id.is_none(),
+            "a server-side provider inherits the no-op resolve_from_client default"
         );
     }
 

@@ -48,6 +48,7 @@ pub mod provider;
 pub mod pull_sync;
 pub mod rate_limiter;
 pub mod registry;
+pub mod resolve;
 
 /// Truncates an EC ID for safe inclusion in log messages.
 ///
@@ -72,7 +73,7 @@ use crate::constants::COOKIE_TS_EC;
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
-use crate::evidence::BorrowedRequestInfo;
+use crate::evidence::{BorrowedRequestInfo, HostSignals};
 use crate::geo::GeoInfo;
 use crate::permissions::PermissionState;
 use crate::platform::RuntimeServices;
@@ -174,6 +175,16 @@ pub struct EcContext {
     /// Set via [`EcContext::set_device_signals`] before
     /// [`EcContext::generate_if_needed`] is called.
     device_signals: Option<DeviceSignals>,
+    /// The host-signal service for this request, when the host supplies one
+    /// (the Fastly adapter registers the TLS/HTTP-2 fingerprints). `None` on a
+    /// host that exposes none. Injected into a provider that needs it when the
+    /// provider is built.
+    host_signals: Option<Arc<dyn HostSignals>>,
+    /// The adapter-injected Edge Cookie provider, when one is wired for this
+    /// request. Captured once from [`RuntimeServices`] at construction and
+    /// passed to [`build_provider`] on every path, so a vendor or host provider
+    /// resolves without core naming it. `None` for built-in-only deployments.
+    ec_provider: Option<Arc<dyn crate::ec::provider::EdgeCookieProvider>>,
     /// The selected Edge Cookie provider (built-in or injected), built once at
     /// construction. Core asks it whether an identifier is well formed
     /// ([`accepts_id`](crate::ec::provider::EdgeCookieProvider::accepts_id)) so
@@ -243,7 +254,7 @@ impl EcContext {
         let host_signals = services.host_signals();
         let ec_provider = services.ec_provider();
         let selected_provider: Option<Arc<dyn crate::ec::provider::EdgeCookieProvider>> =
-            build_provider(&settings.ec, host_signals, ec_provider)?.map(Arc::from);
+            build_provider(&settings.ec, host_signals.clone(), ec_provider.clone())?.map(Arc::from);
 
         // Read back an existing identifier only when the selected provider
         // accepts its shape, so an opaque vendor identifier (for example a signed
@@ -327,6 +338,8 @@ impl EcContext {
             client_ip,
             geo_info: geo_info.cloned(),
             device_signals: None,
+            host_signals,
+            ec_provider,
             selected_provider,
             request_headers,
             request_path,
@@ -561,6 +574,22 @@ impl EcContext {
         self.client_ip.as_deref()
     }
 
+    /// Returns the host-computed client fingerprints captured for this request,
+    /// when the host supplies them.
+    ///
+    /// The resolve path rebuilds the provider with the same injected services
+    /// as the organic path, so it reads the host signals captured here rather
+    /// than re-deriving them.
+    pub(crate) fn host_signals(&self) -> Option<Arc<dyn HostSignals>> {
+        self.host_signals.clone()
+    }
+
+    /// Returns the adapter-injected Edge Cookie provider captured for this
+    /// request, or `None` for a built-in-only deployment.
+    pub(crate) fn ec_provider(&self) -> Option<Arc<dyn crate::ec::provider::EdgeCookieProvider>> {
+        self.ec_provider.clone()
+    }
+
     /// Returns the pre-routing geo data, if available.
     #[must_use]
     pub fn geo_info(&self) -> Option<&GeoInfo> {
@@ -651,6 +680,8 @@ impl EcContext {
             client_ip: None,
             geo_info: None,
             device_signals: None,
+            host_signals: None,
+            ec_provider: None,
             selected_provider: None,
             request_headers: http::HeaderMap::new(),
             request_path: String::new(),
@@ -678,6 +709,8 @@ impl EcContext {
             client_ip,
             geo_info: None,
             device_signals: None,
+            host_signals: None,
+            ec_provider: None,
             selected_provider: None,
             request_headers: http::HeaderMap::new(),
             request_path: String::new(),
@@ -709,6 +742,8 @@ impl EcContext {
             client_ip: None,
             geo_info: None,
             device_signals: None,
+            host_signals: None,
+            ec_provider: None,
             selected_provider: None,
             request_headers: http::HeaderMap::new(),
             request_path: String::new(),
