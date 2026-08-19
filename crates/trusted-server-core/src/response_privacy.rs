@@ -41,7 +41,7 @@ fn strip_cdn_cache_headers(response: &mut Response) {
 ///
 /// Extracted because both arms of the cookie-privacy net below need it.
 ///
-/// `publisher::c2_bypass_reason` deliberately does **not** call this and keeps its own
+/// `publisher::template_cache_bypass_reason` deliberately does **not** call this and keeps its own
 /// copy: it additionally treats `no-cache` as non-shareable, because "revalidate before
 /// reuse" is correct for an HTTP cache and too permissive for a spike-owned one. The
 /// duplicate is the stricter of the two, so consolidating them would loosen the shared
