@@ -204,7 +204,7 @@ TypeScript/Vitest, Viceroy, shell harness.
 - Modify: relevant #1009 findings documents
 
 - [x] Document that `esi` means Fastly shared template cache plus byte-seam assembly, not parser execution or final
-      raw origin caching.
+      assembled-response caching.
 - [x] Document `template_cache_vary`, cookie independence, freshness, metrics, purge, rollback
       ordering, and limitations on non-Fastly adapters.
 - [x] Close or supersede stale spike checkboxes and remove claims contradicted by the final code.

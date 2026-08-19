@@ -1390,7 +1390,7 @@ document containing any `<esi:` directive bypasses the template cache and the pa
 ordinary byte seam still produces the reader's complete response. The stored shared template
 object never contains executable ESI markup.
 
-Only Fastly currently supplies the shared template cache's Core Cache backend. Other adapters accept
+Only Fastly currently supplies the Core Cache backend used by the shared template cache. Other adapters accept
 the mode but safely fall back to the inline transform on every request. This is
 not a top-level HTTP cache hit: Compute still runs and the final assembled
 response is always `Cache-Control: private, no-store`.
@@ -1465,8 +1465,8 @@ For a canary, inspect `X-TS-Template-Cache`. Its bounded values are `hit`,
 `miss-stored`, `miss-store-error`, `miss-reserved`, `bypass-request`,
 `bypass-response`, `unsupported`, `invalid`, and `backend-error`. No URL, header
 value, or cache key is exposed. `invalid` and `backend-error` fail open to a
-fresh origin response; they do not fail the page. The corresponding bounded
-`template_cache` logs use the same terminology for server-side monitoring.
+fresh origin response; they do not fail the page. The corresponding
+`template_cache` logs provide server-side observability for this path.
 
 `X-TS-Assembly` identifies how the private response was assembled:
 
