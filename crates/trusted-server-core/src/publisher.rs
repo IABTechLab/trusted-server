@@ -4117,13 +4117,11 @@ pub async fn handle_publisher_request(
         && !request_requires_origin
         && reader_supports_assembly;
 
-    // Only advertise encodings the rewrite pipeline can decode and re-encode. The
-    // template is normalized to identity after the origin responds, then encoded for
-    // this reader after assembly; the origin offer itself remains reader-compatible so
-    // a response-gate bypass can still fall back to inline losslessly.
-    if !matches!(assembly_mode, AssemblyMode::Esi) || reader_supports_assembly {
-        restrict_accept_encoding(&mut req);
-    } else {
+    // Only advertise encodings the rewrite pipeline can decode and re-encode. This
+    // remains unconditional when C2 negotiation fails: that request bypasses shared
+    // assembly, but its origin response still needs to be processable for TSJS injection.
+    restrict_accept_encoding(&mut req);
+    if matches!(assembly_mode, AssemblyMode::Esi) && !reader_supports_assembly {
         log::debug!("c2_template_cache bypass: reader accepts no representation TS can assemble");
     }
     // Strip the internal `fastly-ssl` scheme signal before forwarding to the
@@ -8492,7 +8490,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_reader_that_refuses_every_supported_encoding_bypasses_c2_losslessly() {
+        async fn esi_unsupported_reader_encoding_still_injects_tsjs() {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let settings = Arc::new(settings_with_mode("esi"));
@@ -8501,25 +8499,33 @@ mod tests {
             let mut request = navigation_request();
             request.headers_mut().insert(
                 header::ACCEPT_ENCODING,
-                HeaderValue::from_static("zstd, identity;q=0"),
+                HeaderValue::from_static(
+                    "zstd, gzip;q=0, deflate;q=0, br;q=0, identity;q=0",
+                ),
             );
 
-            let _ = body_of(run(&settings, &services, request).await).await;
+            let body = String::from_utf8(body_of(run(&settings, &services, request).await).await)
+                .expect("should return UTF-8 HTML");
 
             let forwarded = stub.recorded_request_headers();
             assert!(
                 forwarded[0].iter().any(|(name, value)| {
-                    name.eq_ignore_ascii_case("accept-encoding") && value == "zstd, identity;q=0"
+                    name.eq_ignore_ascii_case("accept-encoding") && value == "identity"
                 }),
-                "an unsupported offer must reach origin unchanged so TS can pass through the \
-                 representation instead of sending forbidden identity"
+                "should force an identity origin representation when no reader encoding is \
+                 available for assembly"
+            );
+            assert!(
+                body.contains("window.tsjs"),
+                "should preserve TSJS injection while bypassing shared assembly"
             );
             assert!(
                 cache
                     .lookups
                     .lock()
                     .expect("should lock lookups")
-                    .is_empty()
+                    .is_empty(),
+                "should bypass C2 when the reader accepts no supported representation"
             );
         }
 
