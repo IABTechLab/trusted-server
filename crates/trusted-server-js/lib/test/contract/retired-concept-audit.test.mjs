@@ -33,11 +33,33 @@ const historicalPerformanceFixturePath = path.join(
   'crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json'
 );
 const mainAuditSha = 'f6a2fb85ce623bf8a574e3941e1ee349acc3412d';
-const auditedClassifications = JSON.parse(readFileSync(auditFixturePath, 'utf8'));
+const rcBaselineSha = 'f0825604ec6740111e99dd8a178e3b880e7d772b';
+const parsedAuditFixture = JSON.parse(readFileSync(auditFixturePath, 'utf8'));
+const auditedClassifications = Array.isArray(parsedAuditFixture)
+  ? parsedAuditFixture
+  : parsedAuditFixture.historicalMain.rows;
 const validClassifications = auditedClassifications.map((row) => ({ ...row }));
 const pendingClassifications = validClassifications.map((row, index) =>
   index === 0 ? { ...row, classification: 'proof-pending', result: 'proof-pending' } : row
 );
+const auditedRcClassifications = Array.isArray(parsedAuditFixture)
+  ? auditedClassifications.map(({ mainSha: _mainSha, ...row }) => ({
+      ...row,
+      baselineSha: rcBaselineSha,
+      classification: row.classification === 'main-owned' ? 'baseline-owned' : row.classification,
+    }))
+  : parsedAuditFixture.rcBaseline.rows;
+const validVersionedFixture = {
+  version: 2,
+  historicalMain: {
+    mainSha: mainAuditSha,
+    rows: validClassifications,
+  },
+  rcBaseline: {
+    baselineSha: rcBaselineSha,
+    rows: auditedRcClassifications,
+  },
+};
 const manifestFence = /```json retired-rcjuly-tsjs-concept-manifest-v1\n([\s\S]*?)\n```/;
 const specSource = readFileSync(specPath, 'utf8');
 const manifestSource = manifestFence.exec(specSource)?.[1];
@@ -73,10 +95,10 @@ function assertSourceRejected(source, expected) {
   assert.throws(() => assertRetiredConceptAudit(auditSource(source)), expected);
 }
 
-function assertFixtureRejected(rows, expected) {
+function assertFixtureRejected(fixture, expected, options = {}) {
   const directory = mkdtempSync(path.join(tmpdir(), 'current-main-concept-audit-'));
   const temporaryFixturePath = path.join(directory, 'audit.json');
-  writeFileSync(temporaryFixturePath, JSON.stringify(rows));
+  writeFileSync(temporaryFixturePath, JSON.stringify(fixture));
   try {
     assert.throws(
       () =>
@@ -86,6 +108,8 @@ function assertFixtureRejected(rows, expected) {
             specPath,
             auditFixturePath: temporaryFixturePath,
             mainAuditSha,
+            rcBaselineSha,
+            ...options,
           })
         ),
       expected
@@ -93,6 +117,26 @@ function assertFixtureRejected(rows, expected) {
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+}
+
+function assertHistoricalRowsRejected(rows, expected) {
+  assertFixtureRejected(
+    {
+      ...validVersionedFixture,
+      historicalMain: { ...validVersionedFixture.historicalMain, rows },
+    },
+    expected
+  );
+}
+
+function assertRcRowsRejected(rows, expected) {
+  assertFixtureRejected(
+    {
+      ...validVersionedFixture,
+      rcBaseline: { ...validVersionedFixture.rcBaseline, rows },
+    },
+    expected
+  );
 }
 
 test('the in-spec retired concept inventory is complete without a historical Git object', () => {
@@ -186,43 +230,43 @@ test('the manifest and retained-concept ledger expose the same 23 IDs', () => {
 });
 
 test('classification rows reject missing, duplicate, pending, mismatched, or historical proof', () => {
-  assertFixtureRejected(
+  assertHistoricalRowsRejected(
     [...validClassifications, { ...validClassifications[0], id: null }],
     /exactly 23 classification rows/
   );
-  assertFixtureRejected(
+  assertHistoricalRowsRejected(
     validClassifications.map((row, index) => (index === 0 ? { ...row, id: null } : row)),
     /valid RCJ id/
   );
-  assertFixtureRejected(validClassifications.slice(1), /missingClassificationIds/);
-  assertFixtureRejected(
+  assertHistoricalRowsRejected(validClassifications.slice(1), /missingClassificationIds/);
+  assertHistoricalRowsRejected(
     [validClassifications[0], ...validClassifications],
     /duplicateClassificationIds/
   );
-  assertFixtureRejected(pendingClassifications, /proof-pending/);
-  assertFixtureRejected(
+  assertHistoricalRowsRejected(pendingClassifications, /proof-pending/);
+  assertHistoricalRowsRejected(
     validClassifications.map((row, index) =>
       index === 0 ? { ...row, mainSha: '0'.repeat(40) } : row
     ),
     /mainSha/
   );
-  assertFixtureRejected(
+  assertHistoricalRowsRejected(
     validClassifications.map((row, index) =>
       index === 0 ? { ...row, ownerPaths: [], testPath: '', command: '' } : row
     ),
     /ownerPaths/
   );
-  assertFixtureRejected(
+  assertHistoricalRowsRejected(
     validClassifications.map((row, index) => (index === 0 ? { ...row, result: 'fail' } : row)),
     /main-owned.*pass/
   );
-  assertFixtureRejected(
+  assertHistoricalRowsRejected(
     validClassifications.map((row, index) =>
       index === 0 ? { ...row, classification: 'implementation-gap' } : row
     ),
     /implementation-gap.*fail/
   );
-  assertFixtureRejected(
+  assertHistoricalRowsRejected(
     validClassifications.map((row, index) =>
       index === 0 ? { ...row, command: 'git show rc/july:historical.ts' } : row
     ),
@@ -241,7 +285,7 @@ test('classification rows reject missing, duplicate, pending, mismatched, or his
 });
 
 test('classification rows pin the authoritative current-main pass and gap results', () => {
-  assertFixtureRejected(
+  assertHistoricalRowsRejected(
     validClassifications.map((row) => ({
       ...row,
       classification: 'main-owned',
@@ -250,7 +294,7 @@ test('classification rows pin the authoritative current-main pass and gap result
     /authoritative classification/
   );
 
-  assertFixtureRejected(
+  assertHistoricalRowsRejected(
     validClassifications.map((row) => {
       if (row.id === 'RCJ-CORE-01') {
         return { ...row, classification: 'implementation-gap', result: 'fail' };
@@ -272,16 +316,153 @@ test('every retained concept has a final current-main classification and reprodu
   });
   assertRetiredConceptAudit(result);
 
-  assert.equal(result.classifications.length, 23);
-  assert.deepEqual(result.classificationCounts, {
+  assert.equal(result.historicalMain.classifications.length, 23);
+  assert.deepEqual(result.historicalMain.classificationCounts, {
     implementationGap: 5,
     mainOwned: 18,
   });
-  assert.deepEqual(result.classifications.map(({ id }) => id).sort(), [...result.ledgerIds].sort());
+  assert.deepEqual(
+    result.historicalMain.classifications.map(({ id }) => id).sort(),
+    [...result.ledgerIds].sort()
+  );
   assert.ok(
-    result.classifications.every(({ classification }) =>
+    result.historicalMain.classifications.every(({ classification }) =>
       ['main-owned', 'implementation-gap'].includes(classification)
     )
+  );
+});
+
+test('the audit fixture exposes immutable historical-main and rc-baseline evidence layers', () => {
+  const result = auditRetiredConceptAudit({
+    specPath,
+    auditFixturePath,
+    mainAuditSha,
+    rcBaselineSha,
+  });
+  assertRetiredConceptAudit(result);
+
+  assert.equal(result.fixtureVersion, 2);
+  assert.equal(result.historicalMain.mainSha, mainAuditSha);
+  assert.equal(result.historicalMain.classifications.length, 23);
+  assert.equal(result.rcBaseline.baselineSha, rcBaselineSha);
+  assert.equal(result.rcBaseline.classifications.length, 23);
+  assert.ok(
+    result.rcBaseline.classifications.every(({ classification }) =>
+      ['baseline-owned', 'implementation-gap'].includes(classification)
+    )
+  );
+});
+
+test('the versioned fixture rejects legacy roots, extra structure, and historical mutation', () => {
+  assertFixtureRejected(validClassifications, /exact version 2 object/);
+  assertFixtureRejected({ ...validVersionedFixture, version: 1 }, /exact version 2 object/);
+  assertFixtureRejected({ ...validVersionedFixture, unexpected: true }, /exact version 2 object/);
+  assertFixtureRejected(
+    {
+      ...validVersionedFixture,
+      historicalMain: { ...validVersionedFixture.historicalMain, unexpected: true },
+    },
+    /historicalMain.*exact/
+  );
+  assertHistoricalRowsRejected(
+    validClassifications.map((row, index) =>
+      index === 0 ? { ...row, disposition: 'preserve' } : row
+    ),
+    /immutable historical-main evidence/
+  );
+});
+
+test('rc-baseline rows reject incomplete, stale, pending, or historical evidence', () => {
+  assertRcRowsRejected(auditedRcClassifications.slice(1), /missingClassificationIds/);
+  assertRcRowsRejected(
+    [auditedRcClassifications[0], ...auditedRcClassifications],
+    /duplicateClassificationIds/
+  );
+  assertRcRowsRejected(
+    auditedRcClassifications.map((row, index) => (index === 0 ? { ...row, id: null } : row)),
+    /valid RCJ id/
+  );
+  assertRcRowsRejected(
+    auditedRcClassifications.map((row, index) =>
+      index === 0 ? { ...row, unexpected: true } : row
+    ),
+    /exact required fields/
+  );
+  assertRcRowsRejected(
+    auditedRcClassifications.map((row, index) =>
+      index === 0 ? { ...row, classification: 'proof-pending', result: 'proof-pending' } : row
+    ),
+    /proof-pending/
+  );
+  assertRcRowsRejected(
+    auditedRcClassifications.map((row, index) =>
+      index === 0 ? { ...row, baselineSha: '0'.repeat(40) } : row
+    ),
+    /baselineSha/
+  );
+  assertRcRowsRejected(
+    auditedRcClassifications.map((row, index) =>
+      index === 0 ? { ...row, ownerPaths: [], testPath: '', command: '' } : row
+    ),
+    /ownerPaths/
+  );
+  assertRcRowsRejected(
+    auditedRcClassifications.map((row, index) => (index === 0 ? { ...row, result: 'fail' } : row)),
+    /baseline-owned.*pass/
+  );
+  assertRcRowsRejected(
+    auditedRcClassifications.map((row) =>
+      row.id === 'RCJ-TRACE-01' ? { ...row, result: 'pass' } : row
+    ),
+    /implementation-gap.*fail/
+  );
+  assertRcRowsRejected(
+    auditedRcClassifications.map((row, index) =>
+      index === 0 ? { ...row, command: 'git show rc/july:historical.ts' } : row
+    ),
+    /historical source/
+  );
+});
+
+test('rc-baseline authority and final pass-gap classifications are pinned', () => {
+  assertFixtureRejected(
+    {
+      ...validVersionedFixture,
+      rcBaseline: { ...validVersionedFixture.rcBaseline, baselineSha: '0'.repeat(40) },
+    },
+    /rcBaseline baselineSha/
+  );
+  assert.throws(
+    () =>
+      auditRetiredConceptAudit({
+        specPath,
+        auditFixturePath,
+        rcBaselineSha: '0'.repeat(40),
+      }),
+    /recorded rc baseline SHA/
+  );
+  assertRcRowsRejected(
+    auditedRcClassifications.map((row) => ({
+      ...row,
+      classification: 'baseline-owned',
+      result: 'pass',
+    })),
+    /authoritative classification/
+  );
+
+  const result = auditRetiredConceptAudit({
+    specPath,
+    auditFixturePath,
+    rcBaselineSha,
+  });
+  assertRetiredConceptAudit(result);
+  assert.deepEqual(result.rcBaseline.classificationCounts, {
+    baselineOwned: 18,
+    implementationGap: 5,
+  });
+  assert.deepEqual(
+    result.rcBaseline.classifications.map(({ id }) => id).sort(),
+    [...result.ledgerIds].sort()
   );
 });
 
@@ -289,7 +470,13 @@ test('the default current-main authority cannot be rewritten through the fixture
   const directory = mkdtempSync(path.join(tmpdir(), 'current-main-authority-'));
   const temporaryFixturePath = path.join(directory, 'audit.json');
   const rewrittenRows = auditedClassifications.map((row) => ({ ...row, mainSha: '0'.repeat(40) }));
-  writeFileSync(temporaryFixturePath, JSON.stringify(rewrittenRows));
+  writeFileSync(
+    temporaryFixturePath,
+    JSON.stringify({
+      ...validVersionedFixture,
+      historicalMain: { ...validVersionedFixture.historicalMain, rows: rewrittenRows },
+    })
+  );
   try {
     assert.throws(
       () =>
@@ -367,7 +554,7 @@ git mv crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs crat
 
 test('the implementation plan contains no executable retired-source command', () => {
   const planSource = readFileSync(planPath, 'utf8');
-  assert.equal(countExecutableShellFences(planSource), 111);
+  assert.equal(countExecutableShellFences(planSource), 54);
   assert.deepEqual(auditRetiredPlanCommands(planSource), []);
 
   const mutatedPlanSource = planSource.replace(
