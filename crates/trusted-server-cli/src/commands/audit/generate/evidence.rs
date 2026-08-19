@@ -145,7 +145,7 @@ impl EvidenceTable {
         if let Some(network_id) = &discovered.gam_network_id {
             self.network_ids.insert(network_id.clone());
         }
-        if discovered.slots.is_empty() {
+        if !discovered.had_slot_evidence {
             if !self.non_empty_pages.contains(path) {
                 self.empty_pages.insert(path.to_string());
             }
@@ -616,6 +616,27 @@ mod tests {
             table.pages().len(),
             2,
             "every folded page should be counted"
+        );
+    }
+
+    #[test]
+    fn collision_only_page_is_not_classified_as_empty() {
+        let discovered = page(
+            &[
+                ("/123/site/home", "ad-x-aaaaaaaaaaaaaaaa-0", &[(300, 250)]),
+                ("/123/site/home", "ad-x-bbbbbbbbbbbbbbbb-1", &[(300, 250)]),
+            ],
+            false,
+        );
+        let mut table = EvidenceTable::default();
+
+        table.fold_page("/collision-only", &discovered);
+
+        assert!(discovered.had_slot_evidence);
+        assert!(discovered.slots.is_empty());
+        assert!(
+            table.empty_pages().is_empty(),
+            "intentionally omitted GPT evidence must not look like a bot challenge"
         );
     }
 

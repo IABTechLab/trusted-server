@@ -935,7 +935,11 @@ fn fold_collected(
         &collected.network_requests,
         page_has_prebid,
     );
-    notes.extend(discovered.warnings.iter().cloned());
+    for warning in &discovered.warnings {
+        if !notes.contains(warning) {
+            notes.push(warning.clone());
+        }
+    }
     table.fold_page(url.path(), &discovered);
     Ok(())
 }
@@ -1498,6 +1502,25 @@ mod tests {
         collected
     }
 
+    fn collected_page_with_ambiguous_slots(url: &str) -> CollectedPage {
+        let mut collected = collected_page();
+        collected.requested_url = url.to_string();
+        collected.final_url = url.to_string();
+        collected.gpt_slots = vec![
+            collector::CollectedGptSlot {
+                gam_unit_path: "/222/homepage/in-content".to_string(),
+                div_id: "ad-x-aaaaaaaaaaaaaaaa-0".to_string(),
+                sizes: vec![(300, 250)],
+            },
+            collector::CollectedGptSlot {
+                gam_unit_path: "/222/homepage/in-content".to_string(),
+                div_id: "ad-x-bbbbbbbbbbbbbbbb-1".to_string(),
+                sizes: vec![(300, 250)],
+            },
+        ];
+        collected
+    }
+
     fn audit_args(url: &str) -> GenerateArgs {
         GenerateArgs {
             url: url.to_string(),
@@ -1529,6 +1552,30 @@ mod tests {
                 "should explain scheme restriction"
             );
         }
+    }
+
+    #[test]
+    fn repeated_ambiguous_collision_note_is_emitted_once() {
+        let mut table = evidence::EvidenceTable::default();
+        let mut notes = Vec::new();
+        for url in [
+            "https://publisher.example/",
+            "https://publisher.example/news",
+        ] {
+            fold_collected(
+                &mut table,
+                &Url::parse(url).expect("should parse fixture URL"),
+                &collected_page_with_ambiguous_slots(url),
+                &mut notes,
+            )
+            .expect("should fold ambiguous page evidence");
+        }
+
+        assert_eq!(
+            notes.len(),
+            1,
+            "the same site-wide collision guidance should not repeat per page"
+        );
     }
 
     #[test]

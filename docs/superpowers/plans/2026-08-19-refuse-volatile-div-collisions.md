@@ -13,6 +13,7 @@
 ### Task 1: Specify refusal behavior
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/commands/audit/generate/gpt_slots.rs`
 - Modify: `crates/trusted-server-cli/src/commands/audit/generate/evidence.rs`
 
@@ -35,6 +36,7 @@
 ### Task 2: Refuse ambiguous collision groups
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/commands/audit/generate/gpt_slots.rs`
 - Modify: `crates/trusted-server-cli/src/commands/audit/generate/evidence.rs`
 
@@ -50,6 +52,7 @@
 ### Task 3: Verify and deliver
 
 **Files:**
+
 - Verify: `crates/trusted-server-cli/src/commands/audit/generate/gpt_slots.rs`
 - Verify: `crates/trusted-server-cli/src/commands/audit/generate/evidence.rs`
 - Verify: `docs/superpowers/specs/2026-08-19-refuse-volatile-div-collisions-design.md`

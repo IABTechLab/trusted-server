@@ -85,6 +85,9 @@ pub(crate) struct DiscoveredSlot {
 pub(crate) struct DiscoveredSlots {
     /// GAM network id shared by the discovered slots, if any were found.
     pub(crate) gam_network_id: Option<String>,
+    /// Whether the page exposed any otherwise usable slot evidence, including
+    /// ambiguous placements that were intentionally omitted from `slots`.
+    pub(crate) had_slot_evidence: bool,
     /// The reconstructed slots, deduplicated by div id in first-seen order.
     pub(crate) slots: Vec<DiscoveredSlot>,
     /// Diagnostics for placements whose normalized stable stems collided.
@@ -109,17 +112,18 @@ pub(crate) fn discover_gpt_slots(
     let mut slots = Vec::new();
     let mut warnings = Vec::new();
     let mut gam_network_id = None;
+    let mut had_slot_evidence = false;
     let mut registry_divs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     for entry in registry {
         let Some(slot) = slot_from_registry(entry, page_has_prebid) else {
             continue;
         };
-        if push_slot_preserving_collisions(&mut slots, &mut registry_divs, slot, &entry.div_id) {
-            warnings.push(format!(
-                "normalized div-id collision retained raw volatile id `{}`; it may not match a later render",
-                entry.div_id
-            ));
+        had_slot_evidence = true;
+        if let Some(prefix) =
+            push_slot_refusing_collisions(&mut slots, &mut registry_divs, slot, &entry.div_id)
+        {
+            warnings.push(ambiguous_collision_warning(&prefix));
         }
         if gam_network_id.is_none() {
             gam_network_id = network_id_from_unit_path(&entry.gam_unit_path);
@@ -132,13 +136,14 @@ pub(crate) fn discover_gpt_slots(
         let Some((network_id, slot, raw_div)) = parse_gampad_request(&request.url) else {
             continue;
         };
+        had_slot_evidence = true;
         if registry_stems.contains(&slot.div_id) {
             continue;
         }
-        if push_slot_preserving_collisions(&mut slots, &mut request_divs, slot, &raw_div) {
-            warnings.push(format!(
-                "normalized request div-id collision retained raw volatile id `{raw_div}`; it may not match a later render"
-            ));
+        if let Some(prefix) =
+            push_slot_refusing_collisions(&mut slots, &mut request_divs, slot, &raw_div)
+        {
+            warnings.push(ambiguous_collision_warning(&prefix));
         }
         if gam_network_id.is_none() {
             gam_network_id = Some(network_id);
@@ -148,46 +153,52 @@ pub(crate) fn discover_gpt_slots(
 
     DiscoveredSlots {
         gam_network_id,
+        had_slot_evidence,
         slots,
         warnings,
     }
 }
 
-/// Adds one source-local slot while retaining distinct raw div IDs that share a stem.
+/// Adds one source-local slot unless distinct raw div IDs share its stable stem.
 ///
-/// Returns whether a normalized collision forced raw, potentially volatile IDs
-/// to be retained for both placements.
-fn push_slot_preserving_collisions(
+/// The first distinct collision removes the tentatively accepted slot and
+/// returns its stem for one diagnostic. Repeats and later collision members stay
+/// suppressed and return `None`.
+fn push_slot_refusing_collisions(
     slots: &mut Vec<DiscoveredSlot>,
     seen_divs: &mut BTreeMap<String, BTreeSet<String>>,
-    mut slot: DiscoveredSlot,
+    slot: DiscoveredSlot,
     raw_div: &str,
-) -> bool {
+) -> Option<String> {
     let normalized = slot.div_id.clone();
     let raw_div = raw_div.strip_suffix("-container").unwrap_or(raw_div);
     match seen_divs.get_mut(&normalized) {
         None => {
             seen_divs.insert(normalized, BTreeSet::from([raw_div.to_string()]));
             slots.push(slot);
-            false
+            None
         }
-        Some(raw_divs) if raw_divs.contains(raw_div) => false,
+        Some(raw_divs) if raw_divs.contains(raw_div) => None,
         Some(raw_divs) => {
-            let previous_raw = raw_divs
-                .first()
-                .expect("should have a first raw div after initial insertion")
-                .clone();
-            if let Some(previous) = slots.iter_mut().find(|entry| entry.div_id == normalized) {
-                previous.div_id.clone_from(&previous_raw);
-                previous.id = slot_id_from_div(&previous_raw);
-            }
-            slot.div_id = raw_div.to_string();
-            slot.id = slot_id_from_div(raw_div);
+            let became_ambiguous = raw_divs.len() == 1;
             raw_divs.insert(raw_div.to_string());
-            slots.push(slot);
-            true
+            if became_ambiguous {
+                slots.retain(|entry| entry.div_id != normalized);
+                Some(normalized)
+            } else {
+                None
+            }
         }
     }
+}
+
+fn ambiguous_collision_warning(prefix: &str) -> String {
+    format!(
+        "skipped ambiguous div-id prefix `{prefix}`: multiple active elements normalized to it, \
+         but the runtime can resolve a prefix to only one active element and exact div ids change \
+         across renders; expose distinct stable div ids in publisher markup before configuring \
+         these placements"
+    )
 }
 
 /// Converts a live-registry slot into a [`DiscoveredSlot`].
@@ -909,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn same_page_hex_normalization_collision_retains_both_raw_slots() {
+    fn same_page_hex_normalization_collision_is_refused() {
         let registry = vec![
             registry_slot(
                 "/987654321/site/homepage",
@@ -925,44 +936,81 @@ mod tests {
 
         let discovered = discover_gpt_slots(&registry, &[], false);
 
-        assert_eq!(discovered.slots.len(), 2);
-        assert_eq!(
-            discovered
-                .slots
-                .iter()
-                .map(|slot| slot.div_id.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "ad-in_content-de669245b2ea4b05826dc96f07a36272-in_content-0",
-                "ad-in_content-8aec8129a83d4e5abc197423120cb19e-in_content-0",
-            ]
+        assert!(discovered.had_slot_evidence);
+        assert!(
+            discovered.slots.is_empty(),
+            "neither a broad prefix nor per-render exact IDs are safe"
         );
-        assert_eq!(discovered.slots[0].formats, vec![(300, 250)]);
-        assert_ne!(discovered.slots[0].id, discovered.slots[1].id);
-        assert_eq!(
-            discovered.warnings.len(),
-            1,
-            "writing raw volatile IDs must be diagnosable"
-        );
+        assert_ambiguous_collision_warning(&discovered, "ad-in_content");
     }
 
     #[test]
     fn repeated_raw_div_after_a_normalization_collision_is_deduplicated() {
         let first = "ad-x-aaaaaaaaaaaaaaaa-0";
         let second = "ad-x-bbbbbbbbbbbbbbbb-1";
+        let third = "ad-x-cccccccccccccccc-2";
         let registry = vec![
             registry_slot("/123456789/site/home", first, &[(300, 250)]),
             registry_slot("/123456789/site/home", second, &[(300, 250)]),
+            registry_slot("/123456789/site/home", first, &[(300, 250)]),
             registry_slot("/123456789/site/home", second, &[(300, 250)]),
+            registry_slot("/123456789/site/home", third, &[(300, 250)]),
         ];
 
         let discovered = discover_gpt_slots(&registry, &[], false);
 
-        assert_eq!(
-            discovered.slots.len(),
-            2,
-            "an exact raw div repeat must remain first-seen deduplicated"
+        assert!(discovered.had_slot_evidence);
+        assert!(
+            discovered.slots.is_empty(),
+            "no repeat or later collision member may resurrect the group"
         );
+        assert_ambiguous_collision_warning(&discovered, "ad-x");
+    }
+
+    #[test]
+    fn request_normalization_collision_is_refused() {
+        let discovered = from_requests(&[
+            request(
+                "https://securepubads.g.doubleclick.net/gampad/ads?iu_parts=123456789%2Csite%2Chome&dids=ad-x-aaaaaaaaaaaaaaaa-0&prev_iu_szs=300x250",
+            ),
+            request(
+                "https://securepubads.g.doubleclick.net/gampad/ads?iu_parts=123456789%2Csite%2Chome&dids=ad-x-bbbbbbbbbbbbbbbb-1&prev_iu_szs=300x250",
+            ),
+        ]);
+
+        assert!(discovered.had_slot_evidence);
+        assert!(discovered.slots.is_empty());
+        assert_eq!(discovered.gam_network_id.as_deref(), Some("123456789"));
+        assert_ambiguous_collision_warning(&discovered, "ad-x");
+    }
+
+    #[test]
+    fn ambiguous_registry_stem_still_suppresses_request_fallback() {
+        let registry = vec![
+            registry_slot(
+                "/123456789/site/home",
+                "ad-x-aaaaaaaaaaaaaaaa-0",
+                &[(300, 250)],
+            ),
+            registry_slot(
+                "/123456789/site/home",
+                "ad-x-bbbbbbbbbbbbbbbb-1",
+                &[(300, 250)],
+            ),
+        ];
+        let requests = vec![request(
+            "https://securepubads.g.doubleclick.net/gampad/ads?iu_parts=123456789%2Csite%2Chome&dids=ad-x-cccccccccccccccc-2&prev_iu_szs=300x250",
+        )];
+
+        let discovered = discover_gpt_slots(&registry, &requests, false);
+
+        assert!(discovered.had_slot_evidence);
+        assert!(
+            discovered.slots.is_empty(),
+            "request fallback must not resurrect an ambiguous registry stem"
+        );
+        assert_eq!(discovered.gam_network_id.as_deref(), Some("123456789"));
+        assert_ambiguous_collision_warning(&discovered, "ad-x");
     }
 
     #[test]
@@ -982,6 +1030,24 @@ mod tests {
         assert_eq!(
             discovered.slots[0].div_id, "ad-x",
             "request fallback must not destabilize a registry-derived prefix"
+        );
+    }
+
+    fn assert_ambiguous_collision_warning(discovered: &DiscoveredSlots, prefix: &str) {
+        assert_eq!(discovered.warnings.len(), 1);
+        let warning = &discovered.warnings[0];
+        assert!(warning.contains(prefix), "warning should name the prefix");
+        assert!(
+            warning.contains("one active element"),
+            "warning should explain why the broad prefix is unsafe"
+        );
+        assert!(
+            warning.contains("change across renders"),
+            "warning should explain why raw IDs are unsafe"
+        );
+        assert!(
+            warning.contains("distinct stable div ids"),
+            "warning should tell the operator how to make the placements configurable"
         );
     }
 }
