@@ -1,6 +1,6 @@
 # APS Render Fix and TSJS Resilience Architecture — Design
 
-- **Status:** revision 40 — hard-cutover contract with a lean first-display owner,
+- **Status:** revision 41 — hard-cutover contract with a lean first-display owner,
   atomic persistent-runtime takeover, an `rc/202608` implementation base,
   retired-branch concept-gap coverage, rc behavior reconciliation, and
   merge-blocking load-time remediation
@@ -1828,7 +1828,35 @@ owned by its GPT slot: for a TS-owned slot the artifact may dispose it only thro
 safe GPT destroy/redefine, while publisher-owned slot DOM remains publisher-controlled
 and the artifact releases only TS metadata and compare-restorable targeting. Before a
 slot publishes another accepted artifact it disposes the prior artifact. Navigation
-disposes artifacts according to those same ownership/quarantine rules. Claim,
+disposes artifacts according to those same ownership/quarantine rules.
+
+A committed GPT/PUC APS overlay is also bound to the exact physical GPT object and
+binding epoch that produced it. The sole early `slotRequested` listener classifies
+the new physical cycle before any later GPT listener runs. An exactly attributable
+TS-owned replacement cycle retains the prior accepted artifact until a new TS
+artifact commits, so a failed TS replacement does not blank a valid prior result. A
+publisher-owned, competing, or ambiguous cycle instead synchronously retires the
+prior TS artifact before that `slotRequested` callback returns: it removes only the
+TS overlay, releases compare-owned host style and targeting, and clears artifact
+metadata without destroying the GPT object, cancelling publisher work, or sending a
+second PUC settlement. An ambiguous/competing cycle separately fails any affected
+live TS attempt under §2.4. Thus native publisher refresh/display can never render
+behind a stale accepted overlay.
+
+Artifact DOM identity is guarded independently of GPT callbacks. The existing
+navigation binding observer treats a disconnected/replaced host, an overlay no
+longer parented by its exact host, or an overlay whose exact node was removed as
+artifact retirement. Its idempotent disposer removes the owned node wherever it was
+moved, compare-restores only the original host values still owned by TS, and drops
+the metadata; it never traverses or removes a publisher/GPT child. The GPT adapter
+also snapshots the exact targeted physical objects before a publisher-originated
+`destroySlots` call and, only when that call returns success, retires their artifacts
+before returning to the publisher. A throw/false result leaves a still-connected
+artifact intact, while the DOM guard still cleans up anything GPT actually removed.
+All these paths share the artifact's exact-once latch and race safely with TS
+replacement commit, navigation disposal, and late callbacks.
+
+Claim,
 registration, owner-control, and renderer-document ports/listeners that are no
 longer needed close after terminal settlement and are never promoted.
 Artifact disposal is synchronous and exact-once. A disposer that throws, returns a
@@ -2074,22 +2102,42 @@ allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow
 `<TS_ORIGIN>` is the canonical ASCII HTTP(S) origin of the bootstrap URL and
 `<CREATIVE_ORIGIN>` is the canonical ASCII HTTPS origin of the validated creative
 URL. They contain no path, query, fragment, credentials, whitespace, quote, semicolon,
-or control character. The outer data container carries this exact meta-CSP after
-sentinel substitution:
+or control character. For `tagType:'iframe'`, the outer data container carries this
+exact meta-CSP after sentinel substitution:
 
 ```text
 default-src 'none'; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' <TS_ORIGIN>; connect-src https: <TS_ORIGIN>; frame-src data: <CREATIVE_ORIGIN>; img-src https: data: blob:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:; worker-src https: blob:; form-action https:;
 ```
 
-The inner data renderer carries the intersecting exact meta-CSP:
+Its inner data renderer carries this intersecting exact meta-CSP:
 
 ```text
 default-src 'none'; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' <TS_ORIGIN>; connect-src https: <TS_ORIGIN>; frame-src <CREATIVE_ORIGIN>; img-src https: data: blob:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:; worker-src https: blob:; form-action https:;
 ```
 
-The outer policy must permit the inner document's runner/resource contract because
-it is inherited by a `data:` child; the inner policy narrows external script and
-creative-frame authority again. Neither policy permits publisher origin as a frame
+For the explicitly enabled `tagType:'script'` case, the generator instead uses the
+following two exact policies. The only difference is the additional validated
+`<CREATIVE_ORIGIN>` in `script-src` at both inheritance levels:
+
+```text
+default-src 'none'; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' <TS_ORIGIN> <CREATIVE_ORIGIN>; connect-src https: <TS_ORIGIN>; frame-src data: <CREATIVE_ORIGIN>; img-src https: data: blob:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:; worker-src https: blob:; form-action https:;
+```
+
+```text
+default-src 'none'; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' <TS_ORIGIN> <CREATIVE_ORIGIN>; connect-src https: <TS_ORIGIN>; frame-src <CREATIVE_ORIGIN>; img-src https: data: blob:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:; worker-src https: blob:; form-action https:;
+```
+
+The descriptor's already validated `tagType` selects exactly one outer/inner pair
+before template generation or DOM mutation. The generator cannot emit the union for
+an iframe creative, omit `<CREATIVE_ORIGIN>` for a script creative, or accept a
+redirect/final script origin outside that exact source. Script bytes execute only in
+the naturally opaque inner data document; no creative script is inserted into the
+outer container or publisher realm.
+
+The selected outer policy must permit the inner document's runner/resource contract
+because it is inherited by a `data:` child; the selected inner policy narrows
+creative-frame authority and, for iframe creatives, external script authority again.
+Neither policy permits publisher origin as a frame
 target unless it is also the validated creative origin, which descriptor validation
 forbids. A loopback HTTP `<TS_ORIGIN>` is named explicitly for hermetic tests and does
 not broaden `https:` production sources.
@@ -2172,6 +2220,9 @@ type OwnerSettlementV1 =
 The top-page mount service owns the APS node, its DOM handlers, bootstrap listener,
 document port, and timers. An accepted settlement promotes that exact iframe into
 the slot's `CommittedRenderArtifact`; a failed or cancelled settlement removes it.
+The promoted PUC overlay then follows §4.1's exact publisher-cycle, successful
+publisher-destroy, DOM-integrity, replacement, and navigation retirement rules; PUC
+Promise settlement is already terminal and is never repeated during retirement.
 The PUC owner owns no APS node: it closes its control port and resolves or rejects
 the renderer Promise exactly once so PUC emits its ordinary completion/failure
 event. The separate PUC ADM owner remains governed by §4.5.
@@ -3784,6 +3835,18 @@ release id.
   slots, and forwards unrelated slots with the original options.
 - Publisher calls are not held until TS targeting is ready. A publisher-owned
   display/refresh remains publisher work, and its failures cannot start TS fallback.
+- The sole GPT adapter marks TS-originated `display`/`refresh`/`destroySlots` calls
+  with its closure-private reentrancy token and observes every other call as
+  publisher-originated without changing its receiver, arguments, order, return, or
+  throw. Its already-first `slotRequested` listener joins the exact physical object
+  to that request-intent evidence. Before returning from a publisher-owned,
+  competing, or ambiguous `slotRequested`, it invokes the §4.1 exact-once committed-
+  overlay retirement; an exactly attributable TS replacement leaves the prior
+  artifact visible until replacement commit. For publisher `destroySlots`, it
+  snapshots the exact requested live objects before forwarding and retires their
+  artifacts only after a successful return. Omitted-slot destruction snapshots all
+  then-live GPT objects. False/throw does not claim destruction, and DOM-integrity
+  retirement remains the backstop if GPT mutated the tree anyway.
 - Every TS-owned GPT destroy/redefine uses one adapter transaction. It first marks
   the exact old object and cycle retired, then calls `destroySlots([old])` and
   requires a successful return before attempting `defineSlot` for a replacement.
@@ -5088,8 +5151,10 @@ and finish GPT slot reconciliation before the final forced-GC measurement.
    resources may use their own origin cookies under browser policy. The renderer
    document accepts no cookie as authority.
 8. Script creatives remain opt-in because they materially broaden executable
-   behavior. Enabling them requires a documented security review of the fixed
-   renderer CSP.
+   behavior. Enabling them selects only the reviewed conditional CSP pair in §4.4:
+   the validated creative origin is added to `script-src` in both inherited policy
+   levels, while iframe creatives retain the narrower pair. Build and browser tests
+   reject any tag-type/policy mismatch or redirected script origin.
 9. Persistent/deferred module URLs are generated from the local immutable release inventory,
    are same-origin exact content-hash paths, and are authenticated by
    release/id/source plus the core-created element and `document.currentScript`.
@@ -5166,7 +5231,9 @@ Tests must cover at least:
   before/after channel creation; a nested SafeFrame-shaped PUC source proving claim
   authentication never performs WindowProxy-to-DOM mapping; publisher,
   GAM, PUC, and creative attempts to navigate or frame a publisher-origin document;
-  exact creative-origin CSP allow/deny; data-document 65,535/65,536/65,537-byte
+  exact iframe-versus-script outer/inner CSP selection, iframe-script refusal,
+  same-origin script-creative execution, cross-origin redirect refusal, and other
+  creative-origin allow/deny cases; data-document 65,535/65,536/65,537-byte
   boundaries; sentinel escaping/completeness; and renderer document success followed
   by runner failure/timeout;
 - runner proxy stall and slow-drip across the five-second total deadline; redirect;
@@ -5182,6 +5249,16 @@ Tests must cover at least:
 - iframe `load`, `error`, removal, supersession, and navigation disposal ordering;
 - accepted-artifact promotion racing terminal disposal, replacement of an accepted
   direct iframe, TS-owned GPT destroy/redefine, and publisher-owned GPT navigation;
+- accepted PUC APS overlay followed by publisher `display`, explicit/global/SRA
+  `refresh`, competing or ambiguous request intent, and an exactly attributable TS
+  replacement that succeeds or fails; prove publisher/ambiguous `slotRequested`
+  retires the overlay before later GPT listeners while a TS replacement retains it
+  until commit; publisher `destroySlots` explicit/all with true/false/throw, GPT DOM
+  removal before/after the call or callback, host replacement/disconnection, owned
+  overlay removal/reparenting, navigation disposal, and all pairwise races prove
+  exact-once node/style/targeting cleanup, no GPT-object destruction by artifact
+  retirement, no repeated PUC settlement, and no refreshed publisher content hidden
+  behind an old overlay;
 - two consecutive attempts installing identical targeting strings with newer
   success, failure, and supersession; older-artifact disposal after newer promotion;
   publisher different-value and same-value `setTargeting`, per-key clear, and
@@ -5467,7 +5544,9 @@ analytics row:
   iframe, one APS runner load, one APS render-completion callback, one accepted
   result, no duplicate render. The top mount, outer data container, inner renderer,
   and descendant creative each have the exact winning viewport with zero default
-  margin, no clipping, and no overflow.
+  margin, no clipping, and no overflow. An ensuing native publisher refresh retires
+  the accepted overlay at its physical `slotRequested` boundary and displays the new
+  GPT result unobscured without a second PUC settlement.
 - Empty GAM fallback: parent settles empty/failure before exactly one child render.
 - Direct ADM: exact owned iframe reaches one accepted result. Existing PBS Cache
   fixtures retain their rc-baseline observable result without entering the new
@@ -5632,6 +5711,7 @@ adding a hidden analytics subsystem here.
 | Third-party creative regains publisher-origin execution            | top-page mount inside the exact trusted slot binding, naturally opaque nested data documents, outer exact-origin `frame-src`, independent publisher `frame-ancestors 'self'`, and three-browser hostile-navigation fixtures                                                                                                                                   |
 | Rc merge silently drops a release-branch behavior                  | first-parent rc ancestry, explicit adoption ledger, conflict inventory, focused baseline-versus-candidate contracts, and full rc suites before feature work                                                                                                                                                                                                   |
 | Required template switch breaks an old omitted-field config        | intentional hard cutover; startup rejects omission, examples/fixtures/operators move atomically, and whole-release rollback restores the prior binary/config together                                                                                                                                                                                         |
+| Accepted APS overlay obscures later publisher GPT content          | bind the artifact to the exact physical object/host; retire it synchronously for publisher/competing/ambiguous `slotRequested`, after successful publisher destroy, or on exact DOM-integrity loss, while retaining it only for a provably TS-owned replacement until commit                                                                                  |
 | Late slot-size observation mutates a newer GPT cycle               | capture runtime-slot/request/element identity, revalidate exact latest filled cycle and live unique binding at commit, disconnect/unsubscribe on disposal, and keep evidence diagnostics-only                                                                                                                                                                 |
 | A module activation never returns                                  | activation is generated first-party code with boundary tests; elapsed returning calls fail through monotonic checks, but JavaScript cannot preempt a nonreturning same-thread function                                                                                                                                                                        |
 | Strict parsing rejects a future APS field                          | descriptor is versioned; outer transport remains tolerant; add a reviewed version/corpus update rather than silently accepting new semantics                                                                                                                                                                                                                  |
@@ -5816,12 +5896,19 @@ The design is complete when all of the following are true:
     bootstrap → outer data container → inner data renderer protocol. No GAM, PUC,
     SafeFrame, bidder, or creative document is an ancestor; the exact-origin CSP and
     publisher `frame-ancestors 'self'` proofs block publisher-origin regain in all
-    three browsers.
+    three browsers. Iframe creatives receive the narrow exact CSP pair; only an
+    explicitly enabled script creative adds its one validated creative origin to
+    `script-src` at both inherited levels.
 35. A no-agent runtime validates and prepares every takeover module synchronously,
     activates parser-time guards and GAM attribution, and commits the one kernel in
     the parser-blocking evaluation before publisher parsing resumes. Agent-page
     takeover may prepare asynchronously only after protected paint and still adopts
     those already-live first-display obligations without overlap.
+36. A committed PUC APS overlay retires exactly once before a publisher-owned,
+    competing, or ambiguous GPT cycle can expose new content, after successful
+    publisher destruction, or when its exact host/node binding is lost. A provably
+    TS-owned replacement retains the prior artifact until replacement commit, and no
+    retirement path destroys the publisher GPT object or repeats PUC settlement.
 
 ## 12. Open implementation decisions
 
