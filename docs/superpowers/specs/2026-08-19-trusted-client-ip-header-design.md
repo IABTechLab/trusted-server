@@ -101,6 +101,14 @@ is stripped even when the feature is not configured. A configured header is
 read before sanitization and removed explicitly, so configuring
 `fastly-client-ip` remains valid.
 
+`X-Forwarded-For` joins the same list. The shared proxy code forwards an inbound
+value to publisher origins, so leaving it would let a client choose the address
+the origin attributes the request to while Trusted Server itself used the
+authenticated one. The Spin adapter already stripped it for this reason; moving
+the rule into the shared list closes the equivalent gap on Fastly without
+changing Spin behaviour. Integrations that need the address continue to send
+their own `X-Forwarded-For` derived from the resolved client IP.
+
 Authentication failures do not log supplied secrets or IP values. A debug-level
 message may record only the reason category (missing authentication, mismatch,
 or invalid IP) and that the peer fallback was used.

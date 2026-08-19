@@ -32,17 +32,24 @@ pub fn copy_custom_headers(from: &Request<EdgeBody>, to: &mut Request<EdgeBody>)
     }
 }
 
-/// Headers that clients can spoof to hijack URL rewriting.
+/// Headers that clients can spoof to hijack URL rewriting or the client address.
 ///
 /// On Fastly Compute these values are client-spoofable at request entry. The
 /// Fastly adapter may first consume an authenticated `fastly-client-ip`, but
 /// removes it before routing along with every other listed header. Stripping
 /// them forces [`RequestInfo::from_request`] to fall back to the trustworthy
 /// `Host` header and [`ClientInfo`] TLS detection.
+///
+/// `x-forwarded-for` is listed because the shared proxy code forwards an inbound
+/// value to publisher origins. No adapter has a trustworthy upstream
+/// forwarded-for chain, so leaving it would let a client choose the address the
+/// origin attributes the request to. Integrations that need the address inject
+/// their own `X-Forwarded-For` from [`ClientInfo::client_ip`] instead.
 pub const SPOOFABLE_FORWARDED_HEADERS: &[&str] = &[
     "forwarded",
     "x-forwarded-host",
     "x-forwarded-proto",
+    "x-forwarded-for",
     "fastly-ssl",
     "fastly-client-ip",
 ];
@@ -670,6 +677,7 @@ mod tests {
         set_header(&mut req, "forwarded", "host=evil.com;proto=https");
         set_header(&mut req, "x-forwarded-host", "evil.com");
         set_header(&mut req, "x-forwarded-proto", "https");
+        set_header(&mut req, "x-forwarded-for", "198.51.100.99, 10.0.0.1");
         set_header(&mut req, "fastly-ssl", "1");
 
         sanitize_forwarded_headers(&mut req);
@@ -685,6 +693,10 @@ mod tests {
         assert!(
             req.headers().get("x-forwarded-proto").is_none(),
             "should strip X-Forwarded-Proto header"
+        );
+        assert!(
+            req.headers().get("x-forwarded-for").is_none(),
+            "should strip client-supplied X-Forwarded-For header"
         );
         assert!(
             req.headers().get("fastly-ssl").is_none(),

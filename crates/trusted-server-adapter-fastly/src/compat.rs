@@ -168,6 +168,21 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_fastly_forwarded_headers_strips_client_supplied_forwarded_for() {
+        let mut req = fastly::Request::get("https://example.com/");
+        req.set_header("x-forwarded-for", "198.51.100.99, 10.0.0.1");
+        req.set_header("host", "example.com");
+
+        sanitize_fastly_forwarded_headers(&mut req, None);
+
+        assert!(
+            req.get_header("x-forwarded-for").is_none(),
+            "should strip client-supplied x-forwarded-for"
+        );
+        assert!(req.get_header("host").is_some(), "should preserve host");
+    }
+
+    #[test]
     fn to_fastly_response_with_streaming_body_produces_empty_body() {
         use edgezero_core::http::StatusCode;
 

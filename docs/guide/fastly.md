@@ -112,6 +112,11 @@ required. Trusted Server removes both trust headers before routing. Direct
 requests and requests with missing, invalid, or duplicated trust headers remain
 available and use the immediate peer address instead.
 
+Trusted Server also strips any client-supplied `X-Forwarded-For` at the edge, so
+the fronting service cannot use that header to carry the reader address.
+Integrations that need the address send their own `X-Forwarded-For` derived from
+the resolved client IP.
+
 ::: warning No-code request routing limitation
 Fastly no-code request routing does not provide a point to inject these headers.
 If that routing path does not preserve the original reader IP, Trusted Server
