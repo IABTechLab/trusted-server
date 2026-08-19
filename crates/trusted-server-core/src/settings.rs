@@ -2206,10 +2206,10 @@ impl Settings {
     /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
     /// admin routes to `crates/trusted-server-adapter-fastly/src/app.rs`.
     ///
-    /// The `/_ts/admin/ec/{id}` entry is the canonical router pattern. Handler
-    /// coverage is checked against representative concrete EC IDs via
-    /// [`admin_auth_probes`](Self::admin_auth_probes), while validation errors
-    /// continue to report this operator-facing route template.
+    /// The `/_ts/admin/ec/{id}` entry is the canonical router pattern. Its
+    /// coverage is checked via [`admin_auth_probes`](Self::admin_auth_probes),
+    /// while validation errors continue to report this operator-facing route
+    /// template.
     pub(crate) const ADMIN_ENDPOINTS: &[&str] = &[
         "/_ts/admin/keys/rotate",
         "/_ts/admin/keys/deactivate",
@@ -2218,12 +2218,22 @@ impl Settings {
         "/_ts/admin/eids",
     ];
 
+    /// Probes that establish handler coverage for the dynamic
+    /// `/_ts/admin/ec/{id}` route.
+    ///
+    /// Coverage cannot be sampled: the router accepts any single segment after
+    /// `/_ts/admin/ec/` and basic auth runs on the raw path before routing, so
+    /// a handler that matches only some ID shapes leaves the rest of the route
+    /// surface — including malformed IDs, which still reach the admin handler —
+    /// unauthenticated at configuration time and fail-closed at runtime.
+    ///
+    /// Both probes must match the same configuration for the route to count as
+    /// covered. The bare prefix rejects handlers anchored to specific ID
+    /// shapes; the concrete ID rejects handlers anchored to the prefix itself
+    /// (`^/_ts/admin/ec/$`). Together they admit only prefix-level matchers
+    /// such as `^/_ts/admin` or `^/_ts/admin/ec/`.
     const ADMIN_EC_ID_AUTH_PROBES: [&str; 2] = [
-        concat!(
-            "/_ts/admin/ec/",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ".abc123",
-        ),
+        "/_ts/admin/ec/",
         concat!(
             "/_ts/admin/ec/",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -2291,26 +2301,19 @@ impl Settings {
         }))
     }
 
+    /// Rejects placeholder and well-known weak handler passwords.
+    ///
+    /// Applies to every handler rather than to handlers inferred to cover an
+    /// admin endpoint: handler selection is first-match-wins over operator
+    /// regexes, so a narrow handler can shadow the admin namespace for paths no
+    /// probe enumerates. Handlers are Trusted Server's own basic-auth gates, so
+    /// a placeholder password is never valid on any of them.
     fn validate_admin_handler_passwords(&self) -> Result<(), Report<TrustedServerError>> {
         for handler in &self.handlers {
-            let covers_admin =
-                Self::ADMIN_ENDPOINTS
-                    .iter()
-                    .try_fold(false, |covers_any_endpoint, path| {
-                        Self::admin_auth_probes(path).iter().try_fold(
-                            covers_any_endpoint,
-                            |covers_any_probe, probe| {
-                                handler
-                                    .matches_path(probe)
-                                    .map(|matches| covers_any_probe || matches)
-                            },
-                        )
-                    })?;
-
-            if covers_admin && is_admin_placeholder_password(handler.password.expose()) {
+            if is_admin_placeholder_password(handler.password.expose()) {
                 return Err(Report::new(TrustedServerError::Configuration {
                     message: format!(
-                        "Admin handler `{}` uses a placeholder password; configure a strong secret",
+                        "Handler `{}` uses a placeholder password; configure a strong secret",
                         handler.path
                     ),
                 }));
@@ -5024,7 +5027,65 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
-    fn from_toml_rejects_placeholder_password_for_concrete_admin_ec_handler() {
+    fn from_toml_rejects_placeholder_password_on_shadowing_admin_handler() {
+        // Handler selection is first-match-wins, so a narrow handler placed
+        // ahead of the admin matcher governs the EC IDs it matches. No probe
+        // enumerates those IDs, so the placeholder check cannot be limited to
+        // handlers inferred to cover an admin endpoint.
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/ec/[a-f0-9]{64}[.]zzzzzz$"
+            username = "admin"
+            password = "change-me-admin-password"
+
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject placeholder password on shadowing admin handler");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("placeholder password"),
+            "should identify the placeholder handler password, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_weak_password_on_non_admin_handler() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/private"
+            username = "admin"
+            password = "changeme""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject a weak password on any handler");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("placeholder password"),
+            "should identify the weak handler password, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_sampled_id_only_dynamic_admin_ec_auth_coverage() {
+        // A handler anchored to the full EC ID grammar still leaves the rest of
+        // the route surface (malformed IDs, which the router accepts and the
+        // admin handler rejects with 400) unauthenticated, so coverage must not
+        // be inferred from ID-shaped samples.
         let toml_str = crate_test_settings_str().replace(
             r#"path = "^/_ts/admin"
             username = "admin"
@@ -5036,16 +5097,62 @@ origin_host_header_overide = "www.example.com""#,
             [[handlers]]
             path = "^/_ts/admin/ec/[a-f0-9]{64}[.][A-Za-z0-9]{6}$"
             username = "admin"
-            password = "change-me-admin-password""#,
+            password = "strong-test-password""#,
         );
 
         let error = Settings::from_toml(&toml_str)
-            .expect_err("should reject placeholder password on concrete EC handler");
+            .expect_err("should reject ID-sampled dynamic EC auth coverage");
         let message = format!("{error:?}");
         assert!(
-            message.contains("placeholder password"),
-            "should identify the placeholder admin password, got: {message}"
+            message.contains("/_ts/admin/ec/{id}"),
+            "should identify the dynamic EC route as uncovered, got: {message}"
         );
+    }
+
+    #[test]
+    fn from_toml_rejects_prefix_anchored_admin_ec_auth_coverage() {
+        // `^/_ts/admin/ec/$` matches the prefix probe but no actual lookup.
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/$"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject prefix-anchored dynamic EC auth coverage");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("/_ts/admin/ec/{id}"),
+            "should identify the dynamic EC route as uncovered, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_accepts_prefix_matcher_admin_ec_auth_coverage() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        Settings::from_toml(&toml_str)
+            .expect("should accept a prefix-level matcher for the dynamic EC route");
     }
 
     #[test]
