@@ -43,7 +43,7 @@ cross-reference point at it. The subject moved, the path did not._
 > other direction.
 >
 > **ESI is therefore feasible and unvalidated, not rejected.** Validating it is
-> [a separate plan](../plans/2026-08-10-1009-esi-validation-spike.md). What survives
+> [a separate plan](./2026-08-10-1009-esi-validation-spike.md). What survives
 > here is the latency re-diagnosis and the Stage 0 optimisation, which are worth doing
 > and are **not** an answer to #1009.
 
@@ -52,12 +52,12 @@ cross-reference point at it. The subject moved, the path did not._
 #1009 is answered across three documents, not one. This is the only place that says
 which owns what.
 
-| Document                                                                 | Owns                                                                                                |
-| ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
-| **This spec**                                                            | Why the TTFB regression happens, what Stage 0 is and why, and the corrected ESI feasibility verdict |
-| [Stage 0 plan](../plans/2026-08-08-1009-measurement-and-stage-0.md)      | Implementing the measurement and the cache-bypass flag. **Does not close #1009.**                   |
-| [ESI validation spike](../plans/2026-08-10-1009-esi-validation-spike.md) | **Where #1009 is actually decided.** Four arms, safety gates, decision rule.                        |
-| [Findings](../plans/2026-08-08-1009-measurement-findings.md)             | Recorded results. Currently: Step A only, at `PROVISIONAL PASS`.                                    |
+| Document                                                            | Owns                                                                                                |
+| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| **This spec**                                                       | Why the TTFB regression happens, what Stage 0 is and why, and the corrected ESI feasibility verdict |
+| [Stage 0 plan](../plans/2026-08-08-1009-measurement-and-stage-0.md) | Implementing the measurement and the cache-bypass flag. **Does not close #1009.**                   |
+| [ESI validation spike](./2026-08-10-1009-esi-validation-spike.md)   | **Where #1009 is actually decided.** Four arms, safety gates, decision rule.                        |
+| [Findings](../plans/2026-08-08-1009-measurement-findings.md)        | Recorded results. Currently: Step A only, at `PROVISIONAL PASS`.                                    |
 
 **If you want the ESI answer**, it is [§2](#2-why--the-three-findings) for the verdict,
 [§6.6](#66-the-esi-pipeline-corrected) for the pipeline, and the spike plan for how it
@@ -91,7 +91,7 @@ gets validated. Everything else here is Stage 0 and the latency analysis behind 
 
 | #   | Decision                                                                                                                                                                                                                                    | Owner needed  |
 | --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
-| D1  | **ESI is feasible and unvalidated.** Validate it via [the spike plan](../plans/2026-08-10-1009-esi-validation-spike.md), not by deferring it.                                                                                               | Eng + product |
+| D1  | **ESI is feasible and unvalidated.** Validate it via [the spike plan](./2026-08-10-1009-esi-validation-spike.md), not by deferring it.                                                                                                      | Eng + product |
 | D2  | **Fund ~3 days of measurement** (§3). No dependencies. Can start immediately.                                                                                                                                                               | Eng           |
 | D3  | **Approve Stage 0** — an operator flag disabling the origin cache bypass, subject to a **`FINAL PASS`** in §3. A `Vary` check alone is a `PROVISIONAL PASS` and is not a release gate. Rollback needs a purge path, not only a config push. | Eng           |
 | D4  | **Stages 1–2 queue behind the SSAT price defect and #938.** Stages 3b–4 unscheduled. ESI is not in this queue — see §7.                                                                                                                     | Product       |
@@ -110,7 +110,7 @@ include tags into a shared template; `fastly::cache::core` stores that template;
 already a dependency. The real open questions are empirical, not architectural: does it
 beat a plain client fetch by enough to justify a Fastly-only rendering path, and can
 per-user leakage be excluded under cold MISS, warm HIT, stale revalidation, and fragment
-failure. [The spike plan](../plans/2026-08-10-1009-esi-validation-spike.md) answers
+failure. [The spike plan](./2026-08-10-1009-esi-validation-spike.md) answers
 those; [§6.6](#66-the-esi-pipeline-corrected) gives the pipeline.
 
 Two constraints stay true regardless. ESI is **Fastly-only at every API level**, so it
@@ -522,7 +522,7 @@ differing in consent, bot classification, and prefetch status** — not an absen
 per-user-values scan, which the broken design would have passed.
 
 This applies to any shared-template work, ESI or client-fill alike. The
-[spike plan](../plans/2026-08-10-1009-esi-validation-spike.md) implements it.
+[spike plan](./2026-08-10-1009-esi-validation-spike.md) implements it.
 
 ---
 
@@ -542,7 +542,7 @@ rather than repeated here; everything below it is deferred.
 
 **ESI is not a stage here.** It was Stage 5 in an earlier revision, queued behind the
 rest. It no longer queues: it is feasible on the pinned SDK and is decided by
-[its own spike plan](../plans/2026-08-10-1009-esi-validation-spike.md), which runs
+[its own spike plan](./2026-08-10-1009-esi-validation-spike.md), which runs
 independently of Stages 1–4. The shared template cache it needs is `fastly::cache::core`
 ([§6.6](#66-the-esi-pipeline-corrected)), not a new service.
 
@@ -785,7 +785,7 @@ exists.
 
 ## Appendix E — ESI notes (condensed)
 
-Input to [the ESI validation spike](../plans/2026-08-10-1009-esi-validation-spike.md).
+Input to [the ESI validation spike](./2026-08-10-1009-esi-validation-spike.md).
 Recording only what would otherwise be re-derived:
 
 - Pin `esi = "0.7"`. Pre-1.0, irregular cadence, two yanked betas in the 0.7 line.

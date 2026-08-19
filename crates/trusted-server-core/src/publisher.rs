@@ -5386,7 +5386,7 @@ impl C2CachePolicy {
 /// Leak vectors are checked before mere ineligibility so the reported reason is
 /// the most serious one that applies.
 ///
-/// See `docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md`
+/// See `docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md`
 /// §6.6 for why C1, C2 and a final assembled-response cache are distinct, and why
 /// the third must never exist.
 #[cfg(test)]
@@ -5748,7 +5748,7 @@ fn c2_cache_ttl(
 /// So ESI returns [`None`] **unconditionally**, and `adSlots` moves to the
 /// per-request body seam alongside the bids. The head is not a template hole.
 ///
-/// See `docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md`
+/// See `docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md`
 /// §6.7.
 pub(crate) fn template_ad_slots_script(
     mode: AssemblyMode,

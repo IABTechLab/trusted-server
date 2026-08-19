@@ -1369,6 +1369,10 @@ formats = [{ width = 728, height = 90 }]
 
 ### Shared template assembly (`assembly_mode = "esi"`)
 
+This configuration is an experimental validation spike scoped to
+[IABTechLab/trusted-server#1009](https://github.com/IABTechLab/trusted-server/issues/1009),
+not a settled production cache interface.
+
 `assembly_mode` controls how initial-page slot and bid state is delivered:
 
 - `inline` (default) transforms every origin response and injects the current
@@ -1403,7 +1407,12 @@ assembly_mode = "esi"
 
 # Every request header, except Accept-Encoding, that the publisher origin can
 # name in Vary for these documents. Names are validated and de-duplicated.
-template_cache_vary = ["rsc", "next-router-prefetch"]
+template_cache_vary = [
+  "rsc",
+  "next-router-state-tree",
+  "next-router-prefetch",
+  "next-router-segment-prefetch",
+]
 
 # Safety ceiling for the shared template. Defaults to 60; valid range 1–86400.
 # The origin's remaining edge freshness may make the actual lifetime shorter.
@@ -1433,7 +1442,7 @@ lifetime is capped by `template_cache_max_age_seconds`.
 A browser reload commonly sends `Cache-Control: max-age=0`. TS may reuse a fresh
 reader-neutral C2 template for that reload, but it still builds a new private
 response and runs a new per-reader auction. Explicit `no-cache`, `no-store`,
-positive or malformed `max-age`, range, and conditional requests still bypass C2.
+positive or malformed request `max-age`, range, and conditional requests still bypass C2.
 Check `X-TS-C2-Cache: hit` to verify template reuse.
 
 `template_cache_vary` is necessary because lookup occurs before the origin can
@@ -1449,6 +1458,8 @@ document's meaning based on `Accept-Encoding`. Never put `Cookie` in
 reader-neutral template. With `origin_is_cookie_independent = false` (the safe
 default), all cookie-bearing requests bypass. With it set to `true`, an origin
 `Vary: Cookie` still overrides the assertion and refuses storage.
+Every other name the origin emits in `Vary` must appear in the configured list;
+an uncovered name safely refuses template storage.
 
 For a canary, inspect `X-TS-C2-Cache`. Its bounded values are `hit`,
 `miss-stored`, `miss-store-error`, `miss-reserved`, `bypass-request`,

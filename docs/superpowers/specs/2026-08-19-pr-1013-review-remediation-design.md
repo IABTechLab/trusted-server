@@ -76,7 +76,7 @@ The remediation will:
 - document the local harness coupling at `build_seam_script`;
 - list `PlatformTemplateCache` in the platform module roster and consolidate exports;
 - run both C2 workflow invocations with `BID_DELAY=3`, keep the `first_body_byte < complete / 3` assertion, and stop after one diagnostic failure when probe timings are non-numeric instead of performing a second comparison with fabricated zero values;
-- move `docs/superpowers/plans/2026-08-10-1009-esi-validation-spike.md` and `docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md` directly into `docs/superpowers/archive/`, then update every reference found by `rg` including links inside the moved documents.
+- move both self-labeled historical #1009 documents directly into `docs/superpowers/archive/`, then update every reference found by `rg` including links inside the moved documents.
 
 ## Error Handling
 

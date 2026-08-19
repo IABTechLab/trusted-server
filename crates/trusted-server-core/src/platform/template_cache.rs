@@ -11,7 +11,7 @@
 //!
 //! C2 holds a *shared template*: no per-user bytes, and no decisions that depend on
 //! the request. What may and may not live in it is
-//! [§6.7 of the design doc](../../../../docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md),
+//! [§6.7 of the design doc](../../../../docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md),
 //! and the invariant is enforced by the rendered-document byte-identity tests in
 //! `publisher`.
 //!

@@ -163,7 +163,7 @@ impl StreamProcessor for HtmlWithPostProcessing {
 /// which coupled two independent choices: once a shared-template mode stopped
 /// emitting the head script, body-close injection silently stopped too.
 ///
-/// See `docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md`
+/// See `docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md`
 /// §6.7.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum BodyCloseInjection {

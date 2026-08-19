@@ -31,6 +31,7 @@
 ### Task 1: Make Fastly cache I/O fail safely
 
 **Files:**
+
 - Modify: `crates/trusted-server-adapter-fastly/src/template_cache.rs`
 - Test: `crates/trusted-server-adapter-fastly/src/template_cache.rs`
 
@@ -68,6 +69,7 @@ git commit -m "Make Fastly template cache reads fallible"
 ### Task 2: Preserve injection when encoding negotiation fails
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/publisher.rs`
 - Test: `crates/trusted-server-core/src/publisher.rs`
 
@@ -103,6 +105,7 @@ git commit -m "Preserve injection for unsupported encodings"
 ### Task 3: Scope terminal privacy re-enforcement to TS-owned responses
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/response_privacy.rs`
 - Modify: `crates/trusted-server-core/src/publisher.rs`
 - Modify: `crates/trusted-server-adapter-fastly/src/main.rs`
@@ -145,6 +148,7 @@ git commit -m "Scope terminal privacy to synthesized responses"
 ### Task 4: Refuse publisher ESI and seam collisions without mutating bytes
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/platform/template_assembly.rs`
 - Modify: `crates/trusted-server-core/src/platform/mod.rs`
 - Modify: `crates/trusted-server-core/src/publisher.rs`
@@ -196,6 +200,7 @@ git commit -m "Refuse publisher ESI and seam collisions"
 ### Task 5: Harden cache keys, metadata, and reservations
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/platform/template_cache.rs`
 - Modify: `crates/trusted-server-core/src/platform/mod.rs`
 - Modify: `crates/trusted-server-adapter-fastly/src/template_cache.rs`
@@ -241,6 +246,7 @@ git commit -m "Harden template cache boundaries"
 ### Task 6: Make initial GPT scheduling one-shot
 
 **Files:**
+
 - Modify: `crates/trusted-server-js/lib/src/integrations/gpt/index.ts`
 - Modify: `crates/trusted-server-core/src/integrations/gpt_bootstrap.js`
 - Modify: `crates/trusted-server-js/lib/test/integrations/gpt/schedule_initial_ad_init.test.ts`
@@ -282,6 +288,7 @@ git commit -m "Make initial GPT scheduling one-shot"
 ### Task 7: Remove spike residue and apply Rust consistency fixes
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/publisher.rs`
 - Modify: `crates/trusted-server-core/src/creative_opportunities.rs`
 - Modify: `crates/trusted-server-core/src/integrations/gpt_diagnostics.rs`
@@ -320,14 +327,14 @@ git commit -m "Remove ESI spike residue"
 ### Task 8: Align manifests, examples, CI, and historical docs
 
 **Files:**
+
 - Modify: `Cargo.toml`
 - Modify: `crates/trusted-server-adapter-fastly/Cargo.toml`
 - Modify: `.github/workflows/test.yml`
 - Modify: `scripts/c2-local-test.sh`
 - Modify: `trusted-server.example.toml`
 - Modify: `docs/guide/configuration.md`
-- Move: `docs/superpowers/plans/2026-08-10-1009-esi-validation-spike.md` to `docs/superpowers/archive/2026-08-10-1009-esi-validation-spike.md`
-- Move: `docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md` to `docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md`
+- Move the #1009 validation spike and cacheable-root design into the flat `docs/superpowers/archive/` directory.
 - Modify: every reference returned by `rg` for those filenames
 
 - [ ] **Step 1: Move the ESI dependency to workspace dependencies**
@@ -347,7 +354,7 @@ Set `BID_DELAY=3` on both workflow harness invocations. In the script, branch ar
 Move both files into the flat `docs/superpowers/archive/` convention. Run:
 
 ```bash
-rg -n "2026-08-10-1009-esi-validation-spike|2026-08-08-esi-cacheable-root-validation-design" docs crates
+rg -n "1009-esi-validation-spike|esi-cacheable-root-validation-design" docs crates
 ```
 
 Update every result, including relative links inside the archived files, until all links resolve to the archive paths.
@@ -358,7 +365,7 @@ Run: `cd docs && npm run format`
 
 Run: `cd crates/trusted-server-js/lib && npm run format`
 
-Run: `rg -n "docs/superpowers/(plans/2026-08-10-1009-esi-validation-spike|specs/2026-08-08-esi-cacheable-root-validation-design)" docs crates`
+Run a stale-link search for either archived filename under the old `plans/` or `specs/` directory.
 
 Expected: formatters PASS and the stale-path search returns no matches.
 
@@ -372,6 +379,7 @@ git commit -m "Align ESI spike documentation and tooling"
 ### Task 9: Resolve the fingerprint suggestion against runtime lifetime
 
 **Files:**
+
 - Inspect: `crates/trusted-server-adapter-fastly/src/app.rs`
 - Inspect: `crates/trusted-server-core/src/publisher.rs`
 - No planned code modification: expand scope only after proving a durable cross-request owner exists
@@ -397,6 +405,7 @@ Do not create an empty commit. Link the `AppState` lifecycle evidence and explai
 ### Task 10: Full verification and review handoff
 
 **Files:**
+
 - Inspect: all changed files
 - No code changes unless a verification failure exposes a regression; any fix starts a new RED/GREEN cycle.
 

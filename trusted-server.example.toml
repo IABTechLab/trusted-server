@@ -203,8 +203,14 @@ price_granularity = "dense"
 # Request headers (other than Accept-Encoding, whose supported content coding TS
 # decodes to identity before storage) that the origin may name in Vary. Values
 # are keyed losslessly and the origin response is checked for drift before
-# storage. Never include Cookie: C2 templates must be reader-neutral.
-# template_cache_vary = ["rsc", "next-router-prefetch"]
+# storage. Every emitted Vary name must be covered or storage is refused. Never
+# include Cookie: C2 templates must be reader-neutral.
+# template_cache_vary = [
+#   "rsc",
+#   "next-router-state-tree",
+#   "next-router-prefetch",
+#   "next-router-segment-prefetch",
+# ]
 
 # Safety ceiling for one reader-neutral C2 template, in seconds. The origin must
 # still authorize shared freshness; TS uses the smaller of that remaining edge

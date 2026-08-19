@@ -59,10 +59,10 @@ jobs:
         run: cargo test-fastly
 
       - name: Run C2 ESI local harness
-        run: ./scripts/c2-local-test.sh esi
+        run: BID_DELAY=3 ./scripts/c2-local-test.sh esi
 
       - name: Run inline control harness
-        run: ./scripts/c2-local-test.sh inline
+        run: BID_DELAY=3 ./scripts/c2-local-test.sh inline
 
   test-axum:
     name: cargo test (axum native)

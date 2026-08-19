@@ -199,7 +199,7 @@ TypeScript/Vitest, Viceroy, shell harness.
 
 - Modify: `trusted-server.example.toml`
 - Modify: `docs/guide/configuration.md`
-- Modify: `docs/superpowers/plans/2026-08-10-1009-esi-validation-spike.md`
+- Modify: `docs/superpowers/archive/2026-08-10-1009-esi-validation-spike.md`
 - Modify: `docs/superpowers/specs/2026-08-11-1009-streaming-assembly-architecture.md`
 - Modify: relevant #1009 findings documents
 

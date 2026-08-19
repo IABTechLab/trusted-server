@@ -31,9 +31,9 @@ request-dependent decisions. Assembly is either the `esi` crate (edge) or a clie
 **Tech Stack:** Rust 2024, `wasm32-wasip1`, `fastly` 0.12.1 (`cache::core`, `http::purge`),
 `esi` 0.7, `lol_html`, a real Fastly test service for cache behaviour.
 
-**Spec:** `docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md` —
+**Spec:** `docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md` —
 read the 2026-08-10 correction at the top and
-[§6.6](../specs/2026-08-08-esi-cacheable-root-validation-design.md#66-the-esi-pipeline-corrected)
+[§6.6](./2026-08-08-esi-cacheable-root-validation-design.md#66-the-esi-pipeline-corrected)
 before writing any code.
 
 **Control:** [the Stage 0 plan](./2026-08-08-1009-measurement-and-stage-0.md). Its
@@ -671,9 +671,9 @@ deployable — a cache that works is necessary, not sufficient.
 ## Task 4: Arm A2 — client-fill
 
 Mostly already specified. See
-[the spec's Appendix B](../specs/2026-08-08-esi-cacheable-root-validation-design.md#appendix-b--stage-1-plumbing-condensed)
+[the spec's Appendix B](./2026-08-08-esi-cacheable-root-validation-design.md#appendix-b--stage-1-plumbing-condensed)
 for the client plumbing, the two-condition join gate, and the server contract; and
-[§5](../specs/2026-08-08-esi-cacheable-root-validation-design.md#5-the-trap-in-the-deferred-work--read-this-before-scheduling-stages-12)
+[§5](./2026-08-08-esi-cacheable-root-validation-design.md#5-the-trap-in-the-deferred-work--read-this-before-scheduling-stages-12)
 for the silent-empty-bids trap, which applies in full.
 
 - [ ] **Step 1: Hoist the closure-trapped client state** — `pageBidsEndpoint`,

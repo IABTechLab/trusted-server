@@ -579,28 +579,29 @@ COMPLETE=$(echo "$B_LINE" | sed -n 's/.*complete=\([0-9]*\)ms.*/\1/p')
 
 if ! [[ "$FIRST_BODY" =~ ^[0-9]+$ && "$COMPLETE" =~ ^[0-9]+$ ]]; then
   bad "socket probe did not return numeric body timings: '$B_LINE'"
-  FIRST_BODY=0
-  COMPLETE=0
+else
+  if [ "$MODE" = "inline" ]; then
+    check "inline delivers the article before the auction resolves" \
+      "$(awk -v f="$FIRST_BODY" -v c="$COMPLETE" 'BEGIN { print (f < c / 3) ? "yes" : "no" }')" \
+      "yes"
+  else
+    # The property the unit tests cannot reach: in-process there is no bid provider, so
+    # there is no auction to wait on and reordering the stream is unobservable. Here the
+    # bid endpoint really sleeps, so the first body byte either beats it or does not.
+    check "cache hit streams: the article is delivered before the auction resolves" \
+      "$(awk -v f="$FIRST_BODY" -v c="$COMPLETE" 'BEGIN { print (f < c / 3) ? "yes" : "no" }')" \
+      "yes"
+  fi
+  printf '    first body byte %sms, complete %sms\n\n' "$FIRST_BODY" "$COMPLETE"
 fi
 
-if [ "$MODE" = "inline" ]; then
-  check "inline delivers the article before the auction resolves" \
-    "$(awk -v f="$FIRST_BODY" -v c="$COMPLETE" 'BEGIN { print (f < c / 3) ? "yes" : "no" }')" \
-    "yes"
-else
-  # The property the unit tests cannot reach: in-process there is no bid provider, so
-  # there is no auction to wait on and reordering the stream is unobservable. Here the
-  # bid endpoint really sleeps, so the first body byte either beats it or does not.
+if [ "$MODE" != "inline" ]; then
   # Guards a regression where assembly rewrote a reader's accepted gzip origin request
   # to identity, making the origin send ~674KB where it would have sent ~100KB. The
   # cache still stores identity; that does not require changing what this reader accepts.
   check "the origin fetch stays compressed" \
     "$(grep -c 'served PLAINTEXT' "$WORK/origin.log" || true)" "0"
-  check "cache hit streams: the article is delivered before the auction resolves" \
-    "$(awk -v f="$FIRST_BODY" -v c="$COMPLETE" 'BEGIN { print (f < c / 3) ? "yes" : "no" }')" \
-    "yes"
 fi
-printf '    first body byte %sms, complete %sms\n\n' "$FIRST_BODY" "$COMPLETE"
 
 info "Result"
 printf '  %d passed, %d failed\n\n' "$PASS" "$FAIL"

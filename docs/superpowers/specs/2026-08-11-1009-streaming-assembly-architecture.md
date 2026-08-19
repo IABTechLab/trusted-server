@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-11
 **Status:** Decision record. Supersedes the delivery half of the
-[ESI validation spike](../plans/2026-08-10-1009-esi-validation-spike.md); the cache half
+[ESI validation spike](../archive/2026-08-10-1009-esi-validation-spike.md); the cache half
 stands.
 **Issue:** IABTechLab/trusted-server#1009
 
