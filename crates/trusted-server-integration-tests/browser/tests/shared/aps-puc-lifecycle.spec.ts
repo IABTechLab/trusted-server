@@ -388,4 +388,44 @@ test.describe("APS/PUC lifecycle over the hard-cutover runtime", () => {
       topCreativeFrames: 1,
     });
   });
+
+  test("retires the exact APS overlay before a publisher refresh returns", async ({
+    page,
+  }) => {
+    await openLifecyclePage(page);
+    await startFictionalPuc(page);
+    await emitNonemptyGam(page);
+    await expectAcceptedLifecycle(page);
+
+    expect(
+      await page.evaluate((slot) => {
+        const stub = (
+          window as unknown as {
+            __gptDiagnosticsStub: {
+              publisherRefresh(slotId: string): void;
+              universalCreativeSnapshot(): Readonly<{
+                lifecycle: readonly string[];
+              }>;
+            };
+          }
+        ).__gptDiagnosticsStub;
+        stub.publisherRefresh(slot);
+        const root = document.getElementById(slot);
+        return {
+          lifecycle: stub.universalCreativeSnapshot().lifecycle,
+          position: root?.style.getPropertyValue("position"),
+          pucFrames:
+            root?.querySelectorAll("iframe[data-fictional-puc]").length ?? -1,
+          topCreativeFrames:
+            root?.querySelectorAll(':scope > iframe[title="Ad content"]')
+              .length ?? -1,
+        };
+      }, SLOT),
+    ).toEqual({
+      lifecycle: ["accepted"],
+      position: "",
+      pucFrames: 1,
+      topCreativeFrames: 0,
+    });
+  });
 });

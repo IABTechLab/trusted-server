@@ -17,6 +17,63 @@ function createTargetingHarness(initial: Record<string, readonly string[]> = {})
 }
 
 describe('owner-aware targeting journal', () => {
+  it('adopts an installed first-display value without rewriting it and restores its predecessor', () => {
+    const service = createTargetingService();
+    const slot = {};
+    const targeting = createTargetingHarness({ key: ['trusted'] });
+
+    const frame = service.adopt(
+      slot,
+      'key',
+      'trusted',
+      Object.freeze(['publisher']),
+      'first-display-owner',
+      targeting
+    );
+
+    expect(frame).toBeDefined();
+    expect(targeting.setTargeting).not.toHaveBeenCalled();
+    frame?.release();
+    expect(targeting.values.get('key')).toEqual(['publisher']);
+  });
+
+  it('rejects adoption when its targeting read observes a same-value publisher write', async () => {
+    const values = new Map<string, readonly string[]>([['key', ['trusted']]]);
+    let reenter = true;
+    const slot = {
+      clearTargeting: vi.fn((key?: string) => {
+        if (key === undefined) values.clear();
+        else values.delete(key);
+      }),
+      getTargeting: vi.fn((key: string) => {
+        if (reenter) {
+          reenter = false;
+          slot.setTargeting(key, 'trusted');
+        }
+        return Object.freeze([...(values.get(key) ?? [])]);
+      }),
+      setTargeting: vi.fn((key: string, value: string | readonly string[]) => {
+        values.set(key, Object.freeze(typeof value === 'string' ? [value] : [...value]));
+      }),
+    };
+    const adapter = adapterForTargetingSlot(slot);
+    const service = createTargetingService();
+    await expect(service.observePublisherMutations(slot, adapter).result).resolves.toBeUndefined();
+
+    const ownership = await adapter.run((gpt) =>
+      service.adopt(slot, 'key', 'trusted', Object.freeze(['publisher']), 'handoff-owner', {
+        clearTargeting: (key) => gpt.clearTargeting(slot, key),
+        getTargeting: (key) => gpt.getTargeting(slot, key),
+        setTargeting: (key, value) => gpt.setTargeting(slot, key, value),
+      })
+    ).result;
+
+    expect(ownership).toBeUndefined();
+    ownership?.release();
+    expect(values.get('key')).toEqual(['trusted']);
+    expect(service.snapshotForTest()).toEqual({ frames: 0, slots: 0 });
+  });
+
   it('restores the exact publisher predecessor after the current TS owner releases', () => {
     const service = createTargetingService();
     const slot = {};

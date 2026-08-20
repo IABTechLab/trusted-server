@@ -74,6 +74,8 @@ const stringTrimIntrinsic = String.prototype.trim;
 const textEncoder = new TextEncoder();
 const textEncoderEncodeIntrinsic = TextEncoder.prototype.encode;
 const artifactDisposals = new WeakMap<object, boolean>();
+const artifactGuards = new WeakMap<object, () => boolean>();
+const artifactRetirements = new WeakMap<object, () => void>();
 const committedArtifactStores = new WeakSet<object>();
 const renderAttempts = new WeakSet<object>();
 const ignoreAsyncDisposal = (): void => undefined;
@@ -325,7 +327,7 @@ export type RenderAttemptState =
   RenderAttemptActiveState | 'accepted' | 'no_bid' | 'failed' | 'cancelled';
 
 export interface CommittedRenderArtifact {
-  readonly kind: 'direct_iframe' | 'puc';
+  readonly kind: 'aps_mount' | 'direct_iframe' | 'puc';
   readonly attemptId: string;
   readonly slot: string;
   readonly navigationGeneration: object;
@@ -336,8 +338,170 @@ export interface CommittedArtifactStore {
   readonly promote: (artifact: CommittedRenderArtifact, stillCurrent?: () => boolean) => boolean;
   readonly current: (slot: string) => CommittedRenderArtifact | undefined;
   readonly release: (artifact: CommittedRenderArtifact) => boolean;
+  /** Retire every committed artifact whose exact DOM/binding guard is no longer current. */
+  readonly sweep: () => number;
   readonly disposeNavigation: (navigationGeneration: object) => void;
   readonly dispose: () => void;
+}
+
+/** Shared exact ownership for the inline position required by absolute render overlays. */
+export interface ArtifactHostPositionLeaseRegistry {
+  readonly bindOwned: (
+    artifact: CommittedRenderArtifact,
+    host: HTMLElement,
+    previousPosition: string,
+    previousPriority: string
+  ) => boolean;
+  readonly inherit: (
+    artifact: CommittedRenderArtifact,
+    predecessor: CommittedRenderArtifact,
+    host: HTMLElement
+  ) => boolean;
+  readonly claim: (artifact: CommittedRenderArtifact) => boolean;
+  readonly current: (artifact: CommittedRenderArtifact) => boolean;
+  readonly release: (artifact: CommittedRenderArtifact) => void;
+}
+
+interface ArtifactHostPositionLease {
+  readonly host: HTMLElement;
+  owner: CommittedRenderArtifact | undefined;
+  readonly previousPosition: string;
+  readonly previousPriority: string;
+}
+
+interface ArtifactHostPositionBinding {
+  live: boolean;
+  readonly lease: ArtifactHostPositionLease;
+  readonly predecessor?: CommittedRenderArtifact;
+}
+
+/** Create one render-runtime lease registry shared by adoption and later APS mounts. */
+export function createArtifactHostPositionLeaseRegistry(): ArtifactHostPositionLeaseRegistry {
+  const bindings = new WeakMap<CommittedRenderArtifact, ArtifactHostPositionBinding>();
+
+  const styleIsOwned = (host: HTMLElement): boolean => {
+    try {
+      return (
+        host.style.getPropertyValue('position') === 'relative' &&
+        host.style.getPropertyPriority('position') === ''
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  const restore = (lease: ArtifactHostPositionLease): void => {
+    try {
+      if (!styleIsOwned(lease.host)) return;
+      if (lease.previousPosition === '') lease.host.style.removeProperty('position');
+      else {
+        lease.host.style.setProperty('position', lease.previousPosition, lease.previousPriority);
+      }
+    } catch {
+      // Compare-owned restoration cannot overwrite a publisher style replacement.
+    }
+  };
+
+  const registry: ArtifactHostPositionLeaseRegistry = {
+    bindOwned(artifact, host, previousPosition, previousPriority): boolean {
+      try {
+        if (
+          !validArtifact(artifact) ||
+          bindings.has(artifact) ||
+          !styleIsOwned(host) ||
+          typeof previousPosition !== 'string' ||
+          typeof previousPriority !== 'string'
+        ) {
+          return false;
+        }
+        const lease: ArtifactHostPositionLease = {
+          host,
+          owner: artifact,
+          previousPosition,
+          previousPriority,
+        };
+        const binding: ArtifactHostPositionBinding = { lease, live: true };
+        bindings.set(artifact, binding);
+        return bindings.get(artifact) === binding;
+      } catch {
+        return false;
+      }
+    },
+    inherit(artifact, predecessor, host): boolean {
+      try {
+        if (!validArtifact(artifact) || bindings.has(artifact) || !styleIsOwned(host)) return false;
+        const previous = bindings.get(predecessor);
+        if (
+          !previous?.live ||
+          previous.lease.host !== host ||
+          previous.lease.owner !== predecessor
+        ) {
+          return false;
+        }
+        const binding: ArtifactHostPositionBinding = {
+          lease: previous.lease,
+          live: true,
+          predecessor,
+        };
+        bindings.set(artifact, binding);
+        return bindings.get(artifact) === binding;
+      } catch {
+        return false;
+      }
+    },
+    claim(artifact): boolean {
+      try {
+        const binding = bindings.get(artifact);
+        if (!binding?.live || !styleIsOwned(binding.lease.host)) return false;
+        if (binding.lease.owner === artifact) return true;
+        const predecessor = binding.predecessor;
+        const previous = predecessor ? bindings.get(predecessor) : undefined;
+        if (
+          !predecessor ||
+          !previous?.live ||
+          previous.lease !== binding.lease ||
+          binding.lease.owner !== predecessor
+        ) {
+          return false;
+        }
+        binding.lease.owner = artifact;
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    current(artifact): boolean {
+      try {
+        const binding = bindings.get(artifact);
+        return (
+          !binding ||
+          (binding.live && binding.lease.owner === artifact && styleIsOwned(binding.lease.host))
+        );
+      } catch {
+        return false;
+      }
+    },
+    release(artifact): void {
+      let binding: ArtifactHostPositionBinding | undefined;
+      try {
+        binding = bindings.get(artifact);
+        if (!binding?.live) return;
+        binding.live = false;
+        if (binding.lease.owner !== artifact) return;
+        const predecessor = binding.predecessor;
+        const previous = predecessor ? bindings.get(predecessor) : undefined;
+        if (predecessor && previous?.live && previous.lease === binding.lease) {
+          binding.lease.owner = predecessor;
+          return;
+        }
+        binding.lease.owner = undefined;
+      } catch {
+        return;
+      }
+      restore(binding.lease);
+    },
+  };
+  return frozen(registry);
 }
 
 export interface RenderDeadline {
@@ -633,7 +797,9 @@ function validArtifact(
     }
     const artifact = value as CommittedRenderArtifact;
     return (
-      (artifact.kind === 'direct_iframe' || artifact.kind === 'puc') &&
+      (artifact.kind === 'aps_mount' ||
+        artifact.kind === 'direct_iframe' ||
+        artifact.kind === 'puc') &&
       validAttemptId(artifact.attemptId) &&
       typeof artifact.slot === 'string' &&
       artifact.slot.length > 0 &&
@@ -651,6 +817,56 @@ function validArtifact(
   }
 }
 
+/** Bind one immutable artifact to one exact synchronous DOM/binding guard. */
+export function bindCommittedArtifactGuard(
+  artifact: CommittedRenderArtifact,
+  current: () => boolean
+): boolean {
+  try {
+    if (
+      !validArtifact(artifact) ||
+      typeof current !== 'function' ||
+      weakMapHas(artifactGuards, artifact)
+    ) {
+      return false;
+    }
+    weakMapSet(artifactGuards, artifact, current);
+    return weakMapGet(artifactGuards, artifact) === current;
+  } catch {
+    return false;
+  }
+}
+
+/** Bind one exact metadata-release callback to a committed artifact's disposal latch. */
+export function bindCommittedArtifactRetirement(
+  artifact: CommittedRenderArtifact,
+  retire: () => void
+): boolean {
+  try {
+    if (
+      !validArtifact(artifact) ||
+      typeof retire !== 'function' ||
+      weakMapHas(artifactRetirements, artifact) ||
+      artifactDisposalStarted(artifact)
+    ) {
+      return false;
+    }
+    weakMapSet(artifactRetirements, artifact, retire);
+    return weakMapGet(artifactRetirements, artifact) === retire;
+  } catch {
+    return false;
+  }
+}
+
+function guardedArtifactCurrent(artifact: CommittedRenderArtifact): boolean {
+  try {
+    const guard = weakMapGet(artifactGuards, artifact);
+    return !guard || Reflect.apply(guard, undefined, []) === true;
+  } catch {
+    return false;
+  }
+}
+
 function disposeArtifact(artifact: CommittedRenderArtifact | undefined): boolean {
   if (!artifact) return true;
   try {
@@ -660,6 +876,16 @@ function disposeArtifact(artifact: CommittedRenderArtifact | undefined): boolean
     weakMapSet(artifactDisposals, artifact, false);
   } catch {
     return false;
+  }
+  let retirementSucceeded = true;
+  try {
+    const retire = weakMapGet(artifactRetirements, artifact);
+    if (retire) {
+      weakMapDelete(artifactRetirements, artifact);
+      Reflect.apply(retire, undefined, []);
+    }
+  } catch {
+    retirementSucceeded = false;
   }
   try {
     const result = Reflect.apply(artifact.dispose, artifact, []) as unknown;
@@ -687,7 +913,7 @@ function disposeArtifact(artifact: CommittedRenderArtifact | undefined): boolean
     }
     if (result !== undefined) return false;
     weakMapSet(artifactDisposals, artifact, true);
-    return true;
+    return retirementSucceeded;
   } catch {
     return false;
   }
@@ -766,6 +992,7 @@ export function createCommittedArtifactStore(): CommittedArtifactStore {
           mutating ||
           !validArtifact(artifact) ||
           artifactDisposalStarted(artifact) ||
+          !guardedArtifactCurrent(artifact) ||
           weakSetHas(disposedNavigations, artifact.navigationGeneration) ||
           !permitsPromotion(stillCurrent)
         ) {
@@ -780,7 +1007,8 @@ export function createCommittedArtifactStore(): CommittedArtifactStore {
           disposeRequested ||
           weakSetHas(disposedNavigations, artifact.navigationGeneration) ||
           setHas(pendingNavigationDisposals, artifact.navigationGeneration) ||
-          !permitsPromotion(stillCurrent)
+          !permitsPromotion(stillCurrent) ||
+          !guardedArtifactCurrent(artifact)
         ) {
           return false;
         }
@@ -794,6 +1022,7 @@ export function createCommittedArtifactStore(): CommittedArtifactStore {
           weakSetHas(disposedNavigations, artifact.navigationGeneration) ||
           setHas(pendingNavigationDisposals, artifact.navigationGeneration) ||
           !permitsPromotion(stillCurrent) ||
+          !guardedArtifactCurrent(artifact) ||
           artifactDisposalStarted(artifact)
         ) {
           if (existing && mapGet(entries, artifact.slot) === existing) {
@@ -835,6 +1064,34 @@ export function createCommittedArtifactStore(): CommittedArtifactStore {
         return cleaned && mapGet(entries, artifact.slot) !== artifact;
       } catch {
         return false;
+      } finally {
+        if (ownsMutation) {
+          mutating = false;
+          drainDeferredDisposal();
+        }
+      }
+    },
+    sweep(): number {
+      let retired = 0;
+      let ownsMutation = false;
+      try {
+        if (disposed || mutating) return 0;
+        mutating = true;
+        ownsMutation = true;
+        const snapshot = mapEntrySnapshot(entries);
+        for (let index = 0; index < snapshot.length; index += 1) {
+          const entry = snapshot[index];
+          if (!entry) continue;
+          const slot = entry[0];
+          const artifact = entry[1];
+          if (mapGet(entries, slot) !== artifact || guardedArtifactCurrent(artifact)) continue;
+          mapDelete(entries, slot);
+          disposeArtifact(artifact);
+          retired += 1;
+        }
+        return retired;
+      } catch {
+        return retired;
       } finally {
         if (ownsMutation) {
           mutating = false;
@@ -1383,7 +1640,12 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
     const sourceType = admittedRenderSource?.type;
     const sourceMatches =
       next === 'waiting_for_document' ? sourceType === 'aps' : sourceType === 'adm';
-    const artifactKind = state === 'rendering_direct' ? 'direct_iframe' : 'puc';
+    const artifactKind =
+      next === 'waiting_for_document'
+        ? 'aps_mount'
+        : state === 'rendering_direct'
+          ? 'direct_iframe'
+          : 'puc';
     if (
       pendingArtifact !== undefined ||
       !validArtifact(artifact, slot, navigationGeneration, id) ||

@@ -16,6 +16,9 @@ import {
   resolveApsRendererV1Url,
 } from '../../src/integrations/aps/render';
 import {
+  bindCommittedArtifactGuard,
+  bindCommittedArtifactRetirement,
+  createArtifactHostPositionLeaseRegistry,
   createCommittedArtifactStore,
   createBootstrapNonceRegistry,
   createRenderAttempt,
@@ -315,6 +318,17 @@ function artifact(
     slot: render.slot,
     navigationGeneration: render.navigationGeneration,
     dispose: vi.fn(),
+  });
+}
+
+function apsArtifactBinding() {
+  return Object.freeze({
+    commit: vi.fn(() => true),
+    finalize: vi.fn(),
+    isCurrent: vi.fn(() => true),
+    previousArtifact: undefined,
+    release: vi.fn(),
+    rollback: vi.fn(),
   });
 }
 
@@ -1195,6 +1209,7 @@ describe('direct APS attempt rendering', () => {
       expect(
         renderDirectApsAttempt({
           attempt: render,
+          bindArtifactGuard: bindCommittedArtifactGuard,
           bootstrapNonces: bootstraps,
           container: document.getElementById('fictional-slot')!,
           messaging,
@@ -1313,6 +1328,7 @@ describe('direct APS attempt rendering', () => {
     const container = document.getElementById('fictional-slot')!;
     const mounted = renderDirectApsAttempt({
       attempt: render,
+      bindArtifactGuard: bindCommittedArtifactGuard,
       bootstrapNonces: bootstraps,
       container,
       messaging,
@@ -1653,6 +1669,7 @@ describe('direct APS attempt rendering', () => {
     expect(
       renderDirectApsAttempt({
         attempt: render,
+        bindArtifactGuard: bindCommittedArtifactGuard,
         bootstrapNonces: bootstraps,
         container,
         messaging: createBrowserMessagingAdapter(target),
@@ -1692,7 +1709,9 @@ describe('direct APS attempt rendering', () => {
   it('keeps a PUC APS overlay hidden until completion and preserves the slot host', () => {
     document.body.innerHTML = '<div id="fictional-slot"><span>GAM content</span></div>';
     const scope = owner();
-    const render = attempt(scope);
+    const artifactStore = createCommittedArtifactStore();
+    const hostPositions = createArtifactHostPositionLeaseRegistry();
+    const render = attempt(scope, { artifacts: artifactStore });
     expect(render.beginGamClaim()).toBe(true);
     expect(render.admitClaimedWinner(claimed(render, scope, DIRECT_APS_SOURCE))).toBe(true);
     expect(render.ownerClaimed()).toBe(true);
@@ -1721,14 +1740,18 @@ describe('direct APS attempt rendering', () => {
     const rendererPort = browserMessagePort();
     const isBindingCurrent = vi.fn(() => true);
     const onArtifactTransferred = vi.fn();
+    const artifactBinding = apsArtifactBinding();
 
     try {
       expect(
         renderPucApsAttempt({
           attempt: render,
+          bindArtifactGuard: bindCommittedArtifactGuard,
           baseArtifact,
+          bindArtifact: () => artifactBinding,
           bootstrapNonces: bootstraps,
           container,
+          hostPositions,
           isBindingCurrent,
           messaging,
           nonces: renderers,
@@ -1783,12 +1806,169 @@ describe('direct APS attempt rendering', () => {
       });
 
       expect(render.snapshot().outcome).toEqual({ outcome: 'accepted' });
+      expect(artifactBinding.commit).toHaveBeenCalledOnce();
+      expect(artifactBinding.finalize).toHaveBeenCalledOnce();
+      expect(artifactBinding.release).not.toHaveBeenCalled();
+      expect(artifactBinding.rollback).not.toHaveBeenCalled();
       expect(frame.style.visibility).toBe('visible');
       expect(container.querySelector('span')?.textContent).toBe('GAM content');
       expect(baseArtifact.dispose).not.toHaveBeenCalled();
+
+      container.style.setProperty('position', 'absolute', 'important');
+      expect(artifactStore.sweep()).toBe(1);
+      expect(frame.isConnected).toBe(false);
+      expect(container.querySelector('span')?.textContent).toBe('GAM content');
+      expect(container.style.getPropertyValue('position')).toBe('absolute');
+      expect(container.style.getPropertyPriority('position')).toBe('important');
+      expect(baseArtifact.dispose).toHaveBeenCalledOnce();
+      expect(artifactBinding.release).toHaveBeenCalledOnce();
     } finally {
       bootstraps.dispose();
       renderers.dispose();
+      document.body.innerHTML = '';
+    }
+  });
+
+  it('transfers one host-position lease across consecutive accepted PUC overlays', () => {
+    document.body.innerHTML = '<div id="fictional-slot"><span>publisher</span></div>';
+    const generation = Object.freeze({});
+    const artifactStore = createCommittedArtifactStore();
+    const hostPositions = createArtifactHostPositionLeaseRegistry();
+    const container = document.getElementById('fictional-slot')!;
+    let physicalArtifact: CommittedRenderArtifact | undefined;
+    const resources: Array<{ dispose: () => void }> = [];
+
+    const bindArtifact = (candidate: CommittedRenderArtifact) => {
+      const previousArtifact = physicalArtifact;
+      let phase: 'prepared' | 'committed' | 'finalized' | 'released' | 'rolled_back' = 'prepared';
+      return Object.freeze({
+        commit: (): boolean => {
+          if (phase !== 'prepared' || physicalArtifact !== previousArtifact) return false;
+          physicalArtifact = candidate;
+          phase = 'committed';
+          return true;
+        },
+        finalize: (): void => {
+          if (phase === 'committed') phase = 'finalized';
+        },
+        isCurrent: (): boolean =>
+          (phase === 'committed' || phase === 'finalized') && physicalArtifact === candidate,
+        previousArtifact,
+        release: (): void => {
+          if (phase === 'released' || phase === 'rolled_back') return;
+          if (physicalArtifact === candidate) {
+            physicalArtifact = phase === 'committed' ? previousArtifact : undefined;
+          }
+          phase = 'released';
+        },
+        rollback: (): void => {
+          if (phase === 'committed' && physicalArtifact === candidate) {
+            physicalArtifact = previousArtifact;
+          }
+          phase = 'rolled_back';
+        },
+      });
+    };
+
+    const mountAndComplete = (index: number): CommittedRenderArtifact => {
+      const scope = owner(indexedAttemptId(index), 'fictional-slot', generation);
+      const render = attempt(scope, { artifacts: artifactStore });
+      expect(render.beginGamClaim()).toBe(true);
+      expect(render.admitClaimedWinner(claimed(render, scope, DIRECT_APS_SOURCE))).toBe(true);
+      expect(render.ownerClaimed()).toBe(true);
+      expect(render.ownerRegistered()).toBe(true);
+      const bootstraps = createBootstrapNonceRegistry({
+        mintNonce: () => Object.freeze({ ok: true as const, value: indexedBootstrapNonce(index) }),
+      });
+      const renderers = createRendererNonceRegistry({
+        mintNonce: () => Object.freeze({ ok: true as const, value: indexedRendererNonce(index) }),
+      });
+      resources.push(bootstraps, renderers);
+      let captureListener: ((event: MessageEvent) => void) | undefined;
+      const rendererPort = browserMessagePort();
+      expect(
+        renderPucApsAttempt({
+          attempt: render,
+          baseArtifact: artifact(scope, 'puc'),
+          bindArtifact,
+          bindArtifactGuard: bindCommittedArtifactGuard,
+          bootstrapNonces: bootstraps,
+          container,
+          hostPositions,
+          isBindingCurrent: () => true,
+          messaging: createBrowserMessagingAdapter({
+            addEventListener: (
+              _type: 'message',
+              listener: (event: MessageEvent) => void,
+              _capture: true
+            ) => {
+              captureListener = listener;
+            },
+            removeEventListener: vi.fn(),
+          }),
+          nonces: renderers,
+          onArtifactTransferred: vi.fn(),
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(true);
+      const frames = [...container.querySelectorAll('iframe')];
+      const frame = frames[frames.length - 1]!;
+      const source = frame.contentWindow!;
+      captureListener?.({
+        data: JSON.stringify({
+          message: 'TS APS Bootstrap Ready',
+          version: 1,
+          bootstrapNonce: indexedBootstrapNonce(index),
+        }),
+        origin: 'null',
+        ports: [],
+        source,
+      } as unknown as MessageEvent);
+      captureListener?.({
+        data: JSON.stringify({
+          message: 'TS APS Container Ready',
+          version: 1,
+          bootstrapNonce: indexedBootstrapNonce(index),
+          rendererNonce: indexedRendererNonce(index),
+        }),
+        origin: 'null',
+        ports: [rendererPort],
+        source,
+      } as unknown as MessageEvent);
+      rendererPort.emit({
+        message: 'TS APS Document Accepted',
+        version: 1,
+        nonce: indexedRendererNonce(index),
+      });
+      rendererPort.emit({
+        message: 'TS APS Render Completed',
+        version: 1,
+        nonce: indexedRendererNonce(index),
+      });
+      expect(render.snapshot().outcome).toEqual({ outcome: 'accepted' });
+      const committed = artifactStore.current('fictional-slot');
+      expect(committed).toBe(physicalArtifact);
+      if (!committed) throw new Error('should promote the APS overlay');
+      return committed;
+    };
+
+    try {
+      const first = mountAndComplete(51);
+      expect(container.style.position).toBe('relative');
+      const second = mountAndComplete(52);
+      expect(second).not.toBe(first);
+      expect(first.dispose).toBeTypeOf('function');
+      expect(container.style.position).toBe('relative');
+      expect(container.querySelectorAll('iframe')).toHaveLength(1);
+      expect(container.querySelector('span')?.textContent).toBe('publisher');
+
+      expect(artifactStore.release(second)).toBe(true);
+      expect(container.style.position).toBe('');
+      expect(container.querySelectorAll('iframe')).toHaveLength(0);
+      expect(container.querySelector('span')?.textContent).toBe('publisher');
+    } finally {
+      for (const resource of resources) resource.dispose();
+      artifactStore.dispose();
       document.body.innerHTML = '';
     }
   });
@@ -1809,14 +1989,19 @@ describe('direct APS attempt rendering', () => {
       mintNonce: () => Object.freeze({ ok: true as const, value: indexedRendererNonce(42) }),
     });
     const container = document.getElementById('fictional-slot')!;
+    const artifactBinding = apsArtifactBinding();
+    const hostPositions = createArtifactHostPositionLeaseRegistry();
 
     try {
       expect(
         renderPucApsAttempt({
           attempt: render,
+          bindArtifactGuard: bindCommittedArtifactGuard,
           baseArtifact,
+          bindArtifact: () => artifactBinding,
           bootstrapNonces: bootstraps,
           container,
+          hostPositions,
           isBindingCurrent: () => true,
           messaging: createBrowserMessagingAdapter({
             addEventListener: vi.fn(),
@@ -1833,6 +2018,9 @@ describe('direct APS attempt rendering', () => {
       expect(container.querySelector('span')?.textContent).toBe('publisher');
       expect(container.style.position).toBe('');
       expect(baseArtifact.dispose).toHaveBeenCalledOnce();
+      expect(artifactBinding.commit).not.toHaveBeenCalled();
+      expect(artifactBinding.finalize).not.toHaveBeenCalled();
+      expect(artifactBinding.release).toHaveBeenCalledOnce();
     } finally {
       bootstraps.dispose();
       renderers.dispose();
@@ -2243,7 +2431,7 @@ describe('direct ADM attempt rendering', () => {
 describe('RenderAttempt state machine', () => {
   it('implements the exact PUC APS state table and makes invalid/replay transitions inert', () => {
     const scope = owner();
-    const candidate = artifact(scope, 'puc');
+    const candidate = artifact(scope, 'aps_mount');
     const render = attempt(scope);
     const observed: RenderAttemptState[] = [];
 
@@ -2313,7 +2501,7 @@ describe('RenderAttempt state machine', () => {
     expect(directAps.beginDirect()).toBe(true);
     expect(directAps.beginAdm(artifact(directApsOwner))).toBe(false);
     expect(directAps.beginApsDocument(artifact(directApsOwner, 'puc'))).toBe(false);
-    expect(directAps.beginApsDocument(artifact(directApsOwner))).toBe(true);
+    expect(directAps.beginApsDocument(artifact(directApsOwner, 'aps_mount'))).toBe(true);
 
     const directAdmOwner = owner(ATTEMPT_TWO);
     const directAdm = attempt(directAdmOwner);
@@ -2331,7 +2519,7 @@ describe('RenderAttempt state machine', () => {
     expect(pucAps.ownerRegistered()).toBe(true);
     expect(pucAps.beginAdm(artifact(pucApsOwner, 'puc'))).toBe(false);
     expect(pucAps.beginApsDocument(artifact(pucApsOwner))).toBe(false);
-    expect(pucAps.beginApsDocument(artifact(pucApsOwner, 'puc'))).toBe(true);
+    expect(pucAps.beginApsDocument(artifact(pucApsOwner, 'aps_mount'))).toBe(true);
   });
 
   it('admits a claimed winner only through the exact one-shot source/context claim', () => {
@@ -2474,12 +2662,12 @@ describe('RenderAttempt state machine', () => {
         case 'waiting_for_document':
           render.admitDirectWinner(APS_SOURCE, WINNER_CONTEXT);
           render.beginDirect();
-          render.beginApsDocument(artifact(scope));
+          render.beginApsDocument(artifact(scope, 'aps_mount'));
           break;
         case 'waiting_for_aps_completion':
           render.admitDirectWinner(APS_SOURCE, WINNER_CONTEXT);
           render.beginDirect();
-          render.beginApsDocument(artifact(scope));
+          render.beginApsDocument(artifact(scope, 'aps_mount'));
           render.apsDocumentAccepted();
           break;
         case 'waiting_for_adm':
@@ -2507,7 +2695,6 @@ describe('RenderAttempt state machine', () => {
     };
 
     const invoke = (render: RenderAttempt, transition: Transition): boolean => {
-      const kind = render.snapshot().state === 'waiting_for_insertion' ? 'puc' : 'direct_iframe';
       switch (transition) {
         case 'admit_direct':
           return render.admitDirectWinner(ADM_SOURCE, WINNER_CONTEXT);
@@ -2522,9 +2709,14 @@ describe('RenderAttempt state machine', () => {
         case 'begin_direct':
           return render.beginDirect();
         case 'begin_aps_document':
-          return render.beginApsDocument(artifact(render, kind));
+          return render.beginApsDocument(artifact(render, 'aps_mount'));
         case 'begin_adm':
-          return render.beginAdm(artifact(render, kind));
+          return render.beginAdm(
+            artifact(
+              render,
+              render.snapshot().state === 'waiting_for_insertion' ? 'puc' : 'direct_iframe'
+            )
+          );
         case 'aps_document_accepted':
           return render.apsDocumentAccepted();
         case 'accept':
@@ -2562,7 +2754,7 @@ describe('RenderAttempt state machine', () => {
     expect(render.winnerContext).toBe(WINNER_CONTEXT);
     expect(render.admitDirectWinner(ADM_SOURCE, WINNER_CONTEXT)).toBe(false);
 
-    const candidate = artifact(scope);
+    const candidate = artifact(scope, 'aps_mount');
     expect(render.beginDirect()).toBe(true);
     expect(render.beginApsDocument(candidate)).toBe(true);
     expect(render.apsDocumentAccepted()).toBe(true);
@@ -2654,7 +2846,7 @@ describe('RenderAttempt state machine', () => {
       const documentAttempt = attempt(documentOwner);
       documentAttempt.admitDirectWinner(APS_SOURCE, WINNER_CONTEXT);
       documentAttempt.beginDirect();
-      documentAttempt.beginApsDocument(artifact(documentOwner));
+      documentAttempt.beginApsDocument(artifact(documentOwner, 'aps_mount'));
       vi.advanceTimersByTime(3_000);
       expect(documentAttempt.snapshot().outcome).toEqual({
         outcome: 'failed',
@@ -2665,7 +2857,7 @@ describe('RenderAttempt state machine', () => {
       const completion = attempt(completionOwner);
       completion.admitDirectWinner(APS_SOURCE, WINNER_CONTEXT);
       completion.beginDirect();
-      completion.beginApsDocument(artifact(completionOwner));
+      completion.beginApsDocument(artifact(completionOwner, 'aps_mount'));
       completion.apsDocumentAccepted();
       vi.advanceTimersByTime(10_000);
       expect(completion.snapshot().outcome).toEqual({
@@ -2691,7 +2883,7 @@ describe('RenderAttempt state machine', () => {
     transitionReference.current = transitionAttempt;
     transitionAttempt.admitDirectWinner(APS_SOURCE, WINNER_CONTEXT);
     transitionAttempt.beginDirect();
-    transitionAttempt.beginApsDocument(artifact(transitionOwner));
+    transitionAttempt.beginApsDocument(artifact(transitionOwner, 'aps_mount'));
     clearReenters = true;
 
     expect(transitionAttempt.apsDocumentAccepted()).toBe(true);
@@ -2887,6 +3079,27 @@ describe('RenderAttempt state machine', () => {
 });
 
 describe('committed artifact ownership', () => {
+  it('retires a lost guarded artifact synchronously and exactly once', () => {
+    const store = createCommittedArtifactStore();
+    const candidate = artifact(owner());
+    const retireAssociation = vi.fn();
+    let current = true;
+    expect(bindCommittedArtifactGuard(candidate, () => current)).toBe(true);
+    expect(bindCommittedArtifactRetirement(candidate, retireAssociation)).toBe(true);
+    expect(bindCommittedArtifactRetirement(candidate, vi.fn())).toBe(false);
+    expect(store.promote(candidate)).toBe(true);
+
+    expect(store.sweep()).toBe(0);
+    current = false;
+    expect(store.sweep()).toBe(1);
+    expect(store.current(candidate.slot)).toBeUndefined();
+    expect(retireAssociation).toHaveBeenCalledOnce();
+    expect(candidate.dispose).toHaveBeenCalledOnce();
+    expect(store.sweep()).toBe(0);
+    expect(candidate.dispose).toHaveBeenCalledOnce();
+    expect(retireAssociation).toHaveBeenCalledOnce();
+  });
+
   it('promotes before attempt disposal, preserves accepted DOM, and disposes the prior artifact before replacement', () => {
     const store = createCommittedArtifactStore();
     const generation = Object.freeze({});
@@ -3124,6 +3337,30 @@ describe('committed artifact ownership', () => {
     expect(store.current('fictional-slot')).toBe(current);
   });
 
+  it('does not publish a candidate whose exact association is lost during prior disposal', () => {
+    const store = createCommittedArtifactStore();
+    const generation = Object.freeze({});
+    let associationCurrent = true;
+    const currentOwner = owner(ATTEMPT_ONE, 'fictional-slot', generation);
+    const current = Object.freeze({
+      kind: 'aps_mount' as const,
+      attemptId: currentOwner.id,
+      slot: currentOwner.slot,
+      navigationGeneration: generation,
+      dispose: vi.fn(() => {
+        associationCurrent = false;
+      }),
+    });
+    const candidate = artifact(owner(ATTEMPT_TWO, 'fictional-slot', generation), 'aps_mount');
+    expect(bindCommittedArtifactGuard(candidate, () => associationCurrent)).toBe(true);
+    expect(store.promote(current)).toBe(true);
+
+    expect(store.promote(candidate)).toBe(false);
+    expect(current.dispose).toHaveBeenCalledOnce();
+    expect(store.current('fictional-slot')).toBeUndefined();
+    expect(candidate.dispose).not.toHaveBeenCalled();
+  });
+
   it('never publishes after its navigation generation or whole store is disposed', () => {
     const generation = Object.freeze({});
     const navigationStore = createCommittedArtifactStore();
@@ -3262,7 +3499,7 @@ describe('RenderAttempt diagnostics producer', () => {
     const renderAttempt = attempt(owner(), { publishDiagnostics });
     expect(renderAttempt.admitDirectWinner(DIRECT_APS_SOURCE, WINNER_CONTEXT)).toBe(true);
     expect(renderAttempt.beginDirect()).toBe(true);
-    const committed = artifact(renderAttempt);
+    const committed = artifact(renderAttempt, 'aps_mount');
     expect(renderAttempt.beginApsDocument(committed)).toBe(true);
     expect(renderAttempt.apsDocumentAccepted()).toBe(true);
 

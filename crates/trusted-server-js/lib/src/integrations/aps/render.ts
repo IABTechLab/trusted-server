@@ -2,12 +2,14 @@ import type { ApsRendererV1 } from '../../core/types';
 import { validateApsRenderer } from '../../core/contracts/aps_renderer';
 import type { MessagingAdapter, MessagingPort } from '../../adapters/messaging';
 import type {
+  ArtifactHostPositionLeaseRegistry,
   BootstrapNonceRegistry,
   CommittedRenderArtifact,
   RenderAttempt,
   RenderFailureReason,
   RendererNonceRegistry,
 } from '../../services/render';
+import type { ApsSlotMountBinding } from '../../services/slots';
 
 import { APS_PERMANENT_SANDBOX, generateApsDataDocumentsV1 } from './documents';
 
@@ -30,6 +32,9 @@ const directRenderDocument = directDomAvailable ? document : undefined;
 const directIframePrototype = directDomAvailable ? HTMLIFrameElement.prototype : undefined;
 const documentCreateElementIntrinsic = directDomAvailable
   ? Document.prototype.createElement
+  : undefined;
+const documentGetElementByIdIntrinsic = directDomAvailable
+  ? Document.prototype.getElementById
   : undefined;
 const nodeAppendChildIntrinsic = directDomAvailable ? Node.prototype.appendChild : undefined;
 const nodeRemoveChildIntrinsic = directDomAvailable ? Node.prototype.removeChild : undefined;
@@ -65,6 +70,9 @@ const elementNamespaceGetter = directDomAvailable
 const elementChildrenGetter = directDomAvailable
   ? Object.getOwnPropertyDescriptor(Element.prototype, 'children')?.get
   : undefined;
+const elementIdGetter = directDomAvailable
+  ? Object.getOwnPropertyDescriptor(Element.prototype, 'id')?.get
+  : undefined;
 const htmlCollectionLengthGetter = directDomAvailable
   ? Object.getOwnPropertyDescriptor(HTMLCollection.prototype, 'length')?.get
   : undefined;
@@ -99,6 +107,10 @@ export function prepareApsRenderSource(
 
 export interface DirectApsAttemptOptions {
   readonly attempt: RenderAttempt;
+  readonly bindArtifactGuard: (
+    artifact: CommittedRenderArtifact,
+    current: () => boolean
+  ) => boolean;
   readonly bootstrapNonces: BootstrapNonceRegistry;
   readonly container: HTMLElement;
   readonly messaging: MessagingAdapter;
@@ -108,6 +120,8 @@ export interface DirectApsAttemptOptions {
 
 export interface PucApsAttemptOptions extends DirectApsAttemptOptions {
   readonly baseArtifact: CommittedRenderArtifact;
+  readonly bindArtifact: ApsSlotMountBinding['bindArtifact'];
+  readonly hostPositions: ArtifactHostPositionLeaseRegistry;
   readonly isBindingCurrent: () => boolean;
   readonly onArtifactTransferred: () => void;
 }
@@ -224,6 +238,7 @@ export function mountApsTopPageAttempt(options: ApsTopPageAttemptOptions): boole
     !directRenderDocument ||
     !directIframePrototype ||
     typeof documentCreateElementIntrinsic !== 'function' ||
+    typeof documentGetElementByIdIntrinsic !== 'function' ||
     typeof nodeAppendChildIntrinsic !== 'function' ||
     typeof nodeRemoveChildIntrinsic !== 'function' ||
     typeof elementRemoveIntrinsic !== 'function' ||
@@ -238,6 +253,7 @@ export function mountApsTopPageAttempt(options: ApsTopPageAttemptOptions): boole
     typeof elementLocalNameGetter !== 'function' ||
     typeof elementNamespaceGetter !== 'function' ||
     typeof elementChildrenGetter !== 'function' ||
+    typeof elementIdGetter !== 'function' ||
     typeof htmlCollectionLengthGetter !== 'function' ||
     typeof iframeContentWindowGetter !== 'function' ||
     typeof iframeSourceGetter !== 'function'
@@ -246,6 +262,7 @@ export function mountApsTopPageAttempt(options: ApsTopPageAttemptOptions): boole
   }
 
   let attempt: RenderAttempt;
+  let bindArtifactGuard: DirectApsAttemptOptions['bindArtifactGuard'];
   let bootstrapNonces: BootstrapNonceRegistry;
   let rendererNonces: RendererNonceRegistry;
   let messaging: MessagingAdapter;
@@ -259,10 +276,14 @@ export function mountApsTopPageAttempt(options: ApsTopPageAttemptOptions): boole
   let ownerDocument: Document;
   let mode: ApsTopPageAttemptOptions['mode'];
   let baseArtifact: CommittedRenderArtifact | undefined;
+  let bindArtifact: ApsSlotMountBinding['bindArtifact'] | undefined;
+  let hostPositions: ArtifactHostPositionLeaseRegistry | undefined;
   let isBindingCurrent: () => boolean;
   let onArtifactTransferred: () => void;
+  let expectedContainerId: string | undefined;
   try {
     attempt = options.attempt;
+    bindArtifactGuard = options.bindArtifactGuard;
     bootstrapNonces = options.bootstrapNonces;
     rendererNonces = options.nonces;
     messaging = options.messaging;
@@ -276,9 +297,15 @@ export function mountApsTopPageAttempt(options: ApsTopPageAttemptOptions): boole
     ownerDocument = Reflect.apply(nodeOwnerDocumentGetter, container, []) as Document;
     mode = options.mode;
     baseArtifact = options.mode === 'puc_overlay' ? options.baseArtifact : undefined;
+    bindArtifact = options.mode === 'puc_overlay' ? options.bindArtifact : undefined;
+    hostPositions = options.mode === 'puc_overlay' ? options.hostPositions : undefined;
     isBindingCurrent = options.mode === 'puc_overlay' ? options.isBindingCurrent : () => true;
     onArtifactTransferred =
       options.mode === 'puc_overlay' ? options.onArtifactTransferred : () => undefined;
+    expectedContainerId =
+      options.mode === 'puc_overlay'
+        ? (Reflect.apply(elementIdGetter, container, []) as string)
+        : undefined;
   } catch {
     return false;
   }
@@ -293,7 +320,12 @@ export function mountApsTopPageAttempt(options: ApsTopPageAttemptOptions): boole
   }
   const renderer = prepareApsRenderSource(sourceCandidate, publisherOrigin);
   const rendererUrl = resolveApsRendererV1Url(publisherOrigin);
-  if (!exactDocumentOrigin || !renderer || !rendererUrl) {
+  if (
+    !exactDocumentOrigin ||
+    !renderer ||
+    !rendererUrl ||
+    (mode === 'puc_overlay' && !expectedContainerId)
+  ) {
     try {
       attempt.fail('winner_not_renderable');
     } catch {
@@ -489,9 +521,7 @@ export function mountApsTopPageAttempt(options: ApsTopPageAttemptOptions): boole
   let insertionPredecessors: readonly Element[] = [];
   let baseArtifactDisposed = false;
   let baseArtifactTransferred = false;
-  let hostPositionOwned = false;
-  let previousHostPosition = '';
-  let previousHostPositionPriority = '';
+  let hostPositionBound = false;
   const expectedFrameSource = rendererUrl + '#' + bootstrapNonce;
 
   const disposeBaseArtifact = (): void => {
@@ -505,18 +535,8 @@ export function mountApsTopPageAttempt(options: ApsTopPageAttemptOptions): boole
   };
 
   const restoreHostPosition = (): void => {
-    if (!hostPositionOwned) return;
-    hostPositionOwned = false;
     try {
-      const style = container.style;
-      if (
-        style.getPropertyValue('position') !== 'relative' ||
-        style.getPropertyPriority('position') !== ''
-      ) {
-        return;
-      }
-      if (previousHostPosition === '') style.removeProperty('position');
-      else style.setProperty('position', previousHostPosition, previousHostPositionPriority);
+      hostPositions?.release(artifact);
     } catch {
       // Compare-owned style restoration cannot expand into publisher styles.
     }
@@ -543,8 +563,18 @@ export function mountApsTopPageAttempt(options: ApsTopPageAttemptOptions): boole
     }
   };
 
+  let artifactBinding:
+    | Readonly<{
+        commit: () => boolean;
+        finalize: () => void;
+        isCurrent: () => boolean;
+        previousArtifact: CommittedRenderArtifact | undefined;
+        release: () => void;
+        rollback: () => void;
+      }>
+    | undefined;
   const artifact: CommittedRenderArtifact = freeze({
-    kind: mode === 'direct' ? ('direct_iframe' as const) : ('puc' as const),
+    kind: 'aps_mount' as const,
     attemptId,
     slot: attemptSlot,
     navigationGeneration,
@@ -564,9 +594,52 @@ export function mountApsTopPageAttempt(options: ApsTopPageAttemptOptions): boole
         // DOM removal remains best-effort under a hostile publisher realm.
       }
       restoreHostPosition();
+      artifactBinding?.release();
       disposeBaseArtifact();
     },
   });
+
+  const persistentFrameCurrent = (): boolean => {
+    try {
+      return (
+        insertionCommitted &&
+        !disposed &&
+        Reflect.apply(nodeOwnerDocumentGetter, iframe, []) === ownerDocument &&
+        Reflect.apply(nodeParentNodeGetter, iframe, []) === container &&
+        Reflect.apply(nodeIsConnectedGetter, iframe, []) === true &&
+        (mode !== 'puc_overlay' ||
+          (Reflect.apply(elementIdGetter, container, []) === expectedContainerId &&
+            Reflect.apply(documentGetElementByIdIntrinsic, ownerDocument, [expectedContainerId]) ===
+              container)) &&
+        Reflect.apply(iframeContentWindowGetter, iframe, []) === frameSource &&
+        Reflect.apply(elementGetAttributeIntrinsic, iframe, ['src']) === expectedFrameSource &&
+        Reflect.apply(iframeSourceGetter, iframe, []) === expectedFrameSource &&
+        Reflect.apply(elementGetAttributeIntrinsic, iframe, ['sandbox']) ===
+          APS_PERMANENT_SANDBOX &&
+        (mode !== 'puc_overlay' ||
+          !hostPositionBound ||
+          hostPositions?.current(artifact) === true) &&
+        (mode !== 'puc_overlay' || artifactBinding?.isCurrent() === true)
+      );
+    } catch {
+      return false;
+    }
+  };
+  if (!bindArtifactGuard(artifact, persistentFrameCurrent)) {
+    artifact.dispose();
+    return fail('internal_error');
+  }
+  if (mode === 'puc_overlay') {
+    try {
+      artifactBinding = bindArtifact?.(artifact);
+    } catch {
+      artifactBinding = undefined;
+    }
+    if (!artifactBinding) {
+      artifact.dispose();
+      return fail('slot_unresolved');
+    }
+  }
 
   const startupFailure = (reason: RenderFailureReason): false => {
     if (!artifactOwnedByAttempt) artifact.dispose();
@@ -614,15 +687,35 @@ export function mountApsTopPageAttempt(options: ApsTopPageAttemptOptions): boole
       const view = ownerDocument.defaultView;
       if (!view) return false;
       const computed = view.getComputedStyle(container);
-      if (computed.position !== 'static') return true;
+      if (computed.position !== 'static') {
+        const previousArtifact = artifactBinding?.previousArtifact;
+        hostPositionBound = Boolean(
+          previousArtifact && hostPositions?.inherit(artifact, previousArtifact, container)
+        );
+        return true;
+      }
       const style = container.style;
-      previousHostPosition = style.getPropertyValue('position');
-      previousHostPositionPriority = style.getPropertyPriority('position');
+      const previousPosition = style.getPropertyValue('position');
+      const previousPriority = style.getPropertyPriority('position');
       style.setProperty('position', 'relative');
-      hostPositionOwned =
-        style.getPropertyValue('position') === 'relative' &&
-        style.getPropertyPriority('position') === '';
-      return hostPositionOwned && isBindingCurrent();
+      if (
+        style.getPropertyValue('position') !== 'relative' ||
+        style.getPropertyPriority('position') !== ''
+      ) {
+        return false;
+      }
+      hostPositionBound =
+        hostPositions?.bindOwned(artifact, container, previousPosition, previousPriority) === true;
+      return hostPositionBound && isBindingCurrent();
+    } catch {
+      return false;
+    }
+  };
+
+  const claimOverlayPositionLease = (): boolean => {
+    if (mode !== 'puc_overlay' || !hostPositionBound) return true;
+    try {
+      return isBindingCurrent() && hostPositions?.claim(artifact) === true;
     } catch {
       return false;
     }
@@ -740,12 +833,38 @@ export function mountApsTopPageAttempt(options: ApsTopPageAttemptOptions): boole
           return;
         }
       }
-      if (
-        Reflect.apply(acceptMethod, attempt, []) === true &&
-        !disposed &&
-        exactFrameBinding(true)
-      ) {
-        if (mode === 'direct') commitContainer(insertionPredecessors);
+      let artifactAssociationCommitted = false;
+      if (mode === 'puc_overlay') {
+        try {
+          artifactAssociationCommitted = artifactBinding?.commit() === true;
+        } catch {
+          artifactAssociationCommitted = false;
+        }
+        if (!artifactAssociationCommitted) {
+          fail('slot_unresolved');
+          return;
+        }
+        if (!claimOverlayPositionLease()) {
+          artifactBinding?.rollback();
+          fail('slot_unresolved');
+          return;
+        }
+      }
+      const accepted = (() => {
+        try {
+          return Reflect.apply(acceptMethod, attempt, []) === true;
+        } catch {
+          return false;
+        }
+      })();
+      if (!accepted) {
+        if (artifactAssociationCommitted) artifactBinding?.rollback();
+        if (!disposed) fail('internal_error');
+        return;
+      }
+      if (artifactAssociationCommitted) artifactBinding?.finalize();
+      if (!disposed && exactFrameBinding(true) && mode === 'direct') {
+        commitContainer(insertionPredecessors);
       }
       return;
     }

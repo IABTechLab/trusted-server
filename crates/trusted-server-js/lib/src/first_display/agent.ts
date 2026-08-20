@@ -26,8 +26,8 @@ import {
 
 import type {
   FirstDisplayGoogletagBatchInput,
-  FirstDisplayGptBoundCycleV1,
   FirstDisplayGptDiagnosticCycleV1,
+  FirstDisplayGptHandoffCycleV1,
 } from './adapters/googletag';
 import { createFirstDisplayAdmRenderBridge } from './adm_render_bridge';
 import { createFirstDisplayProjectedDriver, type FirstDisplayRenderBridgeV1 } from './driver';
@@ -81,18 +81,21 @@ export interface FirstDisplayDriver {
   readonly closeIngress: () => boolean;
   readonly captureHandoff: () => FirstDisplayDriverHandoffV1 | undefined;
   readonly detachCommittedArtifacts: () => boolean;
+  readonly sweepCommittedArtifacts: () => number;
   readonly dispose: () => void;
 }
 
 export interface FirstDisplayDriverHandoffV1 {
   readonly artifacts: readonly Readonly<{
+    hostPosition: string | null;
+    hostPositionPriority: string | null;
     identity: object;
     kind: 'gpt_adm' | 'aps';
     owner: 'trusted_server' | 'publisher';
     slotId: string;
     token: string;
   }>[];
-  readonly cycles: readonly FirstDisplayGptBoundCycleV1[];
+  readonly cycles: readonly FirstDisplayGptHandoffCycleV1[];
   readonly diagnosticCycles: readonly Readonly<FirstDisplayGptDiagnosticCycleV1>[];
   readonly clockEpochMs: number;
   readonly gptDiagnostics: Readonly<FirstDisplayGptDiagnosticsV1>;
@@ -701,6 +704,12 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
         targeting: Object.keys(targeting)
           .sort()
           .map((key) => [key, targeting[key]]),
+        targetingOwnership:
+          cycle?.targetingOwnership.map((ownership) => ({
+            installed: ownership.installed,
+            key: ownership.key,
+            prior: [...ownership.prior],
+          })) ?? [],
         committedArtifact,
         gptToken: cycleTokenBySlot.get(placement.slot) ?? null,
       };
@@ -747,6 +756,8 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
           throw new TypeError('tsjs');
         }
         return {
+          hostPosition: capturedArtifact.hostPosition,
+          hostPositionPriority: capturedArtifact.hostPositionPriority,
           slotId: slot.id,
           kind: slot.committedArtifact,
           owner: capturedArtifact.owner,
@@ -879,6 +890,14 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
   }
 
   private observeDomMutations(records: readonly MutationRecord[]): void {
+    if (records.length > 0) {
+      try {
+        this.options.driver.sweepCommittedArtifacts();
+      } catch {
+        this.fail('bundle_partial');
+        return;
+      }
+    }
     for (const record of records) {
       if (this.isOwnedRuntimeInsertion(record)) continue;
       if (!this.observeNativeMutation()) return;

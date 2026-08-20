@@ -31,6 +31,7 @@ function handoff(revision = 0): Record<string, unknown> {
         owner: 'trusted_server',
         outcome: 'accepted',
         targeting: [['hb_adid', RESERVATION_ID]],
+        targetingOwnership: [],
         committedArtifact: 'gpt_adm',
         gptToken: 'gt1_1',
       },
@@ -47,6 +48,8 @@ function handoff(revision = 0): Record<string, unknown> {
     tombstones: [],
     artifacts: [
       {
+        hostPosition: null,
+        hostPositionPriority: null,
         slotId: 'slot-1',
         kind: 'gpt_adm',
         owner: 'trusted_server',

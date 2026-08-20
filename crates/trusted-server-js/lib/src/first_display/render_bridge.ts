@@ -586,6 +586,13 @@ export function createFirstDisplayRenderBridge(
     string,
     Readonly<{
       frame: HTMLIFrameElement;
+      frameAttributes: string;
+      frameContentWindow: Window;
+      frameSource: string;
+      frameSourceDocument: string;
+      host: HTMLElement;
+      hostPosition: string | null;
+      hostPositionPriority: string | null;
       kind: 'gpt_adm' | 'aps';
       owner: 'trusted_server';
       token: string;
@@ -636,6 +643,103 @@ export function createFirstDisplayRenderBridge(
     } catch {
       // Mutation observation cannot alter the admitted publisher or browser event.
     }
+  };
+
+  const disposeCommittedFrame = (
+    entry: Readonly<{
+      frame: HTMLIFrameElement;
+      host: HTMLElement;
+      hostPosition: string | null;
+      hostPositionPriority: string | null;
+    }>
+  ): void => {
+    try {
+      entry.frame.onload = null;
+      entry.frame.onerror = null;
+      entry.frame.remove();
+    } catch {
+      // The exact TS node loses authority even when hostile DOM cleanup fails.
+    }
+    if (entry.hostPosition === null) return;
+    try {
+      const style = entry.host.style;
+      if (
+        style.getPropertyValue('position') !== 'relative' ||
+        style.getPropertyPriority('position') !== ''
+      ) {
+        return;
+      }
+      if (entry.hostPosition === '') style.removeProperty('position');
+      else style.setProperty('position', entry.hostPosition, entry.hostPositionPriority ?? '');
+    } catch {
+      // Compare-owned restoration cannot overwrite publisher style changes.
+    }
+  };
+
+  const snapshotFrameAttributes = (frame: HTMLIFrameElement): string | undefined => {
+    try {
+      return JSON.stringify(
+        [...frame.attributes]
+          .map((attribute) => [attribute.name, attribute.value] as const)
+          .sort(([left], [right]) => left.localeCompare(right))
+      );
+    } catch {
+      return undefined;
+    }
+  };
+
+  const retireCommitted = (cycle: FirstDisplayGptBoundCycleV1): boolean => {
+    if (disposed || committedArtifactsDetached) return false;
+    const entry = committedFrames.get(cycle.slotId);
+    if (!entry || entry.token !== cycle.bid.rendererReservationId) return false;
+    committedFrames.delete(cycle.slotId);
+    disposeCommittedFrame(entry);
+    notifyNativeMutation();
+    return true;
+  };
+
+  const committedFrameCurrent = (entry: {
+    readonly frame: HTMLIFrameElement;
+    readonly frameAttributes: string;
+    readonly frameContentWindow: Window;
+    readonly frameSource: string;
+    readonly frameSourceDocument: string;
+    readonly host: HTMLElement;
+    readonly hostPosition: string | null;
+  }): boolean => {
+    try {
+      return (
+        entry.frame.ownerDocument === options.document &&
+        entry.host.ownerDocument === options.document &&
+        entry.frame.parentNode === entry.host &&
+        entry.frame.isConnected &&
+        entry.frame.contentWindow === entry.frameContentWindow &&
+        entry.frame.src === entry.frameSource &&
+        entry.frame.srcdoc === entry.frameSourceDocument &&
+        snapshotFrameAttributes(entry.frame) === entry.frameAttributes &&
+        entry.host.isConnected &&
+        entry.host.id.length > 0 &&
+        options.document.getElementById(entry.host.id) === entry.host &&
+        (entry.hostPosition === null ||
+          (entry.host.style.getPropertyValue('position') === 'relative' &&
+            entry.host.style.getPropertyPriority('position') === ''))
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  const sweepCommittedArtifacts = (): number => {
+    if (disposed || committedArtifactsDetached) return 0;
+    let retired = 0;
+    for (const [slotId, entry] of [...committedFrames.entries()]) {
+      if (committedFrames.get(slotId) !== entry || committedFrameCurrent(entry)) continue;
+      committedFrames.delete(slotId);
+      disposeCommittedFrame(entry);
+      retired += 1;
+    }
+    if (retired > 0) notifyNativeMutation();
+    return retired;
   };
 
   const clearOwnedTimer = (handle: unknown): void => {
@@ -792,11 +896,24 @@ export function createFirstDisplayRenderBridge(
     }
     const committedFrame = result === 'accepted' ? attempt.directFrame : undefined;
     releaseAttempt(attempt, result !== 'accepted');
-    if (committedFrame?.isConnected) {
+    const frameAttributes = committedFrame ? snapshotFrameAttributes(committedFrame) : undefined;
+    const frameContentWindow = committedFrame?.contentWindow;
+    if (committedFrame?.isConnected && frameAttributes !== undefined && frameContentWindow) {
       committedFrames.set(
         attempt.cycle.slotId,
         Object.freeze({
           frame: committedFrame,
+          frameAttributes,
+          frameContentWindow,
+          frameSource: committedFrame.src,
+          frameSourceDocument: committedFrame.srcdoc,
+          host: attempt.cycle.element,
+          hostPosition:
+            attempt.overlay && attempt.hostPositionOwned ? attempt.previousHostPosition : null,
+          hostPositionPriority:
+            attempt.overlay && attempt.hostPositionOwned
+              ? attempt.previousHostPositionPriority
+              : null,
           kind: attempt.cycle.bid.renderSource.type === 'adm' ? 'gpt_adm' : 'aps',
           owner: 'trusted_server',
           token: attempt.reservationId,
@@ -1647,6 +1764,8 @@ export function createFirstDisplayRenderBridge(
         attempt?.active && attempt.cycle === cycle && fail(attempt, 'gpt_request_failed')
       );
     },
+    retire: retireCommitted,
+    sweepCommittedArtifacts,
     sealTsAdmission: (): void => {
       if (disposed || [...attempts.values()].some((attempt) => attempt.active)) {
         throw new TypeError('tsjs');
@@ -1673,6 +1792,7 @@ export function createFirstDisplayRenderBridge(
     },
     captureHandoff: () => {
       if (disposed || !ingressClosed || handoffCaptured) return undefined;
+      sweepCommittedArtifacts();
       const observedAt = readNow();
       if (observedAt === undefined) return undefined;
       const reservationTombstones = [...reservations.entries()]
@@ -1703,6 +1823,8 @@ export function createFirstDisplayRenderBridge(
         );
       const artifacts = [...committedFrames.entries()].map(([slotId, entry]) =>
         Object.freeze({
+          hostPosition: entry.hostPosition,
+          hostPositionPriority: entry.hostPositionPriority,
           identity: entry.frame,
           kind: entry.kind,
           owner: entry.owner,
@@ -1723,6 +1845,7 @@ export function createFirstDisplayRenderBridge(
       if (disposed || !ingressClosed || !handoffCaptured || committedArtifactsDetached) {
         return false;
       }
+      if (sweepCommittedArtifacts() > 0) return false;
       committedArtifactsDetached = true;
       return true;
     },
@@ -1742,13 +1865,7 @@ export function createFirstDisplayRenderBridge(
       }
       for (const handle of [...timers]) clearOwnedTimer(handle);
       if (!committedArtifactsDetached) {
-        for (const { frame } of committedFrames.values()) {
-          try {
-            frame.remove();
-          } catch {
-            // The committed owner is terminal and cannot be restored by a hostile DOM node.
-          }
-        }
+        for (const entry of committedFrames.values()) disposeCommittedFrame(entry);
       }
       committedFrames.clear();
       attempts.clear();

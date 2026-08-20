@@ -6,7 +6,10 @@ import type {
   IntegrationPrepareContext,
   PreparedIntegration,
 } from '../../../src/kernel/integration_registry';
-import type { RenderAttempt } from '../../../src/services/render';
+import {
+  createArtifactHostPositionLeaseRegistry,
+  type RenderAttempt,
+} from '../../../src/services/render';
 import type { PucApsMountInput } from '../../../src/services/puc_bridge';
 
 const RELEASE_ID = 'a'.repeat(64);
@@ -25,6 +28,9 @@ describe('APS provider', () => {
       registeredValidation = undefined;
     });
     const render = Object.freeze({
+      bindArtifactGuard: vi.fn(() => true),
+      bootstrapNonces: Object.freeze({}),
+      hostPositions: createArtifactHostPositionLeaseRegistry(),
       publisherOrigin: window.location.origin,
       rendererNonces: Object.freeze({}),
       registerRenderer: vi.fn(
@@ -90,6 +96,9 @@ describe('APS provider', () => {
     const activationRelease: Array<() => void> = [];
     const releaseValidation = vi.fn();
     const render = Object.freeze({
+      bindArtifactGuard: vi.fn(() => true),
+      bootstrapNonces: Object.freeze({}),
+      hostPositions: createArtifactHostPositionLeaseRegistry(),
       publisherOrigin: window.location.origin,
       rendererNonces: Object.freeze({}),
       registerRenderer: vi.fn(() => {

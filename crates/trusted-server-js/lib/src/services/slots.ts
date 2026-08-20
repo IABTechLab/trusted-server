@@ -25,6 +25,7 @@ import type {
   ProjectionSlotRegistration,
   ProjectionSlotRegistry,
 } from './projections';
+import type { CommittedRenderArtifact } from './render';
 
 /** Shared maximum across server-projected and programmatically admitted slots. */
 export const MAX_ACTIVE_SLOT_RECORDS = 256;
@@ -146,6 +147,16 @@ export interface ApsSlotMountBinding {
   readonly element: object;
   readonly physicalSlot: object;
   readonly isCurrent: () => boolean;
+  readonly bindArtifact: (artifact: CommittedRenderArtifact) =>
+    | Readonly<{
+        commit: () => boolean;
+        finalize: () => void;
+        isCurrent: () => boolean;
+        previousArtifact: CommittedRenderArtifact | undefined;
+        release: () => void;
+        rollback: () => void;
+      }>
+    | undefined;
 }
 
 /** Runtime-owned slot registry and physical-cycle boundary. */
@@ -160,6 +171,12 @@ export interface SlotService {
   readonly adoptRegistrationHighWater: (
     navigationGeneration: object,
     nextOrdinal: number
+  ) => boolean;
+  readonly adoptCommittedArtifact: (
+    navigationGeneration: object,
+    registeredSlotId: string,
+    artifact: CommittedRenderArtifact,
+    onRetire?: () => void
   ) => boolean;
   readonly dispose: () => void;
   readonly handleGptEvent: (
@@ -215,9 +232,14 @@ export interface SlotService {
 }
 
 export interface SlotServiceOptions {
+  readonly bindCommittedArtifactRetirement?: (
+    artifact: CommittedRenderArtifact,
+    retire: () => void
+  ) => boolean;
   readonly disposeCommittedArtifact?: (
     navigationGeneration: object,
-    registeredSlotId: string
+    registeredSlotId: string,
+    artifact: CommittedRenderArtifact
   ) => void;
   readonly googletag: GoogletagAdapter;
   readonly now?: () => number;
@@ -270,7 +292,7 @@ interface PhysicalCycle {
 interface PhysicalSlot {
   activeCycle: PhysicalCycle | undefined;
   apsMountClaim: Readonly<{ cycle: PhysicalCycle; token: object }> | undefined;
-  artifactRetirementAttempted: boolean;
+  committedArtifact: CommittedRenderArtifact | undefined;
   bindingEpoch: object;
   definition: GoogletagReplacementDefinition | undefined;
   domElement: object | undefined;
@@ -736,6 +758,7 @@ export function createBrowserSlotReconciliationBoundary(
 
 /** Construct the document-lifetime slot registry and physical GPT cycle service. */
 export function createSlotService(options: SlotServiceOptions): SlotService {
+  const bindCommittedArtifactRetirement = options.bindCommittedArtifactRetirement;
   const navigationStates = new Map<object, NavigationState>();
   const registeredSlots = new Map<string, InternalSlotRecord>();
   const adUnitCodes = new Map<string, Set<InternalSlotRecord>>();
@@ -1030,10 +1053,15 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
   };
 
   const retireCommittedArtifact = (record: InternalSlotRecord, physical: PhysicalSlot): void => {
-    if (physical.artifactRetirementAttempted) return;
-    physical.artifactRetirementAttempted = true;
+    const artifact = physical.committedArtifact;
+    if (!artifact) return;
+    physical.committedArtifact = undefined;
     try {
-      disposeCommittedArtifact?.(record.state.owner.generation, record.view.registeredSlotId);
+      disposeCommittedArtifact?.(
+        record.state.owner.generation,
+        record.view.registeredSlotId,
+        artifact
+      );
     } catch {
       // Physical retirement remains authoritative when artifact cleanup throws.
     }
@@ -1061,7 +1089,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     const physical: PhysicalSlot = {
       activeCycle: undefined,
       apsMountClaim: undefined,
-      artifactRetirementAttempted: false,
+      committedArtifact: undefined,
       bindingEpoch: Object.freeze({}),
       definition,
       domElement,
@@ -1131,7 +1159,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     const orphan: PhysicalSlot = {
       activeCycle: undefined,
       apsMountClaim: undefined,
-      artifactRetirementAttempted: true,
+      committedArtifact: undefined,
       bindingEpoch: Object.freeze({}),
       definition: source.definition,
       domElement: undefined,
@@ -1506,10 +1534,11 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         }
         return physical.activeCycle?.traceHandle;
       }
-      if (physical.state !== 'live' || physical.activeCycle) return;
       const record = physical.record;
       const intent = record?.activeIntent;
       if (
+        physical.state === 'live' &&
+        !physical.activeCycle &&
         intent &&
         !intent.terminal &&
         intent.state === 'active' &&
@@ -1529,7 +1558,9 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         );
         return cycle.traceHandle;
       }
+      if (record) retireCommittedArtifact(record, physical);
       if (intent && !intent.terminal) settle(intent, failed('cycle_unattributable'));
+      if (physical.state !== 'live' || physical.activeCycle) return;
       return openPhysicalCycle(physical, undefined, 'publisher').traceHandle;
     }
 
@@ -2379,7 +2410,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     const physical: PhysicalSlot = {
       activeCycle: undefined,
       apsMountClaim: undefined,
-      artifactRetirementAttempted: false,
+      committedArtifact: undefined,
       bindingEpoch: Object.freeze({}),
       definition,
       domElement,
@@ -2907,6 +2938,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
   };
 
   const applyPublisherIntent = (physical: PhysicalSlot): void => {
+    if (physical.record) retireCommittedArtifact(physical.record, physical);
     if (physical.record?.activeIntent) {
       settle(physical.record.activeIntent, failed('cycle_unattributable'));
     }
@@ -3353,7 +3385,69 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         if (physical.apsMountClaim?.token === token) physical.apsMountClaim = undefined;
         return undefined;
       }
+      const bindArtifact = (
+        artifact: CommittedRenderArtifact
+      ):
+        | Readonly<{
+            commit: () => boolean;
+            finalize: () => void;
+            isCurrent: () => boolean;
+            previousArtifact: CommittedRenderArtifact | undefined;
+            release: () => void;
+            rollback: () => void;
+          }>
+        | undefined => {
+        try {
+          if (
+            !current() ||
+            !Object.isFrozen(artifact) ||
+            artifact.kind !== 'aps_mount' ||
+            artifact.slot !== registeredSlotId ||
+            artifact.navigationGeneration !== navigationGeneration
+          ) {
+            return undefined;
+          }
+          const previous = physical.committedArtifact;
+          let phase: 'prepared' | 'committed' | 'finalized' | 'released' | 'rolled_back' =
+            'prepared';
+          return Object.freeze({
+            commit: (): boolean => {
+              if (phase !== 'prepared' || !current() || physical.committedArtifact !== previous) {
+                return false;
+              }
+              physical.committedArtifact = artifact;
+              phase = 'committed';
+              return true;
+            },
+            finalize: (): void => {
+              if (phase === 'committed') phase = 'finalized';
+            },
+            isCurrent: (): boolean =>
+              (phase === 'committed' || phase === 'finalized') &&
+              physical.committedArtifact === artifact &&
+              current(),
+            previousArtifact: previous,
+            release: (): void => {
+              if (phase === 'released' || phase === 'rolled_back') return;
+              if (physical.committedArtifact === artifact) {
+                physical.committedArtifact = phase === 'committed' ? previous : undefined;
+              }
+              phase = 'released';
+            },
+            rollback: (): void => {
+              if (phase !== 'committed' && phase !== 'released') return;
+              if (phase === 'committed' && physical.committedArtifact === artifact) {
+                physical.committedArtifact = previous;
+              }
+              phase = 'rolled_back';
+            },
+          });
+        } catch {
+          return undefined;
+        }
+      };
       return Object.freeze({
+        bindArtifact,
         bindingEpoch,
         cycle: cycle.traceHandle,
         element: resolution.element,
@@ -3365,12 +3459,61 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     }
   };
 
+  const adoptCommittedArtifact = (
+    navigationGeneration: object,
+    registeredSlotId: string,
+    artifact: CommittedRenderArtifact,
+    onRetire?: () => void
+  ): boolean => {
+    try {
+      const state = mapValue(navigationStates, navigationGeneration);
+      const record = state ? mapValue(state.records, registeredSlotId) : undefined;
+      const physical = record?.physical;
+      if (
+        !state ||
+        state.disposed ||
+        !state.owner.isCurrent() ||
+        !record ||
+        !physical ||
+        physical.record !== record ||
+        physical.state !== 'live' ||
+        physical.committedArtifact !== undefined ||
+        !Object.isFrozen(artifact) ||
+        (artifact.kind !== 'aps_mount' && artifact.kind !== 'direct_iframe') ||
+        artifact.slot !== registeredSlotId ||
+        artifact.navigationGeneration !== navigationGeneration ||
+        (onRetire !== undefined && typeof onRetire !== 'function')
+      ) {
+        return false;
+      }
+      physical.committedArtifact = artifact;
+      if (
+        !bindCommittedArtifactRetirement ||
+        !bindCommittedArtifactRetirement(artifact, () => {
+          if (physical.committedArtifact === artifact) physical.committedArtifact = undefined;
+          try {
+            onRetire?.();
+          } catch {
+            // Exact physical retirement remains authoritative over targeting cleanup failure.
+          }
+        })
+      ) {
+        physical.committedArtifact = undefined;
+        return false;
+      }
+      return physical.committedArtifact === artifact;
+    } catch {
+      return false;
+    }
+  };
+
   const service: SlotService = Object.freeze({
     activate: (): void => {
       if (reconciliationActive) return;
       activateReconciliation();
     },
     activateReconciliation,
+    adoptCommittedArtifact,
     start: (): GoogletagOperation<void> => {
       if (activation) return activation;
       let subscriptions: BindingSubscriptionAdmission | undefined;

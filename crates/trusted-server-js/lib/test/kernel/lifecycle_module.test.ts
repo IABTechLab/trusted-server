@@ -134,6 +134,7 @@ describe('shared integration lifecycle module', () => {
               owner: 'trusted_server',
               outcome: 'failed',
               targeting: [],
+              targetingOwnership: [],
               committedArtifact: 'none',
               gptToken: null,
             },

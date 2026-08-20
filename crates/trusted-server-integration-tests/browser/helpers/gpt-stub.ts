@@ -297,6 +297,7 @@ export async function installGptStub(page: Page): Promise<void> {
           pairedHistoryWrappers: boolean;
         };
         refreshCount(): number;
+        publisherRefresh(slotId: string): void;
         renderUniversalCreative(slotId: string, adId: string): void;
         slot(id: string, adUnitPath?: string): StubSlot;
         targeting(slotId: string, key: string): readonly string[];
@@ -339,6 +340,21 @@ export async function installGptStub(page: Page): Promise<void> {
       },
       refreshCount() {
         return refreshCalls.length;
+      },
+      publisherRefresh(slotId: string) {
+        const slot = slots.get(slotId);
+        if (!slot || !physicalSlots.has(slot)) {
+          throw new Error(`missing fictional publisher slot: ${slotId}`);
+        }
+        pubadsService.refresh([slot]);
+        emissions.push({
+          name: "slotRequested",
+          listeners: listeners.get("slotRequested")?.size ?? 0,
+          physical: physicalSlots.has(slot),
+        });
+        emit("slotRequested", slot, {
+          responseIdentifier: "fictional-publisher-refresh",
+        });
       },
       targeting(slotId: string, key: string) {
         return slots.get(slotId)?.getTargeting(key) ?? [];
@@ -412,12 +428,12 @@ export async function installGptStub(page: Page): Promise<void> {
           window.history.replaceState !== references.replaceState;
         return {
           diagnosticsSafe:
-          commandQueue.push === references.commandPush &&
-          googletag.display === references.display &&
-          googletag.defineSlot === references.defineSlot &&
-          pubadsService.refresh === references.refresh &&
-          window.fetch === references.fetch &&
-          window.XMLHttpRequest.prototype.open === references.xhrOpen,
+            commandQueue.push === references.commandPush &&
+            googletag.display === references.display &&
+            googletag.defineSlot === references.defineSlot &&
+            pubadsService.refresh === references.refresh &&
+            window.fetch === references.fetch &&
+            window.XMLHttpRequest.prototype.open === references.xhrOpen,
           pairedHistoryWrappers: pushStateChanged && replaceStateChanged,
         };
       },

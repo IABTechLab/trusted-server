@@ -52,6 +52,7 @@ function acceptedHandoff(revision: number): Record<string, unknown> {
         owner: 'trusted_server',
         outcome: 'accepted',
         targeting: [['hb_adid', RESERVATION_ID]],
+        targetingOwnership: [],
         committedArtifact: 'gpt_adm',
         gptToken: 'gt1_1',
       },
@@ -67,6 +68,8 @@ function acceptedHandoff(revision: number): Record<string, unknown> {
     ],
     artifacts: [
       {
+        hostPosition: null,
+        hostPositionPriority: null,
         slotId: 'slot-1',
         kind: 'gpt_adm',
         owner: 'trusted_server',
@@ -243,6 +246,7 @@ describe('first-display final handoff owner', () => {
               owner: 'trusted_server',
               outcome: 'failed',
               targeting: [],
+              targetingOwnership: [],
               committedArtifact: 'none',
               gptToken: null,
             },

@@ -30,6 +30,7 @@ import type { RuntimeCapabilityV1 } from '../../kernel/runtime';
 import type { NavigationSession, RenderAttemptScope, RuntimeSession } from '../../kernel/sessions';
 import type { IdentityGenerationResult } from '../../kernel/identity';
 import type {
+  CommittedArtifactStore,
   CommittedRenderArtifact,
   RenderAttempt,
   RenderAttemptCreationResult,
@@ -267,7 +268,13 @@ export function adoptInitialGptFactsFromHandoff(
 export function adoptInitialGptSlotsFromHandoff(
   candidate: unknown,
   navigationGeneration: object,
-  service: Pick<SlotService, 'adoptGptSlot' | 'adoptRegistrationHighWater'>
+  service: Pick<
+    SlotService,
+    'adoptCommittedArtifact' | 'adoptGptSlot' | 'adoptRegistrationHighWater'
+  >,
+  artifactStore: Pick<CommittedArtifactStore, 'current'>,
+  targeting: Pick<TargetingService, 'adopt' | 'observePublisherMutations'>,
+  adapter: GoogletagAdapter
 ): PersistentFirstDisplayAdoptionV1 | undefined {
   const adoption = snapshotPersistentFirstDisplayAdoptionV1(candidate);
   if (!adoption) return undefined;
@@ -304,12 +311,14 @@ export function adoptInitialGptSlotsFromHandoff(
     const domId = dataField(placement, 'domId');
     const gamPath = dataField(placement, 'gamPath');
     const formats = frozenArray(dataField(placement, 'formats'));
+    const targetingOwnership = frozenArray(dataField(placement, 'targetingOwnership'));
     if (
       typeof slotId !== 'string' ||
       adopted.has(slotId) ||
       (owner !== 'publisher' && owner !== 'trusted_server') ||
       typeof identity !== 'object' ||
       identity === null ||
+      !targetingOwnership ||
       (owner === 'trusted_server' &&
         (typeof domId !== 'string' || typeof gamPath !== 'string' || !formats))
     ) {
@@ -329,6 +338,75 @@ export function adoptInitialGptSlotsFromHandoff(
         : { ownership: owner, slot: identity };
     const result = service.adoptGptSlot(navigationGeneration, slotId, binding);
     if (!result.ok) return undefined;
+    const artifact = artifactStore.current(slotId);
+    if (!artifact) return undefined;
+    const releases: TargetingOwnership[] = [];
+    let observation: ReturnType<TargetingService['observePublisherMutations']> | undefined;
+    const releaseTargeting = (): void => {
+      for (let releaseIndex = releases.length - 1; releaseIndex >= 0; releaseIndex -= 1) {
+        try {
+          releases[releaseIndex]?.release();
+        } catch {
+          // Exact artifact retirement contains hostile GPT targeting cleanup.
+        }
+      }
+      releases.length = 0;
+      try {
+        observation?.dispose();
+      } catch {
+        // Adapter observation cleanup cannot restore retired ownership.
+      }
+      observation = undefined;
+    };
+    try {
+      if (targetingOwnership.length > 0) {
+        observation = targeting.observePublisherMutations(identity, adapter);
+        if (observation.status !== 'present') {
+          releaseTargeting();
+          return undefined;
+        }
+        const boundary = synchronousTargetingBoundary(adapter, identity);
+        for (
+          let ownershipIndex = 0;
+          ownershipIndex < targetingOwnership.length;
+          ownershipIndex += 1
+        ) {
+          const ownership = targetingOwnership[ownershipIndex];
+          const key = dataField(ownership, 'key');
+          const installed = dataField(ownership, 'installed');
+          const prior = frozenArray(dataField(ownership, 'prior'));
+          if (
+            typeof key !== 'string' ||
+            typeof installed !== 'string' ||
+            !prior ||
+            prior.some((value) => typeof value !== 'string')
+          ) {
+            releaseTargeting();
+            return undefined;
+          }
+          const adopted = targeting.adopt(
+            identity,
+            key,
+            installed,
+            prior as readonly string[],
+            artifact.attemptId,
+            boundary
+          );
+          if (!adopted) {
+            releaseTargeting();
+            return undefined;
+          }
+          releases.push(adopted);
+        }
+      }
+    } catch {
+      releaseTargeting();
+      return undefined;
+    }
+    if (!service.adoptCommittedArtifact(navigationGeneration, slotId, artifact, releaseTargeting)) {
+      releaseTargeting();
+      return undefined;
+    }
     adopted.add(slotId);
   }
   return adoption;
@@ -428,6 +506,10 @@ interface ProductionRenderCapability {
     current: (slot: string) => CommittedRenderArtifact | undefined;
     release: (artifact: CommittedRenderArtifact) => boolean;
   }>;
+  readonly bindArtifactRetirement: (
+    artifact: CommittedRenderArtifact,
+    retire: () => void
+  ) => boolean;
   readonly createAttempt: (
     owner: RenderAttemptScope,
     parentAttemptId?: string
@@ -1596,6 +1678,7 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
     typeof runtime.protectFirstDisplayAttemptBatch !== 'function' ||
     typeof slotCapability.attachPhysicalService !== 'function' ||
     typeof render.attachPucGamAttemptRegistrar !== 'function' ||
+    typeof render.bindArtifactRetirement !== 'function' ||
     typeof render.createAttempt !== 'function' ||
     typeof render.createSlotOperation !== 'function' ||
     typeof render.commitPageBids !== 'function' ||
@@ -1625,9 +1708,10 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
     document.defaultView.MutationObserver
   );
   const slots = createSlotService({
-    disposeCommittedArtifact: (navigationGeneration, registeredSlotId) => {
+    bindCommittedArtifactRetirement: render.bindArtifactRetirement,
+    disposeCommittedArtifact: (navigationGeneration, registeredSlotId, expectedArtifact) => {
       const artifact = render.artifacts.current(registeredSlotId);
-      if (artifact?.navigationGeneration === navigationGeneration)
+      if (artifact === expectedArtifact && artifact.navigationGeneration === navigationGeneration)
         render.artifacts.release(artifact);
     },
     googletag,
@@ -1849,7 +1933,10 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
           : adoptInitialGptSlotsFromHandoff(
               adoptionCandidate,
               auction.navigation.generation,
-              slots
+              slots,
+              render.artifacts,
+              targeting,
+              googletag
             );
       if (adoptionCandidate !== undefined && (!diagnosticsAdoption || !adoption)) {
         throw new TypeError('GPT first-display adoption is invalid');

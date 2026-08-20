@@ -67,7 +67,10 @@ export function createFirstDisplayAdmRenderBridge(
   options: FirstDisplayAdmRenderBridgeOptionsV1
 ): FirstDisplayRenderBridgeV1 {
   const attempts = new Map<string, AdmAttempt>();
-  const committedFrames = new Map<string, Readonly<{ frame: HTMLIFrameElement; token: string }>>();
+  const committedFrames = new Map<
+    string,
+    Readonly<{ frame: HTMLIFrameElement; host: HTMLElement; token: string }>
+  >();
   const timers = new Set<unknown>();
   let nextReservationOrdinal = 1;
   let lastNow = Number.NEGATIVE_INFINITY;
@@ -130,7 +133,11 @@ export function createFirstDisplayAdmRenderBridge(
     if (result === 'accepted' && frame?.isConnected) {
       committedFrames.set(
         attempt.cycle.slotId,
-        Object.freeze({ frame, token: attempt.cycle.bid.rendererReservationId })
+        Object.freeze({
+          frame,
+          host: attempt.cycle.element,
+          token: attempt.cycle.bid.rendererReservationId,
+        })
       );
     } else if (frame) {
       try {
@@ -150,6 +157,54 @@ export function createFirstDisplayAdmRenderBridge(
     return true;
   };
   const fail = (attempt: AdmAttempt, reason: string): boolean => settle(attempt, 'failed', reason);
+  const retireCommitted = (cycle: FirstDisplayGptBoundCycleV1): boolean => {
+    if (disposed || committedArtifactsDetached) return false;
+    const entry = committedFrames.get(cycle.slotId);
+    if (!entry || entry.token !== cycle.bid.rendererReservationId) return false;
+    committedFrames.delete(cycle.slotId);
+    try {
+      entry.frame.onload = null;
+      entry.frame.onerror = null;
+      entry.frame.remove();
+    } catch {
+      // The exact TS frame loses authority even when hostile DOM cleanup fails.
+    }
+    notifyNativeMutation();
+    return true;
+  };
+  const sweepCommittedArtifacts = (): number => {
+    if (disposed || committedArtifactsDetached) return 0;
+    let retired = 0;
+    for (const [slotId, entry] of [...committedFrames.entries()]) {
+      const current = (() => {
+        try {
+          return (
+            entry.frame.ownerDocument === options.document &&
+            entry.host.ownerDocument === options.document &&
+            entry.frame.parentNode === entry.host &&
+            entry.frame.isConnected &&
+            entry.host.isConnected &&
+            entry.host.id.length > 0 &&
+            options.document.getElementById(entry.host.id) === entry.host
+          );
+        } catch {
+          return false;
+        }
+      })();
+      if (committedFrames.get(slotId) !== entry || current) continue;
+      committedFrames.delete(slotId);
+      try {
+        entry.frame.onload = null;
+        entry.frame.onerror = null;
+        entry.frame.remove();
+      } catch {
+        // The exact TS frame loses authority even when hostile DOM cleanup fails.
+      }
+      retired += 1;
+    }
+    if (retired > 0) notifyNativeMutation();
+    return retired;
+  };
 
   return Object.freeze({
     bind: (cycle: FirstDisplayGptBoundCycleV1, onTerminal: AdmAttempt['onTerminal']): boolean => {
@@ -222,6 +277,8 @@ export function createFirstDisplayAdmRenderBridge(
         attempt?.active && attempt.cycle === cycle && fail(attempt, 'gpt_request_failed')
       );
     },
+    retire: retireCommitted,
+    sweepCommittedArtifacts,
     sealTsAdmission: (): void => {
       if (disposed || sealed || [...attempts.values()].some(({ active }) => active)) {
         throw new TypeError('tsjs');
@@ -236,6 +293,7 @@ export function createFirstDisplayAdmRenderBridge(
     },
     captureHandoff: () => {
       if (disposed || !ingressClosed || handoffCaptured) return undefined;
+      sweepCommittedArtifacts();
       const observedAt = readNow();
       if (observedAt === undefined) return undefined;
       handoffCaptured = true;
@@ -243,6 +301,8 @@ export function createFirstDisplayAdmRenderBridge(
         artifacts: Object.freeze(
           [...committedFrames.entries()].map(([slotId, { frame, token }]) =>
             Object.freeze({
+              hostPosition: null,
+              hostPositionPriority: null,
               identity: frame,
               kind: 'gpt_adm' as const,
               owner: 'trusted_server' as const,
@@ -272,6 +332,7 @@ export function createFirstDisplayAdmRenderBridge(
       if (disposed || !ingressClosed || !handoffCaptured || committedArtifactsDetached) {
         return false;
       }
+      if (sweepCommittedArtifacts() > 0) return false;
       committedArtifactsDetached = true;
       return true;
     },
@@ -285,6 +346,8 @@ export function createFirstDisplayAdmRenderBridge(
       if (!committedArtifactsDetached) {
         for (const { frame } of committedFrames.values()) {
           try {
+            frame.onload = null;
+            frame.onerror = null;
             frame.remove();
           } catch {
             // A terminal owner cannot regain authority through a retained node.

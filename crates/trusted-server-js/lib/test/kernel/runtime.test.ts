@@ -194,6 +194,7 @@ function takeoverHandoff() {
           owner: 'trusted_server',
           outcome: 'failed',
           targeting: [],
+          targetingOwnership: [],
           committedArtifact: 'none',
           gptToken: null,
         },

@@ -89,7 +89,10 @@ function harness() {
       dropCount: 0,
     })),
     captureHandoff: vi.fn(() => [cycleOwner.value].filter(Boolean)),
-    closeIngress: vi.fn(() => true),
+    closeIngress: vi.fn(() => {
+      events.push('gpt:close');
+      return true;
+    }),
     detachCommittedSlots: vi.fn(() => true),
     dispose: vi.fn(),
   };
@@ -109,6 +112,8 @@ function harness() {
       return true;
     }),
     recordFailure: vi.fn(() => true),
+    retire: vi.fn(() => true),
+    sweepCommittedArtifacts: vi.fn(() => 0),
     captureHandoff: vi.fn(() => ({
       artifacts: [],
       clockEpochMs: 0,
@@ -116,7 +121,10 @@ function harness() {
       nextTicketOrdinal: 1,
       tombstones: [],
     })),
-    closeIngress: vi.fn(() => true),
+    closeIngress: vi.fn(() => {
+      events.push('render:close');
+      return true;
+    }),
     detachCommittedArtifacts: vi.fn(() => true),
     sealTsAdmission: vi.fn(() => events.push('render:seal')),
     dispose: vi.fn(() => events.push('render:dispose')),
@@ -176,6 +184,10 @@ describe('projected first-display driver', () => {
     h.getRenderTerminal()('failed', 'internal_error');
     expect(h.events).toEqual(['render:bind', 'action', 'render:gam:nonempty_gam']);
     expect(h.terminals).toEqual([['slot-1', 'accepted', null]]);
+
+    h.getGptCallbacks().onRetire?.(h.cycle);
+    h.getGptCallbacks().onRetire?.(Object.freeze({ ...h.cycle, physicalSlot: {} }));
+    expect(h.renderer.retire).toHaveBeenCalledExactlyOnceWith(h.cycle);
   });
 
   it('fails an empty or mismatched physical GPT cycle without guessing', () => {
@@ -219,6 +231,8 @@ describe('projected first-display driver', () => {
     h.driver.sealTsAdmission();
 
     expect(h.driver.closeIngress()).toBe(true);
+    expect(h.gptBatch.closeIngress).toHaveBeenCalledExactlyOnceWith(['slot-1']);
+    expect(h.events.slice(-2)).toEqual(['gpt:close', 'render:close']);
     expect(h.driver.captureHandoff()).toEqual({
       artifacts: [],
       clockEpochMs: 0,
@@ -275,6 +289,8 @@ describe('projected first-display driver', () => {
         bind: () => true,
         recordGam: () => true,
         recordFailure: () => true,
+        retire: () => true,
+        sweepCommittedArtifacts: () => 0,
         captureHandoff: () => ({
           artifacts: [],
           clockEpochMs: 0,
