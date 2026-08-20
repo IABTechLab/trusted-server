@@ -1049,6 +1049,7 @@ export function installTsAdInit(): void {
           if (bid[key]) gptSlot.setTargeting(key, String(bid[key]!));
         });
         gptSlot.setTargeting(TS_INITIAL_TARGETING_KEY, '1');
+        const requestedSlotSizes = ts.gptSlotHandoffs?.[slotDivId2]?.formats;
         // Diagnostics are observational only. A missing or malformed debug
         // implementation must never interrupt slot mapping or delivery.
         try {
@@ -1058,7 +1059,7 @@ export function installTsAdInit(): void {
             slot.id,
             opportunity,
             bid.hb_auction_id,
-            slot.formats
+            requestedSlotSizes
           );
         } catch {
           // Diagnostics must not alter ad delivery.

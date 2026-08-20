@@ -271,6 +271,20 @@ describe('GptDiagnosticsBadgeManager', () => {
     expect(
       gptDiagnosticsBadgeTextForTest({
         requestNumber: 1,
+        isEmpty: false,
+        requestedSlotSizes: [
+          [300, 250],
+          [320, 50],
+          [728, 90],
+          [970, 250],
+        ],
+        incompleteSequence: false,
+        durations: {},
+      })
+    ).toBe('Filled · Requested 300×250, 320×50, 728×90 +1');
+    expect(
+      gptDiagnosticsBadgeTextForTest({
+        requestNumber: 1,
         isEmpty: true,
         incompleteSequence: false,
         durations: {},

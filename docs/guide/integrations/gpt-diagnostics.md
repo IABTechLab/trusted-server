@@ -293,12 +293,14 @@ separate facts as requested slot sizes, GPT-reported fill size, and observed out
 box. The observed box may differ from GPT's reported size (for example, a flexible APS
 creative can report `1×1` while its allocated outer slot box is larger). It is a
 publisher-page layout measurement, not a claim about universal internal creative-pixel
-dimensions. Empty, unbound, missing, or ambiguous slots do not report an observed box;
-delayed measurements from an older cycle are rejected after a refresh.
+dimensions. A collapsed or hidden bound element can report `0×0`, which records the
+page layout state rather than an invalid measurement. Empty, unbound, missing, or
+ambiguous slots do not report an observed box; delayed measurements from an older cycle
+are rejected after a refresh.
 
 Cross-origin and SafeFrame boundaries prevent diagnostics from inspecting iframe
-content. It does not inspect iframe content or alter the APS sandbox, so it cannot
-use this field to prove the inner creative's pixels.
+content or altering the APS sandbox, so this field cannot prove the inner creative's
+pixels.
 
 Badges and the panel live in a closed Shadow DOM. Diagnostics do not add attributes,
 classes, or inline styles to publisher slot elements.
@@ -388,7 +390,7 @@ inaccessible to JavaScript.
 - Retained request cycles per slot: 10.
 - Retained callback issues: 128.
 - Retained auction-slot-to-GPT-slot associations: 64.
-- Requested slot sizes per correlated request: 16 valid positive sizes.
+- Requested slot sizes per correlated request: the first 16 configured entries, with invalid entries dropped.
 - Retained creative attempts, including status tombstones: 128.
 - Retained attribution issues: 128.
 
