@@ -40,7 +40,8 @@ install_browsers() {
 
 run_browser_matrix() {
   cd "$repository_root/crates/trusted-server-integration-tests/browser"
-  npx playwright test \
+  TS_BROWSER_PROJECTS=chromium,firefox,webkit \
+    npx playwright test \
     tests/shared/aps-renderer.spec.ts \
     tests/shared/aps-puc-lifecycle.spec.ts \
     tests/shared/tsjs-runtime.spec.ts \

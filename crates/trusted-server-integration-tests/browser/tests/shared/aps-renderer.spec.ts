@@ -9,7 +9,8 @@ const APS_TEST_RENDERER_URL = `${APS_TEST_ORIGIN}/integrations/aps/renderer/v2`;
 const APS_TEST_RUNNER_URL = `${APS_TEST_ORIGIN}/integrations/aps/runner.js`;
 const SANDBOX =
   "allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation";
-const PERMANENT_SANDBOX = `${SANDBOX} allow-same-origin`;
+const PERMANENT_SANDBOX =
+  "allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts allow-top-navigation-by-user-activation";
 const FICTIONAL_APS_RUNNER = readFileSync(
   resolve(__dirname, "../../fixtures/fictional-aps-runner.js"),
   "utf8",
@@ -91,6 +92,7 @@ test.describe("APS renderer v2 protocol", () => {
 
   test("uses one port, reports ordered progress, and fails closed", async ({
     page,
+    browserName,
   }) => {
     test.setTimeout(60_000);
     const rendererResponse = await page.request.get(
@@ -615,7 +617,15 @@ window.startApsV2 = function(options) {
       })),
     ).toEqual({ allowed: "executed", unrelated: undefined });
 
-    await start("creative-redirect", "creative-redirect-bid", {
+    // WebKit's Playwright interception backend cannot synthesize a redirect
+    // response. Exercise the same exact-origin CSP boundary there by asking the
+    // fictional runner to attempt the redirected final URL directly; Chromium
+    // and Firefox retain the end-to-end redirect case.
+    const redirectBidId =
+      browserName === "webkit"
+        ? "creative-cross-origin-bid"
+        : "creative-redirect-bid";
+    await start("creative-redirect", redirectBidId, {
       creativeUrl: "https://creative.example/script-redirect.js",
       tagType: "script",
     });
@@ -675,29 +685,36 @@ window.startApsV2 = function(options) {
         await expect(frame).toHaveAttribute("width", String(width));
         await expect(frame).toHaveAttribute("height", String(height));
       }
-      for (const frame of [outerFrame, innerFrame, creativeFrame]) {
-        expect(
-          await frame.evaluate((element) => {
-            const value = element as HTMLElement;
-            const box = value.getBoundingClientRect();
-            const computed = getComputedStyle(value);
-            return {
-              width: box.width,
-              height: box.height,
-              clientWidth: value.clientWidth,
-              clientHeight: value.clientHeight,
-              margin: computed.margin,
-              overflow: computed.overflow,
-            };
-          }),
-        ).toEqual({
+      for (const [frame, declaredOverflow] of [
+        [outerFrame, "hidden"],
+        [innerFrame, ""],
+        [creativeFrame, "hidden"],
+      ] as const) {
+        const frameBox = await frame.evaluate((element) => {
+          const value = element as HTMLElement;
+          const box = value.getBoundingClientRect();
+          const computed = getComputedStyle(value);
+          return {
+            width: box.width,
+            height: box.height,
+            clientWidth: value.clientWidth,
+            clientHeight: value.clientHeight,
+            margin: computed.margin,
+            declaredOverflow: value.style.overflow,
+            computedOverflow: computed.overflow,
+          };
+        });
+        expect(frameBox).toMatchObject({
           width,
           height,
           clientWidth: width,
           clientHeight: height,
           margin: "0px",
-          overflow: "hidden",
+          declaredOverflow,
         });
+        // Chromium normalizes overflow on replaced iframe elements to `clip`;
+        // Firefox/WebKit may preserve the declared `hidden` computed value.
+        expect(["clip", "hidden"]).toContain(frameBox.computedOverflow);
       }
       for (const frame of [outer, inner, creative]) {
         expect(

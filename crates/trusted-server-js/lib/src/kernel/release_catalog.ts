@@ -466,7 +466,15 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     include: 'integration:gpt',
     config: 'gpt',
     provides: ['gpt.v1', 'gpt.events.v1', 'pbs_cache.baseline.v1'],
-    consumes: ['runtime.v1', 'slots.v1', 'auction.v1', 'render.v1', 'messages.v1', 'trace.v1'],
+    consumes: [
+      'runtime.v1',
+      'slots.v1',
+      'auction.v1',
+      'render.v1',
+      'messages.v1',
+      'trace.v1',
+      'aps.v1?aps',
+    ],
     obligation:
       'Sole GPT adapter/listeners plus every initial handoff/hydration/reconciliation path',
   }),

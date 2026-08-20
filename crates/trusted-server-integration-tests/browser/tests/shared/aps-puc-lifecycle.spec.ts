@@ -84,6 +84,19 @@ function boot() {
         },
       ],
     },
+    integrations: {
+      version: 1,
+      entries: [
+        { id: "aps", config: {} },
+        {
+          id: "gpt",
+          config: {
+            gamAttributionEnabled: false,
+            pageBidsEnabled: true,
+          },
+        },
+      ],
+    },
     creative: {
       version: 1,
       enabled: false,
@@ -152,7 +165,6 @@ async function openLifecyclePage(
       browserWindow.tsjs = {
         boot: initialBoot,
         que: [],
-        _integrationConfig: { aps: {}, gpt: {} },
       };
     },
     {
@@ -355,7 +367,7 @@ test.describe("APS/PUC lifecycle over the hard-cutover runtime", () => {
       )
       .toMatchObject({
         lifecycle: ["accepted", "failed:fictional PUC response refused"],
-        ownerFrames: [1, 0],
+        ownerFrames: [0, 0],
         pucFrames: 2,
       });
 

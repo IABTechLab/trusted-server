@@ -46,7 +46,7 @@ const EXPECTED_CATALOG = Object.freeze([
     'gpt',
     'takeover',
     'integration:gpt',
-    ['runtime.v1', 'slots.v1', 'auction.v1', 'render.v1', 'messages.v1', 'trace.v1'],
+    ['runtime.v1', 'slots.v1', 'auction.v1', 'render.v1', 'messages.v1', 'trace.v1', 'aps.v1?aps'],
     ['gpt.v1', 'gpt.events.v1', 'pbs_cache.baseline.v1'],
   ],
   [

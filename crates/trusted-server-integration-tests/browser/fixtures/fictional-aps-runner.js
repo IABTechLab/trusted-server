@@ -92,7 +92,10 @@
             creative.style.margin = "0";
             creative.style.overflow = "hidden";
           }
-          creative.src = bid.ext.creativeurl;
+          creative.src =
+            bidId.indexOf("creative-cross-origin-") === 0
+              ? "https://redirect.example/final.js"
+              : bid.ext.creativeurl;
           document.body.appendChild(creative);
           return;
         }

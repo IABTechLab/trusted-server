@@ -145,7 +145,6 @@ test.describe("TSJS hard-cutover runtime", () => {
       browserWindow.tsjs = {
         boot: initialBoot,
         que,
-        _integrationConfig: {},
         bids: { legacy: true },
         renderAdUnit() {},
         renderAllAdUnits() {},
@@ -230,7 +229,6 @@ test.describe("TSJS hard-cutover runtime", () => {
         browserWindow.tsjs = {
           boot: { ...initialBoot, manifest: { version: 2, releaseId } },
           que: [],
-          _integrationConfig: {},
         };
       },
       {
