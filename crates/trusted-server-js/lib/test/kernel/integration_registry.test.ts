@@ -146,6 +146,7 @@ describe('integration manifest and registration admission', () => {
                 owner: 'trusted_server',
                 outcome: 'failed',
                 targeting: [],
+                targetingOwnership: [],
                 committedArtifact: 'none',
                 gptToken: null,
               },

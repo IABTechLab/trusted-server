@@ -15,7 +15,12 @@ import {
   createRenderRuntimeIntegrationRegistration,
 } from '../../../src/integrations/render_runtime/module';
 import { log } from '../../../src/core/log';
-import { createCommittedArtifactStore, type RenderAttempt } from '../../../src/services/render';
+import {
+  createArtifactHostPositionLeaseRegistry,
+  createCommittedArtifactStore,
+  type CommittedRenderArtifact,
+  type RenderAttempt,
+} from '../../../src/services/render';
 import type { NavigationSession } from '../../../src/kernel/sessions';
 
 const RELEASE_ID = 'a'.repeat(64);
@@ -126,17 +131,31 @@ describe('render_runtime provider', () => {
   });
 
   it('adopts transferred DOM artifacts without removing them on rollback, then arms commit ownership', () => {
+    const host = document.createElement('div');
+    host.id = 'div-1';
     const frame = document.createElement('iframe');
-    document.body.append(frame);
+    frame.srcdoc = '<!doctype html><title>Fictional creative</title>';
+    host.append(frame);
+    document.body.append(host);
+    const physicalSlot = Object.freeze({});
     const adoption = Object.freeze({
       version: 1 as const,
       adoptInitialDisplay: true as const,
       handoff: Object.freeze({
-        slots: Object.freeze([Object.freeze({ id: 'slot-1' })]),
-        cycles: Object.freeze([]),
-        artifacts: Object.freeze([Object.freeze({ slotId: 'slot-1' })]),
+        slots: Object.freeze([Object.freeze({ id: 'slot-1', domId: 'div-1' })]),
+        cycles: Object.freeze([Object.freeze({ slotId: 'slot-1' })]),
+        artifacts: Object.freeze([
+          Object.freeze({
+            hostPosition: null,
+            hostPositionPriority: null,
+            kind: 'gpt_adm' as const,
+            owner: 'trusted_server' as const,
+            slotId: 'slot-1',
+            token: `r1_${'a'.repeat(22)}`,
+          }),
+        ]),
       }),
-      identities: Object.freeze([frame]),
+      identities: Object.freeze([physicalSlot, frame]),
     });
     const navigationGeneration = {};
     const batch = Object.freeze({
@@ -159,7 +178,13 @@ describe('render_runtime provider', () => {
 
     const rollbackStore = createCommittedArtifactStore();
     expect(
-      adoptInitialRenderArtifactsFromHandoff(adoption, navigation, rollbackStore, document)
+      adoptInitialRenderArtifactsFromHandoff(
+        adoption,
+        navigation,
+        rollbackStore,
+        createArtifactHostPositionLeaseRegistry(),
+        document
+      )
     ).toBeDefined();
     rollbackStore.dispose();
     expect(frame.isConnected).toBe(true);
@@ -169,6 +194,7 @@ describe('render_runtime provider', () => {
       adoption,
       navigation,
       committedStore,
+      createArtifactHostPositionLeaseRegistry(),
       document
     );
     expect(committed?.adoption).toBe(adoption);
@@ -176,6 +202,215 @@ describe('render_runtime provider', () => {
     committedStore.dispose();
     expect(frame.isConnected).toBe(false);
     expect(batch.dispose).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['reparented', 'frame_style'] as const)(
+    'retires an adopted APS mount on %s loss and compare-restores only owned style',
+    (mutation) => {
+      const host = document.createElement('div');
+      host.id = 'div-1';
+      host.style.setProperty('position', 'relative');
+      const frame = document.createElement('iframe');
+      frame.setAttribute('sandbox', 'allow-scripts');
+      frame.src = 'https://example.com/renderer';
+      host.append(frame);
+      document.body.append(host);
+      const physicalSlot = Object.freeze({});
+      const navigationGeneration = {};
+      const batch = Object.freeze({
+        createRenderAttempt: vi.fn(() =>
+          Object.freeze({
+            ok: true as const,
+            value: Object.freeze({ id: `a1_${'A'.repeat(22)}`, navigationGeneration }),
+          })
+        ),
+        dispose: vi.fn(),
+      });
+      const navigation = Object.freeze({
+        generation: navigationGeneration,
+        createAuctionBatch: vi.fn(() => batch),
+        isCurrent: () => true,
+      }) as unknown as NavigationSession;
+      const adoption = Object.freeze({
+        version: 1 as const,
+        adoptInitialDisplay: true as const,
+        handoff: Object.freeze({
+          slots: Object.freeze([Object.freeze({ id: 'slot-1', domId: 'div-1' })]),
+          cycles: Object.freeze([Object.freeze({ slotId: 'slot-1' })]),
+          artifacts: Object.freeze([
+            Object.freeze({
+              hostPosition: '',
+              hostPositionPriority: '',
+              kind: 'aps' as const,
+              owner: 'trusted_server' as const,
+              slotId: 'slot-1',
+              token: `r1_${'a'.repeat(22)}`,
+            }),
+          ]),
+        }),
+        identities: Object.freeze([physicalSlot, frame]),
+      });
+      const store = createCommittedArtifactStore();
+      const committed = adoptInitialRenderArtifactsFromHandoff(
+        adoption,
+        navigation,
+        store,
+        createArtifactHostPositionLeaseRegistry(),
+        document
+      );
+      expect(committed).toBeDefined();
+      committed?.arm();
+
+      if (mutation === 'reparented') {
+        const publisherContainer = document.createElement('div');
+        document.body.append(publisherContainer);
+        publisherContainer.append(frame);
+      } else {
+        frame.style.setProperty('visibility', 'hidden');
+      }
+
+      expect(store.sweep()).toBe(1);
+      expect(frame.isConnected).toBe(false);
+      expect(host.style.getPropertyValue('position')).toBe('');
+      expect(store.sweep()).toBe(0);
+    }
+  );
+
+  it('transfers an adopted APS host-position lease through persistent replacement', () => {
+    const host = document.createElement('div');
+    host.id = 'div-1';
+    host.style.setProperty('position', 'relative');
+    const frame = document.createElement('iframe');
+    frame.src = 'https://example.com/renderer';
+    host.append(frame);
+    document.body.append(host);
+    const physicalSlot = Object.freeze({});
+    const navigationGeneration = {};
+    const batch = Object.freeze({
+      createRenderAttempt: vi.fn(() =>
+        Object.freeze({
+          ok: true as const,
+          value: Object.freeze({ id: `a1_${'A'.repeat(22)}`, navigationGeneration }),
+        })
+      ),
+      dispose: vi.fn(),
+    });
+    const navigation = Object.freeze({
+      generation: navigationGeneration,
+      createAuctionBatch: vi.fn(() => batch),
+      isCurrent: () => true,
+    }) as unknown as NavigationSession;
+    const adoption = Object.freeze({
+      version: 1 as const,
+      adoptInitialDisplay: true as const,
+      handoff: Object.freeze({
+        slots: Object.freeze([Object.freeze({ id: 'slot-1', domId: 'div-1' })]),
+        cycles: Object.freeze([Object.freeze({ slotId: 'slot-1' })]),
+        artifacts: Object.freeze([
+          Object.freeze({
+            hostPosition: '',
+            hostPositionPriority: '',
+            kind: 'aps' as const,
+            owner: 'trusted_server' as const,
+            slotId: 'slot-1',
+            token: `r1_${'a'.repeat(22)}`,
+          }),
+        ]),
+      }),
+      identities: Object.freeze([physicalSlot, frame]),
+    });
+    const store = createCommittedArtifactStore();
+    const positions = createArtifactHostPositionLeaseRegistry();
+    const committed = adoptInitialRenderArtifactsFromHandoff(
+      adoption,
+      navigation,
+      store,
+      positions,
+      document
+    );
+    expect(committed).toBeDefined();
+    committed?.arm();
+    const predecessor = store.current('slot-1');
+    if (!predecessor) throw new Error('should adopt the first-display APS artifact');
+    let replacementDisposed = false;
+    const replacement: CommittedRenderArtifact = Object.freeze({
+      attemptId: `a1_${'B'.repeat(22)}`,
+      kind: 'aps_mount' as const,
+      navigationGeneration,
+      slot: 'slot-1',
+      dispose: () => {
+        if (replacementDisposed) return;
+        replacementDisposed = true;
+        positions.release(replacement);
+      },
+    });
+
+    expect(positions.inherit(replacement, predecessor, host)).toBe(true);
+    expect(positions.claim(replacement)).toBe(true);
+    expect(store.promote(replacement)).toBe(true);
+    expect(frame.isConnected).toBe(false);
+    expect(host.style.getPropertyValue('position')).toBe('relative');
+
+    expect(store.release(replacement)).toBe(true);
+    expect(host.style.getPropertyValue('position')).toBe('');
+  });
+
+  it('does not restore an adopted APS host style after a publisher replaces it', () => {
+    const host = document.createElement('div');
+    host.id = 'div-1';
+    host.style.setProperty('position', 'relative');
+    const frame = document.createElement('iframe');
+    host.append(frame);
+    document.body.append(host);
+    const navigationGeneration = {};
+    const batch = Object.freeze({
+      createRenderAttempt: () =>
+        Object.freeze({
+          ok: true as const,
+          value: Object.freeze({ id: `a1_${'A'.repeat(22)}`, navigationGeneration }),
+        }),
+      dispose: vi.fn(),
+    });
+    const navigation = Object.freeze({
+      generation: navigationGeneration,
+      createAuctionBatch: () => batch,
+      isCurrent: () => true,
+    }) as unknown as NavigationSession;
+    const adoption = Object.freeze({
+      version: 1 as const,
+      adoptInitialDisplay: true as const,
+      handoff: Object.freeze({
+        slots: Object.freeze([Object.freeze({ id: 'slot-1', domId: 'div-1' })]),
+        cycles: Object.freeze([Object.freeze({ slotId: 'slot-1' })]),
+        artifacts: Object.freeze([
+          Object.freeze({
+            hostPosition: '',
+            hostPositionPriority: '',
+            kind: 'aps' as const,
+            owner: 'trusted_server' as const,
+            slotId: 'slot-1',
+            token: `r1_${'a'.repeat(22)}`,
+          }),
+        ]),
+      }),
+      identities: Object.freeze([Object.freeze({}), frame]),
+    });
+    const store = createCommittedArtifactStore();
+    const committed = adoptInitialRenderArtifactsFromHandoff(
+      adoption,
+      navigation,
+      store,
+      createArtifactHostPositionLeaseRegistry(),
+      document
+    );
+    expect(committed).toBeDefined();
+    committed?.arm();
+
+    host.style.setProperty('position', 'absolute', 'important');
+    expect(store.sweep()).toBe(1);
+    expect(frame.isConnected).toBe(false);
+    expect(host.style.getPropertyValue('position')).toBe('absolute');
+    expect(host.style.getPropertyPriority('position')).toBe('important');
   });
 
   it('rolls back prepared resources without unbound disposer failures', () => {

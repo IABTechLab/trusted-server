@@ -114,6 +114,8 @@ describe('ADM-only first-display render bridge', () => {
     expect(h.bridge.closeIngress()).toBe(true);
     expect(h.bridge.captureHandoff()?.artifacts).toEqual([
       {
+        hostPosition: null,
+        hostPositionPriority: null,
         identity: frame,
         kind: 'gpt_adm',
         owner: 'trusted_server',
@@ -124,6 +126,19 @@ describe('ADM-only first-display render bridge', () => {
     expect(h.bridge.detachCommittedArtifacts()).toBe(true);
     h.bridge.dispose();
     expect(frame?.isConnected).toBe(true);
+  });
+
+  it('retires one accepted ADM frame without repeating terminal settlement', () => {
+    const h = harness();
+    expect(h.bridge.recordGam(h.cycle, 'gam_empty')).toBe(true);
+    const frame = h.element.querySelector('iframe');
+    frame?.dispatchEvent(new h.dom.window.Event('load'));
+    expect(h.terminal).toHaveBeenCalledOnce();
+
+    expect(h.bridge.retire(h.cycle)).toBe(true);
+    expect(h.bridge.retire(h.cycle)).toBe(false);
+    expect(frame?.isConnected).toBe(false);
+    expect(h.terminal).toHaveBeenCalledOnce();
   });
 
   it('fails the owned frame at the bounded load deadline and rejects APS input', () => {

@@ -20,6 +20,8 @@ export interface FirstDisplayRenderBridgeV1 {
     result: FirstDisplayGptRenderResult
   ) => boolean;
   readonly recordFailure: (cycle: FirstDisplayGptBoundCycleV1) => boolean;
+  readonly retire: (cycle: FirstDisplayGptBoundCycleV1) => boolean;
+  readonly sweepCommittedArtifacts: () => number;
   readonly sealTsAdmission: () => void;
   readonly closeIngress: () => boolean;
   readonly captureHandoff: () => FirstDisplayRenderHandoffV1 | undefined;
@@ -28,6 +30,8 @@ export interface FirstDisplayRenderBridgeV1 {
 }
 
 export interface FirstDisplayRenderHandoffArtifactV1 {
+  readonly hostPosition: string | null;
+  readonly hostPositionPriority: string | null;
   readonly identity: object;
   readonly kind: 'gpt_adm' | 'aps';
   readonly owner: 'trusted_server' | 'publisher';
@@ -182,6 +186,10 @@ export function createFirstDisplayProjectedDriver(
             settle(cycle.slotId, 'failed', 'gpt_request_failed');
           }
         },
+        onRetire: (cycle): void => {
+          const exact = bound.get(cycle.slotId);
+          if (exact && sameCycle(exact, cycle)) options.renderer.retire(exact);
+        },
       });
       if (accepted !== true) throw new TypeError('tsjs');
     },
@@ -192,9 +200,14 @@ export function createFirstDisplayProjectedDriver(
       sealed = true;
       options.renderer.sealTsAdmission();
     },
+    sweepCommittedArtifacts: (): number =>
+      disposed ? 0 : options.renderer.sweepCommittedArtifacts(),
     closeIngress: (): boolean => {
       if (disposed || !sealed || ingressClosed) return false;
-      if (gptBatch && !gptBatch.closeIngress()) return false;
+      const acceptedIds = [...settledResults.entries()]
+        .filter(([, result]) => result === 'accepted')
+        .map(([slotId]) => slotId);
+      if (gptBatch && !gptBatch.closeIngress(acceptedIds)) return false;
       if (!options.renderer.closeIngress()) return false;
       ingressClosed = true;
       return true;

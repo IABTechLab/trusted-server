@@ -8,7 +8,12 @@ import {
   PUC_DYNAMIC_OWNER,
   type PucBridgeOptions,
 } from '../../src/services/puc_bridge';
-import type { RenderFailureReason, RenderOutcome } from '../../src/services/render';
+import {
+  bindCommittedArtifactGuard,
+  createArtifactHostPositionLeaseRegistry,
+  type RenderFailureReason,
+  type RenderOutcome,
+} from '../../src/services/render';
 import type {
   ReservationClaimResult,
   ReservationRecognition,
@@ -2755,6 +2760,15 @@ describe('Universal Creative bridge dispatcher', () => {
     const isCurrent = vi.fn(() => true);
     const resolveApsMountBinding = vi.fn(() =>
       Object.freeze({
+        bindArtifact: () =>
+          Object.freeze({
+            commit: () => true,
+            finalize: () => undefined,
+            isCurrent: () => true,
+            previousArtifact: undefined,
+            release: () => undefined,
+            rollback: () => undefined,
+          }),
         bindingEpoch: Object.freeze({ binding: 1 }),
         cycle: Object.freeze({ isRetired: () => false }),
         element: topSlot,
@@ -2779,7 +2793,9 @@ describe('Universal Creative bridge dispatcher', () => {
         mountAps: (input) =>
           renderPucApsAttempt({
             ...input,
+            bindArtifactGuard: bindCommittedArtifactGuard,
             bootstrapNonces: bootstraps,
+            hostPositions: createArtifactHostPositionLeaseRegistry(),
             nonces: renderers,
             publisherOrigin: window.location.origin,
           }),

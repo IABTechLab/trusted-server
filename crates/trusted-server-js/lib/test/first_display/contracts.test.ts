@@ -46,6 +46,7 @@ function handoff(overrides: Record<string, unknown> = {}): Record<string, unknow
         owner: 'trusted_server',
         outcome: 'accepted',
         targeting: [['hb_adid', RESERVATION_ID]],
+        targetingOwnership: [],
         committedArtifact: 'gpt_adm',
         gptToken: 'gt1_1',
       },
@@ -68,7 +69,14 @@ function handoff(overrides: Record<string, unknown> = {}): Record<string, unknow
       },
     ],
     artifacts: [
-      { slotId: 'slot-1', kind: 'gpt_adm', owner: 'trusted_server', token: RESERVATION_ID },
+      {
+        hostPosition: null,
+        hostPositionPriority: null,
+        slotId: 'slot-1',
+        kind: 'gpt_adm',
+        owner: 'trusted_server',
+        token: RESERVATION_ID,
+      },
     ],
     parserState: [
       {
@@ -344,6 +352,7 @@ describe('first-display immutable contracts', () => {
         domId: `div-${index}`,
         outcome: 'no_bid',
         committedArtifact: 'none',
+        targetingOwnership: [],
         gptToken: null,
       }));
       const attempts = Array.from({ length: count }, (_, index) => ({
@@ -456,6 +465,7 @@ describe('first-display immutable contracts', () => {
       domId: `div-${slotIndex}`,
       outcome: 'no_bid',
       committedArtifact: 'none',
+      targetingOwnership: [],
       gptToken: null,
       targeting: Array.from({ length: 32 }, (_, targetingIndex) => [`k${targetingIndex}`, '']),
     }));

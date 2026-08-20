@@ -183,6 +183,7 @@ function driver(events: string[]): FirstDisplayDriver & {
       }),
     closeIngress: () => true,
     detachCommittedArtifacts: () => true,
+    sweepCommittedArtifacts: () => 0,
     start: (
       _outcomes: readonly FirstDisplayBatchOutcomeV1[],
       onFirstAction: () => boolean,
@@ -214,6 +215,7 @@ describe('bounded first-display agent', () => {
         captureHandoff: () => undefined,
         closeIngress: () => true,
         detachCommittedArtifacts: () => true,
+        sweepCommittedArtifacts: () => 0,
         start: (outcomes: readonly FirstDisplayBatchOutcomeV1[]) => {
           received.push([...outcomes]);
         },
@@ -364,6 +366,7 @@ describe('bounded first-display agent', () => {
       captureHandoff: () => undefined,
       closeIngress: () => true,
       detachCommittedArtifacts: () => true,
+      sweepCommittedArtifacts: () => 0,
       start: (_outcomes: readonly FirstDisplayBatchOutcomeV1[], onFirstAction: () => boolean) => {
         events.push('driver:prepared');
         action = onFirstAction;
@@ -399,6 +402,7 @@ describe('bounded first-display agent', () => {
         captureHandoff: () => undefined,
         closeIngress: () => true,
         detachCommittedArtifacts: () => true,
+        sweepCommittedArtifacts: () => 0,
         start: (_outcomes: readonly FirstDisplayBatchOutcomeV1[], onFirstAction: () => boolean) => {
           lateAction = onFirstAction;
         },
@@ -523,6 +527,7 @@ describe('bounded first-display agent', () => {
       captureHandoff: () => undefined,
       closeIngress: () => true,
       detachCommittedArtifacts: () => true,
+      sweepCommittedArtifacts: () => 0,
       start: () => {
         throw new Error('boom');
       },
@@ -599,6 +604,8 @@ describe('bounded first-display agent', () => {
         return Object.freeze({
           artifacts: Object.freeze([
             Object.freeze({
+              hostPosition: null,
+              hostPositionPriority: null,
               identity: artifact,
               kind: 'gpt_adm' as const,
               owner: 'trusted_server' as const,
@@ -615,6 +622,7 @@ describe('bounded first-display agent', () => {
               physicalSlot,
               placement: projectedBatch.projection.slots[0]!,
               slotId: 'slot-0',
+              targetingOwnership: Object.freeze([]),
               traceToken: 'gt1_1',
             }),
           ]),
@@ -652,6 +660,7 @@ describe('bounded first-display agent', () => {
         events.push('detach');
         return true;
       },
+      sweepCommittedArtifacts: () => 0,
       dispose: () => events.push('dispose'),
     });
     const agent = createFirstDisplayAgent({

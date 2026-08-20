@@ -130,6 +130,9 @@ import {
 } from '../services/projections';
 import { createReservationService, type ReservationService } from '../services/reservations';
 import {
+  bindCommittedArtifactGuard,
+  bindCommittedArtifactRetirement,
+  createArtifactHostPositionLeaseRegistry,
   createCommittedArtifactStore,
   createBootstrapNonceRegistry,
   createRenderAttempt,
@@ -137,6 +140,7 @@ import {
   createSlotOperation,
   renderDirectAdmAttempt,
   type RenderAttempt,
+  type ArtifactHostPositionLeaseRegistry,
   type CommittedArtifactStore,
   type BootstrapNonceRegistry,
   type RendererNonceRegistry,
@@ -204,6 +208,7 @@ function installBrowserTestRuntimeScript(runtimeDocument: Document): void {
 
 export interface BrowserServices {
   readonly artifacts: CommittedArtifactStore;
+  readonly hostPositions: ArtifactHostPositionLeaseRegistry;
   readonly auctionBatches: AuctionBatchService;
   readonly bootstrapNonces: BootstrapNonceRegistry;
   readonly pucBridge: PucBridge;
@@ -1557,10 +1562,15 @@ export function createTestBrowserRuntimeComposition(
           ? undefined
           : createBrowserSlotReconciliationBoundary(document, MutationObserver);
       const artifacts = createCommittedArtifactStore();
+      const hostPositions = createArtifactHostPositionLeaseRegistry();
       const slotService = createSlotService({
-        disposeCommittedArtifact: (navigationGeneration, registeredSlotId) => {
+        bindCommittedArtifactRetirement,
+        disposeCommittedArtifact: (navigationGeneration, registeredSlotId, expectedArtifact) => {
           const artifact = artifacts.current(registeredSlotId);
-          if (artifact?.navigationGeneration === navigationGeneration) {
+          if (
+            artifact === expectedArtifact &&
+            artifact.navigationGeneration === navigationGeneration
+          ) {
             artifacts.release(artifact);
           }
         },
@@ -1602,6 +1612,7 @@ export function createTestBrowserRuntimeComposition(
           try {
             return renderDirectApsAttempt({
               attempt,
+              bindArtifactGuard: bindCommittedArtifactGuard,
               bootstrapNonces,
               container,
               messaging: composition.adapters.messaging,
@@ -1672,6 +1683,7 @@ export function createTestBrowserRuntimeComposition(
         artifacts,
         auctionBatches: batchCoordinator,
         bootstrapNonces,
+        hostPositions,
         reservations: reservationService,
         rendererNonces,
         renderDirectAdm,
@@ -1799,7 +1811,9 @@ export function createTestBrowserRuntimeComposition(
         mountAps: (input) =>
           renderPucApsAttempt({
             ...input,
+            bindArtifactGuard: bindCommittedArtifactGuard,
             bootstrapNonces: prepared.services.bootstrapNonces,
+            hostPositions: prepared.services.hostPositions,
             messaging: composition.adapters.messaging,
             nonces: prepared.services.rendererNonces,
             publisherOrigin: prepared.publisherOrigin,

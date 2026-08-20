@@ -33,9 +33,9 @@ import {
   type CommittedRenderArtifact,
   type RenderAttempt,
 } from '../../../src/services/render';
+import { createTargetingService } from '../../../src/services/targeting';
 import { createReservationService } from '../../../src/services/reservations';
 import type { SlotRequestOutcome } from '../../../src/services/slots';
-import { createTargetingService } from '../../../src/services/targeting';
 
 const RELEASE_ID = 'a'.repeat(64);
 const RESERVATION_ID = `r1_${'a'.repeat(22)}`;
@@ -616,6 +616,16 @@ describe('transactional GPT integration module', () => {
     const physicalSlot = {};
     const frame = {};
     const navigationGeneration = {};
+    const committedArtifact: CommittedRenderArtifact = Object.freeze({
+      attemptId: `a1_${'d'.repeat(22)}`,
+      dispose: vi.fn(),
+      kind: 'puc',
+      navigationGeneration,
+      slot: 'slot-1',
+    });
+    const artifactStore = createCommittedArtifactStore();
+    expect(artifactStore.promote(committedArtifact)).toBe(true);
+    const adoptCommittedArtifact = vi.fn(() => true);
     const adoptGptSlot = vi.fn(() => Object.freeze({ ok: true as const }));
     const adoptRegistrationHighWater = vi.fn(() => true);
     const adoption = Object.freeze({
@@ -630,6 +640,7 @@ describe('transactional GPT integration module', () => {
             domId: 'div-1',
             gamPath: '/123/slot-1',
             formats: Object.freeze([Object.freeze([300, 250])]),
+            targetingOwnership: Object.freeze([]),
           }),
         ]),
         cycles: Object.freeze([Object.freeze({ slotId: 'slot-1' })]),
@@ -639,10 +650,21 @@ describe('transactional GPT integration module', () => {
     });
 
     expect(
-      adoptInitialGptSlotsFromHandoff(adoption, navigationGeneration, {
-        adoptGptSlot,
-        adoptRegistrationHighWater,
-      })
+      adoptInitialGptSlotsFromHandoff(
+        adoption,
+        navigationGeneration,
+        {
+          adoptCommittedArtifact,
+          adoptGptSlot,
+          adoptRegistrationHighWater,
+        },
+        artifactStore,
+        {
+          adopt: vi.fn(),
+          observePublisherMutations: vi.fn(),
+        },
+        {} as never
+      )
     ).toBe(adoption);
     expect(adoptRegistrationHighWater).toHaveBeenCalledExactlyOnceWith(navigationGeneration, 2);
     expect(adoptGptSlot).toHaveBeenCalledExactlyOnceWith(navigationGeneration, 'slot-1', {
@@ -654,7 +676,137 @@ describe('transactional GPT integration module', () => {
       ownership: 'trusted_server',
       slot: physicalSlot,
     });
+    expect(adoptCommittedArtifact).toHaveBeenCalledExactlyOnceWith(
+      navigationGeneration,
+      'slot-1',
+      committedArtifact,
+      expect.any(Function)
+    );
   });
+
+  it.each(['unchanged', 'same_publisher_write', 'different_publisher_write'] as const)(
+    'transfers first-display targeting ownership and preserves %s semantics',
+    (mutation) => {
+      const physicalSlot = {};
+      const frame = {};
+      const navigationGeneration = {};
+      const values = new Map<string, readonly string[]>([['hb_adid', ['trusted']]]);
+      const setTargeting = vi.fn((slot: object, key: string, value: string | readonly string[]) => {
+        expect(slot).toBe(physicalSlot);
+        values.set(key, Object.freeze(typeof value === 'string' ? [value] : [...value]));
+      });
+      const clearTargeting = vi.fn((_slot: object, key?: string) => {
+        if (key === undefined) values.clear();
+        else values.delete(key);
+      });
+      let publisherObserver:
+        Readonly<{ beforePublisherMutation: (slot: object, key?: string) => void }> | undefined;
+      const releaseObservation = Object.assign(vi.fn(), { isCurrent: () => true });
+      const facade = {
+        clearTargeting,
+        getTargeting: (_slot: object, key: string) => Object.freeze([...(values.get(key) ?? [])]),
+        observeTargeting: (
+          slot: object,
+          observer: Readonly<{ beforePublisherMutation: (slot: object, key?: string) => void }>
+        ) => {
+          expect(slot).toBe(physicalSlot);
+          publisherObserver = observer;
+          return releaseObservation;
+        },
+        setTargeting,
+      };
+      const adapter = {
+        run: (command: (gpt: typeof facade) => unknown) => {
+          const result = command(facade);
+          return Object.freeze({
+            status: 'present' as const,
+            result: Promise.resolve(result),
+            dispose: vi.fn(),
+          });
+        },
+      } as never;
+      const artifact: CommittedRenderArtifact = Object.freeze({
+        attemptId: `a1_${'e'.repeat(22)}`,
+        dispose: vi.fn(),
+        kind: 'aps_mount',
+        navigationGeneration,
+        slot: 'slot-1',
+      });
+      const artifactStore = createCommittedArtifactStore();
+      expect(artifactStore.promote(artifact)).toBe(true);
+      let retireTargeting: (() => void) | undefined;
+      const service = {
+        adoptCommittedArtifact: vi.fn(
+          (
+            _generation: object,
+            _slotId: string,
+            _artifact: CommittedRenderArtifact,
+            onRetire?: () => void
+          ) => {
+            retireTargeting = onRetire;
+            return true;
+          }
+        ),
+        adoptGptSlot: vi.fn(() => Object.freeze({ ok: true as const })),
+        adoptRegistrationHighWater: vi.fn(() => true),
+      };
+      const adoption = Object.freeze({
+        version: 1 as const,
+        adoptInitialDisplay: true as const,
+        handoff: Object.freeze({
+          highWater: Object.freeze({ nextSlotRegistrationOrdinal: 2 }),
+          slots: Object.freeze([
+            Object.freeze({
+              id: 'slot-1',
+              owner: 'publisher' as const,
+              targetingOwnership: Object.freeze([
+                Object.freeze({
+                  installed: 'trusted',
+                  key: 'hb_adid',
+                  prior: Object.freeze(['publisher-original']),
+                }),
+              ]),
+            }),
+          ]),
+          cycles: Object.freeze([Object.freeze({ slotId: 'slot-1' })]),
+          artifacts: Object.freeze([Object.freeze({ slotId: 'slot-1' })]),
+        }),
+        identities: Object.freeze([physicalSlot, frame]),
+      });
+      const targeting = createTargetingService();
+
+      expect(
+        adoptInitialGptSlotsFromHandoff(
+          adoption,
+          navigationGeneration,
+          service,
+          artifactStore,
+          targeting,
+          adapter
+        )
+      ).toBe(adoption);
+      expect(setTargeting).not.toHaveBeenCalled();
+
+      if (mutation !== 'unchanged') {
+        publisherObserver?.beforePublisherMutation(physicalSlot, 'hb_adid');
+        values.set(
+          'hb_adid',
+          Object.freeze([mutation === 'same_publisher_write' ? 'trusted' : 'publisher-new'])
+        );
+      }
+      retireTargeting?.();
+
+      expect(values.get('hb_adid')).toEqual([
+        mutation === 'unchanged'
+          ? 'publisher-original'
+          : mutation === 'same_publisher_write'
+            ? 'trusted'
+            : 'publisher-new',
+      ]);
+      expect(setTargeting).toHaveBeenCalledTimes(mutation === 'unchanged' ? 1 : 0);
+      expect(releaseObservation).toHaveBeenCalledOnce();
+    }
+  );
 
   it.each([
     { diagnosticsActive: false, adoptInitialDisplay: false, parserStateValid: true },
@@ -897,6 +1049,7 @@ describe('transactional GPT integration module', () => {
                           Object.freeze(['hb_adid', RESERVATION_ID] as const),
                         ]),
                         committedArtifact: 'gpt_adm' as const,
+                        targetingOwnership: Object.freeze([]),
                         gptToken: 'gt1_1',
                       }),
                     ]),
@@ -912,9 +1065,11 @@ describe('transactional GPT integration module', () => {
                     tombstones: Object.freeze([]),
                     artifacts: Object.freeze([
                       Object.freeze({
+                        hostPosition: null,
+                        hostPositionPriority: null,
                         slotId: 'takeover-slot',
                         kind: 'gpt_adm' as const,
-                        owner: 'publisher' as const,
+                        owner: 'trusted_server' as const,
                         token: RESERVATION_ID,
                       }),
                     ]),
@@ -1059,7 +1214,7 @@ describe('transactional GPT integration module', () => {
       });
       await vi.waitFor(() => expect(display).toHaveBeenCalledOnce());
       expect(protect).not.toHaveBeenCalled();
-      expect(activeMutationObservers.size).toBe(2);
+      expect(activeMutationObservers.size).toBe(3);
       const firstPhysicalSlot = definedSlots[0];
       expect(firstPhysicalSlot).toBeDefined();
       takeoverElement.remove();
@@ -1068,10 +1223,13 @@ describe('transactional GPT integration module', () => {
       document.body.appendChild(replacementElement);
       await Promise.resolve();
       await vi.advanceTimersByTimeAsync(250);
-      expect(destroySlots).toHaveBeenCalledWith([firstPhysicalSlot]);
+      expect(destroySlots).toHaveBeenCalledOnce();
+      const destroyedPhysicalSlot = destroySlots.mock.calls[0]?.[0]?.[0];
+      expect(destroyedPhysicalSlot).toBeDefined();
+      expect(destroyedPhysicalSlot).not.toBe(publisherSlot);
       expect(definedSlots).toHaveLength(1);
-      expect(definedSlots[0]).not.toBe(firstPhysicalSlot);
-      expect(activeMutationObservers.size).toBe(2);
+      expect(definedSlots).not.toContain(destroyedPhysicalSlot);
+      expect(activeMutationObservers.size).toBe(3);
       expect(vi.getTimerCount()).toBe(0);
       vi.useRealTimers();
       expect([...providerFacades.keys()]).toEqual([
@@ -1152,7 +1310,7 @@ describe('transactional GPT integration module', () => {
       expect(refresh).not.toHaveBeenCalled();
       const later = gpt.activateLaterLifecycle();
       expect(Object.isFrozen(later)).toBe(true);
-      expect(activeMutationObservers.size).toBe(2);
+      expect(activeMutationObservers.size).toBe(3);
       expect(() => gpt.activateLaterLifecycle()).toThrow('unavailable');
       const navigationResult = await later.navigate('/spa-production?route=one');
       expect(navigationResult).toEqual({
@@ -1261,7 +1419,7 @@ describe('transactional GPT integration module', () => {
         ((await currentNavigation) as { navigationGeneration: object }).navigationGeneration
       );
       later.release();
-      expect(activeMutationObservers.size).toBe(1);
+      expect(activeMutationObservers.size).toBe(2);
       await later.navigate('/disposed-owner');
       expect(fetchPageBids).toHaveBeenCalledTimes(4);
       fetchPageBids.mockRestore();

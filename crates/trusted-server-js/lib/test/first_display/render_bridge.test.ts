@@ -339,6 +339,23 @@ function startApsDocument(h: ReturnType<typeof harness>) {
   return { documentPort, frame, nonce };
 }
 
+function acceptPucAps(h: ReturnType<typeof harness>): HTMLIFrameElement {
+  registerOwner(h);
+  const { documentPort, frame, nonce } = startApsDocument(h);
+  documentPort.dispatch({
+    message: 'TS APS Document Accepted',
+    version: 1,
+    nonce,
+  });
+  documentPort.dispatch({
+    message: 'TS APS Render Completed',
+    version: 1,
+    nonce,
+  });
+  expect(h.terminals).toEqual(['accepted']);
+  return frame;
+}
+
 describe('bounded first-display render bridge', () => {
   it('observes admitted bridge activity and terminal tombstone expiry', () => {
     const mutations = vi.fn(() => true);
@@ -594,7 +611,70 @@ describe('bounded first-display render bridge', () => {
       lifecycleTicket: ticket,
       outcome: 'accepted',
     });
+    expect(h.bridge.retire(h.cycle)).toBe(true);
+    expect(h.bridge.retire(h.cycle)).toBe(false);
+    expect(frame.isConnected).toBe(false);
+    expect(h.element.style.getPropertyValue('position')).toBe('');
+    expect(h.element.querySelector('span')?.textContent).toBe('publisher GAM content');
+    expect(h.terminals).toEqual(['accepted']);
   });
+
+  it.each(['removed', 'reparented', 'host_replaced'] as const)(
+    'retires an accepted APS overlay before handoff when its DOM is %s',
+    (mutation) => {
+      const h = harness('aps');
+      h.element.innerHTML = '<span>publisher</span>';
+      const frame = acceptPucAps(h);
+      const movedHost = h.dom.window.document.createElement('div');
+      movedHost.id = 'moved-host';
+      h.dom.window.document.body.appendChild(movedHost);
+
+      if (mutation === 'removed') frame.remove();
+      if (mutation === 'reparented') movedHost.appendChild(frame);
+      if (mutation === 'host_replaced') {
+        const replacement = h.element.cloneNode(false);
+        h.element.replaceWith(replacement);
+      }
+
+      expect(h.bridge.sweepCommittedArtifacts()).toBe(1);
+      expect(h.bridge.sweepCommittedArtifacts()).toBe(0);
+      expect(frame.isConnected).toBe(false);
+      expect(h.element.style.getPropertyValue('position')).toBe('');
+      expect(h.element.querySelector('span')?.textContent).toBe('publisher');
+      expect(h.terminals).toEqual(['accepted']);
+
+      h.bridge.sealTsAdmission();
+      expect(h.bridge.closeIngress()).toBe(true);
+      expect(h.bridge.captureHandoff()?.artifacts).toEqual([]);
+      expect(h.bridge.detachCommittedArtifacts()).toBe(true);
+    }
+  );
+
+  it.each(['src', 'srcdoc', 'sandbox', 'frame_style', 'host_position'] as const)(
+    'retires an accepted APS overlay before handoff when its %s integrity changes',
+    (mutation) => {
+      const h = harness('aps');
+      h.element.innerHTML = '<span>publisher</span>';
+      const frame = acceptPucAps(h);
+
+      if (mutation === 'src') frame.setAttribute('src', 'https://publisher.example/replaced');
+      if (mutation === 'srcdoc') frame.srcdoc = '<!doctype html><title>Replacement</title>';
+      if (mutation === 'sandbox') frame.setAttribute('sandbox', 'allow-scripts');
+      if (mutation === 'frame_style') frame.style.setProperty('visibility', 'hidden');
+      if (mutation === 'host_position') h.element.style.setProperty('position', 'absolute');
+
+      expect(h.bridge.sweepCommittedArtifacts()).toBe(1);
+      expect(h.bridge.sweepCommittedArtifacts()).toBe(0);
+      expect(frame.isConnected).toBe(false);
+      expect(h.element.querySelector('span')?.textContent).toBe('publisher');
+      expect(h.terminals).toEqual(['accepted']);
+
+      h.bridge.sealTsAdmission();
+      expect(h.bridge.closeIngress()).toBe(true);
+      expect(h.bridge.captureHandoff()?.artifacts).toEqual([]);
+      expect(h.bridge.detachCommittedArtifacts()).toBe(true);
+    }
+  );
 
   it('renders an attributable empty-GAM ADM fallback directly into the bound element', () => {
     const h = harness('adm');
@@ -839,6 +919,8 @@ describe('bounded first-display render bridge', () => {
     expect(h.bridge.captureHandoff()).toEqual({
       artifacts: [
         {
+          hostPosition: null,
+          hostPositionPriority: null,
           identity: frame,
           kind: 'gpt_adm',
           owner: 'trusted_server',

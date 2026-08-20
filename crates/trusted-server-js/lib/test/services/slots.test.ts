@@ -21,9 +21,24 @@ import {
   type SlotRegistration,
   type SlotService,
 } from '../../src/services/slots';
+import {
+  bindCommittedArtifactRetirement,
+  createCommittedArtifactStore,
+  type CommittedRenderArtifact,
+} from '../../src/services/render';
 
 function createNavigation(): NavigationSession {
   return createRuntimeWithNavigation().navigation;
+}
+
+function committedArtifact(navigationGeneration: object): CommittedRenderArtifact {
+  return Object.freeze({
+    attemptId: `a1_${'c'.repeat(22)}`,
+    dispose: vi.fn(),
+    kind: 'aps_mount' as const,
+    navigationGeneration,
+    slot: 'slot',
+  });
 }
 
 function createRuntimeWithNavigation() {
@@ -1023,13 +1038,19 @@ describe('navigation-owned DOM reconciliation', () => {
   afterEach(() => vi.useRealTimers());
 
   async function completedApsMountCycle(
-    ownership: 'publisher' | 'trusted_server' = 'trusted_server'
+    ownership: 'publisher' | 'trusted_server' = 'trusted_server',
+    disposeCommittedArtifact = vi.fn()
   ) {
     const gpt = createGptHarness();
     const dom = createReconciliationBoundary();
     const element = Object.freeze({ element: 'top-slot' });
     dom.put('slot-div', element);
-    const service = createSlotService({ googletag: gpt.adapter, reconciliation: dom.boundary });
+    const service = createSlotService({
+      bindCommittedArtifactRetirement,
+      disposeCommittedArtifact,
+      googletag: gpt.adapter,
+      reconciliation: dom.boundary,
+    });
     const navigation = createNavigation();
     let slot: object;
     if (ownership === 'trusted_server') {
@@ -1068,7 +1089,7 @@ describe('navigation-owned DOM reconciliation', () => {
       slot,
     });
     await expect(request.result).resolves.toMatchObject({ status: 'rendered' });
-    return { dom, element, intentId, navigation, service, slot };
+    return { disposeCommittedArtifact, dom, element, intentId, navigation, service, slot };
   }
 
   it('claims one exact completed TS cycle and invalidates it on DOM replacement', async () => {
@@ -1092,6 +1113,70 @@ describe('navigation-owned DOM reconciliation', () => {
     expect(
       h.service.resolveApsMountBinding(h.navigation.generation, 'slot', h.intentId)
     ).toBeUndefined();
+  });
+
+  it('retires a committed overlay for a publisher cycle but retains it for an exact TS replacement', async () => {
+    const publisher = await completedApsMountCycle('publisher');
+    const publisherBinding = publisher.service.resolveApsMountBinding(
+      publisher.navigation.generation,
+      'slot',
+      publisher.intentId
+    )!;
+    const publisherArtifact = committedArtifact(publisher.navigation.generation);
+    expect(publisherBinding.bindArtifact(publisherArtifact)?.commit()).toBe(true);
+
+    publisher.service.handleGptEvent('slotRequested', { slot: publisher.slot });
+    expect(publisher.disposeCommittedArtifact).toHaveBeenCalledExactlyOnceWith(
+      publisher.navigation.generation,
+      'slot',
+      publisherArtifact
+    );
+
+    const trusted = await completedApsMountCycle();
+    const trustedBinding = trusted.service.resolveApsMountBinding(
+      trusted.navigation.generation,
+      'slot',
+      trusted.intentId
+    )!;
+    const trustedArtifact = committedArtifact(trusted.navigation.generation);
+    expect(trustedBinding.bindArtifact(trustedArtifact)?.commit()).toBe(true);
+    const replacement = trusted.service.request({
+      expectedSlot: trusted.slot,
+      intentId: 'exact-ts-replacement',
+      navigationGeneration: trusted.navigation.generation,
+      operation: 'refresh',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+    await Promise.resolve();
+
+    trusted.service.handleGptEvent('slotRequested', { slot: trusted.slot });
+    expect(trusted.disposeCommittedArtifact).not.toHaveBeenCalled();
+    replacement.dispose();
+    expect(trusted.disposeCommittedArtifact).not.toHaveBeenCalled();
+  });
+
+  it('restores the prior physical artifact when a provisional replacement is released', async () => {
+    const h = await completedApsMountCycle();
+    const prior = committedArtifact(h.navigation.generation);
+    expect(h.service.adoptCommittedArtifact(h.navigation.generation, 'slot', prior)).toBe(true);
+    const binding = h.service.resolveApsMountBinding(h.navigation.generation, 'slot', h.intentId)!;
+    const replacement = Object.freeze({
+      ...committedArtifact(h.navigation.generation),
+      attemptId: `a1_${'d'.repeat(22)}`,
+    });
+    const admission = binding.bindArtifact(replacement)!;
+    expect(admission.commit()).toBe(true);
+
+    admission.release();
+    admission.rollback();
+    h.service.handleGptEvent('slotRequested', { slot: h.slot });
+
+    expect(h.disposeCommittedArtifact).toHaveBeenCalledExactlyOnceWith(
+      h.navigation.generation,
+      'slot',
+      prior
+    );
   });
 
   it('refuses missing, ambiguous, disconnected, and stale APS mount bindings', async () => {
@@ -1207,6 +1292,24 @@ describe('navigation-owned DOM reconciliation', () => {
     );
   });
 
+  it('clears an adopted physical artifact association when its store retires the exact artifact', () => {
+    const gpt = createGptHarness();
+    const service = createSlotService({
+      bindCommittedArtifactRetirement,
+      googletag: gpt.adapter,
+    });
+    const navigation = createNavigation();
+    bindTrustedSlot(service, navigation);
+    const store = createCommittedArtifactStore();
+    const first = committedArtifact(navigation.generation);
+    const second = committedArtifact(navigation.generation);
+    expect(store.promote(first)).toBe(true);
+    expect(service.adoptCommittedArtifact(navigation.generation, 'slot', first)).toBe(true);
+
+    expect(store.release(first)).toBe(true);
+    expect(service.adoptCommittedArtifact(navigation.generation, 'slot', second)).toBe(true);
+  });
+
   it('debounces an exact disconnected TS slot through the 249/250 ms boundary', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
@@ -1217,6 +1320,7 @@ describe('navigation-owned DOM reconciliation', () => {
     });
     dom.put('slot-div', {});
     const service = createSlotService({
+      bindCommittedArtifactRetirement,
       disposeCommittedArtifact,
       googletag: gpt.adapter,
       now: () => Date.now(),
@@ -1224,6 +1328,8 @@ describe('navigation-owned DOM reconciliation', () => {
     });
     const navigation = createNavigation();
     bindTrustedSlot(service, navigation);
+    const artifact = committedArtifact(navigation.generation);
+    expect(service.adoptCommittedArtifact(navigation.generation, 'slot', artifact)).toBe(true);
     service.activate();
 
     dom.replace('slot-div', {});
@@ -1239,7 +1345,11 @@ describe('navigation-owned DOM reconciliation', () => {
       [[300, 250]],
       'slot-div'
     );
-    expect(disposeCommittedArtifact).toHaveBeenCalledExactlyOnceWith(navigation.generation, 'slot');
+    expect(disposeCommittedArtifact).toHaveBeenCalledExactlyOnceWith(
+      navigation.generation,
+      'slot',
+      artifact
+    );
 
     const request = service.request({
       intentId: 'after-rebind',
@@ -1487,6 +1597,7 @@ describe('navigation-owned DOM reconciliation', () => {
     const disposeCommittedArtifact = vi.fn();
     dom.put('slot-div', {});
     const service = createSlotService({
+      bindCommittedArtifactRetirement,
       disposeCommittedArtifact,
       googletag: gpt.adapter,
       now: () => Date.now(),
@@ -1494,12 +1605,18 @@ describe('navigation-owned DOM reconciliation', () => {
     });
     const navigation = createNavigation();
     bindTrustedSlot(service, navigation);
+    const artifact = committedArtifact(navigation.generation);
+    expect(service.adoptCommittedArtifact(navigation.generation, 'slot', artifact)).toBe(true);
     service.activate();
 
     dom.disconnect('slot-div');
     await vi.advanceTimersByTimeAsync(5_000);
 
-    expect(disposeCommittedArtifact).toHaveBeenCalledExactlyOnceWith(navigation.generation, 'slot');
+    expect(disposeCommittedArtifact).toHaveBeenCalledExactlyOnceWith(
+      navigation.generation,
+      'slot',
+      artifact
+    );
     expect(disposeCommittedArtifact.mock.invocationCallOrder[0]).toBeLessThan(
       gpt.destroySlots.mock.invocationCallOrder[0] as number
     );
@@ -3247,11 +3364,14 @@ describe('physical GPT cycles', () => {
     const harness = createGptHarness();
     const disposeCommittedArtifact = vi.fn();
     const service = createSlotService({
+      bindCommittedArtifactRetirement,
       disposeCommittedArtifact,
       googletag: harness.adapter,
     });
     const navigation = createNavigation();
     const oldSlot = bindTrustedSlot(service, navigation);
+    const artifact = committedArtifact(navigation.generation);
+    expect(service.adoptCommittedArtifact(navigation.generation, 'slot', artifact)).toBe(true);
     const first = service.request({
       intentId: 'completion-timeout',
       navigationGeneration: navigation.generation,
@@ -3269,7 +3389,11 @@ describe('physical GPT cycles', () => {
       throw new Error('Expected completion-timeout replacement');
     }
     expect(harness.destroySlots).toHaveBeenCalledExactlyOnceWith([oldSlot]);
-    expect(disposeCommittedArtifact).toHaveBeenCalledExactlyOnceWith(navigation.generation, 'slot');
+    expect(disposeCommittedArtifact).toHaveBeenCalledExactlyOnceWith(
+      navigation.generation,
+      'slot',
+      artifact
+    );
 
     service.handleGptEvent('slotRenderEnded', {
       isEmpty: false,

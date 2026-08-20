@@ -58,12 +58,16 @@ import {
 import { createReservationService, type ReservationService } from '../../services/reservations';
 import type { PucGamAttemptInput } from '../../services/puc_bridge';
 import {
+  bindCommittedArtifactGuard,
+  bindCommittedArtifactRetirement,
+  createArtifactHostPositionLeaseRegistry,
   createCommittedArtifactStore,
   createBootstrapNonceRegistry,
   createRenderAttempt,
   createRendererNonceRegistry,
   createSlotOperation,
   renderDirectAdmAttempt,
+  type ArtifactHostPositionLeaseRegistry,
   type CommittedArtifactStore,
   type CommittedRenderArtifact,
   type RenderAttempt,
@@ -271,46 +275,148 @@ export function adoptInitialRenderArtifactsFromHandoff(
   candidate: unknown,
   navigation: NavigationSession,
   store: CommittedArtifactStore,
+  hostPositions: ArtifactHostPositionLeaseRegistry,
   document: Document
 ): AdoptedInitialRenderArtifactsV1 | undefined {
   const adoption = snapshotPersistentFirstDisplayAdoptionV1(candidate);
   if (!adoption) return undefined;
   const cycles = adoptionArray(adoptionField(adoption.handoff, 'cycles'));
   const artifacts = adoptionArray(adoptionField(adoption.handoff, 'artifacts'));
-  if (!cycles || !artifacts || adoption.identities.length !== cycles.length + artifacts.length) {
+  const handoffSlots = adoptionArray(adoptionField(adoption.handoff, 'slots'));
+  if (
+    !cycles ||
+    !artifacts ||
+    !handoffSlots ||
+    adoption.identities.length !== cycles.length + artifacts.length ||
+    new Set(adoption.identities).size !== adoption.identities.length
+  ) {
     return undefined;
   }
   if (artifacts.length === 0) {
     return Object.freeze({ adoption, arm: () => undefined });
   }
   const Frame = document.defaultView?.HTMLIFrameElement;
+  const Element = document.defaultView?.HTMLElement;
   const batch = navigation.createAuctionBatch('first-display-adoption');
-  if (!Frame || !batch) return undefined;
+  if (!Frame || !Element || !batch) return undefined;
   const promoted: CommittedRenderArtifact[] = [];
   let armed = false;
   try {
     for (let index = 0; index < artifacts.length; index += 1) {
       const record = artifacts[index];
       const slotId = adoptionField(record, 'slotId');
+      const kind = adoptionField(record, 'kind');
+      const owner = adoptionField(record, 'owner');
+      const token = adoptionField(record, 'token');
+      const hostPosition = adoptionField(record, 'hostPosition');
+      const hostPositionPriority = adoptionField(record, 'hostPositionPriority');
       const identity = adoption.identities[cycles.length + index];
-      if (typeof slotId !== 'string' || !(identity instanceof Frame)) return undefined;
+      const matchingSlots = handoffSlots.filter((entry) => adoptionField(entry, 'id') === slotId);
+      const matchingCycles = cycles.filter((entry) => adoptionField(entry, 'slotId') === slotId);
+      const domId = adoptionField(matchingSlots[0], 'domId');
+      const host = typeof domId === 'string' ? document.getElementById(domId) : null;
+      if (
+        typeof slotId !== 'string' ||
+        (kind !== 'aps' && kind !== 'gpt_adm') ||
+        owner !== 'trusted_server' ||
+        typeof token !== 'string' ||
+        !/^r1_[A-Za-z0-9_-]{22}$/.test(token) ||
+        (hostPosition === null && hostPositionPriority !== null) ||
+        (hostPosition !== null &&
+          (typeof hostPosition !== 'string' ||
+            (hostPositionPriority !== '' && hostPositionPriority !== 'important'))) ||
+        (kind === 'gpt_adm' && hostPosition !== null) ||
+        matchingSlots.length !== 1 ||
+        matchingCycles.length !== 1 ||
+        !(host instanceof Element) ||
+        !(identity instanceof Frame)
+      ) {
+        return undefined;
+      }
+      const previousHostPosition = hostPosition as string | null;
+      const previousHostPositionPriority = hostPositionPriority as '' | 'important' | null;
+      const frame = identity;
+      const expectedContentWindow = frame.contentWindow;
+      const expectedSourceAttribute = frame.getAttribute('src');
+      const expectedSource = frame.src;
+      const expectedSourceDocumentAttribute = frame.getAttribute('srcdoc');
+      const expectedSourceDocument = frame.srcdoc;
+      const expectedSandbox = frame.getAttribute('sandbox');
+      const expectedStyle = frame.getAttribute('style');
+      if (
+        !host.isConnected ||
+        host.ownerDocument !== document ||
+        frame.parentNode !== host ||
+        !frame.isConnected ||
+        frame.ownerDocument !== document ||
+        !expectedContentWindow ||
+        (kind === 'aps' &&
+          hostPosition !== null &&
+          (host.style.getPropertyValue('position') !== 'relative' ||
+            host.style.getPropertyPriority('position') !== ''))
+      ) {
+        return undefined;
+      }
       const attempt = batch.createRenderAttempt(slotId);
       if (!attempt.ok) return undefined;
-      const frame = identity;
+      let disposed = false;
       const artifact: CommittedRenderArtifact = Object.freeze({
-        kind: 'direct_iframe' as const,
+        kind: kind === 'aps' ? ('aps_mount' as const) : ('direct_iframe' as const),
         attemptId: attempt.value.id,
         slot: slotId,
         navigationGeneration: navigation.generation,
         dispose: (): void => {
+          if (disposed) return;
+          disposed = true;
           if (!armed) return;
           try {
             frame.remove();
           } catch {
             // A publisher DOM replacement wins over persistent artifact retirement.
           }
+          hostPositions.release(artifact);
         },
       });
+      if (
+        kind === 'aps' &&
+        previousHostPosition !== null &&
+        !hostPositions.bindOwned(
+          artifact,
+          host,
+          previousHostPosition,
+          previousHostPositionPriority ?? ''
+        )
+      ) {
+        return undefined;
+      }
+      if (
+        !bindCommittedArtifactGuard(artifact, () => {
+          try {
+            return (
+              !disposed &&
+              navigation.isCurrent() &&
+              document.getElementById(domId as string) === host &&
+              host.isConnected &&
+              host.ownerDocument === document &&
+              frame.parentNode === host &&
+              frame.isConnected &&
+              frame.ownerDocument === document &&
+              frame.contentWindow === expectedContentWindow &&
+              frame.getAttribute('src') === expectedSourceAttribute &&
+              frame.src === expectedSource &&
+              frame.getAttribute('srcdoc') === expectedSourceDocumentAttribute &&
+              frame.srcdoc === expectedSourceDocument &&
+              frame.getAttribute('sandbox') === expectedSandbox &&
+              frame.getAttribute('style') === expectedStyle &&
+              (kind !== 'aps' || previousHostPosition === null || hostPositions.current(artifact))
+            );
+          } catch {
+            return false;
+          }
+        })
+      ) {
+        return undefined;
+      }
       if (!store.promote(artifact, () => navigation.isCurrent())) return undefined;
       promoted.push(artifact);
     }
@@ -626,6 +732,21 @@ export function createRenderRuntimeIntegrationRegistration(
 
     const artifacts = createCommittedArtifactStore();
     scope.onDispose(() => artifacts.dispose());
+    const hostPositions = createArtifactHostPositionLeaseRegistry();
+    const ArtifactMutationObserver = view.MutationObserver;
+    if (typeof ArtifactMutationObserver !== 'function') {
+      throw new TypeError('render_runtime requires artifact DOM observation');
+    }
+    const artifactObserver = new ArtifactMutationObserver(() => {
+      artifacts.sweep();
+    });
+    artifactObserver.observe(document, {
+      attributeFilter: ['id', 'sandbox', 'src', 'srcdoc', 'style'],
+      attributes: true,
+      childList: true,
+      subtree: true,
+    });
+    scope.onDispose(() => artifactObserver.disconnect());
     const slots = createRuntimeSlotBroker();
     scope.onDispose(() => slots.dispose());
 
@@ -988,7 +1109,10 @@ export function createRenderRuntimeIntegrationRegistration(
         };
       },
       artifacts,
+      bindArtifactGuard: bindCommittedArtifactGuard,
+      bindArtifactRetirement: bindCommittedArtifactRetirement,
       bootstrapNonces,
+      hostPositions,
       createAttempt,
       createSlotOperation,
       commitPageBids: (
@@ -1085,6 +1209,7 @@ export function createRenderRuntimeIntegrationRegistration(
                 activation.adoption,
                 navigation,
                 artifacts,
+                hostPositions,
                 document
               );
         if (activation.adoption !== undefined && (!adoptedState || !adoptedArtifacts)) {

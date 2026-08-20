@@ -296,6 +296,38 @@ function snapshotStringPairs(
   return Object.freeze(result);
 }
 
+function snapshotTargetingOwnership(
+  value: unknown
+): readonly Readonly<{ installed: string; key: string; prior: readonly string[] }>[] | undefined {
+  const entries = exactArray(value, MAX_TARGETING);
+  if (!entries) return undefined;
+  const seen = new Set<string>();
+  const result: Array<Readonly<{ installed: string; key: string; prior: readonly string[] }>> = [];
+  for (const entry of entries) {
+    const fields = exactRecord(entry, ['installed', 'key', 'prior']);
+    const prior = fields ? exactArray(fields.prior, MAX_TARGETING) : undefined;
+    if (
+      !fields ||
+      !boundedString(fields.key, MAX_PROPERTY_BYTES) ||
+      !boundedString(fields.installed, MAX_STRING_BYTES) ||
+      !prior ||
+      prior.some((value) => !boundedString(value, MAX_STRING_BYTES, true)) ||
+      seen.has(fields.key)
+    ) {
+      return undefined;
+    }
+    seen.add(fields.key);
+    result.push(
+      Object.freeze({
+        installed: fields.installed,
+        key: fields.key,
+        prior: Object.freeze([...prior] as string[]),
+      })
+    );
+  }
+  return Object.freeze(result);
+}
+
 function snapshotSlot(value: unknown): Readonly<Record<string, unknown>> | undefined {
   const fields = exactRecord(value, [
     'id',
@@ -306,6 +338,7 @@ function snapshotSlot(value: unknown): Readonly<Record<string, unknown>> | undef
     'owner',
     'outcome',
     'targeting',
+    'targetingOwnership',
     'committedArtifact',
     'gptToken',
   ]);
@@ -329,6 +362,7 @@ function snapshotSlot(value: unknown): Readonly<Record<string, unknown>> | undef
     formats.push(Object.freeze([dimensions[0], dimensions[1]]));
   }
   const targeting = snapshotStringPairs(fields.targeting, MAX_TARGETING);
+  const targetingOwnership = snapshotTargetingOwnership(fields.targetingOwnership);
   if (
     !boundedString(fields.id) ||
     !aliases ||
@@ -337,6 +371,7 @@ function snapshotSlot(value: unknown): Readonly<Record<string, unknown>> | undef
     (fields.owner !== 'trusted_server' && fields.owner !== 'publisher') ||
     !['accepted', 'no_bid', 'failed', 'cancelled'].includes(fields.outcome as string) ||
     !targeting ||
+    !targetingOwnership ||
     !['none', 'gpt_adm', 'aps'].includes(fields.committedArtifact as string) ||
     (fields.gptToken !== null &&
       (!boundedString(fields.gptToken) || !/^gt1_[1-9a-z][0-9a-z]{0,6}$/.test(fields.gptToken)))
@@ -352,6 +387,7 @@ function snapshotSlot(value: unknown): Readonly<Record<string, unknown>> | undef
     owner: fields.owner,
     outcome: fields.outcome,
     targeting,
+    targetingOwnership,
     committedArtifact: fields.committedArtifact,
     gptToken: fields.gptToken,
   });
@@ -393,14 +429,27 @@ function snapshotTombstone(value: unknown): Readonly<Record<string, unknown>> | 
 }
 
 function snapshotArtifact(value: unknown): Readonly<Record<string, unknown>> | undefined {
-  const fields = exactRecord(value, ['slotId', 'kind', 'owner', 'token']);
+  const fields = exactRecord(value, [
+    'slotId',
+    'kind',
+    'owner',
+    'token',
+    'hostPosition',
+    'hostPositionPriority',
+  ]);
   if (
     !fields ||
     !boundedString(fields.slotId) ||
     (fields.kind !== 'gpt_adm' && fields.kind !== 'aps') ||
     (fields.owner !== 'trusted_server' && fields.owner !== 'publisher') ||
     typeof fields.token !== 'string' ||
-    !/^r1_[A-Za-z0-9_-]{22}$/.test(fields.token)
+    !/^r1_[A-Za-z0-9_-]{22}$/.test(fields.token) ||
+    (fields.hostPosition !== null && !boundedString(fields.hostPosition, MAX_STRING_BYTES, true)) ||
+    (fields.hostPositionPriority !== null &&
+      fields.hostPositionPriority !== '' &&
+      fields.hostPositionPriority !== 'important') ||
+    (fields.hostPosition === null) !== (fields.hostPositionPriority === null) ||
+    (fields.kind === 'gpt_adm' && fields.hostPosition !== null)
   ) {
     return undefined;
   }
@@ -982,8 +1031,19 @@ export function snapshotFirstDisplayHandoffV1(
       slots.some((slot) => {
         const artifact = artifactBySlot.get(slot.id as string);
         const cycle = cycleBySlot.get(slot.id as string);
+        const targetingOwnership = slot.targetingOwnership as readonly Readonly<{
+          installed: string;
+          key: string;
+          prior: readonly string[];
+        }>[];
         if (slot.outcome !== 'accepted') {
-          return slot.committedArtifact !== 'none' || slot.gptToken !== null || artifact || cycle;
+          return (
+            slot.committedArtifact !== 'none' ||
+            slot.gptToken !== null ||
+            targetingOwnership.length !== 0 ||
+            artifact ||
+            cycle
+          );
         }
         const targeting = slot.targeting as readonly (readonly [string, string])[];
         const reservation = targeting.find(([key]) => key === 'hb_adid')?.[1];
@@ -994,7 +1054,12 @@ export function snapshotFirstDisplayHandoffV1(
           artifact.kind !== slot.committedArtifact ||
           artifact.token !== reservation ||
           !cycle ||
-          cycle.token !== slot.gptToken
+          cycle.token !== slot.gptToken ||
+          (slot.owner !== 'publisher' && targetingOwnership.length !== 0) ||
+          targetingOwnership.some(
+            (ownership) =>
+              targeting.find(([key]) => key === ownership.key)?.[1] !== ownership.installed
+          )
         );
       }) ||
       cycles.some((cycle) => {

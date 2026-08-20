@@ -19,6 +19,14 @@ export interface TargetingInventorySnapshot {
 
 /** Owner-aware targeting operations exposed to render services. */
 export interface TargetingService {
+  readonly adopt: (
+    slot: object,
+    key: string,
+    installed: string,
+    predecessor: readonly string[],
+    ownerId: string,
+    targeting: TargetingBoundary
+  ) => TargetingOwnership | undefined;
   readonly dispose: () => void;
   readonly disposeOwner: (ownerId: string) => void;
   readonly invalidatePublisherMutation: (slot: object, key?: string) => void;
@@ -138,6 +146,7 @@ function copyValues(values: readonly string[]): readonly string[] {
 /** Construct the runtime-owned GPT targeting restoration journal. */
 export function createTargetingService(): TargetingService {
   const chainsBySlot = new WeakMap<object, Map<string, TargetingChain>>();
+  const publisherMutationTokensBySlot = new WeakMap<object, object>();
   const observationsBySlot = new WeakMap<object, GoogletagTargetingObservation>();
   const liveFrames = new Set<TargetingFrame>();
   const observationReleases = new Set<() => void>();
@@ -343,6 +352,7 @@ export function createTargetingService(): TargetingService {
   };
 
   const invalidatePublisherMutation = (slot: object, key?: string): void => {
+    setWeakMapValue(publisherMutationTokensBySlot, slot, {});
     const slotChains = weakMapValue(chainsBySlot, slot);
     if (!slotChains) return;
     if (key !== undefined) {
@@ -363,6 +373,86 @@ export function createTargetingService(): TargetingService {
       entries[entries.length] = step.value;
     }
     for (const [entryKey, chain] of entries) invalidateChain(slot, slotChains, entryKey, chain);
+  };
+
+  const adopt = (
+    slot: object,
+    key: string,
+    installed: string,
+    predecessor: readonly string[],
+    ownerId: string,
+    targeting: TargetingBoundary
+  ): TargetingOwnership | undefined => {
+    if (disposed) return undefined;
+    if ((typeof slot !== 'object' || slot === null) && typeof slot !== 'function') {
+      throw new TypeError('GPT slot object required');
+    }
+    if (key.length === 0 || installed.length === 0 || ownerId.length === 0) {
+      throw new TypeError('Targeting key, value, and owner are required');
+    }
+    const predecessorValues = copyValues(predecessor);
+    const mutationToken = weakMapValue(publisherMutationTokensBySlot, slot);
+    const actual = copyValues(targeting.getTargeting(key));
+    if (weakMapValue(publisherMutationTokensBySlot, slot) !== mutationToken) return undefined;
+    if (!exactInstalledValue(actual, installed)) return undefined;
+    const observation = weakMapValue(observationsBySlot, slot);
+    if (observation && !observationIsCurrent(observation)) {
+      invalidatePublisherMutation(slot);
+      return undefined;
+    }
+    if (weakMapValue(publisherMutationTokensBySlot, slot) !== mutationToken) return undefined;
+    let slotChains = weakMapValue(chainsBySlot, slot);
+    if (slotChains && mapValue(slotChains, key)) return undefined;
+    if (!slotChains) slotChains = new Map<string, TargetingChain>();
+    const chain: TargetingChain = { frames: [] };
+    const frame: TargetingFrame = {
+      alive: true,
+      kind: 'frame',
+      predecessor: { kind: 'publisher', values: predecessorValues },
+      boundary: targeting,
+      installed,
+      key,
+      observation,
+      ownerId,
+      slot,
+    };
+    const wasNewSlot = weakMapValue(chainsBySlot, slot) === undefined;
+    let publishedWeakMap = false;
+    let publishedChain = false;
+    let publishedFrame = false;
+    try {
+      if (wasNewSlot) {
+        setWeakMapValue(chainsBySlot, slot, slotChains);
+        if (weakMapValue(chainsBySlot, slot) !== slotChains) throw new Error('journal publication');
+        publishedWeakMap = true;
+        slotCount += 1;
+      }
+      setMapValue(slotChains, key, chain);
+      if (mapValue(slotChains, key) !== chain) throw new Error('journal publication');
+      publishedChain = true;
+      chain.frames[0] = frame;
+      publishedFrame = true;
+      addLiveFrame(frame);
+      frameCount += 1;
+    } catch (error) {
+      if (publishedFrame) chain.frames.length = 0;
+      frame.alive = false;
+      if (deleteLiveFrame(frame) && frameCount > 0) frameCount -= 1;
+      if (publishedChain || mapValue(slotChains, key) === chain) deleteMapValue(slotChains, key);
+      if (weakMapValue(chainsBySlot, slot) === slotChains && mapSize(slotChains) === 0) {
+        deleteWeakMapValue(chainsBySlot, slot);
+        if (publishedWeakMap && slotCount > 0) slotCount -= 1;
+      }
+      throw error;
+    }
+    let released = false;
+    return Object.freeze({
+      ownerId,
+      release: (): void => {
+        if (released) return;
+        released = release(frame);
+      },
+    });
   };
 
   const own = (
@@ -476,6 +566,7 @@ export function createTargetingService(): TargetingService {
   };
 
   return Object.freeze({
+    adopt,
     dispose: (): void => {
       if (disposed) return;
       disposed = true;

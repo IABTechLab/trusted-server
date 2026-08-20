@@ -51,6 +51,16 @@ export interface FirstDisplayGptBoundCycleV1 {
   readonly traceToken: string;
 }
 
+export interface FirstDisplayTargetingOwnershipV1 {
+  readonly installed: string;
+  readonly key: string;
+  readonly prior: readonly string[];
+}
+
+export interface FirstDisplayGptHandoffCycleV1 extends FirstDisplayGptBoundCycleV1 {
+  readonly targetingOwnership: readonly FirstDisplayTargetingOwnershipV1[];
+}
+
 export interface FirstDisplayGptDiagnosticCycleV1 {
   readonly nextCycleOrdinal: number;
   readonly quarantines: readonly string[];
@@ -78,14 +88,17 @@ export interface FirstDisplayGoogletagBatchCallbacks {
     cycle: FirstDisplayGptBoundCycleV1,
     result: FirstDisplayGptRenderResult
   ) => void;
+  /** Retire an accepted TS artifact when its exact parser-time physical binding is lost. */
+  readonly onRetire?: (cycle: FirstDisplayGptBoundCycleV1) => void;
 }
 
 export interface FirstDisplayGoogletagBatch {
   readonly start: (callbacks: FirstDisplayGoogletagBatchCallbacks) => boolean;
   /** Stop provisional GPT ingress after every physical cycle is terminal. */
-  readonly closeIngress: () => boolean;
+  /** Destroy noncommitted TS slots before closing publisher-mutation observation. */
+  readonly closeIngress: (committedSlotIds: readonly string[]) => boolean;
   /** Capture exact terminal physical identities without changing disposal ownership. */
-  readonly captureHandoff: () => readonly FirstDisplayGptBoundCycleV1[] | undefined;
+  readonly captureHandoff: () => readonly FirstDisplayGptHandoffCycleV1[] | undefined;
   readonly captureDiagnosticsHandoff: () => FirstDisplayGptDiagnosticsHandoffV1 | undefined;
   /** Exempt exactly the accepted slot identities from provisional destruction/restoration. */
   readonly detachCommittedSlots: (slotIds: readonly string[]) => boolean;
@@ -139,6 +152,22 @@ interface TargetingRestorer {
   readonly prior: readonly string[];
   readonly slot: object;
   valid: boolean;
+}
+
+interface TargetingWrite {
+  consumed: boolean;
+  readonly operation: 'clearTargeting' | 'setTargeting';
+  readonly slot: object;
+}
+
+interface TargetingObserverRestorer {
+  readonly isCurrent: () => boolean;
+  readonly restore: () => boolean;
+}
+
+interface TargetingObserver {
+  readonly isCurrent: () => boolean;
+  readonly restore: () => boolean;
 }
 
 function externalObject(value: unknown): ExternalObject | undefined {
@@ -235,8 +264,12 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
   private readonly createdSlots = new Set<object>();
   private readonly diagnosticFacts: Readonly<FirstDisplayGptFactV1>[] = [];
   private readonly diagnosticListeners = new Map<string, (event: unknown) => void>();
-  private readonly targetingObservers = new Map<object, () => void>();
+  private readonly targetingObservers = new Map<object, TargetingObserver>();
   private readonly targetingRestorers: TargetingRestorer[] = [];
+  private readonly sealedTargetingOwnership = new Map<
+    object,
+    readonly FirstDisplayTargetingOwnershipV1[]
+  >();
   private readonly publisherCallRestorers: Array<() => void> = [];
   private readonly timers = new Set<unknown>();
   private binding: ExternalObject | undefined;
@@ -250,13 +283,14 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
   private started = false;
   private disposed = false;
   private ingressClosed = false;
+  private ingressClosing = false;
   private committedSlotsDetached = false;
   private readonly detachedSlots = new Set<object>();
   private firstAction = false;
   private diagnosticFactOverflow = 0;
   private diagnosticFactDrops = 0;
   private nextTraceTokenOrdinal = 1;
-  private targetingWriteDepth = 0;
+  private readonly targetingWrites: TargetingWrite[] = [];
 
   public constructor(private readonly options: FirstDisplayGoogletagBatchOptions) {}
 
@@ -304,36 +338,84 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     return true;
   }
 
-  public closeIngress(): boolean {
+  public closeIngress(committedSlotIds: readonly string[]): boolean {
     if (
       this.disposed ||
       this.ingressClosed ||
+      this.ingressClosing ||
       !this.started ||
-      [...this.cycles.values()].some((cycle) => !cycle.settled)
+      [...this.cycles.values()].some((cycle) => !cycle.settled) ||
+      !Array.isArray(committedSlotIds)
     ) {
       return false;
     }
+    const committed = new Set(committedSlotIds);
+    if (committed.size !== committedSlotIds.length) return false;
+    const retainedSlots = new Set<object>();
+    for (const slotId of committed) {
+      const matches = [...this.cycles.values()].filter((cycle) => cycle.slotId === slotId);
+      if (matches.length !== 1 || !matches[0]?.settled) return false;
+      retainedSlots.add(matches[0].physicalSlot);
+    }
+    const destroyableSlots = [...this.createdSlots].filter((slot) => !retainedSlots.has(slot));
+    this.ingressClosing = true;
+    if (destroyableSlots.length > 0) {
+      try {
+        if (!this.binding || call(this.binding, 'destroySlots', [[...destroyableSlots]]) !== true) {
+          this.ingressClosing = false;
+          return false;
+        }
+      } catch {
+        this.ingressClosing = false;
+        return false;
+      }
+      for (const slot of destroyableSlots) this.createdSlots.delete(slot);
+    }
+    this.invalidateStaleTargetingObservers();
+    const retainedTargetingRestorers = this.targetingRestorers.filter((restoration) =>
+      retainedSlots.has(restoration.slot)
+    );
+    for (const restoration of [...this.targetingRestorers].reverse()) {
+      if (retainedSlots.has(restoration.slot)) continue;
+      try {
+        this.restorePublisherTargeting(restoration);
+      } catch {
+        // Publisher mutations win while retained-slot observation is still authoritative.
+      }
+    }
+    this.targetingRestorers.splice(
+      0,
+      this.targetingRestorers.length,
+      ...retainedTargetingRestorers
+    );
     this.ingressClosed = true;
+    this.ingressClosing = false;
     this.removePendingCommand();
     for (const handle of [...this.timers]) this.clearOwnedTimer(handle);
     this.removeListener();
     this.restorePublisherCalls();
-    for (const restoreObserver of this.targetingObservers.values()) {
-      try {
-        restoreObserver();
-      } catch {
-        // The closed generation cannot regain authority through a publisher replacement.
-      }
+    const targetingCandidates = this.captureRetainedTargeting(retainedSlots);
+    this.restoreTargetingObservers();
+    for (const [slot, restorations] of targetingCandidates) {
+      this.sealedTargetingOwnership.set(
+        slot,
+        Object.freeze(
+          restorations
+            .filter(({ valid }) => valid)
+            .map(({ installed, key, prior }) => Object.freeze({ installed, key, prior }))
+        )
+      );
     }
-    this.targetingObservers.clear();
     return true;
   }
 
-  public captureHandoff(): readonly FirstDisplayGptBoundCycleV1[] | undefined {
+  public captureHandoff(): readonly FirstDisplayGptHandoffCycleV1[] | undefined {
     if (this.disposed || !this.ingressClosed) return undefined;
     return Object.freeze(
-      [...this.cycles.values()].map((cycle) =>
-        Object.freeze({
+      [...this.cycles.values()].map((cycle) => {
+        const targetingOwnership =
+          this.sealedTargetingOwnership.get(cycle.physicalSlot) ?? Object.freeze([]);
+        return Object.freeze({
           bid: cycle.bid,
           element: cycle.element,
           isCurrent: cycle.isCurrent,
@@ -341,9 +423,10 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
           physicalSlot: cycle.physicalSlot,
           placement: cycle.placement,
           slotId: cycle.slotId,
+          targetingOwnership: Object.freeze(targetingOwnership),
           traceToken: cycle.traceToken,
-        })
-      )
+        });
+      })
     );
   }
 
@@ -402,6 +485,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     for (const handle of [...this.timers]) this.clearOwnedTimer(handle);
     this.removeListener();
     this.restorePublisherCalls();
+    this.invalidateStaleTargetingObservers();
     for (const restoration of this.targetingRestorers.reverse()) {
       if (this.detachedSlots.has(restoration.slot)) continue;
       try {
@@ -411,14 +495,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       }
     }
     this.targetingRestorers.length = 0;
-    for (const restoreObserver of this.targetingObservers.values()) {
-      try {
-        restoreObserver();
-      } catch {
-        // Publisher replacement wins over observer restoration.
-      }
-    }
-    this.targetingObservers.clear();
+    this.restoreTargetingObservers();
     const destroyableSlots = [...this.createdSlots].filter((slot) => !this.detachedSlots.has(slot));
     if (this.binding && destroyableSlots.length > 0) {
       try {
@@ -429,6 +506,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     }
     this.createdSlots.clear();
     this.cycles.clear();
+    this.sealedTargetingOwnership.clear();
     if (this.detachedSlots.size === 0) this.restoreCreatedBinding();
     else this.createdBinding = undefined;
     this.detachedSlots.clear();
@@ -484,7 +562,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     const service = externalObject(call(binding, 'pubads', []));
     if (!service) throw new TypeError('tsjs');
     this.service = service;
-    this.observePublisherCalls(binding, service);
+    this.observePublisherCalls(binding, service, callbacks);
     this.installListeners(service, callbacks);
     const existing = call(service, 'getSlots', []);
     if (!Array.isArray(existing)) throw new TypeError('tsjs');
@@ -624,11 +702,13 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       const slot = physicalSlot(member(event, 'slot'));
       const cycle = slot ? this.cycles.get(slot) : undefined;
       if (!cycle) {
-        if (slot) this.invalidateCyclesForElement(this.readPhysicalElementId(slot), slot);
+        if (slot) {
+          this.invalidateCyclesForElement(this.readPhysicalElementId(slot), slot, callbacks);
+        }
         return;
       }
       if (cycle.settled) {
-        cycle.bindingState.current = false;
+        this.retireCycle(cycle, callbacks);
         this.captureDiagnosticFact('slotRequested', cycle, event);
         return;
       }
@@ -744,7 +824,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
 
   private observePublisherTargeting(slot: object): void {
     if (this.targetingObservers.has(slot)) return;
-    const restorers: Array<() => void> = [];
+    const restorers: TargetingObserverRestorer[] = [];
     try {
       for (const key of ['setTargeting', 'clearTargeting'] as const) {
         const original = member(slot, key);
@@ -752,10 +832,11 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         const prior = Object.getOwnPropertyDescriptor(slot, key);
         const invalidateTargeting = (targetingKey: string | undefined): void =>
           this.invalidateTargeting(slot, targetingKey);
-        const isTrustedServerWrite = (): boolean => this.targetingWriteDepth > 0;
+        const consumeTrustedServerWrite = (): boolean => this.consumeTargetingWrite(slot, key);
         const ownerMutation = (): void => this.notifyNativeMutation();
         const wrapper = function (this: unknown, ...arguments_: unknown[]): unknown {
-          if (!isTrustedServerWrite() && this === slot) {
+          const trustedServerWrite = this === slot && consumeTrustedServerWrite();
+          if (!trustedServerWrite && this === slot) {
             const targetingKey = typeof arguments_[0] === 'string' ? arguments_[0] : undefined;
             invalidateTargeting(targetingKey);
             const result = Reflect.apply(original, this, arguments_);
@@ -774,23 +855,49 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         ) {
           throw new TypeError('tsjs');
         }
-        restorers.push(() => {
-          const current = Object.getOwnPropertyDescriptor(slot, key);
-          if (!current || !('value' in current) || current.value !== wrapper) return;
-          if (prior) Reflect.defineProperty(slot, key, prior);
-          else Reflect.deleteProperty(slot, key);
+        const isCurrent = (): boolean => {
+          try {
+            const current = Object.getOwnPropertyDescriptor(slot, key);
+            return !!current && 'value' in current && current.value === wrapper;
+          } catch {
+            return false;
+          }
+        };
+        restorers.push({
+          isCurrent,
+          restore: (): boolean => {
+            if (!isCurrent()) return false;
+            try {
+              return prior
+                ? Reflect.defineProperty(slot, key, prior)
+                : Reflect.deleteProperty(slot, key);
+            } catch {
+              return false;
+            }
+          },
         });
       }
     } catch (error) {
-      for (const restore of restorers.reverse()) restore();
+      for (const restorer of restorers.reverse()) restorer.restore();
       throw error;
     }
-    this.targetingObservers.set(slot, () => {
-      for (const restore of restorers.reverse()) restore();
+    this.targetingObservers.set(slot, {
+      isCurrent: (): boolean => restorers.every(({ isCurrent }) => isCurrent()),
+      restore: (): boolean => {
+        let exact = restorers.every(({ isCurrent }) => isCurrent());
+        for (const restorer of restorers.reverse()) {
+          if (!restorer.restore()) exact = false;
+        }
+        return exact;
+      },
     });
   }
 
-  private observePublisherCalls(binding: ExternalObject, service: ExternalObject): void {
+  private observePublisherCalls(
+    binding: ExternalObject,
+    service: ExternalObject,
+    callbacks: FirstDisplayGoogletagBatchCallbacks
+  ): void {
     const installed: Array<() => void> = [];
     try {
       for (const [receiver, key] of [
@@ -803,12 +910,19 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         if (typeof original !== 'function') continue;
         const prior = Object.getOwnPropertyDescriptor(receiver, key);
         const notify = (): void => this.notifyNativeMutation();
-        const invalidate = (arguments_: readonly unknown[], result: unknown): void =>
-          this.invalidateCyclesForPublisherCall(key, arguments_, result);
+        const snapshotDestroy = (arguments_: readonly unknown[]): readonly ActiveCycle[] =>
+          key === 'destroySlots' ? this.snapshotDestroyedCycles(arguments_) : Object.freeze([]);
+        const invalidate = (
+          arguments_: readonly unknown[],
+          result: unknown,
+          destroyed: readonly ActiveCycle[]
+        ): void =>
+          this.invalidateCyclesForPublisherCall(key, arguments_, result, destroyed, callbacks);
         const wrapper = function (this: unknown, ...arguments_: unknown[]): unknown {
+          const destroyed = this === receiver ? snapshotDestroy(arguments_) : Object.freeze([]);
           const result = Reflect.apply(original, this, arguments_);
           if (this === receiver) {
-            invalidate(arguments_, result);
+            invalidate(arguments_, result, destroyed);
             notify();
           }
           return result;
@@ -848,11 +962,54 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     }
   }
 
-  private invalidateCyclesForElement(elementId: string | undefined, replacement: object): void {
+  private retireCycle(cycle: ActiveCycle, callbacks: FirstDisplayGoogletagBatchCallbacks): boolean {
+    if (!cycle.bindingState.current) return false;
+    cycle.bindingState.current = false;
+    try {
+      callbacks.onRetire?.(
+        Object.freeze({
+          bid: cycle.bid,
+          element: cycle.element,
+          isCurrent: cycle.isCurrent,
+          ownership: cycle.ownership,
+          physicalSlot: cycle.physicalSlot,
+          placement: cycle.placement,
+          slotId: cycle.slotId,
+          traceToken: cycle.traceToken,
+        })
+      );
+    } catch {
+      // Binding invalidation remains authoritative when retirement observation fails.
+    }
+    return true;
+  }
+
+  private snapshotDestroyedCycles(arguments_: readonly unknown[]): readonly ActiveCycle[] {
+    try {
+      const targets = arguments_[0];
+      if (targets === undefined) return Object.freeze([...this.cycles.values()]);
+      if (!Array.isArray(targets)) return Object.freeze([]);
+      const cycles = new Set<ActiveCycle>();
+      for (let index = 0; index < targets.length; index += 1) {
+        const target = physicalSlot(targets[index]);
+        const cycle = target ? this.cycles.get(target) : undefined;
+        if (cycle) cycles.add(cycle);
+      }
+      return Object.freeze([...cycles]);
+    } catch {
+      return Object.freeze([]);
+    }
+  }
+
+  private invalidateCyclesForElement(
+    elementId: string | undefined,
+    replacement: object,
+    callbacks: FirstDisplayGoogletagBatchCallbacks
+  ): void {
     if (!elementId) return;
     for (const cycle of this.cycles.values()) {
       if (cycle.physicalSlot !== replacement && cycle.elementId === elementId) {
-        cycle.bindingState.current = false;
+        this.retireCycle(cycle, callbacks);
       }
     }
   }
@@ -860,28 +1017,20 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
   private invalidateCyclesForPublisherCall(
     key: string,
     arguments_: readonly unknown[],
-    result: unknown
+    result: unknown,
+    destroyed: readonly ActiveCycle[],
+    callbacks: FirstDisplayGoogletagBatchCallbacks
   ): void {
     try {
       if (key === 'destroySlots' && result === true) {
-        const targets = arguments_[0];
-        if (targets === undefined) {
-          for (const cycle of this.cycles.values()) cycle.bindingState.current = false;
-          return;
-        }
-        if (!Array.isArray(targets)) return;
-        for (let index = 0; index < targets.length; index += 1) {
-          const target = physicalSlot(targets[index]);
-          const cycle = target ? this.cycles.get(target) : undefined;
-          if (cycle) cycle.bindingState.current = false;
-        }
+        for (const cycle of destroyed) this.retireCycle(cycle, callbacks);
         return;
       }
       if (key === 'defineSlot') {
         const replacement = physicalSlot(result);
         const elementId = arguments_[2];
         if (replacement && typeof elementId === 'string') {
-          this.invalidateCyclesForElement(elementId, replacement);
+          this.invalidateCyclesForElement(elementId, replacement, callbacks);
         }
       }
     } catch {
@@ -1111,8 +1260,24 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
 
   private restorePublisherTargeting(restoration: TargetingRestorer): void {
     if (!restoration.valid) return;
+    const observer = this.targetingObservers.get(restoration.slot);
+    if (observer && !observer.isCurrent()) {
+      this.invalidateTargeting(restoration.slot, undefined);
+      return;
+    }
+    if (!restoration.valid) return;
     const current = call(restoration.slot, 'getTargeting', [restoration.key]);
-    if (!Array.isArray(current) || current.length !== 1 || current[0] !== restoration.installed) {
+    if (!restoration.valid) return;
+    if (observer && !observer.isCurrent()) {
+      this.invalidateTargeting(restoration.slot, undefined);
+      return;
+    }
+    if (
+      !restoration.valid ||
+      !Array.isArray(current) ||
+      current.length !== 1 ||
+      current[0] !== restoration.installed
+    ) {
       return;
     }
     if (restoration.prior.length === 0) {
@@ -1127,12 +1292,73 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     operation: 'clearTargeting' | 'setTargeting',
     arguments_: readonly unknown[]
   ): unknown {
-    this.targetingWriteDepth += 1;
+    const write: TargetingWrite = { consumed: false, operation, slot };
+    this.targetingWrites.push(write);
     try {
       return call(slot, operation, arguments_);
     } finally {
-      this.targetingWriteDepth -= 1;
+      const index = this.targetingWrites.lastIndexOf(write);
+      if (index >= 0) this.targetingWrites.splice(index, 1);
     }
+  }
+
+  private consumeTargetingWrite(
+    slot: object,
+    operation: 'clearTargeting' | 'setTargeting'
+  ): boolean {
+    const write = this.targetingWrites[this.targetingWrites.length - 1];
+    if (!write || write.consumed || write.slot !== slot || write.operation !== operation) {
+      return false;
+    }
+    write.consumed = true;
+    return true;
+  }
+
+  private invalidateStaleTargetingObservers(): void {
+    for (const [slot, observer] of this.targetingObservers) {
+      if (!observer.isCurrent()) this.invalidateTargeting(slot, undefined);
+    }
+  }
+
+  private restoreTargetingObservers(): void {
+    for (const [slot, observer] of this.targetingObservers) {
+      if (!observer.restore()) this.invalidateTargeting(slot, undefined);
+    }
+    this.targetingObservers.clear();
+  }
+
+  private captureRetainedTargeting(
+    retainedSlots: ReadonlySet<object>
+  ): Map<object, TargetingRestorer[]> {
+    const captured = new Map<object, TargetingRestorer[]>();
+    for (const slot of retainedSlots) {
+      const observer = this.targetingObservers.get(slot);
+      if (observer && !observer.isCurrent()) this.invalidateTargeting(slot, undefined);
+      const restorations: TargetingRestorer[] = [];
+      for (const restoration of this.targetingRestorers) {
+        if (!restoration.valid || restoration.slot !== slot) continue;
+        let current: unknown;
+        try {
+          current = call(slot, 'getTargeting', [restoration.key]);
+        } catch {
+          continue;
+        }
+        if (observer && !observer.isCurrent()) {
+          this.invalidateTargeting(slot, undefined);
+          break;
+        }
+        if (
+          restoration.valid &&
+          Array.isArray(current) &&
+          current.length === 1 &&
+          current[0] === restoration.installed
+        ) {
+          restorations.push(restoration);
+        }
+      }
+      captured.set(slot, restorations);
+    }
+    return captured;
   }
 
   private failRows(
@@ -1196,7 +1422,7 @@ export function createFirstDisplayGoogletagBatch(
   const owner = new FirstDisplayGoogletagBatchOwner(options);
   return Object.freeze({
     start: (callbacks: FirstDisplayGoogletagBatchCallbacks) => owner.start(callbacks),
-    closeIngress: () => owner.closeIngress(),
+    closeIngress: (committedSlotIds: readonly string[]) => owner.closeIngress(committedSlotIds),
     captureHandoff: () => owner.captureHandoff(),
     captureDiagnosticsHandoff: () => owner.captureDiagnosticsHandoff(),
     detachCommittedSlots: (slotIds: readonly string[]) => owner.detachCommittedSlots(slotIds),

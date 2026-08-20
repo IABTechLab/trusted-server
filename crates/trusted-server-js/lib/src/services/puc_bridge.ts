@@ -9,7 +9,7 @@ import type {
   RenderFailureReason,
   RenderOutcome,
 } from './render';
-import type { SlotService } from './slots';
+import type { ApsSlotMountBinding, SlotService } from './slots';
 import type {
   ReservationAttempt,
   ReservationRecognition,
@@ -110,6 +110,7 @@ export interface PucBridgeOptions {
 export interface PucApsMountInput {
   readonly attempt: RenderAttempt;
   readonly baseArtifact: CommittedRenderArtifact;
+  readonly bindArtifact: ApsSlotMountBinding['bindArtifact'];
   readonly container: HTMLElement;
   readonly isBindingCurrent: () => boolean;
   readonly messaging: MessagingAdapter;
@@ -1164,6 +1165,7 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
         {
           attempt: binding.attempt as unknown as RenderAttempt,
           baseArtifact: binding.artifact,
+          bindArtifact: mountBinding.bindArtifact,
           container: mountBinding.element as HTMLElement,
           isBindingCurrent: mountBinding.isCurrent,
           messaging,

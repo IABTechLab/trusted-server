@@ -6,7 +6,9 @@ import type {
   IntegrationRegistration,
 } from '../../kernel/integration_registry';
 import type {
+  ArtifactHostPositionLeaseRegistry,
   BootstrapNonceRegistry,
+  CommittedRenderArtifact,
   RendererNonceRegistry,
   RenderAttempt,
 } from '../../services/render';
@@ -21,7 +23,12 @@ import {
 } from './render';
 
 interface RenderCapability {
+  readonly bindArtifactGuard: (
+    artifact: CommittedRenderArtifact,
+    current: () => boolean
+  ) => boolean;
   readonly bootstrapNonces: BootstrapNonceRegistry;
+  readonly hostPositions: ArtifactHostPositionLeaseRegistry;
   readonly publisherOrigin: string;
   readonly rendererNonces: RendererNonceRegistry;
   readonly registerRenderer: (
@@ -61,8 +68,17 @@ export function createApsIntegrationRegistration(releaseId: string): Integration
     const render = capability<RenderCapability>(context.interfaces, 'render.v1');
     const messages = capability<MessagesCapability>(context.interfaces, 'messages.v1');
     if (
+      typeof render.bindArtifactGuard !== 'function' ||
       typeof render.registerRenderer !== 'function' ||
       typeof render.publisherOrigin !== 'string' ||
+      typeof render.hostPositions !== 'object' ||
+      render.hostPositions === null ||
+      !Object.isFrozen(render.hostPositions) ||
+      typeof render.hostPositions.bindOwned !== 'function' ||
+      typeof render.hostPositions.inherit !== 'function' ||
+      typeof render.hostPositions.claim !== 'function' ||
+      typeof render.hostPositions.current !== 'function' ||
+      typeof render.hostPositions.release !== 'function' ||
       typeof messages.messaging !== 'object' ||
       messages.messaging === null ||
       typeof messages.registerApsValidation !== 'function'
@@ -76,6 +92,7 @@ export function createApsIntegrationRegistration(releaseId: string): Integration
       active &&
       renderDirectApsAttempt({
         attempt,
+        bindArtifactGuard: render.bindArtifactGuard,
         bootstrapNonces: render.bootstrapNonces,
         container,
         messaging: messages.messaging,
@@ -86,7 +103,9 @@ export function createApsIntegrationRegistration(releaseId: string): Integration
       active &&
       renderPucApsAttempt({
         ...input,
+        bindArtifactGuard: render.bindArtifactGuard,
         bootstrapNonces: render.bootstrapNonces,
+        hostPositions: render.hostPositions,
         messaging: messages.messaging,
         nonces: render.rendererNonces,
         publisherOrigin: render.publisherOrigin,
