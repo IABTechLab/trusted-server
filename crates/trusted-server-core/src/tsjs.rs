@@ -11,9 +11,38 @@ pub fn tsjs_script_src(module_ids: &[&str]) -> String {
 /// `<script>` tag for injecting the tsjs bundle.
 #[must_use]
 pub fn tsjs_script_tag(module_ids: &[&str]) -> String {
+    tsjs_script_tag_with_attributes(module_ids, &[])
+}
+
+/// Publisher `<script>` tag for the tsjs bundle with trusted static attributes.
+#[must_use]
+pub fn tsjs_script_tag_with_attributes(
+    module_ids: &[&str],
+    attributes: &[(&'static str, &'static str)],
+) -> String {
+    let attributes = attributes
+        .iter()
+        .map(|(name, value)| {
+            debug_assert!(
+                !name.is_empty()
+                    && name.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    }),
+                "attribute name should contain only lowercase ASCII letters, digits, and hyphens"
+            );
+            debug_assert!(
+                !value
+                    .bytes()
+                    .any(|byte| matches!(byte, b'"' | b'&' | b'<' | b'>')),
+                "attribute value should not contain HTML-sensitive characters"
+            );
+            format!(" {name}=\"{value}\"")
+        })
+        .collect::<String>();
+
     format!(
-        "<script src=\"{}\" id=\"trustedserver-js\"></script>",
-        tsjs_script_src(module_ids)
+        "<script src=\"{}\" id=\"trustedserver-js\"{attributes}></script>",
+        tsjs_script_src(module_ids),
     )
 }
 
@@ -171,18 +200,78 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_unified_helpers_use_all_module_ids() {
-        let ids = all_module_ids();
+    fn publisher_tsjs_script_tag_renders_static_attributes() {
+        let module_ids = ["gpt"];
+        let src = tsjs_script_src(&module_ids);
 
         assert_eq!(
-            tsjs_unified_script_src(),
+            tsjs_script_tag_with_attributes(&module_ids, &[("data-ts-gam-attribution", "true")]),
+            format!(
+                "<script src=\"{src}\" id=\"trustedserver-js\" data-ts-gam-attribution=\"true\"></script>"
+            ),
+            "should render trusted static attributes on the publisher bundle tag"
+        );
+        assert_eq!(
+            tsjs_script_tag(&module_ids),
+            format!("<script src=\"{src}\" id=\"trustedserver-js\"></script>"),
+            "should keep the generic tag byte-for-byte unmarked"
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "attribute name should contain only lowercase ASCII letters, digits, and hyphens"
+    )]
+    fn publisher_tsjs_script_tag_rejects_invalid_attribute_name() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-bad_name", "true")]);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "attribute name should contain only lowercase ASCII letters, digits, and hyphens"
+    )]
+    fn publisher_tsjs_script_tag_rejects_empty_attribute_name() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("", "true")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_double_quote_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad\"value")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_ampersand_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad&value")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_less_than_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad<value")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_greater_than_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad>value")]);
+    }
+
+    #[test]
+    fn tsjs_unified_helpers_use_all_module_ids() {
+        let ids = all_module_ids();
+        let src = tsjs_unified_script_src();
+
+        assert_eq!(
+            src,
             tsjs_script_src(&ids),
             "should hash all module IDs for the unified script source"
         );
         assert_eq!(
             tsjs_unified_script_tag(),
-            tsjs_script_tag(&ids),
-            "should wrap the all-module unified script source"
+            format!("<script src=\"{src}\" id=\"trustedserver-js\"></script>"),
+            "should keep the all-module generic tag byte-for-byte unmarked"
         );
     }
 
