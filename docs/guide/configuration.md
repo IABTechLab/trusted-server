@@ -1427,7 +1427,7 @@ The cache fails closed. A template is stored only for a `GET` with a processable
 positive shared freshness. `private`, `no-store`, `no-cache`, exhausted or
 malformed freshness, `Set-Cookie`, `Vary: *`, `Vary: Cookie`, uncovered `Vary`
 names, response-bound CSP nonces, authorization, diagnostics sessions, range or
-conditional requests, request-side `max-age`/`min-fresh` constraints, and
+conditional requests, positive or malformed request `max-age`, `min-fresh`, and
 unsupported CDN-specific cache policy fields all bypass the template cache. Fastly
 `Surrogate-Control` is the narrow exception: the template cache accepts exactly one positive
 `max-age` plus optional valid `stale-while-revalidate` and `stale-if-error`

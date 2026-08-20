@@ -1653,9 +1653,12 @@ pub async fn buffer_publisher_response_async(
             // `process_response_streaming_async`; inline transforms retain the origin
             // coding. This avoids recompressing and immediately decoding a full document.
             let bytes = output.into_inner();
+            // Cache taxonomy for this path: C1 is the raw origin/read-through cache,
+            // the template cache stores processed reader-neutral HTML, and C3 would be
+            // a forbidden cache of the final per-user assembled response.
             // Store first, assemble second — never the reverse. The stored bytes are
             // shared between visitors; the assembled ones carry this visitor's bids.
-            // Swapping these two lines is the C3 leak.
+            // Swapping these two lines would create the forbidden C3 leak.
             // Read before the store: `store_template_if_authorized` *takes* the key so a
             // request cannot store twice, which would leave nothing for assembly to gate
             // on.
@@ -2077,7 +2080,7 @@ impl core::error::Error for SeamError {}
 /// the publisher path stamps `private, no-store` and strips validators. Omitting it
 /// here does not fall back to a safe default — it emits HTML with no `Cache-Control` at
 /// all, which is heuristically cacheable by browsers and intermediaries. That is a
-/// shared cache of an assembled per-user response: the C3 the design forbids outright.
+/// forbidden C3 cache of a final per-user assembled response.
 ///
 /// Asserting the absence of `public`/`s-maxage`/`Surrogate-Control` would not have
 /// caught it. Nothing was present to forbid.
@@ -5491,8 +5494,8 @@ impl TemplateCachePolicy {
 /// the most serious one that applies.
 ///
 /// See `docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md`
-/// §6.6 for why C1, template cache and a final assembled-response cache are distinct, and why
-/// the third must never exist.
+/// §6.6 for why the C1 raw-origin/read-through cache, the reader-neutral template cache, and
+/// the forbidden C3 final assembled-response cache are distinct.
 #[cfg(test)]
 pub(crate) fn template_cache_bypass_reason(
     mode: AssemblyMode,
@@ -8235,59 +8238,63 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn publisher_esi_comment_is_never_stored_or_executed() {
-            let stub = Arc::new(StubHttpClient::new());
-            let cache = Arc::new(MemoryTemplateCache::default());
-            let assembler = Arc::new(RecordingTemplateAssembler::default());
-            let settings = Arc::new(settings_with_mode("esi"));
-            let services = services_with_assembler(
-                Arc::clone(&stub),
-                Arc::clone(&cache),
-                Arc::clone(&assembler),
-            );
-            stub.push_response_with_headers(
-                200,
-                b"<html><head></head><body><!--ESI publisher--></body></html>".to_vec(),
-                vec![
-                    ("content-type", "text/html; charset=utf-8"),
-                    ("cache-control", "public, max-age=300"),
-                ],
-            );
-
-            let response = run(&settings, &services, navigation_request()).await;
-            assert_eq!(
-                header_of(
-                    &response,
-                    header::HeaderName::from_static(HEADER_X_TS_TEMPLATE_CACHE),
+        async fn publisher_esi_directives_are_never_stored_or_executed() {
+            for (source, expected_directive) in [
+                ("<!--ESI publisher-->", "<!--esi publisher-->"),
+                (
+                    "<ESI:remove>publisher</ESI:remove>",
+                    "<esi:remove>publisher</esi:remove>",
                 ),
-                Some("bypass-response")
-            );
-            assert_eq!(
-                header_of(&response, header::HeaderName::from_static("x-ts-assembly")),
-                Some("byte-seam-fallback")
-            );
-            let document = String::from_utf8(body_of(response).await)
-                .expect("served document should be UTF-8");
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let assembler = Arc::new(RecordingTemplateAssembler::default());
+                let settings = Arc::new(settings_with_mode("esi"));
+                let services = services_with_assembler(
+                    Arc::clone(&stub),
+                    Arc::clone(&cache),
+                    Arc::clone(&assembler),
+                );
+                stub.push_response_with_headers(
+                    200,
+                    format!("<html><head></head><body>{source}</body></html>").into_bytes(),
+                    vec![
+                        ("content-type", "text/html; charset=utf-8"),
+                        ("cache-control", "public, max-age=300"),
+                    ],
+                );
 
-            assert!(
-                document
-                    .to_ascii_lowercase()
-                    .contains("<!--esi publisher-->")
-            );
-            assert!(document.contains("scheduleInitialAdInit"));
-            assert!(
-                cache
-                    .entries
-                    .lock()
-                    .expect("should lock entries")
-                    .is_empty(),
-                "publisher-authored ESI must never enter the shared template cache"
-            );
-            assert_eq!(
-                assembler.calls.load(Ordering::Relaxed),
-                0,
-                "publisher-authored ESI must never reach the platform parser"
-            );
+                let response = run(&settings, &services, navigation_request()).await;
+                assert_eq!(
+                    header_of(
+                        &response,
+                        header::HeaderName::from_static(HEADER_X_TS_TEMPLATE_CACHE),
+                    ),
+                    Some("bypass-response")
+                );
+                assert_eq!(
+                    header_of(&response, header::HeaderName::from_static("x-ts-assembly")),
+                    Some("byte-seam-fallback")
+                );
+                let document = String::from_utf8(body_of(response).await)
+                    .expect("served document should be UTF-8");
+
+                assert!(document.to_ascii_lowercase().contains(expected_directive));
+                assert!(document.contains("scheduleInitialAdInit"));
+                assert!(
+                    cache
+                        .entries
+                        .lock()
+                        .expect("should lock entries")
+                        .is_empty(),
+                    "publisher-authored ESI must never enter the shared template cache"
+                );
+                assert_eq!(
+                    assembler.calls.load(Ordering::Relaxed),
+                    0,
+                    "publisher-authored ESI must never reach the platform parser"
+                );
+            }
         }
 
         #[tokio::test]
@@ -8748,8 +8755,9 @@ mod tests {
 
         /// Shareable HTML that already contains the seam marker.
         ///
-        /// The marker is reserved, but publisher content can still contain it. Fresh
-        /// normalization must disambiguate that content from the transform-owned seam.
+        /// The marker is reserved, but publisher content can still contain it. The
+        /// transform adds its own terminal placeholder; repeated markers then make the
+        /// response bypass the template cache rather than requiring normalization.
         fn queue_html_that_collides_with_the_marker(stub: &StubHttpClient) {
             stub.push_response_with_headers(
                 200,
@@ -9256,7 +9264,8 @@ mod tests {
 
         #[tokio::test]
         async fn the_cached_template_holds_the_marker_and_never_the_bids() {
-            // The ordering the C3 prohibition depends on: store before assembling. If
+            // Store the reader-neutral template before assembling the final per-user
+            // response, which must never enter the forbidden C3 cache. If
             // these were swapped, the cache would hold one visitor's bids and serve them
             // to the next — and every test above would still pass, because the served
             // page would look correct.

@@ -1118,6 +1118,23 @@ mod tests {
                 schema_version: TEMPLATE_SCHEMA_VERSION,
                 body_len: 0,
             },
+            TemplateMetadata {
+                content_encoding: "identity".to_string(),
+                policy_headers: vec![(
+                    "content-security-policy\rh=link".to_string(),
+                    "default-src 'self'".to_string(),
+                )],
+                content_type: "text/html".to_string(),
+                schema_version: TEMPLATE_SCHEMA_VERSION,
+                body_len: 0,
+            },
+            TemplateMetadata {
+                content_encoding: "identity".to_string(),
+                policy_headers: Vec::new(),
+                content_type: "text/html\nh=link:</evil>".to_string(),
+                schema_version: TEMPLATE_SCHEMA_VERSION,
+                body_len: 0,
+            },
         ] {
             assert!(
                 metadata.encode().is_err(),

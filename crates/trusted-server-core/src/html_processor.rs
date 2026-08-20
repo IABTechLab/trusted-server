@@ -736,8 +736,9 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             }
             Ok(())
         }));
-        // Nonce attributes are rejected on their own: a document carrying them is written
-        // for a per-response policy whether or not the policy itself reached this scan.
+        // `lol_html` does not entity-decode quoted meta CSP content for the check above.
+        // Reject nonce attributes independently so an entity-encoded meta policy cannot
+        // hide executable nonce-bound content from the template-cache safety scan.
         element_content_handlers.push(element!("[nonce]", move |_el| {
             observed.store(true, Ordering::SeqCst);
             Ok(())
@@ -2148,7 +2149,7 @@ mod tests {
         assert_eq!(
             html.matches(MARKER).count(),
             2,
-            "one source occurrence plus one transform-owned template-cache seam must reach normalization"
+            "one source occurrence plus the transform-owned terminal seam must survive processing; repeated markers are rejected before template caching"
         );
         assert!(
             html.ends_with(MARKER),
