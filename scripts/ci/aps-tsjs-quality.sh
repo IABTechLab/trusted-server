@@ -42,6 +42,13 @@ run_quality_gates() {
   cp "$repository_root/crates/trusted-server-js/dist/tsjs-build-metrics-v1.json" "$evidence_root/"
 }
 
+run_contract_tests() {
+  cd "$repository_root"
+  node --test scripts/ci/dispatch-aps-tsjs-gate.test.mjs
+  node scripts/ci/aps-tsjs-evidence.mjs self-test
+  node scripts/validate-tsjs-performance-evidence.mjs --self-test
+}
+
 case "${1:-}" in
   install)
     install_dependencies
@@ -49,8 +56,11 @@ case "${1:-}" in
   run)
     run_quality_gates
     ;;
+  contracts)
+    run_contract_tests
+    ;;
   *)
-    printf 'usage: %s {install|run}\n' "$0" >&2
+    printf 'usage: %s {install|run|contracts}\n' "$0" >&2
     exit 64
     ;;
 esac

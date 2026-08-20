@@ -36,8 +36,8 @@ const MAXIMUM_P90_RATIO = 1.1;
 const EXPECTED_CHROMIUM = "145.0.7632.6";
 const MACHINE_CLASS = "github-hosted:ubuntu-24.04";
 const RUNNER_IMAGE = "ubuntu-24.04";
-const FIXTURE_ID = "tsjs-main-paired-network-v2";
-const CONTROLLER_ID = "generated-server-v1+production-main-v1";
+const FIXTURE_ID = "tsjs-baseline-paired-network-v3";
+const CONTROLLER_ID = "generated-server-v1+production-rc-v1";
 const COMPARISON_START_MARK = "tsjs:comparison-start";
 const FIRST_OBSERVABLE_ACTION_MARK = "tsjs:first-observable-action";
 const NETWORK_PROFILE = Object.freeze({
@@ -47,7 +47,7 @@ const NETWORK_PROFILE = Object.freeze({
   uploadThroughput: 93_750,
   packetLoss: 0,
 });
-// Current main always ships creative with core, and production's default
+// The rc baseline always ships creative with core, and production's default
 // creative guard is enabled. Keep both comparison sides on that same shape.
 const SELECTED_IDS = ["render_runtime", "creative", "gpt"] as const;
 const DEFERRED_IDS = ["diagnostics_presentation", "gpt_later"] as const;
@@ -60,6 +60,21 @@ const HEAP_CHECKPOINTS = [
 ] as const;
 const HARD_HEAP_CEILING_BYTES = 4 * 1024 * 1024;
 const HEAP_OPERATION_TIMEOUT_MS = 30_000;
+const APS_ACTION_P90_CEILING_MS = 900;
+const APS_ACTION_TO_COMPLETION_P90_CEILING_MS = 1_500;
+const APS_COMPLETION_TO_PAINT_P90_CEILING_MS = 250;
+const APS_TOTAL_P90_CEILING_MS = 2_500;
+const APS_AFTER_PAINT_HEAP_CEILING_BYTES = 3 * 1024 * 1024;
+const APS_AFTER_TAKEOVER_HEAP_CEILING_BYTES = 3_932_160;
+const FICTIONAL_APS_RUNNER = readFileSync(
+  resolve(
+    REPO_ROOT,
+    "crates/trusted-server-integration-tests/browser/fixtures/fictional-aps-runner.js",
+  ),
+  "utf8",
+);
+
+type PerformanceCase = "gpt" | "aps";
 
 type HeapCheckpoint = (typeof HEAP_CHECKPOINTS)[number];
 
@@ -84,7 +99,8 @@ interface Release {
 }
 
 interface FixtureResources {
-  artifactModel: "release-v1" | "legacy-main-v1";
+  performanceCase: PerformanceCase;
+  artifactModel: "release-v1" | "legacy-rc-v1";
   release: Release | null;
   controllerDocument: string | null;
   selectedBody: string;
@@ -94,6 +110,9 @@ interface FixtureResources {
   runtimeSrc: string | null;
   deferred: Map<string, { body: string; src: string }>;
   referenceTransfer: ReferenceTransfer;
+  apsRendererDocument: string | null;
+  apsRendererPath:
+    "/integrations/aps/renderer" | "/integrations/aps/renderer/v2" | null;
 }
 
 interface ReferenceTransferSource {
@@ -166,6 +185,9 @@ interface ComparisonObservation {
   timingMs: number;
   displayCount: number;
   releaseId: string | undefined;
+  actionToCompletionMs?: number;
+  completionToPaintMs?: number;
+  totalToPaintMs?: number;
 }
 
 function exactArtifact(release: Release, id: string): ReleaseArtifact {
@@ -175,7 +197,35 @@ function exactArtifact(release: Release, id: string): ReleaseArtifact {
   return matches[0]!;
 }
 
-function legacyBootInline(): string {
+function apsDescriptor() {
+  const bid = {
+    id: "performance-aps-bid",
+    price: 1.25,
+    w: 300,
+    h: 250,
+    ext: {
+      creativeurl: "https://creative.example/performance",
+      tagtype: "iframe",
+    },
+  };
+  return {
+    type: "aps",
+    version: 1,
+    accountId: "fictional-performance-account",
+    bidId: bid.id,
+    creativeId: "fictional-performance-creative",
+    tagType: bid.ext.tagtype,
+    creativeUrl: bid.ext.creativeurl,
+    aaxResponse: Buffer.from(
+      JSON.stringify({ seatbid: [{ bid: [bid] }] }),
+      "utf8",
+    ).toString("base64"),
+    width: bid.w,
+    height: bid.h,
+  };
+}
+
+function legacyBootInline(performanceCase: PerformanceCase): string {
   const slots = [
     {
       id: "perf-slot",
@@ -185,7 +235,18 @@ function legacyBootInline(): string {
       targeting: {},
     },
   ];
-  return `window.tsjs={adSlots:${JSON.stringify(slots)},bids:{},navGeneration:0};window.__tsjs_gpt_enabled=true;`;
+  const bids =
+    performanceCase === "aps"
+      ? {
+          "perf-slot": {
+            hb_adid: "performance-aps-bid",
+            hb_bidder: "aps",
+            hb_pb: "1.25",
+            renderer: apsDescriptor(),
+          },
+        }
+      : {};
+  return `window.tsjs={adSlots:${JSON.stringify(slots)},bids:${JSON.stringify(bids)},navGeneration:0};window.__tsjs_gpt_enabled=true;`;
 }
 
 function exactControllerInline(document: string): string {
@@ -269,32 +330,43 @@ function measureReferenceTransfer(
   };
 }
 
-function loadReleaseFixtureResources(repositoryRoot: string): FixtureResources {
+function loadReleaseFixtureResources(
+  repositoryRoot: string,
+  performanceCase: PerformanceCase = "gpt",
+): FixtureResources {
   const tsjsCrate = resolve(repositoryRoot, "crates/trusted-server-js");
   const dist = resolve(tsjsCrate, "dist");
   const releaseFile = resolve(dist, "tsjs-release-v1.json");
   const release = JSON.parse(readFileSync(releaseFile, "utf8")) as Release;
   expect(release.version).toBe(1);
+  const selectedIds =
+    performanceCase === "aps"
+      ? (["render_runtime", "aps", "creative", "gpt"] as const)
+      : SELECTED_IDS;
   const runtimeArtifacts = [exactArtifact(release, "core")].concat(
-    SELECTED_IDS.map((id) => exactArtifact(release, id)),
+    selectedIds.map((id) => exactArtifact(release, id)),
   );
   for (const artifact of runtimeArtifacts.slice(1)) {
     expect(artifact.phase).toBe("takeover");
   }
-  expect(
-    runtimeArtifacts.map(({ id }) => id),
-    "release-v1 performance shape must stay core + render + creative + GPT",
-  ).toEqual(["core", "render_runtime", "creative", "gpt"]);
+  expect(runtimeArtifacts.map(({ id }) => id)).toEqual([
+    "core",
+    ...selectedIds,
+  ]);
   const runtimeBody = runtimeArtifacts
     .map((artifact) => readFileSync(resolve(dist, artifact.file), "utf8"))
     .join(";\n");
   const runtimeHash = createHash("sha256").update(runtimeBody).digest("hex");
   const runtimeSrc = `/static/tsjs=tsjs-unified.min.js?v=${runtimeHash}`;
-  const firstDisplayIds = [
-    "first_display",
-    "creative_initial",
-    "gpt_initial",
-  ] as const;
+  const firstDisplayIds =
+    performanceCase === "aps"
+      ? ([
+          "first_display",
+          "aps_initial",
+          "creative_initial",
+          "gpt_initial",
+        ] as const)
+      : (["first_display", "creative_initial", "gpt_initial"] as const);
   const firstDisplayArtifacts = firstDisplayIds.map((id) =>
     exactArtifact(release, id),
   );
@@ -304,7 +376,8 @@ function loadReleaseFixtureResources(repositoryRoot: string): FixtureResources {
     .map((artifact) => readFileSync(resolve(dist, artifact.file), "utf8"))
     .join(";\n");
   const selectedHash = createHash("sha256").update(selectedBody).digest("hex");
-  const selectedSrc = `/static/tsjs=tsjs-first-display.min.js?m=0045&v=${selectedHash}`;
+  const mask = performanceCase === "aps" ? "0047" : "0045";
+  const selectedSrc = `/static/tsjs=tsjs-first-display.min.js?m=${mask}&v=${selectedHash}`;
   const deferred = new Map<string, { body: string; src: string }>();
   for (const id of DEFERRED_IDS) {
     const artifact = exactArtifact(release, id);
@@ -319,7 +392,10 @@ function loadReleaseFixtureResources(repositoryRoot: string): FixtureResources {
   const projectionPath = resolve(directory, "projection.json");
   let controllerDocument: string;
   try {
-    writeFileSync(projectionPath, `${JSON.stringify(initialProjection())}\n`);
+    writeFileSync(
+      projectionPath,
+      `${JSON.stringify(initialProjection(performanceCase))}\n`,
+    );
     const host = /^host: (.+)$/mu.exec(
       execFileSync("rustc", ["-vV"], { encoding: "utf8" }),
     )?.[1];
@@ -339,7 +415,7 @@ function loadReleaseFixtureResources(repositoryRoot: string): FixtureResources {
         "--projection",
         projectionPath,
         "--ids",
-        [...SELECTED_IDS, ...DEFERRED_IDS].join(","),
+        [...selectedIds, ...DEFERRED_IDS].join(","),
       ],
       {
         cwd: repositoryRoot,
@@ -376,6 +452,7 @@ function loadReleaseFixtureResources(repositoryRoot: string): FixtureResources {
     },
   ]);
   return {
+    performanceCase,
     artifactModel: "release-v1",
     release,
     controllerDocument,
@@ -386,11 +463,40 @@ function loadReleaseFixtureResources(repositoryRoot: string): FixtureResources {
     runtimeSrc,
     deferred,
     referenceTransfer,
+    apsRendererDocument:
+      performanceCase === "aps"
+        ? readFileSync(
+            resolve(
+              repositoryRoot,
+              "crates/trusted-server-core/src/integrations/generated/aps_renderer_bootstrap_v2.html",
+            ),
+            "utf8",
+          )
+        : null,
+    apsRendererPath:
+      performanceCase === "aps" ? "/integrations/aps/renderer/v2" : null,
   };
 }
 
-function loadLegacyMainFixtureResources(
+function legacyApsRendererDocument(repositoryRoot: string): string {
+  const source = readFileSync(
+    resolve(
+      repositoryRoot,
+      "crates/trusted-server-core/src/integrations/aps.rs",
+    ),
+    "utf8",
+  );
+  const match = /const APS_RENDERER_DOCUMENT: &str = r#"([\s\S]*?)"#;/u.exec(
+    source,
+  );
+  if (!match?.[1])
+    throw new Error("legacy rc APS renderer document is unavailable");
+  return match[1];
+}
+
+function loadLegacyBaselineFixtureResources(
   repositoryRoot: string,
+  performanceCase: PerformanceCase = "gpt",
 ): FixtureResources {
   const dist = resolve(repositoryRoot, "crates/trusted-server-js/dist");
   const selectedBody = ["tsjs-core.js", "tsjs-creative.js", "tsjs-gpt.js"]
@@ -402,7 +508,7 @@ function loadLegacyMainFixtureResources(
     {
       semanticEndpoint: "inline:legacy-boot",
       delivery: "inline",
-      body: legacyBootInline(),
+      body: legacyBootInline(performanceCase),
     },
     {
       semanticEndpoint: "inline:legacy-ad-init",
@@ -416,7 +522,8 @@ function loadLegacyMainFixtureResources(
     },
   ]);
   return {
-    artifactModel: "legacy-main-v1",
+    performanceCase,
+    artifactModel: "legacy-rc-v1",
     release: null,
     controllerDocument: null,
     selectedBody,
@@ -426,20 +533,29 @@ function loadLegacyMainFixtureResources(
     runtimeSrc: null,
     deferred: new Map(),
     referenceTransfer,
+    apsRendererDocument:
+      performanceCase === "aps"
+        ? legacyApsRendererDocument(repositoryRoot)
+        : null,
+    apsRendererPath:
+      performanceCase === "aps" ? "/integrations/aps/renderer" : null,
   };
 }
 
-function loadMainFixtureResources(repositoryRoot: string): FixtureResources {
+function loadBaselineFixtureResources(
+  repositoryRoot: string,
+  performanceCase: PerformanceCase = "gpt",
+): FixtureResources {
   const releaseFile = resolve(
     repositoryRoot,
     "crates/trusted-server-js/dist/tsjs-release-v1.json",
   );
   return existsSync(releaseFile)
-    ? loadReleaseFixtureResources(repositoryRoot)
-    : loadLegacyMainFixtureResources(repositoryRoot);
+    ? loadReleaseFixtureResources(repositoryRoot, performanceCase)
+    : loadLegacyBaselineFixtureResources(repositoryRoot, performanceCase);
 }
 
-function initialProjection() {
+function initialProjection(performanceCase: PerformanceCase = "gpt") {
   const candidateId = "AAAAAAAAAAAA";
   return {
     version: 1,
@@ -467,13 +583,16 @@ function initialProjection() {
         currency: "USD",
         targeting: { hb_bidder: "trusted" },
         rendererReservationId: `r1_${"a".repeat(22)}`,
-        renderSource: {
-          type: "adm",
-          version: 1,
-          adm: "<main>fictional performance creative</main>",
-          width: 300,
-          height: 250,
-        },
+        renderSource:
+          performanceCase === "aps"
+            ? apsDescriptor()
+            : {
+                type: "adm",
+                version: 1,
+                adm: "<main>fictional performance creative</main>",
+                width: 300,
+                height: 250,
+              },
       },
     ],
   };
@@ -485,9 +604,9 @@ function fixtureDocument(
 ): string {
   const selectedTag = `<script src="${resources.selectedSrc}" id="trustedserver-js"></script>`;
   const comparisonSetup = `<script>window.__fixtureGpt.setManual(true);performance.mark("${COMPARISON_START_MARK}");</script>`;
-  if (resources.artifactModel === "legacy-main-v1") {
+  if (resources.artifactModel === "legacy-rc-v1") {
     const release = manualDisplay ? "" : "window.__fixtureGpt.release();";
-    return `<!doctype html><html><head><meta charset="utf-8"><script>${legacyBootInline()}</script>${comparisonSetup}${selectedTag}</head><body><div id="perf-slot"></div><script>${LEGACY_AD_INIT_INLINE}${release}</script></body></html>`;
+    return `<!doctype html><html><head><meta charset="utf-8"><script>${legacyBootInline(resources.performanceCase)}</script>${comparisonSetup}${selectedTag}</head><body><div id="perf-slot"></div><script>${LEGACY_AD_INIT_INLINE}${release}</script></body></html>`;
   }
   if (!resources.controllerDocument)
     throw new Error("generated controller document is unavailable");
@@ -508,8 +627,11 @@ function fixtureDocument(
   return released;
 }
 
-async function installFixtureGpt(context: BrowserContext): Promise<void> {
-  await context.addInitScript(() => {
+async function installFixtureGpt(
+  context: BrowserContext,
+  performanceCase: PerformanceCase,
+): Promise<void> {
+  await context.addInitScript((selectedCase) => {
     type Listener = (event: Record<string, unknown>) => void;
     type Slot = {
       addService(service: object): Slot;
@@ -567,6 +689,86 @@ async function installFixtureGpt(context: BrowserContext): Promise<void> {
       for (const listener of listeners.get(name) ?? [])
         listener({ slot, ...facts });
     };
+    const startFictionalPuc = (slot: Slot): void => {
+      const adId = slot.getTargeting("hb_adid")[0];
+      const root = document.getElementById(slot.getSlotElementId());
+      if (!adId || !root)
+        throw new Error("fictional APS PUC input is unavailable");
+      const frame = document.createElement("iframe");
+      frame.dataset.fictionalPuc = "";
+      frame.srcdoc = `<!doctype html><body><script>(${String(
+        function fictionalUniversalCreative(reservationId: string) {
+          type OwnerResponse = { adId: string; renderer: string };
+          type PucWindow = Window & {
+            render?: (
+              data: OwnerResponse,
+              helper: object,
+              target: Window,
+            ) => Promise<void>;
+          };
+          const request = (): Promise<OwnerResponse> =>
+            new Promise((resolveRequest, rejectRequest) => {
+              const channel = new MessageChannel();
+              const timeout = window.setTimeout(() => {
+                channel.port1.close();
+                rejectRequest(new Error("fictional PUC response timeout"));
+              }, 5_000);
+              channel.port1.onmessage = (event) => {
+                window.clearTimeout(timeout);
+                channel.port1.close();
+                try {
+                  resolveRequest(
+                    JSON.parse(String(event.data)) as OwnerResponse,
+                  );
+                } catch (error) {
+                  rejectRequest(error);
+                }
+              };
+              channel.port1.start();
+              window.parent.postMessage(
+                JSON.stringify({
+                  message: "Prebid Request",
+                  adId: reservationId,
+                  adServerDomain: window.parent.location.host,
+                }),
+                "*",
+                [channel.port2],
+              );
+            });
+          void request().then(async (response) => {
+            const pucWindow = window as PucWindow;
+            window.eval(response.renderer);
+            if (typeof pucWindow.render !== "function") {
+              throw new Error("fictional PUC renderer is unavailable");
+            }
+            const helper = {
+              sendMessage(
+                message: string,
+                payload: Record<string, unknown>,
+                callback: (event: MessageEvent) => void,
+              ) {
+                const channel = new MessageChannel();
+                channel.port1.onmessage = callback;
+                channel.port1.start();
+                window.parent.postMessage(
+                  JSON.stringify({ message, adId: response.adId, ...payload }),
+                  "*",
+                  [channel.port2],
+                );
+                return () => channel.port1.close();
+              },
+            };
+            await pucWindow.render(response, helper, window);
+          });
+        },
+      )})(${JSON.stringify(adId)});<\/script></body>`;
+      root.appendChild(frame);
+    };
+    const completeSlot = (slot: Slot): void => {
+      emit("slotRequested", slot);
+      emit("slotRenderEnded", slot, { isEmpty: selectedCase !== "aps" });
+      if (selectedCase === "aps") startFictionalPuc(slot);
+    };
     const pubads = {
       addEventListener(name: string, listener: Listener) {
         calls.push(`addEventListener:${name}`);
@@ -585,10 +787,7 @@ async function installFixtureGpt(context: BrowserContext): Promise<void> {
         markFirstObservableAction();
         calls.push("refresh");
         for (const slot of requested ?? [...physical]) {
-          queueMicrotask(() => {
-            emit("slotRequested", slot);
-            emit("slotRenderEnded", slot, { isEmpty: true });
-          });
+          queueMicrotask(() => completeSlot(slot));
         }
       },
     };
@@ -618,10 +817,7 @@ async function installFixtureGpt(context: BrowserContext): Promise<void> {
         const slot = typeof target === "string" ? slots.get(target) : target;
         if (!slot) return;
         displayCount += 1;
-        queueMicrotask(() => {
-          emit("slotRequested", slot);
-          emit("slotRenderEnded", slot, { isEmpty: true });
-        });
+        queueMicrotask(() => completeSlot(slot));
       },
       getConfig: () => ({ disableInitialLoad: false }),
       pubads: () => pubads,
@@ -715,7 +911,7 @@ async function installFixtureGpt(context: BrowserContext): Promise<void> {
         },
       },
     });
-  });
+  }, performanceCase);
 }
 
 async function installAttemptResourceProbe(
@@ -923,6 +1119,36 @@ async function serveFixtureRequest(
     );
     return;
   }
+  if (
+    resources.apsRendererDocument !== null &&
+    url.pathname === resources.apsRendererPath
+  ) {
+    response.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Content-Security-Policy":
+        resources.artifactModel === "release-v1"
+          ? "default-src 'none'; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' http: https:; connect-src http: https:; frame-src data: https:; img-src data: blob: http: https:; media-src blob: http: https:; style-src 'unsafe-inline' http: https:; font-src data: http: https:; worker-src blob: http: https:; frame-ancestors 'self'; form-action https:;"
+          : "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; script-src 'unsafe-inline' http: https:; connect-src http: https:; frame-src http: https: data:; img-src https: data:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:;",
+      "Referrer-Policy": "no-referrer",
+      "X-Content-Type-Options": "nosniff",
+    });
+    response.end(resources.apsRendererDocument);
+    return;
+  }
+  if (
+    resources.performanceCase === "aps" &&
+    url.pathname === "/integrations/aps/runner.js"
+  ) {
+    response.writeHead(200, {
+      "Access-Control-Allow-Origin": "*",
+      "Content-Type": "application/javascript; charset=utf-8",
+      "Cross-Origin-Resource-Policy": "cross-origin",
+      "Referrer-Policy": "no-referrer",
+      "X-Content-Type-Options": "nosniff",
+    });
+    response.end(FICTIONAL_APS_RUNNER);
+    return;
+  }
   if (url.pathname === "/_ts/auction") {
     sendResponse(
       response,
@@ -1031,7 +1257,7 @@ async function openFixture(
   } = options;
   const context = await browser.newContext();
   if (probeAttemptResources) await installAttemptResourceProbe(context);
-  await installFixtureGpt(context);
+  await installFixtureGpt(context, resources.performanceCase);
   const page = await context.newPage();
   const networkSession = await context.newCDPSession(page);
   await networkSession.send("Network.enable");
@@ -1088,21 +1314,50 @@ async function observeComparisonFixture(
       ),
     )
     .toBe(1);
+  if (
+    resources.performanceCase === "aps" &&
+    resources.artifactModel === "release-v1"
+  ) {
+    await waitForMark(run, "tsjs:first-display-terminal");
+    await waitForMark(run, "tsjs:first-display-paint");
+  }
   const observation = await run.page.evaluate(
-    ({ startMark, actionMark }) => {
+    ({ startMark, actionMark, includeAps }) => {
       const start = performance.getEntriesByName(startMark);
       const action = performance.getEntriesByName(actionMark);
+      const bids = performance.getEntriesByName("tsjs:bids-script");
+      const firstDisplay = performance.getEntriesByName("tsjs:first-display");
+      const terminal = performance.getEntriesByName(
+        "tsjs:first-display-terminal",
+      );
+      const paint = performance.getEntriesByName("tsjs:first-display-paint");
       return {
         timingMs:
           (action[0]?.startTime ?? Number.NaN) -
           (start[0]?.startTime ?? Number.NaN),
         displayCount: window.__fixtureGpt.displayCount(),
         releaseId: window.tsjs?.releaseId,
+        ...(includeAps
+          ? {
+              actionToCompletionMs:
+                (terminal[0]?.startTime ?? Number.NaN) -
+                (firstDisplay[0]?.startTime ?? Number.NaN),
+              completionToPaintMs:
+                (paint[0]?.startTime ?? Number.NaN) -
+                (terminal[0]?.startTime ?? Number.NaN),
+              totalToPaintMs:
+                (paint[0]?.startTime ?? Number.NaN) -
+                (bids[0]?.startTime ?? Number.NaN),
+            }
+          : {}),
       };
     },
     {
       startMark: COMPARISON_START_MARK,
       actionMark: FIRST_OBSERVABLE_ACTION_MARK,
+      includeAps:
+        resources.performanceCase === "aps" &&
+        resources.artifactModel === "release-v1",
     },
   );
   expect(run.selectedRequests).toHaveLength(1);
@@ -1114,6 +1369,15 @@ async function observeComparisonFixture(
   expect(observation.displayCount).toBe(1);
   expect(Number.isFinite(observation.timingMs)).toBe(true);
   expect(observation.timingMs).toBeGreaterThan(0);
+  if (observation.actionToCompletionMs !== undefined) {
+    expect(Number.isFinite(observation.actionToCompletionMs)).toBe(true);
+    expect(observation.actionToCompletionMs).toBeGreaterThanOrEqual(0);
+    expect(observation.actionToCompletionMs).toBeLessThanOrEqual(5_000);
+    expect(Number.isFinite(observation.completionToPaintMs)).toBe(true);
+    expect(observation.completionToPaintMs).toBeGreaterThanOrEqual(0);
+    expect(Number.isFinite(observation.totalToPaintMs)).toBe(true);
+    expect(observation.totalToPaintMs).toBeGreaterThanOrEqual(0);
+  }
   return observation;
 }
 
@@ -1471,30 +1735,74 @@ async function collectHeapCheckpoints(
 }
 
 async function collectPairedHeapCheckpoints(
-  mainServer: FixtureServer,
-  mainResources: FixtureResources,
+  baselineServer: FixtureServer,
+  baselineResources: FixtureResources,
   candidateServer: FixtureServer,
   candidateResources: FixtureResources,
 ): Promise<{
-  main: Record<HeapCheckpoint, number>;
+  baseline: Record<HeapCheckpoint, number>;
   candidate: Record<HeapCheckpoint, number>;
 }> {
   const heapBrowser = await chromium.launch({ headless: true });
   try {
     expect(heapBrowser.version()).toBe(EXPECTED_CHROMIUM);
-    const main = await collectHeapCheckpoints(
+    const baseline = await collectHeapCheckpoints(
       heapBrowser,
-      mainServer,
-      mainResources,
+      baselineServer,
+      baselineResources,
     );
     const candidate = await collectHeapCheckpoints(
       heapBrowser,
       candidateServer,
       candidateResources,
     );
-    return { main, candidate };
+    return { baseline, candidate };
   } finally {
     await withHeapOperationTimeout("heap browser close", heapBrowser.close());
+  }
+}
+
+async function collectApsHeapCheckpoints(
+  fixtureServer: FixtureServer,
+  resources: FixtureResources,
+): Promise<{
+  afterProtectedPaint: number;
+  afterTakeoverQueueDrain: number;
+}> {
+  const heapBrowser = await chromium.launch({ headless: true });
+  try {
+    expect(heapBrowser.version()).toBe(EXPECTED_CHROMIUM);
+    const run = await openFixture(heapBrowser, fixtureServer, resources);
+    try {
+      await waitForMark(run, "tsjs:first-display-paint");
+      const afterProtectedPaint = await collectHeap(
+        run.page,
+        "aps:after-protected-paint",
+      );
+      await waitForKernel(run);
+      for (const id of DEFERRED_IDS) {
+        await expect
+          .poll(() =>
+            run.page.evaluate(
+              (moduleId) => window.__fixtureGpt.executionTime(moduleId),
+              id,
+            ),
+          )
+          .not.toBeUndefined();
+      }
+      const afterTakeoverQueueDrain = await collectHeap(
+        run.page,
+        "aps:after-takeover-queue-drain",
+      );
+      return { afterProtectedPaint, afterTakeoverQueueDrain };
+    } finally {
+      await run.close();
+    }
+  } finally {
+    await withHeapOperationTimeout(
+      "APS heap browser close",
+      heapBrowser.close(),
+    );
   }
 }
 
@@ -1579,40 +1887,40 @@ test("measures each distinct semantic transfer source exactly once", () => {
   ).toThrow("semantic transfer source is empty or duplicated");
 });
 
-test("gates semantic reference transfer against the exact current main build", () => {
+test("gates semantic reference transfer against the exact rc base build", () => {
   const mode = process.env.TSJS_PERF_MODE;
-  const mainRoot = process.env.TSJS_PERF_MAIN_ROOT;
-  const mainSha = process.env.TSJS_PERF_MAIN_SHA;
-  if (!mainRoot || !mainSha) {
+  const baselineRoot = process.env.TSJS_PERF_BASE_ROOT;
+  const baseSha = process.env.TSJS_PERF_BASE_SHA;
+  if (!baselineRoot || !baseSha) {
     if (
       mode === "preswitch" ||
       mode === "postswitch" ||
       mode === "pull-request"
     ) {
       throw new Error(
-        "fresh-main semantic transfer comparison is required in CI and release modes",
+        "exact-rc semantic transfer comparison is required in CI and release modes",
       );
     }
     test.skip(
       true,
-      "fresh-main semantic transfer comparison unavailable; check:bundle still enforces candidate ceilings",
+      "exact-rc semantic transfer comparison unavailable; check:bundle still enforces candidate ceilings",
     );
     return;
   }
-  expect(mainSha).toMatch(/^[0-9a-f]{40}$/u);
+  expect(baseSha).toMatch(/^[0-9a-f]{40}$/u);
   expect(
-    execFileSync("git", ["-C", mainRoot, "rev-parse", "HEAD"], {
+    execFileSync("git", ["-C", baselineRoot, "rev-parse", "HEAD"], {
       encoding: "utf8",
     }).trim(),
-  ).toBe(mainSha);
-  const mainResources = loadMainFixtureResources(mainRoot);
+  ).toBe(baseSha);
+  const baselineResources = loadBaselineFixtureResources(baselineRoot);
   const candidateResources = loadReleaseFixtureResources(REPO_ROOT);
 
   for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"] as const) {
     expect(
       candidateResources.referenceTransfer[metric],
       `candidate ${metric} semantic transfer`,
-    ).toBeLessThanOrEqual(mainResources.referenceTransfer[metric]);
+    ).toBeLessThanOrEqual(baselineResources.referenceTransfer[metric]);
   }
 });
 
@@ -1643,6 +1951,48 @@ test("boots the generated first-display artifact through persistent takeover", a
           `first-display smoke failed: ${JSON.stringify({ ...diagnostics, consoleMessages: run.consoleMessages, selectedRequests: run.selectedRequests, runtimeRequests: run.runtimeRequests, deferredRequests: run.deferredRequests, pageErrors: run.pageErrors })}; ${String(error)}`,
         );
       }
+    } finally {
+      await run.close();
+    }
+  } finally {
+    await server.close();
+  }
+});
+
+test("drives the generated APS agent through fictional PUC, terminal, paint, and takeover", async ({
+  browser,
+}) => {
+  const resources = loadReleaseFixtureResources(REPO_ROOT, "aps");
+  const server = await startFixtureServer(resources);
+  try {
+    const run = await openFixture(browser, server, resources);
+    try {
+      let observation: BrowserObservation;
+      try {
+        observation = await observeFixture(run, resources);
+      } catch (error) {
+        const diagnostics = await run.page.evaluate(() => ({
+          marks: performance
+            .getEntriesByType("mark")
+            .map((entry) => ({ name: entry.name, startTime: entry.startTime })),
+          calls: window.__fixtureGpt.calls(),
+          frames: [...document.querySelectorAll("iframe")].map((frame) => ({
+            src: frame.src,
+            title: frame.title,
+            puc: frame.dataset.fictionalPuc !== undefined,
+          })),
+          trace: window.tsjs?.diagnostics?.renderTrace?.current(),
+          resources: performance
+            .getEntriesByType("resource")
+            .map((entry) => entry.name),
+        }));
+        throw new Error(
+          `APS performance smoke failed: ${JSON.stringify({ diagnostics, pageErrors: run.pageErrors, consoleMessages: run.consoleMessages })}; ${String(error)}`,
+        );
+      }
+      expect(observation.releaseId).toBe(resources.release?.releaseId);
+      expect(observation.firstDisplayCount).toBe(1);
+      expect(observation.firstDisplayPaintCount).toBe(1);
     } finally {
       await run.close();
     }
@@ -1714,12 +2064,9 @@ test.describe("TSJS first-display performance gate", () => {
     browser,
     browserName,
   }) => {
-    // The paired comparison opens 110 cold navigations at response commit and
-    // closes each at the common first-action endpoint, then performs one
-    // load-complete candidate lifecycle observation and four paired heap
-    // checkpoints. The 40-minute cap guards hosted-runner variance and evidence
-    // finalization; it is not permission to await the post-action lifecycle
-    // during every timing sample.
+    // Each GPT/APS pair receives five warmups and 50 samples per variant. GPT
+    // samples stop at the common action; candidate APS samples also retain the
+    // real terminal/paint marks needed by the absolute lifecycle gate.
     test.setTimeout(2_400_000);
     const mode = process.env.TSJS_PERF_MODE;
     test.skip(
@@ -1730,22 +2077,34 @@ test.describe("TSJS first-display performance gate", () => {
     expect(browser.version()).toBe(EXPECTED_CHROMIUM);
     expect(process.env.TSJS_PERF_MACHINE_CLASS).toBe(MACHINE_CLASS);
     expect(process.env.TSJS_PERF_RUNNER_IMAGE).toBe(RUNNER_IMAGE);
-    const mainRoot = process.env.TSJS_PERF_MAIN_ROOT;
-    const mainSha = process.env.TSJS_PERF_MAIN_SHA;
-    expect(mainRoot, "TSJS_PERF_MAIN_ROOT is required").toBeTruthy();
-    expect(mainSha, "TSJS_PERF_MAIN_SHA is required").toMatch(
+    const baselineRoot = process.env.TSJS_PERF_BASE_ROOT;
+    const baseSha = process.env.TSJS_PERF_BASE_SHA;
+    expect(baselineRoot, "TSJS_PERF_BASE_ROOT is required").toBeTruthy();
+    expect(baseSha, "TSJS_PERF_BASE_SHA is required").toMatch(
       /^[0-9a-f]{40}$/u,
     );
     expect(
-      execFileSync("git", ["-C", mainRoot!, "rev-parse", "HEAD"], {
+      execFileSync("git", ["-C", baselineRoot!, "rev-parse", "HEAD"], {
         encoding: "utf8",
       }).trim(),
-    ).toBe(mainSha);
-    const mainResources = loadMainFixtureResources(mainRoot!);
+    ).toBe(baseSha);
+    const baselineResources = loadBaselineFixtureResources(baselineRoot!);
     const candidateResources = loadReleaseFixtureResources(REPO_ROOT);
-    const mainServer = await startFixtureServer(mainResources);
+    const apsBaselineResources = loadBaselineFixtureResources(
+      baselineRoot!,
+      "aps",
+    );
+    const apsCandidateResources = loadReleaseFixtureResources(REPO_ROOT, "aps");
+    const baselineServer = await startFixtureServer(baselineResources);
     const candidateServer = await startFixtureServer(candidateResources);
-    activeFixtureServers.push(mainServer, candidateServer);
+    const apsBaselineServer = await startFixtureServer(apsBaselineResources);
+    const apsCandidateServer = await startFixtureServer(apsCandidateResources);
+    activeFixtureServers.push(
+      baselineServer,
+      candidateServer,
+      apsBaselineServer,
+      apsCandidateServer,
+    );
 
     const observeTimingVariant = async (
       fixtureServer: FixtureServer,
@@ -1766,55 +2125,139 @@ test.describe("TSJS first-display performance gate", () => {
       const variants =
         index % 2 === 0
           ? ([
-              [mainServer, mainResources],
+              [baselineServer, baselineResources],
               [candidateServer, candidateResources],
             ] as const)
           : ([
               [candidateServer, candidateResources],
-              [mainServer, mainResources],
+              [baselineServer, baselineResources],
             ] as const);
       for (const [server, resources] of variants) {
         await observeTimingVariant(server, resources);
       }
     }
 
-    const mainSamples: number[] = [];
+    const baselineSamples: number[] = [];
     const candidateSamples: number[] = [];
     for (let index = 0; index < SAMPLES; index += 1) {
       const variants =
         index % 2 === 0
           ? ([
-              ["main", mainServer, mainResources],
+              ["baseline", baselineServer, baselineResources],
               ["candidate", candidateServer, candidateResources],
             ] as const)
           : ([
               ["candidate", candidateServer, candidateResources],
-              ["main", mainServer, mainResources],
+              ["baseline", baselineServer, baselineResources],
             ] as const);
       for (const [variant, server, resources] of variants) {
         const observation = await observeTimingVariant(server, resources);
-        if (variant === "main") {
-          mainSamples.push(observation.timingMs);
+        if (variant === "baseline") {
+          baselineSamples.push(observation.timingMs);
         } else {
           candidateSamples.push(observation.timingMs);
         }
       }
     }
-    expect(mainSamples).toHaveLength(SAMPLES);
+    expect(baselineSamples).toHaveLength(SAMPLES);
     expect(candidateSamples).toHaveLength(SAMPLES);
-    const mainP90 = p90(mainSamples);
+    const baselineP90 = p90(baselineSamples);
     const candidateP90 = p90(candidateSamples);
-    expect(mainP90).toBeGreaterThan(0);
+    expect(baselineP90).toBeGreaterThan(0);
     expect
       .soft(candidateP90, "candidate p90")
-      .toBeLessThanOrEqual(mainP90 * MAXIMUM_P90_RATIO);
+      .toBeLessThanOrEqual(baselineP90 * MAXIMUM_P90_RATIO);
     for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"] as const) {
       expect
         .soft(
           candidateResources.referenceTransfer[metric],
           `candidate ${metric} semantic transfer`,
         )
-        .toBeLessThanOrEqual(mainResources.referenceTransfer[metric]);
+        .toBeLessThanOrEqual(baselineResources.referenceTransfer[metric]);
+    }
+
+    for (let index = 0; index < WARMUPS; index += 1) {
+      const variants =
+        index % 2 === 0
+          ? ([
+              [apsBaselineServer, apsBaselineResources],
+              [apsCandidateServer, apsCandidateResources],
+            ] as const)
+          : ([
+              [apsCandidateServer, apsCandidateResources],
+              [apsBaselineServer, apsBaselineResources],
+            ] as const);
+      for (const [server, resources] of variants) {
+        await observeTimingVariant(server, resources);
+      }
+    }
+
+    const apsBaselineActionSamples: number[] = [];
+    const apsCandidateActionSamples: number[] = [];
+    const apsActionToCompletionSamples: number[] = [];
+    const apsCompletionToPaintSamples: number[] = [];
+    const apsTotalToPaintSamples: number[] = [];
+    for (let index = 0; index < SAMPLES; index += 1) {
+      const variants =
+        index % 2 === 0
+          ? ([
+              ["baseline", apsBaselineServer, apsBaselineResources],
+              ["candidate", apsCandidateServer, apsCandidateResources],
+            ] as const)
+          : ([
+              ["candidate", apsCandidateServer, apsCandidateResources],
+              ["baseline", apsBaselineServer, apsBaselineResources],
+            ] as const);
+      for (const [variant, server, resources] of variants) {
+        const observation = await observeTimingVariant(server, resources);
+        if (variant === "baseline") {
+          apsBaselineActionSamples.push(observation.timingMs);
+          continue;
+        }
+        apsCandidateActionSamples.push(observation.timingMs);
+        apsActionToCompletionSamples.push(observation.actionToCompletionMs!);
+        apsCompletionToPaintSamples.push(observation.completionToPaintMs!);
+        apsTotalToPaintSamples.push(observation.totalToPaintMs!);
+      }
+    }
+    for (const samples of [
+      apsBaselineActionSamples,
+      apsCandidateActionSamples,
+      apsActionToCompletionSamples,
+      apsCompletionToPaintSamples,
+      apsTotalToPaintSamples,
+    ]) {
+      expect(samples).toHaveLength(SAMPLES);
+    }
+    const apsBaselineActionP90 = p90(apsBaselineActionSamples);
+    const apsCandidateActionP90 = p90(apsCandidateActionSamples);
+    const apsActionToCompletionP90 = p90(apsActionToCompletionSamples);
+    const apsCompletionToPaintP90 = p90(apsCompletionToPaintSamples);
+    const apsTotalToPaintP90 = p90(apsTotalToPaintSamples);
+    expect
+      .soft(apsCandidateActionP90, "APS candidate action p90")
+      .toBeLessThanOrEqual(apsBaselineActionP90 * MAXIMUM_P90_RATIO);
+    expect
+      .soft(apsCandidateActionP90, "APS absolute action p90")
+      .toBeLessThanOrEqual(APS_ACTION_P90_CEILING_MS);
+    expect
+      .soft(apsActionToCompletionP90, "APS action-to-completion p90")
+      .toBeLessThanOrEqual(APS_ACTION_TO_COMPLETION_P90_CEILING_MS);
+    expect
+      .soft(apsCompletionToPaintP90, "APS completion-to-paint p90")
+      .toBeLessThanOrEqual(APS_COMPLETION_TO_PAINT_P90_CEILING_MS);
+    expect
+      .soft(apsTotalToPaintP90, "APS total-to-paint p90")
+      .toBeLessThanOrEqual(APS_TOTAL_P90_CEILING_MS);
+    for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"] as const) {
+      expect
+        .soft(
+          apsCandidateResources.referenceTransfer[metric],
+          `APS candidate ${metric} semantic transfer`,
+        )
+        .toBeLessThanOrEqual(
+          apsBaselineResources.referenceTransfer[metric] * MAXIMUM_P90_RATIO,
+        );
     }
 
     const representativeRun = await openFixture(
@@ -1830,22 +2273,48 @@ test.describe("TSJS first-display performance gate", () => {
     expect(representative.releaseId).toBe(
       candidateResources.release?.releaseId,
     );
+    const apsRepresentativeRun = await openFixture(
+      browser,
+      apsCandidateServer,
+      apsCandidateResources,
+      { waitUntil: "load" },
+    );
+    const apsRepresentative = await observeFixture(
+      apsRepresentativeRun,
+      apsCandidateResources,
+    ).finally(() => apsRepresentativeRun.close());
+    expect(apsRepresentative.releaseId).toBe(
+      apsCandidateResources.release?.releaseId,
+    );
 
-    const { main: mainHeapBytes, candidate: candidateHeapBytes } =
+    const { baseline: baselineHeapBytes, candidate: candidateHeapBytes } =
       await collectPairedHeapCheckpoints(
-        mainServer,
-        mainResources,
+        baselineServer,
+        baselineResources,
         candidateServer,
         candidateResources,
       );
     for (const name of HEAP_CHECKPOINTS) {
       expect
-        .soft(mainHeapBytes[name], `${name} main retained heap`)
+        .soft(baselineHeapBytes[name], `${name} rc-baseline retained heap`)
         .toBeLessThanOrEqual(HARD_HEAP_CEILING_BYTES);
       expect
         .soft(candidateHeapBytes[name], `${name} candidate retained heap`)
         .toBeLessThanOrEqual(HARD_HEAP_CEILING_BYTES);
     }
+    const apsHeapBytes = await collectApsHeapCheckpoints(
+      apsCandidateServer,
+      apsCandidateResources,
+    );
+    expect
+      .soft(apsHeapBytes.afterProtectedPaint, "APS heap after protected paint")
+      .toBeLessThanOrEqual(APS_AFTER_PAINT_HEAP_CEILING_BYTES);
+    expect
+      .soft(
+        apsHeapBytes.afterTakeoverQueueDrain,
+        "APS heap after takeover and queue drain",
+      )
+      .toBeLessThanOrEqual(APS_AFTER_TAKEOVER_HEAP_CEILING_BYTES);
 
     const evidenceId = process.env.TSJS_EVIDENCE_ID;
     const headSha = process.env.TSJS_PERF_HEAD_SHA;
@@ -1873,11 +2342,20 @@ test.describe("TSJS first-display performance gate", () => {
     const deferredByResponseEnd = [...representative.deferred].sort(
       (left, right) => left.responseEnd - right.responseEnd,
     );
+    const apsDeferredBeforePaint = apsRepresentative.deferred.filter(
+      ({ startTime }) => startTime < apsRepresentative.paintTime,
+    ).length;
+    const apsDeferredPreparationBeforePaint = apsRepresentative.deferred.filter(
+      ({ preparationTime }) => preparationTime < apsRepresentative.paintTime,
+    ).length;
+    const apsDeferredExecutionBeforePaint = apsRepresentative.deferred.filter(
+      ({ executionTime }) => executionTime < apsRepresentative.paintTime,
+    ).length;
     const npmVersion = execFileSync("npm", ["--version"], {
       encoding: "utf8",
     }).trim();
     const evidence = {
-      schemaVersion: 5,
+      schemaVersion: 6,
       evidenceId,
       mode,
       headSha,
@@ -1900,7 +2378,7 @@ test.describe("TSJS first-display performance gate", () => {
         warmupsPerVariant: WARMUPS,
         samplesPerVariant: SAMPLES,
         percentile: PERCENTILE,
-        interleaving: "alternating-main-candidate",
+        interleaving: "alternating-baseline-candidate",
       },
       networkProfile: {
         mechanism: "cdp-Network.emulateNetworkConditions",
@@ -1920,12 +2398,12 @@ test.describe("TSJS first-display performance gate", () => {
       },
       performance: {
         requestToFirstActionMs: {
-          main: {
-            sha: mainSha,
-            artifactModel: mainResources.artifactModel,
-            selectedTransferBytes: mainResources.selectedTransferBytes,
-            samples: mainSamples,
-            p90: mainP90,
+          baseline: {
+            sha: baseSha,
+            artifactModel: baselineResources.artifactModel,
+            selectedTransferBytes: baselineResources.selectedTransferBytes,
+            samples: baselineSamples,
+            p90: baselineP90,
           },
           candidate: {
             artifactModel: candidateResources.artifactModel,
@@ -1935,15 +2413,15 @@ test.describe("TSJS first-display performance gate", () => {
           },
           percentile: PERCENTILE,
           maximumRatio: MAXIMUM_P90_RATIO,
-          observedRatio: candidateP90 / mainP90,
+          observedRatio: candidateP90 / baselineP90,
         },
       },
       transfer: {
         algorithm: "semantic-tsjs-transfer-v1",
-        mainReferenceTransfer: {
-          sha: mainSha,
-          artifactModel: mainResources.artifactModel,
-          ...mainResources.referenceTransfer,
+        baselineReferenceTransfer: {
+          sha: baseSha,
+          artifactModel: baselineResources.artifactModel,
+          ...baselineResources.referenceTransfer,
         },
         candidateReferenceTransfer: {
           sha: headSha,
@@ -1954,9 +2432,9 @@ test.describe("TSJS first-display performance gate", () => {
       heap: {
         collection: "playwright-requestGC-then-immediate-cdp-getHeapUsage",
         hardCeilingBytes: HARD_HEAP_CEILING_BYTES,
-        main: {
-          sha: mainSha,
-          checkpoints: mainHeapBytes,
+        baseline: {
+          sha: baseSha,
+          checkpoints: baselineHeapBytes,
         },
         candidate: { checkpoints: candidateHeapBytes },
       },
@@ -1974,6 +2452,89 @@ test.describe("TSJS first-display performance gate", () => {
             deferredByResponseEnd[0]!.executionTime >=
             deferredByResponseEnd.at(-1)!.responseEnd,
         },
+      },
+      aps: {
+        marks: {
+          source: "performance-entry",
+          candidateBidsScript: apsRepresentative.bidsScriptCount === 1,
+          candidateFirstDisplay: apsRepresentative.firstDisplayCount === 1,
+          candidateFirstDisplayTerminal: true,
+          candidateFirstDisplayPaint:
+            apsRepresentative.firstDisplayPaintCount === 1,
+        },
+        performance: {
+          firstAction: {
+            baseline: {
+              sha: baseSha,
+              artifactModel: apsBaselineResources.artifactModel,
+              selectedTransferBytes: apsBaselineResources.selectedTransferBytes,
+              samples: apsBaselineActionSamples,
+              p90: apsBaselineActionP90,
+            },
+            candidate: {
+              artifactModel: apsCandidateResources.artifactModel,
+              selectedTransferBytes:
+                apsCandidateResources.selectedTransferBytes,
+              samples: apsCandidateActionSamples,
+              p90: apsCandidateActionP90,
+            },
+            percentile: PERCENTILE,
+            maximumRatio: MAXIMUM_P90_RATIO,
+            absoluteCeilingMs: APS_ACTION_P90_CEILING_MS,
+            observedRatio: apsCandidateActionP90 / apsBaselineActionP90,
+          },
+          actionToCompletion: {
+            samples: apsActionToCompletionSamples,
+            p90: apsActionToCompletionP90,
+            ceilingMs: APS_ACTION_TO_COMPLETION_P90_CEILING_MS,
+          },
+          completionToPaint: {
+            samples: apsCompletionToPaintSamples,
+            p90: apsCompletionToPaintP90,
+            ceilingMs: APS_COMPLETION_TO_PAINT_P90_CEILING_MS,
+          },
+          totalToPaint: {
+            samples: apsTotalToPaintSamples,
+            p90: apsTotalToPaintP90,
+            ceilingMs: APS_TOTAL_P90_CEILING_MS,
+          },
+        },
+        transfer: {
+          algorithm: "semantic-tsjs-transfer-v1",
+          maximumRatio: MAXIMUM_P90_RATIO,
+          baselineReferenceTransfer: {
+            sha: baseSha,
+            artifactModel: apsBaselineResources.artifactModel,
+            ...apsBaselineResources.referenceTransfer,
+          },
+          candidateReferenceTransfer: {
+            sha: headSha,
+            artifactModel: apsCandidateResources.artifactModel,
+            ...apsCandidateResources.referenceTransfer,
+          },
+        },
+        heap: {
+          collection: "playwright-requestGC-then-immediate-cdp-getHeapUsage",
+          afterProtectedPaint: {
+            usedSize: apsHeapBytes.afterProtectedPaint,
+            ceilingBytes: APS_AFTER_PAINT_HEAP_CEILING_BYTES,
+          },
+          afterTakeoverQueueDrain: {
+            usedSize: apsHeapBytes.afterTakeoverQueueDrain,
+            ceilingBytes: APS_AFTER_TAKEOVER_HEAP_CEILING_BYTES,
+          },
+        },
+        requests: {
+          selected: { count: 1 },
+          deferred: {
+            count: apsRepresentative.deferred.length,
+            requestBeforePaintCount: apsDeferredBeforePaint,
+            preloadBeforePaintCount: apsRepresentative.preloadBeforePaintCount,
+            preparationBeforePaintCount: apsDeferredPreparationBeforePaint,
+            executionBeforePaintCount: apsDeferredExecutionBeforePaint,
+          },
+        },
+        assertions: { correctness: true, loadOrder: true },
       },
       assertions: { correctness: true, loadOrder: true },
       provenance: {

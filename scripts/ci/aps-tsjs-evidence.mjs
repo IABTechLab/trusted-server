@@ -156,6 +156,89 @@ function scrubRealGam(realGamRoot, environment) {
   }
 }
 
+function exactManifestKeys(value, expected) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("real-GAM evidence manifest must be an object");
+  }
+  assert.deepEqual(
+    Object.keys(value).sort(),
+    [...expected].sort(),
+    "real-GAM evidence manifest schema must be exact",
+  );
+}
+
+export function validateRealGamArtifact(downloadRoot, expected) {
+  const evidenceRoot = path.join(downloadRoot, "real-gam-evidence");
+  const manifestPath = path.join(evidenceRoot, "evidence-manifest.json");
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  exactManifestKeys(manifest, [
+    "schemaVersion",
+    "evidenceId",
+    "releaseId",
+    "commitSha",
+    "runId",
+    "conclusion",
+    "previousArtifactId",
+  ]);
+  assert.equal(
+    manifest.schemaVersion,
+    1,
+    "real-GAM evidence schema must be v1",
+  );
+  assert.equal(
+    manifest.evidenceId,
+    expected.evidenceId,
+    "real-GAM evidence id must match",
+  );
+  assert.equal(
+    manifest.releaseId,
+    expected.releaseId,
+    "real-GAM release id must match",
+  );
+  assert.equal(
+    manifest.commitSha,
+    expected.commitSha,
+    "real-GAM commit must match",
+  );
+  assert.equal(
+    String(manifest.runId),
+    String(expected.runId),
+    "real-GAM run id must match",
+  );
+  assert.equal(
+    manifest.previousArtifactId,
+    expected.previousArtifactId,
+    "real-GAM rollback artifact must match",
+  );
+  assert.equal(
+    manifest.conclusion,
+    "success",
+    "real-GAM evidence requires a successful conclusion",
+  );
+
+  const files = walkFiles(downloadRoot);
+  for (const file of files) {
+    assertAllowedExtension(file);
+  }
+  const traces = walkFiles(evidenceRoot).filter((file) =>
+    file.endsWith("sanitized-trace-v1.json"),
+  );
+  for (const file of traces) {
+    const text = fs.readFileSync(file, "utf8");
+    if (FORBIDDEN_FIELD.test(text) || DOCUMENT_BODY.test(text)) {
+      throw new Error(
+        `unsafe field or body found in sanitized evidence: ${file}`,
+      );
+    }
+  }
+  assert.equal(
+    traces.length,
+    60,
+    "successful real-GAM evidence must contain 60 traces",
+  );
+  return manifest;
+}
+
 function execute(
   command,
   repositoryRoot = REPOSITORY_ROOT,
@@ -252,6 +335,31 @@ function selfTest() {
       );
     }
     execute("scrub-real-gam", repositoryRoot, environment);
+    const expectedRealGam = {
+      evidenceId: environment.EVIDENCE_ID,
+      releaseId: environment.RELEASE_ID,
+      commitSha: environment.GITHUB_SHA,
+      runId: environment.GITHUB_RUN_ID,
+      previousArtifactId: environment.PREVIOUS_ARTIFACT_ID,
+    };
+    const reportRoot = path.join(roots.realGam, "playwright-report");
+    fs.mkdirSync(reportRoot, { recursive: true });
+    fs.writeFileSync(
+      path.join(reportRoot, "index.html"),
+      "<!doctype html><script>window.__playwrightReport = true;</script>\n",
+    );
+    validateRealGamArtifact(roots.realGam, expectedRealGam);
+    const manifestPath = path.join(traceRoot, "evidence-manifest.json");
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    fs.writeFileSync(
+      manifestPath,
+      `${JSON.stringify({ ...manifest, conclusion: "failure" })}\n`,
+    );
+    assert.throws(
+      () => validateRealGamArtifact(roots.realGam, expectedRealGam),
+      /successful conclusion/u,
+    );
+    fs.writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`);
     fs.writeFileSync(
       path.join(traceRoot, "secret.txt"),
       environment.TS_REAL_GAM_AUTH_HEADER,
@@ -274,8 +382,38 @@ function selfTest() {
 
 const command = process.argv[2];
 if (command === "self-test") selfTest();
-else if (!execute(command)) {
+else if (command === "validate-real-gam") {
+  const [
+    downloadRoot,
+    evidenceId,
+    releaseId,
+    commitSha,
+    runId,
+    previousArtifactId,
+  ] = process.argv.slice(3);
+  if (
+    !downloadRoot ||
+    !evidenceId ||
+    !releaseId ||
+    !/^[0-9a-f]{40}$/u.test(commitSha ?? "") ||
+    !/^[1-9][0-9]*$/u.test(runId ?? "") ||
+    !previousArtifactId ||
+    process.argv.length !== 9
+  ) {
+    throw new Error(
+      "usage: aps-tsjs-evidence.mjs validate-real-gam <download-root> <evidence-id> <release-id> <commit-sha> <run-id> <previous-artifact-id>",
+    );
+  }
+  validateRealGamArtifact(downloadRoot, {
+    evidenceId,
+    releaseId,
+    commitSha,
+    runId,
+    previousArtifactId,
+  });
+  process.stdout.write("APS real-GAM evidence is valid\n");
+} else if (!execute(command)) {
   throw new Error(
-    "usage: aps-tsjs-evidence.mjs {write-quality|write-integration|write-real-gam|scrub-integration|scrub-real-gam|self-test}",
+    "usage: aps-tsjs-evidence.mjs {write-quality|write-integration|write-real-gam|scrub-integration|scrub-real-gam|validate-real-gam|self-test}",
   );
 }
