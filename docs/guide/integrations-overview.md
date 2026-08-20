@@ -186,17 +186,19 @@ enabled = true
 
 ### GPT Runtime Diagnostics
 
-**What it does:** Observes documented GPT lifecycle callbacks and presents directly observed slot, timing, coverage, binding, and visibility facts in a local browser console.
+**What it does:** Observes documented GPT lifecycle callbacks and Trusted Server integration evidence, then presents directly observed slot, request-path, delivery, timing, coverage, binding, and visibility facts in a local browser console.
 
 **Key Features:**
 
 - Explicit browser-session `ts_console` activation through a host-only HttpOnly cookie
 - Conditional standalone delivery only on active HTML documents
-- Initial and refresh request-cycle history
-- Conservative unmatched and ambiguous callback reporting
+- Initial and refresh request-cycle history, with observed request paths and replacements
+- Delivery states derived only from observed Trusted Server creative evidence
+- Source-neutral Ad Manager identifiers and response classes reported by GPT
+- Conservative unmatched, ambiguous, and attribution issue reporting
 - Exact DOM binding and non-layout-changing viewport badges
 - Versioned local JSON export with no diagnostic upload
-- No creative-provenance or auction attribution claims
+- No inferred demand ownership: a filled slot alone never proves Trusted Server delivery
 
 **Configuration:**
 
@@ -207,7 +209,7 @@ enabled = true
 
 **Endpoints:** None. The feature observes GPT in the browser and makes no diagnostic network request.
 
-**When to use:** You need to debug GPT request, response, render, load, viewability, refresh, and slot-binding behavior without changing ad delivery.
+**When to use:** You need to debug GPT request, response, render, load, viewability, refresh, delivery-attribution, and slot-binding behavior without changing ad delivery.
 
 **Learn more:** [GPT Runtime Diagnostics](./integrations/gpt-diagnostics.md)
 
