@@ -2011,6 +2011,17 @@ test('hard-cutover policy rejects every retired wire, runtime, and public surfac
   }
 });
 
+test('browser cutover fixtures do not reconstruct the retired integration config carrier', () => {
+  for (const relativePath of [
+    'crates/trusted-server-integration-tests/browser/tests/shared/aps-puc-lifecycle.spec.ts',
+    'crates/trusted-server-integration-tests/browser/tests/shared/creative-sandbox.spec.ts',
+    'crates/trusted-server-integration-tests/browser/tests/shared/tsjs-runtime.spec.ts',
+  ]) {
+    const source = fs.readFileSync(path.join(repositoryRoot, relativePath), 'utf8');
+    assert.doesNotMatch(source, /_integrationConfig/u, relativePath);
+  }
+});
+
 test('vendor boundary rejects APS, GPT, and PUC artifacts but permits conformance metadata', () => {
   const vendored = [
     ['fixtures/prebid-creative.js', 'window._aps = new Map();'],
@@ -2249,6 +2260,11 @@ test('cutover workflows bind exact release evidence and prior artifact provenanc
   assert.match(cutoverScript, /for runtime in axum fastly cloudflare spin/);
   assert.match(cutoverScript, /aps-proxy-\$runtime\.log/);
   assert.match(cutoverScript, /--project=chromium --project=firefox --project=webkit/);
+  assert.match(
+    cutoverScript,
+    /TS_BROWSER_PROJECTS=chromium,firefox,webkit[\s\\]*npx playwright test/,
+    'the cutover script must declare every requested Playwright project itself'
+  );
   assert.match(integrationWorkflow, /Scrub all integration evidence before upload/);
   assert.match(realGamWorkflow, /aps-real-gam-\$\{\{ github\.run_id \}\}/);
   assert.match(evidenceScript, /capabilities\?/);

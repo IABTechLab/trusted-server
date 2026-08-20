@@ -44,6 +44,7 @@ function creativeDocument(
       slots: [],
       bids: [],
     },
+    integrations: { version: 1, entries: [] },
     creative: {
       version: 1,
       enabled: true,
@@ -60,8 +61,19 @@ function creativeDocument(
 <html>
   <head>
     <script>
-      window.__tsCreativeOrigin = ${JSON.stringify(origin)};
-      window.tsjs = { boot: ${boot}, que: [], _integrationConfig: {} };
+      Object.defineProperty(window, '__tsCreativeOrigin', {
+        value: ${JSON.stringify(origin)},
+        writable: false,
+        configurable: false,
+        enumerable: false,
+      });
+      window.tsjs = { que: [] };
+      const __TSJS_SERVER_BOOT_INPUT_V1__ = {
+        target: window.tsjs,
+        boot: ${boot},
+        outline: null,
+      };
+      ${fixture.bootstrapBody}
     </script>
     <script>
       try { window.__tsCreativeOrigin = 'https://attacker.invalid'; } catch (_error) {}

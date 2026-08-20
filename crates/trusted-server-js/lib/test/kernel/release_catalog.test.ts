@@ -154,7 +154,15 @@ describe('canonical release catalog', () => {
       [
         'gpt',
         ['gpt.v1', 'gpt.events.v1', 'pbs_cache.baseline.v1'],
-        ['runtime.v1', 'slots.v1', 'auction.v1', 'render.v1', 'messages.v1', 'trace.v1'],
+        [
+          'runtime.v1',
+          'slots.v1',
+          'auction.v1',
+          'render.v1',
+          'messages.v1',
+          'trace.v1',
+          'aps.v1?aps',
+        ],
       ],
       ['gpt_diagnostics', ['gpt_diag.v1'], ['runtime.v1', 'gpt.events.v1']],
       ['lockr', [], ['runtime.v1']],

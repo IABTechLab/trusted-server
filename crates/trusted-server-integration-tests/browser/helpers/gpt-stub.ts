@@ -165,6 +165,8 @@ export async function installGptStub(page: Page): Promise<void> {
       refresh: pubadsService.refresh,
       fetch: window.fetch,
       xhrOpen: window.XMLHttpRequest.prototype.open,
+    };
+    const publisherHistoryReferences = {
       pushState: window.history.pushState,
       replaceState: window.history.replaceState,
     };
@@ -433,14 +435,13 @@ export async function installGptStub(page: Page): Promise<void> {
         references.refresh = pubadsService.refresh;
         references.fetch = window.fetch;
         references.xhrOpen = window.XMLHttpRequest.prototype.open;
-        references.pushState = window.history.pushState;
-        references.replaceState = window.history.replaceState;
       },
       referenceOwnership() {
         const pushStateChanged =
-          window.history.pushState !== references.pushState;
+          window.history.pushState !== publisherHistoryReferences.pushState;
         const replaceStateChanged =
-          window.history.replaceState !== references.replaceState;
+          window.history.replaceState !==
+          publisherHistoryReferences.replaceState;
         return {
           diagnosticsSafe:
             commandQueue.push === references.commandPush &&
