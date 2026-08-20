@@ -6016,6 +6016,7 @@ fn page_bids_request_allowed(req: &Request<EdgeBody>) -> bool {
 /// trigger real PBS/APS auctions from a visitor's browser. Every adapter returns
 /// this same response for `OPTIONS /_ts/page-bids` and for its deprecated
 /// `/__ts/page-bids` alias.
+#[must_use]
 pub fn page_bids_preflight_denied() -> Response<EdgeBody> {
     let mut response = Response::new(EdgeBody::from("Forbidden"));
     *response.status_mut() = StatusCode::FORBIDDEN;
