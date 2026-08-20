@@ -182,9 +182,10 @@ auction_html_comment = false
 
 [creative_opportunities]
 # Set to false to disable server-side ad templates while retaining slot definitions
-# and direct POST /auction callers. Structurally inactive templates use
-# Cache-Control: max-age=60; this setting is one cause. Origin private/no-store
-# policies and bot, prefetch, or consent-denied requests retain their origin policy.
+# and direct POST /auction callers. Structurally inactive templates use the
+# browser-only Cache-Control: private, max-age=60 policy; this setting is one cause.
+# Origin private/no-store policies and bot, prefetch, or consent-denied requests
+# retain their origin policy. CDN-specific cache headers remain unchanged.
 # Before rolling back to a binary that predates this setting, restore true, re-push
 # and finalize the config first.
 enabled = true
