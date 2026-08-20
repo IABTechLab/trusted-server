@@ -607,6 +607,31 @@ mod tests {
         assert!(response.headers().get("etag").is_none());
     }
 
+    #[test]
+    fn late_filter_effects_cannot_make_a_page_bids_response_public() {
+        let mut response = trusted_server_core::publisher::page_bids_preflight_denied();
+        let effects = RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("cache-control", "public, s-maxage=3600"),
+                HeaderMutation::set("surrogate-control", "max-age=3600"),
+                HeaderMutation::set("cdn-cache-control", "public, max-age=3600"),
+            ],
+        };
+
+        apply_terminal_response_effects(&mut response, Some(&effects));
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("private, no-store")
+        );
+        assert!(response.headers().get("surrogate-control").is_none());
+        assert!(response.headers().get("cdn-cache-control").is_none());
+    }
+
     fn diagnostics_settings() -> Settings {
         Settings::from_toml(
             r#"

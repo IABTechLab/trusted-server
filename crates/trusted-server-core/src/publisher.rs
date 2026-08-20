@@ -65,7 +65,9 @@ use crate::platform::{
     contains_publisher_esi_directive,
 };
 use crate::price_bucket::{PriceGranularity, price_bucket};
-use crate::response_privacy::enforce_synthesized_html_cache_privacy;
+use crate::response_privacy::{
+    enforce_synthesized_html_cache_privacy, enforce_terminal_private_cache_privacy,
+};
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{
@@ -4408,9 +4410,8 @@ pub async fn handle_publisher_request(
             .await;
         }
 
-        let response = Response::builder()
+        let mut response = Response::builder()
             .status(StatusCode::BAD_GATEWAY)
-            .header(header::CACHE_CONTROL, "private, no-store")
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
             .body(EdgeBody::from(
                 "Publisher origin returned an invalid conditional response",
@@ -4418,6 +4419,7 @@ pub async fn handle_publisher_request(
             .change_context(TrustedServerError::Proxy {
                 message: "failed to build unexpected origin 304 response".to_string(),
             })?;
+        enforce_terminal_private_cache_privacy(&mut response);
         return Ok(PublisherResponse::Buffered(response));
     }
 
@@ -6014,10 +6016,7 @@ fn page_bids_request_allowed(req: &Request<EdgeBody>) -> bool {
 pub fn page_bids_preflight_denied() -> Response<EdgeBody> {
     let mut response = Response::new(EdgeBody::from("Forbidden"));
     *response.status_mut() = StatusCode::FORBIDDEN;
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-store"),
-    );
+    enforce_terminal_private_cache_privacy(&mut response);
     response
 }
 
@@ -6028,10 +6027,7 @@ pub fn page_bids_preflight_denied() -> Response<EdgeBody> {
 fn page_bids_unknown_format() -> Response<EdgeBody> {
     let mut response = Response::new(EdgeBody::from("Unknown format"));
     *response.status_mut() = StatusCode::BAD_REQUEST;
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-store"),
-    );
+    enforce_terminal_private_cache_privacy(&mut response);
     response
 }
 
@@ -6367,10 +6363,7 @@ pub async fn handle_page_bids(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-store"),
-    );
+    enforce_terminal_private_cache_privacy(&mut response);
     mark_deprecated_alias(&mut response, is_legacy_alias);
 
     Ok(response)
@@ -7304,6 +7297,26 @@ mod tests {
                     .get(header::CACHE_CONTROL)
                     .and_then(|v| v.to_str().ok()),
                 Some("private, no-store")
+            );
+            assert!(
+                response
+                    .extensions()
+                    .get::<crate::response_privacy::TerminalPrivateResponse>()
+                    .is_some(),
+                "page-bids errors should remain terminal-private after late response effects"
+            );
+        }
+
+        #[test]
+        fn a_preflight_denial_is_terminal_private() {
+            let response = page_bids_preflight_denied();
+
+            assert!(
+                response
+                    .extensions()
+                    .get::<crate::response_privacy::TerminalPrivateResponse>()
+                    .is_some(),
+                "page-bids preflight denial should remain private after late response effects"
             );
         }
     }
@@ -12089,6 +12102,13 @@ mod tests {
                         .and_then(|value| value.to_str().ok()),
                     Some("private, no-store"),
                     "eligible origin 304 should return an explicitly non-storable response"
+                );
+                assert!(
+                    response
+                        .extensions()
+                        .get::<crate::response_privacy::TerminalPrivateResponse>()
+                        .is_some(),
+                    "invalid origin 304 response should remain private after late response effects"
                 );
                 for header_name in [
                     header::ETAG,
@@ -17455,6 +17475,13 @@ mod tests {
                     response.headers().get(header::CONTENT_TYPE),
                     Some(&HeaderValue::from_static("application/json")),
                     "should return JSON for `{path_and_format}`"
+                );
+                assert!(
+                    response
+                        .extensions()
+                        .get::<crate::response_privacy::TerminalPrivateResponse>()
+                        .is_some(),
+                    "successful per-user page-bids JSON should remain terminal-private"
                 );
             }
         }

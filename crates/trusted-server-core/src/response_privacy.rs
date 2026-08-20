@@ -89,14 +89,19 @@ pub fn enforce_private_no_store(response: &mut Response) {
     strip_cdn_cache_headers(response);
 }
 
+/// Marks a Trusted Server response as terminal-private and applies its cache policy.
+pub(crate) fn enforce_terminal_private_cache_privacy(response: &mut Response) {
+    enforce_private_no_store(response);
+    response.extensions_mut().insert(TerminalPrivateResponse);
+}
+
 /// Forces synthesized HTML to be private and non-storable.
 ///
 /// Use this exact policy whenever Trusted Server changes an origin HTML
 /// representation with request-specific content: force `private, no-store`,
 /// remove origin validators, and remove all CDN-targeted cache directives.
 pub(crate) fn enforce_synthesized_html_cache_privacy(response: &mut Response) {
-    enforce_private_no_store(response);
-    response.extensions_mut().insert(TerminalPrivateResponse);
+    enforce_terminal_private_cache_privacy(response);
 }
 
 /// Forces cookie-bearing responses to stay private to shared caches.
