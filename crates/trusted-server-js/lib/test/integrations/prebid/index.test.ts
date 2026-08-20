@@ -414,9 +414,11 @@ describe('prebid/installPrebidNpm', () => {
     delete testWindow.__tsjs_prebid_diagnostics;
     delete testWindow.tsjs;
     delete mockPbjs['__tsApsBidResponseListenerInstalled'];
+    delete mockPbjs.bidderSettings;
   });
 
   afterEach(() => {
+    delete mockPbjs.bidderSettings;
     vi.restoreAllMocks();
   });
 
@@ -1130,6 +1132,35 @@ describe('prebid/installPrebidNpm', () => {
   });
 
   describe('requestBids shim', () => {
+    it('preserves publisher ts adserverTargeting while adding trustedServer settings', () => {
+      const publisherTargeting = [{ key: 'ts', val: () => 'publisher-value' }];
+      mockPbjs.bidderSettings = {
+        exampleBidder: { adserverTargeting: publisherTargeting },
+      };
+      const pbjs = installPrebidNpm();
+
+      pbjs.requestBids({
+        adUnits: [{ bids: [{ bidder: 'exampleBidder', params: {} }] }],
+      } as unknown as RequestBidsArg);
+
+      const bidderSettings = mockPbjs.bidderSettings as {
+        exampleBidder: { adserverTargeting: typeof publisherTargeting };
+        trustedServer: {
+          allowAlternateBidderCodes: boolean;
+          allowedAlternateBidderCodes: string[];
+        };
+      };
+      expect(bidderSettings.exampleBidder.adserverTargeting).toBe(publisherTargeting);
+      expect(bidderSettings.exampleBidder.adserverTargeting[0].key).toBe('ts');
+      expect(bidderSettings.exampleBidder.adserverTargeting[0].val()).toBe('publisher-value');
+      expect(bidderSettings.trustedServer).toEqual(
+        expect.objectContaining({
+          allowAlternateBidderCodes: true,
+          allowedAlternateBidderCodes: ['*'],
+        })
+      );
+    });
+
     it('injects trustedServer bidder into every ad unit', () => {
       const pbjs = installPrebidNpm();
 
@@ -1850,25 +1881,33 @@ describe('prebid/installRefreshHandler', () => {
 
   it('auctions refreshed TS initial slots and clears stale TS targeting before refresh', () => {
     const originalRefresh = vi.fn();
-    const clearTargeting = vi.fn();
+    const slotTargeting = new Map<string, string[]>([
+      ['ts_initial', ['1']],
+      ['zone', ['homepage']],
+    ]);
+    const clearTargeting = vi.fn((key: string) => {
+      slotTargeting.delete(key);
+    });
+    const setTargeting = vi.fn((key: string, value: string | string[]) => {
+      slotTargeting.set(key, Array.isArray(value) ? value : [value]);
+    });
     const gptSlot = {
       getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
-      getTargeting: vi.fn((key: string) => {
-        if (key === 'ts_initial') return ['1'];
-        if (key === 'zone') return ['homepage'];
-        return [];
-      }),
+      getTargeting: vi.fn((key: string) => slotTargeting.get(key) ?? []),
       getSizes: vi.fn(() => [
         { getWidth: () => 970, getHeight: () => 250 },
         { getWidth: () => 728, getHeight: () => 90 },
       ]),
       clearTargeting,
+      setTargeting,
     };
     const pubads = {
       refresh: originalRefresh,
       getSlots: vi.fn(() => [gptSlot]),
     };
-    const setTargetingForGPTAsync = vi.fn();
+    const setTargetingForGPTAsync = vi.fn(() => {
+      gptSlot.setTargeting('ts', 'prebid-value');
+    });
     mockPbjs.setTargetingForGPTAsync = setTargetingForGPTAsync;
     testWindow.googletag = {
       cmd: { push: (fn: () => void) => fn() },
@@ -1918,12 +1957,17 @@ describe('prebid/installRefreshHandler', () => {
     expect(clearTargeting).toHaveBeenCalledWith('hb_adid');
     expect(clearTargeting).toHaveBeenCalledWith('hb_cache_host');
     expect(clearTargeting).toHaveBeenCalledWith('hb_cache_path');
+    expect(clearTargeting).not.toHaveBeenCalledWith('ts');
     expect(originalRefresh).not.toHaveBeenCalled();
 
     const bidsBackHandler = mockRequestBids.mock.calls[0][0].bidsBackHandler;
     bidsBackHandler();
 
     expect(setTargetingForGPTAsync).toHaveBeenCalled();
+    expect(setTargetingForGPTAsync.mock.invocationCallOrder[0]).toBeLessThan(
+      originalRefresh.mock.invocationCallOrder[0]
+    );
+    expect(slotTargeting.get('ts')).toEqual(['prebid-value']);
     expect(originalRefresh).toHaveBeenCalledWith([gptSlot], undefined);
   });
 
