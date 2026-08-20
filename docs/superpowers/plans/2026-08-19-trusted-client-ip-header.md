@@ -8,13 +8,13 @@ least 32 UTF-8 bytes. A non-ASCII secret could therefore pass startup validation
 but never authenticate a request. Whitespace accepted by `HeaderValue::to_str`
 is also unsuitable because an intermediary may normalize it.
 
-- [ ] Add focused settings tests for the 31/32-byte boundary and rejection of
+- [x] Add focused settings tests for the 31/32-byte boundary and rejection of
       non-ASCII, horizontal-tab, space, DEL, and other control bytes. Assert
       rejected values remain redacted, and run the tests first to demonstrate
       the current failure.
-- [ ] Accept only `shared_secret` bytes in the ASCII graphic range
+- [x] Accept only `shared_secret` bytes in the ASCII graphic range
       `0x21..=0x7e`, retaining the 32-byte minimum and redacted errors.
-- [ ] Update the configuration and Fastly guides to specify 32 or more ASCII
+- [x] Update the configuration and Fastly guides to specify 32 or more ASCII
       graphic bytes and recommend hexadecimal or base64url generation.
 - [ ] Run focused settings tests, formatting, target-matched tests, Clippy, and
       the Fastly release build before updating the PR.

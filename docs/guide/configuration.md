@@ -363,11 +363,11 @@ it but keep using their own runtime client address.
 
 ### `[trusted_client_ip]`
 
-| Field           | Type   | Required | Description                                               |
-| --------------- | ------ | -------- | --------------------------------------------------------- |
-| `ip_header`     | String | Yes      | Header containing exactly one reader IP address           |
-| `auth_header`   | String | Yes      | Header containing exactly one shared-secret value         |
-| `shared_secret` | String | Yes      | Secret shared with the trusted front door, 32+ characters |
+| Field           | Type   | Required | Description                                                                       |
+| --------------- | ------ | -------- | --------------------------------------------------------------------------------- |
+| `ip_header`     | String | Yes      | Header containing exactly one reader IP address                                   |
+| `auth_header`   | String | Yes      | Header containing exactly one shared-secret value                                 |
+| `shared_secret` | String | Yes      | Secret shared with the trusted front door, 32+ ASCII graphic bytes, no whitespace |
 
 All three fields are required when the section exists. When the section is
 absent, Trusted Server continues to use the immediate peer address.
@@ -397,11 +397,11 @@ dedicated `x-` names that no other application or routing logic uses, because
 Trusted Server removes the configured headers before routing.
 
 Generate `shared_secret` with a cryptographically secure random generator,
-store the same value only in the front door and Trusted Server configuration,
-and never commit it. The value is redacted from configuration debug output.
-Configuration fails validation when the secret is shorter than 32 characters,
-matching the minimum applied to `ec.passphrase`, and startup fails when it is
-still the documented placeholder value.
+encode it as hex or base64url, store the same value only in the front door and
+Trusted Server configuration, and never commit it. The value is redacted from
+configuration debug output. Configuration requires at least 32 ASCII graphic
+bytes (`!` through `~`) with no whitespace, controls, DEL, or non-ASCII bytes,
+and startup fails when the value is still the documented placeholder.
 
 Trusted Server strips any client-supplied `X-Forwarded-For` at the edge, so the
 front door cannot use that header to carry the reader address.

@@ -103,11 +103,12 @@ address whenever either trust header carries more than one value, so a client
 that sends its own copy of either header could otherwise force the fallback and
 keep its real address out of geolocation and bot protection.
 
-Use a cryptographically random secret of at least 32 characters in production.
-The value above is a placeholder that Trusted Server rejects at startup. Keep it
-in a private edge dictionary rather than inlining it in VCL, where it is
-readable by anyone with service-configuration access and preserved in every
-version diff. Configure the identical header names and secret in Trusted Server:
+Use a cryptographically random secret of at least 32 ASCII graphic bytes in
+production, encoded as hex or base64url with no whitespace. The value above is
+a placeholder that Trusted Server rejects at startup. Keep it in a private edge
+dictionary rather than inlining it in VCL, where it is readable by anyone with
+service-configuration access and preserved in every version diff. Configure the
+identical header names and secret in Trusted Server:
 
 ```toml
 [trusted_client_ip]
