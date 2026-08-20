@@ -1,5 +1,25 @@
 # Trusted Client IP Header Implementation Plan
 
+## Review remediation
+
+- [x] Add a shared helper that removes the configured IP and authentication
+      headers from a core request, with a failing unit test proving both names
+      are removed while unrelated headers remain.
+- [x] Invoke that helper from the outer request middleware in the Axum,
+      Cloudflare, and Spin adapters so a shared multi-adapter configuration
+      cannot expose either trust header to routing or integrations.
+- [x] Add a regression assertion proving the Fastly entry-point `ClientInfo`
+      address reaches request-scoped services, which are the EC input.
+- [x] Remove the partial `X-Forwarded-For` hardening from this PR and its
+      documentation. Handle trusted XFF reconstruction consistently across all
+      adapters in a separate change.
+- [x] Document that redaction protects logs and debug output but the secret is
+      serialized into the Trusted Server application-config blob.
+- [x] Retain `/.worktrees/` because this checkout has an active unrelated
+      worktree under that path; removing the ignore would expose its contents.
+- [x] Run formatting plus Fastly, Axum, Cloudflare, and Spin tests and
+      target-matched Clippy checks.
+
 ## Review follow-up: header-safe shared secrets
 
 PR review found that the request path reads the authentication field with

@@ -186,21 +186,6 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_fastly_forwarded_headers_strips_client_supplied_forwarded_for() {
-        let mut req = fastly::Request::get("https://example.com/");
-        req.set_header("x-forwarded-for", "198.51.100.99, 10.0.0.1");
-        req.set_header("host", "example.com");
-
-        sanitize_fastly_forwarded_headers(&mut req, None);
-
-        assert!(
-            req.get_header("x-forwarded-for").is_none(),
-            "should strip client-supplied x-forwarded-for"
-        );
-        assert!(req.get_header("host").is_some(), "should preserve host");
-    }
-
-    #[test]
     fn resolve_and_sanitize_client_ip_reads_trust_headers_before_stripping_them() {
         let config = trusted_client_ip_config("x-trusted-client-ip");
         let mut req = fastly::Request::get("https://example.com/");

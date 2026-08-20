@@ -33,7 +33,9 @@ Related issues: #1040 and #1041.
 
 - Automatically infer whether a request came from another Fastly service.
 - Trust `Fastly-Client-IP`, `Fastly-FF`, or `X-Forwarded-For` by presence.
-- Change client-IP handling in Cloudflare, Spin, or Axum adapters.
+- Change client-IP resolution in Cloudflare, Spin, or Axum adapters. Those
+  adapters still remove configured trust headers so a shared configuration
+  cannot expose the authentication value downstream.
 - Add rotating or time-limited request signatures in this change.
 - Make Fastly no-code request routing preserve a value it does not expose.
 
@@ -108,13 +110,11 @@ is stripped even when the feature is not configured. A configured header is
 read before sanitization and removed explicitly, so configuring
 `fastly-client-ip` remains valid.
 
-`X-Forwarded-For` joins the same list. The shared proxy code forwards an inbound
-value to publisher origins, so leaving it would let a client choose the address
-the origin attributes the request to while Trusted Server itself used the
-authenticated one. The Spin adapter already stripped it for this reason; moving
-the rule into the shared list closes the equivalent gap on Fastly without
-changing Spin behaviour. Integrations that need the address continue to send
-their own `X-Forwarded-For` derived from the resolved client IP.
+The core request sanitizer removes the two configured trust headers on every
+adapter. Only Fastly consumes them, but applying the removal invariant across
+adapters prevents a shared multi-platform configuration from forwarding an
+authentication value to routing or integrations. Cross-adapter treatment of
+client-supplied `X-Forwarded-For` is separate from this feature.
 
 Authentication failures do not log supplied secrets or IP values. A debug-level
 message may record only the reason category (missing authentication, mismatch,
@@ -143,6 +143,10 @@ its result with request services and response geo finalization.
 `trusted-server-adapter-fastly/src/compat.rs` removes the configured dynamic
 headers and continues applying the static spoofable-header list.
 
+The Axum, Cloudflare, and Spin outer request middleware invokes the shared core
+sanitizer before routing. Those adapters do not use this configuration to
+resolve their client address.
+
 No core EC, consent, auction, or integration logic changes: those consumers
 already use `RuntimeServices::client_info().client_ip` correctly.
 
@@ -152,6 +156,11 @@ The fronting CDN must overwrite both configured headers on every request sent to
 Trusted Server. It must never preserve caller-provided values. The shared secret
 must be generated randomly, stored in both the fronting service and Trusted
 Server configuration, and excluded from responses and origin requests.
+
+`Redacted<String>` prevents the secret from appearing in debug output and
+validation errors; it does not move the value into a platform secret store. The
+secret is serialized in the Trusted Server application-config blob, so access
+to that configuration store must be restricted.
 
 This design protects against callers that can reach the Trusted Server hostname
 and inject an arbitrary IP header, provided they do not know the shared secret.
@@ -174,6 +183,7 @@ Tests follow red-green-refactor and cover:
 - whitespace-padded, port-bearing, zone-qualified, comma-separated, non-UTF-8,
   empty, or duplicate IP input falls back to the peer IP;
 - configured headers are removed after resolution;
+- configured headers are removed by every adapter before routing;
 - `Fastly-Client-IP` is stripped when configuration is absent;
 - settings parse, validation, secret redaction, and default behavior;
 - a 31-byte secret is rejected and a 32-byte ASCII-graphic secret is accepted;
