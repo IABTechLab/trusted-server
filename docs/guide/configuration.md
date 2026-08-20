@@ -1505,6 +1505,7 @@ URL. Error responses and non-document requests retain the origin policy.
 Any response that carries `Set-Cookie` is finalized as
 `Cache-Control: private, max-age=0`; this privacy rule takes precedence over
 the short inactive-stack policy.
+
 ```toml
 [creative_opportunities]
 enabled = true # set to false to disable server-side ad templates
@@ -1531,6 +1532,7 @@ Because EdgeZero only replaces TOML leaves that already exist, first add
 `enabled = true` to the `[creative_opportunities]` block in the base config
 before using this override. See [Environment Variable Overrides (Typed
 CLI)](#environment-variable-overrides-typed-cli) for the general overlay rules.
+
 ```bash
 TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED=false
 ```
