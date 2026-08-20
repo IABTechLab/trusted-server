@@ -3,6 +3,7 @@ import type {
   ApsNativeRendererHook,
   ApsPrebidRendererEntry,
   ApsRendererV1,
+  GptDiagnosticsCreativeFailure,
   TsjsApi,
 } from '../../core/types';
 
@@ -34,6 +35,55 @@ const activeFrames = new WeakMap<HTMLElement, HTMLIFrameElement>();
 const pendingFrameCancels = new WeakMap<HTMLElement, () => void>();
 const RENDERER_READY_MESSAGE = 'trusted-server/aps/renderer-ready';
 const RENDERER_FAILED_MESSAGE = 'trusted-server/aps/renderer-failed';
+/**
+ * Message the Universal Creative frame relays to the top window when an APS
+ * render never completes.
+ *
+ * The creative frame is cross-origin, so the top-window listener treats every
+ * field as untrusted and validates the reason against
+ * [`APS_RENDER_FAILURE_REASONS`] before recording it. The relay is
+ * diagnostics-only and never influences creative delivery.
+ */
+export const APS_RENDER_FAILED_MESSAGE = 'trusted-server/aps/render-failed';
+
+/**
+ * Wire reasons the render path can emit, mapped onto safe diagnostic categories.
+ *
+ * Built on a null prototype so a hostile `__proto__`, `constructor`, or
+ * `toString` relayed by the cross-origin creative frame resolves to `undefined`
+ * rather than an inherited member.
+ */
+const APS_RENDER_FAILURE_REASONS: Readonly<Record<string, GptDiagnosticsCreativeFailure>> =
+  Object.freeze(
+    Object.assign(Object.create(null) as Record<string, GptDiagnosticsCreativeFailure>, {
+      bad_hash: 'aps_bad_hash',
+      nonce_mismatch: 'aps_nonce_mismatch',
+      source_mismatch: 'aps_source_mismatch',
+      descriptor_keys: 'aps_descriptor_keys',
+      descriptor_fields: 'aps_descriptor_fields',
+      descriptor_envelope: 'aps_descriptor_envelope',
+      amazon_script_error: 'aps_runner_script_error',
+      frame_timeout: 'aps_frame_timeout',
+      frame_load_error: 'aps_frame_load_error',
+      frame_reported_failure: 'aps_frame_reported_failure',
+      unknown: 'aps_unknown',
+    } as const)
+  );
+
+/**
+ * Resolve a relayed render failure reason to a safe diagnostic category.
+ *
+ * Returns `undefined` for anything not on the allowlist, so an unrecognized or
+ * hostile value from the cross-origin creative frame is dropped instead of
+ * being recorded.
+ *
+ * @example
+ * apsRenderFailureReason('frame_timeout'); // 'aps_frame_timeout'
+ * apsRenderFailureReason('__proto__'); // undefined
+ */
+export function apsRenderFailureReason(value: unknown): GptDiagnosticsCreativeFailure | undefined {
+  return typeof value === 'string' ? APS_RENDER_FAILURE_REASONS[value] : undefined;
+}
 const RENDERER_READY_TIMEOUT_MS = 10_000;
 const MAX_PREBID_RENDERER_ENTRIES = 256;
 const DEFAULT_PREBID_RENDERER_TTL_SECONDS = 300;
@@ -563,12 +613,13 @@ var b=new Uint8Array(16);c.getRandomValues(b);var s="";for(var i=0;i<b.length;i+
 var n=w.btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,"");
 var f=w.document.createElement("iframe"),done=false,t;
 function clean(){w.removeEventListener("message",receive);if(t)w.clearTimeout(t);}
-function fail(){if(done)return;done=true;clean();f.remove();reject(new Error("APS renderer frame failed"));}
-function receive(e){var m=e.data;if(e.source!==f.contentWindow||!m||m.nonce!==n)return;
-if(m.message==="${RENDERER_READY_MESSAGE}"){done=true;clean();resolve();}
-else if(m.message==="${RENDERER_FAILED_MESSAGE}")fail();}
+function report(x){try{(w.top||w).postMessage({message:"${APS_RENDER_FAILED_MESSAGE}",adId:(d&&typeof d.adId==="string")?d.adId:"",reason:x},"*");}catch(_e){}}
+function fail(x){if(done)return;done=true;clean();f.remove();report(x||"unknown");reject(new Error("APS renderer frame failed"));}
+function receive(e){var m=e.data;if(e.source!==f.contentWindow||!m)return;
+if(m.message==="${RENDERER_READY_MESSAGE}"&&m.nonce===n){done=true;clean();resolve();}
+else if(m.message==="${RENDERER_FAILED_MESSAGE}"&&(m.nonce===n||m.nonce===undefined))fail(typeof m.reason==="string"?m.reason:"frame_reported_failure");}
 f.width=String(r.width);f.height=String(r.height);f.style.border="0";
 f.setAttribute("sandbox","${APS_RENDERER_SANDBOX}");
 f.src=p.href+"#tsaps="+n;f.onload=function(){if(!done&&f.contentWindow)f.contentWindow.postMessage({nonce:n,renderer:r},"*");};
-f.onerror=fail;w.addEventListener("message",receive);t=w.setTimeout(fail,${RENDERER_READY_TIMEOUT_MS});w.document.body.appendChild(f);
+f.onerror=function(){fail("frame_load_error");};w.addEventListener("message",receive);t=w.setTimeout(function(){fail("frame_timeout");},${RENDERER_READY_TIMEOUT_MS});w.document.body.appendChild(f);
 }catch(e){reject(e);}});};})();`;
