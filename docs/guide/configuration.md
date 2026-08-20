@@ -1537,6 +1537,12 @@ TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED=false
 
 ### Shared template assembly (`assembly_mode = "esi"`)
 
+### Shared template assembly (`assembly_mode = "esi"`)
+
+This configuration is an experimental validation spike scoped to
+[IABTechLab/trusted-server#1009](https://github.com/IABTechLab/trusted-server/issues/1009),
+not a settled production cache interface.
+
 `assembly_mode` controls how initial-page slot and bid state is delivered:
 
 - `inline` (default) transforms every origin response and injects the current
@@ -1550,11 +1556,11 @@ TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED=false
   stream while the auction finishes.
 
 This is deliberately not general publisher-controlled ESI. A transformed origin
-document containing any `<esi:` directive bypasses C2 and the parser, while the
-ordinary byte seam still produces the reader's complete response. The stored C2
+document containing any `<esi:` directive bypasses the template cache and the parser, while the
+ordinary byte seam still produces the reader's complete response. The stored shared template
 object never contains executable ESI markup.
 
-Only Fastly currently supplies the C2 Core Cache backend. Other adapters accept
+Only Fastly currently supplies the Core Cache backend used by the shared template cache. Other adapters accept
 the mode but safely fall back to the inline transform on every request. This is
 not a top-level HTTP cache hit: Compute still runs and the final assembled
 response is always `Cache-Control: private, no-store`.
@@ -1571,7 +1577,12 @@ assembly_mode = "esi"
 
 # Every request header, except Accept-Encoding, that the publisher origin can
 # name in Vary for these documents. Names are validated and de-duplicated.
-template_cache_vary = ["rsc", "next-router-prefetch"]
+template_cache_vary = [
+  "rsc",
+  "next-router-state-tree",
+  "next-router-prefetch",
+  "next-router-segment-prefetch",
+]
 
 # Safety ceiling for the shared template. Defaults to 60; valid range 1–86400.
 # The origin's remaining edge freshness may make the actual lifetime shorter.
@@ -1586,12 +1597,12 @@ The cache fails closed. A template is stored only for a `GET` with a processable
 positive shared freshness. `private`, `no-store`, `no-cache`, exhausted or
 malformed freshness, `Set-Cookie`, `Vary: *`, `Vary: Cookie`, uncovered `Vary`
 names, response-bound CSP nonces, authorization, diagnostics sessions, range or
-conditional requests, request-side `max-age`/`min-fresh` constraints, and
-unsupported CDN-specific cache policy fields all bypass C2. Fastly
-`Surrogate-Control` is the narrow exception: C2 accepts exactly one positive
+conditional requests, positive or malformed request `max-age`, `min-fresh`, and
+unsupported CDN-specific cache policy fields all bypass the template cache. Fastly
+`Surrogate-Control` is the narrow exception: the template cache accepts exactly one positive
 `max-age` plus optional valid `stale-while-revalidate` and `stale-if-error`
 delta-seconds. Restrictive, duplicated, malformed, or unknown directives fail
-closed. Stale windows never extend C2 freshness. Freshness follows Fastly edge
+closed. Stale windows never extend template-cache freshness. Freshness follows Fastly edge
 precedence: `Surrogate-Control: max-age`, then `Cache-Control: s-maxage`,
 `Cache-Control: max-age`, then `Expires`. Restrictive directives in either policy
 still refuse sharing. Origin `Age` and apparent age from `Date` are deducted, time
@@ -1599,10 +1610,10 @@ spent transforming the page continues consuming freshness, and the remaining
 lifetime is capped by `template_cache_max_age_seconds`.
 
 A browser reload commonly sends `Cache-Control: max-age=0`. TS may reuse a fresh
-reader-neutral C2 template for that reload, but it still builds a new private
+reader-neutral shared template for that reload, but it still builds a new private
 response and runs a new per-reader auction. Explicit `no-cache`, `no-store`,
-positive or malformed `max-age`, range, and conditional requests still bypass C2.
-Check `X-TS-C2-Cache: hit` to verify template reuse.
+positive or malformed request `max-age`, range, and conditional requests still bypass the template cache.
+Check `X-TS-Template-Cache: hit` to verify template reuse.
 
 `template_cache_vary` is necessary because lookup occurs before the origin can
 return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
@@ -1617,17 +1628,20 @@ document's meaning based on `Accept-Encoding`. Never put `Cookie` in
 reader-neutral template. With `origin_is_cookie_independent = false` (the safe
 default), all cookie-bearing requests bypass. With it set to `true`, an origin
 `Vary: Cookie` still overrides the assertion and refuses storage.
+Every other name the origin emits in `Vary` must appear in the configured list;
+an uncovered name safely refuses template storage.
 
-For a canary, inspect `X-TS-C2-Cache`. Its bounded values are `hit`,
+For a canary, inspect `X-TS-Template-Cache`. Its bounded values are `hit`,
 `miss-stored`, `miss-store-error`, `miss-reserved`, `bypass-request`,
 `bypass-response`, `unsupported`, `invalid`, and `backend-error`. No URL, header
 value, or cache key is exposed. `invalid` and `backend-error` fail open to a
-fresh origin response; they do not fail the page.
+fresh origin response; they do not fail the page. The corresponding
+`template_cache` logs provide server-side observability for this path.
 
 `X-TS-Assembly` identifies how the private response was assembled:
 
 - `esi-parser` — authorized cold miss assembled by the repaired parser;
-- `byte-seam` — warm C2 hit using the streaming byte seam;
+- `byte-seam` — warm template-cache hit using the streaming byte seam;
 - `byte-seam-fallback` — cold response safely assembled by byte seam because
   the platform parser was unavailable or rejected the document.
 
@@ -1645,18 +1659,12 @@ Rollback must preserve configuration compatibility:
 3. Purge the Fastly surrogate key `ts-template` using the service's normal purge
    tooling, or wait for the bounded origin-derived lifetime to expire.
 
-Run `scripts/c2-local-test.sh esi` before a rollout and
-`scripts/c2-local-test.sh inline` as its control. The harness uses a temporary
+Run `scripts/template-cache-local-test.sh esi` before a rollout and
+`scripts/template-cache-local-test.sh inline` as its control. The harness uses a temporary
 manifest, never edits the tracked `fastly.toml`, verifies cold/warm origin
 counts and response integrity, and executes the generated GPT module against
 the served seam to require a real `defineSlot` call.
 
-> [!WARNING]
-> Setting `enabled = false` writes this field into the pushed configuration blob.
-> Binaries released before this setting reject the unknown field and fail to load
-> settings, which makes every request fail. Before rolling back to an older binary,
-> restore `enabled` to its default, re-push and finalize the configuration, then
-> roll back the binary.
 ### `gam_unit_path` templating
 
 `gam_unit_path` is a template. A publisher whose ad unit varies by site section

@@ -455,6 +455,8 @@ export interface TsjsApi {
   gptSlotHandoffInternal?: boolean;
   /** Guards SPA pushState hook installation. */
   spaHookInstalled?: boolean;
+  /** Internal one-shot state shared by bootstrap and bundle scheduler installs. */
+  initialAdInitScheduled?: boolean;
   /**
    * Monotonic count of committed SPA navigations, incremented synchronously by
    * the SPA auction hook the moment it accepts a route change. The deferred

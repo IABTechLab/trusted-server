@@ -118,12 +118,15 @@
   // spent on a viewed tab, and the post-hydration guarantee holds whenever
   // the request is actually issued.
   ts.scheduleInitialAdInit = function (initialBids, initialSlots) {
-    if ((ts.navGeneration || 0) !== 0) return;
+    // The bundle may replace this scheduler after the fallback claims the initial
+    // pass. Keep the latch on the shared document API so replacement cannot reset it.
+    if ((ts.navGeneration || 0) !== 0 || ts.initialAdInitScheduled) return;
+    ts.initialAdInitScheduled = true;
     // Slots are generation-guarded for the same reason the bids are: the
     // shared-template seam sends both, and an assignment made before this call
     // would overwrite a committed SPA navigation's slots.
-    if (initialSlots) ts.adSlots = initialSlots;
-    if (initialBids) ts.bids = initialBids;
+    if (initialSlots !== undefined) ts.adSlots = initialSlots;
+    if (initialBids !== undefined) ts.bids = initialBids;
     var fire = function () {
       if ((ts.navGeneration || 0) !== 0) return;
       if (typeof ts.adInit === "function") ts.adInit();

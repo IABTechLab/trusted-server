@@ -17,6 +17,13 @@ use crate::cache_policy::{
 };
 use crate::settings::Settings;
 
+/// Marks a response whose `private, no-store` policy belongs to Trusted Server.
+///
+/// Platform terminal hooks use this out-of-band marker to re-enforce the policy after
+/// late integrations run without rewriting unrelated origin-private responses.
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalPrivateResponse;
+
 /// CDN-targeted cache headers stripped from every cookie-bearing response.
 ///
 /// A single source of truth so the adapter copies of the privacy downgrade
@@ -38,11 +45,11 @@ fn strip_cdn_cache_headers(response: &mut Response) {
 ///
 /// Extracted because both arms of the cookie-privacy net below need it.
 ///
-/// `publisher::c2_bypass_reason` deliberately does **not** call this and keeps its own
+/// `publisher::template_cache_bypass_reason` deliberately does **not** call this and keeps its own
 /// copy: it additionally treats `no-cache` as non-shareable, because "revalidate before
 /// reuse" is correct for an HTTP cache and too permissive for a spike-owned one. The
-/// duplicate is the stricter of the two, so consolidating them would loosen the shared-
-/// template gate rather than tidy it.
+/// duplicate is the stricter of the two, so consolidating them would loosen the shared
+/// template-cache gate rather than tidy it.
 ///
 /// Directives are case-insensitive (RFC 9111 §5.2), so `No-Store` and `Private`
 /// count. `no-cache` deliberately does **not**: it requires revalidation before
@@ -74,13 +81,19 @@ pub fn enforce_private_no_store(response: &mut Response) {
     strip_cdn_cache_headers(response);
 }
 
+/// Marks a Trusted Server response as terminal-private and applies its cache policy.
+pub(crate) fn enforce_terminal_private_cache_privacy(response: &mut Response) {
+    enforce_private_no_store(response);
+    response.extensions_mut().insert(TerminalPrivateResponse);
+}
+
 /// Forces synthesized HTML to be private and non-storable.
 ///
 /// Use this exact policy whenever Trusted Server changes an origin HTML
 /// representation with request-specific content: force `private, no-store`,
 /// remove origin validators, and remove all CDN-targeted cache directives.
 pub(crate) fn enforce_synthesized_html_cache_privacy(response: &mut Response) {
-    enforce_private_no_store(response);
+    enforce_terminal_private_cache_privacy(response);
 }
 
 /// Removes runtime edge-cache headers from a response finalized as uncacheable.
@@ -225,6 +238,13 @@ mod tests {
             response.headers()[header::CACHE_CONTROL],
             "private, no-store",
             "synthesized HTML should always be non-storable"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<TerminalPrivateResponse>()
+                .is_some(),
+            "should mark synthesized HTML for terminal privacy re-enforcement"
         );
         for header_name in [header::ETAG.as_str(), header::LAST_MODIFIED.as_str()]
             .into_iter()

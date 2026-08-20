@@ -63,6 +63,11 @@ jobs:
 
       - name: Run inline control harness
         run: ./scripts/c2-local-test.sh inline
+      - name: Run template cache ESI local harness
+        run: BID_DELAY=3 ./scripts/template-cache-local-test.sh esi
+
+      - name: Run inline control harness
+        run: BID_DELAY=3 ./scripts/template-cache-local-test.sh inline
 
   test-axum:
     name: cargo test (axum native)

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lol_html::{
-    EndTagHandler, Settings as RewriterSettings, doc_comments, element, end,
+    EndTagHandler, Settings as RewriterSettings, element, end,
     html_content::{ContentType, EndTag},
     text,
 };
@@ -163,7 +163,7 @@ impl StreamProcessor for HtmlWithPostProcessing {
 /// which coupled two independent choices: once a shared-template mode stopped
 /// emitting the head script, body-close injection silently stopped too.
 ///
-/// See `docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md`
+/// See `docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md`
 /// §6.7.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum BodyCloseInjection {
@@ -204,6 +204,11 @@ pub struct HtmlProcessorConfig {
     pub body_close: BodyCloseInjection,
     /// Whether to omit Trusted Server's automatic `DataDome` client-side tag.
     pub suppress_datadome_client_side_tag: bool,
+    /// Set when the document delivers a response-bound CSP nonce in its own markup.
+    ///
+    /// `None` on every path that cannot store a shared template, so an ordinary inline
+    /// request does not pay for handlers whose only consumer is the template-cache gate.
+    pub csp_nonce_observed: Option<Arc<AtomicBool>>,
 }
 
 impl HtmlProcessorConfig {
@@ -227,6 +232,7 @@ impl HtmlProcessorConfig {
             gpt_diagnostics: None,
             body_close: BodyCloseInjection::None,
             suppress_datadome_client_side_tag: false,
+            csp_nonce_observed: None,
         }
     }
 
@@ -263,6 +269,16 @@ impl HtmlProcessorConfig {
     #[must_use]
     pub fn with_gpt_diagnostics(mut self, decision: Option<GptDiagnosticsRequestDecision>) -> Self {
         self.gpt_diagnostics = decision;
+        self
+    }
+
+    /// Watch the document for a response-bound CSP nonce delivered in its own markup.
+    ///
+    /// Pass `Some` only when the completed transform may be stored as a shared template;
+    /// nothing else reads the observation.
+    #[must_use]
+    pub fn with_csp_nonce_observer(mut self, observed: Option<Arc<AtomicBool>>) -> Self {
+        self.csp_nonce_observed = observed;
         self
     }
 
@@ -360,25 +376,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let ad_bids_state = config.ad_bids_state.clone();
     let gpt_diagnostics = config.gpt_diagnostics.clone();
 
-    // A publisher can legitimately emit the same inert comment text as the reserved
-    // C2 seam, including after `</body>`. Neutralize source comments while they are
-    // parsed; markup injected by the body end-tag handler is output, not reparsed, so
-    // the transform-owned marker remains the only exact copy.
+    // No source-comment neutralization here: rewriting a publisher comment that happens
+    // to match the reserved marker would change publisher content bytes. Collisions are
+    // detected on the completed transform instead, where the response can be refused
+    // outright rather than silently edited.
     let mut document_content_handlers = Vec::new();
-    if let BodyCloseInjection::Marker(marker) = &body_close
-        && let Some(reserved) = marker
-            .strip_prefix("<!--")
-            .and_then(|marker| marker.strip_suffix("-->"))
-    {
-        let reserved = reserved.to_string();
-        let escaped = format!("x{reserved}");
-        document_content_handlers.push(doc_comments!(move |comment| {
-            if comment.text() == reserved {
-                comment.set_text(&escaped)?;
-            }
-            Ok(())
-        }));
-    }
     if let BodyCloseInjection::Marker(marker) = &body_close {
         let marker = marker.clone();
         let injected_bids = Arc::clone(&injected_bids);
@@ -716,6 +718,37 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         }),
     ];
 
+    // A response-bound nonce is only safe for the response that carried it, and the
+    // response-header gate cannot see one the origin delivered in the markup instead.
+    // Observed structurally rather than by scanning the output bytes, which cannot tell a
+    // `nonce` attribute from the same word inside a script.
+    if let Some(observed) = config.csp_nonce_observed.clone() {
+        let meta_observed = Arc::clone(&observed);
+        element_content_handlers.push(element!("meta[http-equiv][content]", move |el| {
+            let delivers_csp = el.get_attribute("http-equiv").is_some_and(|equiv| {
+                matches!(
+                    equiv.trim().to_ascii_lowercase().as_str(),
+                    "content-security-policy" | "content-security-policy-report-only"
+                )
+            });
+            if delivers_csp
+                && el
+                    .get_attribute("content")
+                    .is_some_and(|policy| policy.to_ascii_lowercase().contains("'nonce-"))
+            {
+                meta_observed.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }));
+        // `lol_html` does not entity-decode quoted meta CSP content for the check above.
+        // Reject nonce attributes independently so an entity-encoded meta policy cannot
+        // hide executable nonce-bound content from the template-cache safety scan.
+        element_content_handlers.push(element!("[nonce]", move |_el| {
+            observed.store(true, Ordering::SeqCst);
+            Ok(())
+        }));
+    }
+
     for script_rewriter in script_rewriters {
         let selector = script_rewriter.selector();
         let rewriter = script_rewriter.clone();
@@ -789,6 +822,7 @@ mod tests {
 
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
+            csp_nonce_observed: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_owned(),
             request_host: "test.example.com".to_owned(),
@@ -1761,6 +1795,7 @@ mod tests {
     #[test]
     fn injects_ad_slots_at_head_open() {
         let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1838,6 +1873,7 @@ mod tests {
         let bids_script = r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1876,6 +1912,7 @@ mod tests {
         let bids_script = r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1915,6 +1952,7 @@ mod tests {
 
         let request_host = "proxy.test-publisher.example.com";
         let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.test-publisher.example.com".to_string(),
             request_host: request_host.to_string(),
@@ -1968,6 +2006,7 @@ mod tests {
         // (state is None) — e.g. auction timed out with zero bids. Fallback to {}.
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1999,6 +2038,7 @@ mod tests {
         // unmodified (spec §8: "Existing client-side Prebid/GPT flow runs unmodified").
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2021,10 +2061,145 @@ mod tests {
         );
     }
 
+    fn marker_mode_config(marker: &str, observer: Option<Arc<AtomicBool>>) -> HtmlProcessorConfig {
+        HtmlProcessorConfig {
+            csp_nonce_observed: observer,
+            body_close: BodyCloseInjection::Marker(marker.to_string()),
+            origin_host: "origin.example.com".to_string(),
+            request_host: "example.com".to_string(),
+            request_scheme: "https".to_string(),
+            integrations: IntegrationRegistry::empty_for_tests(),
+            ad_slots_script: None,
+            ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
+            gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
+        }
+    }
+
+    fn render_marker_mode(marker: &str, source: &str) -> String {
+        let mut processor = create_html_processor(marker_mode_config(marker, None));
+        let output = processor
+            .process_chunk(source.as_bytes(), true)
+            .expect("should process the document");
+        String::from_utf8(output).expect("output should be utf8")
+    }
+
+    #[test]
+    fn marker_mode_ignores_a_body_close_written_in_script_data() {
+        // A reverse byte search for `</body>` picks this string literal, because the
+        // document has no structural close at all. Splicing a `<script>` payload there
+        // emits a `</script>` inside the publisher's script and corrupts the document —
+        // and, once stored, every warm reader of it. Only the parser can tell the
+        // difference, so the parser places the marker.
+        const MARKER: &str = "<!--ts-seam-slot-->";
+        let source =
+            r#"<html><head></head><script>const marker = "</body>";</script><p>a</p></html>"#;
+
+        let html = render_marker_mode(MARKER, source);
+
+        assert!(
+            html.contains(r#"const marker = "</body>";"#),
+            "should leave the publisher's script data byte for byte: {html}"
+        );
+        assert_eq!(
+            html.matches(MARKER).count(),
+            1,
+            "should emit exactly one transform-owned marker: {html}"
+        );
+        assert!(
+            html.ends_with(MARKER),
+            "a document with no structural body close takes the terminal marker: {html}"
+        );
+    }
+
+    #[test]
+    fn marker_mode_prefers_the_structural_body_close_over_trailing_comment_data() {
+        // A reverse byte search takes the *last* `</body>` sequence, which here lives in
+        // trailing comment data, so the marker landed after the document's real end.
+        const MARKER: &str = "<!--ts-seam-slot-->";
+        let source = "<html><body><p>a</p></body><!-- </body> --></html>";
+
+        let html = render_marker_mode(MARKER, source);
+
+        assert!(
+            html.contains(&format!("<p>a</p>{MARKER}</body>")),
+            "should place the marker at the structural body close: {html}"
+        );
+        assert!(
+            html.contains("<!-- </body> -->"),
+            "should leave the publisher's trailing comment untouched: {html}"
+        );
+        assert_eq!(
+            html.matches(MARKER).count(),
+            1,
+            "should emit exactly one transform-owned marker: {html}"
+        );
+    }
+
+    #[test]
+    fn a_nonce_bearing_meta_policy_is_observed() {
+        let observed = Arc::new(AtomicBool::new(false));
+        let mut processor =
+            create_html_processor(marker_mode_config("<!--m-->", Some(Arc::clone(&observed))));
+
+        processor
+            .process_chunk(
+                br#"<html><head><meta http-equiv="Content-Security-Policy" content="script-src 'nonce-abc123'"></head><body>a</body></html>"#,
+                true,
+            )
+            .expect("should process the document");
+
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "a policy delivered in markup is invisible to the response-header gate"
+        );
+    }
+
+    #[test]
+    fn a_nonce_attribute_is_observed() {
+        let observed = Arc::new(AtomicBool::new(false));
+        let mut processor =
+            create_html_processor(marker_mode_config("<!--m-->", Some(Arc::clone(&observed))));
+
+        processor
+            .process_chunk(
+                b"<html><head><script nonce=\"abc123\"></script></head><body>a</body></html>",
+                true,
+            )
+            .expect("should process the document");
+
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "a document written for a per-response nonce must not be shared"
+        );
+    }
+
+    #[test]
+    fn the_word_nonce_in_script_text_is_not_observed() {
+        // The reason this is structural rather than a byte scan over the output.
+        let observed = Arc::new(AtomicBool::new(false));
+        let mut processor =
+            create_html_processor(marker_mode_config("<!--m-->", Some(Arc::clone(&observed))));
+
+        processor
+            .process_chunk(
+                br#"<html><head><script>var nonce = "not-a-policy";</script><meta http-equiv="refresh" content="0"></head><body>a</body></html>"#,
+                true,
+            )
+            .expect("should process the document");
+
+        assert!(
+            !observed.load(Ordering::SeqCst),
+            "ordinary script text must not cost a cacheable page its shared template"
+        );
+    }
+
     #[test]
     fn bodyless_marker_mode_emits_an_owned_terminal_seam_even_after_source_bytes() {
-        const MARKER: &str = "<!--reserved-c2-seam-->";
+        const MARKER: &str = "<!--reserved-template-cache-seam-->";
         let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
             body_close: BodyCloseInjection::Marker(MARKER.to_string()),
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2048,11 +2223,11 @@ mod tests {
         assert_eq!(
             html.matches(MARKER).count(),
             2,
-            "one source occurrence plus one transform-owned seam must reach normalization"
+            "one source occurrence plus the transform-owned terminal seam must survive processing; repeated markers are rejected before template caching"
         );
         assert!(
             html.ends_with(MARKER),
-            "the transform-owned fallback must be unambiguously terminal"
+            "the transform-owned template-cache fallback must be unambiguously terminal"
         );
     }
 

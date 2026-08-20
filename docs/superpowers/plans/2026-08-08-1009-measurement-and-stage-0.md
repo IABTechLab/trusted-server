@@ -9,7 +9,7 @@ later work is compared against.
 > **This plan does not close #1009.** It contains no ESI arm and no client-fill arm, so
 > completing it cannot answer whether ESI separates cacheable content from per-user
 > state. It is a **supporting optimisation and the experimental control** for
-> [the ESI validation spike](./2026-08-10-1009-esi-validation-spike.md), which is where
+> [the ESI validation spike](../archive/2026-08-10-1009-esi-validation-spike.md), which is where
 > #1009 is actually decided. Scoped and framed this way after external review on
 > 2026-08-10.
 
@@ -22,7 +22,7 @@ Stages 1–2 in the spec and are explicitly out of scope.
 **Tech Stack:** Rust 2024 edition, `wasm32-wasip1`, Fastly Compute, `web_time::Instant`
 for wasm-safe timing, `log` for instrumentation, Viceroy for adapter tests.
 
-**Spec:** `docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md`
+**Spec:** `docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md`
 (§3 Steps A/B/C and §4 Stage 0). Read §4 and §5 before starting Task 5.
 
 **Before pushing, run both documentation gates:**
@@ -551,7 +551,7 @@ config flip rather than a second deploy — see Task 5. Replace the block at
 ```rust
 // Single source of truth for the request and the log line below. Operator-
 // controlled so the read-through cache can be re-enabled without a release;
-// see docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md §4.
+// see docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md §4.
 let cache_bypass = should_run_ad_stack && settings.publisher.bypass_origin_cache;
 if cache_bypass {
     platform_request = platform_request.with_cache_bypass();
@@ -796,7 +796,7 @@ cache poisoning, where minutes of exposure are worse than a slow rollout.
 
 **But a config push is not a full rollback.** It stops HTML navigations reading from
 cache; it evicts nothing already stored. See Step 4's rollback sequence — flip, then purge
-or roll a versioned namespace, then observe past the origin TTL. Until a C1 purge path
+or roll a versioned namespace, then observe past the origin TTL. Until a raw origin cache purge path
 exists, the tail is "wait out the origin TTL," and that must be an accepted, recorded
 risk before the flip.
 
@@ -918,9 +918,10 @@ expire. The origin's `max-age=60` bounds that, but does not remove it.
 Full rollback:
 
 1. Push `bypass_origin_cache = true`.
-2. Purge — **and note this is C1, not C2.** `InsertBuilder::surrogate_keys` belongs to
-   the Core Cache API and applies to the transformed-template cache the ESI spike builds.
-   It has no effect on the HTTP read-through cache that Stage 0 turns on. Purging C1
+2. Purge — **and note this is the raw origin cache, not the shared transformed-template cache.**
+   `InsertBuilder::surrogate_keys` belongs to the Core Cache API and applies to the
+   transformed-template cache the ESI spike builds. It has no effect on the HTTP read-through
+   cache that Stage 0 turns on. Purging the raw origin cache
    requires either surrogate keys the **origin** supplies on its responses, or the HTTP
    cache's own request/candidate surrogate-key surface. Confirm which is available before
    relying on it.

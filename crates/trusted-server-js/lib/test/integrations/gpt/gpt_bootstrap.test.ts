@@ -269,6 +269,57 @@ describe('gpt_bootstrap.js fallback', () => {
     expect(adInit).toHaveBeenCalledTimes(1);
   });
 
+  it('fallback scheduler accepts only the first schedule call', () => {
+    runBootstrap();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    ts.scheduleInitialAdInit!({ first: { hb_pb: '1.00' } });
+    ts.scheduleInitialAdInit!({ second: { hb_pb: '2.00' } });
+    expect(ts.bids).toEqual({ first: { hb_pb: '1.00' } });
+
+    window.dispatchEvent(new Event('load'));
+    flushFrame();
+    flushFrame();
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('fallback scheduler preserves head-injected slots when initialSlots is omitted', () => {
+    runBootstrap();
+    const ts = (window as TestWindow).tsjs!;
+    ts.adInit = vi.fn();
+    const headSlot = {
+      id: 'head_slot',
+      gam_unit_path: '/123/head',
+      div_id: 'div-head',
+      formats: [[300, 250]] as Array<[number, number]>,
+    };
+    ts.adSlots = [headSlot];
+
+    ts.scheduleInitialAdInit!({ head_slot: { hb_pb: '1.00' } });
+
+    expect(ts.adSlots).toEqual([headSlot]);
+  });
+
+  it('fallback scheduler replaces existing slots when initialSlots is explicitly empty', () => {
+    runBootstrap();
+    const ts = (window as TestWindow).tsjs!;
+    ts.adInit = vi.fn();
+    ts.adSlots = [
+      {
+        id: 'stale_slot',
+        gam_unit_path: '/123/stale',
+        div_id: 'div-stale',
+        formats: [[300, 250]],
+      },
+    ];
+
+    ts.scheduleInitialAdInit!({}, []);
+
+    expect(ts.adSlots).toEqual([]);
+  });
+
   it('fallback scheduler rides animation frames in a hidden document, holding adInit until first view', () => {
     // Mirrors the bundle scheduler's intended hidden-tab behavior: rAF is not
     // serviced while hidden, so a background-tab load holds the initial

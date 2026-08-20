@@ -325,7 +325,7 @@ pub struct CreativeOpportunitiesConfig {
     /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_cache_vary: Option<Vec<String>>,
-    /// Maximum time a reader-neutral transformed template may remain in C2.
+    /// Maximum time a reader-neutral transformed template may remain in the shared template cache.
     ///
     /// This is a safety ceiling, not freshness authorization. The origin must still
     /// provide positive shared freshness, and the stored lifetime is the smaller of
@@ -352,7 +352,7 @@ pub struct CreativeOpportunitiesConfig {
     /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_is_cookie_independent: Option<bool>,
-    /// Slot templates. An empty vec or `enabled = false` disables template delivery.
+    /// Slot templates. Empty vec = feature disabled (no auction fired, no globals injected).
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub slot: Vec<CreativeOpportunitySlot>,
 }
@@ -393,9 +393,6 @@ impl CreativeOpportunitiesConfig {
                 .unwrap_or(DEFAULT_TEMPLATE_CACHE_MAX_AGE_SECONDS),
         ))
     }
-}
-
-impl CreativeOpportunitiesConfig {
     /// Derives the `{section}` value for `path` under this config's section
     /// policy ([`section_root`](Self::section_root) and
     /// [`section_segment`](Self::section_segment)).
@@ -482,7 +479,7 @@ impl CreativeOpportunitiesConfig {
             })?;
             if names.iter().any(|name| name.eq_ignore_ascii_case("cookie")) {
                 return Err(
-                    "template_cache_vary must not include Cookie; C2 templates are reader-neutral"
+                    "template_cache_vary must not include Cookie; shared templates are reader-neutral"
                         .to_string(),
                 );
             }
@@ -2399,7 +2396,7 @@ mod tests {
         .expect("shape should deserialize before runtime validation");
         let err = cookie_key
             .validate_runtime()
-            .expect_err("per-cookie templates violate the reader-neutral C2 contract");
+            .expect_err("per-cookie templates violate the reader-neutral shared-template contract");
         assert!(err.contains("Cookie"), "unexpected error: {err}");
     }
 

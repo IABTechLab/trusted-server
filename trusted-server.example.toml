@@ -244,7 +244,7 @@ auction_timeout_ms = 500  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES_
 price_granularity = "dense"
 
 # Initial-page delivery mode. `inline` is the default and current production
-# behaviour. `esi` is an opt-in Fastly Core Cache experiment. C2 stores an inert
+# behaviour. `esi` is an opt-in Fastly Core Cache experiment. The shared template cache stores an inert
 # comment; a cold miss validates the repaired ESI parser in a private working
 # copy, while warm hits use the streaming byte seam. No fragment HTTP request or
 # publisher-controlled ESI is allowed.
@@ -255,16 +255,22 @@ price_granularity = "dense"
 # Request headers (other than Accept-Encoding, whose supported content coding TS
 # decodes to identity before storage) that the origin may name in Vary. Values
 # are keyed losslessly and the origin response is checked for drift before
-# storage. Never include Cookie: C2 templates must be reader-neutral.
-# template_cache_vary = ["rsc", "next-router-prefetch"]
+# storage. Every emitted Vary name must be covered or storage is refused. Never
+# include Cookie: shared templates must be reader-neutral.
+# template_cache_vary = [
+#   "rsc",
+#   "next-router-state-tree",
+#   "next-router-prefetch",
+#   "next-router-segment-prefetch",
+# ]
 
-# Safety ceiling for one reader-neutral C2 template, in seconds. The origin must
+# Safety ceiling for one reader-neutral shared template, in seconds. The origin must
 # still authorize shared freshness; TS uses the smaller of that remaining edge
 # freshness and this value. Defaults to 60. Valid range: 1 through 86400.
 # template_cache_max_age_seconds = 1200  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__TEMPLATE_CACHE_MAX_AGE_SECONDS
 
 # Unsafe unless independently verified at the publisher origin. The default
-# excludes every cookie-bearing request from C2. Set true only when origin HTML
+# excludes every cookie-bearing request from the template cache. Set true only when origin HTML
 # is byte-independent of Cookie; an origin Vary: Cookie is still refused.
 # origin_is_cookie_independent = false
 

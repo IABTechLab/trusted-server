@@ -1,4 +1,4 @@
-//! Fastly Core Cache backing for the shared transformed-template cache (C2).
+//! Fastly Core Cache backing for the shared transformed-template cache.
 //!
 //! Only the Fastly adapter implements this; every other adapter uses
 //! `UnavailableTemplateCache`, so the ESI assembly mode stays portable and only
@@ -20,17 +20,13 @@ use fastly::cache::core::{CacheKey, Found, Transaction};
 use std::io::Write as _;
 use std::time::Duration;
 use trusted_server_core::platform::{
-    PlatformTemplateCache, PlatformTemplateCacheReservation, TemplateCacheError, TemplateCacheKey,
+    PlatformTemplateCache, PlatformTemplateCacheReservation,
+    TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY, TemplateCacheError, TemplateCacheKey,
     TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation, TemplateEntry,
     TemplateMetadata,
 };
 
-/// Surrogate key attached to every stored template, so a single purge clears them
-/// all. This is the rollback lever: without it, backing out a bad template means
-/// waiting for the TTL.
-const PURGE_ALL_SURROGATE_KEY: &str = "ts-template";
-
-/// Fastly Core Cache implementation of the C2 template cache.
+/// Fastly Core Cache implementation of the shared template cache.
 #[derive(Default)]
 pub struct FastlyTemplateCache;
 
@@ -51,9 +47,29 @@ fn backend_error(message: impl Into<String>) -> TemplateCacheError {
     }
 }
 
+fn cancel_invalid_reservation<E: core::fmt::Debug>(
+    validation_error: TemplateCacheError,
+    cancel: impl FnOnce() -> Result<(), E>,
+) -> Result<(), TemplateCacheError> {
+    match cancel() {
+        Ok(()) => Err(validation_error),
+        Err(error) => Err(backend_error(format!(
+            "{validation_error}; cancelling invalid cache reservation also failed: {error:?}"
+        ))),
+    }
+}
+
 enum ReadFoundError {
     Invalid(TemplateCacheMiss),
     Backend(TemplateCacheError),
+}
+
+fn read_cache_body(mut reader: impl std::io::Read) -> Result<Vec<u8>, ReadFoundError> {
+    let mut body = Vec::new();
+    reader
+        .read_to_end(&mut body)
+        .map_err(|_| ReadFoundError::Invalid(TemplateCacheMiss::Truncated))?;
+    Ok(body)
 }
 
 fn read_found(found: &Found, key: &TemplateCacheKey) -> Result<TemplateEntry, ReadFoundError> {
@@ -74,14 +90,12 @@ fn read_found(found: &Found, key: &TemplateCacheKey) -> Result<TemplateEntry, Re
         return Err(ReadFoundError::Invalid(TemplateCacheMiss::Truncated));
     }
 
-    let body = found
-        .to_stream()
-        .map_err(|error| {
-            ReadFoundError::Backend(backend_error(format!(
-                "opening cached template body failed: {error:?}"
-            )))
-        })?
-        .into_bytes();
+    let stream = found.to_stream().map_err(|error| {
+        ReadFoundError::Backend(backend_error(format!(
+            "opening cached template body failed: {error:?}"
+        )))
+    })?;
+    let body = read_cache_body(stream)?;
     if body.len() as u64 != metadata.body_len {
         return Err(ReadFoundError::Invalid(TemplateCacheMiss::Truncated));
     }
@@ -101,19 +115,32 @@ impl PlatformTemplateCacheReservation for FastlyTemplateReservation {
         max_age: Duration,
     ) -> Result<(), TemplateCacheError> {
         if metadata.body_len != body.len() as u64 {
-            return Err(backend_error(format!(
+            let validation_error = backend_error(format!(
                 "metadata body_len {} does not match the {} bytes supplied",
                 metadata.body_len,
                 body.len()
-            )));
+            ));
+            return cancel_invalid_reservation(validation_error, || {
+                self.transaction.cancel_insert_or_update()
+            });
         }
+        let encoded_metadata = match metadata.encode() {
+            Ok(encoded_metadata) => encoded_metadata,
+            Err(error) => {
+                let validation_error =
+                    backend_error(format!("encoding template metadata failed: {error}"));
+                return cancel_invalid_reservation(validation_error, || {
+                    self.transaction.cancel_insert_or_update()
+                });
+            }
+        };
 
         let mut writer = self
             .transaction
             .insert(max_age)
             .surrogate_keys(self.surrogate_keys.iter().map(String::as_str))
             .known_length(body.len() as u64)
-            .user_metadata(metadata.encode().into())
+            .user_metadata(encoded_metadata.into())
             .execute()
             .map_err(|e| backend_error(format!("cache insert failed: {e:?}")))?;
         writer
@@ -177,7 +204,7 @@ impl PlatformTemplateCache for FastlyTemplateCache {
             ReadFoundError::Backend(error) => {
                 // This legacy method cannot expose a backend error. Production uses
                 // `lookup_or_reserve`, which preserves it for bounded diagnostics.
-                log::warn!("c2_template_cache legacy read failed: {error}");
+                log::warn!("template_cache legacy read failed: {error}");
                 TemplateCacheMiss::NotFound
             }
         })
@@ -198,6 +225,9 @@ impl PlatformTemplateCache for FastlyTemplateCache {
                 body.len()
             )));
         }
+        let encoded_metadata = metadata.encode().map_err(|error| {
+            backend_error(format!("encoding template metadata failed: {error}"))
+        })?;
 
         let cache_key = CacheKey::from(key.to_cache_key().into_bytes());
 
@@ -226,13 +256,15 @@ impl PlatformTemplateCache for FastlyTemplateCache {
         let mut writer = tx
             .insert(max_age)
             .surrogate_keys(surrogate_keys.iter().map(String::as_str))
-            .user_metadata(metadata.encode().into())
+            .known_length(body.len() as u64)
+            .user_metadata(encoded_metadata.into())
             .execute()
             .map_err(|e| backend_error(format!("cache insert failed: {e:?}")))?;
 
         if let Err(e) = writer.write_all(&body) {
-            // Deliberately not calling `finish()`. An unfinished entry has no known
-            // length, and even if it is observable, `get`'s length check rejects it.
+            // Deliberately do not call `finish()`. If partial content becomes
+            // observable, fallible reads and the post-read check against the declared
+            // body length reject it.
             return Err(backend_error(format!("writing template body failed: {e}")));
         }
 
@@ -251,7 +283,7 @@ impl PlatformTemplateCache for FastlyTemplateCache {
     }
 
     async fn purge_all(&self) -> Result<(), TemplateCacheError> {
-        fastly::http::purge::purge_surrogate_key(PURGE_ALL_SURROGATE_KEY)
+        fastly::http::purge::purge_surrogate_key(TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY)
             .map_err(|e| backend_error(format!("purging templates failed: {e:?}")))
     }
 }
@@ -259,8 +291,24 @@ impl PlatformTemplateCache for FastlyTemplateCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     use trusted_server_core::creative_opportunities::AssemblyMode;
     use trusted_server_core::platform::TEMPLATE_SCHEMA_VERSION;
+
+    struct FailingReader {
+        returned_prefix: bool,
+    }
+
+    impl io::Read for FailingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.returned_prefix {
+                return Err(io::Error::other("abandoned cache stream"));
+            }
+            self.returned_prefix = true;
+            buffer[..3].copy_from_slice(b"abc");
+            Ok(3)
+        }
+    }
 
     /// Distinct per test, so tests sharing the process cache cannot collide.
     fn key(url: &str) -> TemplateCacheKey {
@@ -300,6 +348,19 @@ mod tests {
     }
 
     #[test]
+    fn cache_body_read_error_is_a_truncated_miss() {
+        let error = read_cache_body(FailingReader {
+            returned_prefix: false,
+        })
+        .expect_err("should reject an abandoned cache stream");
+
+        assert!(
+            matches!(error, ReadFoundError::Invalid(TemplateCacheMiss::Truncated)),
+            "should classify a cache stream read failure as truncated"
+        );
+    }
+
+    #[test]
     fn a_stored_template_reads_back_intact() {
         let cache = cache();
         let key = key("https://example.com/roundtrip");
@@ -333,6 +394,76 @@ mod tests {
             TemplateCacheLookup::Hit(entry) => assert_eq!(entry.body, body),
             _ => panic!("the next transactional lookup must see the inserted template"),
         }
+    }
+
+    #[test]
+    fn length_mismatch_cancels_the_reservation_obligation() {
+        let cache = cache();
+        let key = key("https://example.com/reservation-length-mismatch");
+        let body = b"template".to_vec();
+        let mut metadata = metadata_for(&body);
+        metadata.body_len += 1;
+        let reservation = match run(cache.lookup_or_reserve(&key)).expect("lookup should work") {
+            TemplateCacheLookup::Reserved(reservation) => reservation,
+            _ => panic!("a cold lookup should reserve the key"),
+        };
+
+        let error = reservation
+            .insert(&metadata, body, Duration::from_secs(60))
+            .expect_err("length mismatch should fail insertion");
+
+        assert!(
+            error.to_string().contains("does not match"),
+            "should preserve the original validation reason: {error}"
+        );
+        match run(cache.lookup_or_reserve(&key)).expect("second lookup should work") {
+            TemplateCacheLookup::Reserved(reservation) => reservation
+                .cancel()
+                .expect("should cancel the proof reservation"),
+            _ => panic!("the invalid insert should release the reservation obligation"),
+        }
+    }
+
+    #[test]
+    fn metadata_encoding_failure_cancels_the_reservation_obligation() {
+        let cache = cache();
+        let key = key("https://example.com/reservation-metadata-encoding");
+        let body = b"template".to_vec();
+        let mut metadata = metadata_for(&body);
+        metadata.content_type = "text/html\ninjected".to_string();
+        let reservation = match run(cache.lookup_or_reserve(&key)).expect("lookup should work") {
+            TemplateCacheLookup::Reserved(reservation) => reservation,
+            _ => panic!("a cold lookup should reserve the key"),
+        };
+
+        let error = reservation
+            .insert(&metadata, body, Duration::from_secs(60))
+            .expect_err("invalid metadata should fail insertion");
+
+        assert!(
+            error
+                .to_string()
+                .contains("encoding template metadata failed"),
+            "should preserve the original validation reason: {error}"
+        );
+        match run(cache.lookup_or_reserve(&key)).expect("second lookup should work") {
+            TemplateCacheLookup::Reserved(reservation) => reservation
+                .cancel()
+                .expect("should cancel the proof reservation"),
+            _ => panic!("the invalid insert should release the reservation obligation"),
+        }
+    }
+
+    #[test]
+    fn invalid_reservation_cancellation_preserves_both_errors() {
+        let error = cancel_invalid_reservation(backend_error("metadata validation failed"), || {
+            Err("simulated cancellation failure")
+        })
+        .expect_err("invalid reservation should return an error");
+
+        let message = error.to_string();
+        assert!(message.contains("metadata validation failed"));
+        assert!(message.contains("simulated cancellation failure"));
     }
 
     #[test]
@@ -400,7 +531,12 @@ mod tests {
 
         let mut writer = fastly::cache::core::insert(cache_key, Duration::from_secs(0))
             .stale_while_revalidate(Duration::from_secs(60))
-            .user_metadata(metadata.encode().into())
+            .user_metadata(
+                metadata
+                    .encode()
+                    .expect("valid metadata should encode")
+                    .into(),
+            )
             .execute()
             .expect("should begin insert");
         writer.write_all(&body).expect("should write body");
