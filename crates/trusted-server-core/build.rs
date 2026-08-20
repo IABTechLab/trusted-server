@@ -24,12 +24,13 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let config_store = manifest
-        .manifest()
-        .stores
-        .config
-        .as_ref()
-        .expect("should declare [stores.config] in edgezero.toml");
+    let Some(config_store) = manifest.manifest().stores.config.as_ref() else {
+        println!(
+            "cargo::error=should declare [stores.config] in EdgeZero manifest at {}",
+            manifest_path.display()
+        );
+        std::process::exit(1);
+    };
     let default_store_id = config_store.default_id();
     println!("cargo:rustc-env=TRUSTED_SERVER_DEFAULT_CONFIG_STORE_ID={default_store_id}");
 }
