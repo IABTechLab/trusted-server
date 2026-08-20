@@ -477,7 +477,10 @@ pub fn tsjs_bootstrap_fixture_fragment_v1(
         .map(|product_id| {
             let config = match product_id {
                 "didomi" => serde_json::json!({ "proxyPath": "/integrations/didomi/" }),
-                "gpt" => serde_json::json!({ "gamAttributionEnabled": false }),
+                "gpt" => serde_json::json!({
+                    "gamAttributionEnabled": false,
+                    "pageBidsEnabled": false,
+                }),
                 "prebid" => serde_json::json!({
                     "accountId": "fixture",
                     "timeout": 1_000,
@@ -985,7 +988,13 @@ mod tests {
             ("datadome", serde_json::json!({})),
             ("didomi", serde_json::json!({ "proxyPath": "/consent/" })),
             ("google_tag_manager", serde_json::json!({})),
-            ("gpt", serde_json::json!({ "gamAttributionEnabled": true })),
+            (
+                "gpt",
+                serde_json::json!({
+                    "gamAttributionEnabled": true,
+                    "pageBidsEnabled": true,
+                }),
+            ),
             ("lockr", serde_json::json!({})),
             ("osano", serde_json::json!({})),
             ("permutive", serde_json::json!({})),
@@ -997,7 +1006,7 @@ mod tests {
 
         assert_eq!(
             serde_json::to_string(&configs).expect("carrier should serialize"),
-            r#"{"version":1,"entries":[{"id":"aps","config":{}},{"id":"datadome","config":{}},{"id":"didomi","config":{"proxyPath":"/consent/"}},{"id":"google_tag_manager","config":{}},{"id":"gpt","config":{"gamAttributionEnabled":true}},{"id":"lockr","config":{}},{"id":"osano","config":{}},{"id":"permutive","config":{}},{"id":"prebid","config":{"accountId":"publisher"}},{"id":"sourcepoint","config":{"rewriteSdk":true}},{"id":"testlight","config":{}}]}"#,
+            r#"{"version":1,"entries":[{"id":"aps","config":{}},{"id":"datadome","config":{}},{"id":"didomi","config":{"proxyPath":"/consent/"}},{"id":"google_tag_manager","config":{}},{"id":"gpt","config":{"gamAttributionEnabled":true,"pageBidsEnabled":true}},{"id":"lockr","config":{}},{"id":"osano","config":{}},{"id":"permutive","config":{}},{"id":"prebid","config":{"accountId":"publisher"}},{"id":"sourcepoint","config":{"rewriteSdk":true}},{"id":"testlight","config":{}}]}"#,
         );
     }
 
@@ -1246,7 +1255,10 @@ mod tests {
     fn first_display_outline_binds_the_canonical_integration_config_digest() {
         let configs = IntegrationConfigsV1::new(vec![(
             "gpt",
-            serde_json::json!({ "gamAttributionEnabled": false }),
+            serde_json::json!({
+                "gamAttributionEnabled": false,
+                "pageBidsEnabled": false,
+            }),
         )])
         .expect("GPT browser config should be admitted");
         let canonical = serde_json::to_string(&configs).expect("carrier should serialize");
@@ -1321,7 +1333,10 @@ mod tests {
                 ],
                 integration_configs: &IntegrationConfigsV1::new(vec![(
                     "gpt",
-                    serde_json::json!({ "gamAttributionEnabled": false }),
+                    serde_json::json!({
+                        "gamAttributionEnabled": false,
+                        "pageBidsEnabled": false,
+                    }),
                 )])
                 .expect("GPT browser config should be admitted"),
                 auction_projection_json: VALID_BROWSER_AUCTION_PROJECTION_JSON,

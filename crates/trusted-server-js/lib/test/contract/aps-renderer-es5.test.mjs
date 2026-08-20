@@ -16,7 +16,7 @@ const validatorUrl = new URL(
 const validatorSource = await readFile(validatorUrl, 'utf8');
 const bootstrapDocument = await readFile(
   new URL(
-    '../../../../trusted-server-core/src/integrations/generated/aps_renderer_bootstrap_v1.html',
+    '../../../../trusted-server-core/src/integrations/generated/aps_renderer_bootstrap_v2.html',
     import.meta.url
   ),
   'utf8'
@@ -168,7 +168,10 @@ function bootstrapScript() {
   return match[1];
 }
 
-function executeBootstrap(hash = '#b1_AAECAwQFBgcICQoLDA0ODw') {
+function executeBootstrap(
+  hash = '#b1_AAECAwQFBgcICQoLDA0ODw',
+  referrer = 'https://publisher.example/article'
+) {
   const parent = {
     messages: [],
     postMessage(message, origin) {
@@ -180,11 +183,11 @@ function executeBootstrap(hash = '#b1_AAECAwQFBgcICQoLDA0ODw') {
   const context = vm.createContext({
     URL,
     TextEncoder,
-    document: { referrer: 'https://publisher.example/article' },
+    document: { referrer },
     history: { replaceState() {} },
     location: {
       hash,
-      pathname: '/integrations/aps/renderer/v1',
+      pathname: '/integrations/aps/renderer/v2',
       search: '',
       replace(value) {
         replacements.push(value);
@@ -201,7 +204,7 @@ function executeBootstrap(hash = '#b1_AAECAwQFBgcICQoLDA0ODw') {
     },
   });
   vm.runInContext(bootstrapScript(), context, {
-    filename: 'aps_renderer_bootstrap_v1.html',
+    filename: 'aps_renderer_bootstrap_v2.html',
   });
   return {
     parent,
@@ -212,96 +215,94 @@ function executeBootstrap(hash = '#b1_AAECAwQFBgcICQoLDA0ODw') {
   };
 }
 
-test('the generated renderer response is an ES5 descriptor-free bootstrap', () => {
+test('the generated renderer response is an ES5 descriptor-isolated materializer', () => {
   const source = bootstrapScript();
   assert.doesNotMatch(source, /=>|\b(?:const|let|class)\b|\?\.|\?\?/);
-  assert.doesNotMatch(
-    source,
-    /aaxResponse|accountId|bidId|creativeId|creativeUrl|runner|createElement|iframe|fetch|XMLHttpRequest/i
-  );
+  assert.doesNotMatch(source, /example-account-id|fictional-selected-bid-id|fictional-creative-id/u);
+  assert.doesNotMatch(source, /fetch|XMLHttpRequest/u);
   assert.match(source, /TS APS Bootstrap Ready/);
-  assert.match(source, /TS APS Bootstrap Navigate/);
+  assert.match(source, /TS APS Bootstrap Configure/);
+  assert.match(source, /classifyApsRendererV1/u);
   assert.match(source, /data:text\/html;charset=utf-8,/);
 });
 
-test('the generated bootstrap accepts one exact parent navigation instruction', () => {
-  const nonce = 'b1_AAECAwQFBgcICQoLDA0ODw';
-  const harness = executeBootstrap(`#${nonce}`);
+test('the generated bootstrap materializes the opaque documents after first-action configuration', () => {
+  const bootstrapNonce = 'b1_AAECAwQFBgcICQoLDA0ODw';
+  const rendererNonce = 'n1_AAECAwQFBgcICQoLDA0ODw';
+  const harness = executeBootstrap(`#${bootstrapNonce}`);
+  const configuration = JSON.stringify({
+    message: 'TS APS Bootstrap Configure',
+    version: 2,
+    bootstrapNonce,
+    rendererNonce,
+    creativeOrigin: 'https://creative.example',
+    tagType: 'iframe',
+  });
+
+  harness.dispatch({
+    source: harness.parent,
+    origin: 'https://publisher.example',
+    data: configuration,
+    ports: [],
+  });
+
+  assert.equal(harness.replacements.length, 1);
+  const containerUrl = harness.replacements[0];
+  assert.match(containerUrl, /^data:text\/html;charset=utf-8,/u);
+  assert.match(containerUrl, new RegExp(`#${bootstrapNonce}$`, 'u'));
+  const outerDocument = decodeURIComponent(
+    containerUrl.slice('data:text/html;charset=utf-8,'.length, -(`#${bootstrapNonce}`).length)
+  );
+  assert.match(outerDocument, new RegExp(rendererNonce, 'u'));
+  assert.match(outerDocument, /TS APS Container Ready/u);
+  assert.doesNotMatch(
+    outerDocument,
+    /example-account-id|fictional-selected-bid-id|fictional-creative-id/u
+  );
+});
+
+test('the generated bootstrap authenticates the parent event without referrer dependence', () => {
+  const bootstrapNonce = 'b1_AAECAwQFBgcICQoLDA0ODw';
+  const harness = executeBootstrap(`#${bootstrapNonce}`, '');
   assert.deepEqual(harness.parent.messages, [
     {
       message: JSON.stringify({
         message: 'TS APS Bootstrap Ready',
         version: 1,
-        bootstrapNonce: nonce,
+        bootstrapNonce,
       }),
-      origin: 'https://publisher.example',
+      origin: '*',
     },
   ]);
-
-  const containerUrl = `data:text/html;charset=utf-8,%3C!doctype%20html%3E#${nonce}`;
-  const navigation = JSON.stringify({
-    message: 'TS APS Bootstrap Navigate',
-    version: 1,
-    bootstrapNonce: nonce,
-    containerUrl,
-  });
   harness.dispatch({
     source: harness.parent,
     origin: 'https://publisher.example',
-    data: navigation,
+    data: JSON.stringify({
+      message: 'TS APS Bootstrap Configure',
+      version: 2,
+      bootstrapNonce,
+      rendererNonce: 'n1_AAECAwQFBgcICQoLDA0ODw',
+      creativeOrigin: 'https://creative.example',
+      tagType: 'iframe',
+    }),
     ports: [],
   });
-  harness.dispatch({
-    source: harness.parent,
-    origin: 'https://publisher.example',
-    data: navigation,
-    ports: [],
-  });
-  assert.deepEqual(harness.replacements, [containerUrl]);
+  assert.equal(harness.replacements.length, 1);
 });
 
-test('the generated bootstrap accepts the exact container URL boundary', () => {
-  const nonce = `b1_${'a'.repeat(22)}`;
-  const prefix = 'data:text/html;charset=utf-8,';
-  const suffix = `#${nonce}`;
-  const containerUrl = `${prefix}${'a'.repeat(196_663 - prefix.length - suffix.length)}${suffix}`;
-  const navigation = JSON.stringify({
-    message: 'TS APS Bootstrap Navigate',
-    version: 1,
-    bootstrapNonce: nonce,
-    containerUrl,
-  });
-  assert.equal(Buffer.byteLength(containerUrl), 196_663);
-  assert.ok(Buffer.byteLength(navigation) <= 196_800);
-  const harness = executeBootstrap(`#${nonce}`);
-
-  harness.dispatch({
-    source: harness.parent,
-    origin: 'https://publisher.example',
-    data: navigation,
-    ports: [],
-  });
-
-  assert.deepEqual(harness.replacements, [containerUrl]);
-});
-
-test('the generated bootstrap rejects malformed, misbound, and oversized navigation', () => {
+test('the generated bootstrap rejects malformed, misbound, and oversized configuration', () => {
   const nonce = 'b1_AAECAwQFBgcICQoLDA0ODw';
-  const containerUrl = `data:text/html;charset=utf-8,%3C!doctype%20html%3E#${nonce}`;
-  const containerPrefix = 'data:text/html;charset=utf-8,';
-  const containerSuffix = `#${nonce}`;
-  const overlongContainerUrl = `${containerPrefix}${'a'.repeat(
-    196_664 - containerPrefix.length - containerSuffix.length
-  )}${containerSuffix}`;
   const valid = {
-    message: 'TS APS Bootstrap Navigate',
-    version: 1,
+    message: 'TS APS Bootstrap Configure',
+    version: 2,
     bootstrapNonce: nonce,
-    containerUrl,
+    rendererNonce: 'n1_AAECAwQFBgcICQoLDA0ODw',
+    creativeOrigin: 'https://creative.example',
+    tagType: 'iframe',
   };
   const cases = [
     { source: {}, origin: 'https://publisher.example', data: JSON.stringify(valid), ports: [] },
-    { source: null, origin: 'https://attacker.example', data: JSON.stringify(valid), ports: [] },
+    { source: null, origin: 'null', data: JSON.stringify(valid), ports: [] },
     {
       source: null,
       origin: 'https://publisher.example',
@@ -317,7 +318,7 @@ test('the generated bootstrap rejects malformed, misbound, and oversized navigat
     {
       source: null,
       origin: 'https://publisher.example',
-      data: JSON.stringify(valid).replace('"version":1', '"version":1,"version":1'),
+      data: JSON.stringify(valid).replace('"version":2', '"version":2,"version":2'),
       ports: [],
     },
     {
@@ -331,14 +332,14 @@ test('the generated bootstrap rejects malformed, misbound, and oversized navigat
       origin: 'https://publisher.example',
       data: JSON.stringify({
         ...valid,
-        containerUrl: overlongContainerUrl,
+        creativeOrigin: 'https://publisher.example',
       }),
       ports: [],
     },
     {
       source: null,
       origin: 'https://publisher.example',
-      data: 'x'.repeat(196_801),
+      data: 'x'.repeat(16_385),
       ports: [],
     },
   ];

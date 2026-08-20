@@ -72,6 +72,8 @@ export interface ApsDataDocumentsV1 {
   readonly innerUrl: string;
 }
 
+// Build-time authority for the renderer-v2 response generator and its contract tests.
+// Production TSJS artifacts must not import this module.
 const INNER_TEMPLATE = `<!doctype html>
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="__TS_INNER_CSP__">

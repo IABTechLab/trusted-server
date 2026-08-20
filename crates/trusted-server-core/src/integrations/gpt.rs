@@ -394,9 +394,14 @@ pub fn register(
     #[serde(rename_all = "camelCase")]
     struct GptBrowserConfigV1 {
         gam_attribution_enabled: bool,
+        page_bids_enabled: bool,
     }
     let browser_config = GptBrowserConfigV1 {
         gam_attribution_enabled: integration.config.gam_attribution_enabled,
+        page_bids_enabled: settings
+            .creative_opportunities
+            .as_ref()
+            .is_some_and(|config| config.enabled),
     };
 
     Ok(Some(
@@ -572,6 +577,36 @@ mod tests {
 
         assert!(!disabled.gam_attribution_enabled);
         assert!(enabled.gam_attribution_enabled);
+    }
+
+    #[test]
+    fn browser_config_projects_creative_opportunity_delivery_state() {
+        for enabled in [false, true] {
+            let mut settings = create_test_settings();
+            settings
+                .integrations
+                .insert_config("gpt", &serde_json::json!({ "enabled": true }))
+                .expect("should enable GPT");
+            settings.creative_opportunities = Some(
+                toml::from_str(&format!(
+                    "enabled = {enabled}\ngam_network_id = \"12345\"\n"
+                ))
+                .expect("should build creative opportunity config"),
+            );
+
+            let registration = register(&settings)
+                .expect("GPT registration should succeed")
+                .expect("GPT should be enabled");
+
+            assert_eq!(
+                registration.browser_config_v1,
+                Some(serde_json::json!({
+                    "gamAttributionEnabled": false,
+                    "pageBidsEnabled": enabled,
+                })),
+                "GPT browser config must carry the exact publisher delivery switch"
+            );
+        }
     }
 
     // -- URL detection --

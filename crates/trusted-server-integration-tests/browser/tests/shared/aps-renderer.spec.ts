@@ -5,10 +5,11 @@ import { runtimeUrl } from "../../helpers/state.js";
 
 const IFRAME_CREATIVE_URL = "https://creative.example/iframe";
 const APS_TEST_ORIGIN = "https://aps-renderer.test";
-const APS_TEST_RENDERER_URL = `${APS_TEST_ORIGIN}/integrations/aps/renderer/v1`;
+const APS_TEST_RENDERER_URL = `${APS_TEST_ORIGIN}/integrations/aps/renderer/v2`;
 const APS_TEST_RUNNER_URL = `${APS_TEST_ORIGIN}/integrations/aps/runner.js`;
 const SANDBOX =
   "allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation";
+const PERMANENT_SANDBOX = `${SANDBOX} allow-same-origin`;
 const FICTIONAL_APS_RUNNER = readFileSync(
   resolve(__dirname, "../../fixtures/fictional-aps-runner.js"),
   "utf8",
@@ -48,13 +49,13 @@ function descriptor() {
   };
 }
 
-test.describe("APS renderer v1 protocol", () => {
+test.describe("APS renderer v2 protocol", () => {
   test("leaves every removed or unknown APS route unserved", async ({
     page,
   }) => {
     for (const path of [
       "/integrations/aps/renderer",
-      "/integrations/aps/renderer/v2",
+      "/integrations/aps/renderer/v1",
       "/integrations/aps/runner/v1.js",
     ]) {
       const response = await page.request.get(runtimeUrl(path));
@@ -66,7 +67,7 @@ test.describe("APS renderer v1 protocol", () => {
     page,
   }) => {
     const rendererResponse = await page.request.get(
-      runtimeUrl("/integrations/aps/renderer/v1"),
+      runtimeUrl("/integrations/aps/renderer/v2"),
     );
     expect(rendererResponse.status()).toBe(200);
     expect(rendererResponse.headers()["content-type"]).toBe(
@@ -82,14 +83,13 @@ test.describe("APS renderer v1 protocol", () => {
     expect(rendererResponse.headers()["x-frame-options"]).toBeUndefined();
     const csp = rendererResponse.headers()["content-security-policy"];
     expect(csp).toBe(
-      "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' 'self' https:; connect-src https:; frame-src https: data: blob:; img-src https: data: blob:; media-src https: data: blob:; style-src 'unsafe-inline' https:; font-src https: data:; worker-src https: blob:; form-action https:;",
+      "default-src 'none'; sandbox allow-scripts; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'self'; form-action 'none';",
     );
     const rendererDocument = await rendererResponse.text();
 
-    // WebKit correctly treats `self` inside the sandbox as the iframe's opaque
-    // origin. Fulfil the exact served document at an HTTPS test origin so all
-    // engines exercise the production `https:` runner allowance; no CSP or
-    // sandbox relaxation is needed for the local HTTP transport.
+    // Fulfil the exact served document and its parent at one HTTPS test origin so
+    // frame-ancestors 'self', parent-origin authentication, and the live runner
+    // proxy URL all exercise the production shape over the local test transport.
     await page.route(APS_TEST_RENDERER_URL, (route) =>
       route.fulfill({
         status: 200,
@@ -118,51 +118,74 @@ test.describe("APS renderer v1 protocol", () => {
         body: FICTIONAL_APS_RUNNER,
       });
     });
-    await page.route(runtimeUrl("/aps-v1-protocol-test"), (route) =>
+    await page.route(`${APS_TEST_ORIGIN}/aps-v2-protocol-test`, (route) =>
       route.fulfill({
         status: 200,
         contentType: "text/html",
         headers: {
           "content-security-policy":
-            "default-src 'none'; script-src 'unsafe-inline'; frame-src https:",
+            "default-src 'none'; script-src 'unsafe-inline'; frame-src 'self' data: https://creative.example",
         },
         body: `<!doctype html><meta charset="utf-8"><div id="slots"></div><script>
-window.apsV1Records = Object.create(null);
-window.startApsV1 = function(options) {
+window.apsV2Records = Object.create(null);
+window.startApsV2 = function(options) {
   var slot = document.createElement('div');
   slot.id = options.slotId;
   slot.innerHTML = '<span class="existing">existing publisher content</span>';
   document.getElementById('slots').appendChild(slot);
   var frame = document.createElement('iframe');
   frame.setAttribute('sandbox', ${JSON.stringify(SANDBOX)});
-  frame.src = ${JSON.stringify(APS_TEST_RENDERER_URL)} + '#tsaps=' + options.nonce;
+  frame.src = ${JSON.stringify(APS_TEST_RENDERER_URL)} + '#' + options.bootstrapNonce;
   frame.style.display = 'none';
-  var channel = new MessageChannel();
-  var record = {messages: [], frame: frame, channel: channel};
-  window.apsV1Records[options.slotId] = record;
-  channel.port1.onmessage = function(event) {
-    record.messages.push(event.data);
-    if (event.data && event.data.message === 'TS APS Render Completed') {
-      var existing = slot.querySelector('.existing');
-      if (existing) existing.remove();
-      frame.style.display = '';
+  var record = {messages: [], frame: frame, port: null};
+  window.apsV2Records[options.slotId] = record;
+  function receive(event) {
+    if (event.source !== frame.contentWindow || event.origin !== 'null' ||
+        typeof event.data !== 'string') return;
+    var value;
+    try { value = JSON.parse(event.data); } catch (_error) { return; }
+    if (value.message === 'TS APS Bootstrap Ready' && value.version === 1 &&
+        value.bootstrapNonce === options.bootstrapNonce && event.ports.length === 0) {
+      frame.setAttribute('sandbox', ${JSON.stringify(PERMANENT_SANDBOX)});
+      var creativeOrigin = new URL(options.renderer.creativeUrl).origin;
+      frame.contentWindow.postMessage(JSON.stringify({
+        message: 'TS APS Bootstrap Configure',
+        version: 2,
+        bootstrapNonce: options.bootstrapNonce,
+        rendererNonce: options.rendererNonce,
+        creativeOrigin: creativeOrigin,
+        tagType: options.renderer.tagType
+      }), '*', []);
+      return;
     }
-  };
-  channel.port1.start();
-  frame.onload = function() {
-    frame.contentWindow.postMessage({
+    if (value.message !== 'TS APS Container Ready' || value.version !== 1 ||
+        value.bootstrapNonce !== options.bootstrapNonce ||
+        value.rendererNonce !== options.rendererNonce || event.ports.length !== 1) return;
+    window.removeEventListener('message', receive, true);
+    record.port = event.ports[0];
+    record.port.onmessage = function(portEvent) {
+      record.messages.push(portEvent.data);
+      if (portEvent.data && portEvent.data.message === 'TS APS Render Completed') {
+        var existing = slot.querySelector('.existing');
+        if (existing) existing.remove();
+        frame.style.display = '';
+      }
+    };
+    record.port.start();
+    record.port.postMessage({
       version: 1,
-      nonce: options.messageNonce || options.nonce,
+      nonce: options.rendererNonce,
       publisherOrigin: location.origin,
       renderer: options.renderer
-    }, '*', [channel.port2]);
-  };
+    });
+  }
+  window.addEventListener('message', receive, true);
   slot.appendChild(frame);
 };
 </script>`,
       }),
     );
-    await page.goto(runtimeUrl("/aps-v1-protocol-test"));
+    await page.goto(`${APS_TEST_ORIGIN}/aps-v2-protocol-test`);
 
     const makeDescriptor = (bidId: string) => {
       const value = descriptor();
@@ -182,37 +205,39 @@ window.startApsV1 = function(options) {
       bidId: string,
       rendererOverrides: Record<string, unknown> = {},
     ) => {
-      const nonce = `n1_${slotId.padEnd(22, "x").slice(0, 22)}`;
+      const bootstrapNonce = `b1_${slotId.padEnd(22, "b").slice(0, 22)}`;
+      const rendererNonce = `n1_${slotId.padEnd(22, "n").slice(0, 22)}`;
       await page.evaluate(
-        ({ slotId, nonce, renderer }) => {
+        ({ slotId, bootstrapNonce, rendererNonce, renderer }) => {
           (
             window as unknown as {
-              startApsV1(options: Record<string, unknown>): void;
+              startApsV2(options: Record<string, unknown>): void;
             }
-          ).startApsV1({ slotId, nonce, renderer });
+          ).startApsV2({ slotId, bootstrapNonce, rendererNonce, renderer });
         },
         {
           slotId,
-          nonce,
+          bootstrapNonce,
+          rendererNonce,
           renderer: {
             ...makeDescriptor(bidId),
             ...rendererOverrides,
           },
         },
       );
-      return nonce;
+      return rendererNonce;
     };
     const messages = (slotId: string) =>
       page.evaluate(
         (id) =>
           (
             window as unknown as {
-              apsV1Records: Record<
+              apsV2Records: Record<
                 string,
                 { messages: Array<Record<string, unknown>> }
               >;
             }
-          ).apsV1Records[id]?.messages ?? [],
+          ).apsV2Records[id]?.messages ?? [],
         slotId,
       );
 

@@ -460,7 +460,7 @@ interface ApsMessagingValidationRegistration {
   readonly validateApsRenderer: (candidate: unknown) => boolean;
 }
 
-const APS_RENDERER_PATH = '/integrations/aps/renderer/v1';
+const APS_RENDERER_PATH = '/integrations/aps/renderer/v2';
 
 function exactRuntimeCapability(
   interfaces: Readonly<Record<string, unknown>>

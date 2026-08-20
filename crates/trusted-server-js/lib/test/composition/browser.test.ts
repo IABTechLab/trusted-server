@@ -1950,7 +1950,7 @@ describe('browser composition', () => {
   it('injects GPT and Prebid module boundaries with only server-frozen configuration', async () => {
     const releaseId = 'a'.repeat(64);
     const target = {};
-    const gptConfig = Object.freeze({ gamAttributionEnabled: false });
+    const gptConfig = Object.freeze({ gamAttributionEnabled: false, pageBidsEnabled: true });
     const prebidConfig = Object.freeze({
       accountId: 'test',
       timeout: 1_000,
@@ -2079,7 +2079,10 @@ describe('browser composition', () => {
           integrations: {
             version: 1,
             entries: [
-              { id: 'gpt', config: { gamAttributionEnabled: false } },
+              {
+                id: 'gpt',
+                config: { gamAttributionEnabled: false, pageBidsEnabled: true },
+              },
               { id: 'prebid', config: prebidConfig },
             ],
           },

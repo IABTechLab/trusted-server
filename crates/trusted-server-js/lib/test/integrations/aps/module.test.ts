@@ -79,7 +79,7 @@ describe('APS provider', () => {
     expect(registeredRenderer).toBe(aps.render);
     expect(registeredValidation).toMatchObject({
       expectedPublisherOrigin: window.location.origin,
-      expectedRendererUrl: new URL('/integrations/aps/renderer/v1', window.location.origin).href,
+      expectedRendererUrl: new URL('/integrations/aps/renderer/v2', window.location.origin).href,
     });
 
     activationRelease.reverse().forEach((callback) => callback());

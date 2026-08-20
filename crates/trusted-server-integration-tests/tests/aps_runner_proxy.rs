@@ -27,11 +27,11 @@ const SUCCESS_HEADERS: [&str; 5] = [
 // dispatch, local error serialization, and response delivery, so retain a
 // bounded allowance for work outside the transport window.
 const DOWNSTREAM_DEADLINE_OBSERVATION_ALLOWANCE: Duration = Duration::from_millis(250);
-const RENDERER_V1_PATH: &str = "/integrations/aps/renderer/v1";
+const RENDERER_V2_PATH: &str = "/integrations/aps/renderer/v2";
 const CLOUDFLARE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
-const RENDERER_V1_CSP: &str = "default-src 'none'; sandbox allow-scripts; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'self'; form-action 'none';";
-const RENDERER_V1_DOCUMENT: &str = include_str!(
-    "../../trusted-server-core/src/integrations/generated/aps_renderer_bootstrap_v1.html"
+const RENDERER_V2_CSP: &str = "default-src 'none'; sandbox allow-scripts; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'self'; form-action 'none';";
+const RENDERER_V2_DOCUMENT: &str = include_str!(
+    "../../trusted-server-core/src/integrations/generated/aps_renderer_bootstrap_v2.html"
 );
 
 struct CorpusCase {
@@ -520,7 +520,7 @@ fn wait_for_cloudflare_renderer_readiness(client: &Client, base_url: &str) {
         let exact = client
             .request(
                 reqwest::Method::from_bytes(b"PROPFIND").expect("PROPFIND should be valid"),
-                format!("{base_url}{RENDERER_V1_PATH}"),
+                format!("{base_url}{RENDERER_V2_PATH}"),
             )
             .send()
             .is_ok_and(exact_renderer_method_response);
@@ -565,7 +565,7 @@ fn actual_adapter_proxy_corpus() {
     let response = client
         .request(
             reqwest::Method::from_bytes(b"PROPFIND").expect("PROPFIND should be valid"),
-            format!("{}{}", process.base_url, RENDERER_V1_PATH),
+            format!("{}{}", process.base_url, RENDERER_V2_PATH),
         )
         .header("authorization", "Bearer must-not-reach-publisher")
         .send()
@@ -573,7 +573,7 @@ fn actual_adapter_proxy_corpus() {
     assert_exact_local_failure(response, 405, true);
 
     let renderer = client
-        .get(format!("{}{}", process.base_url, RENDERER_V1_PATH))
+        .get(format!("{}{}", process.base_url, RENDERER_V2_PATH))
         .send()
         .expect("renderer request should complete");
     assert_eq!(renderer.status().as_u16(), 200);
@@ -589,7 +589,7 @@ fn actual_adapter_proxy_corpus() {
     assert_eq!(renderer.headers()["referrer-policy"], "no-referrer");
     assert_eq!(
         renderer.headers()["content-security-policy"],
-        RENDERER_V1_CSP
+        RENDERER_V2_CSP
     );
     assert!(!renderer.headers().contains_key("x-frame-options"));
     let semantic_headers: BTreeSet<&str> = renderer
@@ -618,11 +618,11 @@ fn actual_adapter_proxy_corpus() {
             .bytes()
             .expect("renderer body should be readable")
             .as_ref(),
-        RENDERER_V1_DOCUMENT.as_bytes()
+        RENDERER_V2_DOCUMENT.as_bytes()
     );
 
     for path in [
-        "/integrations/aps/renderer/v2",
+        "/integrations/aps/renderer/v1",
         "/integrations/aps/runner/v1.js",
     ] {
         let response = client

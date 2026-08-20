@@ -191,7 +191,7 @@ fn wait_for_aps_route_ready(base_url: &str, options: super::ReadyCheckOptions) -
     let renderer_url = format!(
         "{}{}",
         base_url,
-        trusted_server_core::integrations::aps::APS_RENDERER_V1_ROUTE
+        trusted_server_core::integrations::aps::APS_RENDERER_V2_ROUTE
     );
     let probe_method =
         reqwest::Method::from_bytes(b"PROPFIND").expect("should parse PROPFIND readiness method");

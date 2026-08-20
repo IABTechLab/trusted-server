@@ -48,6 +48,7 @@ import {
 import type { FirstDisplayRenderBridgeOptionsV1 } from './render_bridge';
 
 const MAX_U32 = 4_294_967_295;
+const BUNDLE_PARTIAL: BootFailureReason = 'bundle_partial';
 const AUCTION_PROTOCOLS = ['aps', 'gpt', 'prebid'] as const;
 const ACTION_KINDS = new Set(['gpt_adm', 'aps']);
 const TERMINAL_RESULTS = new Set(['accepted', 'failed', 'cancelled']);
@@ -431,7 +432,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
       );
       return true;
     } catch {
-      return this.fail('bundle_partial');
+      return this.fail(BUNDLE_PARTIAL);
     }
   }
 
@@ -457,7 +458,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
       this.observedMutationRevision = this.handoffOwner.mutationRevision;
       return observed;
     }
-    if (this.observedMutationRevision >= MAX_U32) return this.fail('bundle_partial');
+    if (this.observedMutationRevision >= MAX_U32) return this.fail(BUNDLE_PARTIAL);
     this.observedMutationRevision += 1;
     return true;
   }
@@ -520,7 +521,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
 
   private settle(slotId: string, result: FirstDisplayTerminalResult, reason: string | null): void {
     if (!this.actionStarted) {
-      this.fail('bundle_partial');
+      this.fail(BUNDLE_PARTIAL);
       return;
     }
     if (this.stateValue !== 'active') return;
@@ -531,17 +532,17 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
         ? reason !== null
         : typeof reason !== 'string' || reason.length === 0 || reason.length > 256)
     ) {
-      this.fail('bundle_partial');
+      this.fail(BUNDLE_PARTIAL);
       return;
     }
     if (!this.pending.has(slotId)) {
-      if (!this.slotResults.has(slotId)) this.fail('bundle_partial');
+      if (!this.slotResults.has(slotId)) this.fail(BUNDLE_PARTIAL);
       return;
     }
     if (result === 'accepted') {
       const atMs = this.readTiming();
       if (atMs === undefined || this.nextTraceSequence > 4_294_967_295) {
-        this.fail('bundle_partial');
+        this.fail(BUNDLE_PARTIAL);
         return;
       }
       this.acceptedTrace.set(
@@ -562,7 +563,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
     this.stateValue = 'terminal';
     this.terminalAtMs = this.readTiming();
     if (this.terminalAtMs === undefined) {
-      this.fail('bundle_partial');
+      this.fail(BUNDLE_PARTIAL);
       return;
     }
     this.options.bootstrap.settle();
@@ -571,9 +572,9 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
   }
 
   private recordFirstAction(): boolean {
-    if (this.stateValue !== 'active' || this.actionStarted) return this.fail('bundle_partial');
+    if (this.stateValue !== 'active' || this.actionStarted) return this.fail(BUNDLE_PARTIAL);
     if (!this.options.bootstrap.startAction()) {
-      if (this.options.bootstrap.state !== 'failed') return this.fail('bundle_partial');
+      if (this.options.bootstrap.state !== 'failed') return this.fail(BUNDLE_PARTIAL);
       this.failed = true;
       this.stateValue = 'failed';
       this.disposeDriver();
@@ -582,7 +583,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
     }
     this.actionStarted = true;
     const firstDisplayMs = this.readTiming();
-    if (firstDisplayMs === undefined) return this.fail('bundle_partial');
+    if (firstDisplayMs === undefined) return this.fail(BUNDLE_PARTIAL);
     this.firstActionAtMs = firstDisplayMs;
     this.mark('tsjs:first-display');
     try {
@@ -607,28 +608,28 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
       try {
         this.options.driver.sealTsAdmission();
       } catch {
-        this.fail('bundle_partial');
+        this.fail(BUNDLE_PARTIAL);
         return;
       }
       this.sealed = true;
       this.stateValue = 'painted';
       this.paintAtMs = this.readTiming();
       if (this.paintAtMs === undefined) {
-        this.fail('bundle_partial');
+        this.fail(BUNDLE_PARTIAL);
         return;
       }
       this.mark('tsjs:first-display-paint');
       try {
         this.options.onProtectedPaint();
       } catch {
-        this.fail('bundle_partial');
+        this.fail(BUNDLE_PARTIAL);
       }
     };
     try {
       if (this.options.paint.hidden()) this.options.paint.scheduleHidden(next);
       else this.options.paint.requestFrame(next);
     } catch {
-      this.fail('bundle_partial');
+      this.fail(BUNDLE_PARTIAL);
     }
   }
 
@@ -885,7 +886,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
       });
       this.mutationObserver = observer;
     } catch {
-      this.fail('bundle_partial');
+      this.fail(BUNDLE_PARTIAL);
     }
   }
 
@@ -894,7 +895,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
       try {
         this.options.driver.sweepCommittedArtifacts();
       } catch {
-        this.fail('bundle_partial');
+        this.fail(BUNDLE_PARTIAL);
         return;
       }
     }

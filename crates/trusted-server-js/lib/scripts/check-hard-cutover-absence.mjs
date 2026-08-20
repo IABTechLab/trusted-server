@@ -178,7 +178,7 @@ forbid(routeAndConfigFiles, 'deprecated page-bids route', /\/__ts\/page-bids/g);
 forbid(
   routeAndConfigFiles,
   'non-canonical APS renderer route',
-  /\/integrations\/aps\/renderer(?!\/v1(?![A-Za-z0-9_./-]))/g
+  /\/integrations\/aps\/renderer(?!\/v2(?![A-Za-z0-9_./-]))/g
 );
 const apsIntegrationFile = path.join(
   repositoryRoot,
@@ -189,7 +189,7 @@ forbidSource(
   apsIntegrationFile,
   apsIntegrationSource.split('\n#[cfg(test)]')[0] ?? apsIntegrationSource,
   'non-canonical APS renderer route',
-  /\/integrations\/aps\/renderer(?!\/v1(?![A-Za-z0-9_./-]))/g
+  /\/integrations\/aps\/renderer(?!\/v2(?![A-Za-z0-9_./-]))/g
 );
 if (
   !apsIntegrationSource.includes(

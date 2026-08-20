@@ -625,7 +625,8 @@ mod tests {
     }
 
     fn news_config() -> CreativeOpportunitiesConfig {
-        let toml = "gam_network_id = \"123\"\n\
+        let toml = "enabled = true\n\
+             gam_network_id = \"123\"\n\
              \n\
              [[slot]]\n\
              id = \"atf\"\n\

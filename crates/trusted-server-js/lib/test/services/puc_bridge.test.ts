@@ -1152,7 +1152,7 @@ describe('Universal Creative bridge dispatcher', () => {
           message: 'TS APS Start',
           version: 1,
           lifecycleTicket: LIFECYCLE_TICKET,
-          rendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
+          rendererUrl: 'https://publisher.example/integrations/aps/renderer/v2',
           envelope: {
             version: 1,
             nonce: 'n1_abcdefghijklmnopqrstuv',

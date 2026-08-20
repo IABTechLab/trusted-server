@@ -183,7 +183,9 @@ function tracedRegistration(
 
 function integrationConfig(id: string): unknown {
   if (id === 'didomi') return Object.freeze({ proxyPath: '/integrations/didomi/consent/' });
-  if (id === 'gpt') return Object.freeze({ gamAttributionEnabled: false });
+  if (id === 'gpt') {
+    return Object.freeze({ gamAttributionEnabled: false, pageBidsEnabled: true });
+  }
   if (id === 'prebid') {
     return Object.freeze({
       accountId: 'test',

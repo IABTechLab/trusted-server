@@ -18,7 +18,7 @@ import type { PucApsMountInput } from '../../services/puc_bridge';
 import {
   renderDirectApsAttempt,
   renderPucApsAttempt,
-  resolveApsRendererV1Url,
+  resolveApsRendererV2Url,
   validateApsRenderer,
 } from './render';
 
@@ -85,7 +85,7 @@ export function createApsIntegrationRegistration(releaseId: string): Integration
     ) {
       throw new TypeError('APS capability graph is malformed');
     }
-    const rendererUrl = resolveApsRendererV1Url(render.publisherOrigin);
+    const rendererUrl = resolveApsRendererV2Url(render.publisherOrigin);
     if (!rendererUrl) throw new TypeError('APS publisher origin is invalid');
     let active = false;
     const renderer = (attempt: RenderAttempt, container: HTMLElement): boolean =>

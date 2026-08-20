@@ -1094,7 +1094,7 @@ describe('first-display initial slice definitions', () => {
         afterActivate: () => undefined,
       })
     );
-    expect(protocol?.rendererUrl).toBe('https://publisher.example/integrations/aps/renderer/v1');
+    expect(protocol?.rendererUrl).toBe('https://publisher.example/integrations/aps/renderer/v2');
     expect(protocol?.publisherOrigin).toBe('https://publisher.example');
     expect(protocol?.sandbox).toBe(
       'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation'

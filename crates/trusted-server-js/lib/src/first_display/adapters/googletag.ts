@@ -14,19 +14,29 @@ const MAX_DIAGNOSTIC_FACTS = 512;
 const MAX_DIAGNOSTIC_FACT_BYTES = 1_000;
 const MAX_DIAGNOSTIC_SECTION_BYTES = 512 * 1024;
 const MAX_U32 = 4_294_967_295;
+const SLOT_REQUESTED = 'slotRequested';
+const SLOT_RESPONSE_RECEIVED = 'slotResponseReceived';
+const SLOT_RENDER_ENDED = 'slotRenderEnded';
+const SLOT_ONLOAD = 'slotOnload';
+const IMPRESSION_VIEWABLE = 'impressionViewable';
+const SLOT_VISIBILITY_CHANGED = 'slotVisibilityChanged';
+const OVERLAPPING_REQUEST_CYCLES = 'overlapping_request_cycles';
+const INVALID_EVENT_ORDER = 'invalid_event_order';
+const GPT_REQUEST_FAILED = 'gpt_request_failed';
+const SLOT_UNRESOLVED = 'slot_unresolved';
 const DIAGNOSTIC_ONLY_EVENTS = Object.freeze([
-  'slotResponseReceived',
-  'slotOnload',
-  'impressionViewable',
-  'slotVisibilityChanged',
+  SLOT_RESPONSE_RECEIVED,
+  SLOT_ONLOAD,
+  IMPRESSION_VIEWABLE,
+  SLOT_VISIBILITY_CHANGED,
 ] as const);
 const DIAGNOSTIC_EVENT_ORDER: readonly FirstDisplayGptDiagnosticEventV1[] = Object.freeze([
-  'slotRequested',
-  'slotResponseReceived',
-  'slotRenderEnded',
-  'slotOnload',
-  'impressionViewable',
-  'slotVisibilityChanged',
+  SLOT_REQUESTED,
+  SLOT_RESPONSE_RECEIVED,
+  SLOT_RENDER_ENDED,
+  SLOT_ONLOAD,
+  IMPRESSION_VIEWABLE,
+  SLOT_VISIBILITY_CHANGED,
 ]);
 
 export type FirstDisplayGptRenderResult = 'gam_empty' | 'nonempty_gam';
@@ -35,9 +45,9 @@ export type FirstDisplayGptFailureReason =
   | 'external_artifact_incompatible'
   | 'external_ready_timeout'
   | 'gpt_completion_timeout'
-  | 'gpt_request_failed'
+  | typeof GPT_REQUEST_FAILED
   | 'gpt_request_timeout'
-  | 'slot_unresolved';
+  | typeof SLOT_UNRESOLVED;
 
 export interface FirstDisplayGptBoundCycleV1 {
   readonly bid: FirstDisplayProjectionBidV1;
@@ -572,7 +582,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       if (this.disposed) return;
       const element = resolveElement(this.options.document, row.placement);
       if (!element) {
-        callbacks.onFailure(row.placement.slot, 'slot_unresolved');
+        callbacks.onFailure(row.placement.slot, SLOT_UNRESOLVED);
         continue;
       }
       const matches = existing.filter((candidate) =>
@@ -583,7 +593,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
             : false
       );
       if (matches.length > 1) {
-        callbacks.onFailure(row.placement.slot, 'slot_unresolved');
+        callbacks.onFailure(row.placement.slot, SLOT_UNRESOLVED);
         continue;
       }
       const publisherSlot = physicalSlot(matches[0]);
@@ -597,7 +607,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
           ])
         );
       if (!slot) {
-        callbacks.onFailure(row.placement.slot, 'slot_unresolved');
+        callbacks.onFailure(row.placement.slot, SLOT_UNRESOLVED);
         continue;
       }
       const ownership = publisherSlot ? 'publisher' : 'trusted_server';
@@ -611,12 +621,12 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         Object.freeze({ initialLoadDisabled: disabled, ownership })
       );
       if (!plan) {
-        callbacks.onFailure(row.placement.slot, 'gpt_request_failed');
+        callbacks.onFailure(row.placement.slot, GPT_REQUEST_FAILED);
         continue;
       }
       const traceTokenOrdinal = this.nextTraceTokenOrdinal;
       if (traceTokenOrdinal > 4_294_967_295) {
-        callbacks.onFailure(row.placement.slot, 'gpt_request_failed');
+        callbacks.onFailure(row.placement.slot, GPT_REQUEST_FAILED);
         continue;
       }
       const traceToken = `gt1_${traceTokenOrdinal.toString(36)}`;
@@ -687,7 +697,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         }
       } catch {
         if (cycle.settled) continue;
-        this.failCycle(cycle, callbacks, 'gpt_request_failed');
+        this.failCycle(cycle, callbacks, GPT_REQUEST_FAILED);
       }
     }
   }
@@ -709,7 +719,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       }
       if (cycle.settled) {
         this.retireCycle(cycle, callbacks);
-        this.captureDiagnosticFact('slotRequested', cycle, event);
+        this.captureDiagnosticFact(SLOT_REQUESTED, cycle, event);
         return;
       }
       if (!cycle.requestInvoked) return;
@@ -718,7 +728,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         return;
       }
       cycle.requested = true;
-      this.captureDiagnosticFact('slotRequested', cycle, event);
+      this.captureDiagnosticFact(SLOT_REQUESTED, cycle, event);
       if (cycle.requestTimer !== undefined) this.clearOwnedTimer(cycle.requestTimer);
     };
     const renderListener = (event: unknown): void => {
@@ -728,7 +738,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       const cycle = slot ? this.cycles.get(slot) : undefined;
       if (!cycle) return;
       if (cycle.settled) {
-        this.captureDiagnosticFact('slotRenderEnded', cycle, event);
+        this.captureDiagnosticFact(SLOT_RENDER_ENDED, cycle, event);
         return;
       }
       if (!cycle.requested) return;
@@ -736,10 +746,10 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         Object.freeze({ isEmpty: member(event, 'isEmpty') })
       );
       if (!result) {
-        this.failCycle(cycle, callbacks, 'gpt_request_failed');
+        this.failCycle(cycle, callbacks, GPT_REQUEST_FAILED);
         return;
       }
-      this.captureDiagnosticFact('slotRenderEnded', cycle, event);
+      this.captureDiagnosticFact(SLOT_RENDER_ENDED, cycle, event);
       cycle.settled = true;
       if (cycle.requestTimer !== undefined) this.clearOwnedTimer(cycle.requestTimer);
       if (cycle.completionTimer !== undefined) this.clearOwnedTimer(cycle.completionTimer);
@@ -759,10 +769,10 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     };
     this.requestedListener = requestedListener;
     this.renderListener = renderListener;
-    this.diagnosticListeners.set('slotRequested', requestedListener);
-    this.diagnosticListeners.set('slotRenderEnded', renderListener);
-    call(service, 'addEventListener', ['slotRequested', requestedListener]);
-    call(service, 'addEventListener', ['slotRenderEnded', renderListener]);
+    this.diagnosticListeners.set(SLOT_REQUESTED, requestedListener);
+    this.diagnosticListeners.set(SLOT_RENDER_ENDED, renderListener);
+    call(service, 'addEventListener', [SLOT_REQUESTED, requestedListener]);
+    call(service, 'addEventListener', [SLOT_RENDER_ENDED, renderListener]);
     if (this.options.diagnosticsActive === true) {
       for (const eventType of DIAGNOSTIC_ONLY_EVENTS) {
         const listener = (event: unknown): void => {
@@ -1075,19 +1085,19 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     let disposition: FirstDisplayGptFactV1['disposition'] = 'matched';
     let issueReason: FirstDisplayGptFactV1['issueReason'] = null;
     let diagnosticCycle: FirstDisplayDiagnosticCycleRecord | undefined;
-    if (eventType === 'slotRequested') {
+    if (eventType === SLOT_REQUESTED) {
       if (cycle.diagnosticRecords.some((record) => record.state === 'open')) {
         disposition = 'ambiguous';
-        issueReason = 'overlapping_request_cycles';
+        issueReason = OVERLAPPING_REQUEST_CYCLES;
       } else if (cycle.nextDiagnosticCycleOrdinal > MAX_U32) {
         disposition = 'unmatched';
-        issueReason = 'invalid_event_order';
+        issueReason = INVALID_EVENT_ORDER;
       } else {
         if (cycle.diagnosticRecords.length >= 10) {
           const pruneIndex = cycle.diagnosticRecords.findIndex((record) => record.state !== 'open');
           if (pruneIndex < 0) {
             disposition = 'ambiguous';
-            issueReason = 'overlapping_request_cycles';
+            issueReason = OVERLAPPING_REQUEST_CYCLES;
           } else {
             cycle.diagnosticRecords.splice(pruneIndex, 1);
             cycle.unknownPriorCycle = true;
@@ -1097,7 +1107,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
           diagnosticCycle = {
             ordinal: cycle.nextDiagnosticCycleOrdinal,
             ...(responseIdentifier === undefined ? {} : { responseIdentifier }),
-            seen: new Set(['slotRequested']),
+            seen: new Set([SLOT_REQUESTED]),
             state: 'open',
           };
           cycle.nextDiagnosticCycleOrdinal += 1;
@@ -1132,7 +1142,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         diagnosticCycle = candidates[0];
       } else if (candidates.length > 1) {
         disposition = 'ambiguous';
-        issueReason = 'overlapping_request_cycles';
+        issueReason = OVERLAPPING_REQUEST_CYCLES;
       } else {
         const duplicate = cycle.diagnosticRecords.find(
           (record) =>
@@ -1143,18 +1153,18 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         );
         if (duplicate) {
           diagnosticCycle = duplicate;
-          issueReason = 'invalid_event_order';
+          issueReason = INVALID_EVENT_ORDER;
         } else {
           disposition = 'unmatched';
           issueReason = cycle.unknownPriorCycle ? 'unknown_prior_cycle' : 'no_request_cycle';
         }
       }
-      if (diagnosticCycle && issueReason !== 'invalid_event_order') {
+      if (diagnosticCycle && issueReason !== INVALID_EVENT_ORDER) {
         diagnosticCycle.seen.add(eventType);
         if (diagnosticCycle.responseIdentifier === undefined && responseIdentifier !== undefined) {
           diagnosticCycle.responseIdentifier = responseIdentifier;
         }
-        if (eventType === 'slotRenderEnded') diagnosticCycle.state = 'completed';
+        if (eventType === SLOT_RENDER_ENDED) diagnosticCycle.state = 'completed';
       }
     }
     if (this.options.diagnosticsActive !== true) return;
@@ -1171,7 +1181,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     }
     const size = member(event, 'size');
     const renderedSize =
-      eventType === 'slotRenderEnded' &&
+      eventType === SLOT_RENDER_ENDED &&
       Array.isArray(size) &&
       size.length === 2 &&
       size.every(
@@ -1199,13 +1209,13 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       capturedAtMs: observedAtMs,
       elementId: cycle.elementId,
       adUnitPath: cycle.placement.gamUnitPath,
-      isEmpty: eventType === 'slotRenderEnded' ? optionalBoolean('isEmpty') : null,
+      isEmpty: eventType === SLOT_RENDER_ENDED ? optionalBoolean('isEmpty') : null,
       renderedSize,
-      isBackfill: eventType === 'slotRenderEnded' ? optionalBoolean('isBackfill') : null,
+      isBackfill: eventType === SLOT_RENDER_ENDED ? optionalBoolean('isBackfill') : null,
       slotContentChanged:
-        eventType === 'slotRenderEnded' ? optionalBoolean('slotContentChanged') : null,
+        eventType === SLOT_RENDER_ENDED ? optionalBoolean('slotContentChanged') : null,
       visibilityPercent:
-        eventType === 'slotVisibilityChanged' &&
+        eventType === SLOT_VISIBILITY_CHANGED &&
         typeof visibility === 'number' &&
         Number.isFinite(visibility) &&
         visibility >= 0 &&

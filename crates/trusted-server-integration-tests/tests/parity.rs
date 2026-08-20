@@ -19,7 +19,7 @@ use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp as AxumApp;
 use trusted_server_adapter_cloudflare::app::TrustedServerApp as CloudflareApp;
 use trusted_server_adapter_spin::app::TrustedServerApp as SpinApp;
-use trusted_server_core::integrations::aps::APS_RENDERER_V1_ROUTE;
+use trusted_server_core::integrations::aps::APS_RENDERER_V2_ROUTE;
 use trusted_server_core::settings::Settings;
 
 /// Shared test settings for all adapters.
@@ -779,7 +779,7 @@ fn canonical_headers(headers: &HeaderMap) -> BTreeMap<String, Vec<String>> {
 fn aps_renderer_request() -> edgezero_core::http::Request {
     request_builder()
         .method("GET")
-        .uri(APS_RENDERER_V1_ROUTE)
+        .uri(APS_RENDERER_V2_ROUTE)
         .body(edgezero_core::body::Body::empty())
         .expect("should build APS renderer request")
 }
@@ -795,7 +795,7 @@ fn response_parts(response: edgezero_core::http::Response) -> (u16, HeaderMap, b
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn aps_renderer_v1_response_is_exact_across_portable_adapters() {
+async fn aps_renderer_v2_response_is_exact_across_portable_adapters() {
     let axum = trusted_server_adapter_axum::app::dispatch_reserved_with_settings(
         test_settings(),
         aps_renderer_request(),
