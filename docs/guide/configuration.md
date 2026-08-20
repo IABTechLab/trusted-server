@@ -646,6 +646,23 @@ path = "^/api/v[0-9]+/private"  # /api/v1/private, /api/v2/private
 
 **Validation**: Application startup fails if regex is invalid.
 
+::: warning Admin coverage and passwords are validated at startup
+
+Startup fails when no handler covers an admin route. The dynamic
+`/_ts/admin/ec/{id}` route accepts any segment after `/_ts/admin/ec/`, and
+Basic Auth runs on the raw path before routing, so coverage cannot be inferred
+from ID-shaped samples: a pattern such as
+`^/_ts/admin/ec/[a-f0-9]{64}[.][A-Za-z0-9]{6}$` is rejected. Use a prefix-level
+matcher (`^/_ts/admin`, or `^/_ts/admin/ec/` alongside the other admin
+patterns).
+
+Startup also fails when any handler — admin or not — uses a placeholder or
+well-known weak password (`changeme`, `password`, `admin`, or a
+`replace-with-…` template value). Handler selection is first-match-wins, so a
+narrow handler ahead of the admin pattern governs the paths it matches.
+
+:::
+
 ::: warning Scope patterns to the paths you mean
 
 Handler patterns are matched against the full request path, so a broad pattern

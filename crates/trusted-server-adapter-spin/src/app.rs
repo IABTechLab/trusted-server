@@ -12,7 +12,10 @@ use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::handle_admin_eids_lookup;
+use trusted_server_core::ec::admin::{
+    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
+    deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
+};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
@@ -368,17 +371,7 @@ fn admin_key_management_not_supported() -> Response {
 }
 
 fn admin_ec_lookup_not_supported() -> Response {
-    let body = edgezero_core::body::Body::from(
-        "Admin EC lookup is not supported on Fermyon Spin.\n\
-         Use the Fastly adapter (via Viceroy or deployed) to inspect EC entries.\n",
-    );
-    let mut response = Response::new(body);
-    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
+    core_admin_ec_lookup_not_supported()
 }
 
 // ---------------------------------------------------------------------------
@@ -689,6 +682,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         ) -> Result<Response, EdgeError> {
             let services = build_runtime_services(&ctx);
             let mut req = ctx.into_request();
+            if let Some(response) = deny_admin_diagnostic_fallback(&req) {
+                return Ok(response);
+            }
             if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
                 &state.settings,
                 &mut req,
