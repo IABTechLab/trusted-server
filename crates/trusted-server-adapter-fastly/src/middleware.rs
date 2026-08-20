@@ -260,6 +260,7 @@ mod tests {
     use error_stack::Report;
     use futures::executor::block_on;
     use trusted_server_core::platform::{PlatformError, PlatformGeo};
+    use trusted_server_core::response_privacy::apply_inactive_ad_stack_browser_cache_policy;
 
     fn empty_response() -> Response {
         response_builder()
@@ -431,29 +432,38 @@ mod tests {
     }
 
     #[test]
-    fn enforce_set_cookie_cache_privacy_downgrades_inactive_cache_policy() {
+    fn enforce_set_cookie_cache_privacy_downgrades_late_cookie_policies() {
         // Mirrors the EdgeZero post-ec_finalize guard: a Set-Cookie added after
-        // finalize headers ran must override the inactive template cache policy.
-        let mut response = response_with_headers(&[
-            ("set-cookie", "ts-ec=abc; Path=/"),
-            ("cache-control", "max-age=60"),
-            ("surrogate-control", "max-age=600"),
-        ]);
+        // finalize headers ran must override both origin-public and inactive
+        // template cache policies.
+        for (cache_control, generated_inactive_policy) in [
+            ("public, max-age=600", false),
+            ("private, max-age=60", true),
+        ] {
+            let mut response = response_with_headers(&[
+                ("set-cookie", "ts-ec=abc; Path=/"),
+                ("cache-control", cache_control),
+                ("surrogate-control", "max-age=600"),
+            ]);
+            if generated_inactive_policy {
+                apply_inactive_ad_stack_browser_cache_policy(&mut response);
+            }
 
-        enforce_set_cookie_cache_privacy(&mut response);
+            enforce_set_cookie_cache_privacy(&mut response);
 
-        assert_eq!(
-            response
-                .headers()
-                .get("cache-control")
-                .and_then(|v| v.to_str().ok()),
-            Some("private, max-age=0"),
-            "should downgrade an inactive cache policy on a cookie response"
-        );
-        assert!(
-            response.headers().get("surrogate-control").is_none(),
-            "should strip surrogate-control from the inactive cookie response"
-        );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|v| v.to_str().ok()),
+                Some("private, max-age=0"),
+                "should downgrade {cache_control} on a cookie response"
+            );
+            assert!(
+                response.headers().get("surrogate-control").is_none(),
+                "should strip surrogate-control from a {cache_control} cookie response"
+            );
+        }
     }
 
     #[test]
