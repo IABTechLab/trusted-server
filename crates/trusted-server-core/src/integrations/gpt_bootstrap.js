@@ -94,10 +94,11 @@
   // and deliberately identical to the bundle scheduler — the impression is
   // spent on a viewed tab, and the post-hydration guarantee holds whenever
   // the request is actually issued.
-  var initialAdInitScheduled = false;
   ts.scheduleInitialAdInit = function (initialBids, initialSlots) {
-    if ((ts.navGeneration || 0) !== 0 || initialAdInitScheduled) return;
-    initialAdInitScheduled = true;
+    // The bundle may replace this scheduler after the fallback claims the initial
+    // pass. Keep the latch on the shared document API so replacement cannot reset it.
+    if ((ts.navGeneration || 0) !== 0 || ts.initialAdInitScheduled) return;
+    ts.initialAdInitScheduled = true;
     // Slots are generation-guarded for the same reason the bids are: the
     // shared-template seam sends both, and an assignment made before this call
     // would overwrite a committed SPA navigation's slots.

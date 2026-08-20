@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import type { TsjsApi } from '../../../src/core/types';
@@ -9,6 +12,14 @@ type TestWindow = Window & {
 
 const originalPushState = history.pushState.bind(history);
 const originalReplaceState = history.replaceState.bind(history);
+const BOOTSTRAP_SOURCE = readFileSync(
+  path.resolve(process.cwd(), '../../trusted-server-core/src/integrations/gpt_bootstrap.js'),
+  'utf8'
+);
+
+function runBootstrap(): void {
+  new Function(BOOTSTRAP_SOURCE)();
+}
 
 /**
  * Executable lifecycle coverage for `tsjs.scheduleInitialAdInit` — the
@@ -158,6 +169,36 @@ describe('scheduleInitialAdInit', () => {
     ts.scheduleInitialAdInit!({ second: { hb_pb: '2.00' } });
     expect(ts.bids).toEqual({ first: { hb_pb: '1.00' } });
 
+    window.dispatchEvent(new Event('load'));
+    flushFrame();
+    flushFrame();
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the first schedule claim across bootstrap-to-bundle handoff', async () => {
+    runBootstrap();
+    const ts = (window as TestWindow).tsjs!;
+    const firstSlot = {
+      id: 'first_slot',
+      gam_unit_path: '/123/first',
+      div_id: 'div-first',
+      formats: [[300, 250]] as Array<[number, number]>,
+    };
+    const secondSlot = {
+      id: 'second_slot',
+      gam_unit_path: '/123/second',
+      div_id: 'div-second',
+      formats: [[728, 90]] as Array<[number, number]>,
+    };
+
+    ts.scheduleInitialAdInit!({ first_slot: { hb_pb: '1.00' } }, [firstSlot]);
+    await importGptModule();
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+    ts.scheduleInitialAdInit!({ second_slot: { hb_pb: '2.00' } }, [secondSlot]);
+
+    expect(ts.bids).toEqual({ first_slot: { hb_pb: '1.00' } });
+    expect(ts.adSlots).toEqual([firstSlot]);
     window.dispatchEvent(new Event('load'));
     flushFrame();
     flushFrame();

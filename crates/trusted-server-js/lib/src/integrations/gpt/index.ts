@@ -671,10 +671,12 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * their head script already installed the slots. An explicit empty array clears
  * that state, while omission preserves it. The scheduler accepts only its first
  * generation-0 call so duplicate public API calls cannot define and display the
- * initial slots twice. If a navigation commits before scheduling or before the
- * deferred callback, the SSR payload and `adInit()` are both dropped. The
- * generation counter (not a URL comparison) keeps this aligned with the SPA
- * auction hook's navigation identity.
+ * initial slots twice. The latch lives on `tsjs` so a bootstrap fallback that
+ * claims the initial pass keeps that claim when the bundle replaces its
+ * scheduler. If a navigation commits before scheduling or before the deferred
+ * callback, the SSR payload and `adInit()` are both dropped. The generation
+ * counter (not a URL comparison) keeps this aligned with the SPA auction hook's
+ * navigation identity.
  *
  * Hidden documents: browsers do not service `requestAnimationFrame` while a
  * document is hidden, so a background-tab load (Cmd+click, open-in-new-tab)
@@ -686,13 +688,12 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * holds whenever the request is actually issued.
  */
 function installScheduleInitialAdInit(ts: TsjsApi): void {
-  let initialAdInitScheduled = false;
   ts.scheduleInitialAdInit = function (
     initialBids?: Record<string, AuctionBidData>,
     initialSlots?: AuctionSlot[]
   ) {
-    if ((ts.navGeneration ?? 0) !== 0 || initialAdInitScheduled) return;
-    initialAdInitScheduled = true;
+    if ((ts.navGeneration ?? 0) !== 0 || ts.initialAdInitScheduled) return;
+    ts.initialAdInitScheduled = true;
     if (initialSlots !== undefined) ts.adSlots = initialSlots;
     if (initialBids !== undefined) ts.bids = initialBids;
     const runUnlessNavigated = (): void => {
