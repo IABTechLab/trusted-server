@@ -10,6 +10,7 @@ import { describe, expect, it } from 'vitest';
 import {
   ARTIFACT_RELEASE_SENTINEL,
   assertNoLegacyRuntimeFlags,
+  assertPurePrebidArtifact,
   deriveBundleMetadata,
   main,
   parseArgs,
@@ -24,6 +25,27 @@ describe('build-prebid-external metadata', () => {
       /legacy TSJS runtime flag/
     );
     expect(() => assertNoLegacyRuntimeFlags('window.pbjs = { que: [] };')).not.toThrow();
+  });
+
+  it('rejects Trusted Server auction, render, and PUC behavior in the external Prebid artifact', () => {
+    for (const marker of [
+      'TS APS Top Mount Started',
+      'TS ADM Start',
+      'TS Render Owner Register',
+      '/_ts/auction',
+      'rendererReservationId',
+      'lifecycleTicket',
+      'tsjs.requestAds',
+    ]) {
+      expect(() => assertPurePrebidArtifact(`/* prebid */ ${marker}`)).toThrow(
+        /TS-owned auction or render behavior/
+      );
+    }
+    expect(() =>
+      assertPurePrebidArtifact(
+        'window.pbjs={que:[],cmd:[]};window.__prebidProtocol="Prebid Request";Object.defineProperty(window.pbjs,"__trustedServerArtifactV1",{});'
+      )
+    ).not.toThrow();
   });
 
   it('derives filename, sha256, and SRI from exact bundle bytes', () => {

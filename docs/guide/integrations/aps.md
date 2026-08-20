@@ -272,7 +272,7 @@ allow-scripts
 allow-top-navigation-by-user-activation
 ```
 
-It deliberately omits `allow-same-origin` during bootstrap, so APS and bidder execution remains below an opaque-origin boundary. The renderer response repeats these restrictions with a CSP `sandbox` directive, preventing another embedding path from restoring publisher-origin execution by omitting the iframe attribute. Trusted Server generates independent 128-bit bootstrap and renderer nonces, binds each to its own phase, and accepts each exactly once. No descriptor or data-document URL crosses the bootstrap configuration channel. Existing slot content is retained until the inner renderer has accepted the descriptor and APS reports render completion.
+It deliberately omits `allow-same-origin` during bootstrap, so APS and bidder execution remains below an opaque-origin boundary. The renderer response is an intentional transport-CSP superset with no CSP `sandbox` directive. The generated outer and inner meta CSPs narrow it to the exact Trusted Server and creative origins, while the iframe `sandbox` attributes enforce the exact phase-specific restrictions. Trusted Server generates independent 128-bit bootstrap and renderer nonces, binds each to its own phase, and accepts each exactly once. No descriptor or data-document URL crosses the bootstrap configuration channel. Existing slot content is retained until the inner renderer has accepted the descriptor and APS reports render completion.
 
 ### Direct `/auction`
 
@@ -280,11 +280,7 @@ In `trusted_server` mode, the TSJS auction client validates the typed renderer d
 
 ### GAM and Universal Creative
 
-For initial navigation and page-bids, Trusted Server publishes the same descriptor in `window.tsjs.bids`. The source-checked Prebid Universal Creative bridge accepts requests only from the iframe that owns the matching `hb_adid` and validates the complete envelope. In `trusted_server` mode it returns a static dynamic-renderer program that creates the same opaque renderer iframe. After the response is delivered, the bridge expands an authenticated ordinary display iframe only when its width and height attributes and computed geometry are still 1x1. It resizes that source iframe and its immediate collapsed shell parent to the validated winning dimensions. Ambiguous sources, stale navigation or refresh completions, anchors, interstitials, fixed or sticky frames, invalid dimensions, and already-expanded frames remain unchanged. The same guard applies to APS capabilities, inline `adm`, and PBS Cache responses.
-
-In `publisher_native` mode the bridge instead resolves the publisher div and starts the friendly-frame runner without sending a Universal Creative renderer response. That renderer replaces the slot through a different owner and does not run the collapsed-shell helper.
-
-After the native runner loads, Trusted Server replaces the existing children of the resolved publisher div with the friendly frame. This removes the GAM or Universal Creative iframe when it is inside that div. If the runner fails, the existing iframe remains, but its Universal Creative request receives no response because Trusted Server has already claimed the selected bid. This one-owner behavior avoids a second render path, but GAM impression and viewability reporting must be validated with the APS account team for the controlled cohort.
+For initial navigation, Trusted Server publishes the descriptor in the immutable `tsjs.boot.auctionProjection`. A later SPA page-bids response replaces only that navigation session's internal projection and never mutates `tsjs.boot`. The source-checked Prebid Universal Creative bridge accepts requests only from the iframe that owns the matching `hb_adid`, validates the complete envelope, and returns a static dynamic-renderer program that creates the same opaque renderer iframe.
 
 For client-side `trustedServer` adapter auctions, Prebid generates its own `hb_adid`. Trusted Server binds that generated ID to the validated APS descriptor in a bounded, expiring browser registry before GAM refresh. The bridge verifies that the requesting Universal Creative iframe belongs to the same ad unit, consumes the capability once, and passes the APS bid ID separately to the Amazon runner.
 
