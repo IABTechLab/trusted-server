@@ -576,11 +576,6 @@ pub trait IntegrationHeadInjector: Send + Sync {
     fn integration_id(&self) -> &'static str;
     /// Return HTML snippets to insert at the start of `<head>`.
     fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String>;
-
-    /// Return attributes to add to the publisher TSJS bundle tag.
-    fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
-        Vec::new()
-    }
 }
 
 /// Registration payload returned by integration builders.
@@ -1423,16 +1418,6 @@ impl IntegrationRegistry {
         inserts
     }
 
-    /// Collect static attributes for the publisher TSJS bundle tag.
-    #[must_use]
-    pub fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
-        self.inner
-            .head_injectors
-            .iter()
-            .flat_map(|injector| injector.tsjs_script_tag_attributes())
-            .collect()
-    }
-
     /// Provide a snapshot of registered integrations and their hooks.
     #[must_use]
     pub fn registered_integrations(&self) -> Vec<IntegrationMetadata> {
@@ -1869,58 +1854,6 @@ mod tests {
     use crate::constants::COOKIE_TS_EC;
     use crate::platform::test_support::noop_services;
     use http::{HeaderValue, StatusCode, header};
-
-    struct DefaultMetadataHeadInjector;
-
-    impl IntegrationHeadInjector for DefaultMetadataHeadInjector {
-        fn integration_id(&self) -> &'static str {
-            "default-metadata"
-        }
-
-        fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-            Vec::new()
-        }
-    }
-
-    struct StaticMetadataHeadInjector;
-
-    impl IntegrationHeadInjector for StaticMetadataHeadInjector {
-        fn integration_id(&self) -> &'static str {
-            "static-metadata"
-        }
-
-        fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-            Vec::new()
-        }
-
-        fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
-            vec![
-                ("data-ts-gam-attribution", "true"),
-                ("data-test-order", "second"),
-            ]
-        }
-    }
-
-    #[test]
-    fn tsjs_script_tag_attributes_preserve_registration_order_and_default_empty() {
-        let registry = IntegrationRegistry::from_rewriters_with_head_injectors(
-            Vec::new(),
-            Vec::new(),
-            vec![
-                Arc::new(DefaultMetadataHeadInjector),
-                Arc::new(StaticMetadataHeadInjector),
-            ],
-        );
-
-        assert_eq!(
-            registry.tsjs_script_tag_attributes(),
-            vec![
-                ("data-ts-gam-attribution", "true"),
-                ("data-test-order", "second"),
-            ],
-            "should omit default-empty metadata and preserve registered attribute order"
-        );
-    }
 
     // Mock integration proxy for testing
     struct MockProxy;

@@ -1050,7 +1050,8 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
           protocolId && AUCTION_PROTOCOLS.includes(protocolId)
             ? captureProtocolRegistration(candidate, protocolId, fullProtocols)
             : candidate,
-          own
+          own,
+          config.value
         );
         if (protocolId && AUCTION_PROTOCOLS.includes(protocolId)) {
           if (auctionProtocols.has(protocolId) || !protocolIdentity(installed, protocolId)) {

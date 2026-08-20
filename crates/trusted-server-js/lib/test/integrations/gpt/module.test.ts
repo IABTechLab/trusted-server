@@ -809,14 +809,51 @@ describe('transactional GPT integration module', () => {
   );
 
   it.each([
-    { diagnosticsActive: false, adoptInitialDisplay: false, parserStateValid: true },
-    { diagnosticsActive: true, adoptInitialDisplay: false, parserStateValid: true },
-    { diagnosticsActive: false, adoptInitialDisplay: true, parserStateValid: true },
-    { diagnosticsActive: false, adoptInitialDisplay: true, parserStateValid: false },
-    { diagnosticsActive: false, adoptInitialDisplay: true, parserStateValid: 'absent' },
+    {
+      diagnosticsActive: false,
+      adoptInitialDisplay: false,
+      parserStateValid: true,
+      gamAttributionEnabled: false,
+    },
+    {
+      diagnosticsActive: true,
+      adoptInitialDisplay: false,
+      parserStateValid: true,
+      gamAttributionEnabled: false,
+    },
+    {
+      diagnosticsActive: false,
+      adoptInitialDisplay: false,
+      parserStateValid: true,
+      gamAttributionEnabled: true,
+    },
+    {
+      diagnosticsActive: false,
+      adoptInitialDisplay: true,
+      parserStateValid: true,
+      gamAttributionEnabled: false,
+    },
+    {
+      diagnosticsActive: false,
+      adoptInitialDisplay: true,
+      parserStateValid: true,
+      gamAttributionEnabled: true,
+    },
+    {
+      diagnosticsActive: false,
+      adoptInitialDisplay: true,
+      parserStateValid: false,
+      gamAttributionEnabled: false,
+    },
+    {
+      diagnosticsActive: false,
+      adoptInitialDisplay: true,
+      parserStateValid: 'absent',
+      gamAttributionEnabled: false,
+    },
   ])(
-    'uses only catalog capabilities without replaying adopted display (diagnostics=$diagnosticsActive, adoption=$adoptInitialDisplay, parser=$parserStateValid)',
-    async ({ diagnosticsActive, adoptInitialDisplay, parserStateValid }) => {
+    'uses only catalog capabilities without replaying adopted display (diagnostics=$diagnosticsActive, adoption=$adoptInitialDisplay, parser=$parserStateValid, attribution=$gamAttributionEnabled)',
+    async ({ diagnosticsActive, adoptInitialDisplay, parserStateValid, gamAttributionEnabled }) => {
       vi.useFakeTimers();
       const NativeMutationObserver = window.MutationObserver;
       const activeMutationObservers = new Set<MutationObserver>();
@@ -893,6 +930,7 @@ describe('transactional GPT integration module', () => {
           removedTypes.push(type);
         }),
       };
+      const setConfig = vi.fn();
       (window as Window & { googletag?: unknown }).googletag = {
         apiReady: true,
         pubadsReady: true,
@@ -902,7 +940,7 @@ describe('transactional GPT integration module', () => {
         display,
         getConfig: vi.fn(() => ({ disableInitialLoad: false })),
         pubads: () => pubads,
-        setConfig: vi.fn(),
+        setConfig,
       };
       const providerFacades = new Map<string, Readonly<Record<string, unknown>>>();
       const protect = vi.fn(() => true);
@@ -994,7 +1032,8 @@ describe('transactional GPT integration module', () => {
         runtimeCapability: runtime,
         getBindings: (id) =>
           Object.freeze({
-            config: id === 'gpt' ? GPT_CONFIG : undefined,
+            config:
+              id === 'gpt' ? Object.freeze({ ...GPT_CONFIG, gamAttributionEnabled }) : undefined,
             interfaces: Object.freeze({}),
           }),
         onCapabilityStaged: (key, facade) => {
@@ -1078,9 +1117,10 @@ describe('transactional GPT integration module', () => {
                         ? Object.freeze([
                             Object.freeze({
                               sliceId: 'gpt_initial',
-                              observations: Object.freeze(['protocol_version']),
+                              observations: Object.freeze(['gam', 'v']),
                               values: Object.freeze([
-                                Object.freeze(['protocol_version', 1] as const),
+                                Object.freeze(['gam', gamAttributionEnabled] as const),
+                                Object.freeze(['v', 1] as const),
                               ]),
                             }),
                           ])
@@ -1173,6 +1213,7 @@ describe('transactional GPT integration module', () => {
       const result = await registry.install(installCallbacks);
       if (adoptInitialDisplay && parserStateValid !== true) {
         expect(result).toMatchObject({ state: 'fallback', reason: 'bundle_partial' });
+        expect(setConfig).not.toHaveBeenCalled();
         expect(defineSlot).not.toHaveBeenCalled();
         expect(display).not.toHaveBeenCalled();
         expect(refresh).not.toHaveBeenCalled();
@@ -1180,6 +1221,12 @@ describe('transactional GPT integration module', () => {
         return;
       }
       expect(result.state).toBe('kernel');
+      expect(setConfig).toHaveBeenCalledTimes(
+        gamAttributionEnabled && !adoptInitialDisplay ? 1 : 0
+      );
+      if (gamAttributionEnabled && !adoptInitialDisplay) {
+        expect(setConfig).toHaveBeenCalledExactlyOnceWith({ targeting: { ts: 'true' } });
+      }
       const gpt = providerFacades.get('gpt.v1') as {
         activateLaterLifecycle: () => Readonly<{
           navigate: (path: string) => Promise<unknown>;
@@ -1425,6 +1472,10 @@ describe('transactional GPT integration module', () => {
       fetchPageBids.mockRestore();
       sourceFrame.remove();
       slotElement.remove();
+
+      expect(setConfig.mock.calls).toEqual(
+        gamAttributionEnabled ? [[{ targeting: { ts: 'true' } }]] : []
+      );
 
       if (result.state === 'kernel') result.dispose();
       expect(activeMutationObservers.size).toBe(0);

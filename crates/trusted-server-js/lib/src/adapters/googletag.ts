@@ -220,6 +220,7 @@ export interface GoogletagOperation<T> {
 /** Narrow GPT boundary consumed by kernel sessions and services. */
 export interface GoogletagAdapter {
   bindingStatus(): GoogletagBindingStatus;
+  enqueueGamAttribution(): boolean;
   adoptDiagnosticsState?(input: GoogletagDiagnosticsAdoptionV1): boolean;
   diagnosticsIdentity(slot: object): Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined;
   traceToken(slot: object): GptSlotTokenV1 | undefined;
@@ -1131,6 +1132,58 @@ export function createBrowserGoogletagAdapter(
   let pendingReservations = 0;
   let disposed = false;
   let firstDisplayObserved = false;
+  let gamAttributionEnqueued = false;
+
+  const enqueueGamAttribution = (): boolean => {
+    if (disposed) return false;
+    if (gamAttributionEnqueued) return true;
+    let binding = readTarget(target);
+    if (binding === undefined || binding === null) {
+      const created = { cmd: [] };
+      try {
+        if (
+          !Reflect.defineProperty(target, 'googletag', {
+            configurable: true,
+            enumerable: true,
+            value: created,
+            writable: true,
+          }) ||
+          readTarget(target) !== created
+        ) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+      binding = created;
+    }
+    if ((typeof binding !== 'object' || binding === null) && typeof binding !== 'function') {
+      return false;
+    }
+    const queue = commandQueue(binding as object);
+    if (!queue) return false;
+    gamAttributionEnqueued = true;
+    try {
+      queueCommand(queue, () => {
+        try {
+          const current = readTarget(target);
+          const root =
+            (typeof current === 'object' && current !== null) || typeof current === 'function'
+              ? (current as object)
+              : (binding as object);
+          const setConfig = safeMember(root, 'setConfig');
+          if (typeof setConfig === 'function') {
+            Reflect.apply(setConfig, root, [{ targeting: { ts: 'true' } }]);
+          }
+        } catch {
+          // Missing or hostile GPT targeting cannot block later queue work.
+        }
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   const reportDiagnosticsFailure = (code: GoogletagDiagnosticsFailureCode): void => {
     try {
@@ -3032,6 +3085,7 @@ export function createBrowserGoogletagAdapter(
 
   return Object.freeze({
     bindingStatus: (): GoogletagBindingStatus => currentBinding().status,
+    enqueueGamAttribution,
     adoptDiagnosticsState,
     diagnosticsIdentity: (slot: object): Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined => {
       const state = diagnosticsSlotState(slot);

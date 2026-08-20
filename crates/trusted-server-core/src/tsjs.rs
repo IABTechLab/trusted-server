@@ -163,6 +163,15 @@ impl IntegrationConfigsV1 {
         selected.validate_manifest(module_ids)?;
         Ok(selected)
     }
+
+    fn gpt_gam_attribution_enabled(&self) -> bool {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == "gpt")
+            .and_then(|entry| entry.config.get("gamAttributionEnabled"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
 }
 
 impl Default for IntegrationConfigsV1 {
@@ -311,6 +320,7 @@ pub fn tsjs_bootstrap_fragment_v1(
         FirstDisplaySelectionConfigV1 {
             enabled_integrations: &enabled_integrations,
             creative: config.creative,
+            gam_attribution_enabled: config.integration_configs.gpt_gam_attribution_enabled(),
         },
     );
     let agent = match first_display.as_ref() {
@@ -562,6 +572,8 @@ pub struct FirstDisplaySelectionConfigV1<'a> {
     pub enabled_integrations: &'a [&'a str],
     /// Exact server-resolved parser-time creative guard policy.
     pub creative: CreativeBootConfigV1,
+    /// Whether GPT owns the document-local parser-time GAM attribution obligation.
+    pub gam_attribution_enabled: bool,
 }
 
 /// Exact ordered first-display slice mask selected for one immutable projection.
@@ -668,7 +680,7 @@ pub fn select_first_display_slices_v1(
     let creative_guard = enabled.contains("creative")
         && config.creative.enabled
         && (config.creative.click_guard || config.creative.render_guard);
-    let gpt_participates = winner_count > 0;
+    let gpt_participates = winner_count > 0 || config.gam_attribution_enabled;
     let prebid_participates =
         enabled.contains("prebid") && projection.bids.iter().any(|bid| bid.provider == "prebid");
     let mut mask = 0_u16;
@@ -1286,6 +1298,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn production_bootstrap_selects_gpt_initial_for_attribution_without_a_winner() {
+        let configs = IntegrationConfigsV1::new(vec![(
+            "gpt",
+            serde_json::json!({
+                "gamAttributionEnabled": true,
+                "pageBidsEnabled": false,
+            }),
+        )])
+        .expect("GPT browser config should be admitted");
+        let projection = serde_json::to_string(&first_display_projection(None))
+            .expect("no-bid projection should serialize");
+
+        let script = tsjs_bootstrap_fragment_v1(
+            TsjsBootScriptConfigV1 {
+                module_ids: &["render_runtime", "gpt"],
+                integration_configs: &configs,
+                auction_projection_json: &projection,
+                creative: CreativeBootConfigV1 {
+                    enabled: false,
+                    click_guard: false,
+                    render_guard: false,
+                },
+                render_trace_overlay: false,
+                gpt_diagnostics_active: false,
+            },
+            "https://publisher.example",
+        )
+        .expect("attribution-only first-display bootstrap should serialize");
+
+        assert!(
+            script.contains(r#""slices":["first_display","gpt_initial"]"#),
+            "typed GAM attribution must select the GPT parser-time owner: {script}"
+        );
+        assert!(
+            script.contains("m=0041"),
+            "attribution-only first display must use the admitted GPT mask: {script}"
+        );
+    }
+
     fn hash_query_value(src: &str) -> &str {
         src.split_once("?v=")
             .map(|(_, hash)| hash)
@@ -1802,6 +1854,7 @@ mod tests {
             FirstDisplaySelectionConfigV1 {
                 enabled_integrations: &enabled,
                 creative: CreativeBootConfigV1::default(),
+                gam_attribution_enabled: false,
             },
         )
         .expect("closed no-bid batch should select the base agent");
@@ -1813,6 +1866,7 @@ mod tests {
             FirstDisplaySelectionConfigV1 {
                 enabled_integrations: &enabled,
                 creative: CreativeBootConfigV1::default(),
+                gam_attribution_enabled: false,
             },
         )
         .expect("closed GPT ADM batch should select GPT initial ownership");
@@ -1825,6 +1879,7 @@ mod tests {
                 FirstDisplaySelectionConfigV1 {
                     enabled_integrations: &enabled,
                     creative: CreativeBootConfigV1::default(),
+                    gam_attribution_enabled: false,
                 },
             )
             .is_none(),
@@ -1838,6 +1893,7 @@ mod tests {
                 FirstDisplaySelectionConfigV1 {
                     enabled_integrations: &enabled,
                     creative: CreativeBootConfigV1::default(),
+                    gam_attribution_enabled: false,
                 },
             )
             .is_none(),
@@ -1856,6 +1912,7 @@ mod tests {
                     click_guard: false,
                     render_guard: true,
                 },
+                gam_attribution_enabled: false,
             },
         )
         .expect("bounded creative/GPT configuration should select the agent");
@@ -1871,6 +1928,7 @@ mod tests {
             FirstDisplaySelectionConfigV1 {
                 enabled_integrations: &["aps", "gpt"],
                 creative: CreativeBootConfigV1::default(),
+                gam_attribution_enabled: false,
             },
         )
         .expect("bounded APS/GPT configuration should select the agent");
@@ -1887,6 +1945,7 @@ mod tests {
             FirstDisplaySelectionConfigV1 {
                 enabled_integrations: &["gpt", "prebid"],
                 creative: CreativeBootConfigV1::default(),
+                gam_attribution_enabled: false,
             },
         )
         .expect("bounded Prebid/GPT configuration should select the agent");
@@ -1924,6 +1983,7 @@ mod tests {
                     click_guard: false,
                     render_guard: true,
                 },
+                gam_attribution_enabled: false,
             },
         )
         .expect("the optimized closed composition should fit the generated budget");
@@ -1938,6 +1998,7 @@ mod tests {
                 FirstDisplaySelectionConfigV1 {
                     enabled_integrations: &unknown,
                     creative: CreativeBootConfigV1::default(),
+                    gam_attribution_enabled: false,
                 },
             )
             .is_none(),

@@ -17,6 +17,7 @@ import { OSANO_INITIAL_SLICE } from '../../src/first_display/slices/osano';
 import { PERMUTIVE_INITIAL_SLICE } from '../../src/first_display/slices/permutive';
 import { SOURCEPOINT_INITIAL_SLICE } from '../../src/first_display/slices/sourcepoint';
 import { TESTLIGHT_INITIAL_SLICE } from '../../src/first_display/slices/testlight';
+import type { InitialSliceInstaller } from '../../src/first_display/slices/definition';
 import type { FirstDisplayRouteRuleV1 } from '../../src/first_display/leaf/route_guard';
 import { installDidomiInitial } from '../../src/first_display/leaf/config_guard';
 import type { FirstDisplayCreativeGuardV1 } from '../../src/first_display/leaf/creative_guard';
@@ -146,22 +147,26 @@ describe('first-display initial slice definitions', () => {
         }),
         own
       ),
-      installGptInitial(Object.freeze({ observe, register }), own, () =>
-        Object.freeze({
-          start: () => true,
-          closeIngress: () => true,
-          captureHandoff: () => Object.freeze([]),
-          captureDiagnosticsHandoff: () =>
-            Object.freeze({
-              cycles: Object.freeze([]),
-              facts: Object.freeze([]),
-              nextTraceTokenOrdinal: 1,
-              overflowCount: 0,
-              dropCount: 0,
-            }),
-          detachCommittedSlots: () => true,
-          dispose: () => undefined,
-        })
+      installGptInitial(
+        Object.freeze({ gam: () => true, observe, register }),
+        own,
+        () =>
+          Object.freeze({
+            start: () => true,
+            closeIngress: () => true,
+            captureHandoff: () => Object.freeze([]),
+            captureDiagnosticsHandoff: () =>
+              Object.freeze({
+                cycles: Object.freeze([]),
+                facts: Object.freeze([]),
+                nextTraceTokenOrdinal: 1,
+                overflowCount: 0,
+                dropCount: 0,
+              }),
+            detachCommittedSlots: () => true,
+            dispose: () => undefined,
+          }),
+        Object.freeze({ gamAttributionEnabled: false, pageBidsEnabled: true })
       ),
       installPrebidInitial(Object.freeze({ observe, register }), own),
     ];
@@ -181,6 +186,52 @@ describe('first-display initial slice definitions', () => {
       expect(Object.isFrozen(protocol)).toBe(true);
     }
   });
+
+  it.each([false, true])(
+    'projects the typed GAM attribution flag into the first-display GPT owner (%s)',
+    (gamAttributionEnabled) => {
+      const observe = vi.fn();
+      const gam = vi.fn(() => true);
+      let protocol: FirstDisplayGptProtocolV1 | undefined;
+      const createBatch = vi.fn((_input: unknown) =>
+        Object.freeze({
+          start: () => true,
+          closeIngress: () => true,
+          captureHandoff: () => Object.freeze([]),
+          captureDiagnosticsHandoff: () =>
+            Object.freeze({
+              cycles: Object.freeze([]),
+              facts: Object.freeze([]),
+              nextTraceTokenOrdinal: 1,
+              overflowCount: 0,
+              dropCount: 0,
+            }),
+          detachCommittedSlots: () => true,
+          dispose: () => undefined,
+        })
+      );
+      installGptInitial(
+        Object.freeze({
+          gam,
+          observe,
+          register: (candidate: FirstDisplayGptProtocolV1) => {
+            protocol = candidate;
+            return () => undefined;
+          },
+        }),
+        () => undefined,
+        createBatch,
+        Object.freeze({ gamAttributionEnabled, pageBidsEnabled: true })
+      );
+
+      protocol?.createBatch({} as never);
+
+      expect(createBatch).toHaveBeenCalledOnce();
+      expect(createBatch.mock.calls[0]?.[0]).toEqual({});
+      expect(gam).toHaveBeenCalledTimes(gamAttributionEnabled ? 1 : 0);
+      expect(observe).toHaveBeenCalledWith('gam', gamAttributionEnabled);
+    }
+  );
 
   it('pins the exact twelve optional slices in build order', () => {
     expect(INITIAL_SLICE_DEFINITIONS.map(({ id }) => id)).toEqual([
@@ -366,10 +417,10 @@ describe('first-display initial slice definitions', () => {
       activate: (
         id: string,
         own: (dispose: () => void) => void,
-        install?: (candidate: unknown, ownEffect: (dispose: () => void) => void) => void
+        install?: InitialSliceInstaller
       ) => {
         expect(id).toBe('didomi_initial');
-        install?.(bindings, own);
+        install?.(bindings, own, undefined);
       },
     });
     const prepared = DIDOMI_INITIAL_SLICE.prepare(host);
@@ -478,7 +529,7 @@ describe('first-display initial slice definitions', () => {
       activate: (
         id: string,
         own: (dispose: () => void) => void,
-        install?: (candidate: unknown, ownEffect: (dispose: () => void) => void) => void
+        install?: InitialSliceInstaller
       ) => {
         expect(id).toBe('testlight_initial');
         install?.(
@@ -487,7 +538,8 @@ describe('first-display initial slice definitions', () => {
             observe: (_name: string, count: number) => observations.push(count),
             target,
           }),
-          own
+          own,
+          undefined
         );
       },
     });
@@ -550,7 +602,7 @@ describe('first-display initial slice definitions', () => {
         activate: (
           _id: string,
           own: (release: () => void) => void,
-          install?: (candidate: unknown, ownEffect: (release: () => void) => void) => void
+          install?: InitialSliceInstaller
         ) =>
           install?.(
             Object.freeze({
@@ -561,7 +613,8 @@ describe('first-display initial slice definitions', () => {
                 return dispose;
               },
             }),
-            own
+            own,
+            undefined
           ),
       });
       fixture.definition.prepare(host).activate(
@@ -609,8 +662,8 @@ describe('first-display initial slice definitions', () => {
       activate: (
         _id: string,
         own: (release: () => void) => void,
-        install?: (candidate: unknown, ownEffect: (release: () => void) => void) => void
-      ) => install?.(bindings, own),
+        install?: InitialSliceInstaller
+      ) => install?.(bindings, own, undefined),
     });
 
     LOCKR_INITIAL_SLICE.prepare(host).activate(
@@ -677,10 +730,10 @@ describe('first-display initial slice definitions', () => {
       activate: (
         id: string,
         own: (release: () => void) => void,
-        install?: (candidate: unknown, ownEffect: (release: () => void) => void) => void
+        install?: InitialSliceInstaller
       ) => {
         expect(id).toBe('permutive_initial');
-        install?.(bindings, own);
+        install?.(bindings, own, undefined);
       },
     });
 
@@ -753,10 +806,10 @@ describe('first-display initial slice definitions', () => {
       activate: (
         id: string,
         own: (release: () => void) => void,
-        install?: (candidate: unknown, ownEffect: (release: () => void) => void) => void
+        install?: InitialSliceInstaller
       ) => {
         expect(id).toBe('sourcepoint_initial');
-        install?.(bindings, own);
+        install?.(bindings, own, undefined);
       },
     });
 
@@ -822,10 +875,10 @@ describe('first-display initial slice definitions', () => {
       activate: (
         id: string,
         own: (release: () => void) => void,
-        install?: (candidate: unknown, ownEffect: (release: () => void) => void) => void
+        install?: InitialSliceInstaller
       ) => {
         expect(id).toBe('osano_initial');
-        install?.(bindings, own);
+        install?.(bindings, own, undefined);
       },
     });
 
@@ -981,10 +1034,10 @@ describe('first-display initial slice definitions', () => {
       activate: (
         id: string,
         own: (dispose: () => void) => void,
-        install?: (candidate: unknown, ownEffect: (dispose: () => void) => void) => void
+        install?: InitialSliceInstaller
       ) => {
         expect(id).toBe('creative_initial');
-        install?.(bindings, own);
+        install?.(bindings, own, undefined);
       },
     });
 
@@ -1041,7 +1094,7 @@ describe('first-display initial slice definitions', () => {
         activate: (
           _id: string,
           own: (dispose: () => void) => void,
-          install?: (candidate: unknown, ownEffect: (dispose: () => void) => void) => void
+          install?: InitialSliceInstaller
         ) =>
           install?.(
             Object.freeze({
@@ -1053,7 +1106,8 @@ describe('first-display initial slice definitions', () => {
               observe: () => undefined,
               register,
             }),
-            own
+            own,
+            undefined
           ),
       });
       expect(() =>
@@ -1081,10 +1135,10 @@ describe('first-display initial slice definitions', () => {
       activate: (
         id: string,
         own: (dispose: () => void) => void,
-        install?: (candidate: unknown, ownEffect: (dispose: () => void) => void) => void
+        install?: InitialSliceInstaller
       ) => {
         expect(id).toBe('aps_initial');
-        install?.(bindings, own);
+        install?.(bindings, own, undefined);
       },
     });
 
@@ -1162,6 +1216,7 @@ describe('first-display initial slice definitions', () => {
     const disposers: Array<() => void> = [];
     let protocol: FirstDisplayGptProtocolV1 | undefined;
     const bindings = Object.freeze({
+      gam: vi.fn(() => true),
       observe: vi.fn(),
       register: (candidate: FirstDisplayGptProtocolV1) => {
         protocol = candidate;
@@ -1172,10 +1227,14 @@ describe('first-display initial slice definitions', () => {
       activate: (
         id: string,
         own: (dispose: () => void) => void,
-        install?: (candidate: unknown, ownEffect: (dispose: () => void) => void) => void
+        install?: InitialSliceInstaller
       ) => {
         expect(id).toBe('gpt_initial');
-        install?.(bindings, own);
+        install?.(
+          bindings,
+          own,
+          Object.freeze({ gamAttributionEnabled: false, pageBidsEnabled: true })
+        );
       },
     });
 
@@ -1232,10 +1291,10 @@ describe('first-display initial slice definitions', () => {
       activate: (
         id: string,
         own: (dispose: () => void) => void,
-        install?: (candidate: unknown, ownEffect: (dispose: () => void) => void) => void
+        install?: InitialSliceInstaller
       ) => {
         expect(id).toBe('prebid_initial');
-        install?.(bindings, own);
+        install?.(bindings, own, undefined);
       },
     });
 

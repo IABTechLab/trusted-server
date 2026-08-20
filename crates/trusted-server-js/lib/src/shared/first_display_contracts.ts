@@ -468,9 +468,16 @@ function validParserValues(
     typeof value === 'number' && Number.isInteger(value) && value >= 0;
   switch (sliceId) {
     case 'aps_initial':
-    case 'gpt_initial':
     case 'prebid_initial':
       return single('protocol_version', (value) => value === 1);
+    case 'gpt_initial':
+      return (
+        values.length === 2 &&
+        values[0]?.[0] === 'gam' &&
+        typeof values[0][1] === 'boolean' &&
+        values[1]?.[0] === 'v' &&
+        values[1][1] === 1
+      );
     case 'creative_initial':
       return single('guard_count', (value) => integer(value) && value >= 1 && value <= 3);
     case 'datadome_initial':

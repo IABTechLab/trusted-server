@@ -61,6 +61,47 @@ function createReadyGoogletag(
 describe('browser googletag adapter readiness', () => {
   afterEach(() => vi.useRealTimers());
 
+  it('enqueues GAM attribution once before later publisher commands', () => {
+    const ready = createReadyGoogletag({ deferCommands: true });
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    const order: string[] = [];
+    ready.googletag.setConfig.mockImplementation((config) => {
+      order.push('trusted-server');
+      return JSON.stringify(config);
+    });
+
+    expect(adapter.enqueueGamAttribution()).toBe(true);
+    expect(adapter.enqueueGamAttribution()).toBe(true);
+    ready.googletag.cmd.push(() => order.push('publisher'));
+
+    expect(ready.commands).toHaveLength(2);
+    ready.commands.splice(0).forEach((command) => command());
+    expect(order).toEqual(['trusted-server', 'publisher']);
+    expect(ready.googletag.setConfig).toHaveBeenCalledExactlyOnceWith({
+      targeting: { ts: 'true' },
+    });
+  });
+
+  it('creates an absent GPT queue and isolates a missing or throwing targeting API', () => {
+    const target: { googletag?: unknown } = {};
+    const adapter = createBrowserGoogletagAdapter(target);
+
+    expect(adapter.enqueueGamAttribution()).toBe(true);
+    const created = target.googletag as { cmd: Array<() => void> };
+    expect(created.cmd).toHaveLength(1);
+    expect(() => created.cmd[0]?.()).not.toThrow();
+
+    const publisher = vi.fn();
+    const throwing = createReadyGoogletag();
+    throwing.googletag.setConfig.mockImplementation(() => {
+      throw new Error('targeting unavailable');
+    });
+    const throwingAdapter = createBrowserGoogletagAdapter({ googletag: throwing.googletag });
+    expect(throwingAdapter.enqueueGamAttribution()).toBe(true);
+    expect(() => throwing.googletag.cmd.push(publisher)).not.toThrow();
+    expect(publisher).toHaveBeenCalledOnce();
+  });
+
   it('reports present and gives the command only a frozen narrow facade', async () => {
     const ready = createReadyGoogletag();
     const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });

@@ -59,8 +59,11 @@ function handoff(revision = 0): Record<string, unknown> {
     parserState: [
       {
         sliceId: 'gpt_initial',
-        observations: ['protocol_version'],
-        values: [['protocol_version', 1]],
+        observations: ['gam', 'v'],
+        values: [
+          ['gam', false],
+          ['v', 1],
+        ],
       },
     ],
     gptDiagnostics: { facts: [], overflowCount: 0, dropCount: 0 },

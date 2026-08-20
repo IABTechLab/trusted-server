@@ -160,6 +160,7 @@ function createGptHarness(
   });
   const adapter: GoogletagAdapter = Object.freeze({
     bindingStatus: () => 'present',
+    enqueueGamAttribution: vi.fn(() => true),
     diagnosticsIdentity: () => undefined,
     dispose: vi.fn(),
     notifyReady: vi.fn(),
@@ -4626,6 +4627,7 @@ describe('Task 11 adversarial ownership review', () => {
       let rejectNext = true;
       const adapter: GoogletagAdapter = Object.freeze({
         bindingStatus: () => 'present',
+        enqueueGamAttribution: vi.fn(() => true),
         diagnosticsIdentity: () => undefined,
         dispose: vi.fn(),
         notifyReady: vi.fn(),
