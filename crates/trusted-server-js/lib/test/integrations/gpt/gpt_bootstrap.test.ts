@@ -174,6 +174,7 @@ describe('gpt_bootstrap.js fallback', () => {
     const setConfig = vi.fn(() => {
       throw new Error('publisher setConfig failed');
     });
+    const warn = vi.fn();
     const disableInitialLoad = vi.fn();
     const pubads = {
       disableInitialLoad,
@@ -181,6 +182,16 @@ describe('gpt_bootstrap.js fallback', () => {
       refresh: vi.fn(),
     };
     const publisherCommand = vi.fn();
+    (window as TestWindow).tsjs = {
+      log: {
+        setLevel: vi.fn(),
+        getLevel: vi.fn(() => 'warn'),
+        info: vi.fn(),
+        warn,
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    };
     (window as TestWindow).googletag = makeGoogleTag({
       cmd: queue,
       setConfig,
@@ -193,6 +204,7 @@ describe('gpt_bootstrap.js fallback', () => {
 
     expect(() => [...queue].forEach((command) => command())).not.toThrow();
     expect(setConfig).toHaveBeenCalledWith({ targeting: { ts: 'true' } });
+    expect(warn).toHaveBeenCalledWith('GAM attribution targeting failed', expect.any(Error));
     expect(publisherCommand).toHaveBeenCalledTimes(1);
     expect(typeof (window as TestWindow).tsjs!.adInit).toBe('function');
     pubads.disableInitialLoad();

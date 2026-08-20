@@ -1430,7 +1430,7 @@ mod tests {
     #[test]
     fn head_inserts_queue_gam_attribution_before_guard_and_ad_requests() {
         let targeting_index = GPT_BOOTSTRAP_JS
-            .find("gpt.setConfig({ targeting: { ts: 'true' } })")
+            .find("gpt.setConfig({ targeting: { ts: \"true\" } })")
             .expect("should apply the fixed page-level GAM targeting pair");
         let guard_index = GPT_BOOTSTRAP_JS
             .find("if (ts.adInit) return;")

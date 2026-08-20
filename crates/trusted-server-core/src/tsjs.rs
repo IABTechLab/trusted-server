@@ -22,7 +22,22 @@ pub fn tsjs_script_tag_with_attributes(
 ) -> String {
     let attributes = attributes
         .iter()
-        .map(|(name, value)| format!(" {name}=\"{value}\""))
+        .map(|(name, value)| {
+            debug_assert!(
+                !name.is_empty()
+                    && name.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    }),
+                "attribute name should contain only lowercase ASCII letters, digits, and hyphens"
+            );
+            debug_assert!(
+                !value
+                    .bytes()
+                    .any(|byte| matches!(byte, b'"' | b'&' | b'<' | b'>')),
+                "attribute value should not contain HTML-sensitive characters"
+            );
+            format!(" {name}=\"{value}\"")
+        })
         .collect::<String>();
 
     format!(
@@ -204,6 +219,46 @@ mod tests {
             format!("<script src=\"{src}\" id=\"trustedserver-js\"></script>"),
             "should keep the generic tag byte-for-byte unmarked"
         );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "attribute name should contain only lowercase ASCII letters, digits, and hyphens"
+    )]
+    fn publisher_tsjs_script_tag_rejects_invalid_attribute_name() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-bad_name", "true")]);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "attribute name should contain only lowercase ASCII letters, digits, and hyphens"
+    )]
+    fn publisher_tsjs_script_tag_rejects_empty_attribute_name() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("", "true")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_double_quote_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad\"value")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_ampersand_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad&value")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_less_than_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad<value")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "attribute value should not contain HTML-sensitive characters")]
+    fn publisher_tsjs_script_tag_rejects_greater_than_in_attribute_value() {
+        let _ = tsjs_script_tag_with_attributes(&["gpt"], &[("data-safe-name", "bad>value")]);
     }
 
     #[test]
