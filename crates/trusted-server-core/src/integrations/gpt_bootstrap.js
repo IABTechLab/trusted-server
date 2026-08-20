@@ -17,6 +17,27 @@
 (function () {
   if (typeof window === "undefined") return;
   var ts = (window.tsjs = window.tsjs || {});
+  var tag;
+
+  if (window.__tsjs_gam_attribution_enabled === true) {
+    tag = window.googletag = window.googletag || { cmd: [] };
+    tag.cmd = tag.cmd || [];
+    tag.cmd.push(function () {
+      try {
+        var gpt = window.googletag;
+        if (gpt && typeof gpt.setConfig === "function") {
+          // "ts" is the fixed GAM key, not the local window.tsjs alias.
+          gpt.setConfig({ targeting: { ts: "true" } });
+        }
+      } catch (error) {
+        // Attribution must not interrupt the existing bootstrap queue.
+        ts.log &&
+          ts.log.warn &&
+          ts.log.warn("GAM attribution targeting failed", error);
+      }
+    });
+  }
+
   if (ts.adInit) return;
 
   // Track whether the publisher disabled GPT initial load. Read the effective
@@ -38,7 +59,9 @@
     return true;
   }
 
-  (window.googletag = window.googletag || { cmd: [] }).cmd.push(function () {
+  tag = tag || (window.googletag = window.googletag || { cmd: [] });
+  tag.cmd = tag.cmd || [];
+  tag.cmd.push(function () {
     var gpt = window.googletag;
     syncInitialLoadDisabled(gpt);
     if (

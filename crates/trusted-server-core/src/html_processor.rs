@@ -431,7 +431,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     }
                     // Main bundle: core + non-deferred integrations (synchronous).
                     let immediate_ids = integrations.js_module_ids_immediate();
-                    snippet.push_str(&tsjs::tsjs_script_tag(&immediate_ids));
+                    let script_attributes = integrations.tsjs_script_tag_attributes();
+                    snippet.push_str(&tsjs::tsjs_script_tag_with_attributes(
+                        &immediate_ids,
+                        &script_attributes,
+                    ));
                     // Active diagnostics loads synchronously after core so its
                     // GPT listeners precede publisher scripts in the origin head.
                     if let Some(module_tag) = gpt_diagnostics
@@ -954,6 +958,76 @@ mod tests {
         assert!(
             tsjs_index < title_index,
             "should prepend all injected content before existing head content"
+        );
+    }
+
+    #[test]
+    fn integration_head_injector_marks_only_attribution_enabled_gpt_bundle() {
+        fn process(gpt_config: Option<(bool, bool)>) -> String {
+            let integrations = if let Some((enabled, gam_attribution_enabled)) = gpt_config {
+                let mut settings = create_test_settings();
+                settings
+                    .integrations
+                    .insert_config(
+                        "gpt",
+                        &json!({
+                            "enabled": enabled,
+                            "gam_attribution_enabled": gam_attribution_enabled
+                        }),
+                    )
+                    .expect("should insert GPT config");
+                IntegrationRegistry::new(&settings).expect("should build GPT registry")
+            } else {
+                IntegrationRegistry::empty_for_tests()
+            };
+            let mut config = create_test_config();
+            config.integrations = integrations;
+            let mut processor = create_html_processor(config);
+            let output = processor
+                .process_chunk(b"<html><head></head><body></body></html>", true)
+                .expect("should process HTML");
+
+            String::from_utf8(output).expect("should produce valid UTF-8")
+        }
+
+        let attributed = process(Some((true, true)));
+        let unattributed = process(Some((true, false)));
+        let disabled_gpt = process(Some((false, true)));
+        let without_gpt = process(None);
+
+        for html in [&attributed, &unattributed, &disabled_gpt, &without_gpt] {
+            assert_eq!(
+                html.matches("id=\"trustedserver-js\"").count(),
+                1,
+                "should emit exactly one publisher bundle tag: {html}"
+            );
+        }
+        assert!(
+            attributed.contains("data-ts-gam-attribution=\"true\""),
+            "should mark only an attribution-enabled GPT publisher bundle"
+        );
+        assert!(
+            !unattributed.contains("data-ts-gam-attribution"),
+            "should leave an attribution-disabled GPT publisher bundle unmarked"
+        );
+        assert!(
+            !disabled_gpt.contains("data-ts-gam-attribution"),
+            "should let the GPT master switch suppress attribution metadata"
+        );
+        assert!(
+            !without_gpt.contains("data-ts-gam-attribution"),
+            "should leave a non-GPT publisher bundle unmarked"
+        );
+
+        let head_insert_index = attributed
+            .find("window.__tsjs_installGptShim")
+            .expect("should include the GPT head insert");
+        let publisher_bundle_index = attributed
+            .find("id=\"trustedserver-js\"")
+            .expect("should include the publisher bundle");
+        assert!(
+            head_insert_index < publisher_bundle_index,
+            "should keep integration head inserts before the publisher bundle"
         );
     }
 
