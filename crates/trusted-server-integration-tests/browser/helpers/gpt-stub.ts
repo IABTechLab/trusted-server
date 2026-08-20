@@ -25,6 +25,7 @@ export async function installGptStub(page: Page): Promise<void> {
     let initialLoadDisabled = false;
     let requestStartOnDisplay = false;
     let nonemptyCompletionOnDisplay = false;
+    let destroySucceeds = true;
 
     const createSlot = (id: string, adUnitPath: string): StubSlot => {
       const targeting = new Map<string, string[]>();
@@ -111,6 +112,7 @@ export async function installGptStub(page: Page): Promise<void> {
       pubadsReady: true,
       cmd: commandQueue,
       destroySlots(requested?: StubSlot[]) {
+        if (!destroySucceeds) return false;
         const candidates = requested ?? [...physicalSlots];
         for (const slot of candidates) physicalSlots.delete(slot);
         return true;
@@ -297,6 +299,7 @@ export async function installGptStub(page: Page): Promise<void> {
           pairedHistoryWrappers: boolean;
         };
         refreshCount(): number;
+        publisherDestroy(slotId: string, succeeds?: boolean): boolean;
         publisherRefresh(slotId: string): void;
         renderUniversalCreative(slotId: string, adId: string): void;
         slot(id: string, adUnitPath?: string): StubSlot;
@@ -340,6 +343,18 @@ export async function installGptStub(page: Page): Promise<void> {
       },
       refreshCount() {
         return refreshCalls.length;
+      },
+      publisherDestroy(slotId: string, succeeds = true) {
+        const slot = slots.get(slotId);
+        if (!slot || !physicalSlots.has(slot)) {
+          throw new Error(`missing fictional publisher slot: ${slotId}`);
+        }
+        destroySucceeds = succeeds;
+        try {
+          return googletag.destroySlots([slot]);
+        } finally {
+          destroySucceeds = true;
+        }
       },
       publisherRefresh(slotId: string) {
         const slot = slots.get(slotId);

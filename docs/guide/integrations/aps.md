@@ -288,6 +288,11 @@ After the native runner loads, Trusted Server replaces the existing children of 
 
 For client-side `trustedServer` adapter auctions, Prebid generates its own `hb_adid`. Trusted Server binds that generated ID to the validated APS descriptor in a bounded, expiring browser registry before GAM refresh. The bridge verifies that the requesting Universal Creative iframe belongs to the same ad unit, consumes the capability once, and passes the APS bid ID separately to the Amazon runner.
 
+The protected browser conformance environment uses Prebid Universal Creative
+`1.17.2`. Configure that release in GAM outside this repository. Trusted Server
+does not vendor, proxy, pin, archive, or serve PUC bytes; the version is test and
+operator metadata for the externally hosted creative only.
+
 These paths do not fetch PBS Cache, fire generic APS win/billing beacons, or call `apstag.setDisplayBids()` for the Trusted Server winner. Publisher-owned native APS objects are otherwise left untouched.
 
 ## Publisher CSP
@@ -325,11 +330,8 @@ This release is a direct configuration and protocol cutover:
 6. Prepare GAM line items and Universal Creative for `hb_bidder=aps` and the selected APS `hb_adid`.
 7. Disable publisher-native APS demand for the Trusted Server test cohort.
 
-There is no legacy runtime switch. Roll back by disabling `[auction]` or
-removing the APS provider, restoring native APS for the cohort, or deploying
-the prior binary.
-
-Changing `rendering_mode` does not update pages that are already loaded or stored in an HTML cache. A cached `trusted_server` page can continue requesting `/integrations/aps/renderer` after a native-mode deployment removes that route. A cached `publisher_native` page continues using its captured native mode after rollback. Coordinate the mode change with HTML cache expiry or purge and reload active test sessions before judging the result.
+There is no legacy runtime switch. Roll back by disabling `[integrations.aps]`, restoring native APS for the cohort, or deploying the prior binary.
+Disabling `[integrations.aps]` is also the containment stop for renderer or live-runner incidents: it removes APS auction and browser materialization ownership without adding a cached or vendored fallback.
 
 ## Rollout
 
