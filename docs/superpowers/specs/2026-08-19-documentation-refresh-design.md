@@ -37,8 +37,8 @@ found systemic drift in every surface. The failures fall into five categories:
    (only Fastly has a setup guide, and it is orphaned from the nav), EdgeZero
    platform layer, auction telemetry/Tinybird (a 17-file `tinybird/` directory
    with no operator path to a working config), the tsjs module system, GPT
-   slot handoff, cross-adapter parity testing, `testlight` (the canonical
-   reference integration), and `adserver_mock`. Seven of ten crates have no
+   slot handoff, cross-adapter parity testing, `testlight` (the example/test
+   integration the integration guide mirrors), and `adserver_mock`. Seven of ten crates have no
    README, including all four adapters and the CLI.
 4. **Publishing and policy hygiene.** All 75 internal spec/plan files under
    `docs/superpowers/` are built and published to the public GitHub Pages site
@@ -134,8 +134,8 @@ Smallest package, highest urgency.
   delete the CNAME and keep the project-path deploy; revisit if a custom
   domain is actually provisioned. Update `docs/README.md:138` and `:172`
   accordingly.
-- `fastly.toml`: replace the personal email in `authors` with a team alias or
-  empty list; remove or externalize the hardcoded `service_id` (confirm the
+- `fastly.toml`: replace the personal email in `authors` with an empty list
+  (matching the workspace `Cargo.toml`); remove or externalize the hardcoded `service_id` (confirm the
   deploy workflow's expectations first; the CHANGELOG already claims this
   removal happened); add `# local test fixture, not a real key` labels to the
   `[local_server]` secret/JWKS entries; add one-line comments to the four KV
@@ -168,7 +168,9 @@ replacement prose; the goal is that nothing documented is false.
 - `docs/guide/integrations-overview.md:46-48`: remove the same dead routes.
 - `docs/guide/ad-serving.md`: remove the Equativ section, the
   `[ad_servers.equativ]` block, the top-level `[prebid]` block (real section
-  is `[integrations.prebid]`), and the placeholder `trackImpression` API.
+  is `[integrations.prebid]`), and the placeholder `trackImpression` API;
+  also remove the `equativ` bidder from the example in
+  `docs/guide/integration-guide.md:313`.
   Rewrite the page as a short, accurate description of the real flow:
   creative opportunities matched during HTML processing, server-side auction,
   creative rewriting to the first-party proxy, GPT handoff.
@@ -221,7 +223,8 @@ replacement prose; the goal is that nothing documented is false.
 - `docs/guide/getting-started.md:141`: `[gdpr]` does not exist; the section
   is `[consent]`.
 
-Acceptance: grepping the docs tree for `first-party/ad`, `third-party/ad`,
+Acceptance: grepping all tracked markdown and example config (the docs tree
+plus root files and crate READMEs) for `first-party/ad`, `third-party/ad`,
 `equativ`, `ad_servers`, `RequestWrapper`, `trackImpression`, `SEQUENCE.md`,
 `synthetic_id`, `providers/your_provider`, and `mock = true` (APS context)
 returns nothing; no sidebar entry points at a nonexistent integration.
@@ -277,9 +280,9 @@ Rebuild `docs/guide/api-reference.md` from the route inventory (Appendix A).
 - Document the fallback dispatch order (tsjs, integration proxy routes,
   asset routes, publisher origin proxy) so route-shadowing questions are
   answerable from docs.
-- Add an Integration Endpoints section generated from the registry proxy
-  table (Appendix C column "proxy routes") instead of today's three-entry
-  list.
+- Add an Integration Endpoints section generated from each integration's
+  `IntegrationProxy::routes()` registration (the integrations are enumerated
+  in Appendix C) instead of today's three-entry list.
 - State auth expectations per route group: Basic auth handlers covering
   `Settings::ADMIN_ENDPOINTS`, Bearer auth on the partner API, `tstoken`
   signing on first-party proxy URLs.
@@ -329,7 +332,8 @@ route names its handler file.
   performance tables from 7 to all 14 IDs using the registry capability
   matrix (Appendix C).
 - Testing docs: rewrite root `TESTING.md` as the test-matrix index (the
-  aliases from `.cargo/config.toml`, the eight CI test jobs, the parity
+  aliases from `.cargo/config.toml`, the seven `test.yml` jobs plus the four
+  integration-test workflow jobs, the parity
   suite, `scripts/test-cli.sh`, integration/browser scripts, vitest), and
   move its current content, an auction curl runbook, into
   `docs/guide/auction-testing.md` cross-linked from the auction README.
@@ -365,10 +369,11 @@ serve`; link the four deployment guides; refresh the doc-site link table.
   Rewrite `crates/trusted-server-core/README.md` as an actual crate overview
   (currently covers 2 of ~40 modules), linking to the deep-dive docs.
 - New `scripts/README.md` (one line per script).
-- `ProjectGovernance.md`: correct the two claims contradicted by repo state
+- `ProjectGovernance.md`: the two claims contradicted by repo state
   (meeting minutes "maintained within the repository" - none exist;
-  "continuous releases" - none tagged since v1.1.0) or convert them to
-  intentions; link it from `CONTRIBUTING.md` so the governance model is
+  "continuous releases" - none tagged since v1.1.0) become accurate
+  statements of intent, unless open question 6 resolves them differently;
+  link it from `CONTRIBUTING.md` so the governance model is
   visible at the contribution point. Naming maintainers/CODEOWNERS is a
   maintainer decision, flagged as an open question.
 - Add `readme = "README.md"` to each crate's `Cargo.toml` once the READMEs
