@@ -1061,11 +1061,21 @@ impl IntegrationRegistry {
     /// Collect static attributes for the publisher TSJS bundle tag.
     #[must_use]
     pub fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
-        let mut attributes = Vec::new();
+        let mut attributes: Vec<(&'static str, &'static str)> = Vec::new();
         for injector in &self.inner.head_injectors {
             for attribute in injector.tsjs_script_tag_attributes() {
-                if !attributes.iter().any(|(name, _)| *name == attribute.0) {
-                    attributes.push(attribute);
+                let existing = attributes
+                    .iter()
+                    .find(|(name, _)| *name == attribute.0)
+                    .copied();
+                match existing {
+                    None => attributes.push(attribute),
+                    Some((_, kept_value)) if kept_value != attribute.1 => log::warn!(
+                        "Integration `{}` emits conflicting value for publisher tag attribute `{}`; keeping the first",
+                        injector.integration_id(),
+                        attribute.0
+                    ),
+                    Some(_) => {}
                 }
             }
         }
