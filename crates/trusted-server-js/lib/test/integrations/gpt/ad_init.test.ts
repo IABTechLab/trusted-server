@@ -1874,7 +1874,7 @@ describe('installTsAdInit', () => {
       setTargeting: vi.fn().mockReturnThis(),
       clearTargeting,
       getSlotElementId: vi.fn().mockReturnValue('div-old-route'),
-      getTargeting: vi.fn().mockReturnValue([]),
+      getTargeting: vi.fn((key: string) => (key === 'ts' ? ['publisher-value'] : [])),
     };
     const mockPubads = {
       enableSingleRequest: vi.fn(),
@@ -1908,6 +1908,7 @@ describe('installTsAdInit', () => {
     expect(clearTargeting).toHaveBeenCalledWith('hb_cache_path');
     expect(clearTargeting).toHaveBeenCalledWith('ts_initial');
     expect(clearTargeting).toHaveBeenCalledWith('pos');
+    expect(clearTargeting).not.toHaveBeenCalledWith('ts');
     expect(mockPubads.refresh).not.toHaveBeenCalled();
     expect((window as TestWindow).tsjs!.divToSlotId).toEqual({});
     expect((window as TestWindow).tsjs!.prevSlotTargetingKeys).toEqual({});

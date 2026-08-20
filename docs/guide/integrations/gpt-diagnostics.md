@@ -19,7 +19,7 @@ Server candidate, a PUC markup request, a successfully posted markup response, a
 GPT slot load are separate steps in an evidence ladder.
 
 This feature requires zero publisher-code changes. Activation remains the existing
-server integration configuration plus `?ts_console=true`; it does not require new
+server integration configuration plus `?ts_console=1`; it does not require new
 publisher JavaScript, React, Next.js, DOM, or GAM configuration.
 
 The diagnostics integration is independent of the
@@ -36,11 +36,36 @@ The module is unavailable unless explicitly enabled for the deployment:
 enabled = true
 ```
 
-Deployment configuration only makes the module available. Inactive browser sessions
-receive no diagnostics module. When activated, the standalone content-hashed module
-loads synchronously after the core bundle so it can install listeners before
-publisher GPT request code. The standalone static response is cookie-independent and
-remains publicly cacheable; active HTML responses are private and non-storeable.
+Deployment configuration makes the module available; it does not activate any browser
+session. Inactive browser sessions receive no diagnostics module. When activated, the
+standalone content-hashed module loads synchronously after the core bundle so it can
+install listeners before publisher GPT request code. The standalone static response is
+cookie-independent and remains publicly cacheable; active HTML responses are private
+and non-storeable.
+
+### Auction correlation token
+
+Enabling the integration has one further server-side effect, beyond module
+availability, that does not depend on browser activation. For each server-side auction
+that produced winning bids, Trusted Server mints a fresh correlation token and publishes
+it as `hb_auction_id` on each winning bid in `window.tsjs.bids`:
+
+```text
+ts-auc-2f8c1d5a4b7e4c0f9a3d6b1e8c5f2a7d
+```
+
+- The token is generated per auction from a random UUID. It is not derived from the Edge
+  Cookie ID, the auction request ID, or any other visitor identifier, and it does not
+  repeat across auctions.
+- It is **not** a GAM targeting key. Of the Trusted Server bid fields, only `hb_pb`,
+  `hb_bidder`, `hb_adid`, `hb_cache_host`, `hb_cache_path`, and `ts_initial` are applied
+  as slot targeting alongside the slot's configured targeting, so the token never enters
+  the ad request.
+- It is absent when the integration is disabled, and absent for any auction that
+  produced no winning bids.
+- It is published on every document whose auction produced winning bids, including
+  documents with no active console session, because the console reads it from the same
+  page bid state the GPT integration already consumes.
 
 ## Activate or Deactivate a Browser Session
 
@@ -56,7 +81,13 @@ Open a page with one of these exact, case-sensitive query directives:
 For example:
 
 ```text
-https://publisher.example.com/article?ts_console=true
+https://publisher.example.com/article?ts_console=1
+```
+
+Deactivate the same browser session with the matching directive:
+
+```text
+https://publisher.example.com/article?ts_console=0
 ```
 
 An exact directive establishes or clears the host-only, `Secure`, `HttpOnly`,
@@ -124,10 +155,11 @@ arguments, result, and synchronous throw. A `refresh()` call that omits its slot
 list, or passes `null` or `undefined` for it, refreshes every slot; the observer
 reads GPT's current slot list for diagnostics only. A stale refresh function
 reference captured before installation bypasses that boundary and remains
-`unattributed`. Prebid sets a scoped,
-synchronous diagnostics context while delegating its own refresh, so nesting does not
-mislabel a Prebid refresh as `competing`. Diagnostics never suppresses or changes a
-GPT request.
+`unattributed`. Prebid and the Trusted Server `adInit` refresh each set a scoped,
+synchronous diagnostics context while delegating their own refresh, so a nested
+`pubads.refresh` is not mislabeled `publisher_refresh` or `competing`. Both clear that
+context even when the delegated refresh throws, and the Prebid wrapper restores the
+exact prior value. Diagnostics never suppresses or changes a GPT request.
 
 For a direct observation, the optional opaque auction ID is retained only after
 trimming to a non-empty value no longer than 256 UTF-8 bytes. No auction payload,
@@ -170,31 +202,33 @@ that acknowledgement is outside the zero-publisher-change design.
 
 The derived `delivery` value uses these evidence-safe meanings:
 
-| Delivery state                 | Panel wording                                                                                      |
-| ------------------------------ | -------------------------------------------------------------------------------------------------- |
-| `trusted_server_response_sent` | Trusted Server selected; markup response sent to PUC                                               |
-| `trusted_server_selected`      | Trusted Server selected; no markup response confirmed                                              |
-| `candidate_unconfirmed`        | Trusted Server candidate unconfirmed — another GAM result or a creative/bridge failure is possible |
-| `no_candidate`                 | adInit observed no direct Trusted Server candidate for this request                                |
-| `unknown`                      | Delivery status unknown — required GPT or direct-candidate evidence was not observed               |
-| `pending`                      | Waiting for Trusted Server creative evidence                                                       |
-| `not_applicable`               | No delivery conclusion is displayed before render or for an explicitly empty result.               |
+| Delivery state                 | Panel wording                                                                                                                                               |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `trusted_server_response_sent` | Trusted Server selected; markup response sent to PUC                                                                                                        |
+| `trusted_server_selected`      | Trusted Server selected; no markup response confirmed                                                                                                       |
+| `candidate_unconfirmed`        | Trusted Server candidate unconfirmed — another GAM result or a creative/bridge failure is possible                                                          |
+| `no_candidate`                 | adInit observed no direct Trusted Server candidate for this request                                                                                         |
+| `unknown`                      | Delivery status unknown — required GPT or direct-candidate evidence was not observed                                                                        |
+| `pending`                      | Waiting for Trusted Server creative evidence                                                                                                                |
+| `not_applicable`               | No delivery conclusion is displayed before render or for an explicitly empty result, provided no Trusted Server creative evidence was stamped on the cycle. |
 
 For an explicit non-empty candidate, diagnostics wait five seconds from
 `slotRenderEnded` for positive creative evidence. If no matched PUC request arrives,
 the state becomes `candidate_unconfirmed`. Possible explanations include a different
 GAM result, targeting overwrite, PUC configuration or ID mismatch, and bridge failure;
-the missing request does not select among them. A late positive observation upgrades
-the state.
+the missing request does not select among them. A late positive observation inside the
+30-second attempt window upgrades the state.
 
 ### Creative-bridge failures
 
 A matched creative attempt can report these safe, non-terminal categories:
 
-- `missing_render_source`
-- `cache_fetch_failed`
-- `invalid_cache_payload`
-- `response_post_failed`
+| Failure                 | Observed at the bridge                                                                         |
+| ----------------------- | ---------------------------------------------------------------------------------------------- |
+| `missing_render_source` | The bid carried neither inline markup nor a complete PBS Cache host and path.                  |
+| `cache_fetch_failed`    | The PBS Cache fetch was rejected, failed while reading the body, or returned a non-OK status.  |
+| `invalid_cache_payload` | The cache response was read but held no renderable creative, so nothing was posted.            |
+| `response_post_failed`  | `port.postMessage` threw while posting markup, on either the inline or the cached-markup path. |
 
 Failures are deduplicated and retain first-observed order. Detailed URLs, cache IDs,
 payloads, markup, and error objects remain only in existing operational logging and do
@@ -218,6 +252,11 @@ GPT populates its source-agnostic line item and creative IDs for reservation and
 line-item backfill alike, so they classify as `reservation` only when GPT also
 reported the render as explicitly non-backfill. On their own they remain
 `unclassified_non_empty` rather than becoming an unsupported conclusion.
+
+Identifiers are retained only as positive whole numbers, and the yield-group and company
+lists keep at most eight IDs each. GPT reports these fields only for reservation and
+backfill ads served by PubAdsService, so an absent identifier is a fact about the render
+rather than a gap in observation.
 
 ## Attribution Issues and Callback Coverage
 
@@ -269,6 +308,28 @@ A concise viewport badge appears only when a slot:
 - Has at least one observed request.
 - Has a unique, connected exact binding.
 - Has a non-zero rectangle intersecting the viewport.
+
+A badge summarizes the slot's most recent request cycle: the GPT result (Filled, Empty,
+Rendered (fill unknown), or Pending), a short delivery label, a `Competing paths`
+marker when the request path is `competing`, the rendered size, and the request-to-
+response, response-to-render, and render-to-viewable durations that are available. It
+adds `Incomplete sequence` when a callback proved a missing or invalid earlier step.
+
+Badge delivery labels are the same derived states the panel and export report, shortened
+to fit:
+
+| Delivery state                 | Badge label             |
+| ------------------------------ | ----------------------- |
+| `trusted_server_response_sent` | TS response sent        |
+| `trusted_server_selected`      | TS selected             |
+| `pending`                      | TS candidate (pending)  |
+| `candidate_unconfirmed`        | TS unconfirmed          |
+| `no_candidate`                 | No TS candidate         |
+| `unknown`                      | Delivery unknown        |
+| `not_applicable`               | No delivery label shown |
+
+The badge never re-derives delivery from raw timestamps; it labels the state the store
+already resolved, so a badge cannot disagree with the panel or the export.
 
 Missing elements and duplicate DOM or GPT slot IDs remain visible in the panel as
 Unbound or Ambiguous and receive no badge. If DOM uniqueness cannot be verified
@@ -340,10 +401,13 @@ The allowlisted export contains:
 
 It does not contain raw targeting, bid IDs, bid prices, bidder identity, creative
 markup, cache URLs, cache payloads, cache or bridge error details, cookies, user
-identifiers, query strings, or URL fragments. The exported
-`trustedServerAuctionId` is a token minted fresh for each server-side auction: it
-is not derived from the Edge Cookie ID or any other visitor identifier, and it does
-not repeat across auctions, so it cannot be joined back to a visitor.
+identifiers, query strings, or URL fragments. The exported `trustedServerAuctionId`
+is the `hb_auction_id` value described in
+[Auction correlation token](#auction-correlation-token): minted fresh for each
+server-side auction, not derived from the Edge Cookie ID or any other visitor
+identifier, and never repeated across auctions, so it cannot be joined back to a
+visitor. Diagnostics retain it only after trimming to a non-empty value of at most
+256 UTF-8 bytes.
 
 Captured records are memory-only. Diagnostics do not add an upload, diagnostics
 network request, `localStorage`, `sessionStorage`, IndexedDB, or other persistence.
@@ -418,6 +482,58 @@ Overlapping requests for the same GPT Slot object cannot be correlated safely be
 documented callbacks do not expose a request-cycle identifier. Avoid overlap in
 controlled tests, or use the issue record as evidence that correlation was not
 possible.
+
+### A refresh is `unattributed` or `competing`
+
+`unattributed` means no request-path evidence was still eligible when GPT emitted
+`slotRequested`. Each source's marker lives five seconds and is consumed once, so a
+request more than five seconds after the observation, a refresh function reference the
+publisher captured before installation, and any path Trusted Server does not observe
+all stay `unattributed`. Diagnostics never fill that gap from timing, element IDs, or
+targeting names.
+
+`competing` means two or more sources contributed evidence for the same request. It is
+a warning that competition or overwrite is possible, not a statement about which values
+GPT sent. To narrow it in a controlled test, trigger one path at a time and leave more
+than five seconds between refreshes.
+
+### Delivery stays `candidate_unconfirmed`
+
+The cycle rendered explicitly non-empty with a Trusted Server candidate, but no matched
+creative markup request arrived within five seconds of `slotRenderEnded`. Read the
+cycle's other facts before concluding anything:
+
+- `responseClass` and the GAM identifiers show what Ad Manager reported delivering.
+- A creative-bridge failure category on the same cycle shows the bridge was reached and
+  failed.
+- An attribution issue at the same time shows the request arrived but could not be
+  correlated.
+- No evidence at all is consistent with a different GAM result, a targeting overwrite,
+  and a PUC configuration or ID mismatch alike.
+
+A late positive observation within the 30-second attempt window — measured from the
+cycle's GPT request, and only while that cycle is still retained — upgrades the state,
+so re-read the panel rather than exporting immediately after render.
+
+### Correlation evidence is missing
+
+Attribution issues record why creative evidence could not be attached. They never
+increment callback coverage and never create a delivery claim of their own, though
+evidence already stamped on a cycle still resolves that cycle's delivery state:
+
+| Reason                             | What was observed                                                                                                                                                                             |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `creative_request_without_slot`    | The markup request carried no auction slot ID, or no retained association mapped it to a GPT slot.                                                                                            |
+| `creative_request_without_cycle`   | The slot had no retained request cycle inside the 30-second attempt window, or its most recent cycle was already reported empty.                                                              |
+| `creative_request_ambiguous_cycle` | An earlier non-empty cycle for the same slot was still in window before render, so no cycle was chosen.                                                                                       |
+| `creative_request_on_empty_cycle`  | GPT later reported the matched cycle empty, so the attempt was dropped and cannot complete; selection or response evidence already stamped on that cycle still appears as its delivery state. |
+| `creative_attempt_capacity`        | The 128-attempt bound was reached with every retained attempt still live.                                                                                                                     |
+| `creative_attempt_unknown`         | A request, response, or failure referenced an attempt no longer retained.                                                                                                                     |
+| `creative_attempt_expired`         | The attempt passed its 30-second lifetime before its response or failure was observed.                                                                                                        |
+| `creative_attempt_evicted`         | The attempt's slot or request cycle was dropped first, by a retention bound or by GPT reporting that cycle empty.                                                                             |
+
+Repeated issues on a busy page usually mean retention bounds, not delivery failure.
+Reduce refresh overlap or capture a shorter session, then re-read the cycle.
 
 ## Limits
 
