@@ -1590,8 +1590,17 @@ presentation, orientation lock, and storage-access escape. The bootstrap's exact
 response CSP is:
 
 ```text
-default-src 'none'; sandbox allow-scripts; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'self'; form-action 'none';
+default-src 'none'; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' http: https:; connect-src http: https:; frame-src data: https:; img-src data: blob: http: https:; media-src blob: http: https:; style-src 'unsafe-inline' http: https:; font-src data: http: https:; worker-src blob: http: https:; frame-ancestors 'self'; form-action https:;
 ```
+
+The browser inherits this response policy across the bootstrap's `data:`
+navigation. It is therefore an intentional transport superset and has no CSP
+`sandbox` directive: otherwise it would block the nested data frame, same-origin
+runner proxy, inline layout, and permanent creative sandbox tokens required by the
+generated documents. The descriptor-free bootstrap has no pre-configuration
+network operation. After configuration, the generated outer and inner meta CSPs
+intersect with this response policy and narrow every network-capable directive to
+the exact Trusted Server and validated creative origins for that attempt.
 
 The bootstrap validates its exact `b1_` fragment nonce, sends readiness only to its
 actual `parent`, and accepts one canonical JSON configuration from that exact

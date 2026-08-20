@@ -68,7 +68,7 @@ pub const APS_RUNNER_BLOCKING_READ_TIMEOUT: Duration = Duration::from_millis(250
 pub fn is_aps_family_path(path: &str) -> bool {
     path == "/integrations/aps" || path.starts_with("/integrations/aps/")
 }
-const APS_RENDERER_V2_CSP: &str = "default-src 'none'; sandbox allow-scripts; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'self'; form-action 'none';";
+const APS_RENDERER_V2_CSP: &str = "default-src 'none'; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' http: https:; connect-src http: https:; frame-src data: https:; img-src data: blob: http: https:; media-src blob: http: https:; style-src 'unsafe-inline' http: https:; font-src data: http: https:; worker-src blob: http: https:; frame-ancestors 'self'; form-action https:;";
 
 // This document is served with an immutable v2 URL. Any semantic change must
 // ship at a new versioned route so cached v2 bytes retain their contract.
@@ -3393,7 +3393,7 @@ mod tests {
         assert!(!response.headers().contains_key("x-frame-options"));
         assert_eq!(
             APS_RENDERER_V2_CSP,
-            "default-src 'none'; sandbox allow-scripts; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'self'; form-action 'none';"
+            "default-src 'none'; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' http: https:; connect-src http: https:; frame-src data: https:; img-src data: blob: http: https:; media-src blob: http: https:; style-src 'unsafe-inline' http: https:; font-src data: http: https:; worker-src blob: http: https:; frame-ancestors 'self'; form-action https:;"
         );
         assert_eq!(
             APS_RENDERER_SANDBOX,

@@ -110,7 +110,7 @@ test.describe("APS renderer v2 protocol", () => {
     expect(rendererResponse.headers()["x-frame-options"]).toBeUndefined();
     const csp = rendererResponse.headers()["content-security-policy"];
     expect(csp).toBe(
-      "default-src 'none'; sandbox allow-scripts; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'self'; form-action 'none';",
+      "default-src 'none'; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' http: https:; connect-src http: https:; frame-src data: https:; img-src data: blob: http: https:; media-src blob: http: https:; style-src 'unsafe-inline' http: https:; font-src data: http: https:; worker-src blob: http: https:; frame-ancestors 'self'; form-action https:;",
     );
     const rendererDocument = await rendererResponse.text();
 
