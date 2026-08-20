@@ -332,6 +332,15 @@ describe('publisher-native APS runner contract tests', () => {
     expect(slot.querySelector('span')).not.toBeNull();
     expect(trustedServer).not.toHaveBeenCalled();
 
+    const runnerDocument = frame.contentDocument!;
+    expect(runnerDocument.documentElement.style.margin).toBe('0px');
+    expect(runnerDocument.documentElement.style.padding).toBe('0px');
+    expect(runnerDocument.body.style.margin).toBe('0px');
+    expect(runnerDocument.body.style.padding).toBe('0px');
+    const creativeFrame = runnerDocument.createElement('iframe');
+    runnerDocument.body.appendChild(creativeFrame);
+    await vi.waitFor(() => expect(creativeFrame.style.display).toBe('block'));
+
     runner.dispatchEvent(new Event('load'));
     await expect(accepted).resolves.toBe(true);
     expect(slot.querySelector('span')).toBeNull();

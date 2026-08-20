@@ -155,6 +155,9 @@ const FAKE_RUNNER = `(function(){
       if (bid.ext.tagtype === 'iframe') {
         var frame = document.createElement('iframe');
         frame.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+        frame.width = String(bid.w);
+        frame.height = String(bid.h);
+        frame.style.border = '0';
         frame.src = bid.ext.creativeurl;
         document.body.appendChild(frame);
       } else {
@@ -1054,6 +1057,29 @@ parent.postMessage(JSON.stringify({
         await expect(
             page.locator("#publisher-native-slot .existing"),
         ).toHaveCount(0);
+        expect(
+            await frame.evaluate((element: HTMLIFrameElement) => {
+                const document = element.contentDocument!;
+                const creative = document.body.querySelector("iframe")!;
+                return {
+                    bodyMargin: getComputedStyle(document.body).margin,
+                    bodyPadding: getComputedStyle(document.body).padding,
+                    creativeDisplay: getComputedStyle(creative).display,
+                    clientWidth: document.documentElement.clientWidth,
+                    clientHeight: document.documentElement.clientHeight,
+                    scrollWidth: document.documentElement.scrollWidth,
+                    scrollHeight: document.documentElement.scrollHeight,
+                };
+            }),
+        ).toEqual({
+            bodyMargin: "0px",
+            bodyPadding: "0px",
+            creativeDisplay: "block",
+            clientWidth: 300,
+            clientHeight: 250,
+            scrollWidth: 300,
+            scrollHeight: 250,
+        });
         expect(
             await page
                 .locator("#publisher-native-slot")
