@@ -2100,13 +2100,26 @@ impl CacheAssetRule {
 
         let preset_is_content_addressed =
             matches!(self.preset, Some(CacheAssetPreset::NextJsStatic));
-        if !preset_is_content_addressed && self.fingerprint_style.is_none() {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "cache.asset_rules `{}` sets immutable without fingerprint_style or a content-addressed preset",
-                    self.id
-                ),
-            }));
+        if !preset_is_content_addressed {
+            match self.fingerprint_style {
+                None => {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "cache.asset_rules `{}` sets immutable without fingerprint_style or a content-addressed preset",
+                            self.id
+                        ),
+                    }));
+                }
+                Some(CacheAssetFingerprintStyle::ViteBase64Url) => {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "cache.asset_rules `{}` cannot set immutable with vite-base64-url; use a content-addressed preset or an unambiguous fingerprint_style",
+                            self.id
+                        ),
+                    }));
+                }
+                Some(_) => {}
+            }
         }
 
         Ok(())
@@ -2222,15 +2235,30 @@ fn compile_cache_asset_glob_patterns(
     pattern: &str,
     compiled: &mut Vec<Pattern>,
 ) -> Result<(), String> {
-    compiled.push(Pattern::new(pattern).map_err(|err| err.to_string())?);
+    let mut variants = vec![pattern.to_string()];
+    let mut variant_index = 0;
 
-    if let Some(optional_recursive_start) = pattern.find("**/") {
-        let without_recursive_segment = format!(
-            "{}{}",
-            &pattern[..optional_recursive_start],
-            &pattern[optional_recursive_start + "**/".len()..]
-        );
-        compile_cache_asset_glob_patterns(&without_recursive_segment, compiled)?;
+    while variant_index < variants.len() {
+        let variant = variants[variant_index].clone();
+        let optional_segments = variant
+            .match_indices("**/")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for segment_start in optional_segments {
+            let without_segment = format!(
+                "{}{}",
+                &variant[..segment_start],
+                &variant[segment_start + "**/".len()..]
+            );
+            if !variants.contains(&without_segment) {
+                variants.push(without_segment);
+            }
+        }
+        variant_index += 1;
+    }
+
+    for variant in variants {
+        compiled.push(Pattern::new(&variant).map_err(|err| err.to_string())?);
     }
 
     Ok(())
@@ -2279,7 +2307,7 @@ fn path_extension(path: &str) -> Option<String> {
     (!extension.is_empty()).then(|| extension.to_ascii_lowercase())
 }
 
-/// Operator-selected filename fingerprint convention for an immutable custom rule.
+/// Operator-selected filename fingerprint convention for a cache rule.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum CacheAssetFingerprintStyle {
@@ -2287,7 +2315,7 @@ pub enum CacheAssetFingerprintStyle {
     Hex,
     /// An eight-character uppercase Base32 suffix, such as `app-VRTVD5R5.js`.
     EsbuildBase32,
-    /// An eight-character `Base64URL` suffix, such as `index-BsELY24f.js`.
+    /// An eight-character `Base64URL` suffix for non-immutable rules, such as `index-BsELY24f.js`.
     ViteBase64Url,
 }
 
@@ -3677,11 +3705,6 @@ mod tests {
                 "/assets/app-VRTVD5R5.js",
                 "/assets/index-BsELY24f.js",
             ),
-            (
-                "vite-base64-url",
-                "/assets/index-BsELY24f.js",
-                "/assets/app.0123abcd.js",
-            ),
         ] {
             let toml_str = format!(
                 r#"{}
@@ -3718,55 +3741,61 @@ mod tests {
     }
 
     #[test]
-    fn filename_fingerprint_gate_matches_only_the_selected_style() {
-        for (style, path, expected) in [
-            (
-                CacheAssetFingerprintStyle::Hex,
-                "/assets/app.0123abcd.js",
-                true,
-            ),
-            (
-                CacheAssetFingerprintStyle::Hex,
-                "/assets/hero-Portrait.jpg",
-                false,
-            ),
-            (
-                CacheAssetFingerprintStyle::EsbuildBase32,
-                "/assets/app-VRTVD5R5.js",
-                true,
-            ),
-            (
-                CacheAssetFingerprintStyle::EsbuildBase32,
-                "/assets/hero-Portrait.jpg",
-                false,
-            ),
-            (
-                CacheAssetFingerprintStyle::ViteBase64Url,
-                "/assets/index-BsELY24f.js",
-                true,
-            ),
-            (
-                CacheAssetFingerprintStyle::ViteBase64Url,
-                "/assets/hero-Portrait.jpg",
-                true,
-            ),
-            (
-                CacheAssetFingerprintStyle::ViteBase64Url,
-                "/assets/app.js",
-                false,
-            ),
-            (
-                CacheAssetFingerprintStyle::ViteBase64Url,
-                "/assets/deadbeef.js",
-                false,
-            ),
+    fn immutable_vite_style_cannot_cache_human_named_assets() {
+        let rule = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "vite-assets"
+            enabled = true
+            path_globs = ["/assets/**/*.js", "/assets/**/*.jpg", "/assets/**/*.png", "/assets/**/*.svg"]
+            fingerprint_style = "vite-base64-url"
+            visibility = "public"
+            browser_ttl_seconds = 31536000
+            edge_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+
+        for path in [
+            "/assets/hero-Portrait.jpg",
+            "/assets/logo-DarkMode.svg",
+            "/assets/banner-Summer24.png",
         ] {
-            assert_eq!(
-                filename_contains_fingerprint(path, style),
-                expected,
-                "{style:?} fingerprint result should match for {path}"
+            let error = Settings::from_toml(&rule)
+                .expect_err("should reject immutable Vite-style cache rule");
+            assert!(
+                format!("{error:?}").contains("cannot set immutable with vite-base64-url"),
+                "{path} must not receive an immutable policy through a Vite-style rule"
             );
         }
+    }
+
+    #[test]
+    fn non_immutable_vite_style_remains_available_for_cache_matching() {
+        let toml = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "vite-assets"
+            enabled = true
+            path_glob = "/assets/*.js"
+            fingerprint_style = "vite-base64-url"
+            browser_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let settings =
+            Settings::from_toml(&toml).expect("should allow Vite-style matching without immutable");
+
+        assert!(
+            settings
+                .asset_cache_policy_for_path("/assets/index-BsELY24f.js")
+                .expect("should evaluate Vite-style cache rule")
+                .is_some(),
+            "non-immutable Vite-style rule should still match a Vite output filename"
+        );
     }
 
     #[test]
@@ -3811,6 +3840,32 @@ mod tests {
                     .expect("should evaluate recursive asset rule")
                     .is_some(),
                 "double-star glob should match {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_asset_rule_globs_expand_each_optional_recursive_segment() {
+        let toml = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "nested-assets"
+            enabled = true
+            path_glob = "/a/**/b/**/c.js"
+            browser_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse recursive cache rule");
+
+        for path in ["/a/x/b/y/c.js", "/a/b/y/c.js", "/a/x/b/c.js", "/a/b/c.js"] {
+            assert!(
+                settings
+                    .asset_cache_policy_for_path(path)
+                    .expect("should evaluate recursive cache rule")
+                    .is_some(),
+                "recursive pattern should match {path}"
             );
         }
     }

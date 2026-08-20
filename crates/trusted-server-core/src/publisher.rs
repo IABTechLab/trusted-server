@@ -509,13 +509,11 @@ fn encode_complete_body(
 
 /// Unified tsjs static serving: `/static/tsjs=<filename>`
 ///
-/// Serves three types of bundles:
+/// Serves two types of bundles:
 /// - **Unified bundle** (`tsjs-unified.min.js`): core + immediate (non-deferred)
 ///   integration modules.
 /// - **Deferred module** (`tsjs-{id}.min.js`): a single self-contained IIFE for
-///   modules loaded with `defer` (e.g., Prebid).
-/// - **Standalone diagnostics module** (`tsjs-gpt_diagnostics.min.js`): delivered
-///   only when the diagnostics integration is enabled and a document activates it.
+///   modules loaded with `defer` (e.g., prebid).
 ///
 /// # Errors
 ///
@@ -535,7 +533,7 @@ pub fn handle_tsjs_dynamic(
     let filename = &path[PREFIX.len()..];
 
     if UNIFIED_FILENAMES.contains(&filename) {
-        // Serve core + immediate modules (excludes deferred like prebid)
+        // Serve core + immediate modules (excludes deferred like prebid).
         let module_ids = integration_registry.js_module_ids_immediate();
         let body = trusted_server_js::concatenate_modules(&module_ids);
         let hash = trusted_server_js::concatenated_hash(&module_ids);
@@ -547,10 +545,10 @@ pub fn handle_tsjs_dynamic(
         // are served as content-addressed standalone assets. Delivery remains
         // cookie-independent so the static response can stay publicly cached.
         let deferred_ids = integration_registry.js_module_ids_deferred();
-        let is_enabled_diagnostics_module = module_id
+        let diagnostics_standalone = module_id
             == crate::integrations::gpt_diagnostics::GPT_DIAGNOSTICS_INTEGRATION_ID
-            && integration_registry.is_enabled(module_id);
-        if !deferred_ids.contains(&module_id) && !is_enabled_diagnostics_module {
+            && integration_registry.integration_enabled(module_id);
+        if !deferred_ids.contains(&module_id) && !diagnostics_standalone {
             return Ok(not_found_response());
         }
         if let (Some(content), Some(hash)) = (
@@ -1515,7 +1513,14 @@ fn apply_publisher_asset_cache_policy(
     response: &mut Response<EdgeBody>,
 ) -> Result<(), Report<TrustedServerError>> {
     let is_cacheable_method = *method == Method::GET || *method == Method::HEAD;
-    if !is_cacheable_method || response_cache_control_is_private_or_no_store(response) {
+    if !is_cacheable_method
+        || response_cache_control_is_private_or_no_store(response)
+        || response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(is_html_content_type)
+    {
         return Ok(());
     }
 
@@ -4518,7 +4523,7 @@ pub async fn handle_publisher_request(
     let gate_content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
-        .and_then(|h| h.to_str().ok())
+        .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
     let mut template_cache_key = template_cache_reservation.and_then(|reservation| {
@@ -6556,7 +6561,7 @@ mod tests {
         build_services_with_secret_http_client_and_client_ip, noop_services,
         noop_services_with_telemetry_sink,
     };
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use edgezero_core::body::Body as EdgeBody;
     use http::{Method, Request as HttpRequest, StatusCode, header};
     use std::sync::Arc;
@@ -12820,6 +12825,188 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publisher_asset_cache_policy_applies_to_non_html_response() {
+        let settings = Settings::from_toml(&format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "publisher-fingerprinted-assets"
+            enabled = true
+            path_globs = ["/assets/**/*.png"]
+            fingerprint_style = "hex"
+            visibility = "public"
+            browser_ttl_seconds = 31536000
+            edge_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        ))
+        .expect("should parse settings with cache rule");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"png".to_vec(),
+            vec![
+                (header::CONTENT_TYPE.as_str(), "image/png"),
+                (header::CACHE_CONTROL.as_str(), "public, max-age=60"),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/assets/logo.0123abcd.png")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = run_publisher_proxy(&settings, &services, request).await;
+        let PublisherResponse::PassThrough { response, .. } = response else {
+            panic!("should pass through non-HTML asset response");
+        };
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("public, max-age=31536000, s-maxage=31536000, immutable"),
+            "matched publisher asset should receive immutable browser and edge policy"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("surrogate-control")
+                .and_then(|value| value.to_str().ok()),
+            None,
+            "S-maxage fallback should keep the edge TTL in Cache-Control"
+        );
+    }
+
+    #[tokio::test]
+    async fn publisher_asset_policy_response_with_cookie_is_private_after_finalization() {
+        let settings = Settings::from_toml(&format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "publisher-fingerprinted-assets"
+            enabled = true
+            path_globs = ["/assets/**/*.png"]
+            fingerprint_style = "hex"
+            visibility = "public"
+            browser_ttl_seconds = 31536000
+            edge_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        ))
+        .expect("should parse settings with cache rule");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"png".to_vec(),
+            vec![
+                (header::CONTENT_TYPE.as_str(), "image/png"),
+                (header::CACHE_CONTROL.as_str(), "public, max-age=60"),
+                (header::SET_COOKIE.as_str(), "viewer=example; Path=/"),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/assets/logo.0123abcd.png")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = run_publisher_proxy(&settings, &services, request).await;
+        let PublisherResponse::PassThrough { mut response, .. } = response else {
+            panic!("should pass through non-HTML asset response");
+        };
+        crate::response_privacy::apply_response_headers_with_cache_privacy(
+            &settings,
+            &mut response,
+        );
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, max-age=0"),
+            "publisher asset with Set-Cookie must become private after finalization"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "publisher asset with Set-Cookie must not retain a shared-cache header"
+        );
+    }
+
+    #[tokio::test]
+    async fn publisher_asset_cache_policy_skips_html_response() {
+        let settings = Settings::from_toml(&format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "broad-publisher-path"
+            enabled = true
+            path_glob = "/news/*.html"
+            visibility = "public"
+            browser_ttl_seconds = 31536000
+            edge_ttl_seconds = 31536000
+            immutable = true
+            fingerprint_style = "hex"
+        "#,
+            crate_test_settings_str()
+        ))
+        .expect("should parse settings with cache rule");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"<html><body>news</body></html>".to_vec(),
+            vec![
+                (header::CONTENT_TYPE.as_str(), "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL.as_str(), "public, max-age=60"),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/news/story.0123abcd.html")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = run_publisher_proxy(&settings, &services, request).await;
+        let response = match response {
+            PublisherResponse::Stream { response, .. } | PublisherResponse::Buffered(response) => {
+                response
+            }
+            PublisherResponse::PassThrough { .. } | PublisherResponse::AssembleTemplate { .. } => {
+                panic!("should classify HTML response for processing")
+            }
+        };
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("max-age=60"),
+            "asset policy must not apply shared asset caching to publisher HTML"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "HTML response must not receive a shared-cache header"
+        );
+    }
+
+    #[tokio::test]
     async fn publisher_request_uses_platform_http_client_with_http_types() {
         let settings = create_test_settings();
         let stub = Arc::new(StubHttpClient::new());
@@ -14250,6 +14437,106 @@ mod tests {
             response.status(),
             StatusCode::NOT_FOUND,
             "should reject unknown module names"
+        );
+    }
+
+    #[test]
+    fn tsjs_dynamic_uses_immutable_cache_for_matching_hash() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let module_ids = registry.js_module_ids_immediate();
+        let hash = trusted_server_js::concatenated_hash(&module_ids);
+        let request = build_request(
+            Method::GET,
+            &format!("https://publisher.example/static/tsjs=tsjs-unified.min.js?v={hash}"),
+        );
+
+        let response = handle_tsjs_dynamic(&request, &registry, EdgeCacheHeader::SurrogateControl)
+            .expect("should handle tsjs request");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("public, max-age=31536000, immutable"),
+            "matching content-versioned bundle should be immutable"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("surrogate-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("max-age=31536000"),
+            "matching content-versioned bundle should set the Fastly edge TTL"
+        );
+    }
+
+    #[test]
+    fn tsjs_dynamic_uses_cloudflare_edge_header_when_selected() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let module_ids = registry.js_module_ids_immediate();
+        let hash = trusted_server_js::concatenated_hash(&module_ids);
+        let request = build_request(
+            Method::GET,
+            &format!("https://publisher.example/static/tsjs=tsjs-unified.min.js?v={hash}"),
+        );
+
+        let response = handle_tsjs_dynamic(
+            &request,
+            &registry,
+            EdgeCacheHeader::CloudflareCdnCacheControl,
+        )
+        .expect("should handle tsjs request");
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cloudflare-cdn-cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("max-age=31536000"),
+            "Cloudflare requests should use its edge cache header"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "Cloudflare requests should not emit Fastly's edge cache header"
+        );
+    }
+
+    #[test]
+    fn tsjs_dynamic_keeps_short_cache_for_mismatched_hash() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let request = build_request(
+            Method::GET,
+            "https://publisher.example/static/tsjs=tsjs-unified.min.js?v=not-the-hash",
+        );
+
+        let response = handle_tsjs_dynamic(&request, &registry, EdgeCacheHeader::SurrogateControl)
+            .expect("should handle tsjs request");
+        let cache_control = response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .expect("should set cache-control");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            cache_control.contains("max-age=300") && !cache_control.contains("immutable"),
+            "mismatched hash should retain the short, mutable cache policy"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("surrogate-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("max-age=300, stale-while-revalidate=60, stale-if-error=86400"),
+            "mismatched hash should retain the short Fastly edge TTL"
         );
     }
 

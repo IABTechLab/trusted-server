@@ -1086,25 +1086,21 @@ at least one of `browser_ttl_seconds` or `edge_ttl_seconds`; private rules must
 configure `browser_ttl_seconds` and must not configure `edge_ttl_seconds`.
 `path_glob` and `path_globs` are mutually exclusive. `immutable = true`
 additionally requires a positive browser TTL and either the content-addressed
-`nextjs-static` preset or an explicit `fingerprint_style`.
+`nextjs-static` preset, `hex`, or `esbuild-base32`.
 
-The filename fingerprint check is intentionally conservative and style-specific.
-It examines the suffix immediately before the final extension and requires a
-nonempty filename prefix separated by `.`, `-`, `_`, or `~`. Set exactly the
-style emitted by the publisher's bundler:
+The filename fingerprint check examines the suffix immediately before the final
+extension and requires a nonempty filename prefix separated by `.`, `-`, `_`,
+or `~`. The accepted immutable conventions are:
 
 - `hex`: hexadecimal suffixes of at least eight characters containing a letter,
   such as `app.0123abcd.js`;
 - `esbuild-base32`: eight-character uppercase Base32 suffixes, such as
-  `app-VRTVD5R5.js`;
-- `vite-base64-url`: eight-character Base64URL suffixes with a mixed character
-  class, such as `index-BsELY24f.js`.
+  `app-VRTVD5R5.js`.
 
-A style is an explicit operator assertion, not proof of content addressing.
-For example, some human-written mixed-case names can resemble a Vite suffix, so
-only select `vite-base64-url` after verifying the publisher's build output. A
-base rule that matches while its selected fingerprint style fails emits a debug
-log with the rule ID and rejected path.
+`vite-base64-url` remains available for non-immutable cache rules, but it cannot
+prove content addressing. Ordinary names such as `hero-Portrait.jpg` can match
+its eight-character Base64URL shape. A matching rule whose selected fingerprint
+style fails emits a debug log with the rule ID and rejected path.
 
 Glob patterns are case-sensitive. `*` matches within a single path component,
 while `**` matches recursively: `/assets/*.js` matches `/assets/app.js` but not
@@ -1124,8 +1120,8 @@ edge_ttl_seconds = 31536000
 immutable = true
 ```
 
-**Publisher allowlist example** (enable only after verifying the filename
-convention):
+**Publisher allowlist example** (enable only for an unambiguous immutable
+filename convention):
 
 ```toml
 [[cache.asset_rules]]
@@ -1137,7 +1133,7 @@ path_globs = [
   "/assets/**/*.png",
   "/assets/**/*.webp",
 ]
-fingerprint_style = "vite-base64-url"
+fingerprint_style = "hex"
 visibility = "public"
 browser_ttl_seconds = 31536000
 edge_ttl_seconds = 31536000
