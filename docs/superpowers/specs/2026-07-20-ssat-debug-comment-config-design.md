@@ -60,9 +60,9 @@ alongside the existing bool, with:
   config-driven," not "applied unconditionally in every mode."
 - Adding failure-reason instrumentation to provider adapters that don't
   capture any today. Notably, `AuctionResponse::no_bid()`
-  ([auction/types.rs:296](../../../crates/trusted-server-core/src/auction/types.rs#L296))
+  ([auction/types.rs:296](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/auction/types.rs#L296))
   always carries empty metadata, and `aps.rs`
-  ([integrations/aps.rs:546](../../../crates/trusted-server-core/src/integrations/aps.rs#L546))
+  ([integrations/aps.rs:546](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/aps.rs#L546))
   never attaches a no-fill reason. `verbosity=full` will show nothing more for
   an APS no-bid than redacted mode does today, because there is nothing more
   captured server-side. Fixing that is separate, larger, per-provider work —
@@ -76,23 +76,23 @@ alongside the existing bool, with:
 - Tightening `Bid`-level fields (`Bid.metadata`, `nurl`, `burl`) to a
   fail-closed allowlist. These already pass through `redact_bid_for_dump`
   unfiltered today in all verbosity modes
-  ([publisher.rs:966-972](../../../crates/trusted-server-core/src/publisher.rs#L966-L972)),
+  ([publisher.rs:966-972](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/publisher.rs#L966-L972)),
   pre-existing and tracked separately as issue #925. Unaffected by, and
   orthogonal to, this design.
 
 ## Current Behavior (today, for reference)
 
 `prepend_auction_debug_comment`
-([publisher.rs:950](../../../crates/trusted-server-core/src/publisher.rs#L950))
+([publisher.rs:950](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/publisher.rs#L950))
 unconditionally:
 
 - Includes `provider_responses` and `mediator_response` (when present).
 - Includes every provider's `bids` array.
 - Filters each response's metadata to a fixed 7-key allowlist:
   `error_type, status, message, responsetimemillis, errors, warnings, bidstatus`
-  ([publisher.rs:878](../../../crates/trusted-server-core/src/publisher.rs#L878)).
+  ([publisher.rs:878](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/publisher.rs#L878)).
 - Previews each bid's `creative` to 512 bytes
-  ([publisher.rs:893](../../../crates/trusted-server-core/src/publisher.rs#L893)).
+  ([publisher.rs:893](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/publisher.rs#L893)).
 - Neutralizes `-->`/`--!>` comment terminators and caps the total serialized
   dump at 256KB, unconditionally.
 
@@ -100,10 +100,10 @@ Notably absent from the allowlist today despite already being captured
 server-side by the prebid integration:
 
 - `http_status` — numeric HTTP status from a non-2xx PBS response
-  ([prebid.rs:2025](../../../crates/trusted-server-core/src/integrations/prebid.rs#L2025)).
+  ([prebid.rs:2025](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/prebid.rs#L2025)).
 - `upstream_message` / `upstream_message_truncated` — the actual PBS error
   body text, only populated when `[integrations.prebid] debug = true`
-  ([prebid.rs:2038-2046](../../../crates/trusted-server-core/src/integrations/prebid.rs#L2038-L2046)).
+  ([prebid.rs:2038-2046](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/prebid.rs#L2038-L2046)).
   The text is bounded but provider-controlled, and may echo identifiers or
   other request values. It is therefore available only in `upstream` and
   `full` modes, never in the safe `redacted` default.
@@ -117,7 +117,7 @@ strings or nested identity data. This design therefore moves all four out of
 Also captured server-side, but deliberately excluded from the allowlist and
 staying that way in redacted mode: the raw `debug` subtree
 (`httpcalls`/`resolvedrequest`) that PBS returns when `integrations.prebid.debug`
-is on ([prebid.rs:1945-1948](../../../crates/trusted-server-core/src/integrations/prebid.rs#L1945-L1948)).
+is on ([prebid.rs:1945-1948](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/prebid.rs#L1945-L1948)).
 This carries the resolved OpenRTB request: device IP, geo, `user.ext.eids`, TC
 consent string, per-bidder request/response bodies. This is the data `full`
 verbosity exists to expose, on explicit opt-in.
@@ -216,7 +216,7 @@ pub enum AuctionDebugCommentVerbosity {
 ```
 
 `DebugConfig` derives `#[derive(Default, ...)]`
-([settings.rs:1895](../../../crates/trusted-server-core/src/settings.rs#L1895)),
+([settings.rs:1895](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/settings.rs#L1895)),
 which requires every field's type to implement `Default`. The hand-written
 `impl Default for AuctionDebugCommentOptions` above is required for this to
 compile — a naive `#[derive(Default)]` would produce
@@ -263,7 +263,7 @@ This makes `redacted` fail closed at the rendering boundary even if a future
 provider writes an unexpected value beneath a familiar metadata key.
 
 `Settings::finalize_deserialized`
-([settings.rs:2038-2059](../../../crates/trusted-server-core/src/settings.rs#L2038-L2059))
+([settings.rs:2038-2059](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/settings.rs#L2038-L2059))
 — the associated fn that already calls `settings.integrations.normalize();
 settings.proxy.normalize(); settings.image_optimizer.normalize();` on a
 locally-owned `settings: Self` — gains
@@ -336,7 +336,7 @@ Unconditional regardless of `options` (safety nets, not redaction controls):
 - `MAX_AUCTION_DEBUG_DUMP_BYTES` (256KB) final cap on the serialized dump
 
 **Wiring** — production call site
-[publisher.rs:1394](../../../crates/trusted-server-core/src/publisher.rs#L1394)
+[publisher.rs:1394](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/publisher.rs#L1394)
 (the two existing test call sites for `prepend_auction_debug_comment`, around
 publisher.rs:2638 and 2699, also need the new parameter — same signature
 change ripples to both):

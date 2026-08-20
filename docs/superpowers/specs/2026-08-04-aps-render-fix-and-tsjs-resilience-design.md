@@ -13,6 +13,11 @@
   `origin/main` at the same fetch was
   `2e85a1cdcfe3d23814bab5b2215dd6b096f871eb` and is already an ancestor of the
   rc baseline; it is not a competing implementation authority.
+- **Final release-branch refresh:** fetched `origin/rc/202608` at
+  `67517504b1e44fe9943550cde6408cf77ed25018` on 2026-08-20. The final overlap
+  audit and performance comparison use that exact tip. It already contains the
+  `main` ancestry selected by the release branch, so `main` is not merged
+  separately.
 - **Retired-branch evidence:** the immutable historical snapshot
   `905984e62a0858c53d9f0ff6dd3a1bf190cf311d` from retired `rc/july` is only a
   finite TSJS concept-gap checklist. It is not a baseline, merge source, API
@@ -109,9 +114,11 @@ Any new analytics contract requires a separate design.
 
 ### 0.4 `rc/202608` authority and retired-branch TSJS concept audit
 
-The exact `origin/rc/202608` commit recorded above is the normative starting point.
-Its source, behavior, tests, APIs, CI, dependency state, and performance shape are
-the baseline. The implementation branch has that rc commit as its first parent and
+The initial `origin/rc/202608` implementation commit recorded above is the normative
+starting point, and the final refreshed tip is the release comparison baseline. Their
+source, behavior, tests, APIs, CI, dependency state, and performance shape are
+authoritative at their respective checkpoints. The implementation branch has the
+initial rc commit as its first parent and
 the previously reviewed APS/TSJS feature history as its second parent. A conflict
 resolution is not itself behavioral evidence: every overlapping rc behavior must be
 identified, assigned an owner, and proved after reconciliation. Unless this design

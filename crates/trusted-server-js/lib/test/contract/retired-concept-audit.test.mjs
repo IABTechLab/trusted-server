@@ -33,7 +33,7 @@ const historicalPerformanceFixturePath = path.join(
   'crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json'
 );
 const mainAuditSha = 'f6a2fb85ce623bf8a574e3941e1ee349acc3412d';
-const rcBaselineSha = 'f0825604ec6740111e99dd8a178e3b880e7d772b';
+const rcBaselineSha = '67517504b1e44fe9943550cde6408cf77ed25018';
 const parsedAuditFixture = JSON.parse(readFileSync(auditFixturePath, 'utf8'));
 const auditedClassifications = Array.isArray(parsedAuditFixture)
   ? parsedAuditFixture

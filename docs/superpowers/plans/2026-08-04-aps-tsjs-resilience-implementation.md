@@ -43,6 +43,13 @@ display split, integration catalog, hard cutover, package upgrade, and most
 verification surfaces. Those commits are implementation history, not evidence that
 revision 42 is complete.
 
+The final Task 17 refresh fetched and integrated `origin/rc/202608` at
+`67517504b1e44fe9943550cde6408cf77ed25018` on 2026-08-20. Its rc-owned package and
+operator-document changes are retained. Its raw-global GAM-attribution transport is
+superseded by the typed immutable GPT configuration carrier and sole parser-time GPT
+owner, and its mutable publisher-native APS experiment is superseded by the single
+Trusted Server renderer owner required by revision 42.
+
 `origin/rc/202608` is the behavior, API, dependency, CI, and performance baseline.
 Do not merge `main` separately. Before final verification, fetch the release branch;
 if it advanced, merge its exact tip and repeat the overlap audit and complete gates.
@@ -1154,6 +1161,18 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
       conflict or rc change touching TSJS, APS, publisher HTML, diagnostics,
       integration config, build, or CI, name the final owner and focused test. Keep
       EdgeZero and other excluded features unchanged.
+
+  Final refresh inventory for `67517504b1e44fe9943550cde6408cf77ed25018`:
+
+  | Rc overlap                                                   | Final disposition and owner                                                                                                                                                                                   | Focused proof                                                                                                        |
+  | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+  | APS provider, renderer, browser types, and guide             | Revision 42 supersedes the publisher-native experiment. `integrations/aps.rs`, `integrations/aps/render.ts`, and the shared render services retain one TS-owned renderer and the no-second-auction invariant. | APS Rust tests, `test/integrations/aps/render.test.ts`, GPT/PUC ownership tests, hard-cutover scan                   |
+  | GAM cohort attribution                                       | Preserve the configuration and reporting concept; supersede rc raw globals and the activation attribute with the frozen GPT config carrier and sole parser-time GPT owner.                                    | GPT Rust config tests, `tsjs.rs` selection tests, first-display GPT adapter/slice tests, persistent GPT module tests |
+  | GPT diagnostics correlation guide                            | Preserve the rc correlation evidence, rewritten to the immutable initial projection and navigation-internal page-bids projection.                                                                             | GPT diagnostics store/API/data/overlay suites and docs format/build                                                  |
+  | Retired GPT bootstrap, request runtime, and legacy GPT tests | Keep the revision-42 deletions; no second runtime or compatibility file returns.                                                                                                                              | hard-cutover scan, architecture test, release graph test                                                             |
+  | Docs TypeScript-ESLint update                                | Preserve rc package and lockfile ownership.                                                                                                                                                                   | docs install, lint, format, and build                                                                                |
+  | GPT operator wording and example config                      | Preserve rc's provider-neutral environment-overlay wording; do not add EdgeZero feature work.                                                                                                                 | docs format/build and config tests                                                                                   |
+  | Rc GAM review plan/spec artifacts                            | Preserve as release-branch documentation; they do not override revision 42's TSJS architecture.                                                                                                               | docs format/build and plan-integrity scan                                                                            |
 
 - [ ] **Step 3: Update every rc-baseline row and rerun its exact proof.** No stale
       SHA or prior pass satisfies the gate.

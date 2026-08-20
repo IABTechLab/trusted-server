@@ -290,11 +290,11 @@
     ]
   },
   "rcBaseline": {
-    "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+    "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
     "rows": [
       {
         "id": "RCJ-CORE-01",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "baseline-owned",
         "ownerPaths": [
           "crates/trusted-server-js/lib/src/core/auction.ts",
@@ -308,7 +308,7 @@
       },
       {
         "id": "RCJ-CORE-02",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "baseline-owned",
         "ownerPaths": [
           "crates/trusted-server-js/lib/src/core/config.ts",
@@ -323,7 +323,7 @@
       },
       {
         "id": "RCJ-BOOT-01",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "baseline-owned",
         "ownerPaths": [
           "crates/trusted-server-core/src/html_processor.rs",
@@ -336,7 +336,7 @@
       },
       {
         "id": "RCJ-TRACE-01",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "implementation-gap",
         "ownerPaths": ["crates/trusted-server-js/lib/src/core/index.ts"],
         "testPath": "crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
@@ -346,7 +346,7 @@
       },
       {
         "id": "RCJ-GPT-01",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "baseline-owned",
         "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/gpt/index.ts"],
         "testPath": "crates/trusted-server-js/lib/test/integrations/gpt/ad_init.test.ts",
@@ -356,7 +356,7 @@
       },
       {
         "id": "RCJ-GPT-02",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "baseline-owned",
         "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/gpt/index.ts"],
         "testPath": "crates/trusted-server-js/lib/test/integrations/gpt/ad_init.test.ts",
@@ -366,7 +366,7 @@
       },
       {
         "id": "RCJ-GPT-03",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "baseline-owned",
         "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/gpt/index.ts"],
         "testPath": "crates/trusted-server-js/lib/test/integrations/gpt/index.test.ts",
@@ -376,7 +376,7 @@
       },
       {
         "id": "RCJ-GPT-04",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "implementation-gap",
         "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/gpt/index.ts"],
         "testPath": "crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
@@ -386,7 +386,7 @@
       },
       {
         "id": "RCJ-PREBID-01",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "baseline-owned",
         "ownerPaths": [
           "crates/trusted-server-js/lib/build-prebid-external.mjs",
@@ -399,7 +399,7 @@
       },
       {
         "id": "RCJ-PREBID-02",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "baseline-owned",
         "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/prebid/index.ts"],
         "testPath": "crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts",
@@ -409,7 +409,7 @@
       },
       {
         "id": "RCJ-PREBID-03",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "baseline-owned",
         "ownerPaths": [
           "crates/trusted-server-js/lib/build-prebid-external.mjs",
@@ -422,7 +422,7 @@
       },
       {
         "id": "RCJ-PREBID-04",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "baseline-owned",
         "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/prebid/index.ts"],
         "testPath": "crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts",
@@ -432,7 +432,7 @@
       },
       {
         "id": "RCJ-APS-01",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "baseline-owned",
         "ownerPaths": [
           "crates/trusted-server-core/src/integrations/aps.rs",
@@ -445,7 +445,7 @@
       },
       {
         "id": "RCJ-APS-02",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "baseline-owned",
         "ownerPaths": [
           "crates/trusted-server-js/lib/src/integrations/aps/render.ts",
@@ -459,7 +459,7 @@
       },
       {
         "id": "RCJ-APS-03",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "implementation-gap",
         "ownerPaths": [
           "crates/trusted-server-core/src/integrations/aps.rs",
@@ -472,7 +472,7 @@
       },
       {
         "id": "RCJ-APS-04",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "implementation-gap",
         "ownerPaths": [
           "crates/trusted-server-core/src/integrations/aps.rs",
@@ -485,7 +485,7 @@
       },
       {
         "id": "RCJ-CREATIVE-01",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "baseline-owned",
         "ownerPaths": ["crates/trusted-server-core/src/publisher.rs"],
         "testPath": "crates/trusted-server-core/src/publisher.rs",
@@ -495,7 +495,7 @@
       },
       {
         "id": "RCJ-CREATIVE-02",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "baseline-owned",
         "ownerPaths": [
           "crates/trusted-server-js/lib/src/integrations/creative/click.ts",
@@ -508,7 +508,7 @@
       },
       {
         "id": "RCJ-CREATIVE-03",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "baseline-owned",
         "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/creative/index.ts"],
         "testPath": "crates/trusted-server-js/lib/test/integrations/creative/image.test.ts",
@@ -518,7 +518,7 @@
       },
       {
         "id": "RCJ-DIAG-01",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "baseline-owned",
         "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/index.ts"],
         "testPath": "crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/index.test.ts",
@@ -528,7 +528,7 @@
       },
       {
         "id": "RCJ-INT-01",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "baseline-owned",
         "ownerPaths": [
           "crates/trusted-server-core/src/integrations/testlight.rs",
@@ -547,7 +547,7 @@
       },
       {
         "id": "RCJ-INT-02",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "baseline-owned",
         "ownerPaths": [
           "crates/trusted-server-js/lib/src/shared/async.ts",
@@ -564,7 +564,7 @@
       },
       {
         "id": "RCJ-QUAL-01",
-        "baselineSha": "f0825604ec6740111e99dd8a178e3b880e7d772b",
+        "baselineSha": "67517504b1e44fe9943550cde6408cf77ed25018",
         "classification": "implementation-gap",
         "ownerPaths": [
           "crates/trusted-server-js/lib/eslint.config.js",

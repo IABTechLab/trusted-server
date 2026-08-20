@@ -72,7 +72,7 @@ rewrite_script = true
 The environment override
 `TRUSTED_SERVER__INTEGRATIONS__GPT__GAM_ATTRIBUTION_ENABLED` works only when
 `gam_attribution_enabled` is already present under `[integrations.gpt]` in the
-TOML file. EdgeZero v0.0.4 cannot create a missing configuration leaf.
+TOML file. The environment overlay cannot create a missing configuration leaf.
 
 ## Endpoints
 
