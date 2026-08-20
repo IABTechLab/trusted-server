@@ -1,5 +1,24 @@
 # Trusted Client IP Header Implementation Plan
 
+## Review follow-up: header-safe shared secrets
+
+PR review found that the request path reads the authentication field with
+`HeaderValue::to_str`, while configuration originally accepted any string of at
+least 32 UTF-8 bytes. A non-ASCII secret could therefore pass startup validation
+but never authenticate a request. Whitespace accepted by `HeaderValue::to_str`
+is also unsuitable because an intermediary may normalize it.
+
+- [ ] Add focused settings tests for the 31/32-byte boundary and rejection of
+      non-ASCII, horizontal-tab, space, DEL, and other control bytes. Assert
+      rejected values remain redacted, and run the tests first to demonstrate
+      the current failure.
+- [ ] Accept only `shared_secret` bytes in the ASCII graphic range
+      `0x21..=0x7e`, retaining the 32-byte minimum and redacted errors.
+- [ ] Update the configuration and Fastly guides to specify 32 or more ASCII
+      graphic bytes and recommend hexadecimal or base64url generation.
+- [ ] Run focused settings tests, formatting, target-matched tests, Clippy, and
+      the Fastly release build before updating the PR.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Resolve the reader IP behind an authenticated fronting CDN while preserving peer-IP fallback and stripping all trust headers before routing.
@@ -51,7 +70,7 @@ fn trusted_client_ip_is_absent_by_default() {
 #[test]
 fn trusted_client_ip_parses_and_redacts_secret() {
     let toml = format!(
-        "{}\n[trusted_client_ip]\nip_header = \"fastly-client-ip\"\nauth_header = \"x-ts-client-ip-auth\"\nshared_secret = \"unit-test-shared-secret\"\n",
+        "{}\n[trusted_client_ip]\nip_header = \"fastly-client-ip\"\nauth_header = \"x-ts-client-ip-auth\"\nshared_secret = \"unit-test-shared-secret-0123456789\"\n",
         crate_test_settings_str()
     );
     let settings = Settings::from_toml(&toml)
@@ -109,6 +128,9 @@ pub struct TrustedClientIpConfig {
 }
 
 impl TrustedClientIpConfig {
+    /// Minimum accepted authentication secret length in ASCII graphic bytes.
+    const MIN_SHARED_SECRET_LENGTH: usize = 32;
+
     /// Compares a request authentication value with the configured secret.
     #[must_use]
     pub fn authenticates(&self, candidate: &str) -> bool {
@@ -157,6 +179,20 @@ fn trusted_client_ip_rejects_fastly_tls_bridge_headers() {
 fn trusted_client_ip_rejects_empty_secret() { /* shared_secret = "" */ }
 
 #[test]
+fn trusted_client_ip_rejects_a_31_byte_secret() { /* shared_secret = 31 * "a" */ }
+
+#[test]
+fn trusted_client_ip_accepts_a_32_byte_ascii_graphic_secret() {
+    /* shared_secret = 32 * "a" */
+}
+
+#[test]
+fn trusted_client_ip_rejects_non_header_safe_secrets_without_exposing_them() {
+    // Exercise a >=32-byte non-ASCII value, HTAB, space, DEL, and another
+    // control byte. Assert each validation error omits the rejected value.
+}
+
+#[test]
 fn trusted_client_ip_rejects_malformed_header_names() { /* spaces/control bytes */ }
 
 #[test]
@@ -165,9 +201,9 @@ fn trusted_client_ip_rejects_incomplete_section() { /* omit each required field 
 #[test]
 fn trusted_client_ip_authentication_is_exact() {
     let config = trusted_client_ip_test_config();
-    assert!(config.authenticates("unit-test-shared-secret"));
+    assert!(config.authenticates("unit-test-shared-secret-0123456789"));
     assert!(!config.authenticates("wrong-secret"));
-    assert!(!config.authenticates(" unit-test-shared-secret"));
+    assert!(!config.authenticates(" unit-test-shared-secret-0123456789"));
 }
 ```
 
@@ -180,7 +216,7 @@ Run the same filtered core test command. Expected: parsing tests pass, while the
 unsafe/identical-header tests fail because cross-field validation is not yet
 implemented.
 
-- [ ] **Step 6: Implement header-name validation**
+- [ ] **Step 6: Implement header-name and shared-secret validation**
 
 Add `#[validate(schema(function = "validate_trusted_client_ip_config"))]` to
 `TrustedClientIpConfig`, then add helpers that parse names through
@@ -209,12 +245,20 @@ fn validate_trusted_client_ip_config(
             return Err(ValidationError::new("reserved_trusted_client_ip_header"));
         }
     }
+    let shared_secret = config.shared_secret.expose().as_bytes();
+    if shared_secret.len() < TrustedClientIpConfig::MIN_SHARED_SECRET_LENGTH {
+        return Err(ValidationError::new("short_trusted_client_ip_shared_secret"));
+    }
+    if !shared_secret.iter().all(|byte| matches!(byte, b'!'..=b'~')) {
+        return Err(ValidationError::new("invalid_trusted_client_ip_shared_secret"));
+    }
     Ok(())
 }
 ```
 
 Use descriptive validation messages if the validator API allows them without
-duplicating logic. Do not include `shared_secret` in errors.
+duplicating logic. Do not include `shared_secret` in errors. Test the 31/32-byte
+boundary plus non-ASCII, horizontal tab, space, DEL, and another control byte.
 
 - [ ] **Step 7: Run the filtered core tests and verify GREEN**
 

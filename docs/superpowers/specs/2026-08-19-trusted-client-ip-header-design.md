@@ -51,8 +51,12 @@ shared_secret = "replace-with-a-random-shared-secret"
 All three fields are required when the section is present. `shared_secret` uses
 the existing `Redacted<String>` type so debug representations do not disclose
 it. Configuration validation rejects invalid header names, identical header
-names, and secrets shorter than the 32-character minimum already applied to
-`ec.passphrase`. The shared `reject_placeholder_secrets` startup gate also
+names, secrets containing bytes outside the ASCII graphic range
+`0x21..=0x7e`, and secrets shorter than 32 ASCII bytes. This is intentionally
+stricter than the request reader's `HeaderValue::to_str` contract, which also
+accepts horizontal tab: excluding all whitespace prevents an intermediary from
+normalizing a configured secret into a different request value. The shared
+`reject_placeholder_secrets` startup gate also
 rejects the placeholder secret published in the example configuration and
 guides, so a copied config cannot ship a publicly known secret.
 
@@ -79,10 +83,11 @@ loaded but before spoofable headers are sanitized:
 1. Capture `req.get_client_ip_addr()` as the fallback peer address.
 2. If `trusted_client_ip` is absent, select the peer address.
 3. If configured, require exactly one authentication-header field value. It
-   must be valid UTF-8 and match the configured secret byte-for-byte, without
-   trimming or other normalization. Compare fixed-size SHA-256 digests using a
-   constant-time comparison. A missing, duplicated, non-UTF-8, empty, or
-   mismatched authentication value fails authentication.
+   must be representable by `HeaderValue::to_str` and match the configured
+   ASCII-graphic secret byte-for-byte, without trimming or other normalization.
+   Compare fixed-size SHA-256 digests using a constant-time comparison. A
+   missing, duplicated, non-ASCII, empty, or mismatched authentication value
+   fails authentication.
 4. Only after authentication succeeds, require exactly one IP-header field
    value and parse it directly as `std::net::IpAddr`. Do not trim or normalize
    the value. This accepts canonical or otherwise Rust-supported IPv4 and IPv6
@@ -171,6 +176,9 @@ Tests follow red-green-refactor and cover:
 - configured headers are removed after resolution;
 - `Fastly-Client-IP` is stripped when configuration is absent;
 - settings parse, validation, secret redaction, and default behavior;
+- a 31-byte secret is rejected and a 32-byte ASCII-graphic secret is accepted;
+- non-ASCII, horizontal-tab, space, DEL, and other control-character shared
+  secrets fail configuration validation without appearing in the error;
 - `client_info_from_request` and entry-point geo finalization receive the same
   selected address.
 
@@ -201,3 +209,5 @@ native unit tests and Wasm compilation still provide local evidence.
 - Invalid forwarded IP: the request succeeds using the peer IP.
 - Trust headers never reach routing or downstream origins.
 - Existing direct Fastly deployments require no configuration migration.
+- Configuration accepts only shared secrets of 32 or more ASCII graphic bytes
+  (`0x21..=0x7e`), excluding whitespace and non-ASCII values.
