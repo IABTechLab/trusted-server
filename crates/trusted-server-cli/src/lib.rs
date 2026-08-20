@@ -1,15 +1,3 @@
-#![cfg_attr(
-    test,
-    allow(
-        clippy::print_stdout,
-        clippy::print_stderr,
-        clippy::panic,
-        clippy::dbg_macro,
-        clippy::unwrap_used,
-        reason = "CLI tests use panic-on-failure helpers"
-    )
-)]
-
 #[cfg(not(target_arch = "wasm32"))]
 mod ad_templates;
 #[cfg(not(target_arch = "wasm32"))]
@@ -22,7 +10,7 @@ mod prebid_bundle;
 mod run;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use run::run_from_env;
+pub use run::{RunOutcome, run_from_env};
 
 // Every `ts` subcommand's implementation lives under `commands/<name>`. The
 // `ts dev` group is available on every host target; its only subcommand,

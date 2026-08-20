@@ -19,5 +19,20 @@ if ! rustup target list --installed | awk -v target="$HOST_TARGET" '$0 == target
 fi
 
 cargo test --package trusted-server-cli --target "$HOST_TARGET"
-cargo test --package trusted-server-cli --target "$HOST_TARGET" \
-  commands::audit::browser::tests:: -- --ignored --test-threads=1
+export TS_AUDIT_BROWSER_TESTS=1
+AUDIT_BROWSER_TEST_FILTERS=(
+  "commands::audit::browser::tests::"
+  "commands::audit::generate::browser_collector::tests::progress_failure_still_finalizes_browser_session"
+)
+for AUDIT_BROWSER_TEST_FILTER in "${AUDIT_BROWSER_TEST_FILTERS[@]}"; do
+  AUDIT_BROWSER_TEST_COUNT="$({
+    cargo test --package trusted-server-cli --target "$HOST_TARGET" \
+      "$AUDIT_BROWSER_TEST_FILTER" -- --ignored --list
+  } | awk '/: test$/ { count += 1 } END { print count + 0 }')"
+  if [ "$AUDIT_BROWSER_TEST_COUNT" -eq 0 ]; then
+    echo "No ignored browser audit fixtures matched $AUDIT_BROWSER_TEST_FILTER" >&2
+    exit 1
+  fi
+  cargo test --package trusted-server-cli --target "$HOST_TARGET" \
+    "$AUDIT_BROWSER_TEST_FILTER" -- --ignored --test-threads=1
+done

@@ -64,7 +64,7 @@ mod tests {
     fn valid_candidate_passes_without_warnings() {
         let config = baseline();
 
-        let warnings = check_candidate(&config, &config).expect("valid candidate should pass");
+        let warnings = check_candidate(&config, &config).expect("should accept valid candidate");
 
         assert!(
             warnings.is_empty(),

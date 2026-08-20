@@ -6,7 +6,7 @@
 //! against inventory that does not exist, which is worse than a narrow literal.
 //! So this module is built to refuse rather than guess.
 //!
-//! Three rules do the load-bearing work:
+//! The inference applies three evidence rules:
 //!
 //! 1. **Positional binding.** `{network_id}` is bound to unit segment 0 and only
 //!    if that segment is the resolved network id. Substring replacement would
@@ -14,8 +14,8 @@
 //! 2. **Exactly one varying segment.** Zero means nothing was proven and the
 //!    path stays literal; two means the unit varies along a dimension the
 //!    request path cannot supply (device, geo, experiment), so it is refused.
-//! 3. **The witness rule.** Two pages must show *different* derived sections
-//!    *and* different unit segments. Without it a single-page crawl is
+//! 3. **Cross-page variation.** Two pages must show *different* derived sections
+//!    and different unit segments. A single-page crawl is
 //!    indistinguishable from a static path — literal, `{network_id}`-only and
 //!    `{section}` all reproduce one observation equally well, and round-trip
 //!    verification cannot tell them apart. Only variation can.
@@ -96,9 +96,15 @@ enum SlotAnalysis {
     Static,
     /// Cannot be represented; carries the operator-facing reason.
     Refuse(String),
-    /// Would be templatable but no root page was observed, so `section_root`
-    /// is undetermined under this candidate.
-    RootUnwitnessed,
+    /// Unit segment `varying` tracks the derived section on every page this slot
+    /// was seen on, but none of those pages lacked the section segment, so the
+    /// slot witnessed no `section_root` of its own.
+    ///
+    /// Carries `varying` because such a slot is still templatable *when another
+    /// slot witnessed the config-level `section_root`*: a placement that only
+    /// exists on section pages (a sidebar, an in-article unit) never renders on a
+    /// path where `{section}` would fall back to the root.
+    RootUnwitnessed { varying: usize },
 }
 
 /// Infers unit-path templates for every slot in `table`.
@@ -112,6 +118,7 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
     // Evaluate every candidate index independently; ambiguity between two that
     // both fit is a refusal, not a preference for the smaller one.
     let mut qualifying: Vec<(usize, String, BTreeMap<String, SlotAnalysis>)> = Vec::new();
+    let mut root_witness_missing = false;
     for segment in 0..=MAX_SECTION_SEGMENT {
         let analyses: BTreeMap<String, SlotAnalysis> = slots
             .iter()
@@ -128,12 +135,16 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
         // Slots must agree: `section_root` is one config-level value, so two
         // slots claiming different roots means this index is not the real one.
         let Some(root) = roots.iter().next().copied() else {
+            // Distinguish "nothing tracks the section" from "everything does but
+            // no crawled page lacked the section segment": the second is a crawl
+            // gap the operator can close, and the generic literal-path refusal
+            // below does not say so.
+            root_witness_missing |= analyses
+                .values()
+                .any(|analysis| matches!(analysis, SlotAnalysis::RootUnwitnessed { .. }));
             continue;
         };
         if roots.len() > 1 {
-            continue;
-        }
-        if !witnessed(&slots, &analyses, segment) {
             continue;
         }
         qualifying.push((segment, root.to_string(), analyses));
@@ -149,7 +160,7 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
                 .collect();
             diagnostics.push(format!(
                 "more than one section_segment ({}) explains the observed ad-unit paths \
-                 equally well, so no template can be chosen safely; keeping literal paths",
+                 equally well, so no template can be chosen safely; slots without one safe literal path are omitted",
                 indices.join(", ")
             ));
             None
@@ -158,11 +169,17 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
 
     let Some((section_segment, section_root, analyses)) = chosen else {
         if diagnostics.is_empty() {
-            diagnostics.push(
+            diagnostics.push(if root_witness_missing {
+                "the ad-unit paths do track the page section, but no crawled page lacked a \
+                 section segment, so `section_root` could not be witnessed and no {section} \
+                 template can be written; include the site root in the crawl (or set \
+                 section_root by hand) to template these slots"
+                    .to_string()
+            } else {
                 "no ad-unit path varied by page section across the crawl, so paths were kept \
                  literal; crawl more sections to enable a {section} template"
-                    .to_string(),
-            );
+                    .to_string()
+            });
         }
         return InferenceOutcome {
             policy: None,
@@ -178,29 +195,49 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
             .get(&slot.div_id)
             .cloned()
             .unwrap_or(SlotAnalysis::Static);
-        let decision = match analysis {
-            SlotAnalysis::Templatable { varying, .. } => {
+        let templatable = match analysis {
+            SlotAnalysis::Templatable { varying, .. } => Some((varying, true)),
+            // The config-level `section_root` is witnessed by another slot on the
+            // same property, and this slot's page patterns are derived from the
+            // paths it was seen on — all of which carry a section segment — so
+            // `{section}` never falls back to the root for it. Refusing here cost
+            // real inventory: a sidebar or in-article unit that simply does not
+            // exist on the site root was omitted from the config entirely.
+            SlotAnalysis::RootUnwitnessed { varying } => Some((varying, false)),
+            SlotAnalysis::Static | SlotAnalysis::Refuse(_) => None,
+        };
+        let decision = match (templatable, analysis) {
+            (Some((varying, witnessed_root)), _) => {
                 let template = build_template(slot, varying);
                 match verify_round_trip(&template, slot, network_id, &section_root, section_segment)
                 {
                     Ok(()) => {
                         templated += 1;
+                        if !witnessed_root {
+                            diagnostics.push(format!(
+                                "slot `{}` was never observed on a page without a section \
+                                 segment, so its `{{section}}` template relies on the \
+                                 config-level section_root `{section_root}` witnessed by other \
+                                 slots; it is only rendered for the paths this slot was seen on",
+                                slot.id
+                            ));
+                        }
                         SlotDecision::Template(template)
                     }
                     Err(reason) => {
                         diagnostics.push(format!(
                             "slot `{}` template `{template}` did not reproduce the observed \
-                             ad-unit paths ({reason}); keeping the literal path",
+                             ad-unit paths ({reason}); refusing any unsafe fallback",
                             slot.id
                         ));
                         literal_decision(slot)
                     }
                 }
             }
-            SlotAnalysis::Static | SlotAnalysis::RootUnwitnessed => literal_decision(slot),
-            SlotAnalysis::Refuse(reason) => SlotDecision::Refuse {
+            (None, SlotAnalysis::Refuse(reason)) => SlotDecision::Refuse {
                 reasons: vec![reason],
             },
+            (None, _) => literal_decision(slot),
         };
         decisions.push((slot.div_id.clone(), decision));
     }
@@ -226,40 +263,6 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
         decisions,
         diagnostics,
     }
-}
-
-/// Whether the accepted analyses actually witnessed section variation.
-///
-/// Requires two rows with both a different derived section and a different
-/// value in the varying unit segment. Round-trip verification cannot supply
-/// this: one observation is reproduced equally well by a literal path, a
-/// `{network_id}`-only template, and a `{section}` template.
-fn witnessed(
-    slots: &[&SlotEvidence],
-    analyses: &BTreeMap<String, SlotAnalysis>,
-    section_segment: usize,
-) -> bool {
-    for slot in slots {
-        let Some(SlotAnalysis::Templatable {
-            varying,
-            section_root,
-        }) = analyses.get(&slot.div_id)
-        else {
-            continue;
-        };
-        let mut sections = BTreeSet::new();
-        let mut units = BTreeSet::new();
-        for row in &slot.rows {
-            sections.insert(derive_section(&row.path, section_root, section_segment));
-            if let Some(value) = segment_at(&row.unit_path, *varying) {
-                units.insert(value.to_string());
-            }
-        }
-        if sections.len() >= 2 && units.len() >= 2 {
-            return true;
-        }
-    }
-    false
 }
 
 /// Checks the properties of a slot's observations that do not depend on which
@@ -332,6 +335,11 @@ fn structural_check(slot: &SlotEvidence) -> Result<Option<usize>, String> {
 }
 
 /// Analyses one slot under a candidate `section_segment`.
+///
+/// [`structural_check`] has already established that a templatable candidate
+/// contains more than one observed unit path. Therefore a successful derived
+/// section match here is itself the required variation witness; a second
+/// witness predicate would only restate that invariant.
 fn analyse_slot(slot: &SlotEvidence, network_id: &str, section_segment: usize) -> SlotAnalysis {
     let varying = match structural_check(slot) {
         Err(reason) => return SlotAnalysis::Refuse(reason),
@@ -369,7 +377,7 @@ fn analyse_slot(slot: &SlotEvidence, network_id: &str, section_segment: usize) -
     let Some(section_root) = roots.next() else {
         // Without a root observation, `section_root` would be a guess that
         // silently mis-renders every short path.
-        return SlotAnalysis::RootUnwitnessed;
+        return SlotAnalysis::RootUnwitnessed { varying };
     };
     if roots.next().is_some() {
         return SlotAnalysis::Static;
@@ -416,9 +424,12 @@ fn build_template(slot: &SlotEvidence, varying: usize) -> String {
 
 /// Replays `template` through the runtime renderer against every observation.
 ///
-/// This is the gate that catches a section slug the path cannot reproduce — a
-/// publisher whose `/car-research` pages request `.../carresearch`, say, where
-/// the derived section and the observed segment differ.
+/// Defense in depth rather than the primary gate: [`analyse_slot`] already
+/// refuses to call a slot templatable when the derived section and the observed
+/// segment disagree — a publisher whose `/site-news` pages request
+/// `.../sitenews`, say — so a mismatch reaching here would mean inference and
+/// the runtime renderer disagree. The template is then dropped instead of
+/// written, and the diagnostic names the paths that did not reproduce.
 fn verify_round_trip(
     template: &str,
     slot: &SlotEvidence,
@@ -510,11 +521,6 @@ fn path_segments(path: &str) -> Vec<&str> {
     path.split('/').filter(|part| !part.is_empty()).collect()
 }
 
-/// The ad-unit path segment at `index`, if present.
-fn segment_at(unit_path: &str, index: usize) -> Option<&str> {
-    segments(unit_path).into_iter().nth(index)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,13 +552,13 @@ mod tests {
         let table = table_for(
             "ad-header",
             &[
-                ("/", "/88059007/autoblog/homepage"),
-                ("/news/story-abc", "/88059007/autoblog/news"),
-                ("/deals/thing", "/88059007/autoblog/deals"),
+                ("/", "/123456789/publisher/homepage"),
+                ("/news/story-abc", "/123456789/publisher/news"),
+                ("/deals/thing", "/123456789/publisher/deals"),
             ],
         );
 
-        let outcome = infer_unit_templates(&table, "88059007");
+        let outcome = infer_unit_templates(&table, "123456789");
 
         assert_eq!(
             outcome.policy,
@@ -563,7 +569,7 @@ mod tests {
         );
         assert_eq!(
             only_decision(&outcome),
-            &SlotDecision::Template("/{network_id}/autoblog/{section}".to_string())
+            &SlotDecision::Template("/{network_id}/publisher/{section}".to_string())
         );
     }
 
@@ -650,16 +656,16 @@ mod tests {
     }
 
     #[test]
-    fn a_slug_the_path_cannot_reproduce_stays_literal() {
-        // `/car-research` requests `.../carresearch`: the derived section and
+    fn a_slug_the_path_cannot_reproduce_is_refused() {
+        // `/site-news` requests `.../sitenews`: the derived section and
         // the observed segment differ, so the template would render the wrong
-        // unit. Round-trip verification is what catches this.
+        // unit. Candidate analysis rejects the inconsistent section mapping.
         let table = table_for(
             "ad-header",
             &[
                 ("/", "/123/site/homepage"),
                 ("/news/story", "/123/site/news"),
-                ("/car-research/x", "/123/site/carresearch"),
+                ("/site-news/x", "/123/site/sitenews"),
             ],
         );
 
@@ -676,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unwitnessed_root_does_not_template() {
+    fn an_unwitnessed_root_is_refused() {
         // Every crawled page had a section, so `section_root` would be a guess
         // that silently mis-renders the homepage.
         let table = table_for(
@@ -693,6 +699,82 @@ mod tests {
         let SlotDecision::Refuse { .. } = only_decision(&outcome) else {
             panic!("two literal paths and no template is not representable as one literal");
         };
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|note| note.contains("section_root` could not be witnessed")),
+            "the crawl gap, not \"nothing generalized\", is the reason; got {:?}",
+            outcome.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_slot_absent_from_the_root_templates_from_the_witnessed_policy() {
+        // The live shape behind the `ad-atf_sidebar-0` refusal: a header on the
+        // root and every section witnesses `section_root`, while a sidebar exists
+        // only on section pages. The sidebar's unit path tracks the section just
+        // as well, and its page patterns never cover the root, so refusing it
+        // dropped real inventory from the config.
+        let mut table = EvidenceTable::default();
+        let pages: &[(&str, &[(&str, &str)])] = &[
+            ("/", &[("ad-header", "/123/site/homepage")]),
+            (
+                "/news/story",
+                &[
+                    ("ad-header", "/123/site/news"),
+                    ("ad-sidebar", "/123/site/news"),
+                ],
+            ),
+            (
+                "/deals/x",
+                &[
+                    ("ad-header", "/123/site/deals"),
+                    ("ad-sidebar", "/123/site/deals"),
+                ],
+            ),
+        ];
+        for (path, slots) in pages {
+            let registry: Vec<CollectedGptSlot> = slots
+                .iter()
+                .map(|(div_id, unit_path)| CollectedGptSlot {
+                    gam_unit_path: (*unit_path).to_string(),
+                    div_id: (*div_id).to_string(),
+                    sizes: vec![(728, 90)],
+                })
+                .collect();
+            table.fold_page(path, &discover_gpt_slots(&registry, &[], false));
+        }
+
+        let outcome = infer_unit_templates(&table, "123");
+
+        assert_eq!(
+            outcome.policy,
+            Some(SectionPolicy {
+                section_root: "homepage".to_string(),
+                section_segment: 0,
+            }),
+            "the header witnesses the config-level policy"
+        );
+        assert_eq!(
+            outcome.decision("ad-sidebar"),
+            Some(&SlotDecision::Template(
+                "/{network_id}/site/{section}".to_string()
+            )),
+            "a slot that only exists on section pages is still templatable"
+        );
+        assert_eq!(
+            outcome.decision("ad-header"),
+            Some(&SlotDecision::Template(
+                "/{network_id}/site/{section}".to_string()
+            ))
+        );
+        assert!(
+            outcome.diagnostics.iter().any(|note| note
+                .contains("`ad-sidebar` was never observed on a page without a section segment")),
+            "the borrowed section_root should be stated; got {:?}",
+            outcome.diagnostics
+        );
     }
 
     #[test]

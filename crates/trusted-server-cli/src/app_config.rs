@@ -62,8 +62,33 @@ pub fn load_settings(args: &AppConfigArgs) -> Result<LoadedSettings, String> {
 ///
 /// Returns the same path-resolution, read, and parse errors as
 /// [`load_settings`].
-pub fn load_file_settings(args: &AppConfigArgs) -> Result<LoadedSettings, String> {
+#[cfg(test)]
+pub(crate) fn load_file_settings(args: &AppConfigArgs) -> Result<LoadedSettings, String> {
     load_settings_with_env_overlay(args, false)
+}
+
+/// Resolves the operator-owned app-config path without deserializing settings.
+///
+/// Mutating recovery commands use this when the existing config may already be
+/// invalid but still needs a narrowly scoped structural repair.
+///
+/// # Errors
+///
+/// Returns a user-facing string when the manifest cannot be loaded or has no
+/// `[app].name` and no explicit config path was supplied.
+pub fn resolve_app_config_file(args: &AppConfigArgs) -> Result<PathBuf, String> {
+    if let Some(path) = &args.app_config {
+        return Ok(path.clone());
+    }
+    let manifest_loader = ManifestLoader::from_path(&args.manifest)
+        .map_err(|err| format!("failed to load {}: {err}", args.manifest.display()))?;
+    let app_name = manifest_loader.manifest().app.name.clone().ok_or_else(|| {
+        format!(
+            "{} has no [app].name; cannot resolve trusted-server.toml",
+            args.manifest.display()
+        )
+    })?;
+    Ok(resolve_app_config_path(None, &args.manifest, &app_name))
 }
 
 fn load_settings_with_env_overlay(

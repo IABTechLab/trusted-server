@@ -8,6 +8,7 @@
 
 use std::io::{self, Write};
 
+use trusted_server_core::auction::types::MediaType;
 use trusted_server_core::creative_opportunities::{
     AdStackGateInput, CreativeOpportunitiesConfig, evaluate_ad_stack_gate,
 };
@@ -26,6 +27,7 @@ use crate::commands::audit::AuditAdTemplatesVerifyArgs;
 use crate::commands::audit::collector::{
     AdTemplateCollectorConfig, AuditCollector, BrowserCollectRequest, build_ad_template_init_script,
 };
+use crate::run::RunOutcome;
 
 /// Verifies configured ad-template slots against live page evidence.
 ///
@@ -33,7 +35,9 @@ use crate::commands::audit::collector::{
 ///
 /// Returns a user-facing string when config loading fails, or when verification
 /// surfaces a page-level error or a `--strict` failure (after writing output).
-pub(crate) fn run_verify(args: &AuditAdTemplatesVerifyArgs) -> Result<(), String> {
+pub(crate) fn run_verify(args: &AuditAdTemplatesVerifyArgs) -> Result<RunOutcome, String> {
+    args.browser.validate()?;
+    validate_cookie_scope(&args.urls, &args.cookies)?;
     let loaded = crate::app_config::load_settings(&args.config)?;
     let collector = crate::commands::audit::browser::BrowserCollector::from_opts(&args.browser);
     let report = build_report(
@@ -47,7 +51,7 @@ pub(crate) fn run_verify(args: &AuditAdTemplatesVerifyArgs) -> Result<(), String
             allow_cross_origin_redirect: args.allow_cross_origin_redirect,
         },
         &args.cookies,
-    );
+    )?;
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -57,11 +61,30 @@ pub(crate) fn run_verify(args: &AuditAdTemplatesVerifyArgs) -> Result<(), String
         write_human(&mut out, &report)?;
     }
 
-    if report.ok {
-        Ok(())
-    } else {
+    if report.pages.iter().any(|page| page.error.is_some()) {
         Err("ad-template verification reported problems".to_string())
+    } else if report.ok {
+        Ok(RunOutcome::Success)
+    } else {
+        Ok(RunOutcome::AssertionFailed)
     }
+}
+
+fn validate_cookie_scope(urls: &[url::Url], cookies: &[(String, String)]) -> Result<(), String> {
+    if cookies.is_empty() {
+        return Ok(());
+    }
+    let origins: std::collections::BTreeSet<String> = urls
+        .iter()
+        .map(|url| url.origin().ascii_serialization())
+        .collect();
+    if origins.len() > 1 {
+        return Err(
+            "--cookie may be used only when every verification URL has one origin; split this run so credentials are never copied to another origin"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Run-level verification switches.
@@ -86,23 +109,27 @@ fn build_report(
     urls: &[url::Url],
     options: VerifyOptions,
     cookies: &[(String, String)],
-) -> VerificationReport {
-    let init_script = build_init_script(creative);
+) -> Result<VerificationReport, String> {
+    let init_script = build_init_script(creative)?;
+
+    let requests: Vec<_> = urls
+        .iter()
+        .map(|url| BrowserCollectRequest {
+            url: url.clone(),
+            init_scripts: vec![init_script.clone()],
+            scroll: options.scroll,
+            collect_ad_evidence: true,
+            cookies: cookies.to_vec(),
+        })
+        .collect();
+    let collected_pages = collector.collect_pages(&requests);
 
     let mut pages = Vec::with_capacity(urls.len());
     let mut any_error = false;
     let mut any_strict_fail = false;
 
-    for url in urls {
-        let request = BrowserCollectRequest {
-            url: url.clone(),
-            init_scripts: init_script.clone().into_iter().collect(),
-            scroll: options.scroll,
-            collect_ad_evidence: true,
-            cookies: cookies.to_vec(),
-        };
-
-        match collector.collect_page(request) {
+    for (url, collected) in urls.iter().zip(collected_pages) {
+        match collected {
             Err(message) => {
                 any_error = true;
                 pages.push(error_page(url, &message));
@@ -129,21 +156,48 @@ fn build_report(
     }
 
     let ok = !(any_error || (options.strict && any_strict_fail));
-    VerificationReport {
+    Ok(VerificationReport {
         ok,
         strict: options.strict,
         pages,
         warnings: Vec::new(),
-    }
+    })
+}
+
+/// The URL without its fragment, for comparisons the server can observe.
+pub(super) fn without_fragment(url: &url::Url) -> url::Url {
+    let mut url = url.clone();
+    url.set_fragment(None);
+    url
 }
 
 /// Whether navigation left the requested URL's origin (scheme, host, or port).
-fn origin_changed(requested: &url::Url, final_url: &url::Url) -> bool {
-    requested.origin() != final_url.origin()
+///
+/// A same-host default-port `http:80` to `https:443` redirect is *not* a change:
+/// the host is the cookie boundary, and that upgrade is the ordinary canonical
+/// redirect. Host changes, port changes, and HTTPS downgrades all are.
+pub(super) fn origin_changed(requested: &url::Url, final_url: &url::Url) -> bool {
+    if requested.host_str() != final_url.host_str() {
+        return true;
+    }
+
+    match (requested.scheme(), final_url.scheme()) {
+        ("http", "https") => {
+            requested.port_or_known_default() != Some(80)
+                || final_url.port_or_known_default() != Some(443)
+        }
+        (requested_scheme @ ("http" | "https"), final_scheme)
+            if requested_scheme == final_scheme =>
+        {
+            requested.port_or_known_default() != final_url.port_or_known_default()
+        }
+        // Refuse HTTPS downgrades and any unexpected scheme transition.
+        _ => true,
+    }
 }
 
 /// Builds the read-only collector init script from the configured slots.
-fn build_init_script(creative: Option<&CreativeOpportunitiesConfig>) -> Option<String> {
+fn build_init_script(creative: Option<&CreativeOpportunitiesConfig>) -> Result<String, String> {
     let config = AdTemplateCollectorConfig {
         div_prefixes: creative
             .map(|creative| {
@@ -154,17 +208,8 @@ fn build_init_script(creative: Option<&CreativeOpportunitiesConfig>) -> Option<S
                     .collect()
             })
             .unwrap_or_default(),
-        aps_slot_ids: creative
-            .map(|creative| {
-                creative
-                    .slot
-                    .iter()
-                    .filter_map(|slot| slot.providers.aps.as_ref().map(|aps| aps.slot_id.clone()))
-                    .collect()
-            })
-            .unwrap_or_default(),
     };
-    build_ad_template_init_script(&config).ok()
+    build_ad_template_init_script(&config)
 }
 
 /// Assembles a successful page result, returning the wire `PageJson` and whether
@@ -203,10 +248,16 @@ fn build_page(
     let strict_failed = result.strict_failed();
 
     let mut warnings: Vec<Warning> = collected.warnings.to_vec();
-    if requested_path != final_path {
+    warnings.extend(evidence.warnings.iter().map(|warning| Warning {
+        code: format!("page_{}", warning.code),
+        message: warning.message.clone(),
+    }));
+    // Fragments never reach the server, so a fragment-only difference is not a
+    // redirect and slots match on the path either way.
+    if without_fragment(requested) != without_fragment(final_url) {
         warnings.push(Warning {
             code: "redirected".to_string(),
-            message: format!("navigation redirected from {requested_path} to {final_path}"),
+            message: format!("navigation redirected from {requested} to {final_url}"),
         });
     }
 
@@ -321,7 +372,7 @@ fn to_slot_json(expected: &ExpectedSlot, result: &SlotResult) -> SlotJson {
     SlotJson {
         id: result.id.clone(),
         status: to_status(result.status),
-        phase: to_phase(result.phase),
+        phase: result.phase.map(to_phase),
         configured: ConfiguredJson {
             div_id: expected.div_id.clone(),
             gam_unit_path: expected.gam_unit_path.clone(),
@@ -331,7 +382,7 @@ fn to_slot_json(expected: &ExpectedSlot, result: &SlotResult) -> SlotJson {
                 .map(|format| FormatJson {
                     width: format.width,
                     height: format.height,
-                    media_type: format.media_type.clone(),
+                    media_type: media_type_label(&format.media_type).to_string(),
                 })
                 .collect(),
             providers: expected.providers.clone(),
@@ -368,6 +419,7 @@ fn to_status(status: CompareStatus) -> SlotStatus {
         CompareStatus::Confirmed => SlotStatus::Confirmed,
         CompareStatus::Partial => SlotStatus::Partial,
         CompareStatus::Missing => SlotStatus::Missing,
+        CompareStatus::Unconfirmable => SlotStatus::Unconfirmable,
     }
 }
 
@@ -375,6 +427,14 @@ fn to_phase(phase: EvidencePhase) -> EvidencePhaseJson {
     match phase {
         EvidencePhase::InitialLoad => EvidencePhaseJson::InitialLoad,
         EvidencePhase::Scroll => EvidencePhaseJson::Scroll,
+    }
+}
+
+fn media_type_label(media_type: &MediaType) -> &'static str {
+    match media_type {
+        MediaType::Banner => "banner",
+        MediaType::Video => "video",
+        MediaType::Native => "native",
     }
 }
 
@@ -398,8 +458,11 @@ fn write_human(out: &mut dyn Write, report: &VerificationReport) -> Result<(), S
         .map_err(write_err)
     };
 
+    for warning in &report.warnings {
+        write_warning(out, "", warning)?;
+    }
     for page in &report.pages {
-        writeln!(out, "url: {}", page.url).map_err(write_err)?;
+        writeln!(out, "url: {}", escape_terminal_text(&page.url)).map_err(write_err)?;
         if let Some(error) = &page.error {
             writeln!(
                 out,
@@ -411,14 +474,40 @@ fn write_human(out: &mut dyn Write, report: &VerificationReport) -> Result<(), S
             continue;
         }
         if let Some(path) = &page.path {
-            writeln!(out, "  path: {path}").map_err(write_err)?;
+            writeln!(out, "  path: {}", escape_terminal_text(path)).map_err(write_err)?;
+        }
+        if let Some(expected) = page.runtime_ad_stack_expected {
+            writeln!(out, "  runtime ad stack: {}", runtime_label(expected)).map_err(write_err)?;
+        }
+        if let Some(count) = page.matched_slot_count {
+            writeln!(out, "  matched slots: {count}").map_err(write_err)?;
+        }
+        if let Some(gates) = &page.gates {
+            writeln!(out, "  gates: {}", gates_label(gates)).map_err(write_err)?;
         }
         for slot in &page.slots {
-            writeln!(out, "  slot {}: {}", slot.id, status_label(slot.status))
-                .map_err(write_err)?;
+            writeln!(
+                out,
+                "  slot {}: {}",
+                escape_terminal_text(&slot.id),
+                status_label(slot.status)
+            )
+            .map_err(write_err)?;
             for warning in &slot.warnings {
                 write_warning(out, "    ", warning)?;
             }
+        }
+        for extra in &page.extra_evidence {
+            writeln!(
+                out,
+                "  extra {} evidence: div={} gam={} sizes={:?} ({})",
+                escape_terminal_text(&extra.kind),
+                escape_terminal_text(extra.dom_id.as_deref().unwrap_or("-")),
+                escape_terminal_text(extra.gam_unit_path.as_deref().unwrap_or("-")),
+                extra.sizes,
+                escape_terminal_text(&extra.reason),
+            )
+            .map_err(write_err)?;
         }
         for warning in &page.warnings {
             write_warning(out, "  ", warning)?;
@@ -432,7 +521,37 @@ fn status_label(status: SlotStatus) -> &'static str {
         SlotStatus::Confirmed => "confirmed",
         SlotStatus::Partial => "partial",
         SlotStatus::Missing => "missing",
+        SlotStatus::Unconfirmable => "unconfirmable",
     }
+}
+
+fn runtime_label(expected: RuntimeAdStackExpectedJson) -> &'static str {
+    match expected {
+        RuntimeAdStackExpectedJson::Yes => "yes",
+        RuntimeAdStackExpectedJson::No => "no",
+        RuntimeAdStackExpectedJson::Unknown => "unknown",
+    }
+}
+
+fn gate_label(gate: GateState) -> &'static str {
+    match gate {
+        GateState::Pass => "pass",
+        GateState::Fail => "fail",
+        GateState::Unknown => "unknown",
+    }
+}
+
+fn gates_label(gates: &Gates) -> String {
+    format!(
+        "method_get={} navigation={} not_prefetch={} not_bot={} matched_slots={} auction_enabled={} consent={}",
+        gate_label(gates.method_get),
+        gate_label(gates.navigation),
+        gate_label(gates.not_prefetch),
+        gate_label(gates.not_bot),
+        gate_label(gates.matched_slots),
+        gate_label(gates.auction_enabled),
+        gate_label(gates.consent_allows_auction),
+    )
 }
 
 #[allow(
@@ -445,6 +564,7 @@ fn write_err(error: io::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
 
     use super::*;
@@ -453,6 +573,7 @@ mod tests {
 
     struct FakeCollector {
         pages: HashMap<String, Result<CollectedPage, String>>,
+        batch_calls: Cell<usize>,
     }
 
     impl FakeCollector {
@@ -461,7 +582,7 @@ mod tests {
             pages.insert(
                 requested.to_string(),
                 Ok(CollectedPage {
-                    final_url: url::Url::parse(final_url).expect("valid final url"),
+                    final_url: url::Url::parse(final_url).expect("should parse final URL"),
                     title: String::new(),
                     script_count: 0,
                     resource_count: 0,
@@ -469,7 +590,10 @@ mod tests {
                     ad_evidence: Some(evidence),
                 }),
             );
-            Self { pages }
+            Self {
+                pages,
+                batch_calls: Cell::new(0),
+            }
         }
 
         fn with_error(mut self, requested: &str, message: &str) -> Self {
@@ -485,6 +609,18 @@ mod tests {
                 .get(request.url.as_str())
                 .cloned()
                 .unwrap_or_else(|| Err(format!("no fake page for {}", request.url)))
+        }
+
+        fn collect_pages(
+            &self,
+            requests: &[BrowserCollectRequest],
+        ) -> Vec<Result<CollectedPage, String>> {
+            self.batch_calls.set(self.batch_calls.get() + 1);
+            requests
+                .iter()
+                .cloned()
+                .map(|request| self.collect_page(request))
+                .collect()
         }
     }
 
@@ -548,7 +684,7 @@ mod tests {
         let config = news_config();
         let parsed: Vec<url::Url> = urls
             .iter()
-            .map(|url| url::Url::parse(url).expect("valid url"))
+            .map(|url| url::Url::parse(url).expect("should parse URL"))
             .collect();
         build_report(
             collector,
@@ -558,6 +694,7 @@ mod tests {
             options,
             &[],
         )
+        .expect("typed collector configuration should serialize")
     }
 
     #[test]
@@ -574,7 +711,7 @@ mod tests {
         assert_eq!(json["pages"][0]["slots"][0]["status"], "confirmed");
         let warnings = json["pages"][0]["warnings"]
             .as_array()
-            .expect("warnings array");
+            .expect("should have warnings array");
         assert!(
             warnings.iter().any(|w| w["code"] == "redirected"),
             "redirect should emit a `redirected` warning"
@@ -604,7 +741,7 @@ mod tests {
         assert!(
             json["pages"][0]["slots"]
                 .as_array()
-                .expect("slots array")
+                .expect("should have slots array")
                 .is_empty(),
             "off-origin evidence must not be reported as slot verification"
         );
@@ -651,6 +788,45 @@ mod tests {
     }
 
     #[test]
+    fn same_host_http_to_https_upgrade_is_accepted() {
+        let collector = FakeCollector::page(
+            "http://www.example.com/news/story",
+            "https://www.example.com/news/story",
+            confirmed_news_evidence(),
+        );
+        let report = report_for(
+            &collector,
+            true,
+            true,
+            &["http://www.example.com/news/story"],
+        );
+
+        assert!(report.ok, "a default-port HTTPS upgrade should be accepted");
+    }
+
+    #[test]
+    fn downgrade_and_port_changes_are_rejected() {
+        for (requested, final_url) in [
+            (
+                "https://www.example.com/news/story",
+                "http://www.example.com/news/story",
+            ),
+            (
+                "https://www.example.com:8443/news/story",
+                "https://www.example.com:9443/news/story",
+            ),
+            (
+                "http://www.example.com:8080/news/story",
+                "https://www.example.com:8443/news/story",
+            ),
+        ] {
+            let collector = FakeCollector::page(requested, final_url, confirmed_news_evidence());
+            let report = report_for(&collector, true, true, &[requested]);
+            assert!(!report.ok, "redirect {requested} -> {final_url} must fail");
+        }
+    }
+
+    #[test]
     fn confirmed_page_is_ok_in_default_mode() {
         let collector = FakeCollector::page(
             "https://www.example.com/news/story",
@@ -666,6 +842,66 @@ mod tests {
 
         assert!(report.ok, "confirmed page should be ok");
         assert_eq!(report.pages[0].matched_slot_count, Some(1));
+    }
+
+    #[test]
+    fn verifier_surfaces_injected_collector_warnings() {
+        let mut evidence = confirmed_news_evidence();
+        evidence.warnings.push(Warning {
+            code: "fluid_size_ignored".to_string(),
+            message: "a fluid size could not be compared".to_string(),
+        });
+        let collector = FakeCollector::page(
+            "https://www.example.com/news/story",
+            "https://www.example.com/news/story",
+            evidence,
+        );
+
+        let report = report_for(
+            &collector,
+            true,
+            false,
+            &["https://www.example.com/news/story"],
+        );
+
+        assert!(
+            report.pages[0]
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "page_fluid_size_ignored"),
+            "collector warning should be visible in the page report"
+        );
+    }
+
+    #[test]
+    fn human_output_includes_runtime_and_extra_evidence_diagnostics() {
+        let mut evidence = confirmed_news_evidence();
+        evidence.gpt_slots.push(GptSlotEvidence {
+            gam_unit_path: "/123/publisher/extra".to_string(),
+            div_id: "ad-extra-0".to_string(),
+            sizes: vec![(728, 90)],
+            phase: EvidencePhase::InitialLoad,
+        });
+        let collector = FakeCollector::page(
+            "https://www.example.com/news/story",
+            "https://www.example.com/news/story",
+            evidence,
+        );
+        let report = report_for(
+            &collector,
+            true,
+            false,
+            &["https://www.example.com/news/story"],
+        );
+        let mut output = Vec::new();
+
+        write_human(&mut output, &report).expect("should write human report");
+        let output = String::from_utf8(output).expect("should be UTF-8 output");
+
+        assert!(output.contains("runtime ad stack: unknown"));
+        assert!(output.contains("matched slots: 1"));
+        assert!(output.contains("gates: method_get=pass"));
+        assert!(output.contains("extra gpt evidence"));
     }
 
     #[test]
@@ -732,8 +968,40 @@ mod tests {
         );
 
         assert!(!report.ok, "a page-level error sets ok=false");
+        assert_eq!(
+            collector.batch_calls.get(),
+            1,
+            "all verifier URLs should use one collector batch"
+        );
         let json = serde_json::to_value(&report).expect("should serialize");
         assert_eq!(json["pages"][1]["error"]["code"], "navigation_failed");
         assert!(json["pages"][1]["final_url"].is_null());
+    }
+
+    #[test]
+    fn supplied_cookies_are_rejected_for_multiple_origins() {
+        let urls = [
+            url::Url::parse("https://a.example/x").expect("should parse first URL"),
+            url::Url::parse("https://b.example/y").expect("should parse second URL"),
+        ];
+
+        let error = validate_cookie_scope(&urls, &[("session".to_string(), "secret".to_string())])
+            .expect_err("should not replicate one cookie across origins");
+
+        assert!(
+            error.contains("one origin"),
+            "the refusal should explain cookie scope, got {error}"
+        );
+    }
+
+    #[test]
+    fn supplied_cookies_are_allowed_for_same_origin_urls() {
+        let urls = [
+            url::Url::parse("https://a.example/x").expect("should parse first URL"),
+            url::Url::parse("https://a.example/y").expect("should parse second URL"),
+        ];
+
+        validate_cookie_scope(&urls, &[("session".to_string(), "secret".to_string())])
+            .expect("same-origin URLs share the intended cookie scope");
     }
 }

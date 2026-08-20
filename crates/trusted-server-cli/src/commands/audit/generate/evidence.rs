@@ -104,13 +104,14 @@ fn pages_are_disjoint(slots: &[&SlotEvidence]) -> bool {
 fn shared_div_prefix(slots: &[&SlotEvidence]) -> Option<String> {
     let mut prefix: &str = slots.first()?.div_id.as_str();
     for slot in &slots[1..] {
-        let shared = slot
-            .div_id
-            .char_indices()
-            .zip(prefix.chars())
-            .take_while(|((_, left), right)| left == right)
-            .count();
-        prefix = &prefix[..shared];
+        let mut shared_end = 0;
+        for ((byte_index, left), right) in prefix.char_indices().zip(slot.div_id.chars()) {
+            if left != right {
+                break;
+            }
+            shared_end = byte_index + left.len_utf8();
+        }
+        prefix = &prefix[..shared_end];
     }
     let trimmed = prefix.trim_end_matches(|ch: char| ch != '-' && ch != '_');
     let candidate = trimmed.trim_end_matches(['-', '_']);
@@ -129,6 +130,15 @@ pub(super) struct EvidenceTable {
     pages: BTreeSet<String>,
     /// Page paths that produced no slot evidence at all.
     empty_pages: BTreeSet<String>,
+    /// Page paths that produced slot evidence on at least one selected profile.
+    non_empty_pages: BTreeSet<String>,
+    /// Div stems any page refused as ambiguous, unioned across the crawl.
+    ///
+    /// The verdict has to outlive the page that reached it. Article pages carry
+    /// several in-content units and refuse the shared prefix; a landing page
+    /// carries one and would otherwise contribute it as a usable slot, so the
+    /// written config would depend on which pages the crawl happened to sample.
+    ambiguous_stems: BTreeSet<String>,
 }
 
 impl EvidenceTable {
@@ -142,10 +152,16 @@ impl EvidenceTable {
         if let Some(network_id) = &discovered.gam_network_id {
             self.network_ids.insert(network_id.clone());
         }
-        if discovered.slots.is_empty() {
-            self.empty_pages.insert(path.to_string());
+        if !discovered.had_slot_evidence {
+            if !self.non_empty_pages.contains(path) {
+                self.empty_pages.insert(path.to_string());
+            }
             return;
         }
+        self.non_empty_pages.insert(path.to_string());
+        self.empty_pages.remove(path);
+        self.ambiguous_stems
+            .extend(discovered.ambiguous_stems.iter().cloned());
 
         for slot in &discovered.slots {
             let entry = self.slots.entry(slot.div_id.clone()).or_insert_with(|| {
@@ -169,16 +185,17 @@ impl EvidenceTable {
         }
     }
 
-    /// Slots in first-seen order.
+    /// Slots in first-seen order, excluding stems any page refused as ambiguous.
     pub(super) fn slots(&self) -> impl Iterator<Item = &SlotEvidence> {
         self.order
             .iter()
+            .filter(|div_id| !self.ambiguous_stems.contains(*div_id))
             .filter_map(|div_id| self.slots.get(div_id))
     }
 
-    /// Number of distinct slots observed.
+    /// Number of usable distinct slots observed.
     pub(super) fn slot_count(&self) -> usize {
-        self.slots.len()
+        self.slots().count()
     }
 
     /// Every page path folded in, whether or not it yielded slots.
@@ -195,7 +212,11 @@ impl EvidenceTable {
         &self.empty_pages
     }
 
-    /// Whether any slot was observed at all.
+    /// Whether any slot was observed at all, ambiguous ones included.
+    ///
+    /// Deliberately not `slot_count() == 0`: a crawl that saw only ambiguous
+    /// placements did observe an ad stack, and the caller distinguishes "this
+    /// page has no slots" from "every slot found was refused".
     pub(super) fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
@@ -223,7 +244,7 @@ impl EvidenceTable {
             if units.len() != 1 {
                 continue;
             }
-            let unit = (*units.iter().next().expect("one unit path")).to_string();
+            let unit = (*units.iter().next().expect("should have one unit path")).to_string();
             let formats: Vec<(u32, u32)> = slot.formats.iter().copied().collect();
             by_shape.entry((unit, formats)).or_default().push(slot);
         }
@@ -232,10 +253,13 @@ impl EvidenceTable {
             .into_iter()
             .filter(|(_, slots)| slots.len() > 1)
             .filter(|(_, slots)| pages_are_disjoint(slots))
-            .map(|((unit_path, _), slots)| FragmentGroup {
-                div_ids: slots.iter().map(|slot| slot.div_id.clone()).collect(),
-                unit_path,
-                suggested_prefix: shared_div_prefix(&slots),
+            .filter_map(|((unit_path, _), slots)| {
+                let suggested_prefix = shared_div_prefix(&slots);
+                (suggested_prefix.is_some() || slots.len() >= 3).then(|| FragmentGroup {
+                    div_ids: slots.iter().map(|slot| slot.div_id.clone()).collect(),
+                    unit_path,
+                    suggested_prefix,
+                })
             })
             .collect()
     }
@@ -389,16 +413,16 @@ mod tests {
 
     #[test]
     fn one_placement_under_per_render_div_ids_is_detected() {
-        // The live shape: a timestamped token means each page yields a new key
-        // for the same placement. Same unit, same formats, never co-occurring.
+        // Each page yields a new key for the same placement: same unit, same
+        // formats, never co-occurring. The tokens here deliberately do *not*
+        // match the digit-led shape `discover_gpt_slots` refuses on sight, so
+        // this exercises the evidence-based detector that catches the stacks
+        // whose token shape cannot be recognized from one observation.
         let mut table = EvidenceTable::default();
         for (path, div) in [
-            (
-                "/features/a",
-                "rh-gam-kso_26329268ce6Bj0uc8sL0_ei_overlay_1",
-            ),
-            ("/news/b", "rh-gam-kso_26329269aoYmv4RQyN3n_ei_overlay_1"),
-            ("/deals/c", "rh-gam-kso_26329270mYPDB3tz8cpB_ei_overlay_1"),
+            ("/features/a", "ex_slot_ce6Bj0uc8sL0aa_overlay_1"),
+            ("/news/b", "ex_slot_aoYmv4RQyN3nbb_overlay_1"),
+            ("/deals/c", "ex_slot_mYPDB3tz8cpBcc_overlay_1"),
         ] {
             table.fold_page(
                 path,
@@ -413,8 +437,61 @@ mod tests {
         assert_eq!(groups[0].unit_path, "/99/site_Overlay");
         assert_eq!(
             groups[0].suggested_prefix.as_deref(),
-            Some("rh-gam-kso"),
+            Some("ex_slot"),
             "the suggestion should be trimmed back off the volatile token"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_stem_stays_refused_on_every_page() {
+        // The article page carries two in-content units and refuses the shared
+        // prefix; the landing page carries one. Folding the landing page must
+        // not resurrect a prefix that cannot resolve to one element site-wide.
+        let mut table = EvidenceTable::default();
+        table.fold_page(
+            "/news/story",
+            &page(
+                &[
+                    (
+                        "/123/site/news",
+                        "ad-in_content-de669245b2ea4b05826dc96f07a36272-in_content-0",
+                        &[(300, 250)],
+                    ),
+                    (
+                        "/123/site/news",
+                        "ad-in_content-8aec8129a83d4e5abc197423120cb19e-in_content-1",
+                        &[(300, 250)],
+                    ),
+                ],
+                false,
+            ),
+        );
+        table.fold_page(
+            "/",
+            &page(
+                &[(
+                    "/123/site/home",
+                    "ad-in_content-1c0de08e5a2f4d6f9b3a7e5c8d1f2a4b-in_content-0",
+                    &[(300, 250)],
+                )],
+                false,
+            ),
+        );
+
+        assert_eq!(
+            table.slots().count(),
+            0,
+            "a stem refused on one page must stay refused, got {:?}",
+            table.slots().map(|slot| &slot.div_id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            table.slot_count(),
+            0,
+            "the count should match what is written"
+        );
+        assert!(
+            !table.is_empty(),
+            "the crawl did observe an ad stack, so this is not an empty result"
         );
     }
 
@@ -484,10 +561,65 @@ mod tests {
 
         let groups = table.fragmented_slots();
 
+        assert!(
+            groups.is_empty(),
+            "two unrelated placements are too ambiguous to classify as fragments"
+        );
+    }
+
+    #[test]
+    fn three_disjoint_same_shape_ids_are_fragment_evidence_without_a_prefix() {
+        let mut table = EvidenceTable::default();
+        for (path, div_id) in [("/a", "alpha"), ("/b", "bravo"), ("/c", "charlie")] {
+            table.fold_page(path, &page(&[("/99/site/x", div_id, &[(300, 250)])], false));
+        }
+
+        let groups = table.fragmented_slots();
         assert_eq!(groups.len(), 1);
-        assert_eq!(
-            groups[0].suggested_prefix, None,
-            "unrelated ids should not produce a misleading suggestion"
+        assert_eq!(groups[0].suggested_prefix, None);
+    }
+
+    #[test]
+    fn unicode_shared_prefix_uses_a_utf8_boundary() {
+        let mut table = EvidenceTable::default();
+        table.fold_page(
+            "/a",
+            &page(&[("/99/site/x", "ünicode-ad-a", &[(300, 250)])], false),
+        );
+        table.fold_page(
+            "/b",
+            &page(&[("/99/site/x", "ünicode-ad-b", &[(300, 250)])], false),
+        );
+
+        let groups = table.fragmented_slots();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].suggested_prefix.as_deref(), Some("ünicode-ad"));
+    }
+
+    #[test]
+    fn a_later_non_empty_profile_clears_the_empty_page_marker() {
+        let mut table = EvidenceTable::default();
+        table.fold_page("/news", &page(&[], false));
+        table.fold_page(
+            "/news",
+            &page(&[("/99/site/news", "ad-atf", &[(300, 250)])], false),
+        );
+
+        assert!(table.empty_pages().is_empty());
+    }
+
+    #[test]
+    fn a_later_empty_profile_does_not_re_mark_a_non_empty_page() {
+        let mut table = EvidenceTable::default();
+        table.fold_page(
+            "/news",
+            &page(&[("/99/site/news", "ad-atf", &[(300, 250)])], false),
+        );
+        table.fold_page("/news", &page(&[], false));
+
+        assert!(
+            table.empty_pages().is_empty(),
+            "emptiness is a page-level fact across all selected profiles"
         );
     }
 
@@ -554,6 +686,27 @@ mod tests {
             table.pages().len(),
             2,
             "every folded page should be counted"
+        );
+    }
+
+    #[test]
+    fn collision_only_page_is_not_classified_as_empty() {
+        let discovered = page(
+            &[
+                ("/123/site/home", "ad-x-aaaaaaaaaaaaaaaa-0", &[(300, 250)]),
+                ("/123/site/home", "ad-x-bbbbbbbbbbbbbbbb-1", &[(300, 250)]),
+            ],
+            false,
+        );
+        let mut table = EvidenceTable::default();
+
+        table.fold_page("/collision-only", &discovered);
+
+        assert!(discovered.had_slot_evidence);
+        assert!(discovered.slots.is_empty());
+        assert!(
+            table.empty_pages().is_empty(),
+            "intentionally omitted GPT evidence must not look like a bot challenge"
         );
     }
 
