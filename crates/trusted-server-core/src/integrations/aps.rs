@@ -121,7 +121,7 @@ pub enum ApsRenderingMode {
     /// Render through Trusted Server's opaque static renderer route.
     #[default]
     TrustedServer,
-    /// Delegate rendering to the publisher's explicit browser hook.
+    /// Render through the injected APS runner in a publisher-origin friendly frame.
     PublisherNative,
 }
 
@@ -2433,7 +2433,7 @@ mod tests {
     }
 
     #[test]
-    fn publisher_native_config_registers_hook_mode_without_renderer_route() {
+    fn publisher_native_config_registers_runner_mode_without_renderer_route() {
         let mut settings = create_test_settings();
         settings
             .integrations

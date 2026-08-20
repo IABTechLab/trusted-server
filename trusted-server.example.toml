@@ -185,7 +185,7 @@ debug = false
 # Script creatives require separate security validation before opt-in.
 allow_script_creatives = false
 # Default: Trusted Server's opaque static renderer route. Set publisher_native only
-# when the publisher installs the documented tsjs.apsNativeRenderer hook.
+# for the controlled publisher-origin friendly-frame experiment.
 rendering_mode = "trusted_server"
 
 [integrations.google_tag_manager]

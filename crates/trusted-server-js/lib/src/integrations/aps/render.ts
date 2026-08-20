@@ -1,14 +1,12 @@
 import { log } from '../../core/log';
-import type {
-  ApsNativeRendererHook,
-  ApsPrebidRendererEntry,
-  ApsRendererV1,
-  TsjsApi,
-} from '../../core/types';
+import { findSlot } from '../../core/render';
+import type { ApsPrebidRendererEntry, ApsRendererV1, TsjsApi } from '../../core/types';
 
 export const APS_RENDERER_PATH = '/integrations/aps/renderer';
 export const APS_RENDERING_MODE_META_NAME = 'trusted-server-aps-rendering-mode';
-export const APS_NATIVE_RENDERER_ACK_TIMEOUT_MS = 10_000;
+export const APS_PREBID_CREATIVE_RUNNER_URL =
+  'https://client.aps.amazon-adsystem.com/prebid-creative.js';
+export const APS_NATIVE_RENDERER_TIMEOUT_MS = 10_000;
 export const APS_RENDERER_SANDBOX =
   'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation';
 export const APS_UNIVERSAL_CREATIVE_RENDERER_VERSION = 4;
@@ -51,6 +49,29 @@ function releaseNativeDispatch(slotId: string, dispatch: symbol): boolean {
   if (nativeDispatches.get(slotId) !== dispatch) return false;
   nativeDispatches.delete(slotId);
   return true;
+}
+
+function findApsContainer(slotId: string): HTMLElement | null {
+  const direct = findSlot(slotId);
+  if (direct) return direct;
+
+  try {
+    for (const [divId, mappedSlotId] of Object.entries(window.tsjs?.divToSlotId ?? {})) {
+      if (mappedSlotId !== slotId) continue;
+      const mapped = findSlot(divId);
+      if (mapped) return mapped;
+    }
+
+    const configuredDivId = window.tsjs?.adSlots?.find((slot) => slot.id === slotId)?.div_id;
+    return configuredDivId ? findSlot(configuredDivId) : null;
+  } catch {
+    return null;
+  }
+}
+
+function cancelPendingApsRendering(slotId: string): void {
+  const container = findApsContainer(slotId);
+  if (container) pendingFrameCancels.get(container)?.();
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -291,7 +312,7 @@ export function consumeApsPrebidRenderer(adId: string, expected: ApsPrebidRender
   return true;
 }
 
-/** Whether the server explicitly selected the opt-in publisher-native hook mode. */
+/** Whether the server explicitly selected the opt-in publisher-native runner mode. */
 export function isPublisherNativeApsRendering(): boolean {
   return (
     document.head.querySelector(
@@ -310,16 +331,17 @@ export interface DispatchApsRenderingOptions {
 /**
  * Dispatch a validated APS descriptor to exactly one configured rendering owner.
  *
- * Publisher hooks own side-effect cancellation and render completion. Trusted Server
- * ignores superseded hook acknowledgements and never falls back to its iframe.
+ * Native mode loads APS's fixed Prebid creative runner in a publisher-origin friendly
+ * frame. Superseded attempts are cancelled and never fall back to the opaque renderer.
  */
 export function dispatchApsRendering({
   slotId,
   renderer: input,
   trustedServer,
 }: DispatchApsRenderingOptions): boolean | Promise<boolean> {
-  // Record every attempt before any early return so it supersedes an older
-  // pending native acknowledgement for the same slot.
+  // Every attempt supersedes a pending frame for this slot, including an invalid
+  // replacement that fails before a new frame can be created.
+  cancelPendingApsRendering(slotId);
   const dispatch = Symbol(slotId);
   nativeDispatches.set(slotId, dispatch);
 
@@ -337,84 +359,133 @@ export function dispatchApsRendering({
     }
   }
 
-  let hook: ApsNativeRendererHook | undefined;
-  let render: ApsNativeRendererHook['render'] | undefined;
+  let rendering: Promise<boolean>;
   try {
-    hook = window.tsjs?.apsNativeRenderer;
-    render = hook?.render;
+    rendering = renderApsPublisherNative({ slotId, renderer });
   } catch {
     releaseNativeDispatch(slotId, dispatch);
-    log.warn('APS native renderer: publisher hook lookup threw');
-    return Promise.resolve(false);
-  }
-  if (!hook || typeof render !== 'function') {
-    releaseNativeDispatch(slotId, dispatch);
-    log.warn('APS native renderer: publisher hook is unavailable');
+    log.warn('APS native renderer: failed to start publisher-origin frame');
     return Promise.resolve(false);
   }
 
-  let response: unknown;
-  try {
-    response = Reflect.apply(render, hook, [{ version: 1, slotId, renderer }]);
-  } catch {
-    releaseNativeDispatch(slotId, dispatch);
-    log.warn('APS native renderer: publisher hook threw');
+  return rendering.then((accepted) => {
+    if (!releaseNativeDispatch(slotId, dispatch)) {
+      log.warn('APS native renderer: ignored stale completion');
+      return false;
+    }
+    return accepted;
+  });
+}
+
+export interface RenderApsPublisherNativeOptions {
+  slotId: string;
+  renderer: unknown;
+}
+
+/** Render the exact selected response through APS's fixed runner in a friendly iframe. */
+export function renderApsPublisherNative({
+  slotId,
+  renderer: input,
+}: RenderApsPublisherNativeOptions): Promise<boolean> {
+  const renderer = validateApsRenderer(input);
+  const container = findApsContainer(slotId);
+  if (!renderer || !container) {
+    log.warn(
+      renderer ? 'APS native renderer: slot not found' : 'APS renderer: rejected descriptor'
+    );
     return Promise.resolve(false);
   }
 
-  if (nativeDispatches.get(slotId) !== dispatch) {
-    log.warn('APS native renderer: ignored stale acknowledgement');
-    return Promise.resolve(false);
-  }
+  // Keep an already committed creative visible until the replacement runner loads.
+  pendingFrameCancels.get(container)?.();
+  const iframe = document.createElement('iframe');
+  iframe.title = 'Ad content';
+  iframe.width = String(renderer.width);
+  iframe.height = String(renderer.height);
+  iframe.style.border = '0';
+  iframe.style.display = 'none';
+  activeFrames.set(container, iframe);
 
   return new Promise<boolean>((resolve) => {
     let settled = false;
-    const settle = (accepted: boolean, warning?: string): void => {
+    let runner: HTMLScriptElement | undefined;
+
+    const cleanup = (): void => {
+      window.clearTimeout(timeoutId);
+      runner?.removeEventListener('load', commit);
+      runner?.removeEventListener('error', fail);
+    };
+    const finish = (accepted: boolean, warning?: string): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timeout);
-      if (!releaseNativeDispatch(slotId, dispatch)) {
-        log.warn('APS native renderer: ignored stale acknowledgement');
+      cleanup();
+      if (pendingFrameCancels.get(container) === cancel) pendingFrameCancels.delete(container);
+
+      if (!accepted || activeFrames.get(container) !== iframe || !iframe.isConnected) {
+        if (activeFrames.get(container) === iframe) activeFrames.delete(container);
+        iframe.remove();
+        if (warning) log.warn(warning);
         resolve(false);
         return;
       }
-      if (warning) log.warn(warning);
-      resolve(accepted);
-    };
-    const timeout = setTimeout(() => {
-      settle(false, 'APS native renderer: publisher hook acknowledgement timed out');
-    }, APS_NATIVE_RENDERER_ACK_TIMEOUT_MS);
 
-    Promise.resolve(response).then(
-      (value) => {
-        let accepted: boolean;
-        try {
-          if (
-            !isRecord(value) ||
-            (!hasExactKeys(value, ['accepted']) && !hasExactKeys(value, ['accepted', 'reason'])) ||
-            typeof value.accepted !== 'boolean' ||
-            (Object.prototype.hasOwnProperty.call(value, 'reason') &&
-              typeof value.reason !== 'string')
-          ) {
-            settle(false, 'APS native renderer: publisher hook returned malformed acknowledgement');
-            return;
-          }
-          accepted = value.accepted;
-        } catch {
-          settle(false, 'APS native renderer: publisher hook returned malformed acknowledgement');
-          return;
-        }
-
-        if (!accepted) {
-          settle(false, 'APS native renderer: publisher hook declined descriptor');
-          return;
-        }
-        settle(true);
-      },
-      () => {
-        settle(false, 'APS native renderer: publisher hook rejected');
+      for (const child of Array.from(container.children)) {
+        if (child !== iframe) child.remove();
       }
+      iframe.style.display = '';
+      resolve(true);
+    };
+    const cancel = (): void => finish(false);
+    function fail(): void {
+      finish(false, 'APS native renderer: creative runner failed');
+    }
+    function commit(): void {
+      finish(true);
+    }
+
+    const timeoutId = window.setTimeout(
+      () => finish(false, 'APS native renderer: creative runner timed out'),
+      APS_NATIVE_RENDERER_TIMEOUT_MS
     );
+    pendingFrameCancels.set(container, cancel);
+    container.appendChild(iframe);
+
+    try {
+      const frameWindow = iframe.contentWindow as
+        | (Window &
+            typeof globalThis & {
+              _aps: Map<string, { queue: Event[]; store: Map<string, Map<unknown, unknown>> }>;
+            })
+        | null;
+      const frameDocument = iframe.contentDocument;
+      if (!frameWindow || !frameDocument) {
+        fail();
+        return;
+      }
+
+      frameDocument.open();
+      frameDocument.write(
+        '<!doctype html><html><head><meta charset="utf-8"></head><body></body></html>'
+      );
+      frameDocument.close();
+      frameWindow._aps = new Map();
+      frameWindow._aps.set(renderer.accountId, {
+        queue: [
+          new frameWindow.CustomEvent('prebid/creative/render', {
+            detail: { aaxResponse: renderer.aaxResponse, seatBidId: renderer.bidId },
+          }),
+        ],
+        store: new Map([['listeners', new Map()]]),
+      });
+
+      runner = frameDocument.createElement('script');
+      runner.src = APS_PREBID_CREATIVE_RUNNER_URL;
+      runner.addEventListener('load', commit, { once: true });
+      runner.addEventListener('error', fail, { once: true });
+      frameDocument.head.appendChild(runner);
+    } catch {
+      fail();
+    }
   });
 }
 

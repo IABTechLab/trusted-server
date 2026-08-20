@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AdUnit } from '../../src/core/types';
-import { APS_RENDERING_MODE_META_NAME } from '../../src/integrations/aps/render';
+import {
+  APS_PREBID_CREATIVE_RUNNER_URL,
+  APS_RENDERING_MODE_META_NAME,
+} from '../../src/integrations/aps/render';
 import envelope from '../fixtures/aps-renderer-v1.json';
 
 async function flushRequestAds(): Promise<void> {
@@ -138,7 +141,7 @@ describe('request.requestAds', () => {
     expect(document.querySelector('#slot1 span')).toBeNull();
   });
 
-  it('contract test: dispatches a direct APS bid to the native publisher hook without an iframe', async () => {
+  it('contract test: renders a direct APS bid through the injected native runner', async () => {
     const apsBid = envelope.seatbid[0].bid[0];
     const renderer = {
       type: 'aps' as const,
@@ -151,8 +154,6 @@ describe('request.requestAds', () => {
       width: apsBid.w,
       height: apsBid.h,
     };
-    const render = vi.fn().mockResolvedValue({ accepted: true });
-    window.tsjs = { apsNativeRenderer: { render } } as typeof window.tsjs;
     const marker = document.createElement('meta');
     marker.name = APS_RENDERING_MODE_META_NAME;
     marker.content = 'publisher_native';
@@ -179,11 +180,27 @@ describe('request.requestAds', () => {
 
       requestAds();
       await flushRequestAds();
-      await Promise.resolve();
+      const frame = document.querySelector<HTMLIFrameElement>('#slot1 iframe')!;
+      const runner = frame.contentDocument?.querySelector<HTMLScriptElement>('script');
+      expect(runner).not.toBeNull();
+      const frameWindow = frame.contentWindow as unknown as {
+        _aps: Map<string, { queue: Array<CustomEvent<Record<string, string>>> }>;
+      };
+      const queued = frameWindow._aps.get(renderer.accountId)?.queue[0];
 
-      expect(render).toHaveBeenCalledWith({ version: 1, slotId: 'slot1', renderer });
-      expect(document.querySelector('#slot1 iframe')).toBeNull();
+      expect(frame.getAttribute('sandbox')).toBeNull();
+      expect(runner!.src).toBe(APS_PREBID_CREATIVE_RUNNER_URL);
+      expect(queued?.type).toBe('prebid/creative/render');
+      expect(queued?.detail).toEqual({
+        aaxResponse: renderer.aaxResponse,
+        seatBidId: renderer.bidId,
+      });
       expect(document.querySelector('#slot1 span')).not.toBeNull();
+
+      runner!.dispatchEvent(new Event('load'));
+      await Promise.resolve();
+      expect(document.querySelector('#slot1 span')).toBeNull();
+      expect(frame.style.display).toBe('');
     } finally {
       marker.remove();
     }
