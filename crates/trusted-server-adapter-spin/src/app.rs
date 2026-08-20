@@ -1,8 +1,12 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use edgezero_adapter_spin::config_store::SpinConfigStore;
 use edgezero_adapter_spin::context::SpinRequestContext;
 use edgezero_core::app::Hooks;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
@@ -10,11 +14,15 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::RuntimeServices;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use trusted_server_core::platform::{PlatformConfigStore, StoreName};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -28,13 +36,21 @@ use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use trusted_server_core::settings_data::{default_config_key, default_secret_store_name};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware};
 use crate::platform::build_runtime_services;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use crate::platform::{ConfigStoreHandleAdapter, SpinSecretStoreAdapter};
 
 // ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
+
+/// Spin auto-provides this key-value store label without runtime configuration.
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+const SPIN_DEFAULT_CONFIG_STORE: &str = "default";
 
 /// Application state built once at startup and shared across all requests.
 pub struct AppState {
@@ -50,8 +66,42 @@ pub struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let settings = Settings::from_toml(include_str!("../../../trusted-server.example.toml"))?;
+    let settings = load_startup_settings()?;
     build_state_with_settings(settings)
+}
+
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
+    let config_store_name = StoreName::from(SPIN_DEFAULT_CONFIG_STORE);
+    let config_key = default_config_key();
+    let config_store =
+        futures::executor::block_on(SpinConfigStore::open(config_store_name.as_ref().to_owned()))
+            .map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: "failed to open Spin Trusted Server config store".to_string(),
+            })
+            .attach(error.to_string())
+        })?;
+    let config_handle = ConfigStoreHandle::new(Arc::new(config_store));
+    let config_adapter = ConfigStoreHandleAdapter(config_handle);
+    let raw_envelope = config_adapter
+        .get(&config_store_name, &config_key)
+        .map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: "failed to read Spin Trusted Server app-config blob".to_string(),
+            })
+            .attach(error.to_string())
+        })?;
+    let secret_store = SpinSecretStoreAdapter;
+    settings_from_config_blob(&raw_envelope, &secret_store, &default_secret_store_name())
+}
+
+#[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
+fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
+    Err(Report::new(TrustedServerError::Configuration {
+        message: "Spin startup settings require the production config store".to_string(),
+    })
+    .attach("use TrustedServerApp::routes_with_settings for host tests"))
 }
 
 /// Build the application state from explicit settings.
