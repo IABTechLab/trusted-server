@@ -955,7 +955,7 @@ pub struct Bid {
     /// Prebid Cache UUID for this bid.
     ///
     /// Populated from `ext.prebid.cache.bids.cacheId` in the PBS response.
-    /// Used as `hb_adid` targeting value in `window.tsjs.bids`. `None` for
+    /// Used as the `hb_adid` value in the initial browser auction projection. `None` for
     /// non-PBS providers (e.g., APS) and PBS bids without Prebid Cache enabled.
     pub cache_id: Option<String>,
     /// Prebid Cache host (e.g., `"openads.adsrvr.org"`).

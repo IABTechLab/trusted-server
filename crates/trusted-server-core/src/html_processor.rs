@@ -182,12 +182,12 @@ pub struct HtmlProcessorConfig {
     pub request_host: String,
     pub request_scheme: String,
     pub integrations: IntegrationRegistry,
-    /// Pre-computed `<script>(window.tsjs=window.tsjs||{}).adSlots=...;</script>`.
-    /// Injected at `<head>` open. `None` when no slots matched.
+    /// Pre-computed canonical browser-slot JSON used to build the immutable boot
+    /// auction projection. `None` when no slots matched.
     pub ad_slots_script: Option<String>,
     /// Shared auction result — written by auction task before HTML processing begins.
     /// Handler reads this in `el.on_end_tag()` on the body element.
-    /// `None` means no auction ran; inject empty `tsjs.bids = {}` as fallback.
+    /// `None` means no auction ran; inject an empty boot auction projection.
     pub ad_bids_state: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Maximum bytes the post-processing accumulator may buffer before the
     /// processor aborts. Mirrors `publisher.max_buffered_body_bytes` so the

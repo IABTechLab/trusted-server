@@ -47,8 +47,10 @@ and non-storeable.
 
 Enabling the integration has one server-side effect that does not depend on browser
 activation. For each server-side auction that produced winning bids, Trusted Server
-mints a fresh correlation token and publishes it as `hb_auction_id` on each winning bid
-in `window.tsjs.bids`:
+mints a fresh correlation token and publishes it as `hb_auction_id` on each winning
+bid targeting record in the initial immutable `tsjs.boot.auctionProjection`. A later
+SPA page-bids response keeps its replacement projection internal to that navigation
+session:
 
 ```text
 ts-auc-2f8c1d5a4b7e4c0f9a3d6b1e8c5f2a7d

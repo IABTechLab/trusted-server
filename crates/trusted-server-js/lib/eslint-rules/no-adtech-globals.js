@@ -2,8 +2,9 @@ const ADTECH_GLOBALS = new Set(['googletag', 'pbjs']);
 const GLOBAL_ROOTS = new Set(['globalThis', 'self', 'window']);
 
 // Known blind spots include computed composition (`globalThis['goog' + 'letag']`)
-// and function-returned roots (`getWin().googletag`); adapter boundaries and
-// restricted imports remain defense in depth.
+// and function-returned roots (`getWin().googletag`). Exact adapter boundaries,
+// restricted imports, bundle/source scans, and browser ownership tests remain the
+// defense-in-depth layers for those exotic forms.
 
 function normalizeFilename(filename, rootDirectory) {
   const normalized = filename.replaceAll('\\', '/');

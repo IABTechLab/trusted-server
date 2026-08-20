@@ -278,8 +278,12 @@ test('restricted paths enforce dependency direction and exact target-file exempt
     (await restrictedMessages("import '../core/types';", 'src/services/new-service.ts')).length > 0
   );
   assert.ok(
-    (await restrictedMessages("import '../composition/runtime_transport';", 'src/kernel/new-runtime.ts'))
-      .length > 0
+    (
+      await restrictedMessages(
+        "import '../composition/runtime_transport';",
+        'src/kernel/new-runtime.ts'
+      )
+    ).length > 0
   );
   assert.ok(
     (
@@ -332,4 +336,16 @@ test('every current integration directory participates in cross-integration isol
     .sort();
 
   assert.deepEqual(actual, [...ARCHITECTURE_INTEGRATION_DIRECTORIES].sort());
+});
+
+test('documents exotic global-analysis blind spots and the defense-in-depth layers', async () => {
+  const source = await readFile(
+    path.join(packageRoot, 'eslint-rules/no-adtech-globals.js'),
+    'utf8'
+  );
+
+  assert.match(source, /computed composition/u);
+  assert.match(source, /function-returned roots/u);
+  assert.match(source, /bundle\/source scans/u);
+  assert.match(source, /browser ownership tests/u);
 });

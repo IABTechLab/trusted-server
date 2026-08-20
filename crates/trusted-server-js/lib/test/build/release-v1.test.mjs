@@ -20,6 +20,10 @@ import {
 } from '../../scripts/check-bundle-budgets.mjs';
 import * as bundleBudgets from '../../scripts/check-bundle-budgets.mjs';
 import * as bundleMetrics from '../../scripts/bundle-metrics.mjs';
+import {
+  findCutoverTextViolations,
+  findVendorBoundaryViolations,
+} from '../../scripts/check-hard-cutover-absence.mjs';
 
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 const libDirectory = path.resolve(testDirectory, '../..');
@@ -1976,6 +1980,69 @@ test('hard-cutover absence is exposed once and enforced after both production bu
   assert.notEqual(buildStep, -1);
   assert.ok(externalPrebidStep > buildStep, 'pure Prebid must build after the TSJS release');
   assert.ok(absenceStep > externalPrebidStep, 'absence must run after both production builds');
+});
+
+test('hard-cutover policy rejects every retired wire, runtime, and public surface', () => {
+  const retired = [
+    ['src/legacy.ts', '"/integrations/aps/renderer"'],
+    [
+      'src/legacy.ts',
+      "JSON.stringify({message:'Prebid Response',rendererVersion:'4',rendererUrl})",
+    ],
+    ['src/legacy.ts', "port.postMessage({message:'TS APS Start'})"],
+    ['src/legacy.ts', 'window.__tsjs_gpt_enabled = true'],
+    ['src/legacy.ts', 'script.setAttribute("data-ts-gam-attribution", "1")'],
+    ['src/legacy.ts', 'interface TsjsApiV1 {}'],
+    ['src/legacy.ts', 'tsjs.renderAdUnit("slot")'],
+    ['src/legacy.ts', 'tsjs.setConfig({debug: true})'],
+    ['src/legacy.ts', 'const value = tsjs.getConfig()'],
+    ['src/legacy.ts', 'const slots = tsjs.adSlots'],
+    ['src/legacy.ts', 'const trace = tsjs.renders'],
+    ['src/legacy.ts', 'const diagnostics = tsjs.gptDiagnostics'],
+    ['src/legacy.ts', 'tsjs.version = "0.1.0"'],
+    ['src/legacy.ts', 'window.dispatchEvent(new Event("tsjs:adRendered"))'],
+    ['src/composition/browser.ts', 'export function createBrowserRuntime() {}'],
+  ];
+  for (const [file, source] of retired) {
+    assert.ok(
+      findCutoverTextViolations(file, source).length > 0,
+      `retired cutover surface should be rejected: ${source}`
+    );
+  }
+});
+
+test('vendor boundary rejects APS, GPT, and PUC artifacts but permits conformance metadata', () => {
+  const vendored = [
+    ['fixtures/prebid-creative.js', 'window._aps = new Map();'],
+    ['fixtures/gpt.js', 'window.googletag = window.googletag || {};'],
+    ['fixtures/gpt.js.map', '{"sources":["gpt.js"]}'],
+    ['fixtures/gpt.js.sha256', 'deadbeef'],
+    ['fixtures/prebid-universal-creative-1.17.2.js', 'window.renderAd = function() {};'],
+    ['fixtures/renamed.js', '/*! Prebid Universal Creative v1.17.2 */'],
+    ['fixtures/renamed.js', '/*! @license Google Publisher Tag */'],
+    ['fixtures/renamed.js', '/*! Copyright Amazon Publisher Services */'],
+    ['fixtures/vendor.json', '{"pucIntegrity":"sha384-deadbeef"}'],
+  ];
+  for (const [file, source] of vendored) {
+    assert.ok(
+      findVendorBoundaryViolations(file, source).length > 0,
+      `vendored upstream artifact should be rejected: ${file}`
+    );
+  }
+  assert.deepEqual(
+    findVendorBoundaryViolations(
+      'browser/helpers/gam-test-network.ts',
+      'export const REAL_GAM_PUC_RELEASE = "1.17.2"; Object.freeze({pucRelease: REAL_GAM_PUC_RELEASE});'
+    ),
+    []
+  );
+  assert.deepEqual(
+    findVendorBoundaryViolations(
+      'browser/fixtures/fictional-aps-runner.js',
+      '// Fictional hermetic APS runner fixture; not copied from APS.\nwindow._aps = new Map();'
+    ),
+    []
+  );
 });
 
 test('registered integration dispatch selects post-switch evidence without changing the instrument', () => {

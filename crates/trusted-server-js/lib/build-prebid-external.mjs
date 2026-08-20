@@ -42,7 +42,25 @@ const LEGACY_RUNTIME_FLAG_PREFIX = ['__', 'tsjs', '_'].join('');
 /** Refuse to publish an external Prebid artifact carrying a retired TSJS runtime flag. */
 export function assertNoLegacyRuntimeFlags(bundleCode) {
   if (bundleCode.includes(LEGACY_RUNTIME_FLAG_PREFIX)) {
-    throw new Error('[build-prebid-external] Generated artifact contains a legacy TSJS runtime flag');
+    throw new Error(
+      '[build-prebid-external] Generated artifact contains a legacy TSJS runtime flag'
+    );
+  }
+}
+
+const TS_OWNED_PREBID_ARTIFACT_MARKERS = [
+  /\bTS (?:APS|ADM|Owner|Render Owner)\b/u,
+  /\/_ts\/(?:auction|page-bids)\b/u,
+  /\b(?:rendererReservationId|lifecycleTicket)\b/u,
+  /\btsjs\.(?:addAdUnits|diagnostics|requestAds)\b/u,
+];
+
+/** Keep the independently useful external bundle free of TS-owned behavior. */
+export function assertPurePrebidArtifact(bundleCode) {
+  if (TS_OWNED_PREBID_ARTIFACT_MARKERS.some((expression) => expression.test(bundleCode))) {
+    throw new Error(
+      '[build-prebid-external] Generated artifact contains TS-owned auction or render behavior'
+    );
   }
 }
 
@@ -404,6 +422,7 @@ async function buildExternalBundle(outDir, generatedModules, stamp) {
       throw new Error('[build-prebid-external] Artifact release sentinel remained after stamping');
     }
     assertNoLegacyRuntimeFlags(finalBundle);
+    assertPurePrebidArtifact(finalBundle);
     const bundleBytes = Buffer.from(finalBundle, 'utf8');
     const metadata = deriveBundleMetadata(bundleBytes);
     const finalPath = path.join(outDir, metadata.filename);

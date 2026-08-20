@@ -1326,7 +1326,7 @@ pub struct OwnedProcessResponseParams {
     /// The streaming phase collects these and writes bids to `ad_bids_state`
     /// before processing the last body chunk, so `</body>` injection sees live bids.
     pub(crate) dispatched_auction: Option<DispatchedAuction>,
-    /// Price granularity used to bucket bids when building `tsjs.bids`.
+    /// Price granularity used to bucket bids in the browser auction projection.
     pub(crate) price_granularity: PriceGranularity,
     /// Whether to omit Trusted Server's automatic `DataDome` client-side tag.
     pub(crate) suppress_datadome_client_side_tag: bool,
@@ -3932,7 +3932,7 @@ pub async fn handle_publisher_request(
     // stamp.
     // Gate on `should_run_ad_stack` rather than content-type alone: when no slot
     // matched, the feature is disabled, or this is not an ad-eligible navigation,
-    // no per-user `tsjs.adSlots`/`tsjs.bids` are injected, so forcing private
+    // no per-navigation browser auction projection is injected, so forcing private
     // here would needlessly strip shared cacheability from ordinary publisher
     // HTML. Applies regardless of the auction *outcome* (empty bids still inject
     // per-user slot state). The separate EC-cookie cache net in the adapter's

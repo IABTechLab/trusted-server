@@ -6,15 +6,21 @@ const repositoryRoot = path.resolve(packageRoot, '../../..');
 const extensions = new Set([
   '.css',
   '.html',
+  '.integrity',
   '.js',
   '.json',
+  '.log',
+  '.map',
   '.md',
   '.mjs',
   '.rs',
   '.sh',
+  '.sha256',
+  '.sri',
   '.toml',
   '.ts',
   '.tsx',
+  '.txt',
   '.yaml',
   '.yml',
 ]);
@@ -45,6 +51,9 @@ function lineNumber(source, offset) {
 
 const jsPackageFiles = collect(packageRoot);
 const shippedTsjsFiles = collect(path.join(packageRoot, 'src'));
+const productionTsjsFiles = shippedTsjsFiles.filter(
+  (file) => !/(?:_test|\.test)\.[cm]?[jt]sx?$/u.test(file)
+);
 const generatedTsjsFiles = collect(path.join(packageRoot, 'dist'));
 const currentGuideFiles = collect(path.join(repositoryRoot, 'docs/guide'));
 const browserTestFiles = collect(
@@ -85,6 +94,115 @@ function forbid(files, label, expression) {
 
 function token(...parts) {
   return parts.join('');
+}
+
+const retiredRuntimeFiles = new Set([
+  'src/composition/browser.ts',
+  'src/composition/critical_transport.ts',
+  'src/composition/index.ts',
+  'src/core/bootstrap_controller.ts',
+]);
+const retiredCutoverExpressions = [
+  [
+    'non-canonical APS renderer route',
+    /\/integrations\/aps\/renderer(?!\/v2(?![A-Za-z0-9_./-]))/gu,
+  ],
+  [
+    'rendererUrl in a v4 Prebid response',
+    /(?:message\s*:\s*['"]Prebid Response['"]|\[['"]message['"]\]\s*=\s*[^;\n]*prebidResponse)[\s\S]{0,512}(?:rendererVersion\s*:\s*['"]4['"]|\[['"]rendererVersion['"]\]\s*=)[\s\S]{0,512}\brendererUrl\b/gu,
+  ],
+  ['retired APS owner start payload', /['"]TS APS Start['"]/gu],
+  ['raw TSJS integration global', /__tsjs_[A-Za-z0-9_]+/gu],
+  ['retired bundle activation attribute', /data-ts-gam-attribution/gu],
+  [
+    'retired TSJS public surface',
+    /\b(?:LegacyTsjsApi|TsjsApiV1|apsPrebidRenderers|renderAllAdUnits|renderAdUnit|renderLog|renderSeq|registerContextProvider|collectContext|installGuards)\b|tsjs:adRendered/gu,
+  ],
+  [
+    'retired TSJS namespace member',
+    /\btsjs(?:\.|\?\.)(?:adSlots|bids|getConfig|gptDiagnostics|renders|setConfig)\b/gu,
+  ],
+  ['retired TSJS public version', /\btsjs(?:\.|\?\.)version\s*=\s*['"]0\.1\.0['"]/gu],
+  ['retired creative global', /\b(?:tscreative|tsCreativeConfig)\b/gu],
+];
+
+export function findCutoverTextViolations(file, source) {
+  const normalized = file
+    .replaceAll('\\', '/')
+    .replace(/^.*\/crates\/trusted-server-js\/lib\//u, '');
+  const found = [];
+  if (retiredRuntimeFiles.has(normalized)) found.push('retired second runtime file');
+  for (const [label, expression] of retiredCutoverExpressions) {
+    expression.lastIndex = 0;
+    if (expression.test(source)) found.push(label);
+  }
+  return found;
+}
+
+const forbiddenVendorBasename =
+  /^(?:gpt|pubads_impl|prebid-creative|prebid-universal-creative(?:[._-].*)?)\.(?:[cm]?js|html)(?:\.(?:integrity|map|sha256|sri))?$/iu;
+const vendorBodyExpressions = [
+  /\/[*!]\s*(?:@license\s+)?[^\n]{0,160}\bPrebid Universal Creative\b/giu,
+  /\/[*!][^\n]{0,160}@license[^\n]{0,160}\bGoogle Publisher Tag\b/giu,
+  /\/[*!][^\n]{0,160}(?:Copyright|@license)[^\n]{0,160}\bAmazon Publisher Services\b/giu,
+  /\b(?:apsRunner|gpt|puc)(?:Digest|Integrity|Sha(?:256|384|512)|Sri|Checksum|Version)\b/giu,
+  /\b(?:digest|integrity|sha(?:256|384|512)|sri|checksum)\b[^\n]{0,160}\b(?:prebid-creative\.js|Google Publisher Tag|Prebid Universal Creative|Amazon Publisher Services)\b/giu,
+  /\b(?:prebid-creative\.js|Google Publisher Tag|Prebid Universal Creative|Amazon Publisher Services)\b[^\n]{0,160}\b(?:digest|integrity|sha(?:256|384|512)|sri|checksum)\b/giu,
+];
+
+export function findVendorBoundaryViolations(file, source) {
+  const normalized = file.replaceAll('\\', '/');
+  const basename = path.posix.basename(normalized);
+  const found = [];
+  if (forbiddenVendorBasename.test(basename)) found.push('vendor distributable filename');
+  for (const expression of vendorBodyExpressions) {
+    expression.lastIndex = 0;
+    if (expression.test(source)) found.push('stored vendor body, checksum, or version metadata');
+  }
+  return found;
+}
+
+for (const file of uniqueFiles([
+  ...productionTsjsFiles,
+  ...generatedTsjsFiles,
+  ...currentGuideFiles,
+  ...productionRustFiles,
+])) {
+  const source = fs.readFileSync(file, 'utf8');
+  const productionSource = file.endsWith('.rs')
+    ? (source.split('\n#[cfg(test)]')[0] ?? source)
+    : source;
+  for (const label of findCutoverTextViolations(relative(file), productionSource)) {
+    violations.push(`${relative(file)}:1: ${label}`);
+  }
+}
+
+const vendorBoundaryFiles = [
+  ...productionTsjsFiles,
+  ...generatedTsjsFiles,
+  ...productionRustFiles,
+  ...collect(path.join(repositoryRoot, 'crates/trusted-server-integration-tests/browser/fixtures')),
+  ...collect(path.join(repositoryRoot, 'crates/trusted-server-integration-tests/fixtures')),
+  ...collect(path.join(repositoryRoot, 'target/aps-tsjs-quality-evidence')),
+  ...collect(path.join(repositoryRoot, 'target/aps-tsjs-cutover-evidence')),
+  ...collect(
+    path.join(repositoryRoot, 'crates/trusted-server-integration-tests/browser/real-gam-evidence')
+  ),
+  ...collect(
+    path.join(repositoryRoot, 'crates/trusted-server-integration-tests/browser/playwright-report')
+  ),
+  ...collect(
+    path.join(repositoryRoot, 'crates/trusted-server-integration-tests/browser/test-results')
+  ),
+];
+for (const file of uniqueFiles(vendorBoundaryFiles)) {
+  const source = fs.readFileSync(file, 'utf8');
+  const productionSource = file.endsWith('.rs')
+    ? (source.split('\n#[cfg(test)]')[0] ?? source)
+    : source;
+  for (const label of findVendorBoundaryViolations(relative(file), productionSource)) {
+    violations.push(`${relative(file)}:1: ${label}`);
+  }
 }
 
 const oldRuntimePrefix = token('__', 'tsjs', '_');
@@ -230,6 +348,22 @@ for (const manifest of browserPackageManifests) {
     violations.push(`${manifest}:1: PUC package is vendored into the local harness`);
   }
 }
+const realGamNetworkFile = path.join(
+  repositoryRoot,
+  'crates/trusted-server-integration-tests/browser/helpers/gam-test-network.ts'
+);
+const realGamNetworkSource = fs.readFileSync(realGamNetworkFile, 'utf8');
+if (!/export const REAL_GAM_PUC_RELEASE = ['"]1\.17\.2['"];/u.test(realGamNetworkSource)) {
+  violations.push(
+    `${relative(realGamNetworkFile)}:1: protected conformance metadata must pin PUC 1.17.2`
+  );
+}
+forbidSource(
+  realGamNetworkFile,
+  realGamNetworkSource,
+  'PUC conformance metadata must not carry vendor bytes, URLs, or checksums',
+  /\bPUC_(?:ASSET|BODY|DIGEST|INTEGRITY|SCRIPT|SRI|URL|VERSION)\b/gu
+);
 
 for (const manifest of [
   'crates/trusted-server-adapter-fastly/Cargo.toml',
@@ -285,10 +419,13 @@ for (const [file, required] of requiredReplacements) {
   }
 }
 
+const executedAsMain =
+  process.argv[1] !== undefined &&
+  path.resolve(process.argv[1]) === path.resolve(import.meta.filename);
 if (violations.length > 0) {
   console.error(`Hard-cutover absence check failed (${violations.length} violations):`);
   for (const violation of violations.sort()) console.error(`- ${violation}`);
   process.exitCode = 1;
-} else {
+} else if (executedAsMain) {
   console.log('Hard-cutover absence check passed.');
 }
