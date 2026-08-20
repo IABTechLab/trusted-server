@@ -2095,13 +2095,14 @@ impl Settings {
         Ok(())
     }
 
-    /// Returns compiled creative opportunity slots, or empty slice if feature is disabled.
+    /// Returns compiled creative opportunity slots when template delivery is enabled.
     #[must_use]
     pub fn creative_opportunity_slots(
         &self,
     ) -> &[crate::creative_opportunities::CreativeOpportunitySlot] {
         self.creative_opportunities
             .as_ref()
+            .filter(|co| co.enabled)
             .map(|co| co.slot.as_slice())
             .unwrap_or(&[])
     }
@@ -5014,6 +5015,10 @@ formats = [{ width = 300, height = 250 }]
         let co = settings
             .creative_opportunities
             .expect("should have creative_opportunities");
+        assert!(
+            co.enabled,
+            "creative-opportunity templates should default to enabled"
+        );
         assert_eq!(co.gam_network_id, "21765378893");
         assert_eq!(co.auction_timeout_ms, Some(500));
         assert_eq!(
@@ -5021,6 +5026,45 @@ formats = [{ width = 300, height = 250 }]
             Some(0),
             "startup finalization should materialize the dynamic-template compatibility marker"
         );
+    }
+
+    #[test]
+    fn settings_disables_creative_opportunity_slots_when_configured_off() {
+        let toml = format!(
+            "{}\n[creative_opportunities]\nenabled = false\ngam_network_id = \"21765378893\"\n\n[[creative_opportunities.slot]]\nid = \"atf\"\npage_patterns = [\"/\"]\nformats = [{{ width = 300, height = 250 }}]\n",
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse disabled templates");
+        assert!(
+            settings.creative_opportunity_slots().is_empty(),
+            "disabled template delivery should expose no runtime slots"
+        );
+    }
+
+    #[test]
+    fn legacy_settings_loader_applies_creative_opportunity_enabled_environment_override() {
+        let toml = format!(
+            "{}\n[creative_opportunities]\nenabled = true\ngam_network_id = \"21765378893\"\n",
+            crate_test_settings_str()
+        );
+        let env_key = format!(
+            "{}{}CREATIVE_OPPORTUNITIES{}ENABLED",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+
+        temp_env::with_var(env_key, Some("false"), || {
+            let settings = Settings::from_toml_and_env(&toml)
+                .expect("should parse template enabled environment override");
+            assert!(
+                !settings
+                    .creative_opportunities
+                    .expect("should have creative opportunities")
+                    .enabled,
+                "legacy settings loader should disable template delivery"
+            );
+        });
     }
 
     #[test]

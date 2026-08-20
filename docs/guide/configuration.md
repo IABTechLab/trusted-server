@@ -1347,8 +1347,35 @@ Defines the ad slots the trusted server offers on a page: which pages each slot
 appears on (`page_patterns`), its supported sizes (`formats`), and the GAM ad
 unit it maps to (`gam_unit_path`).
 
+`enabled` is the dedicated server-side ad-template switch. It defaults to `true`
+for compatibility with existing configurations. Set it to `false` to stop
+publisher HTML and SPA page-bids template delivery while retaining the slot
+configuration and direct `POST /auction` endpoint.
+
+#### Publisher document cache policy
+
+For a successful GET publisher document, Trusted Server applies the
+browser-only `Cache-Control: private, max-age=60` policy from
+[#1007](https://github.com/IABTechLab/trusted-server/issues/1007) when the
+server-side ad stack is structurally inactive. This includes an absent
+`[creative_opportunities]` section, `enabled = false`, no slot matching the
+path, or a disabled auction. The `private` directive prevents shared caches
+that use `Cache-Control` from storing the document. The policy replaces the
+origin browser cache policy except when the origin sends `private` or
+`no-store`, which are preserved. Bot, prefetch, and consent-denied requests
+also retain the origin policy because they can produce a request-specific
+representation for the same URL. Error responses and non-document requests
+retain the origin policy.
+
+Trusted Server leaves origin validators and CDN-specific cache headers
+unchanged. Those headers continue to control supporting CDNs independently of
+the browser-only policy. If a response using the generated inactive-stack
+policy later carries `Set-Cookie`, cookie privacy finalization replaces it with
+`Cache-Control: private, max-age=0` and removes the CDN-specific cache headers.
+
 ```toml
 [creative_opportunities]
+enabled = true # set to false to disable server-side ad templates
 gam_network_id = "123456789"
 price_granularity = "dense"
 
@@ -1366,6 +1393,23 @@ gam_unit_path = "/{network_id}/example/{section}"
 page_patterns = ["/", "/news", "/news/*", "/reviews", "/reviews/*"]
 formats = [{ width = 728, height = 90 }]
 ```
+
+The same switch can be overridden through the typed CLI environment overlay.
+Because EdgeZero only replaces TOML leaves that already exist, first add
+`enabled = true` to the `[creative_opportunities]` block in the base config
+before using this override. See [Environment Variable Overrides (Typed
+CLI)](#environment-variable-overrides-typed-cli) for the general overlay rules.
+
+```bash
+TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED=false
+```
+
+> [!WARNING]
+> Setting `enabled = false` writes this field into the pushed configuration blob.
+> Binaries released before this setting reject the unknown field and fail to load
+> settings, which makes every request fail. Before rolling back to an older binary,
+> restore `enabled` to its default, re-push and finalize the configuration, then
+> roll back the binary.
 
 ### `gam_unit_path` templating
 
@@ -1420,8 +1464,9 @@ publisher-specific. Startup fails if `{section}` is used without a valid
 `section_root`. Startup rejects a blank `gam_network_id` only when an absent
 path/default or a `{network_id}` template consumes it; static paths and
 templates without `{network_id}` do not consume it. A
-`[creative_opportunities]` block with no slots is disabled, so its
-`gam_network_id` is not checked.
+`[creative_opportunities]` block with `enabled = false` or no slots is
+inactive, so no publisher templates are delivered and its `gam_network_id` is
+not checked when no slot uses it.
 
 Both knobs are config-driven, so the URL→section convention stays with the
 publisher: `section_segment` selects which segment names the section, and

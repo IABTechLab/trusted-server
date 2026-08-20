@@ -59,7 +59,10 @@ use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_eta
 use crate::integrations::IntegrationRegistry;
 use crate::platform::{GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
 use crate::price_bucket::{PriceGranularity, price_bucket};
-use crate::response_privacy::enforce_synthesized_html_cache_privacy;
+use crate::response_privacy::{
+    apply_inactive_ad_stack_browser_cache_policy, cache_control_forbids_shared_storage,
+    enforce_synthesized_html_cache_privacy,
+};
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{
@@ -1800,27 +1803,46 @@ pub(crate) fn is_prefetch_request(req: &Request<EdgeBody>) -> bool {
     header("sec-purpose") || header("purpose")
 }
 
-/// Returns true only when the publisher request should run the full
-/// server-side ad stack: auction dispatch plus initial ad-slot injection.
+#[derive(Debug, Clone, Copy)]
+struct ServerSideAdStackConfig {
+    /// Dedicated `[creative_opportunities].enabled` switch.
+    ad_templates_enabled: bool,
+    /// Global `[auction].enabled` gate used by publisher/page-bids flows.
+    auction_enabled: bool,
+}
+
+/// Returns whether request-scoped signals permit an ad-eligible navigation.
+fn is_server_side_ad_eligible_navigation(
+    is_get: bool,
+    is_navigation: bool,
+    is_prefetch: bool,
+    is_bot: bool,
+    consent_allows_auction: bool,
+) -> bool {
+    is_get && is_navigation && !is_prefetch && !is_bot && consent_allows_auction
+}
+
+/// Returns true only when the publisher should inject and run server-side ad templates.
 ///
-/// `auction_enabled` is the global `[auction].enabled` kill switch — when
-/// false, no automatic server-side auction or ad-slot injection runs.
-pub(crate) fn should_run_server_side_ad_stack(
+/// This includes auction dispatch plus initial ad-slot injection.
+fn should_run_server_side_ad_stack(
     is_get: bool,
     is_navigation: bool,
     is_prefetch: bool,
     is_bot: bool,
     has_matched_slots: bool,
     consent_allows_auction: bool,
-    auction_enabled: bool,
+    config: ServerSideAdStackConfig,
 ) -> bool {
-    is_get
-        && is_navigation
-        && !is_prefetch
-        && !is_bot
+    is_server_side_ad_eligible_navigation(
+        is_get,
+        is_navigation,
+        is_prefetch,
+        is_bot,
+        consent_allows_auction,
+    ) && config.ad_templates_enabled
         && has_matched_slots
-        && consent_allows_auction
-        && auction_enabled
+        && config.auction_enabled
 }
 
 /// Write winning bids from an auction result into the shared `ad_bids_state` lock.
@@ -2697,7 +2719,10 @@ pub async fn handle_publisher_request(
     let is_prefetch = is_prefetch_request(&req);
     let is_bot = is_bot_user_agent(&req);
 
-    let matched_slots = if is_get {
+    let creative_opportunities = settings.creative_opportunities.as_ref();
+    let ad_templates_enabled = creative_opportunities.is_some_and(|co_config| co_config.enabled);
+    let ad_templates_disabled = creative_opportunities.is_some_and(|co_config| !co_config.enabled);
+    let matched_slots = if is_get && ad_templates_enabled {
         settings
             .creative_opportunities
             .as_ref()
@@ -2720,7 +2745,10 @@ pub async fn handle_publisher_request(
         is_bot,
         !matched_slots.is_empty(),
         consent_allows_auction,
-        auction.orchestrator.is_enabled(),
+        ServerSideAdStackConfig {
+            ad_templates_enabled,
+            auction_enabled: auction.orchestrator.is_enabled(),
+        },
     );
     let should_run_auction = should_run_ad_stack;
     // Diagnostic: shows which gate suppresses the server-side auction. Pair with
@@ -2728,14 +2756,16 @@ pub async fn handle_publisher_request(
     // when `consent_allows_auction=false`.
     log::debug!(
         "server-side ad-stack gate: is_get={is_get} is_navigation={is_navigation} \
-         is_prefetch={is_prefetch} is_bot={is_bot} matched_slots={} \
-         consent_allows_auction={consent_allows_auction} orchestrator_enabled={} \
-         -> should_run_auction={should_run_auction}",
+         is_prefetch={is_prefetch} is_bot={is_bot} ad_templates_enabled={ad_templates_enabled} \
+         matched_slots={} consent_allows_auction={consent_allows_auction} \
+         orchestrator_enabled={} -> should_run_auction={should_run_auction}",
         matched_slots.len(),
         auction.orchestrator.is_enabled(),
     );
 
-    if matched_slots.is_empty() && settings.creative_opportunities.is_some() {
+    if ad_templates_disabled {
+        log::debug!("Server-side ad templates are disabled by configuration");
+    } else if matched_slots.is_empty() && settings.creative_opportunities.is_some() {
         log::debug!(
             "No creative opportunity slots matched path '{}' — skipping auction and injection",
             request_path
@@ -2860,7 +2890,9 @@ pub async fn handle_publisher_request(
                 }
             }
         } else {
-            let skip_reason = if !auction.orchestrator.is_enabled() {
+            let skip_reason = if ad_templates_disabled {
+                "ad_templates_disabled"
+            } else if !auction.orchestrator.is_enabled() {
                 "auction_disabled"
             } else if !consent_allows_auction {
                 "consent_denied"
@@ -2986,8 +3018,6 @@ pub async fn handle_publisher_request(
         return Ok(PublisherResponse::Buffered(response));
     }
 
-    crate::integrations::gpt_diagnostics::finalize_response(&gpt_diagnostics, &mut response);
-
     let ad_slots_script = if should_run_ad_stack {
         settings
             .creative_opportunities
@@ -3003,19 +3033,36 @@ pub async fn handle_publisher_request(
     //
     // Gate on `should_run_ad_stack` rather than content-type alone: when no slot
     // matched, the feature is disabled, or this is not an ad-eligible navigation,
-    // no per-user `tsjs.adSlots`/`tsjs.bids` are injected, so forcing private
-    // here would needlessly strip shared cacheability from ordinary publisher
-    // HTML. Applies regardless of the auction *outcome* (empty bids still inject
-    // per-user slot state). The separate EC-cookie cache net in the adapter's
-    // `finalize_response` keeps first-visit identity responses private.
+    // no per-user `tsjs.adSlots`/`tsjs.bids` are injected. Applies regardless of
+    // the auction *outcome* (empty bids still inject per-user slot state). The
+    // separate EC-cookie cache net in the adapter's `finalize_response` keeps
+    // first-visit identity responses private.
     let origin_content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or_default();
-    if should_run_ad_stack && is_html_content_type(origin_content_type) {
-        enforce_synthesized_html_cache_privacy(&mut response);
+    if is_html_content_type(origin_content_type) {
+        if should_run_ad_stack {
+            enforce_synthesized_html_cache_privacy(&mut response);
+        } else if is_server_side_ad_eligible_navigation(
+            is_get,
+            is_navigation,
+            is_prefetch,
+            is_bot,
+            consent_allows_auction,
+        ) && response.status() == StatusCode::OK
+        {
+            // Issue #1007 caps browser caching for structurally inactive
+            // server-side ad templates. Request-scoped skips retain the origin
+            // policy because the same URL can otherwise render templates.
+            if !cache_control_forbids_shared_storage(response.headers()) {
+                apply_inactive_ad_stack_browser_cache_policy(&mut response);
+            }
+        }
     }
+
+    crate::integrations::gpt_diagnostics::finalize_response(&gpt_diagnostics, &mut response);
 
     let content_type = response
         .headers()
@@ -3945,7 +3992,11 @@ pub async fn handle_page_bids(
         })
         .unwrap_or_else(|| "/".to_string());
 
-    let matched_slots = match_renderable_slots(auction.slots, co_config, &path_param);
+    let matched_slots = if co_config.enabled {
+        match_renderable_slots(auction.slots, co_config, &path_param)
+    } else {
+        Vec::new()
+    };
 
     let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
     let ec_id = ec_context.ec_value().filter(|_| ec_context.ec_allowed());
@@ -3964,7 +4015,10 @@ pub async fn handle_page_bids(
     let is_bot = is_bot_user_agent(&req);
 
     let auction_enabled = auction.orchestrator.is_enabled();
-    if !auction_enabled {
+    let ad_templates_enabled = co_config.enabled;
+    if !ad_templates_enabled {
+        log::debug!("page-bids: [creative_opportunities].enabled is false — skipping templates");
+    } else if !auction_enabled {
         log::debug!("page-bids: [auction].enabled is false — skipping auction");
     } else if matched_slots.is_empty() {
         log::debug!(
@@ -3980,14 +4034,14 @@ pub async fn handle_page_bids(
         );
     }
 
-    // The [auction].enabled kill switch and a consent denial disable the entire
-    // server-side ad stack. In those states the endpoint must return no slots,
-    // so the SPA hook does not assign `ts.adSlots` and call `adInit()` —
-    // otherwise the kill switch/consent gate would stop SSP calls but still let
-    // the client create/refresh GPT slots. Bot/prefetch requests, by contrast,
-    // keep their slot definitions (the placement structure is unchanged) but
-    // skip the live auction, matching the existing bot/prefetch behaviour.
-    let ad_stack_enabled = auction_enabled && consent_allows_auction;
+    // The dedicated template switch, [auction].enabled, and a consent denial
+    // disable the entire server-side ad stack. In those states the endpoint must
+    // return no slots, so the SPA hook does not assign `ts.adSlots` and call
+    // `adInit()` — otherwise the gate would stop SSP calls but still let the
+    // client create/refresh GPT slots client-side. Bot/prefetch requests, by
+    // contrast, keep their slot definitions (the placement structure is
+    // unchanged) but skip the live auction, matching the existing behavior.
+    let ad_stack_enabled = ad_templates_enabled && auction_enabled && consent_allows_auction;
 
     let (winning_bids, prebuilt_bid_map) = if matched_slots.is_empty() {
         (std::collections::HashMap::new(), None)
@@ -4088,7 +4142,9 @@ pub async fn handle_page_bids(
                 }
             }
         } else {
-            let skip_reason = if !auction_enabled {
+            let skip_reason = if !ad_templates_enabled {
+                "ad_templates_disabled"
+            } else if !auction_enabled {
                 "auction_disabled"
             } else if !consent_allows_auction {
                 "consent_denied"
@@ -4849,6 +4905,29 @@ mod tests {
                 .expect("should parse settings with auction and creative opportunities enabled")
         }
 
+        fn settings_with_disabled_ad_templates() -> Settings {
+            let toml = format!(
+                "{}\n[auction]\nenabled = true\n\n\
+                 [creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
+                crate_test_settings_str()
+            );
+            Settings::from_toml(&toml).expect("should parse settings with disabled ad templates")
+        }
+
+        fn settings_with_disabled_auction() -> Settings {
+            let toml = format!(
+                "{}\n[auction]\nenabled = false\n\n\
+                 [creative_opportunities]\ngam_network_id = \"12345\"\n",
+                crate_test_settings_str()
+            );
+            Settings::from_toml(&toml).expect("should parse settings with disabled auction")
+        }
+
+        fn settings_without_creative_opportunities() -> Settings {
+            Settings::from_toml(&crate_test_settings_str())
+                .expect("should parse settings without creative opportunities")
+        }
+
         fn settings_with_dispatching_provider() -> Settings {
             let toml = format!(
                 "{}\n[auction]\nenabled = true\nproviders = [\"{UNEXPECTED_304_PROVIDER}\"]\n\n\
@@ -4907,13 +4986,24 @@ mod tests {
                 .expect("should build conditional navigation request")
         }
 
-        fn queue_cacheable_html_response(stub: &StubHttpClient) {
+        fn queue_html_response_with_cache_control(
+            stub: &StubHttpClient,
+            cache_control: &'static str,
+        ) {
+            queue_html_response_with_status_and_cache_control(stub, 200, cache_control);
+        }
+
+        fn queue_html_response_with_status_and_cache_control(
+            stub: &StubHttpClient,
+            status: u16,
+            cache_control: &'static str,
+        ) {
             stub.push_response_with_headers(
-                200,
+                status,
                 b"<html><body>origin</body></html>".to_vec(),
                 vec![
                     ("content-type", "text/html; charset=utf-8"),
-                    ("cache-control", "public, max-age=300"),
+                    ("cache-control", cache_control),
                     ("etag", ORIGIN_ETAG),
                     ("last-modified", ORIGIN_LAST_MODIFIED),
                     ("surrogate-control", "max-age=300"),
@@ -4924,14 +5014,40 @@ mod tests {
             );
         }
 
+        fn non_regulated_consent() -> crate::consent::ConsentContext {
+            crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            }
+        }
+
         async fn run_with_slots(
             settings: &Settings,
             services: &RuntimeServices,
             slots: &[CreativeOpportunitySlot],
             req: Request<EdgeBody>,
         ) -> PublisherResponse {
+            run_with_slots_and_consent(settings, services, slots, req, non_regulated_consent())
+                .await
+        }
+
+        async fn run_with_slots_and_consent(
+            settings: &Settings,
+            services: &RuntimeServices,
+            slots: &[CreativeOpportunitySlot],
+            req: Request<EdgeBody>,
+            consent: crate::consent::ConsentContext,
+        ) -> PublisherResponse {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            run_with_orchestrator(settings, services, &orchestrator, slots, req).await
+            run_with_orchestrator_and_consent(
+                settings,
+                services,
+                &orchestrator,
+                slots,
+                req,
+                consent,
+            )
+            .await
         }
 
         async fn run_with_orchestrator(
@@ -4941,10 +5057,25 @@ mod tests {
             slots: &[CreativeOpportunitySlot],
             req: Request<EdgeBody>,
         ) -> PublisherResponse {
-            let consent = crate::consent::ConsentContext {
-                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
-                ..Default::default()
-            };
+            run_with_orchestrator_and_consent(
+                settings,
+                services,
+                orchestrator,
+                slots,
+                req,
+                non_regulated_consent(),
+            )
+            .await
+        }
+
+        async fn run_with_orchestrator_and_consent(
+            settings: &Settings,
+            services: &RuntimeServices,
+            orchestrator: &AuctionOrchestrator,
+            slots: &[CreativeOpportunitySlot],
+            req: Request<EdgeBody>,
+            consent: crate::consent::ConsentContext,
+        ) -> PublisherResponse {
             let mut ec_context = EcContext::new_for_test(None, consent);
 
             handle_publisher_request(
@@ -4983,7 +5114,7 @@ mod tests {
             // Arrange
             let settings = settings_with_enabled_auction_and_creative_opportunities();
             let stub = Arc::new(StubHttpClient::new());
-            queue_cacheable_html_response(&stub);
+            queue_html_response_with_cache_control(&stub, "public, max-age=300");
             let services = build_services_with_http_client(
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
             );
@@ -5076,11 +5207,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn navigation_without_matched_slots_preserves_origin_cache_policy() {
+        async fn navigation_without_matched_slots_uses_short_browser_cache_policy() {
             // Arrange
             let settings = settings_with_enabled_auction_and_creative_opportunities();
             let stub = Arc::new(StubHttpClient::new());
-            queue_cacheable_html_response(&stub);
+            queue_html_response_with_cache_control(&stub, "public, max-age=300");
             let services = build_services_with_http_client(
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
             );
@@ -5126,7 +5257,7 @@ mod tests {
             );
 
             for (header_name, expected) in [
-                (header::CACHE_CONTROL, "public, max-age=300"),
+                (header::CACHE_CONTROL, "private, max-age=60"),
                 (header::ETAG, ORIGIN_ETAG),
                 (header::LAST_MODIFIED, ORIGIN_LAST_MODIFIED),
                 (
@@ -5153,6 +5284,408 @@ mod tests {
                         .and_then(|value| value.to_str().ok()),
                     Some(expected),
                     "publisher response without matched slots should preserve {header_name}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn disabled_ad_templates_use_short_browser_cache_policy() {
+            // Arrange
+            let mut settings = settings_with_disabled_ad_templates();
+            settings.proxy.allowed_domains =
+                vec!["*.example".to_string(), "*.example.com".to_string()];
+            let stub = Arc::new(StubHttpClient::new());
+            queue_html_response_with_cache_control(&stub, "public, max-age=300");
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let slots = [article_slot()];
+
+            // Act
+            let response = run_with_slots(
+                &settings,
+                &services,
+                &slots,
+                conditional_navigation_request(),
+            )
+            .await;
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let response = buffer_publisher_response_async(
+                response,
+                &Method::GET,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            )
+            .await
+            .expect("should buffer disabled-template response");
+            let (response_head, body) = response.into_parts();
+            let body = String::from_utf8(
+                body.into_bytes()
+                    .expect("should return an in-memory publisher body")
+                    .to_vec(),
+            )
+            .expect("should return UTF-8 publisher HTML");
+
+            // Assert
+            assert_eq!(
+                stub.recorded_cache_bypass_flags(),
+                vec![false],
+                "disabled server-side ad templates should not bypass the origin cache"
+            );
+            assert_eq!(
+                response_head
+                    .headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("private, max-age=60"),
+                "disabled server-side ad templates should use the private browser cache policy"
+            );
+            assert!(
+                !body.contains(".adSlots=JSON.parse"),
+                "disabled server-side ad templates should not inject ad-slot state"
+            );
+            for (header_name, expected) in [
+                (header::ETAG, ORIGIN_ETAG),
+                (header::LAST_MODIFIED, ORIGIN_LAST_MODIFIED),
+                (
+                    header::HeaderName::from_static("surrogate-control"),
+                    "max-age=300",
+                ),
+                (
+                    header::HeaderName::from_static("fastly-surrogate-control"),
+                    "max-age=300",
+                ),
+                (
+                    header::HeaderName::from_static("cdn-cache-control"),
+                    "max-age=300",
+                ),
+                (
+                    header::HeaderName::from_static("cloudflare-cdn-cache-control"),
+                    "max-age=300",
+                ),
+            ] {
+                assert_eq!(
+                    response_head
+                        .headers
+                        .get(&header_name)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(expected),
+                    "disabled server-side ad templates should preserve {header_name}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn disabled_auction_uses_private_browser_cache_policy() {
+            // Arrange
+            let settings = settings_with_disabled_auction();
+            let stub = Arc::new(StubHttpClient::new());
+            queue_html_response_with_cache_control(&stub, "no-cache");
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+
+            // Act
+            let response = run_with_slots(
+                &settings,
+                &services,
+                &[article_slot()],
+                conditional_navigation_request(),
+            )
+            .await;
+            let response_head = response_head(response);
+
+            // Assert
+            assert_eq!(
+                response_head
+                    .headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("private, max-age=60"),
+                "disabled auction should use the private browser cache policy"
+            );
+        }
+
+        #[tokio::test]
+        async fn navigation_without_matched_slots_replaces_origin_cache_policy() {
+            let settings = settings_with_enabled_auction_and_creative_opportunities();
+
+            for cache_control in ["no-cache", "max-age=0", "must-revalidate", "s-maxage=0"] {
+                // Arrange
+                let stub = Arc::new(StubHttpClient::new());
+                queue_html_response_with_cache_control(&stub, cache_control);
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+
+                // Act
+                let response =
+                    run_with_slots(&settings, &services, &[], conditional_navigation_request())
+                        .await;
+                let response_head = response_head(response);
+
+                // Assert
+                assert_eq!(
+                    response_head
+                        .headers
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("private, max-age=60"),
+                    "inactive server-side ad templates should replace origin {cache_control} policy"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn navigation_without_matched_slots_preserves_private_origin_cache_policy() {
+            let settings = settings_with_enabled_auction_and_creative_opportunities();
+
+            for cache_control in ["private, max-age=0", "No-Store"] {
+                // Arrange
+                let stub = Arc::new(StubHttpClient::new());
+                queue_html_response_with_cache_control(&stub, cache_control);
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+
+                // Act
+                let response =
+                    run_with_slots(&settings, &services, &[], conditional_navigation_request())
+                        .await;
+                let response_head = response_head(response);
+
+                // Assert
+                assert_eq!(
+                    response_head
+                        .headers
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(cache_control),
+                    "inactive server-side ad templates should preserve private origin {cache_control} policy"
+                );
+                for (header_name, expected) in [
+                    (header::ETAG, ORIGIN_ETAG),
+                    (header::LAST_MODIFIED, ORIGIN_LAST_MODIFIED),
+                    (
+                        header::HeaderName::from_static("surrogate-control"),
+                        "max-age=300",
+                    ),
+                    (
+                        header::HeaderName::from_static("fastly-surrogate-control"),
+                        "max-age=300",
+                    ),
+                    (
+                        header::HeaderName::from_static("cdn-cache-control"),
+                        "max-age=300",
+                    ),
+                    (
+                        header::HeaderName::from_static("cloudflare-cdn-cache-control"),
+                        "max-age=300",
+                    ),
+                ] {
+                    assert_eq!(
+                        response_head
+                            .headers
+                            .get(&header_name)
+                            .and_then(|value| value.to_str().ok()),
+                        Some(expected),
+                        "inactive server-side ad templates should preserve {header_name}"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn request_scoped_ad_stack_suppression_preserves_origin_cache_policy() {
+            let settings = settings_with_enabled_auction_and_creative_opportunities();
+            let slots = [article_slot()];
+            let mut bot_request = conditional_navigation_request();
+            bot_request.headers_mut().insert(
+                "user-agent",
+                HeaderValue::from_static("Mozilla/5.0 (compatible; Googlebot/2.1)"),
+            );
+            let mut prefetch_request = conditional_navigation_request();
+            prefetch_request
+                .headers_mut()
+                .insert("sec-purpose", HeaderValue::from_static("prefetch"));
+
+            for (skip_reason, request, consent) in [
+                ("bot", bot_request, non_regulated_consent()),
+                ("prefetch", prefetch_request, non_regulated_consent()),
+                (
+                    "consent denied",
+                    conditional_navigation_request(),
+                    crate::consent::ConsentContext {
+                        jurisdiction: crate::consent::jurisdiction::Jurisdiction::Gdpr,
+                        ..Default::default()
+                    },
+                ),
+            ] {
+                // Arrange
+                let stub = Arc::new(StubHttpClient::new());
+                queue_html_response_with_cache_control(&stub, "no-cache");
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+
+                // Act
+                let response =
+                    run_with_slots_and_consent(&settings, &services, &slots, request, consent)
+                        .await;
+                let response_head = response_head(response);
+
+                // Assert
+                assert_eq!(
+                    response_head
+                        .headers
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("no-cache"),
+                    "{skip_reason} should retain the origin cache policy"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn absent_creative_opportunities_use_short_browser_cache_policy() {
+            // Arrange
+            let settings = settings_without_creative_opportunities();
+            let stub = Arc::new(StubHttpClient::new());
+            queue_html_response_with_cache_control(&stub, "no-cache");
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+
+            // Act
+            let response =
+                run_with_slots(&settings, &services, &[], conditional_navigation_request()).await;
+            let response_head = response_head(response);
+
+            // Assert
+            assert_eq!(
+                response_head
+                    .headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("private, max-age=60"),
+                "absent creative opportunities should use the private inactive-stack cache policy"
+            );
+        }
+
+        #[tokio::test]
+        async fn inactive_ad_stack_preserves_non_ok_response_cache_policy() {
+            let settings = settings_with_disabled_ad_templates();
+
+            for status in [206, 404, 500, 503] {
+                // Arrange
+                let stub = Arc::new(StubHttpClient::new());
+                queue_html_response_with_status_and_cache_control(&stub, status, "no-cache");
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+
+                // Act
+                let response = run_with_slots(
+                    &settings,
+                    &services,
+                    &[article_slot()],
+                    conditional_navigation_request(),
+                )
+                .await;
+                let response_head = response_head(response);
+
+                // Assert
+                assert_eq!(
+                    response_head
+                        .headers
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("no-cache"),
+                    "inactive server-side ad templates should preserve origin policy on {status}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn inactive_ad_stack_preserves_gpt_diagnostics_cache_privacy() {
+            // Arrange
+            let mut settings = settings_with_disabled_ad_templates();
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should enable GPT diagnostics");
+            let stub = Arc::new(StubHttpClient::new());
+            queue_html_response_with_cache_control(&stub, "no-cache");
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let request = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://ts.example.com/article?ts_console=1")
+                .header(header::HOST, "ts.example.com")
+                .header("sec-fetch-dest", "document")
+                .body(EdgeBody::empty())
+                .expect("should build GPT diagnostics request");
+
+            // Act
+            let response = run_with_slots(&settings, &services, &[article_slot()], request).await;
+            let response_head = response_head(response);
+
+            // Assert
+            assert_eq!(
+                response_head
+                    .headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("private, no-store"),
+                "active GPT diagnostics should retain cache privacy when server-side ad templates are inactive"
+            );
+        }
+
+        #[tokio::test]
+        async fn inactive_ad_stack_preserves_non_get_and_non_document_cache_policy() {
+            let settings = settings_with_disabled_ad_templates();
+
+            for request in [
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("https://ts.example.com/article")
+                    .header(header::HOST, "ts.example.com")
+                    .header("sec-fetch-dest", "document")
+                    .body(EdgeBody::empty())
+                    .expect("should build non-GET document request"),
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("https://ts.example.com/article")
+                    .header(header::HOST, "ts.example.com")
+                    .header("sec-fetch-dest", "empty")
+                    .body(EdgeBody::empty())
+                    .expect("should build non-document request"),
+            ] {
+                // Arrange
+                let stub = Arc::new(StubHttpClient::new());
+                queue_html_response_with_cache_control(&stub, "no-cache");
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+
+                // Act
+                let response =
+                    run_with_slots(&settings, &services, &[article_slot()], request).await;
+                let response_head = response_head(response);
+
+                // Assert
+                assert_eq!(
+                    response_head
+                        .headers
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("no-cache"),
+                    "inactive server-side ad templates should preserve non-document request policy"
                 );
             }
         }
@@ -5984,38 +6517,68 @@ mod tests {
 
     #[test]
     fn server_side_ad_stack_runs_only_when_all_auction_gates_pass() {
+        let enabled_config = ServerSideAdStackConfig {
+            ad_templates_enabled: true,
+            auction_enabled: true,
+        };
         assert!(
-            should_run_server_side_ad_stack(true, true, false, false, true, true, true),
-            "GET, real navigation, matched slots, and consent should run TS ad stack"
+            should_run_server_side_ad_stack(true, true, false, false, true, true, enabled_config,),
+            "GET, real navigation, enabled templates, matched slots, and consent should run TS ad stack"
         );
 
         assert!(
-            !should_run_server_side_ad_stack(false, true, false, false, true, true, true),
+            !should_run_server_side_ad_stack(false, true, false, false, true, true, enabled_config,),
             "non-GET requests should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, false, false, false, true, true, true),
+            !should_run_server_side_ad_stack(true, false, false, false, true, true, enabled_config,),
             "non-document requests should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, true, false, true, true, true),
+            !should_run_server_side_ad_stack(true, true, true, false, true, true, enabled_config,),
             "prefetch requests should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, true, true, true, true),
+            !should_run_server_side_ad_stack(true, true, false, true, true, true, enabled_config,),
             "bot requests should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, false, true, true),
+            !should_run_server_side_ad_stack(true, true, false, false, false, true, enabled_config,),
             "requests with no matching slots should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, true, false, true),
+            !should_run_server_side_ad_stack(true, true, false, false, true, false, enabled_config,),
             "requests without required consent should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, true, true, false),
+            !should_run_server_side_ad_stack(
+                true,
+                true,
+                false,
+                false,
+                true,
+                true,
+                ServerSideAdStackConfig {
+                    ad_templates_enabled: true,
+                    auction_enabled: false,
+                },
+            ),
             "disabled [auction].enabled kill switch should skip TS ad stack and injection"
+        );
+        assert!(
+            !should_run_server_side_ad_stack(
+                true,
+                true,
+                false,
+                false,
+                true,
+                true,
+                ServerSideAdStackConfig {
+                    ad_templates_enabled: false,
+                    auction_enabled: true,
+                },
+            ),
+            "disabled [creative_opportunities].enabled switch should skip TS ad stack and injection"
         );
     }
 
@@ -8716,6 +9279,7 @@ mod tests {
 
         fn make_config() -> CreativeOpportunitiesConfig {
             CreativeOpportunitiesConfig {
+                enabled: true,
                 gam_network_id: "21765378893".to_string(),
                 auction_timeout_ms: Some(500),
                 price_granularity: PriceGranularity::Dense,
@@ -10404,6 +10968,14 @@ mod tests {
             Settings::from_toml(&toml).expect("should parse settings with creative_opportunities")
         }
 
+        fn settings_with_co_templates_disabled() -> Settings {
+            let toml = format!(
+                "{}\n[auction]\nenabled = true\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
+                crate_test_settings_str()
+            );
+            Settings::from_toml(&toml).expect("should parse settings with disabled templates")
+        }
+
         async fn run_page_bids(
             settings: &Settings,
             orchestrator: &AuctionOrchestrator,
@@ -11150,6 +11722,35 @@ mod tests {
                     .len(),
                 0,
                 "disabled auction must not produce bids"
+            );
+        }
+
+        #[tokio::test]
+        async fn disabled_server_side_ad_templates_return_no_slots_or_bids() {
+            // The dedicated template switch must suppress publisher/page-bids
+            // delivery without using the global auction switch.
+            let settings = settings_with_co_templates_disabled();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let slots = article_slot();
+            let req = make_page_bids_request("/2024/01/my-article/");
+
+            let body = run_page_bids_consent_allowed(&settings, &orchestrator, &slots, req).await;
+
+            assert_eq!(
+                body["slots"]
+                    .as_array()
+                    .expect("slots should be array")
+                    .len(),
+                0,
+                "disabled server-side ad templates must not return slot definitions"
+            );
+            assert_eq!(
+                body["bids"]
+                    .as_object()
+                    .expect("bids should be object")
+                    .len(),
+                0,
+                "disabled server-side ad templates must not produce bids"
             );
         }
 
