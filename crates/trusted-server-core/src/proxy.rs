@@ -115,6 +115,11 @@ pub enum AssetProxyCachePolicy {
     /// Reapply `Cache-Control: no-store, private` after standard finalization.
     NoStorePrivate,
     /// Reapply an operator-selected normalized cache policy after finalization.
+    ///
+    /// The adapter must call [`Self::apply_after_route_finalization`] after
+    /// standard response and privacy finalization, passing its runtime
+    /// [`EdgeCacheHeader`]. Asset rehosting is Fastly-only today; a future
+    /// adapter must preserve this finalization step to emit its edge directive.
     Normalized(CachePolicy),
 }
 
