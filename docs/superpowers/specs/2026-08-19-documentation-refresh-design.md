@@ -115,10 +115,10 @@ The source-of-truth map:
 
 ## Work packages
 
-Each package is one PR, independently reviewable and landable. WP1 and WP2
-are corrective and should land first; WP3-WP6 are completion work; WP7-WP8
-are quality and enforcement. Later packages assume earlier ones only where
-noted.
+All eight packages ship in one single implementation PR. Each package is one
+commit (or a small commit series) in the order below, so the PR is
+reviewable commit-by-commit: WP1 and WP2 are corrective, WP3-WP6 are
+completion work, WP7-WP8 are quality and enforcement.
 
 ### WP1: Publishing and policy hygiene
 
@@ -251,9 +251,9 @@ Bring the two operator-facing config artifacts to parity with `Settings`
   `didomi`, `sourcepoint`, `lockr`, `gpt`, `gpt_diagnostics`,
   `google_tag_manager`, `adserver_mock`), each with its typed config keys
   from the integration source.
-- Add a parity checklist to the PR description mapping each of the 15
-  `Settings` fields to its example-toml block and configuration.md heading
-  (the table in Appendix B is the worklist).
+- Add a parity checklist to the implementation PR description mapping each
+  of the 15 `Settings` fields to its example-toml block and configuration.md
+  heading (the table in Appendix B is the worklist).
 
 Acceptance: every field of `Settings` appears in both
 `trusted-server.example.toml` and `docs/guide/configuration.md`; every
@@ -465,16 +465,18 @@ failing doctest fails CI.
 | 7     | WP7 in-code docs         | M    | -                               |
 | 8     | WP8 enforcement          | S    | WP7 (doc build must pass first) |
 
-WP1-WP3 can proceed in parallel. WP8 lands last so the new gates start green.
+Commits land in this order within the single implementation PR; WP8 comes
+last so the new CI gates turn green on the same PR.
 
 ## Verification
 
-Per PR: `cd docs && npm run lint && npm run format && npm run build`;
+For the implementation PR:
+`cd docs && npm run lint && npm run format && npm run build`;
 `cargo fmt --all -- --check`; the target-matched clippy/test aliases for any
 crate whose source files changed (WP7); `cargo doc --no-deps` locally for
-rustdoc changes. For WP2-WP4, the acceptance greps listed in each package are
-run and their output included in the PR description. For WP1, a local
-`vitepress build` listing of `dist/` proves the exclusion set.
+rustdoc changes. The acceptance greps listed in WP2-WP4 are run and their
+output included in the PR description. For WP1, a local `vitepress build`
+listing of `dist/` proves the exclusion set.
 
 ## Open questions
 
