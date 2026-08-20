@@ -50,6 +50,7 @@ const APS_RENDERER_CSP: &str = "default-src 'none'; sandbox allow-forms allow-po
 
 const APS_RENDERER_DOCUMENT: &str = r#"<!doctype html>
 <meta charset="utf-8">
+<style>html,body{margin:0;padding:0}body>iframe{display:block}</style>
 <script>
 (function(){
 'use strict';
@@ -2529,6 +2530,10 @@ mod tests {
         assert!(APS_RENDERER_DOCUMENT.contains("message.nonce!==expected"));
         assert!(APS_RENDERER_DOCUMENT.contains("prebid/creative/render"));
         assert!(APS_RENDERER_DOCUMENT.contains("window._aps instanceof Map"));
+        assert!(
+            APS_RENDERER_DOCUMENT
+                .contains("html,body{margin:0;padding:0}body>iframe{display:block}")
+        );
         assert!(APS_RENDERER_DOCUMENT.contains("store:new Map([['listeners',new Map()]])"));
         assert!(APS_RENDERER_DOCUMENT.contains("account.queue.push(new CustomEvent"));
         assert!(
