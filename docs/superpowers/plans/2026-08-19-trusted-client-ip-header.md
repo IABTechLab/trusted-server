@@ -16,7 +16,7 @@ is also unsuitable because an intermediary may normalize it.
       `0x21..=0x7e`, retaining the 32-byte minimum and redacted errors.
 - [x] Update the configuration and Fastly guides to specify 32 or more ASCII
       graphic bytes and recommend hexadecimal or base64url generation.
-- [ ] Run focused settings tests, formatting, target-matched tests, Clippy, and
+- [x] Run focused settings tests, formatting, target-matched tests, Clippy, and
       the Fastly release build before updating the PR.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
