@@ -28,7 +28,7 @@ Key rotation is the process of generating new signing keys and transitioning fro
 
 ## Edge Cookie HMAC Passphrase
 
-The Edge Cookie `ec.passphrase` is long-lived HMAC-SHA256 keying material used to derive visitor EC IDs. Use a high-entropy random value of at least 32 characters; shorter values are rejected at settings validation. Rotating this passphrase changes derived EC IDs and requires rebuilding or allowing expiry of the existing EC identity graph.
+The Edge Cookie `ec.providers.hmac.passphrase` is long-lived HMAC-SHA256 keying material used to derive visitor EC IDs. Use a high-entropy random value of at least 32 characters; shorter values are rejected at settings validation. Rotating this passphrase changes derived EC IDs and requires rebuilding or allowing expiry of the existing EC identity graph.
 
 ## Prerequisites
 
