@@ -55,19 +55,22 @@ export const APS_RENDER_FAILED_MESSAGE = 'trusted-server/aps/render-failed';
  */
 const APS_RENDER_FAILURE_REASONS: Readonly<Record<string, GptDiagnosticsCreativeFailure>> =
   Object.freeze(
-    Object.assign(Object.create(null) as Record<string, GptDiagnosticsCreativeFailure>, {
-      bad_hash: 'aps_bad_hash',
-      nonce_mismatch: 'aps_nonce_mismatch',
-      source_mismatch: 'aps_source_mismatch',
-      descriptor_keys: 'aps_descriptor_keys',
-      descriptor_fields: 'aps_descriptor_fields',
-      descriptor_envelope: 'aps_descriptor_envelope',
-      amazon_script_error: 'aps_runner_script_error',
-      frame_timeout: 'aps_frame_timeout',
-      frame_load_error: 'aps_frame_load_error',
-      frame_reported_failure: 'aps_frame_reported_failure',
-      unknown: 'aps_unknown',
-    } as const)
+    Object.assign(
+      Object.create(null) as Record<string, GptDiagnosticsCreativeFailure>,
+      {
+        bad_hash: 'aps_bad_hash',
+        nonce_mismatch: 'aps_nonce_mismatch',
+        source_mismatch: 'aps_source_mismatch',
+        descriptor_keys: 'aps_descriptor_keys',
+        descriptor_fields: 'aps_descriptor_fields',
+        descriptor_envelope: 'aps_descriptor_envelope',
+        amazon_script_error: 'aps_runner_script_error',
+        frame_timeout: 'aps_frame_timeout',
+        frame_load_error: 'aps_frame_load_error',
+        frame_reported_failure: 'aps_frame_reported_failure',
+        unknown: 'aps_unknown',
+      } as const
+    )
   );
 
 /**
