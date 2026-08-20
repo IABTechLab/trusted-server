@@ -3,7 +3,7 @@
 **Date:** 2026-08-19
 **Revised:** 2026-08-20 (addresses pre-implementation review)
 **Status:** Draft, pending review
-**Scope:** Documentation and doc tooling. No runtime behavior changes. Baseline audited at `main` commit `2e85a1cdc` (2026-08-18).
+**Scope:** Documentation and doc tooling. No runtime behavior changes. Baseline audited at `main` commit `2e85a1cdc` (2026-08-18); realigned 2026-08-20 to the release branch `rc/202608`, which this PR targets. Notable rc deltas folded in below: a 16th `[cache]` settings section, three admin EC diagnostic routes, a restructured CLI (`ts audit generate`, `ad-templates`, `active-version`, `healthcheck`, `rollback`, `config gc`), and rc's own updates to `cli.md`, `configuration.md`, and `api-reference.md`. Line citations are from the main baseline unless marked rc; spot-rechecked claims cite rc line numbers.
 
 ## Context
 
@@ -17,7 +17,9 @@ drift in every surface. The failures fall into six categories:
 1. **Fabricated or dead content presented as real.** The API reference
    documents `GET /first-party/ad` and `POST /third-party/ad`; neither exists
    anywhere in `crates/` (the real client auction endpoint is `POST /auction`).
-   The same dead endpoints recur in `docs/guide/error-reference.md:658` and
+   On rc the dead sections sit at `api-reference.md:86,191` with two more
+   occurrences at `:707,711`, and the same dead endpoints recur in
+   `docs/guide/error-reference.md:658` and
    `docs/guide/integrations/prebid.md:515-531`.
    `docs/guide/ad-serving.md` documents an Equativ ad server and an
    `[ad_servers.equativ]` config key with zero code presence.
@@ -34,13 +36,16 @@ drift in every surface. The failures fall into six categories:
    `KeyRotationManager::new(...)?` signature (the real constructor returns
    `Self`, not a `Result`).
 2. **Incomplete references.** `docs/guide/configuration.md` has no
-   `[consent]`, `[tinybird]`, or `[debug]` sections, and its Integration
+   `[consent]`, `[tinybird]`, or `[debug]` sections (rc added a `[cache]`
+   section; those three remain missing), and its Integration
    Configurations section covers 5 of 14 IDs. `trusted-server.example.toml`
    has no `[tinybird]`, `[consent]`, `[rewrite]`, `[tester_cookie]`, or
    `[image_optimizer]` blocks. The API reference omits `POST /auction`,
    `/_ts/page-bids`, `/health`, `/_ts/debug/ja4`, the EC partner API, and all
-   integration endpoints except three. `docs/guide/cli.md` omits
-   `ts config diff` and the entire `ts dev` subtree.
+   integration endpoints except three. `docs/guide/cli.md` gained
+   `config diff`, `ts dev proxy`, and the ad-template workflows on rc, but
+   does not cover the new lifecycle commands (`active-version`,
+   `healthcheck`, `rollback`) or `config gc`.
    `docs/guide/integrations-overview.md` compares 7 of 14 integration IDs.
    `docs/guide/architecture.md` describes 4 of 10 workspace crates. The
    integration guide's code snippets do not compile against the current API:
@@ -96,7 +101,8 @@ Treat documentation as a product surface with a defined source of truth per
 artifact, fix the audit findings in eight work packages ordered by risk, and
 add enforcement, including executable parity checks, so the same drift is
 caught by CI instead of by the next manual audit. Every claim in the
-refreshed docs must be verifiable against code on `main`; anything
+refreshed docs must be verifiable against code on the PR's target branch
+(`rc/202608`, the August 2026 release); anything
 aspirational must be labeled as such or removed; adapter support claims must
 come from an honest, owned support matrix rather than marketing copy.
 
@@ -137,7 +143,7 @@ under `docs/superpowers/`, legitimately contain every retired term):
   in active-set documentation exists in the code at `main`, with
   adapter-specific availability stated where behavior differs.
 - Every shipped, operator- or publisher-visible surface has documentation:
-  all 14 integration IDs, all 15 config sections, the deployment adapters
+  all 14 integration IDs, all 16 config sections, the deployment adapters
   (with honest maturity labels), all `ts` commands, the telemetry pipeline,
   and the tsjs module system.
 - The adapter support model is truthful: three deployment adapters (Fastly
@@ -358,7 +364,11 @@ Bring the two operator-facing config artifacts to parity with `Settings`
   `origin_url`, paired `path_pattern`/`target_path`, optional S3 SigV4 auth
   block), `[integrations.osano]`, the missing `[auction]` keys (`mediator`,
   `creative_store`; `allowed_context_keys` is already present at line 145),
-  and `[debug].inject_adm_for_testing` with its never-in-production warning.
+  and `[debug].inject_adm_for_testing` with its never-in-production warning
+  (rc's `[debug]` block now carries `ja4_endpoint_enabled`,
+  `auction_html_comment`, and `auction_html_comment_options`). For the rc
+  `[cache]` section, promote the commented `[[cache.asset_rules]]` examples
+  to a complete worked block covered by the WP8 parse test.
 - `docs/guide/configuration.md`: add the missing `[consent]`, `[tinybird]`,
   and `[debug]` sections (the `[tester_cookie]`, `[rewrite]`, and
   image-optimizer sections already exist at lines 360, 702, and 946;
@@ -370,7 +380,7 @@ Bring the two operator-facing config artifacts to parity with `Settings`
 - Every example block must actually parse: WP8 adds a test that feeds the
   uncommented example config through `Settings::from_toml`, so examples are
   finalized and validity-checked in CI rather than eyeballed.
-- Add a parity checklist to the PR description mapping each of the 15
+- Add a parity checklist to the PR description mapping each of the 16
   `Settings` fields to its example-toml block and configuration.md heading
   (the table in Appendix B is the worklist).
 
@@ -386,6 +396,9 @@ with per-endpoint contracts, not just paths.
 
 - Document every named route: health, discovery/signing endpoints, admin key
   rotation (and the deliberately 404-denied legacy `/admin/keys/*` aliases),
+  the rc admin EC diagnostics (`GET /_ts/admin/ec`, `/_ts/admin/ec/{id}`,
+  `/_ts/admin/eids`; rc's api-reference already documents them, so the
+  rebuild folds them in under the same contract checklist),
   EC partner API (`/_ts/api/v1/batch-sync`, `/_ts/api/v1/identify`), tester
   cookie endpoints, `POST /auction`, `GET /_ts/page-bids` plus the legacy
   `/__ts/page-bids` alias, the four `/first-party/*` proxy endpoints,
@@ -493,8 +506,10 @@ route names its handler file and satisfies the contract checklist.
   cloudflare/spin/parity/CLI/browser suites and replace the fictional
   two-job CI YAML with the real seven-job layout.
 - `docs/guide/cli.md`: full command reference from the clap tree (Appendix
-  D), adding `ts config diff` and the `ts dev` subtree with its macOS-only
-  gating, and linking to `ts-dev-proxy.md`.
+  D). rc already covers `config diff`, `ts dev proxy`, `audit generate`,
+  and the ad-template workflows; add the missing lifecycle commands
+  (`active-version`, `healthcheck`, `rollback`) and `config gc`, verify the
+  rc additions against the clap tree, and link to `ts-dev-proxy.md`.
 - Site usability: enable VitePress `lastUpdated` (the deploy workflow
   already fetches full history for it) and local search
   (`themeConfig.search`), so the 1,600-line configuration reference is
@@ -747,6 +762,7 @@ capability matrix is written from those files, not from this table alone.
 | `/.well-known/trusted-server.json`                                                            | GET                                                                                  | all                                                                                     | `core/src/request_signing/endpoints.rs`                                         |
 | `/verify-signature`                                                                           | POST                                                                                 | all                                                                                     | `core/src/request_signing/endpoints.rs`                                         |
 | `/_ts/admin/keys/rotate`, `/_ts/admin/keys/deactivate`                                        | POST                                                                                 | Fastly working; Axum, Cloudflare, and Spin register the routes and return not-supported | `core/src/request_signing/endpoints.rs`, `adapter-fastly/src/management_api.rs` |
+| `/_ts/admin/ec`, `/_ts/admin/ec/{id}`, `/_ts/admin/eids`                                      | GET                                                                                  | Fastly only (rc); Basic-auth gated admin EC diagnostics                                 | `core/src/ec/admin.rs`                                                          |
 | `/admin/keys/*`                                                                               | the seven fallback methods                                                           | all: deliberately 404-denied legacy aliases                                             | adapter apps                                                                    |
 | `/_ts/api/v1/batch-sync`                                                                      | POST                                                                                 | Fastly only; Bearer auth + rate limit                                                   | `core/src/ec/batch_sync.rs`                                                     |
 | `/_ts/api/v1/identify`                                                                        | GET, OPTIONS                                                                         | Fastly only                                                                             | `core/src/ec/identify.rs`                                                       |
@@ -766,26 +782,28 @@ proxy routes, asset routes, publisher proxy.
 
 ## Appendix B: Settings sections (truth source for WP3)
 
-From `core/src/settings.rs` (`Settings`, line ~1916). Columns record what
-each artifact carries today.
+From `core/src/settings.rs` (`Settings`; 16 fields on rc/202608). Columns
+record what each artifact carries today. On rc, `request_signing` and
+`creative_opportunities` are `Option` fields.
 
-| Section                    | Struct                        | `trusted-server.example.toml`                                                   | `configuration.md`         |
-| -------------------------- | ----------------------------- | ------------------------------------------------------------------------------- | -------------------------- |
-| `[publisher]`              | `Publisher`                   | present                                                                         | present                    |
-| `[tester_cookie]`          | `TesterCookieConfig`          | missing                                                                         | present (line 360)         |
-| `[ec]`                     | `Ec` + `EcPartner`            | present                                                                         | present                    |
-| `[integrations.*]`         | per-integration typed configs | partial (osano missing)                                                         | 5 of 14 IDs                |
-| `[[handlers]]`             | `Handler`                     | present                                                                         | present                    |
-| `response_headers`         | map                           | present (commented)                                                             | present                    |
-| `[request_signing]`        | `RequestSigning`              | present                                                                         | present                    |
-| `[rewrite]`                | `Rewrite`                     | missing                                                                         | present (line 702)         |
-| `[auction]`                | `AuctionConfig`               | missing `mediator`, `creative_store` (`allowed_context_keys` present, line 145) | present                    |
-| `[consent]`                | `ConsentConfig`               | missing                                                                         | missing                    |
-| `[proxy]`                  | `Proxy`                       | partial; `asset_routes` missing                                                 | present incl. asset routes |
-| `[creative_opportunities]` | `CreativeOpportunitiesConfig` | present                                                                         | present                    |
-| `[image_optimizer]`        | `ImageOptimizerSettings`      | missing                                                                         | present (line 946 area)    |
-| `[tinybird]`               | `TinybirdSettings`            | missing                                                                         | missing                    |
-| `[debug]`                  | `DebugConfig`                 | partial (`inject_adm_for_testing` missing)                                      | missing                    |
+| Section                    | Struct                        | `trusted-server.example.toml`                                                        | `configuration.md`         |
+| -------------------------- | ----------------------------- | ------------------------------------------------------------------------------------ | -------------------------- |
+| `[publisher]`              | `Publisher`                   | present                                                                              | present                    |
+| `[tester_cookie]`          | `TesterCookieConfig`          | missing                                                                              | present (line 360)         |
+| `[ec]`                     | `Ec` + `EcPartner`            | present                                                                              | present                    |
+| `[integrations.*]`         | per-integration typed configs | partial (osano missing)                                                              | 5 of 14 IDs                |
+| `[[handlers]]`             | `Handler`                     | present                                                                              | present                    |
+| `response_headers`         | map                           | present (commented)                                                                  | present                    |
+| `[request_signing]`        | `RequestSigning`              | present                                                                              | present                    |
+| `[rewrite]`                | `Rewrite`                     | missing                                                                              | present (line 702)         |
+| `[auction]`                | `AuctionConfig`               | missing `mediator`, `creative_store` (`allowed_context_keys` present, line 145)      | present                    |
+| `[consent]`                | `ConsentConfig`               | missing                                                                              | missing                    |
+| `[proxy]`                  | `Proxy`                       | partial; `asset_routes` missing                                                      | present incl. asset routes |
+| `[creative_opportunities]` | `CreativeOpportunitiesConfig` | present                                                                              | present                    |
+| `[image_optimizer]`        | `ImageOptimizerSettings`      | missing                                                                              | present (line 946 area)    |
+| `[tinybird]`               | `TinybirdSettings`            | missing                                                                              | missing                    |
+| `[debug]`                  | `DebugConfig`                 | present on rc incl. `auction_html_comment_options`; `inject_adm_for_testing` missing | missing                    |
+| `[cache]` (rc)             | `CacheSettings`               | commented `[[cache.asset_rules]]` examples only                                      | present (rc)               |
 
 ## Appendix C: Integration registry (truth source for WP5 overview table)
 
@@ -814,12 +832,16 @@ DJS deferred JS, AP auction provider.
 
 ## Appendix D: CLI tree and environment variables
 
-`ts` commands (from `crates/trusted-server-cli/src/run.rs`): `audit`,
-`auth login|logout|status`, `build`, `config init|diff|push|validate`,
-`deploy`, `prebid bundle`, `provision`, `serve`,
+`ts` commands (from `crates/trusted-server-cli/src/run.rs` on rc/202608):
+`audit generate|ad-templates`, `active-version`, `auth login|logout|status`,
+`build`, `config init|diff|push|validate|ad-templates|gc`, `deploy`,
+`healthcheck`, `prebid bundle`, `provision`, `rollback`, `serve`,
 `dev proxy [ca path|install|uninstall|regenerate]` (macOS only; `ts dev`
-lists no subcommands on other hosts). All commands and flags carry help text;
-`docs/guide/cli.md` must add `config diff` and the `dev` subtree.
+lists no subcommands on other hosts). Commands that detect drift
+(`config diff`, `config ad-templates check`, audit verification) report a
+distinct drift outcome with a stable exit code. All commands and flags carry
+help text; `docs/guide/cli.md` must add `active-version`, `healthcheck`,
+`rollback`, and `config gc`.
 
 Runtime environment variables to document (WP2 `.env.example` / `.env.dev`):
 `FASTLY_SERVICE_VERSION`, `FASTLY_IS_STAGING`, `FASTLY_HOSTNAME`,
