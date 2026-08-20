@@ -47,6 +47,18 @@ fn backend_error(message: impl Into<String>) -> TemplateCacheError {
     }
 }
 
+fn cancel_invalid_reservation<E: core::fmt::Debug>(
+    validation_error: TemplateCacheError,
+    cancel: impl FnOnce() -> Result<(), E>,
+) -> Result<(), TemplateCacheError> {
+    match cancel() {
+        Ok(()) => Err(validation_error),
+        Err(error) => Err(backend_error(format!(
+            "{validation_error}; cancelling invalid cache reservation also failed: {error:?}"
+        ))),
+    }
+}
+
 enum ReadFoundError {
     Invalid(TemplateCacheMiss),
     Backend(TemplateCacheError),
@@ -103,15 +115,25 @@ impl PlatformTemplateCacheReservation for FastlyTemplateReservation {
         max_age: Duration,
     ) -> Result<(), TemplateCacheError> {
         if metadata.body_len != body.len() as u64 {
-            return Err(backend_error(format!(
+            let validation_error = backend_error(format!(
                 "metadata body_len {} does not match the {} bytes supplied",
                 metadata.body_len,
                 body.len()
-            )));
+            ));
+            return cancel_invalid_reservation(validation_error, || {
+                self.transaction.cancel_insert_or_update()
+            });
         }
-        let encoded_metadata = metadata.encode().map_err(|error| {
-            backend_error(format!("encoding template metadata failed: {error}"))
-        })?;
+        let encoded_metadata = match metadata.encode() {
+            Ok(encoded_metadata) => encoded_metadata,
+            Err(error) => {
+                let validation_error =
+                    backend_error(format!("encoding template metadata failed: {error}"));
+                return cancel_invalid_reservation(validation_error, || {
+                    self.transaction.cancel_insert_or_update()
+                });
+            }
+        };
 
         let mut writer = self
             .transaction
@@ -240,8 +262,9 @@ impl PlatformTemplateCache for FastlyTemplateCache {
             .map_err(|e| backend_error(format!("cache insert failed: {e:?}")))?;
 
         if let Err(e) = writer.write_all(&body) {
-            // Deliberately not calling `finish()`. An unfinished entry has no known
-            // length, and even if it is observable, `get`'s length check rejects it.
+            // Deliberately do not call `finish()`. If partial content becomes
+            // observable, fallible reads and the post-read check against the declared
+            // body length reject it.
             return Err(backend_error(format!("writing template body failed: {e}")));
         }
 
@@ -371,6 +394,76 @@ mod tests {
             TemplateCacheLookup::Hit(entry) => assert_eq!(entry.body, body),
             _ => panic!("the next transactional lookup must see the inserted template"),
         }
+    }
+
+    #[test]
+    fn length_mismatch_cancels_the_reservation_obligation() {
+        let cache = cache();
+        let key = key("https://example.com/reservation-length-mismatch");
+        let body = b"template".to_vec();
+        let mut metadata = metadata_for(&body);
+        metadata.body_len += 1;
+        let reservation = match run(cache.lookup_or_reserve(&key)).expect("lookup should work") {
+            TemplateCacheLookup::Reserved(reservation) => reservation,
+            _ => panic!("a cold lookup should reserve the key"),
+        };
+
+        let error = reservation
+            .insert(&metadata, body, Duration::from_secs(60))
+            .expect_err("length mismatch should fail insertion");
+
+        assert!(
+            error.to_string().contains("does not match"),
+            "should preserve the original validation reason: {error}"
+        );
+        match run(cache.lookup_or_reserve(&key)).expect("second lookup should work") {
+            TemplateCacheLookup::Reserved(reservation) => reservation
+                .cancel()
+                .expect("should cancel the proof reservation"),
+            _ => panic!("the invalid insert should release the reservation obligation"),
+        }
+    }
+
+    #[test]
+    fn metadata_encoding_failure_cancels_the_reservation_obligation() {
+        let cache = cache();
+        let key = key("https://example.com/reservation-metadata-encoding");
+        let body = b"template".to_vec();
+        let mut metadata = metadata_for(&body);
+        metadata.content_type = "text/html\ninjected".to_string();
+        let reservation = match run(cache.lookup_or_reserve(&key)).expect("lookup should work") {
+            TemplateCacheLookup::Reserved(reservation) => reservation,
+            _ => panic!("a cold lookup should reserve the key"),
+        };
+
+        let error = reservation
+            .insert(&metadata, body, Duration::from_secs(60))
+            .expect_err("invalid metadata should fail insertion");
+
+        assert!(
+            error
+                .to_string()
+                .contains("encoding template metadata failed"),
+            "should preserve the original validation reason: {error}"
+        );
+        match run(cache.lookup_or_reserve(&key)).expect("second lookup should work") {
+            TemplateCacheLookup::Reserved(reservation) => reservation
+                .cancel()
+                .expect("should cancel the proof reservation"),
+            _ => panic!("the invalid insert should release the reservation obligation"),
+        }
+    }
+
+    #[test]
+    fn invalid_reservation_cancellation_preserves_both_errors() {
+        let error = cancel_invalid_reservation(backend_error("metadata validation failed"), || {
+            Err("simulated cancellation failure")
+        })
+        .expect_err("invalid reservation should return an error");
+
+        let message = error.to_string();
+        assert!(message.contains("metadata validation failed"));
+        assert!(message.contains("simulated cancellation failure"));
     }
 
     #[test]
