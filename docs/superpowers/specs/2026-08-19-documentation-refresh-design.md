@@ -115,7 +115,8 @@ The source-of-truth map:
 
 ## Work packages
 
-All eight packages ship in one single implementation PR. Each package is one
+All eight packages ship in the same single PR as this spec (#1049, branch
+`spec-docs-refresh`): the spec commit lands first, then each package as one
 commit (or a small commit series) in the order below, so the PR is
 reviewable commit-by-commit: WP1 and WP2 are corrective, WP3-WP6 are
 completion work, WP7-WP8 are quality and enforcement.
@@ -257,7 +258,7 @@ Bring the two operator-facing config artifacts to parity with `Settings`
   `didomi`, `sourcepoint`, `lockr`, `gpt`, `gpt_diagnostics`,
   `google_tag_manager`, `adserver_mock`), each with its typed config keys
   from the integration source.
-- Add a parity checklist to the implementation PR description mapping each
+- Add a parity checklist to the PR description mapping each
   of the 15 `Settings` fields to its example-toml block and configuration.md
   heading (the table in Appendix B is the worklist).
 
@@ -478,12 +479,12 @@ failing doctest fails CI.
 | 7     | WP7 in-code docs         | M    | -                               |
 | 8     | WP8 enforcement          | S    | WP7 (doc build must pass first) |
 
-Commits land in this order within the single implementation PR; WP8 comes
-last so the new CI gates turn green on the same PR.
+Commits land in this order within the single PR, after the spec commit; WP8
+comes last so the new CI gates turn green on the same PR.
 
 ## Verification
 
-For the implementation PR:
+Before the PR is marked ready:
 `cd docs && npm run lint && npm run format && npm run build`;
 `cargo fmt --all -- --check`; the target-matched clippy/test aliases for any
 crate whose source files changed (WP7); `cargo doc --no-deps` locally for
