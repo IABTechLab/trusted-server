@@ -96,9 +96,15 @@ enum SlotAnalysis {
     Static,
     /// Cannot be represented; carries the operator-facing reason.
     Refuse(String),
-    /// Would be templatable but no root page was observed, so `section_root`
-    /// is undetermined under this candidate.
-    RootUnwitnessed,
+    /// Unit segment `varying` tracks the derived section on every page this slot
+    /// was seen on, but none of those pages lacked the section segment, so the
+    /// slot witnessed no `section_root` of its own.
+    ///
+    /// Carries `varying` because such a slot is still templatable *when another
+    /// slot witnessed the config-level `section_root`*: a placement that only
+    /// exists on section pages (a sidebar, an in-article unit) never renders on a
+    /// path where `{section}` would fall back to the root.
+    RootUnwitnessed { varying: usize },
 }
 
 /// Infers unit-path templates for every slot in `table`.
@@ -112,6 +118,7 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
     // Evaluate every candidate index independently; ambiguity between two that
     // both fit is a refusal, not a preference for the smaller one.
     let mut qualifying: Vec<(usize, String, BTreeMap<String, SlotAnalysis>)> = Vec::new();
+    let mut root_witness_missing = false;
     for segment in 0..=MAX_SECTION_SEGMENT {
         let analyses: BTreeMap<String, SlotAnalysis> = slots
             .iter()
@@ -128,6 +135,13 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
         // Slots must agree: `section_root` is one config-level value, so two
         // slots claiming different roots means this index is not the real one.
         let Some(root) = roots.iter().next().copied() else {
+            // Distinguish "nothing tracks the section" from "everything does but
+            // no crawled page lacked the section segment": the second is a crawl
+            // gap the operator can close, and the generic literal-path refusal
+            // below does not say so.
+            root_witness_missing |= analyses
+                .values()
+                .any(|analysis| matches!(analysis, SlotAnalysis::RootUnwitnessed { .. }));
             continue;
         };
         if roots.len() > 1 {
@@ -155,11 +169,17 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
 
     let Some((section_segment, section_root, analyses)) = chosen else {
         if diagnostics.is_empty() {
-            diagnostics.push(
+            diagnostics.push(if root_witness_missing {
+                "the ad-unit paths do track the page section, but no crawled page lacked a \
+                 section segment, so `section_root` could not be witnessed and no {section} \
+                 template can be written; include the site root in the crawl (or set \
+                 section_root by hand) to template these slots"
+                    .to_string()
+            } else {
                 "no ad-unit path varied by page section across the crawl, so paths were kept \
                  literal; crawl more sections to enable a {section} template"
-                    .to_string(),
-            );
+                    .to_string()
+            });
         }
         return InferenceOutcome {
             policy: None,
@@ -175,13 +195,33 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
             .get(&slot.div_id)
             .cloned()
             .unwrap_or(SlotAnalysis::Static);
-        let decision = match analysis {
-            SlotAnalysis::Templatable { varying, .. } => {
+        let templatable = match analysis {
+            SlotAnalysis::Templatable { varying, .. } => Some((varying, true)),
+            // The config-level `section_root` is witnessed by another slot on the
+            // same property, and this slot's page patterns are derived from the
+            // paths it was seen on — all of which carry a section segment — so
+            // `{section}` never falls back to the root for it. Refusing here cost
+            // real inventory: a sidebar or in-article unit that simply does not
+            // exist on the site root was omitted from the config entirely.
+            SlotAnalysis::RootUnwitnessed { varying } => Some((varying, false)),
+            SlotAnalysis::Static | SlotAnalysis::Refuse(_) => None,
+        };
+        let decision = match (templatable, analysis) {
+            (Some((varying, witnessed_root)), _) => {
                 let template = build_template(slot, varying);
                 match verify_round_trip(&template, slot, network_id, &section_root, section_segment)
                 {
                     Ok(()) => {
                         templated += 1;
+                        if !witnessed_root {
+                            diagnostics.push(format!(
+                                "slot `{}` was never observed on a page without a section \
+                                 segment, so its `{{section}}` template relies on the \
+                                 config-level section_root `{section_root}` witnessed by other \
+                                 slots; it is only rendered for the paths this slot was seen on",
+                                slot.id
+                            ));
+                        }
                         SlotDecision::Template(template)
                     }
                     Err(reason) => {
@@ -194,10 +234,10 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
                     }
                 }
             }
-            SlotAnalysis::Static | SlotAnalysis::RootUnwitnessed => literal_decision(slot),
-            SlotAnalysis::Refuse(reason) => SlotDecision::Refuse {
+            (None, SlotAnalysis::Refuse(reason)) => SlotDecision::Refuse {
                 reasons: vec![reason],
             },
+            (None, _) => literal_decision(slot),
         };
         decisions.push((slot.div_id.clone(), decision));
     }
@@ -337,7 +377,7 @@ fn analyse_slot(slot: &SlotEvidence, network_id: &str, section_segment: usize) -
     let Some(section_root) = roots.next() else {
         // Without a root observation, `section_root` would be a guess that
         // silently mis-renders every short path.
-        return SlotAnalysis::RootUnwitnessed;
+        return SlotAnalysis::RootUnwitnessed { varying };
     };
     if roots.next().is_some() {
         return SlotAnalysis::Static;
@@ -659,6 +699,82 @@ mod tests {
         let SlotDecision::Refuse { .. } = only_decision(&outcome) else {
             panic!("two literal paths and no template is not representable as one literal");
         };
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|note| note.contains("section_root` could not be witnessed")),
+            "the crawl gap, not \"nothing generalized\", is the reason; got {:?}",
+            outcome.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_slot_absent_from_the_root_templates_from_the_witnessed_policy() {
+        // The live shape behind the `ad-atf_sidebar-0` refusal: a header on the
+        // root and every section witnesses `section_root`, while a sidebar exists
+        // only on section pages. The sidebar's unit path tracks the section just
+        // as well, and its page patterns never cover the root, so refusing it
+        // dropped real inventory from the config.
+        let mut table = EvidenceTable::default();
+        let pages: &[(&str, &[(&str, &str)])] = &[
+            ("/", &[("ad-header", "/123/site/homepage")]),
+            (
+                "/news/story",
+                &[
+                    ("ad-header", "/123/site/news"),
+                    ("ad-sidebar", "/123/site/news"),
+                ],
+            ),
+            (
+                "/deals/x",
+                &[
+                    ("ad-header", "/123/site/deals"),
+                    ("ad-sidebar", "/123/site/deals"),
+                ],
+            ),
+        ];
+        for (path, slots) in pages {
+            let registry: Vec<CollectedGptSlot> = slots
+                .iter()
+                .map(|(div_id, unit_path)| CollectedGptSlot {
+                    gam_unit_path: (*unit_path).to_string(),
+                    div_id: (*div_id).to_string(),
+                    sizes: vec![(728, 90)],
+                })
+                .collect();
+            table.fold_page(path, &discover_gpt_slots(&registry, &[], false));
+        }
+
+        let outcome = infer_unit_templates(&table, "123");
+
+        assert_eq!(
+            outcome.policy,
+            Some(SectionPolicy {
+                section_root: "homepage".to_string(),
+                section_segment: 0,
+            }),
+            "the header witnesses the config-level policy"
+        );
+        assert_eq!(
+            outcome.decision("ad-sidebar"),
+            Some(&SlotDecision::Template(
+                "/{network_id}/site/{section}".to_string()
+            )),
+            "a slot that only exists on section pages is still templatable"
+        );
+        assert_eq!(
+            outcome.decision("ad-header"),
+            Some(&SlotDecision::Template(
+                "/{network_id}/site/{section}".to_string()
+            ))
+        );
+        assert!(
+            outcome.diagnostics.iter().any(|note| note
+                .contains("`ad-sidebar` was never observed on a page without a section segment")),
+            "the borrowed section_root should be stated; got {:?}",
+            outcome.diagnostics
+        );
     }
 
     #[test]
