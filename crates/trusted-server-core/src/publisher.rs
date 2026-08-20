@@ -8317,7 +8317,15 @@ mod tests {
     }
 
     fn streaming_finalize_response(params: OwnedProcessResponseParams, body: EdgeBody) -> EdgeBody {
-        let settings = Arc::new(create_test_settings());
+        streaming_finalize_response_with_settings(params, body, create_test_settings())
+    }
+
+    fn streaming_finalize_response_with_settings(
+        params: OwnedProcessResponseParams,
+        body: EdgeBody,
+        settings: Settings,
+    ) -> EdgeBody {
+        let settings = Arc::new(settings);
         let registry = Arc::new(
             IntegrationRegistry::new(&settings).expect("should create integration registry"),
         );
@@ -8368,6 +8376,40 @@ mod tests {
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
         }
+    }
+
+    #[test]
+    fn streaming_finalize_emits_gam_attribution_head_before_origin_eof() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "gpt",
+                &serde_json::json!({
+                    "enabled": true,
+                    "gam_attribution_enabled": true
+                }),
+            )
+            .expect("should insert GPT config");
+
+        let body = streaming_finalize_response_with_settings(
+            html_stream_params("", None),
+            origin_chunk_then_pending(bytes::Bytes::from_static(
+                b"<html><head></head><body><p>origin remains pending</p>",
+            )),
+            settings,
+        );
+        let html = String::from_utf8(first_lazy_body_chunk(body).to_vec())
+            .expect("should emit UTF-8 HTML");
+
+        assert!(
+            html.contains("__tsjs_gam_attribution_enabled=true"),
+            "first rewritten head chunk should carry the primary activation flag: {html}"
+        );
+        assert!(
+            html.contains("data-ts-gam-attribution=\"true\""),
+            "first rewritten head chunk should authorize the bundle fallback: {html}"
+        );
     }
 
     #[test]
@@ -9300,9 +9342,14 @@ mod tests {
 
         #[test]
         fn ad_slots_script_contains_slot_data() {
-            let slots = vec![make_slot()];
+            let mut slot = make_slot();
+            slot.targeting
+                .insert("ts".to_string(), "operator-value".to_string());
+            let slots = vec![slot];
             let config = make_config();
             let script = build_ad_slots_script(&slots, &config, "/");
+            let slot_json = crate::publisher::build_slot_json(&slots[0], &config, "example")
+                .expect("should build slot JSON");
             assert!(
                 script.contains("window.tsjs=window.tsjs||{}"),
                 "should initialise tsjs namespace"
@@ -9316,6 +9363,10 @@ mod tests {
             assert!(
                 !script.contains("__ts_request_id"),
                 "must NOT contain request_id"
+            );
+            assert_eq!(
+                slot_json["targeting"]["ts"], "operator-value",
+                "should forward operator-provided ts targeting verbatim"
             );
         }
 

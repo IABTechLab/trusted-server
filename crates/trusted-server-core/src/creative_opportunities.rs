@@ -1756,11 +1756,18 @@ mod tests {
 
     #[test]
     fn to_ad_slot_sets_floor_price_and_formats() {
-        let slot = make_slot("atf", vec!["/"]);
+        let mut slot = make_slot("atf", vec!["/"]);
+        slot.targeting
+            .insert("ts".to_string(), "operator-value".to_string());
         let ad_slot = slot.to_ad_slot();
         assert_eq!(ad_slot.id, "atf");
         assert_eq!(ad_slot.floor_price, Some(0.50));
         assert_eq!(ad_slot.formats.len(), 1);
+        assert_eq!(
+            ad_slot.targeting.get("ts"),
+            Some(&serde_json::Value::String("operator-value".to_owned())),
+            "should preserve operator-provided ts targeting verbatim"
+        );
     }
 
     #[test]
