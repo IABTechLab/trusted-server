@@ -12,6 +12,10 @@ on:
     types: [opened, synchronize, reopened]
   workflow_dispatch:
     inputs:
+      base_sha:
+        description: Exact rc/202608 base commit for performance comparison
+        required: true
+        type: string
       evidence_id:
         description: Unique identifier used to bind this run to an evidence artifact
         required: true
@@ -42,6 +46,7 @@ jobs:
        startsWith(inputs.evidence_id, 'aps-tsjs-postswitch-'))
     uses: ./.github/workflows/tsjs-performance-gate.yml
     with:
+      base_sha: ${{ inputs.base_sha }}
       evidence_id: ${{ inputs.evidence_id }}
       mode: ${{ startsWith(inputs.evidence_id, 'aps-tsjs-postswitch-') && 'postswitch' || 'preswitch' }}
 

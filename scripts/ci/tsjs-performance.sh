@@ -14,6 +14,9 @@ validate_inputs() {
     *) return 1 ;;
   esac
   [[ "${TSJS_EVIDENCE_ID:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]]
+  [[ "${TSJS_PERF_HEAD_SHA:-}" =~ ^[0-9a-f]{40}$ ]]
+  [[ "${TSJS_PERF_BASE_SHA:-}" =~ ^[0-9a-f]{40}$ ]]
+  test "$(git -C "$repository_root" rev-parse HEAD)" = "$TSJS_PERF_HEAD_SHA"
 }
 
 verify_toolchains() {
@@ -34,20 +37,22 @@ build_candidate() {
   node "$repository_root/scripts/validate-tsjs-performance-evidence.mjs" --self-test
 }
 
-build_main() {
+build_baseline() {
   test -n "${RUNNER_TEMP:-}"
   test -n "${GITHUB_ENV:-}"
+  base_sha="${TSJS_PERF_BASE_SHA:-}"
+  [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]
   cd "$repository_root"
-  git fetch origin main
-  main_sha="$(git rev-parse origin/main)"
-  main_root="$RUNNER_TEMP/tsjs-performance-main"
-  [[ "$main_sha" =~ ^[0-9a-f]{40}$ ]]
-  test "$(git cat-file -t "$main_sha")" = commit
-  git worktree add --detach "$main_root" "$main_sha"
-  npm --prefix "$main_root/crates/trusted-server-js/lib" ci
-  npm --prefix "$main_root/crates/trusted-server-js/lib" run build
-  printf 'TSJS_PERF_MAIN_SHA=%s\n' "$main_sha" >> "$GITHUB_ENV"
-  printf 'TSJS_PERF_MAIN_ROOT=%s\n' "$main_root" >> "$GITHUB_ENV"
+  git fetch origin refs/heads/rc/202608:refs/remotes/origin/rc/202608
+  test "$(git cat-file -t "$base_sha")" = commit
+  git merge-base --is-ancestor "$base_sha" origin/rc/202608
+  baseline_root="$RUNNER_TEMP/tsjs-performance-baseline"
+  test ! -e "$baseline_root"
+  git worktree add --detach "$baseline_root" "$base_sha"
+  npm --prefix "$baseline_root/crates/trusted-server-js/lib" ci
+  npm --prefix "$baseline_root/crates/trusted-server-js/lib" run build
+  printf 'TSJS_PERF_BASE_SHA=%s\n' "$base_sha" >> "$GITHUB_ENV"
+  printf 'TSJS_PERF_BASE_ROOT=%s\n' "$baseline_root" >> "$GITHUB_ENV"
 }
 
 install_browser() {
@@ -71,13 +76,13 @@ validate_evidence() {
   test -n "${TSJS_PERF_OUTPUT:-}"
   test -n "${TSJS_EVIDENCE_ID:-}"
   test -n "${TSJS_PERF_HEAD_SHA:-}"
-  test -n "${TSJS_PERF_MAIN_SHA:-}"
+  test -n "${TSJS_PERF_BASE_SHA:-}"
   test -n "${TSJS_PERF_MODE:-}"
   node "$repository_root/scripts/validate-tsjs-performance-evidence.mjs" \
     --file "$TSJS_PERF_OUTPUT" \
     --evidence-id "$TSJS_EVIDENCE_ID" \
     --head-sha "$TSJS_PERF_HEAD_SHA" \
-    --main-sha "$TSJS_PERF_MAIN_SHA" \
+    --base-sha "$TSJS_PERF_BASE_SHA" \
     --mode "$TSJS_PERF_MODE"
 }
 
@@ -91,8 +96,8 @@ case "${1:-}" in
   build-candidate)
     build_candidate
     ;;
-  build-main)
-    build_main
+  build-baseline)
+    build_baseline
     ;;
   install-browser)
     install_browser
@@ -104,7 +109,7 @@ case "${1:-}" in
     validate_evidence
     ;;
   *)
-    printf 'usage: %s {validate-inputs|verify-toolchains|build-candidate|build-main|install-browser|run-sample|validate-evidence}\n' "$0" >&2
+    printf 'usage: %s {validate-inputs|verify-toolchains|build-candidate|build-baseline|install-browser|run-sample|validate-evidence}\n' "$0" >&2
     exit 64
     ;;
 esac

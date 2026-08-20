@@ -26,6 +26,10 @@ on:
       - "scripts/validate-tsjs-performance-evidence.mjs"
   workflow_dispatch:
     inputs:
+      base_sha:
+        description: Exact pull-request base commit reachable from origin/rc/202608
+        required: true
+        type: string
       evidence_id:
         description: Unique identifier bound to the uploaded evidence
         required: true
@@ -39,6 +43,10 @@ on:
           - postswitch
   workflow_call:
     inputs:
+      base_sha:
+        description: Exact pull-request base commit reachable from origin/rc/202608
+        required: true
+        type: string
       evidence_id:
         description: Unique identifier bound to the uploaded evidence
         required: true
@@ -54,6 +62,7 @@ env:
   TSJS_PERF_WORKFLOW_NAME: TSJS Performance Gate
   TSJS_PERF_WORKFLOW_FILE: .github/workflows/tsjs-performance-gate.yml
   TSJS_PERF_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+  TSJS_PERF_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.base_sha }}
 
 jobs:
   measure:
@@ -69,6 +78,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
       - name: Validate immutable measurement inputs
         shell: bash
@@ -101,9 +111,9 @@ jobs:
       - name: Build the real TSJS artifacts once
         run: bash scripts/ci/tsjs-performance.sh build-candidate
 
-      - name: Build the exact current main artifacts
+      - name: Build the exact rc baseline artifacts
         shell: bash
-        run: bash scripts/ci/tsjs-performance.sh build-main
+        run: bash scripts/ci/tsjs-performance.sh build-baseline
 
       - name: Install the lockfile-pinned Chromium setup
         run: bash scripts/ci/tsjs-performance.sh install-browser

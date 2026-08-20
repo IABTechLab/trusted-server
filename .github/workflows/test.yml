@@ -293,6 +293,10 @@ jobs:
       - name: Verify generated APS renderer contract
         run: npm run check:aps-contract
 
+      - name: Verify APS/TSJS gate scripts
+        working-directory: ${{ github.workspace }}
+        run: bash scripts/ci/aps-tsjs-quality.sh contracts
+
       - name: Enforce hard-cutover absence
         run: npm run check:hard-cutover-absence
 
