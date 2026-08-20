@@ -194,6 +194,11 @@ For initial navigation and page-bids, Trusted Server publishes the same descript
 
 For client-side `trustedServer` adapter auctions, Prebid generates its own `hb_adid`. Trusted Server binds that generated ID to the validated APS descriptor in a bounded, expiring browser registry before GAM refresh. The bridge verifies that the requesting Universal Creative iframe belongs to the same ad unit, consumes the capability once, and passes the APS bid ID separately to the Amazon runner.
 
+The protected browser conformance environment uses Prebid Universal Creative
+`1.17.2`. Configure that release in GAM outside this repository. Trusted Server
+does not vendor, proxy, pin, archive, or serve PUC bytes; the version is test and
+operator metadata for the externally hosted creative only.
+
 These paths do not fetch PBS Cache, fire generic APS win/billing beacons, or call `apstag.setDisplayBids()` for the Trusted Server winner. Publisher-owned native APS objects are otherwise left untouched.
 
 ## Publisher CSP
@@ -232,6 +237,7 @@ This release is a direct protocol cutover:
 7. Disable publisher-native APS demand for the Trusted Server test cohort.
 
 There is no legacy runtime switch. Roll back by disabling `[integrations.aps]`, restoring native APS for the cohort, or deploying the prior binary.
+Disabling `[integrations.aps]` is also the containment stop for renderer or live-runner incidents: it removes APS auction and browser materialization ownership without adding a cached or vendored fallback.
 
 ## Rollout
 
