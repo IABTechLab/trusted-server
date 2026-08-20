@@ -1017,13 +1017,18 @@ export function createFirstDisplayRenderBridge(
 
     if (message === 'TS APS Bootstrap Ready') {
       const fields = exactRecord(parseJson(data), ['message', 'version', 'bootstrapNonce']);
-      const bootstrapNonce = fields?.bootstrapNonce;
+      const bootstrapNonce = fields?.['bootstrapNonce'];
       if (
         fields?.message !== message ||
         fields.version !== 1 ||
         typeof bootstrapNonce !== 'string' ||
         !BOOTSTRAP_NONCE_ID.test(bootstrapNonce) ||
-        data !== JSON.stringify({ message, version: 1, bootstrapNonce })
+        data !==
+          JSON.stringify({
+            message,
+            version: 1,
+            ['bootstrapNonce']: bootstrapNonce,
+          })
       ) {
         return true;
       }
@@ -1055,8 +1060,8 @@ export function createFirstDisplayRenderBridge(
       const navigation = JSON.stringify({
         message: 'TS APS Bootstrap Configure',
         version: 2,
-        bootstrapNonce,
-        rendererNonce,
+        ['bootstrapNonce']: bootstrapNonce,
+        ['rendererNonce']: rendererNonce,
         creativeOrigin: policy.creativeOrigin,
         tagType: policy.tagType,
       });
@@ -1074,8 +1079,8 @@ export function createFirstDisplayRenderBridge(
       'bootstrapNonce',
       'rendererNonce',
     ]);
-    const bootstrapNonce = fields?.bootstrapNonce;
-    const rendererNonce = fields?.rendererNonce;
+    const bootstrapNonce = fields?.['bootstrapNonce'];
+    const rendererNonce = fields?.['rendererNonce'];
     if (
       fields?.message !== message ||
       fields.version !== 1 ||
@@ -1083,7 +1088,13 @@ export function createFirstDisplayRenderBridge(
       !BOOTSTRAP_NONCE_ID.test(bootstrapNonce) ||
       typeof rendererNonce !== 'string' ||
       !NONCE_ID.test(rendererNonce) ||
-      data !== JSON.stringify({ message, version: 1, bootstrapNonce, rendererNonce })
+      data !==
+        JSON.stringify({
+          message,
+          version: 1,
+          ['bootstrapNonce']: bootstrapNonce,
+          ['rendererNonce']: rendererNonce,
+        })
     ) {
       return true;
     }

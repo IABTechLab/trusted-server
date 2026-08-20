@@ -29,7 +29,7 @@ const SUCCESS_HEADERS: [&str; 5] = [
 const DOWNSTREAM_DEADLINE_OBSERVATION_ALLOWANCE: Duration = Duration::from_millis(250);
 const RENDERER_V2_PATH: &str = "/integrations/aps/renderer/v2";
 const CLOUDFLARE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
-const RENDERER_V2_CSP: &str = "default-src 'none'; sandbox allow-scripts; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'self'; form-action 'none';";
+const RENDERER_V2_CSP: &str = "default-src 'none'; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' http: https:; connect-src http: https:; frame-src data: https:; img-src data: blob: http: https:; media-src blob: http: https:; style-src 'unsafe-inline' http: https:; font-src data: http: https:; worker-src blob: http: https:; frame-ancestors 'self'; form-action https:;";
 const RENDERER_V2_DOCUMENT: &str = include_str!(
     "../../trusted-server-core/src/integrations/generated/aps_renderer_bootstrap_v2.html"
 );

@@ -99,8 +99,15 @@ function exactPlain(value,keys){
  return !!value&&typeof value==='object'&&!Array.isArray(value)&&
   Object.getPrototypeOf(value)===Object.prototype&&apsExactRecord(value,keys);
 }
+function hasForbiddenOriginCharacter(value){
+ for(var index=0;index<value.length;index+=1){
+  var code=value.charCodeAt(index);
+  if(code<=32||code===127||value[index]==="'"||value[index]==='"'||value[index]===';')return true;
+ }
+ return false;
+}
 function exactOrigin(value){
- if(typeof value!=='string'||utf8Length(value)>2048||/[\\x00-\\x20\\x7f'";]/.test(value))return false;
+ if(typeof value!=='string'||utf8Length(value)>2048||hasForbiddenOriginCharacter(value))return false;
  try{
   var parsed=new URL(value);
   return (parsed.protocol==='https:'||parsed.protocol==='http:')&&parsed.hostname!==''&&

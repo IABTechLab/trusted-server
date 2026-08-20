@@ -615,6 +615,16 @@ test('messaging protocol binding is declared before schema initialization', () =
   );
 });
 
+test('generated APS bootstrap configuration preserves its public wire keys', () => {
+  const source = fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-aps_initial.js'), 'utf8');
+
+  assert.match(
+    source,
+    /TS APS Bootstrap Configure",version:2,bootstrapNonce:[^,}]+,["']?rendererNonce["']?:/u,
+    'the independently minified APS slice must serialize rendererNonce with its authored name'
+  );
+});
+
 test('co-bundled render_runtime and independent GPT start one branded display flow', async () => {
   const release = JSON.parse(
     fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-release-v1.json'), 'utf8')
@@ -1737,6 +1747,18 @@ test('production bundle graphs reject every current forbidden edge', () => {
   rejectSource('aps', 'src/kernel/runtime.ts', /inlines provider core/);
   rejectSource('gpt', 'src/adapters/prebid.ts', /inlines provider prebid/);
   rejectSource('aps', 'src/shared/dom_insertion_dispatcher.ts', /forbidden shared source/);
+  for (const artifactId of ['first_display', 'aps']) {
+    rejectSource(
+      artifactId,
+      'src/shared/aps_documents.ts',
+      /unclassified current production source/
+    );
+    rejectSource(
+      artifactId,
+      'src/core/contracts/generated/renderer_validator_document_v1.ts',
+      /unclassified current production source/
+    );
+  }
   rejectSource('aps', 'src/test/fake_adapter.ts', /test\/fake\/no-op seam/);
   const vendoredProvider = structuredClone(metrics);
   vendoredProvider.modules[1].sources.push({

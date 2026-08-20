@@ -218,7 +218,10 @@ function executeBootstrap(
 test('the generated renderer response is an ES5 descriptor-isolated materializer', () => {
   const source = bootstrapScript();
   assert.doesNotMatch(source, /=>|\b(?:const|let|class)\b|\?\.|\?\?/);
-  assert.doesNotMatch(source, /example-account-id|fictional-selected-bid-id|fictional-creative-id/u);
+  assert.doesNotMatch(
+    source,
+    /example-account-id|fictional-selected-bid-id|fictional-creative-id/u
+  );
   assert.doesNotMatch(source, /fetch|XMLHttpRequest/u);
   assert.match(source, /TS APS Bootstrap Ready/);
   assert.match(source, /TS APS Bootstrap Configure/);
@@ -251,13 +254,116 @@ test('the generated bootstrap materializes the opaque documents after first-acti
   assert.match(containerUrl, /^data:text\/html;charset=utf-8,/u);
   assert.match(containerUrl, new RegExp(`#${bootstrapNonce}$`, 'u'));
   const outerDocument = decodeURIComponent(
-    containerUrl.slice('data:text/html;charset=utf-8,'.length, -(`#${bootstrapNonce}`).length)
+    containerUrl.slice('data:text/html;charset=utf-8,'.length, -`#${bootstrapNonce}`.length)
   );
   assert.match(outerDocument, new RegExp(rendererNonce, 'u'));
   assert.match(outerDocument, /TS APS Container Ready/u);
   assert.doesNotMatch(
     outerDocument,
     /example-account-id|fictional-selected-bid-id|fictional-creative-id/u
+  );
+});
+
+test('the generated inner document accepts an exact loopback publisher origin', () => {
+  const bootstrapNonce = 'b1_AAECAwQFBgcICQoLDA0ODw';
+  const rendererNonce = 'n1_AAECAwQFBgcICQoLDA0ODw';
+  const publisherOrigin = 'http://127.0.0.1:8888';
+  const harness = executeBootstrap(`#${bootstrapNonce}`);
+  harness.dispatch({
+    source: harness.parent,
+    origin: publisherOrigin,
+    data: JSON.stringify({
+      message: 'TS APS Bootstrap Configure',
+      version: 2,
+      bootstrapNonce,
+      rendererNonce,
+      creativeOrigin: 'https://creative.example',
+      tagType: 'iframe',
+    }),
+    ports: [],
+  });
+
+  const outerUrl = harness.replacements[0];
+  assert.ok(outerUrl, 'bootstrap should materialize one outer data document');
+  const outerDocument = decodeURIComponent(
+    outerUrl.slice('data:text/html;charset=utf-8,'.length, -`#${bootstrapNonce}`.length)
+  );
+  const innerUrlSource = /var INNER_URL=("(?:[^"\\]|\\.)*");/u.exec(outerDocument)?.[1];
+  assert.ok(innerUrlSource, 'outer document should contain one encoded inner URL');
+  const innerUrl = JSON.parse(innerUrlSource);
+  const innerDocument = decodeURIComponent(
+    innerUrl.slice('data:text/html;charset=utf-8,'.length, -`#${rendererNonce}`.length)
+  );
+  const innerScript = /<script>\n([\s\S]+)\n<\/script>\n$/u.exec(innerDocument)?.[1];
+  assert.ok(innerScript, 'inner document should contain one renderer script');
+
+  let receiveBind;
+  const documentMessages = [];
+  const documentPort = {
+    close() {},
+    onmessage: undefined,
+    onmessageerror: undefined,
+    postMessage(message) {
+      documentMessages.push(message);
+    },
+    start() {},
+  };
+  class FakeCustomEvent {
+    constructor(type, options) {
+      this.type = type;
+      this.detail = options.detail;
+    }
+  }
+  const innerParent = { postMessage() {} };
+  const innerWindow = {};
+  const context = vm.createContext({
+    URL,
+    TextEncoder,
+    TextDecoder,
+    atob,
+    btoa,
+    CustomEvent: FakeCustomEvent,
+    document: {
+      createElement() {
+        return {};
+      },
+      head: { appendChild() {} },
+    },
+    documentPort,
+    envelopeJson: JSON.stringify({
+      version: 1,
+      nonce: rendererNonce,
+      publisherOrigin,
+      renderer: {
+        ...corpus.baseDescriptor,
+        aaxResponse: encodeBytes(JSON.stringify(goldenEnvelope)),
+      },
+    }),
+    history: { replaceState() {} },
+    location: { hash: `#${rendererNonce}`, pathname: '', search: '' },
+    parent: innerParent,
+    window: innerWindow,
+    addEventListener(_type, listener) {
+      receiveBind = listener;
+    },
+    removeEventListener() {},
+  });
+  vm.runInContext(innerScript, context, { filename: 'aps_renderer_inner_v1.html' });
+  receiveBind?.({
+    source: innerParent,
+    origin: 'null',
+    ports: [documentPort],
+    data: JSON.stringify({ message: 'TS APS Inner Bind', version: 1, rendererNonce }),
+  });
+  vm.runInContext('documentPort.onmessage({data:JSON.parse(envelopeJson)})', context);
+
+  assert.equal(
+    JSON.stringify(documentMessages[0]),
+    JSON.stringify({
+      message: 'TS APS Document Accepted',
+      version: 1,
+      nonce: rendererNonce,
+    })
   );
 });
 
