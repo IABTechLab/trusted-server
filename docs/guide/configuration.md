@@ -1468,23 +1468,26 @@ After the EdgeZero cutover, the Fastly adapter always dispatches through the
 EdgeZero entry point. The former `edgezero_enabled` and `edgezero_rollout_pct`
 canary keys are no longer read.
 
-The Fastly service must provide the logical config store selected by
-`[stores.config].default` in `edgezero.toml`. By default, the logical store ID
-is also the platform store name and the app-config blob key. Deployments can
-override the platform store name with
-`EDGEZERO__STORES__CONFIG__<ID>__NAME`; both the runtime and `ts config push`
-honor that override. The runtime also reads
-`EDGEZERO__STORES__CONFIG__<ID>__KEY`, but `ts config push` requires a matching
-`--key` argument to publish the blob at that key:
+The Fastly service opens the logical config store selected by
+`[stores.config].default` in `edgezero.toml` and reads the app-config blob at
+its default key. A Fastly resource link maps that logical store name to the
+physical config store for the service at runtime.
+
+For a service-specific physical store, create the store, link it with the
+logical name, then push to that physical store:
 
 ```bash
-EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY=staging \
-  ts config push --adapter fastly --key staging
+fastly config-store create --name <physical-store-name>
+fastly resource-link create --service-id <service-id> --version <version> \
+  --resource-id <config-store-id> --name trusted_server_config
+EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<physical-store-name> \
+  ts config push --adapter fastly
 ```
 
-The resolved store and key must contain a valid Trusted Server app-config blob
-envelope. An absent or empty entry makes application startup fail closed. Use
-the Trusted Server CLI to provision the store and publish the validated config.
+The resource-link name must match the logical store ID, and the pushed store
+must contain a valid Trusted Server app-config blob envelope at its default key.
+An absent or empty entry makes application startup fail closed. Use the Trusted
+Server CLI to provision the store and publish the validated config.
 
 **Local development** (writes the entry used by Viceroy in `fastly.toml`):
 

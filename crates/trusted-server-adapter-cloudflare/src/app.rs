@@ -75,10 +75,11 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
     Settings::from_toml(include_str!("../../../trusted-server.example.toml"))
 }
 
+/// Older Cloudflare bindings used this JSON property before config stores adopted
+/// the manifest-derived default.
+///
+/// Remove this fallback only when support for those bindings is deliberately retired.
 #[cfg(any(test, target_arch = "wasm32"))]
-// Older Cloudflare bindings used this JSON property before config stores adopted
-// the manifest-derived default. Remove this fallback only when support for those
-// bindings is deliberately retired.
 const LEGACY_CONFIG_BLOB_KEY: &str = "app_config";
 
 #[cfg(any(test, target_arch = "wasm32"))]
@@ -146,25 +147,17 @@ fn cloudflare_config_envelope(
             .ok_or(CloudflareConfigEnvelopeError::NonString {
                 key: CONFIG_BLOB_KEY,
             }),
-        None if CONFIG_BLOB_KEY != LEGACY_CONFIG_BLOB_KEY => {
-            match value.get(LEGACY_CONFIG_BLOB_KEY) {
-                Some(envelope) => {
-                    envelope
-                        .as_str()
-                        .ok_or(CloudflareConfigEnvelopeError::NonString {
-                            key: LEGACY_CONFIG_BLOB_KEY,
-                        })
-                }
-                None => Err(CloudflareConfigEnvelopeError::Missing {
-                    primary_key: CONFIG_BLOB_KEY,
-                    legacy_key: LEGACY_CONFIG_BLOB_KEY,
+        None => match value.get(LEGACY_CONFIG_BLOB_KEY) {
+            Some(envelope) => envelope
+                .as_str()
+                .ok_or(CloudflareConfigEnvelopeError::NonString {
+                    key: LEGACY_CONFIG_BLOB_KEY,
                 }),
-            }
-        }
-        None => Err(CloudflareConfigEnvelopeError::Missing {
-            primary_key: CONFIG_BLOB_KEY,
-            legacy_key: LEGACY_CONFIG_BLOB_KEY,
-        }),
+            None => Err(CloudflareConfigEnvelopeError::Missing {
+                primary_key: CONFIG_BLOB_KEY,
+                legacy_key: LEGACY_CONFIG_BLOB_KEY,
+            }),
+        },
     }
 }
 
