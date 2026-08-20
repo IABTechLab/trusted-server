@@ -403,8 +403,10 @@ configuration debug output. Configuration requires at least 32 ASCII graphic
 bytes (`!` through `~`) with no whitespace, controls, DEL, or non-ASCII bytes,
 and startup fails when the value is still the documented placeholder.
 
-Trusted Server strips any client-supplied `X-Forwarded-For` at the edge, so the
-front door cannot use that header to carry the reader address.
+Unless `X-Forwarded-For` is explicitly selected as the authenticated
+`ip_header`, Trusted Server strips it at the edge. Prefer `Fastly-Client-IP` or a
+dedicated `x-` header for the reader address so `X-Forwarded-For` retains its
+usual forwarding semantics.
 
 **Environment Overrides**:
 
