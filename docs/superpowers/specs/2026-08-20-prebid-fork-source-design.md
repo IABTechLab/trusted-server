@@ -38,9 +38,15 @@ commit produced the hosted artifact.
   it.
 - Accept any git ref (branch, tag, or commit SHA), resolve it to the
   exact commit at build time, and record that commit in the manifest.
+  Exact-commit provenance is guaranteed for git sources; for path
+  sources it is best effort (see Design section 6).
 - Record source provenance (`npm`, `path`, or `git` plus URL, ref,
-  commit, or path) in the generated `manifest.json`.
-- Preserve current behavior byte-for-byte when no source is configured.
+  commit, or path) in the generated `manifest.json`, and verify the
+  generator recorded it before patching the config.
+- Preserve the produced bundle JavaScript byte-for-byte when no source
+  is configured. The manifest gains a `source` field in all modes; the
+  bundle contents, filename derivation, and config patching are
+  unchanged.
 - Keep the existing failure guarantee: `trusted-server.toml` is never
   patched when generation fails.
 
@@ -138,6 +144,12 @@ config key if present, else the default npm package.
 `load_bundle_config` gains an optional `source` field. An empty or
 whitespace-only string is a config error.
 
+Relative paths resolve against different bases depending on where they
+are declared: a relative `--prebid-source` path resolves against the
+current working directory, while a relative config `source` path
+resolves against the directory containing the config file, so a pushed
+or shared config keeps its meaning regardless of where the CLI runs.
+
 ### 2. Source classification and the resolver seam
 
 Introduce a `PrebidSource` enum in `prebid_bundle.rs`:
@@ -149,7 +161,12 @@ Introduce a `PrebidSource` enum in `prebid_bundle.rs`:
 Classification: strings starting with `https://`, `git@`, or `ssh://`
 parse as git, with an optional trailing `#<ref>` split off; everything
 else is a path. `http://` is rejected with an error suggesting
-`https://`.
+`https://`. An `https://` URL containing userinfo (anything before an
+`@` in the authority, such as an embedded token) is rejected with an
+error directing the operator to git credential helpers or SSH:
+credential-bearing URLs would otherwise leak into command arguments,
+the cache directory's git config, CLI output, and a potentially
+publicly hosted manifest.
 
 Resolution runs behind a new trait (mirroring the existing
 `PrebidBundleGenerator` seam so tests can fake it):
@@ -177,11 +194,14 @@ package:
 
 - `package.json` exists;
 - `dist/src/` exists;
-- `metadata/modules/` exists.
+- `metadata/modules/` exists;
+- `node_modules/` exists, because the built `dist/` files carry bare
+  imports (for example `@babel/runtime`, `dlv`, `dset`) that Vite
+  resolves from the fork's own dependency tree.
 
-A missing `dist/src/` fails with guidance naming the exact commands
-(`npm ci && npx gulp build` inside the checkout). The CLI never runs
-installs or builds in a path source.
+A missing `dist/src/` or `node_modules/` fails with guidance naming
+the exact commands (`npm ci && npx gulp build` inside the checkout).
+The CLI never runs installs or builds in a path source.
 
 ### 4. Git sources: clone, build, cache
 
@@ -190,16 +210,31 @@ For `Git`:
 1. Compute the cache directory:
    `~/.cache/trusted-server/prebid-src/<hash-of-url>` (honoring
    `XDG_CACHE_HOME` when set).
-2. Clone the URL there if absent; otherwise `git fetch`.
-3. Check out the requested ref (default: the remote default branch) and
-   resolve it to a commit SHA via `git rev-parse`.
-4. Read the stamp file `.ts-prebid-build-stamp` in the checkout. If it
-   names the same SHA and `dist/src/` exists, skip the build.
-5. Otherwise run `npm ci` then `npx gulp build` in the checkout,
+2. Take an exclusive per-URL lock for the remaining steps: an advisory
+   `flock` on a lock file beside the cache directory. Two concurrent
+   `ts prebid bundle` runs against the same URL otherwise share one
+   mutable checkout and can interleave checkout/build steps, producing
+   a bundle from one commit with provenance for another. A held lock
+   makes the second run wait, with a periodic "waiting for
+   concurrent build" message.
+3. Clone the URL there if absent; otherwise `git fetch`.
+4. Resolve the requested ref (default: the remote default branch) to a
+   commit OID against the freshly fetched remote state:
+   `refs/remotes/origin/<ref>` for branches, `refs/tags/<ref>` for
+   tags, and the OID itself for a full or abbreviated SHA. Never
+   resolve a bare local branch name: after the first checkout a local
+   branch would pin the old commit while `origin/<ref>` advances,
+   silently skipping rebuilds of a moving branch.
+5. Check out that OID detached (`git checkout --detach <oid>`), so no
+   local branch state exists to go stale.
+6. Read the stamp file `.ts-prebid-build-stamp` in the checkout. If it
+   names the same OID and `dist/src/` exists, skip the build.
+7. Otherwise run `npm ci` then `npx gulp build` in the checkout,
    forwarding stdout/stderr like the generator does, and write the
    stamp file on success.
-6. Validate the result with the same checks as a path source, then
-   treat the checkout directory as the package directory.
+8. Validate the result with the same checks as a path source, then
+   treat the checkout directory as the package directory. The lock is
+   held until the generator has finished reading from the checkout.
 
 Build failures surface the underlying exit status and never touch the
 operator's config. The first build of a fork takes minutes (Prebid's
@@ -254,11 +289,24 @@ new `source` key in `manifest.json`:
 }
 ```
 
-For a path source: `{ "kind": "path", "path": "/abs/path" }`. When no
-`--source` is given the generator writes `{ "kind": "npm" }`. The Rust
-manifest deserializer ignores unknown fields, so no compatibility work
-is needed there; the CLI additionally prints the resolved source in its
-summary output.
+For a path source, provenance is best effort: the CLI records
+`{ "kind": "path", "path": "/abs/path" }` and, when the path sits
+inside a git work tree, adds the checkout's `HEAD` commit and a
+`dirty` flag from `git status --porcelain`. A dirty or non-git path
+source cannot pin an exact commit, which is the documented trade-off
+of path mode against git mode.
+
+The CLI always passes `--source`, including `{ "kind": "npm" }` for
+the default mode; the generator's own default (writing
+`{ "kind": "npm" }` when the flag is absent) covers only direct
+`npm run build:prebid-external` invocations.
+
+After generation, the CLI deserializes the optional `source` field
+from `manifest.json` and verifies it matches the provenance it passed;
+a missing or mismatched value is an error and the config is not
+patched. Older manifests without the field remain readable everywhere
+else because the deserializer keeps the field optional. The CLI also
+prints the resolved source in its summary output.
 
 ## Testing plan
 
@@ -270,12 +318,31 @@ summary output.
 - Classification: `https://...`, `git@...`, `ssh://...` parse as git
   with and without `#ref`; other strings parse as paths; `http://` is
   rejected.
-- Path validation: missing `dist/src/` fails with build-command
-  guidance; a valid built layout passes; the source directory is never
-  written to.
+- Path validation: missing `dist/src/` or `node_modules/` fails with
+  build-command guidance; a valid built layout passes; the source
+  directory is never written to.
+- URL hygiene: an `https://` URL with embedded userinfo is rejected.
+- Relative path resolution: a relative config `source` resolves
+  against the config file's directory; a relative `--prebid-source`
+  resolves against the working directory.
 - Resolver flows with a fake `PrebidSourceResolver`: resolved directory
   and provenance reach the generator arguments; resolver failure leaves
   `trusted-server.toml` unpatched.
+- Provenance verification: a manifest whose `source` is missing or
+  differs from the resolved provenance fails and leaves the config
+  unpatched.
+- The production resolver itself is tested, not only its callers. The
+  resolver takes a command-runner seam (mirroring how
+  `PrebidBundleGenerator` isolates npm) so unit tests can script git
+  and build outcomes: clone-vs-fetch selection, remote-side ref
+  resolution, detached checkout, stamp read/write, build skip on
+  matching OID, lock acquisition, and process failures. In addition,
+  integration tests drive the real git logic against temporary local
+  repositories created in the test (`git init` fixtures with the
+  built-package layout committed), with only the npm/gulp build step
+  stubbed through the runner. These cover the moving-branch case: the
+  fixture branch advances between two resolves and the second run must
+  rebuild at the new OID rather than reuse the stale one.
 - Existing default-flow tests continue to pass unchanged.
 
 ### Generator tests (`test/build-prebid-external.test.mjs`)
@@ -293,9 +360,9 @@ summary output.
 
 ### Out of scope for automated tests
 
-Cloning and building a real Prebid fork stays manual (network and
-multi-minute build); the git/npm orchestration is covered through the
-resolver trait with fakes.
+Cloning and building a real Prebid fork stays manual (network access
+and a multi-minute build); automated coverage stops at local git
+fixtures with the build step stubbed.
 
 ## Documentation changes
 
