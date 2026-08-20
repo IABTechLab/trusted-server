@@ -96,7 +96,16 @@ fn admin_diagnostic_shape(path: &str) -> Option<AdminDiagnosticShape> {
 /// fallback, because doing so would forward Trusted Server admin credentials
 /// and request bodies to the publisher origin.
 fn is_reserved_admin_path(path: &str) -> bool {
-    path.starts_with(ADMIN_NAMESPACE_PREFIX) || path.starts_with(RETIRED_ADMIN_KEYS_PREFIX)
+    // `/_ts/admin` is matched on the bare prefix because the unanchored
+    // `^/_ts/admin` auth regex authenticates those paths too. No auth handler
+    // matches the retired `/admin/keys` alias, so only the alias itself and its
+    // separator descendants are reserved — a bare prefix there would also deny
+    // unrelated publisher paths such as `/admin/keystore`.
+    path.starts_with(ADMIN_NAMESPACE_PREFIX)
+        || path == RETIRED_ADMIN_KEYS_PREFIX
+        || path
+            .strip_prefix(RETIRED_ADMIN_KEYS_PREFIX)
+            .is_some_and(|remainder| remainder.starts_with('/'))
 }
 
 /// Percent-decodes `path` once, returning `None` when the path contains no
@@ -858,6 +867,7 @@ mod tests {
             "/admin",
             "/admin/login",
             "/admin/keyboards",
+            "/admin/keystore",
             "/_ts/api/v1/batch-sync",
         ] {
             let request = request_with_method(http::Method::POST, path);
