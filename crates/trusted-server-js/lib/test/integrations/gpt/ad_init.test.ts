@@ -305,7 +305,7 @@ describe('installTsAdInit', () => {
         'atf_sidebar_ad',
         expectedOpportunity,
         undefined,
-        [[300, 250]]
+        undefined
       );
     }
   );
@@ -331,11 +331,11 @@ describe('installTsAdInit', () => {
       'atf_sidebar_ad',
       'unrenderable_candidate',
       'auction-123',
-      [[300, 250]]
+      undefined
     );
   });
 
-  it('captures every configured Trusted Server format when associating a GPT slot', async () => {
+  it('retains handoff formats when reusing a Trusted Server-defined GPT slot', async () => {
     const recordTrustedServerOpportunity = vi.fn();
     const formats: Array<[number, number]> = [
       [300, 250],
@@ -347,6 +347,17 @@ describe('installTsAdInit', () => {
       recordTrustedServerOpportunity,
       formats
     );
+    (window as TestWindow).tsjs!.gptSlotHandoffs = {
+      'div-atf-sidebar': {
+        gamUnitPath: '/123/atf',
+        formats,
+        divIdPrefix: 'div-atf-sidebar',
+        slotElementId: 'div-atf-sidebar',
+        publisherClaimed: true,
+        suppressPublisherDisplay: false,
+        suppressPublisherRefresh: false,
+      },
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -375,7 +386,7 @@ describe('installTsAdInit', () => {
       'atf_sidebar_ad',
       'no_candidate',
       undefined,
-      [[300, 250]]
+      undefined
     );
   });
 

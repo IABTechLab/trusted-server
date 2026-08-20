@@ -2,6 +2,7 @@ import type { GptDiagnosticsRequestCycle } from '../../core/types';
 
 import type { GptDiagnosticsBindingManager } from './binding';
 import { unhandledCase } from './exhaustive';
+import { formatSizes, scheduleFrame } from './presentation_helpers';
 import type {
   GptDiagnosticsBindingInput,
   GptDiagnosticsStoreSlotSnapshot,
@@ -26,19 +27,12 @@ type BadgeWindow = Window & {
 
 const BADGE_MAX_WIDTH_PX = 260;
 const BADGE_EDGE_GUTTER_PX = 4;
+const MAX_BADGE_REQUESTED_SLOT_SIZES = 3;
 
 interface BadgeOptions {
   window?: BadgeWindow;
   document?: Document;
   scheduleFrame?: (callback: () => void) => void;
-}
-
-function defaultScheduleFrame(callback: () => void): void {
-  if (typeof requestAnimationFrame === 'function') {
-    requestAnimationFrame(() => callback());
-  } else {
-    queueMicrotask(callback);
-  }
 }
 
 function intersectsViewport(rectangle: DOMRect, window: Window): boolean {
@@ -106,10 +100,6 @@ function deliveryLabel(cycle: GptDiagnosticsRequestCycle): string | undefined {
   }
 }
 
-function formatSizes(sizes: ReadonlyArray<readonly [number, number]>): string {
-  return sizes.map((size) => `${size[0]}×${size[1]}`).join(', ');
-}
-
 function badgeText(cycle: GptDiagnosticsRequestCycle): string {
   const firstLine: string[] = [];
   if (cycle.isEmpty === true) firstLine.push('Empty');
@@ -120,7 +110,13 @@ function badgeText(cycle: GptDiagnosticsRequestCycle): string {
   if (delivery) firstLine.push(delivery);
   if (cycle.requestPath === 'competing') firstLine.push('Competing paths');
   if (cycle.requestedSlotSizes) {
-    firstLine.push(`Requested ${formatSizes(cycle.requestedSlotSizes)}`);
+    const displayedSizes = cycle.requestedSlotSizes.slice(0, MAX_BADGE_REQUESTED_SLOT_SIZES);
+    const remainingSizeCount = cycle.requestedSlotSizes.length - displayedSizes.length;
+    firstLine.push(
+      `Requested ${formatSizes(displayedSizes)}${
+        remainingSizeCount > 0 ? ` +${remainingSizeCount}` : ''
+      }`
+    );
   }
   if (cycle.size) firstLine.push(`GPT fill ${cycle.size[0]}×${cycle.size[1]}`);
   if (cycle.observedSlotSize) {
@@ -169,7 +165,8 @@ export class GptDiagnosticsBadgeManager {
     this.bindings = bindings;
     this.window = options.window ?? (window as unknown as BadgeWindow);
     this.document = options.document ?? document;
-    this.scheduleFrame = options.scheduleFrame ?? defaultScheduleFrame;
+    this.scheduleFrame =
+      options.scheduleFrame ?? ((callback) => scheduleFrame(this.window, callback));
     this.refreshSlotElementIds();
     this.unsubscribeStore = this.store.subscribe(() => {
       this.refreshSlotElementIds();
