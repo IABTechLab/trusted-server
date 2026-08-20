@@ -196,12 +196,37 @@ export type GptDiagnosticsTrustedServerOpportunity =
   | 'unrenderable_candidate'
   | 'no_candidate';
 
-/** A safe failure category observed while obtaining or posting creative markup. */
+/**
+ * A safe failure category observed while obtaining or posting creative markup.
+ *
+ * The `aps_` members cover the APS Universal Creative render path, where a
+ * blank slot is otherwise indistinguishable from a filled one: Ad Manager
+ * reports a non-empty 1x1 render whether or not the creative ever drew. Each
+ * member names the exact guard that stopped the render.
+ */
 export type GptDiagnosticsCreativeFailure =
   | 'missing_render_source'
   | 'cache_fetch_failed'
   | 'invalid_cache_payload'
-  | 'response_post_failed';
+  | 'response_post_failed'
+  // Reported by the sandboxed renderer document and relayed by the creative.
+  | 'aps_bad_hash'
+  | 'aps_nonce_mismatch'
+  | 'aps_source_mismatch'
+  | 'aps_descriptor_keys'
+  | 'aps_descriptor_fields'
+  | 'aps_descriptor_envelope'
+  | 'aps_runner_script_error'
+  // Observed by the Universal Creative source around its renderer frame.
+  | 'aps_frame_timeout'
+  | 'aps_frame_load_error'
+  | 'aps_frame_reported_failure'
+  | 'aps_unknown'
+  // Observed on the Trusted Server side of the capability handshake.
+  | 'aps_consumed_tombstone'
+  | 'aps_source_not_in_ad_unit'
+  | 'aps_missing_renderer_url'
+  | 'aps_tombstone_capacity';
 
 /** Delivery evidence derived for a GPT request cycle. */
 export type GptDiagnosticsDelivery =
