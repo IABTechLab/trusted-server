@@ -16,6 +16,7 @@ use clap::{Args, Subcommand};
 use crate::app_config::AppConfigArgs;
 use crate::commands::audit::collector::{BrowserOpts, GenerateBrowserOpts};
 use crate::commands::audit::page::PageAuditArgs;
+use crate::error::{CliResult, cli_error};
 use crate::run::RunOutcome;
 
 /// Parses and validates an `http`/`https` URL, rejecting all other schemes.
@@ -91,6 +92,8 @@ pub(crate) struct LegacyGenerateArgs {
         requires = "legacy_url"
     )]
     pub(crate) cookies: Vec<(String, String)>,
+    #[command(flatten)]
+    pub(crate) browser: GenerateBrowserOpts,
 }
 
 /// `ts audit` subcommands.
@@ -253,7 +256,7 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
             let raw_config = std::fs::read_to_string(&app_config_path).map_err(|error| {
                 format!("failed to read {}: {error}", app_config_path.display())
             })?;
-            let existing_creative = best_effort_creative_config(&raw_config);
+            let existing_creative = creative_config(&raw_config)?;
             let profiles = gen_args.profiles()?;
             let collectors: Vec<generate::browser_collector::BrowserAuditCollector> = profiles
                 .iter()
@@ -298,18 +301,22 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
             ad_templates::run_verify(verify_args)
         }
         Some(AuditSubcommand::Generate(generate_args)) => {
+            generate_args.browser.validate()?;
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
-            let collector = generate::browser_collector::BrowserAuditCollector::default();
+            let collector = generate::browser_collector::BrowserAuditCollector::default()
+                .with_browser_options(&generate_args.browser);
             generate::run_generate(generate_args, &collector, &mut out)
                 .map(|()| RunOutcome::Success)
         }
         None => match args.legacy_url.as_ref() {
             Some(url) => {
+                args.legacy_generate.browser.validate()?;
                 let generate_args = legacy_generate_args(args, url);
                 let stdout = std::io::stdout();
                 let mut out = stdout.lock();
-                let collector = generate::browser_collector::BrowserAuditCollector::default();
+                let collector = generate::browser_collector::BrowserAuditCollector::default()
+                    .with_browser_options(&generate_args.browser);
                 generate::run_generate(&generate_args, &collector, &mut out)
                     .map(|()| RunOutcome::Success)
             }
@@ -320,13 +327,39 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
     }
 }
 
-fn best_effort_creative_config(
+/// Reads the config's `[creative_opportunities]` section, when it has one.
+///
+/// An unrelated invalid setting elsewhere in the document must not hide the
+/// section — the runtime rejects such a file, but the operator still has to be
+/// able to update slots in it — so the document is read as plain TOML rather
+/// than through [`Settings`](trusted_server_core::settings::Settings).
+///
+/// A section that is present but unreadable is *not* treated as absent.
+/// `CreativeOpportunitiesConfig` uses `deny_unknown_fields`, so one mistyped key
+/// would otherwise leave the merge with nothing to merge into and replace the
+/// operator's entire slot array.
+///
+/// # Errors
+///
+/// Returns a user-facing error when the section is present but cannot be
+/// deserialized.
+fn creative_config(
     document: &str,
-) -> Option<trusted_server_core::creative_opportunities::CreativeOpportunitiesConfig> {
-    toml::from_str::<toml::Value>(document)
+) -> CliResult<Option<trusted_server_core::creative_opportunities::CreativeOpportunitiesConfig>> {
+    let Some(section) = toml::from_str::<toml::Value>(document)
         .ok()
         .and_then(|value| value.get("creative_opportunities").cloned())
-        .and_then(|value| value.try_into().ok())
+    else {
+        return Ok(None);
+    };
+    match section.try_into() {
+        Ok(config) => Ok(Some(config)),
+        Err(error) => cli_error(format!(
+            "failed to read the existing `[creative_opportunities]` section, so generating \
+             slots would discard the configured ones: {error}. Fix the section (or delete it) \
+             and re-run"
+        )),
+    }
 }
 
 fn legacy_generate_args(args: &AuditArgs, url: &url::Url) -> generate::GenerateArgs {
@@ -338,6 +371,7 @@ fn legacy_generate_args(args: &AuditArgs, url: &url::Url) -> generate::GenerateA
         no_config: args.legacy_generate.no_config,
         force: args.legacy_generate.force,
         cookies: args.legacy_generate.cookies.clone(),
+        browser: args.legacy_generate.browser.clone(),
     }
 }
 
@@ -363,14 +397,48 @@ mod tests {
     }
 
     #[test]
-    fn invalid_baseline_still_yields_best_effort_creative_config() {
+    fn invalid_setting_outside_the_section_still_yields_creative_config() {
         let document = "unknown_runtime_key = true\n\
             [creative_opportunities]\ngam_network_id = \"123\"\n";
 
-        let creative = best_effort_creative_config(document)
-            .expect("an unrelated invalid setting must not hide creative config");
+        let creative = creative_config(document)
+            .expect("an unrelated invalid setting must not hide creative config")
+            .expect("the section is present");
 
         assert_eq!(creative.gam_network_id, "123");
+    }
+
+    #[test]
+    fn absent_section_reads_as_absent() {
+        let creative =
+            creative_config("[auction]\nenabled = true\n").expect("should read the document");
+
+        assert!(
+            creative.is_none(),
+            "a document with no `[creative_opportunities]` has no configured slots"
+        );
+    }
+
+    #[test]
+    fn unreadable_section_is_refused_rather_than_read_as_absent() {
+        // `deny_unknown_fields` makes one mistyped key inside the section fail
+        // to deserialize. Reading that as "no slots configured" would let a
+        // merge replace the operator's entire slot array.
+        let document = "[creative_opportunities]\n\
+            gam_network_id = \"123\"\n\
+            gam_netwrok_id = \"123\"\n\
+            [[creative_opportunities.slot]]\n\
+            id = \"header\"\n\
+            div_id = \"ad-header\"\n\
+            page_patterns = [\"/\"]\n\
+            formats = [{ width = 728, height = 90 }]\n";
+
+        let error = creative_config(document).expect_err("should refuse an unreadable section");
+
+        assert!(
+            error.contains("would discard the configured ones"),
+            "error should say what merging would cost, got {error}"
+        );
     }
 
     #[test]
@@ -402,6 +470,10 @@ mod tests {
                 no_config: false,
                 force: true,
                 cookies: vec![("session".to_string(), "example".to_string())],
+                browser: GenerateBrowserOpts {
+                    headful: true,
+                    ..GenerateBrowserOpts::default()
+                },
             },
         };
 
@@ -423,6 +495,10 @@ mod tests {
         assert_eq!(
             generate.cookies,
             [("session".to_string(), "example".to_string())]
+        );
+        assert!(
+            generate.browser.headful,
+            "browser flags passed to the legacy form should reach generation"
         );
     }
 }

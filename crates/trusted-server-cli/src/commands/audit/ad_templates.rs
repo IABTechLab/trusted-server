@@ -164,6 +164,13 @@ fn build_report(
     })
 }
 
+/// The URL without its fragment, for comparisons the server can observe.
+pub(super) fn without_fragment(url: &url::Url) -> url::Url {
+    let mut url = url.clone();
+    url.set_fragment(None);
+    url
+}
+
 /// Whether navigation left the requested URL's origin (scheme, host, or port).
 ///
 /// A same-host default-port `http:80` to `https:443` redirect is *not* a change:
@@ -245,7 +252,9 @@ fn build_page(
         code: format!("page_{}", warning.code),
         message: warning.message.clone(),
     }));
-    if requested != final_url {
+    // Fragments never reach the server, so a fragment-only difference is not a
+    // redirect and slots match on the path either way.
+    if without_fragment(requested) != without_fragment(final_url) {
         warnings.push(Warning {
             code: "redirected".to_string(),
             message: format!("navigation redirected from {requested} to {final_url}"),

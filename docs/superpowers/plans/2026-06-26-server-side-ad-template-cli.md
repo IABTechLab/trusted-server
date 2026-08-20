@@ -1056,16 +1056,16 @@
       assert_eq!(result.slots[0].status, SlotStatus::Confirmed, "container element id is a valid GPT div match");
   }
 
-  // §5.4: out-of-page GPT slot is not confirmed; reported as a warning.
+  // §5.4: out-of-page GPT slot is partial (so it fails strict) plus a warning.
   #[test]
-  fn out_of_page_gpt_slot_warns_and_does_not_confirm() {
+  fn out_of_page_gpt_slot_warns_and_is_partial() {
       let expected = expected_slot("interstitial", "ad-oop-", "/123/news/oop", &[(300, 250)], &[]);
       // gpt_slot with empty sizes models an out-of-page slot (no numeric sizes).
       let evidence = evidence(vec![dom("ad-oop-0")], vec![gpt_slot("/123/news/oop", "ad-oop-0", &[])], Vec::new());
 
       let result = compare_page_evidence(&[expected], &evidence, RuntimeGateSummary::unknown_allowed());
 
-      assert_ne!(result.slots[0].status, SlotStatus::Confirmed, "out-of-page is not confirmed in Phase 1");
+      assert_eq!(result.slots[0].status, SlotStatus::Partial, "a sizeless slot against banner formats is partial");
       assert!(result.slots[0].warnings.iter().any(|w| w.code == "out_of_page_slot"));
   }
 
@@ -1261,7 +1261,8 @@
   - `fluid_size_ignored` — non-numeric observed sizes like `"fluid"` ignored for matching;
   - `extra_observed_size` — observed GPT sizes not in the configured set;
   - `configured_size_not_observed` — configured sizes never observed (when ≥1 was);
-  - `out_of_page_slot` — out-of-page GPT slot observed; not confirmed in Phase 1.
+  - `out_of_page_slot` — out-of-page GPT slot with no sizes observed; the slot is
+    reported `partial`, which fails `--strict`.
 
   Provider + extra evidence:
   - APS: configured `providers.aps.slot_id` with matching `fetchBids` → no warning;

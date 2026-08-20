@@ -63,7 +63,7 @@ pub fn load_settings(args: &AppConfigArgs) -> Result<LoadedSettings, String> {
 /// Returns the same path-resolution, read, and parse errors as
 /// [`load_settings`].
 #[cfg(test)]
-pub fn load_file_settings(args: &AppConfigArgs) -> Result<LoadedSettings, String> {
+pub(crate) fn load_file_settings(args: &AppConfigArgs) -> Result<LoadedSettings, String> {
     load_settings_with_env_overlay(args, false)
 }
 

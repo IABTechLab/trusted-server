@@ -133,9 +133,11 @@ whole config is rejected.
 
 Configured media type remains a typed `MediaType` through comparison and is
 rendered to a string only at the output boundary. Slots that the phase-one
-checker cannot confirm (video/native-only and out-of-page) are represented as
-unconfirmable and do not fail `--strict`; genuinely partial or missing
-confirmable slots still fail. Slot phase is absent when no evidence exists.
+checker cannot confirm (video/native-only) are represented as unconfirmable and
+do not fail `--strict`; genuinely partial or missing confirmable slots still
+fail, including a live out-of-page slot with no sizes matched against
+banner-configured formats, which is partial. Slot phase is absent when no
+evidence exists.
 The server-side APS compatibility field no longer creates unconditional
 client-side `fetchBids` warnings.
 

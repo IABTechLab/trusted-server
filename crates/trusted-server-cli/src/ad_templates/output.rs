@@ -129,6 +129,10 @@ pub struct VerificationReport {
     /// One entry per requested URL, in input order.
     pub pages: Vec<PageJson>,
     /// Run-level warnings not attributable to a single page.
+    ///
+    /// Always empty today — every warning the verifier raises belongs to a page
+    /// or a slot. Kept because the JSON schema declares it, so a consumer can
+    /// read it unconditionally.
     pub warnings: Vec<Warning>,
 }
 

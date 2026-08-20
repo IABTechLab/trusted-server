@@ -62,7 +62,14 @@
         // keeps the deterministic audit answer without throwing and aborting
         // the publisher's CMP initialization.
         set: () => {},
-        configurable: false
+        // Configurable so a CMP that installs itself with `defineProperty`
+        // replaces the stub instead of throwing: losing the substitution on
+        // such a page is better than aborting the CMP mid-initialization and
+        // auditing a half-built ad stack. Enumerable so the property looks like
+        // the real global it stands in for, rather than adding a signal that
+        // `Object.keys(window)` can see the difference.
+        configurable: true,
+        enumerable: true
       })
     } catch (error) {
       // The page installed an earlier value; leave it untouched.

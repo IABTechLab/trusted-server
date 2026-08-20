@@ -382,6 +382,8 @@ fn run_explain(args: &AdTemplatesExplainArgs, out: &mut dyn Write) -> Result<(),
         match gate.expected {
             RuntimeAdStackExpected::Yes => "yes",
             RuntimeAdStackExpected::No => "no",
+            // `explain` always supplies a consent decision, which is the only
+            // input that yields `Unknown`; the arm is here for exhaustiveness.
             RuntimeAdStackExpected::Unknown => "unknown",
         }
     )
@@ -475,11 +477,19 @@ fn format_providers(slot: &CreativeOpportunitySlot) -> String {
     providers.join(", ")
 }
 
+/// Renders a set of config-derived slot ids for the terminal.
+///
+/// Config can arrive from a pushed blob or the env overlay, not only from a file
+/// the operator read, so the ids are escaped before they reach a terminal — the
+/// assertion-failure path prints them too.
 fn join_set(set: &BTreeSet<&str>) -> String {
     if set.is_empty() {
         return "(none)".to_string();
     }
-    set.iter().copied().collect::<Vec<_>>().join(", ")
+    set.iter()
+        .map(|id| escape_terminal_text(id).into_owned())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn plural(count: usize) -> &'static str {

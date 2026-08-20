@@ -38,9 +38,14 @@ const SETTLE_POLL_MS: u64 = 250;
 const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound for each CDP operation after navigation.
 const CDP_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
-/// Hard cap per decoded evidence list, mirroring the collector script's
-/// `__ts_max_entries`, so a hostile page cannot inflate CLI memory.
-const MAX_EVIDENCE_ENTRIES: usize = 1024;
+/// Hard cap per decoded evidence list, so a hostile page cannot inflate CLI
+/// memory.
+///
+/// Must equal `__ts_max_entries` in `ad_template_collector.js`. The collector
+/// already caps each list, but the evidence object lives on `window`, so a page
+/// that appends to it directly is bounded here instead. Anything the collector
+/// itself dropped is reported as an `evidence_truncated` warning.
+const MAX_EVIDENCE_ENTRIES: usize = 128;
 /// Hard cap on the UTF-8 JSON payload before CDP transfers it back to Rust.
 const MAX_EVIDENCE_PAYLOAD_BYTES: usize = 1024 * 1024;
 /// Hard cap on browser teardown so a wedged Chrome cannot hang the audit.
@@ -239,11 +244,19 @@ pub(crate) fn resolve_chrome(
 }
 
 /// Builds a host-only cookie that applies to every path on `url`'s host.
+///
+/// Scoped by origin rather than by the full URL: only the origin is load-bearing
+/// for a host-only cookie, and a full URL would carry the path, query, and any
+/// `user:password@` into CDP and into this function's error message.
 pub(crate) fn host_cookie(name: &str, value: &str, url: &url::Url) -> Result<CookieParam, String> {
-    url.host_str()
-        .ok_or_else(|| format!("cannot scope cookie `{name}` because {} has no host", url))?;
+    let origin = url.origin();
+    if !origin.is_tuple() {
+        return Err(format!(
+            "cannot scope cookie `{name}` because the audited URL has no host"
+        ));
+    }
     let mut cookie = CookieParam::new(name.to_string(), value.to_string());
-    cookie.url = Some(url.to_string());
+    cookie.url = Some(origin.ascii_serialization());
     cookie.path = Some("/".to_string());
     cookie.secure = Some(url.scheme() == "https");
     Ok(cookie)
@@ -889,6 +902,23 @@ fn decode_ad_evidence_envelope(
     }
 }
 
+/// Whether a Chrome/Chromium fixture is available for browser-backed tests.
+///
+/// Skips optional local runs, but makes the scripted/CI contract fail loudly.
+/// Shared with the generation collector's tests so the contract has one
+/// definition.
+#[cfg(test)]
+pub(crate) fn browser_fixture_available() -> bool {
+    if resolve_chrome(None).is_ok() {
+        return true;
+    }
+    assert!(
+        std::env::var_os("TS_AUDIT_BROWSER_TESTS").is_none(),
+        "TS_AUDIT_BROWSER_TESTS requires Chrome/Chromium; set CHROME to its executable"
+    );
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read as _, Write as _};
@@ -899,18 +929,6 @@ mod tests {
     use crate::commands::audit::collector::{
         AdTemplateCollectorConfig, build_ad_template_init_script,
     };
-
-    /// Skips optional local runs, but makes the scripted/CI contract fail loudly.
-    fn browser_fixture_available() -> bool {
-        if resolve_chrome(None).is_ok() {
-            return true;
-        }
-        assert!(
-            std::env::var_os("TS_AUDIT_BROWSER_TESTS").is_none(),
-            "TS_AUDIT_BROWSER_TESTS requires Chrome/Chromium; set CHROME to its executable"
-        );
-        false
-    }
 
     #[test]
     fn well_known_chrome_paths_are_known_for_this_os() {
@@ -941,8 +959,8 @@ mod tests {
         assert_eq!(cookie.path.as_deref(), Some("/"));
         assert_eq!(
             cookie.url.as_deref(),
-            Some("https://publisher.example/news/story"),
-            "the URL scopes a host-only cookie before first navigation"
+            Some("https://publisher.example"),
+            "the origin scopes a host-only cookie before first navigation"
         );
         assert_eq!(cookie.secure, Some(true), "HTTPS cookies must be Secure");
     }

@@ -132,6 +132,13 @@ pub(super) struct EvidenceTable {
     empty_pages: BTreeSet<String>,
     /// Page paths that produced slot evidence on at least one selected profile.
     non_empty_pages: BTreeSet<String>,
+    /// Div stems any page refused as ambiguous, unioned across the crawl.
+    ///
+    /// The verdict has to outlive the page that reached it. Article pages carry
+    /// several in-content units and refuse the shared prefix; a landing page
+    /// carries one and would otherwise contribute it as a usable slot, so the
+    /// written config would depend on which pages the crawl happened to sample.
+    ambiguous_stems: BTreeSet<String>,
 }
 
 impl EvidenceTable {
@@ -153,6 +160,8 @@ impl EvidenceTable {
         }
         self.non_empty_pages.insert(path.to_string());
         self.empty_pages.remove(path);
+        self.ambiguous_stems
+            .extend(discovered.ambiguous_stems.iter().cloned());
 
         for slot in &discovered.slots {
             let entry = self.slots.entry(slot.div_id.clone()).or_insert_with(|| {
@@ -176,16 +185,17 @@ impl EvidenceTable {
         }
     }
 
-    /// Slots in first-seen order.
+    /// Slots in first-seen order, excluding stems any page refused as ambiguous.
     pub(super) fn slots(&self) -> impl Iterator<Item = &SlotEvidence> {
         self.order
             .iter()
+            .filter(|div_id| !self.ambiguous_stems.contains(*div_id))
             .filter_map(|div_id| self.slots.get(div_id))
     }
 
-    /// Number of distinct slots observed.
+    /// Number of usable distinct slots observed.
     pub(super) fn slot_count(&self) -> usize {
-        self.slots.len()
+        self.slots().count()
     }
 
     /// Every page path folded in, whether or not it yielded slots.
@@ -202,7 +212,11 @@ impl EvidenceTable {
         &self.empty_pages
     }
 
-    /// Whether any slot was observed at all.
+    /// Whether any slot was observed at all, ambiguous ones included.
+    ///
+    /// Deliberately not `slot_count() == 0`: a crawl that saw only ambiguous
+    /// placements did observe an ad stack, and the caller distinguishes "this
+    /// page has no slots" from "every slot found was refused".
     pub(super) fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
@@ -399,13 +413,16 @@ mod tests {
 
     #[test]
     fn one_placement_under_per_render_div_ids_is_detected() {
-        // A timestamped token means each page yields a new key
-        // for the same placement. Same unit, same formats, never co-occurring.
+        // Each page yields a new key for the same placement: same unit, same
+        // formats, never co-occurring. The tokens here deliberately do *not*
+        // match the digit-led shape `discover_gpt_slots` refuses on sight, so
+        // this exercises the evidence-based detector that catches the stacks
+        // whose token shape cannot be recognized from one observation.
         let mut table = EvidenceTable::default();
         for (path, div) in [
-            ("/features/a", "ex_slot_26329268ce6Bj0uc8sL0_overlay_1"),
-            ("/news/b", "ex_slot_26329269aoYmv4RQyN3n_overlay_1"),
-            ("/deals/c", "ex_slot_26329270mYPDB3tz8cpB_overlay_1"),
+            ("/features/a", "ex_slot_ce6Bj0uc8sL0aa_overlay_1"),
+            ("/news/b", "ex_slot_aoYmv4RQyN3nbb_overlay_1"),
+            ("/deals/c", "ex_slot_mYPDB3tz8cpBcc_overlay_1"),
         ] {
             table.fold_page(
                 path,
@@ -422,6 +439,59 @@ mod tests {
             groups[0].suggested_prefix.as_deref(),
             Some("ex_slot"),
             "the suggestion should be trimmed back off the volatile token"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_stem_stays_refused_on_every_page() {
+        // The article page carries two in-content units and refuses the shared
+        // prefix; the landing page carries one. Folding the landing page must
+        // not resurrect a prefix that cannot resolve to one element site-wide.
+        let mut table = EvidenceTable::default();
+        table.fold_page(
+            "/news/story",
+            &page(
+                &[
+                    (
+                        "/123/site/news",
+                        "ad-in_content-de669245b2ea4b05826dc96f07a36272-in_content-0",
+                        &[(300, 250)],
+                    ),
+                    (
+                        "/123/site/news",
+                        "ad-in_content-8aec8129a83d4e5abc197423120cb19e-in_content-1",
+                        &[(300, 250)],
+                    ),
+                ],
+                false,
+            ),
+        );
+        table.fold_page(
+            "/",
+            &page(
+                &[(
+                    "/123/site/home",
+                    "ad-in_content-1c0de08e5a2f4d6f9b3a7e5c8d1f2a4b-in_content-0",
+                    &[(300, 250)],
+                )],
+                false,
+            ),
+        );
+
+        assert_eq!(
+            table.slots().count(),
+            0,
+            "a stem refused on one page must stay refused, got {:?}",
+            table.slots().map(|slot| &slot.div_id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            table.slot_count(),
+            0,
+            "the count should match what is written"
+        );
+        assert!(
+            !table.is_empty(),
+            "the crawl did observe an ad stack, so this is not an empty result"
         );
     }
 

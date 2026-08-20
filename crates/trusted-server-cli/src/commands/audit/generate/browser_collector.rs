@@ -17,8 +17,9 @@ use crate::commands::audit::browser::{
 };
 use crate::commands::audit::collector::GenerateBrowserOpts;
 use crate::commands::audit::generate::collector::{
-    AuditCollector, CollectedGptSlot, CollectedLink, CollectedPage, CollectedRequest,
-    CollectedScriptTag, CollectionProgress, ControlFlow, PageSink, ProgressSink, RootPlanner,
+    AuditCollector, CONSENT_STUB_WARNING, CollectedGptSlot, CollectedLink, CollectedPage,
+    CollectedRequest, CollectedScriptTag, CollectionProgress, ControlFlow, PageSink, ProgressSink,
+    RootPlanner,
 };
 use crate::error::{CliResult, report_error};
 
@@ -33,7 +34,10 @@ const SETTLE_MAX_WAIT: Duration = Duration::from_secs(12);
 const NAVIGATION_LOAD_TIMEOUT: Duration = Duration::from_secs(12);
 const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const PAGE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
-const RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD: usize = 100_000;
+/// Size the page's resource-timing buffer is raised to before navigation, and
+/// therefore also the count at which the buffer is full and entries were lost.
+/// One constant so the script and the warning threshold cannot drift apart.
+const RESOURCE_TIMING_BUFFER_SIZE: usize = 100_000;
 const RESOURCE_TIMING_BUFFER_WARNING: &str = "browser resource timing buffer reached its configured size; some network assets may be missing";
 
 /// A device the crawl can emulate.
@@ -397,6 +401,13 @@ async fn with_browser(
         } else {
             Some(targets.len())
         };
+        // Pace the crawl before announcing the page, so the progress line marks
+        // the navigation rather than the start of the wait. Back-to-back
+        // navigations are both discourteous to the origin and a signal bot
+        // protection scores against the session.
+        if index > 0 && !page_delay.is_zero() {
+            sleep(page_delay).await;
+        }
         if let Err(error) = on_progress(CollectionProgress::Loading {
             current: index + 1,
             total,
@@ -404,11 +415,6 @@ async fn with_browser(
         }) {
             result = Err(error);
             break;
-        }
-        // Pace the crawl. Back-to-back navigations are both discourteous to the
-        // origin and a signal bot protection scores against the session.
-        if index > 0 && !page_delay.is_zero() {
-            sleep(page_delay).await;
         }
         let collected = collect_page_from_browser(
             &mut browser,
@@ -502,13 +508,15 @@ async fn collect_page_from_browser(
     settle_quiet: Duration,
     settle_max: Duration,
 ) -> CliResult<CollectedPage> {
-    set_browser_cookies(browser, cookies, target_url)
-        .await
-        .map_err(report_error)?;
+    // Per-page failures below return the message unlogged: the crawl attributes
+    // each one to its page once, and `report_error` would also log an unscoped
+    // duplicate in the middle of progress output.
+    set_browser_cookies(browser, cookies, target_url).await?;
 
-    let page = browser.new_page("about:blank").await.map_err(|error| {
-        report_error(format!("failed to create browser page for audit: {error}"))
-    })?;
+    let page = browser
+        .new_page("about:blank")
+        .await
+        .map_err(|error| format!("failed to create browser page for audit: {error}"))?;
 
     let result = collect_open_page(
         &page,
@@ -556,21 +564,14 @@ async fn collect_open_page(
     if assume_consent {
         page.evaluate_on_new_document(SHARED_CONSENT_STUB_SCRIPT)
             .await
-            .map_err(|error| {
-                report_error(format!("failed to install the consent stub: {error}"))
-            })?;
-        warnings.push(
-            "consent_stub_active: audit consent APIs were stubbed; re-run with --no-assume-consent to observe the publisher CMP without substitution"
-                .to_string(),
-        );
+            .map_err(|error| format!("failed to install the consent stub: {error}"))?;
+        warnings.push(CONSENT_STUB_WARNING.to_string());
     }
-    page.evaluate_on_new_document("performance.setResourceTimingBufferSize(100000)")
-        .await
-        .map_err(|error| {
-            report_error(format!(
-                "failed to increase the resource timing buffer: {error}"
-            ))
-        })?;
+    page.evaluate_on_new_document(format!(
+        "performance.setResourceTimingBufferSize({RESOURCE_TIMING_BUFFER_SIZE})"
+    ))
+    .await
+    .map_err(|error| format!("failed to increase the resource timing buffer: {error}"))?;
 
     // Navigate, but don't hard-fail when the `load` event never fires. Ad-heavy
     // pages (video players, continuous ad refresh, anti-bot scripts) can keep
@@ -624,17 +625,17 @@ async fn collect_open_page(
 
     let final_url = timeout(PAGE_OPERATION_TIMEOUT, page.url())
         .await
-        .map_err(|_| report_error("timed out reading final page URL"))?
-        .map_err(|error| report_error(format!("failed to read final page URL: {error}")))?
-        .ok_or_else(|| report_error("browser page URL was empty after navigation"))?;
+        .map_err(|_| "timed out reading final page URL".to_string())?
+        .map_err(|error| format!("failed to read final page URL: {error}"))?
+        .ok_or("browser page URL was empty after navigation")?;
     let page_title = timeout(PAGE_OPERATION_TIMEOUT, page.get_title())
         .await
-        .map_err(|_| report_error("timed out reading page title"))?
-        .map_err(|error| report_error(format!("failed to read page title: {error}")))?;
+        .map_err(|_| "timed out reading page title".to_string())?
+        .map_err(|error| format!("failed to read page title: {error}"))?;
     let html = timeout(PAGE_OPERATION_TIMEOUT, page.content())
         .await
-        .map_err(|_| report_error("timed out reading rendered page HTML"))?
-        .map_err(|error| report_error(format!("failed to read rendered page HTML: {error}")))?;
+        .map_err(|_| "timed out reading rendered page HTML".to_string())?
+        .map_err(|error| format!("failed to read rendered page HTML: {error}"))?;
 
     let script_tags: Vec<BrowserScriptTag> = timeout(
         PAGE_OPERATION_TIMEOUT,
@@ -646,14 +647,10 @@ async fn collect_open_page(
         ),
     )
     .await
-    .map_err(|_| report_error("timed out reading rendered script tags"))?
-    .map_err(|error| report_error(format!("failed to read rendered script tags: {error}")))?
+    .map_err(|_| "timed out reading rendered script tags".to_string())?
+    .map_err(|error| format!("failed to read rendered script tags: {error}"))?
     .into_value()
-    .map_err(|error| {
-        report_error(format!(
-            "failed to decode rendered script tag data: {error}"
-        ))
-    })?;
+    .map_err(|error| format!("failed to decode rendered script tag data: {error}"))?;
 
     let network_requests: Vec<BrowserPerformanceEntry> = timeout(
         PAGE_OPERATION_TIMEOUT,
@@ -665,18 +662,10 @@ async fn collect_open_page(
         ),
     )
     .await
-    .map_err(|_| report_error("timed out reading browser performance entries"))?
-    .map_err(|error| {
-        report_error(format!(
-            "failed to read browser performance resource entries: {error}"
-        ))
-    })?
+    .map_err(|_| "timed out reading browser performance entries".to_string())?
+    .map_err(|error| format!("failed to read browser performance resource entries: {error}"))?
     .into_value()
-    .map_err(|error| {
-        report_error(format!(
-            "failed to decode browser performance resource data: {error}"
-        ))
-    })?;
+    .map_err(|error| format!("failed to decode browser performance resource data: {error}"))?;
 
     if let Some(warning) = resource_timing_buffer_warning(network_requests.len()) {
         warnings.push(warning.to_string());
@@ -753,9 +742,7 @@ async fn collect_open_page(
             .await_promise(true)
             .return_by_value(true)
             .build()
-            .map_err(|error| {
-                report_error(format!("failed to build sitemap evaluation: {error}"))
-            })?;
+            .map_err(|error| format!("failed to build sitemap evaluation: {error}"))?;
         match timeout(PAGE_OPERATION_TIMEOUT, page.evaluate(evaluation)).await {
             Ok(Ok(result)) => match result.into_value() {
                 Ok(locations) => locations,
@@ -975,23 +962,19 @@ async fn wait_for_page_settle(
         let ready_state: String =
             timeout(PAGE_OPERATION_TIMEOUT, page.evaluate("document.readyState"))
                 .await
-                .map_err(|_| report_error("timed out reading document ready state"))?
-                .map_err(|error| {
-                    report_error(format!("failed to read document ready state: {error}"))
-                })?
+                .map_err(|_| "timed out reading document ready state".to_string())?
+                .map_err(|error| format!("failed to read document ready state: {error}"))?
                 .into_value()
-                .map_err(|error| {
-                    report_error(format!("failed to decode document ready state: {error}"))
-                })?;
+                .map_err(|error| format!("failed to decode document ready state: {error}"))?;
         let resource_count: usize = timeout(
             PAGE_OPERATION_TIMEOUT,
             page.evaluate("performance.getEntriesByType('resource').length"),
         )
         .await
-        .map_err(|_| report_error("timed out reading resource count"))?
-        .map_err(|error| report_error(format!("failed to read resource count: {error}")))?
+        .map_err(|_| "timed out reading resource count".to_string())?
+        .map_err(|error| format!("failed to read resource count: {error}"))?
         .into_value()
-        .map_err(|error| report_error(format!("failed to decode resource count: {error}")))?;
+        .map_err(|error| format!("failed to decode resource count: {error}"))?;
 
         // Accept `interactive` as well as `complete`: ad-heavy pages often never
         // reach `complete` (the `load` event never fires), but their GPT slots
@@ -1056,8 +1039,7 @@ fn is_successful_navigation_status(status: i64) -> bool {
 }
 
 fn resource_timing_buffer_warning(resource_count: usize) -> Option<&'static str> {
-    (resource_count >= RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD)
-        .then_some(RESOURCE_TIMING_BUFFER_WARNING)
+    (resource_count >= RESOURCE_TIMING_BUFFER_SIZE).then_some(RESOURCE_TIMING_BUFFER_WARNING)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1081,18 +1063,7 @@ mod tests {
     use chromiumoxide::handler::http::HttpRequest;
 
     use super::*;
-
-    /// Skips optional local runs, but makes the scripted/CI contract fail loudly.
-    fn browser_fixture_available() -> bool {
-        if resolve_chrome(None).is_ok() {
-            return true;
-        }
-        assert!(
-            std::env::var_os("TS_AUDIT_BROWSER_TESTS").is_none(),
-            "TS_AUDIT_BROWSER_TESTS requires Chrome/Chromium; set CHROME to its executable"
-        );
-        false
-    }
+    use crate::commands::audit::browser::browser_fixture_available;
 
     #[test]
     fn successful_navigation_status_allows_redirects_but_rejects_errors() {
@@ -1136,12 +1107,12 @@ mod tests {
     #[test]
     fn resource_timing_buffer_warning_starts_at_threshold() {
         assert_eq!(
-            resource_timing_buffer_warning(RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD - 1),
+            resource_timing_buffer_warning(RESOURCE_TIMING_BUFFER_SIZE - 1),
             None,
             "should not warn before the resource timing buffer threshold"
         );
         assert_eq!(
-            resource_timing_buffer_warning(RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD),
+            resource_timing_buffer_warning(RESOURCE_TIMING_BUFFER_SIZE),
             Some(RESOURCE_TIMING_BUFFER_WARNING),
             "should warn when the resource timing buffer reaches the threshold"
         );

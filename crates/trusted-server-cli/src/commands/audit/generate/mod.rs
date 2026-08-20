@@ -20,7 +20,8 @@ use trusted_server_core::creative_opportunities::{
 };
 use url::Url;
 
-use crate::commands::audit::ad_templates::origin_changed;
+use crate::commands::audit::ad_templates::{origin_changed, without_fragment};
+use crate::commands::audit::collector::GenerateBrowserOpts;
 use crate::commands::audit::generate::collector::AuditCollector;
 use crate::commands::audit::generate::slot_toml::{
     render_slots, replace_key_in_section, resolve_network_id, splice_creative_slots, toml_string,
@@ -98,6 +99,8 @@ pub(crate) struct GenerateArgs {
     /// cookie) so the origin serves the real page instead of a challenge.
     #[arg(long = "cookie", value_name = "NAME=VALUE", value_parser = crate::commands::audit::parse_cookie)]
     pub(crate) cookies: Vec<(String, String)>,
+    #[command(flatten)]
+    pub(crate) browser: GenerateBrowserOpts,
 }
 
 const DEFAULT_JS_ASSETS_PATH: &str = "js-assets.toml";
@@ -558,9 +561,13 @@ pub(crate) fn run_update_slots(
             &mut |_, root| {
                 root_url = root.final_url().unwrap_or_else(|_| target_url.clone());
                 if origin_changed(&target_url, &root_url) {
+                    // Origins only: the origin is what the refusal is about, and
+                    // a full URL would echo any `user:password@` the operator
+                    // passed into stderr.
                     return cli_error(format!(
                         "refusing cross-origin root redirect from {} to {}; the requested origin is the audit and cookie trust boundary",
-                        target_url, root_url
+                        target_url.origin().ascii_serialization(),
+                        root_url.origin().ascii_serialization()
                     ));
                 }
                 let plan = crawl_plan::plan_crawl(
@@ -585,7 +592,12 @@ pub(crate) fn run_update_slots(
                         }
                     }
                     Err(error) => {
-                        notes.push(format!("skipped `{url}` on {first_label}: {error}"));
+                        // Path only, like the progress lines: a planned target
+                        // still carries the origin and any userinfo.
+                        notes.push(format!(
+                            "skipped `{}` on {first_label}: {error}",
+                            url.path()
+                        ));
                     }
                 }
                 Ok(collector::ControlFlow::Continue)
@@ -601,6 +613,15 @@ pub(crate) fn run_update_slots(
         ))
     })?;
     notes.extend(plan.notes.iter().cloned());
+    // Fragments never reach the server, so only a difference the origin acted on
+    // counts as a redirect worth reporting.
+    if without_fragment(&root_url) != without_fragment(&target_url) {
+        notes.push(format!(
+            "followed a root redirect from `{}` to `{}`; slots and page patterns are derived from the final URL",
+            target_url.path(),
+            root_url.path()
+        ));
+    }
 
     // Every profile walks the same pages into the same table. When two profiles
     // disagree about a slot's ad-unit path, that shows up as two observations of
@@ -743,13 +764,15 @@ pub(crate) fn run_update_slots(
     if request.dry_run {
         let old_managed = managed_creative_projection(&existing)?;
         let new_managed = managed_creative_projection(&updated)?;
-        let diff = similar::TextDiff::from_lines(&old_managed, &new_managed);
         if old_managed == new_managed {
-            writeln!(out, "No managed creative-opportunity changes.").map_err(|error| {
+            // Stdout is the diff surface, so an English sentence there would
+            // break a redirected `--dry-run`; an empty diff is the stdout answer.
+            writeln!(err, "No managed creative-opportunity changes.").map_err(|error| {
                 report_error(format!("failed to write preview output: {error}"))
             })?;
             return Ok(());
         }
+        let diff = similar::TextDiff::from_lines(&old_managed, &new_managed);
         writeln!(
             out,
             "{}",
@@ -773,6 +796,11 @@ pub(crate) fn run_update_slots(
             request.config_path.display()
         ));
     }
+    // A writer could still land between this check and the rename below. That
+    // window is microseconds against a browser crawl's minutes, and the rename
+    // is atomic, so the loser of the race loses a whole write rather than half
+    // of one. Closing it properly would need file locking the operator's editor
+    // does not take part in.
     write_file_atomically(request.config_path, &updated).map_err(|error| {
         report_error(format!(
             "failed to write config {}: {error}",
@@ -922,7 +950,17 @@ fn fold_collected(
     // so this is the complete set, not a second copy.
     let artifact = analyze_collected_page(collected)?;
     for warning in &artifact.warnings {
-        notes.push(format!("`{}`: {warning}", url.path()));
+        // The consent stub is a property of the run, not of this page. Scoping it
+        // to a path and repeating it per page and profile buries the per-page
+        // diagnostics an operator is reading these notes for.
+        let note = if warning == collector::CONSENT_STUB_WARNING {
+            warning.clone()
+        } else {
+            format!("`{}`: {warning}", url.path())
+        };
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
     }
     if let Some(reason) = looks_like_an_interstitial(&artifact) {
         notes.push(format!("`{}`: {reason}", url.path()));
@@ -995,7 +1033,10 @@ fn crawl_sections(
                         }
                     }
                     Err(error) => {
-                        notes.push(format!("skipped `{url}` on {profile_label}: {error}"));
+                        notes.push(format!(
+                            "skipped `{}` on {profile_label}: {error}",
+                            url.path()
+                        ));
                     }
                 }
                 Ok(collector::ControlFlow::Continue)
@@ -1024,6 +1065,13 @@ fn guard_challenge_rate(table: &evidence::EvidenceTable) -> CliResult<()> {
     ))
 }
 
+/// Refuses a merge that would reinterpret templated slots the config already has.
+///
+/// # Errors
+///
+/// Returns an error when preserved `{section}` slots were written against a
+/// different section policy than this run inferred, since the merge would leave
+/// them pointing at ad units nobody configured.
 fn validate_merge_policy(
     existing: Option<&CreativeOpportunitiesConfig>,
     inferred: Option<&unit_template::SectionPolicy>,
@@ -1043,7 +1091,18 @@ fn validate_merge_policy(
     let Some(inferred) = inferred.filter(|_| preserves_template) else {
         return Ok(());
     };
-    let configured_root = existing.section_root.as_deref().unwrap_or_default();
+    // A `{section}` slot with no `section_root` cannot load at all —
+    // `validate_runtime` requires one — so there is no working policy to
+    // preserve and nothing for the inferred one to contradict. Adopting it is
+    // what makes such a config loadable, and `check_candidate` still gates the
+    // result, so this is not the refusal case.
+    let Some(configured_root) = existing
+        .section_root
+        .as_deref()
+        .filter(|root| !root.is_empty())
+    else {
+        return Ok(());
+    };
     let configured_segment = existing.section_segment.unwrap_or(0);
     if configured_root != inferred.section_root || configured_segment != inferred.section_segment {
         return cli_error(format!(
@@ -1531,6 +1590,7 @@ mod tests {
             no_config: false,
             force: false,
             cookies: Vec::new(),
+            browser: GenerateBrowserOpts::default(),
         }
     }
 
@@ -1602,6 +1662,57 @@ mod tests {
     }
 
     #[test]
+    fn the_consent_stub_note_is_reported_once_and_unscoped() {
+        let mut table = evidence::EvidenceTable::default();
+        let mut notes = Vec::new();
+        for url in [
+            "https://publisher.example/",
+            "https://publisher.example/news",
+        ] {
+            let mut page = collected_page();
+            page.requested_url = url.to_string();
+            page.final_url = url.to_string();
+            page.warnings
+                .push(collector::CONSENT_STUB_WARNING.to_string());
+            fold_collected(
+                &mut table,
+                &Url::parse(url).expect("should parse fixture URL"),
+                &page,
+                &mut notes,
+            )
+            .expect("should fold page evidence");
+        }
+
+        assert_eq!(
+            notes,
+            [collector::CONSENT_STUB_WARNING.to_string()],
+            "a run-wide fact should appear once, without a page path"
+        );
+    }
+
+    #[test]
+    fn merge_adopts_the_inferred_policy_when_none_is_configured() {
+        // A hand-written `{section}` slot with no `section_root` describes a
+        // config the runtime refuses to load, so the first merge should repair it
+        // rather than demand `--replace` (which would discard the hand-tuned
+        // slots it is preserving).
+        let existing: CreativeOpportunitiesConfig = toml::from_str(
+            "gam_network_id = \"123\"\n\
+             [[slot]]\nid = \"header\"\ndiv_id = \"ad-header\"\n\
+             gam_unit_path = \"/{network_id}/site/{section}\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 728, height = 90 }]\n",
+        )
+        .expect("should parse creative config");
+        let inferred = unit_template::SectionPolicy {
+            section_root: "homepage".to_string(),
+            section_segment: 1,
+        };
+
+        validate_merge_policy(Some(&existing), Some(&inferred), false)
+            .expect("an unset section_root is no policy to preserve");
+    }
+
+    #[test]
     fn resolve_output_plan_rejects_no_outputs() {
         let mut args = audit_args("https://publisher.example");
         args.no_js_assets = true;
@@ -1660,6 +1771,7 @@ mod tests {
             no_config: false,
             force: false,
             cookies: Vec::new(),
+            browser: GenerateBrowserOpts::default(),
         };
         let collector = FakeCollector::new(collected_page());
         let mut out = Vec::new();
@@ -2057,6 +2169,7 @@ mod tests {
         collected.requested_url = "http://publisher.example/".to_string();
         collected.final_url = "https://publisher.example/".to_string();
         let collector = FakeCollector::new(collected);
+        let mut notes = Vec::new();
 
         run_update_slots(
             &UpdateSlotsRequest {
@@ -2071,7 +2184,7 @@ mod tests {
             },
             &[("desktop", &collector)],
             &mut std::io::sink(),
-            &mut std::io::sink(),
+            &mut notes,
         )
         .expect("a same-host HTTPS upgrade should not be treated as cross-origin");
 
@@ -2081,6 +2194,11 @@ mod tests {
             value["creative_opportunities"]["slot"][0]["div_id"].as_str(),
             Some("div-gpt-ad-header"),
             "evidence from the upgraded root should be written"
+        );
+        let notes = String::from_utf8(notes).expect("notes should be UTF-8");
+        assert!(
+            notes.contains("followed a root redirect"),
+            "an accepted redirect should say the run switched URLs, got {notes:?}"
         );
     }
 

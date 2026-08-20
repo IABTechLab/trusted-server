@@ -3,6 +3,12 @@ use url::Url;
 
 use crate::error::CliResult;
 
+/// Warning recorded on a page collected with the audit consent stub installed.
+///
+/// A whole-run fact rather than a property of one page, so consumers report it
+/// once and unscoped instead of once per page and per profile.
+pub(crate) const CONSENT_STUB_WARNING: &str = "consent_stub_active: audit consent APIs were stubbed; re-run with --no-assume-consent to observe the publisher CMP without substitution";
+
 /// A user-visible phase reached while collecting browser audit evidence.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CollectionProgress<'a> {
@@ -46,6 +52,10 @@ pub(crate) enum ControlFlow {
     /// Collect the next target.
     Continue,
     /// Stop the crawl without an error (budget reached, challenge rate exceeded).
+    ///
+    /// What this can prevent depends on the collector: a sequential one loads no
+    /// further pages, while the browser collector has already finished
+    /// navigating by the time it folds, so there it only stops the fold.
     Stop,
 }
 
@@ -115,7 +125,17 @@ pub(crate) trait AuditCollector {
             total: None,
             url: root,
         })?;
-        let root_page = self.collect_page(root, cookies)?;
+        // A root failure is reported through `on_page` rather than returned, so
+        // the caller sees the reason as a per-page note exactly as it does from
+        // the browser collector. With no root page there is nothing to plan
+        // from, so the crawl ends here.
+        let root_page = match self.collect_page(root, cookies) {
+            Ok(page) => page,
+            Err(error) => {
+                on_page(root, Err(error))?;
+                return Ok(());
+            }
+        };
         on_progress(CollectionProgress::Planning)?;
         let targets = planner(root, &root_page)?;
         if on_page(root, Ok(root_page))? == ControlFlow::Stop {

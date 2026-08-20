@@ -578,61 +578,80 @@ fn ensure_only_managed_fields_changed(before: &str, after: &str) -> CliResult<()
     Ok(())
 }
 
-/// Whether `document` uses CRLF line endings (so edits preserve them).
-fn uses_crlf(document: &str) -> bool {
-    let mut multiline: Option<u8> = None;
+/// Byte offsets of the `\n` bytes that terminate a document line.
+///
+/// Only newlines outside comments and string values delimit lines, so the scan
+/// skips a `#` comment to end of line, skips single-line basic and literal
+/// strings, and tracks multiline `"""` / `'''` bodies. Without the comment and
+/// single-line-string cases a stray triple quote desynchronizes the scan and the
+/// document's line endings are flipped or left mixed — a rewrite
+/// [`ensure_only_managed_fields_changed`] cannot catch, because it compares
+/// parsed values.
+fn document_newlines(document: &str) -> Vec<usize> {
     let bytes = document.as_bytes();
+    let mut newlines = Vec::new();
     let mut index = 0_usize;
     while index < bytes.len() {
-        if let Some(quote) = multiline {
-            if bytes[index..].starts_with(&[quote, quote, quote]) {
-                multiline = None;
-                index += 3;
-                continue;
+        match bytes[index] {
+            b'#' => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
             }
-        } else if bytes[index..].starts_with(b"\"\"\"") {
-            multiline = Some(b'\"');
-            index += 3;
-            continue;
-        } else if bytes[index..].starts_with(b"'''") {
-            multiline = Some(b'\'');
-            index += 3;
-            continue;
-        } else if bytes[index] == b'\n' {
-            return index > 0 && bytes[index - 1] == b'\r';
+            b'\n' => {
+                newlines.push(index);
+                index += 1;
+            }
+            quote @ (b'"' | b'\'') => {
+                if bytes[index..].starts_with(&[quote, quote, quote]) {
+                    index += 3;
+                    while index < bytes.len() && !bytes[index..].starts_with(&[quote, quote, quote])
+                    {
+                        index += 1;
+                    }
+                    index = index.saturating_add(3).min(bytes.len());
+                } else {
+                    index += 1;
+                    while index < bytes.len() && bytes[index] != quote && bytes[index] != b'\n' {
+                        index += if quote == b'"' && bytes[index] == b'\\' {
+                            2
+                        } else {
+                            1
+                        };
+                    }
+                    if index < bytes.len() && bytes[index] == quote {
+                        index += 1;
+                    }
+                }
+            }
+            _ => index += 1,
         }
-        index += 1;
     }
-    false
+    newlines
 }
 
-/// Converts document line terminators while leaving multiline-string content intact.
+/// Whether `document` uses CRLF line endings (so edits preserve them).
+fn uses_crlf(document: &str) -> bool {
+    let bytes = document.as_bytes();
+    document_newlines(document)
+        .first()
+        .is_some_and(|&index| index > 0 && bytes[index - 1] == b'\r')
+}
+
+/// Converts document line terminators while leaving string content intact.
 fn convert_document_lf_to_crlf(document: &str) -> String {
+    let bytes = document.as_bytes();
     let mut output = String::with_capacity(document.len());
-    let mut multiline: Option<char> = None;
-    let mut chars = document.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if matches!(ch, '\"' | '\'') {
-            let mut probe = chars.clone();
-            if probe.next() == Some(ch) && probe.next() == Some(ch) {
-                output.push(ch);
-                output.push(chars.next().expect("should have second quote"));
-                output.push(chars.next().expect("should have third quote"));
-                multiline = if multiline == Some(ch) {
-                    None
-                } else if multiline.is_none() {
-                    Some(ch)
-                } else {
-                    multiline
-                };
-                continue;
-            }
-        }
-        if ch == '\n' && multiline.is_none() && !output.ends_with('\r') {
+    let mut previous = 0_usize;
+    for index in document_newlines(document) {
+        output.push_str(&document[previous..index]);
+        if index == 0 || bytes[index - 1] != b'\r' {
             output.push('\r');
         }
-        output.push(ch);
+        output.push('\n');
+        previous = index + 1;
     }
+    output.push_str(&document[previous..]);
     output
 }
 
@@ -1164,6 +1183,37 @@ slot_id = "sidebar"
         assert!(
             out.contains("a\r\nb"),
             "an unrelated multiline string value must remain byte-identical"
+        );
+    }
+
+    #[test]
+    fn a_triple_quote_in_a_comment_does_not_desynchronize_the_line_scan() {
+        // A `"""` inside a comment is not a multiline string. Treating it as one
+        // makes the rest of the document read as string content, so a CRLF file
+        // is detected as LF and gets rewritten wholesale.
+        let existing = "# see \"\"\" docs\r\n[creative_opportunities]\r\n\
+             gam_network_id = \"111\"\r\n";
+
+        let out = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
+            .expect("should splice CRLF document");
+
+        assert!(
+            !out.replace("\r\n", "").contains('\n'),
+            "the document's CRLF endings must survive a triple quote in a comment, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_triple_quote_in_a_single_line_string_does_not_desynchronize_the_line_scan() {
+        let existing = "[publisher]\r\nlabel = 'a \"\"\" b'\r\n\r\n\
+             [creative_opportunities]\r\ngam_network_id = \"111\"\r\n";
+
+        let out = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
+            .expect("should splice CRLF document");
+
+        assert!(
+            !out.replace("\r\n", "").contains('\n'),
+            "the document's CRLF endings must survive a triple quote in a value, got {out:?}"
         );
     }
 

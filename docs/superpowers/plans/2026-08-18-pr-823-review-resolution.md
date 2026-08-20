@@ -96,7 +96,8 @@ Cover:
 - an unrenderable dynamic slot is omitted from expected slots and does not make `matched_slots` pass;
 - the diagnostic says the runtime omits the slot for that path;
 - `MediaType` remains typed through comparison;
-- video/native-only and out-of-page slots produce `Unconfirmable` and do not fail strict;
+- video/native-only slots produce `Unconfirmable` and do not fail strict;
+- a sizeless out-of-page slot against banner-configured formats is `Partial` and fails strict;
 - an incompatible banner is still `Partial` and fails strict;
 - a missing slot has `phase: None` and JSON omits `phase`;
 - server-side APS configuration alone does not emit `aps_evidence_missing`;

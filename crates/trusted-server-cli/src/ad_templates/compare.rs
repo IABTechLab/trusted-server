@@ -45,11 +45,16 @@ pub struct GptSlotEvidence {
     pub phase: EvidencePhase,
 }
 
-/// An `apstag.fetchBids` call observed on the page (spec §5.5).
+/// An `apstag.fetchBids` call the page made, if any were recorded.
+///
+/// The collector no longer hooks `apstag`: server-side APS configuration is
+/// metadata rather than a client assertion, so a missing client call is not a
+/// finding. The field and this shape stay for the evidence payload's schema, and
+/// the list arrives empty.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(
     dead_code,
-    reason = "decoded for compatibility; APS slot IDs are server-side metadata, not a client assertion"
+    reason = "decoded for schema stability; the collector records no APS calls"
 )]
 pub struct ApsFetchBidsEvidence {
     /// The APS slot ID requested.
@@ -188,7 +193,8 @@ pub struct SlotEvidence {
 /// Live ad-slot evidence with no matching configured slot.
 #[derive(Debug, Clone)]
 pub struct ExtraEvidence {
-    /// Evidence kind: `dom`, `gpt`, or `aps`.
+    /// Evidence kind. Only `gpt` is produced today; the field is a string so a
+    /// later evidence source can be added without changing the JSON schema.
     pub kind: String,
     /// The phase it was observed in.
     pub phase: EvidencePhase,
@@ -267,6 +273,10 @@ pub fn compare_page_evidence(
 
         let banner = banner_sizes(slot);
         let mut warnings = Vec::new();
+        // `expected_slots_for_path` drops a slot whose template does not render,
+        // so on the verify path this arm is unreachable; it exists for callers
+        // that build expected slots directly, and as a guard if that filter ever
+        // changes.
         if slot.gam_unit_path.is_none() {
             warnings.push(warning(
                 "gam_unit_path_unrenderable",

@@ -74,8 +74,31 @@ pub struct GenerateBrowserOpts {
     #[arg(long, default_value_t = 10_000)]
     pub settle_max_ms: u64,
     /// Navigate to origins whose TLS certificate does not validate.
+    ///
+    /// DANGEROUS: the audit sends any `--cookie` session to the origin and
+    /// treats what it reads back as the evidence it writes config from, so an
+    /// invalid certificate could mean an impersonator is harvesting the session
+    /// and fabricating the evidence. Use only against a host you control with a
+    /// known self-signed certificate.
     #[arg(long)]
     pub danger_accept_invalid_certs: bool,
+}
+
+/// Defaults mirroring the `#[arg(default_value_t)]` values above, so a path that
+/// builds these options in code (the legacy `ts audit <url>` form) behaves like
+/// the parsed command.
+impl Default for GenerateBrowserOpts {
+    fn default() -> Self {
+        Self {
+            chrome: None,
+            headful: false,
+            no_assume_consent: false,
+            browser_proxy: None,
+            settle_quiet_ms: 750,
+            settle_max_ms: 10_000,
+            danger_accept_invalid_certs: false,
+        }
+    }
 }
 
 impl GenerateBrowserOpts {

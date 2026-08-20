@@ -46,21 +46,22 @@ static UUID_SEGMENT: LazyLock<Regex> = LazyLock::new(|| {
 /// both breaks runtime div matching and starves template inference of the
 /// repeated observations it needs.
 ///
-/// The uppercase form is distinctive enough to match bare. The lowercase one is
-/// anchored (`_r_`, a short alphanumeric run, `_`) so an ordinary id that merely
-/// contains `_r_` keeps its full stem.
-static REACT_USE_ID: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"_R_|_r_[0-9a-z]{1,8}_").expect("should compile react id regex"));
+/// The uppercase form is distinctive enough to match bare, and its hash is
+/// included so the match spans the whole ephemeral token — [`normalize_div_stem`]
+/// only reads the match *start*, but [`ephemeral_marker_residue`] excises the
+/// match, and a residue that still carried the hash would make two renders of one
+/// element look like two elements. The lowercase form is anchored (`_r_`, a short
+/// alphanumeric run, `_`) so an ordinary id that merely contains `_r_` keeps its
+/// full stem.
+static REACT_USE_ID: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"_R_[0-9a-z]*_?|_r_[0-9a-z]{1,8}_").expect("should compile react id regex")
+});
 
 /// Hosts that serve GPT `gampad/ads` requests.
 const GAMPAD_HOSTS: &[&str] = &["securepubads.g.doubleclick.net", "pubads.g.doubleclick.net"];
 
 /// Common GPT div-id prefix stripped when deriving a slot id.
 const GPT_DIV_PREFIX: &str = "div-gpt-ad-";
-
-/// Publisher integration whose div IDs include a per-render timestamp/random
-/// token before the placement kind (for example, `_ei_inarticle_1`).
-const RH_GAM_KSO_PREFIX: &str = "rh-gam-kso";
 
 /// Minimum width/height for a format to be treated as a real creative size.
 ///
@@ -94,6 +95,12 @@ pub(crate) struct DiscoveredSlots {
     pub(crate) had_slot_evidence: bool,
     /// The reconstructed slots, deduplicated by div id in first-seen order.
     pub(crate) slots: Vec<DiscoveredSlot>,
+    /// Div stems refused because several live elements normalized onto them.
+    ///
+    /// Carried separately from `slots` because the verdict is a property of the
+    /// *site*, not of this page: another page that happens to render only one
+    /// member of the group must not resurrect the ambiguous prefix.
+    pub(crate) ambiguous_stems: BTreeSet<String>,
     /// Diagnostics for placements whose normalized stable stems collided.
     pub(crate) warnings: Vec<String>,
 }
@@ -115,9 +122,14 @@ pub(crate) fn discover_gpt_slots(
 ) -> DiscoveredSlots {
     let mut slots = Vec::new();
     let mut warnings = Vec::new();
+    let mut ambiguous_stems = BTreeSet::new();
     let mut gam_network_id = None;
     let mut had_slot_evidence = false;
-    let mut registry_divs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut registry_residues: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // Stems refused outright, so the request fallback cannot re-add them. Kept
+    // apart from `registry_residues` so a later registry entry cannot read a
+    // refused stem as a one-member collision group.
+    let mut refused_stems: BTreeSet<String> = BTreeSet::new();
 
     for entry in registry {
         let Some(slot) = slot_from_registry(entry, page_has_prebid) else {
@@ -127,23 +139,25 @@ pub(crate) fn discover_gpt_slots(
         if gam_network_id.is_none() {
             gam_network_id = network_id_from_unit_path(&entry.gam_unit_path);
         }
-        if let Some(prefix) = known_per_render_div_prefix(&entry.div_id) {
-            registry_divs
-                .entry(slot.div_id.clone())
-                .or_default()
-                .insert(entry.div_id.clone());
-            push_unique_warning(&mut warnings, known_per_render_warning(prefix));
+        if let Some(prefix) = volatile_prefix_before_placement(&entry.div_id) {
+            refused_stems.insert(slot.div_id.clone());
+            push_unique_warning(&mut warnings, volatile_prefix_warning(&prefix));
             continue;
         }
         if let Some(prefix) =
-            push_slot_refusing_collisions(&mut slots, &mut registry_divs, slot, &entry.div_id)
+            push_slot_refusing_collisions(&mut slots, &mut registry_residues, slot, &entry.div_id)
         {
             warnings.push(ambiguous_collision_warning(&prefix));
+            ambiguous_stems.insert(prefix);
         }
     }
 
-    let registry_stems: BTreeSet<String> = registry_divs.keys().cloned().collect();
-    let mut request_divs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let registry_stems: BTreeSet<String> = registry_residues
+        .keys()
+        .cloned()
+        .chain(refused_stems)
+        .collect();
+    let mut request_residues: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for request in requests {
         let Some((network_id, slot, raw_div)) = parse_gampad_request(&request.url) else {
             continue;
@@ -155,14 +169,15 @@ pub(crate) fn discover_gpt_slots(
         if registry_stems.contains(&slot.div_id) {
             continue;
         }
-        if let Some(prefix) = known_per_render_div_prefix(&raw_div) {
-            push_unique_warning(&mut warnings, known_per_render_warning(prefix));
+        if let Some(prefix) = volatile_prefix_before_placement(&raw_div) {
+            push_unique_warning(&mut warnings, volatile_prefix_warning(&prefix));
             continue;
         }
         if let Some(prefix) =
-            push_slot_refusing_collisions(&mut slots, &mut request_divs, slot, &raw_div)
+            push_slot_refusing_collisions(&mut slots, &mut request_residues, slot, &raw_div)
         {
             warnings.push(ambiguous_collision_warning(&prefix));
+            ambiguous_stems.insert(prefix);
         }
     }
     make_slot_ids_unique(&mut slots);
@@ -171,33 +186,39 @@ pub(crate) fn discover_gpt_slots(
         gam_network_id,
         had_slot_evidence,
         slots,
+        ambiguous_stems,
         warnings,
     }
 }
 
-/// Adds one source-local slot unless distinct raw div IDs share its stable stem.
+/// Adds one source-local slot unless two distinct *elements* share its stem.
 ///
-/// The first distinct collision removes the tentatively accepted slot and
-/// returns its stem for one diagnostic. Repeats and later collision members stay
+/// Sharing a stem is not by itself ambiguity: one element re-rendered under a
+/// fresh framework token is exactly what normalization exists to absorb, and it
+/// produces two raw ids that collapse onto one stem. Ambiguity is two elements,
+/// which [`ephemeral_marker_residue`] separates from two renders of one.
+///
+/// The first distinct residue removes the tentatively accepted slot and returns
+/// its stem for one diagnostic. Repeats and later collision members stay
 /// suppressed and return `None`.
 fn push_slot_refusing_collisions(
     slots: &mut Vec<DiscoveredSlot>,
-    seen_divs: &mut BTreeMap<String, BTreeSet<String>>,
+    seen_residues: &mut BTreeMap<String, BTreeSet<String>>,
     slot: DiscoveredSlot,
     raw_div: &str,
 ) -> Option<String> {
     let normalized = slot.div_id.clone();
-    let raw_div = raw_div.strip_suffix("-container").unwrap_or(raw_div);
-    match seen_divs.get_mut(&normalized) {
+    let residue = ephemeral_marker_residue(raw_div);
+    match seen_residues.get_mut(&normalized) {
         None => {
-            seen_divs.insert(normalized, BTreeSet::from([raw_div.to_string()]));
+            seen_residues.insert(normalized, BTreeSet::from([residue]));
             slots.push(slot);
             None
         }
-        Some(raw_divs) if raw_divs.contains(raw_div) => None,
-        Some(raw_divs) => {
-            let became_ambiguous = raw_divs.len() == 1;
-            raw_divs.insert(raw_div.to_string());
+        Some(residues) if residues.contains(&residue) => None,
+        Some(residues) => {
+            let became_ambiguous = residues.len() == 1;
+            residues.insert(residue);
             if became_ambiguous {
                 slots.retain(|entry| entry.div_id != normalized);
                 Some(normalized)
@@ -208,6 +229,7 @@ fn push_slot_refusing_collisions(
     }
 }
 
+/// Operator-facing text for a stem several live elements normalized onto.
 fn ambiguous_collision_warning(prefix: &str) -> String {
     format!(
         "skipped ambiguous div-id prefix `{prefix}`: multiple active elements normalized to it, \
@@ -217,30 +239,64 @@ fn ambiguous_collision_warning(prefix: &str) -> String {
     )
 }
 
-fn known_per_render_div_prefix(div_id: &str) -> Option<&'static str> {
+/// The stable prefix of a div id whose per-render token precedes more of the id.
+///
+/// Some ad stacks build ids as `<family>_<per-render token>_<placement>` — a
+/// millisecond timestamp plus a random suffix sitting *before* the part that
+/// distinguishes one placement from the next. Such an id can be written neither
+/// literally (the token changes on the next render) nor as a prefix: the only
+/// stable prefix stops at the token, and that prefix reaches every placement in
+/// the family, while the runtime resolves a prefix to a single element. So the
+/// slot is refused from a single observation, without waiting for a second
+/// placement to prove the collision.
+///
+/// The shape decides, not the vendor: any segment that is a long digit run
+/// followed by more alphanumerics counts, so a new stack with the same layout
+/// needs no code change. A token in *trailing* position is deliberately not this
+/// case — everything before it still identifies the element — and is left to
+/// normalization and the same-page collision check.
+fn volatile_prefix_before_placement(div_id: &str) -> Option<String> {
     let div_id = div_id.strip_suffix("-container").unwrap_or(div_id);
-    let remainder = div_id.strip_prefix("rh-gam-kso_")?;
-    let (token, placement) = remainder.split_once("_ei_")?;
-    let leading_digits = token.bytes().take_while(u8::is_ascii_digit).count();
-    let token_is_dynamic = leading_digits >= 8
-        && token.len() > leading_digits
-        && token.bytes().all(|byte| byte.is_ascii_alphanumeric());
-    let placement_index = placement
-        .strip_prefix("inarticle_")
-        .or_else(|| placement.strip_prefix("overlay_"))?;
-    let placement_is_known =
-        !placement_index.is_empty() && placement_index.bytes().all(|byte| byte.is_ascii_digit());
-    (token_is_dynamic && placement_is_known).then_some(RH_GAM_KSO_PREFIX)
+    let mut start = 0_usize;
+    for (index, character) in div_id.char_indices() {
+        if character != '_' && character != '-' {
+            continue;
+        }
+        if is_per_render_token(&div_id[start..index]) {
+            let prefix = div_id[..start].trim_end_matches(['_', '-']);
+            // A delimiter is one byte, so the remainder starts just past it.
+            return (!prefix.is_empty() && !div_id[index + 1..].is_empty())
+                .then(|| prefix.to_string());
+        }
+        start = index + character.len_utf8();
+    }
+    None
 }
 
-fn known_per_render_warning(prefix: &str) -> String {
+/// Whether one div-id segment is a per-render token: a long leading digit run (a
+/// millisecond timestamp) followed by more alphanumerics (a random suffix).
+///
+/// Both halves are required. A bare digit run is how publishers write stable
+/// placement indices, and a token with a non-alphanumeric character is some
+/// other structure than a generated id.
+fn is_per_render_token(segment: &str) -> bool {
+    let leading_digits = segment.bytes().take_while(u8::is_ascii_digit).count();
+    leading_digits >= 8
+        && segment.len() > leading_digits
+        && segment.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// Operator-facing text for a div-id family carrying a per-render token.
+fn volatile_prefix_warning(prefix: &str) -> String {
     format!(
-        "skipped known per-render div-id family `{prefix}`: exact div ids change across renders \
-         and no distinct stable element prefix is available; expose distinct stable div ids in \
-         publisher markup before configuring these placements"
+        "skipped volatile div-id family `{prefix}`: a per-render token sits before the placement \
+         suffix, so exact div ids change across renders and no distinct stable element prefix is \
+         available; expose distinct stable div ids in publisher markup before configuring these \
+         placements"
     )
 }
 
+/// Records `warning` unless the same text was already recorded for this page.
 fn push_unique_warning(warnings: &mut Vec<String>, warning: String) {
     if !warnings.contains(&warning) {
         warnings.push(warning);
@@ -314,21 +370,60 @@ fn is_usable_unit_path(path: &str) -> bool {
 /// → `ad-in_content`.
 fn normalize_div_stem(div_id: &str) -> String {
     let stem = div_id.strip_suffix("-container").unwrap_or(div_id);
-    let mut cut = stem.len();
-    if let Some(matched) = REACT_USE_ID.find(stem) {
-        cut = cut.min(matched.start());
-    }
-    let uuid = UUID_SEGMENT.find(stem);
-    let hex = HEX_HASH_SEGMENT.find_iter(stem).find(|matched| {
-        matched
-            .as_str()
-            .bytes()
-            .any(|byte| matches!(byte, b'a'..=b'f'))
-    });
-    if let Some(matched) = uuid.into_iter().chain(hex).min_by_key(regex::Match::start) {
-        cut = cut.min(matched.start());
-    }
+    let cut = ephemeral_marker_ranges(stem)
+        .first()
+        .map_or(stem.len(), |range| range.start);
     stem[..cut].trim_end_matches('-').to_string()
+}
+
+/// Byte ranges of every ephemeral per-render marker in `stem`, in order and
+/// without overlaps.
+///
+/// A hex-hash candidate must contain at least one `a`-`f`; a run of 16+ digits
+/// is how publishers write stable ids, not a hash.
+fn ephemeral_marker_ranges(stem: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges: Vec<std::ops::Range<usize>> = REACT_USE_ID
+        .find_iter(stem)
+        .chain(UUID_SEGMENT.find_iter(stem))
+        .chain(HEX_HASH_SEGMENT.find_iter(stem).filter(|matched| {
+            matched
+                .as_str()
+                .bytes()
+                .any(|byte| matches!(byte, b'a'..=b'f'))
+        }))
+        .map(|matched| matched.range())
+        .collect();
+    ranges.sort_by_key(|range| range.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start < last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
+/// The parts of a raw div id that no ephemeral marker covered, NUL-joined.
+///
+/// [`normalize_div_stem`] truncates at the first marker, so two ids differing
+/// only *inside* a marker collapse onto one stem — the signature of one element
+/// re-rendered. What the markers did not cover separates that from two elements:
+/// `ad-header-0-_R_3f_` and `ad-header-0-_r_0_` leave the same residue (one
+/// element, two renders), while `…-in_content-0` and `…-in_content-1` do not
+/// (two siblings). A live div id cannot contain NUL, so joining on it cannot
+/// make two different residues compare equal.
+fn ephemeral_marker_residue(div_id: &str) -> String {
+    let stem = div_id.strip_suffix("-container").unwrap_or(div_id);
+    let mut residue = String::with_capacity(stem.len());
+    let mut previous = 0_usize;
+    for range in ephemeral_marker_ranges(stem) {
+        residue.push_str(&stem[previous..range.start]);
+        residue.push('\0');
+        previous = range.end;
+    }
+    residue.push_str(&stem[previous..]);
+    residue
 }
 
 /// Extracts the leading network id from a GAM ad-unit path (`/<network>/...`).
@@ -962,11 +1057,18 @@ mod tests {
             "https://securepubads.g.doubleclick.net/gampad/ads?iu_parts=123%2Cnews%2Catf&dids=ad-a%2Cad-b&prev_iu_szs=300x250",
         )]);
 
-        assert!(discovered.slots.is_empty());
+        assert!(
+            discovered.slots.is_empty(),
+            "a comma-joined SRA did list is not one element"
+        );
     }
 
     #[test]
-    fn same_page_hex_normalization_collision_is_refused() {
+    fn one_element_under_two_render_tokens_is_not_a_collision() {
+        // Both ids describe in-content placement 0; only the hash between the
+        // two copies of the placement name differs, which is what one element
+        // re-rendered looks like. Refusing here would refuse the very shape
+        // normalization exists to absorb.
         let registry = vec![
             registry_slot(
                 "/987654321/site/homepage",
@@ -982,12 +1084,75 @@ mod tests {
 
         let discovered = discover_gpt_slots(&registry, &[], false);
 
-        assert!(discovered.had_slot_evidence);
+        assert_eq!(
+            discovered.slots.len(),
+            1,
+            "two renders of one element are one slot, got {:?}",
+            discovered.slots
+        );
+        assert_eq!(discovered.slots[0].div_id, "ad-in_content");
+        assert!(
+            discovered.warnings.is_empty(),
+            "a re-render is not an ambiguity to report, got {:?}",
+            discovered.warnings
+        );
+        assert!(discovered.ambiguous_stems.is_empty());
+    }
+
+    #[test]
+    fn sibling_placements_sharing_one_stem_are_refused() {
+        // Same shape as above, but the trailing placement index differs: these
+        // are two live elements, and one prefix cannot resolve to both.
+        let registry = vec![
+            registry_slot(
+                "/987654321/site/homepage",
+                "ad-in_content-de669245b2ea4b05826dc96f07a36272-in_content-0",
+                &[(300, 250)],
+            ),
+            registry_slot(
+                "/987654321/site/homepage",
+                "ad-in_content-8aec8129a83d4e5abc197423120cb19e-in_content-1",
+                &[(300, 250)],
+            ),
+        ];
+
+        let discovered = discover_gpt_slots(&registry, &[], false);
+
+        assert!(
+            discovered.had_slot_evidence,
+            "a refused placement is still evidence of an ad stack"
+        );
         assert!(
             discovered.slots.is_empty(),
             "neither a broad prefix nor per-render exact IDs are safe"
         );
         assert_ambiguous_collision_warning(&discovered, "ad-in_content");
+        assert!(
+            discovered.ambiguous_stems.contains("ad-in_content"),
+            "the verdict must travel with the evidence, got {:?}",
+            discovered.ambiguous_stems
+        );
+    }
+
+    #[test]
+    fn react_server_and_client_render_tokens_are_one_slot() {
+        // A hydrating publisher reports the SSR id and the client id for the
+        // same element. Both must collapse rather than refuse each other.
+        let registry = vec![
+            registry_slot("/123456789/site/news", "ad-header-0-_R_3f_", &[(728, 90)]),
+            registry_slot("/123456789/site/news", "ad-header-0-_r_0_", &[(728, 90)]),
+        ];
+
+        let discovered = discover_gpt_slots(&registry, &[], false);
+
+        assert_eq!(
+            discovered.slots.len(),
+            1,
+            "SSR and client renders of one element are one slot, got {:?}",
+            discovered.slots
+        );
+        assert_eq!(discovered.slots[0].div_id, "ad-header-0");
+        assert!(discovered.warnings.is_empty());
     }
 
     #[test]
@@ -1005,7 +1170,10 @@ mod tests {
 
         let discovered = discover_gpt_slots(&registry, &[], false);
 
-        assert!(discovered.had_slot_evidence);
+        assert!(
+            discovered.had_slot_evidence,
+            "a refused placement is still evidence of an ad stack"
+        );
         assert!(
             discovered.slots.is_empty(),
             "no repeat or later collision member may resurrect the group"
@@ -1024,68 +1192,107 @@ mod tests {
             ),
         ]);
 
-        assert!(discovered.had_slot_evidence);
-        assert!(discovered.slots.is_empty());
-        assert_eq!(discovered.gam_network_id.as_deref(), Some("123456789"));
+        assert!(
+            discovered.had_slot_evidence,
+            "a refused placement is still evidence of an ad stack"
+        );
+        assert!(
+            discovered.slots.is_empty(),
+            "a refused placement must not be written, got {:?}",
+            discovered.slots
+        );
+        assert_eq!(
+            discovered.gam_network_id.as_deref(),
+            Some("123456789"),
+            "refusing a slot must not discard the network id"
+        );
         assert_ambiguous_collision_warning(&discovered, "ad-x");
     }
 
     #[test]
-    fn single_known_per_render_registry_slot_is_refused() {
+    fn single_volatile_family_registry_slot_is_refused() {
         let discovered = discover_gpt_slots(
             &[registry_slot(
                 "/123456789/site_in-article_desktop_1",
-                "rh-gam-kso_12345678AbCdEfGh_ei_inarticle_1",
+                "vendor-tag_12345678AbCdEfGh_slot_inarticle_1",
                 &[(300, 250)],
             )],
             &[],
             false,
         );
 
-        assert!(discovered.had_slot_evidence);
+        assert!(
+            discovered.had_slot_evidence,
+            "a refused placement is still evidence of an ad stack"
+        );
         assert!(
             discovered.slots.is_empty(),
-            "one observation of a known per-render family must not be written literally"
+            "one observation of a per-render family must not be written literally"
         );
         assert_eq!(discovered.gam_network_id.as_deref(), Some("123456789"));
-        assert_known_per_render_warning(&discovered);
+        assert_volatile_prefix_warning(&discovered, "vendor-tag");
     }
 
     #[test]
-    fn single_known_per_render_request_slot_is_refused() {
+    fn single_volatile_family_request_slot_is_refused() {
         let discovered = from_requests(&[request(
-            "https://securepubads.g.doubleclick.net/gampad/ads?iu_parts=123456789%2Csite_in-article_desktop_1&dids=rh-gam-kso_12345678AbCdEfGh_ei_inarticle_1&prev_iu_szs=300x250",
+            "https://securepubads.g.doubleclick.net/gampad/ads?iu_parts=123456789%2Csite_in-article_desktop_1&dids=vendor-tag_12345678AbCdEfGh_slot_inarticle_1&prev_iu_szs=300x250",
         )]);
 
-        assert!(discovered.had_slot_evidence);
-        assert!(discovered.slots.is_empty());
-        assert_eq!(discovered.gam_network_id.as_deref(), Some("123456789"));
-        assert_known_per_render_warning(&discovered);
+        assert!(
+            discovered.had_slot_evidence,
+            "a refused placement is still evidence of an ad stack"
+        );
+        assert!(
+            discovered.slots.is_empty(),
+            "a refused placement must not be written, got {:?}",
+            discovered.slots
+        );
+        assert_eq!(
+            discovered.gam_network_id.as_deref(),
+            Some("123456789"),
+            "refusing a slot must not discard the network id"
+        );
+        assert_volatile_prefix_warning(&discovered, "vendor-tag");
     }
 
     #[test]
-    fn known_per_render_match_does_not_claim_arbitrary_vendor_ids() {
-        assert_eq!(
-            known_per_render_div_prefix("rh-gam-kso_12345678AbCdEfGh_ei_inarticle_1"),
-            Some("rh-gam-kso")
-        );
-        assert_eq!(
-            known_per_render_div_prefix("rh-gam-kso_12345678AbCdEfGh_ei_overlay_1-container"),
-            Some("rh-gam-kso")
-        );
-        for stable in [
-            "rh-gam-kso_stable_ei_inarticle_1",
-            "rh-gam-kso_12345678_ei_inarticle_1",
-            "rh-gam-kso_12345678AbCdEfGh_ei_sidebar_1",
-            "rh-gam-kso_12345678AbCdEfGh_ei_overlay_stable",
-            "rh-gam-kso_12345678AbCdEfGh_ei_overlay_",
-            "rh-gam-kso_12345678AbCdEfGh_ei_overlay_1_extra",
-            "rh-gam-kso-header",
+    fn volatile_prefix_covers_every_placement_after_the_token() {
+        // The token's position is what makes the id unusable, so the placement
+        // that follows it is irrelevant: every one of these leaves `vendor-tag`
+        // as the only stable prefix, and that prefix reaches all of them.
+        for volatile in [
+            "vendor-tag_12345678AbCdEfGh_slot_inarticle_1",
+            "vendor-tag_12345678AbCdEfGh_slot_overlay_1-container",
+            "vendor-tag_12345678AbCdEfGh_slot_sidebar_1",
+            "vendor-tag_12345678AbCdEfGh_slot_overlay_stable",
+            "vendor-tag_12345678AbCdEfGh_slot_overlay_1_extra",
         ] {
             assert_eq!(
-                known_per_render_div_prefix(stable),
+                volatile_prefix_before_placement(volatile).as_deref(),
+                Some("vendor-tag"),
+                "`{volatile}` should be refused as a volatile family"
+            );
+        }
+    }
+
+    #[test]
+    fn volatile_prefix_does_not_claim_stable_div_ids() {
+        for stable in [
+            // No per-render token at all.
+            "vendor-tag_stable_slot_inarticle_1",
+            // A bare digit run is how stable placement indices are written.
+            "vendor-tag_12345678_slot_inarticle_1",
+            "ad-slot-1234567890123456-tail",
+            // The token is trailing, so the prefix before it still identifies
+            // this element and normalization/collision handling own the case.
+            "vendor-tag_slot_inarticle_12345678AbCdEfGh",
+            "vendor-tag-header",
+        ] {
+            assert_eq!(
+                volatile_prefix_before_placement(stable),
                 None,
-                "`{stable}` should not match the narrow per-render family"
+                "`{stable}` should stay eligible"
             );
         }
     }
@@ -1110,7 +1317,10 @@ mod tests {
 
         let discovered = discover_gpt_slots(&registry, &requests, false);
 
-        assert!(discovered.had_slot_evidence);
+        assert!(
+            discovered.had_slot_evidence,
+            "a refused placement is still evidence of an ad stack"
+        );
         assert!(
             discovered.slots.is_empty(),
             "request fallback must not resurrect an ambiguous registry stem"
@@ -1157,11 +1367,25 @@ mod tests {
         );
     }
 
-    fn assert_known_per_render_warning(discovered: &DiscoveredSlots) {
-        assert_eq!(discovered.warnings.len(), 1);
+    fn assert_volatile_prefix_warning(discovered: &DiscoveredSlots, prefix: &str) {
+        assert_eq!(
+            discovered.warnings.len(),
+            1,
+            "should report the family once, got {:?}",
+            discovered.warnings
+        );
         let warning = &discovered.warnings[0];
-        assert!(warning.contains("rh-gam-kso"));
-        assert!(warning.contains("change across renders"));
-        assert!(warning.contains("distinct stable div ids"));
+        assert!(
+            warning.contains(prefix),
+            "warning should name the family prefix, got {warning}"
+        );
+        assert!(
+            warning.contains("change across renders"),
+            "warning should explain why the exact ids are unsafe, got {warning}"
+        );
+        assert!(
+            warning.contains("distinct stable div ids"),
+            "warning should tell the operator how to make the placements configurable, got {warning}"
+        );
     }
 }

@@ -1,7 +1,7 @@
 // Bounded ad-template evidence collector, injected before publisher scripts run.
 //
-// This body runs inside an IIFE that defines `__TS_CONFIG` (configured div
-// prefixes + APS slot IDs). It records evidence into `window.__tsAdTemplateEvidence`
+// This body runs inside an IIFE that defines `__TS_CONFIG` (the configured div
+// prefixes). It records evidence into `window.__tsAdTemplateEvidence`
 // and never captures page HTML, cookies, storage, request bodies, or arbitrary DOM.
 // It always calls original page functions with unchanged arguments and never
 // spoofs the browser automation flag.
@@ -28,8 +28,22 @@ function __ts_text(value) {
   return String(value).slice(0, __ts_max_string_length)
 }
 
+// Truncation has to be visible: surplus configured slots classify Missing, and
+// `--strict` counts that, so a silent drop is indistinguishable from real drift.
+let __ts_truncated = false
 function __ts_push(list, entry) {
-  if (list.length < __ts_max_entries) list.push(entry)
+  if (list.length < __ts_max_entries) {
+    list.push(entry)
+    return
+  }
+  if (__ts_truncated) return
+  __ts_truncated = true
+  if (__ts_ev.warnings.length < __ts_max_entries) {
+    __ts_ev.warnings.push({
+      code: "evidence_truncated",
+      message: "an evidence list hit the " + __ts_max_entries + "-entry cap; results are incomplete"
+    })
+  }
 }
 
 function __ts_warn(code, error) {
@@ -52,7 +66,7 @@ function __ts_warn_ignored_size(width, height) {
     numeric && (width < 0 || height < 0 || width > 4294967295 || height > 4294967295)
   __ts_push(__ts_ev.warnings, {
     code: outOfRange ? "size_out_of_range" : "fluid_size_ignored",
-    message: outOfRange ? "GPT size outside u32 range ignored" : "non-numeric GPT size ignored"
+    message: outOfRange ? "GPT size outside u32 range ignored" : "non-integer GPT size ignored"
   })
 }
 
@@ -131,6 +145,9 @@ function __ts_install(name, wrap) {
   let internal
   Object.defineProperty(window, name, {
     configurable: true,
+    // A real `window.googletag` is an ordinary enumerable global; matching that
+    // keeps `Object.keys(window)` identical with and without the collector.
+    enumerable: true,
     get() {
       return internal
     },

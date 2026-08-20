@@ -52,6 +52,28 @@ const NON_PAGE_EXTENSIONS: &[&str] = &[
     ".xml", ".pdf", ".zip", ".mp4", ".mp3", ".rss",
 ];
 
+/// ISO 639-1 alpha-2 language codes, sorted for binary search.
+///
+/// Country codes are deliberately absent: `/us` and `/tv` are section roots on
+/// plenty of publishers, and only the language form appears as a URL locale
+/// prefix on its own.
+const ISO_639_1_CODES: &[&str] = &[
+    "aa", "ab", "ae", "af", "ak", "am", "an", "ar", "as", "av", "ay", "az", "ba", "be", "bg", "bh",
+    "bi", "bm", "bn", "bo", "br", "bs", "ca", "ce", "ch", "co", "cr", "cs", "cu", "cv", "cy", "da",
+    "de", "dv", "dz", "ee", "el", "en", "eo", "es", "et", "eu", "fa", "ff", "fi", "fj", "fo", "fr",
+    "fy", "ga", "gd", "gl", "gn", "gu", "gv", "ha", "he", "hi", "ho", "hr", "ht", "hu", "hy", "hz",
+    "ia", "id", "ie", "ig", "ii", "ik", "io", "is", "it", "iu", "ja", "jv", "ka", "kg", "ki", "kj",
+    "kk", "kl", "km", "kn", "ko", "kr", "ks", "ku", "kv", "kw", "ky", "la", "lb", "lg", "li", "ln",
+    "lo", "lt", "lu", "lv", "mg", "mh", "mi", "mk", "ml", "mn", "mr", "ms", "mt", "my", "na", "nb",
+    "nd", "ne", "ng", "nl", "nn", "no", "nr", "nv", "ny", "oc", "oj", "om", "or", "os", "pa", "pi",
+    "pl", "ps", "pt", "qu", "rm", "rn", "ro", "ru", "rw", "sa", "sc", "sd", "se", "sg", "si", "sk",
+    "sl", "sm", "sn", "so", "sq", "sr", "ss", "st", "su", "sv", "sw", "ta", "te", "tg", "th", "ti",
+    "tk", "tl", "tn", "to", "tr", "ts", "tt", "tw", "ty", "ug", "uk", "ur", "uz", "ve", "vi", "vo",
+    "wa", "wo", "xh", "yi", "yo", "za", "zh", "zu",
+];
+
+/// Filenames that name a directory's index document rather than a page of their
+/// own, so a link to one is treated as a link to the parent directory.
 const DIRECTORY_INDEX_NAMES: &[&str] = &[
     "index.html",
     "index.htm",
@@ -297,11 +319,19 @@ fn same_origin_page_url(root: &Url, raw: &str, section_segment: usize) -> Option
     {
         return None;
     }
+    // A section reachable only through its index document is still that section:
+    // `/news/index.html` is `/news`. Rejecting the URL outright loses the
+    // section; dropping the filename keeps it.
+    if path
+        .split('/')
+        .rfind(|part| !part.is_empty())
+        .is_some_and(|last| DIRECTORY_INDEX_NAMES.contains(&last))
+    {
+        url.path_segments_mut().ok()?.pop();
+    }
+    let path = percent_decode_for_filtering(url.path()).to_ascii_lowercase();
     let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
     if segments.is_empty() {
-        return None;
-    }
-    if DIRECTORY_INDEX_NAMES.contains(&segments.last().copied().unwrap_or_default()) {
         return None;
     }
     if NOISE_SEGMENTS.contains(&segments.get(section_segment).copied().unwrap_or_default()) {
@@ -334,6 +364,8 @@ fn section_at(url: &Url, index: usize) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+/// Whether the requested root is nothing but a locale prefix, which puts
+/// sections one segment deeper than usual.
 fn root_is_locale_prefix(root: &Url) -> bool {
     let segments: Vec<&str> = root
         .path()
@@ -343,14 +375,27 @@ fn root_is_locale_prefix(root: &Url) -> bool {
     matches!(segments.as_slice(), [locale] if is_locale_segment(locale))
 }
 
+/// Whether a root's single path segment is a locale prefix (`/en`, `/en-gb`)
+/// rather than a content section.
+///
+/// The language half must be a real ISO 639-1 code. Accepting any two letters
+/// read ordinary section roots — `/tv`, `/ai`, `/us` — as locales, which shifts
+/// `section_segment` by one: article slugs then become "sections" and the
+/// containment check below discards the root's real siblings.
 fn is_locale_segment(segment: &str) -> bool {
-    let bytes = segment.as_bytes();
-    matches!(bytes, [a, b] if a.is_ascii_alphabetic() && b.is_ascii_alphabetic())
-        || matches!(bytes, [a, b, b'-', c, d]
-            if a.is_ascii_alphabetic()
-                && b.is_ascii_alphabetic()
-                && c.is_ascii_alphabetic()
-                && d.is_ascii_alphabetic())
+    let segment = segment.to_ascii_lowercase();
+    match segment.as_bytes() {
+        [_, _] => is_language_code(&segment),
+        [_, _, b'-', c, d] => {
+            is_language_code(&segment[..2]) && c.is_ascii_alphabetic() && d.is_ascii_alphabetic()
+        }
+        _ => false,
+    }
+}
+
+/// Whether `segment` is an ISO 639-1 alpha-2 language code.
+fn is_language_code(segment: &str) -> bool {
+    ISO_639_1_CODES.binary_search(&segment).is_ok()
 }
 
 /// Decodes percent escapes solely for normalized path classification.
@@ -430,7 +475,11 @@ mod tests {
             CrawlBudget::default(),
         );
 
-        assert_eq!(segments(&plan), ["news"]);
+        assert_eq!(
+            segments(&plan),
+            ["news"],
+            "only the witnessed section should be planned"
+        );
         let section = &plan.sections[0];
         assert_eq!(
             section.landing.as_ref().map(Url::as_str),
@@ -498,7 +547,11 @@ mod tests {
             CrawlBudget::default(),
         );
 
-        assert_eq!(segments(&plan), ["news"]);
+        assert_eq!(
+            segments(&plan),
+            ["news"],
+            "only the witnessed section should be planned"
+        );
         assert_eq!(
             plan.sections[0].landing.as_ref().map(Url::as_str),
             Some("https://publisher.example/news"),
@@ -544,7 +597,11 @@ mod tests {
         );
 
         assert_eq!(plan.sections.len(), 2, "section cap should be honoured");
-        assert_eq!(plan.dropped_sections.len(), 2);
+        assert_eq!(
+            plan.dropped_sections.len(),
+            2,
+            "sections past the budget should be reported as dropped"
+        );
         assert!(
             plan.notes
                 .iter()
@@ -576,7 +633,11 @@ mod tests {
             2,
             "root + 2 pages fills max_pages = 3"
         );
-        assert_eq!(plan.dropped_sections.len(), 1);
+        assert_eq!(
+            plan.dropped_sections.len(),
+            1,
+            "the section past the budget should be reported as dropped"
+        );
     }
 
     #[test]
@@ -602,8 +663,14 @@ mod tests {
     fn empty_input_plans_nothing_rather_than_panicking() {
         let plan = plan_crawl(&root(), &[], &[], CrawlBudget::default());
 
-        assert!(plan.sections.is_empty());
-        assert!(plan.targets().is_empty());
+        assert!(
+            plan.sections.is_empty(),
+            "no input means no sections to sample"
+        );
+        assert!(
+            plan.targets().is_empty(),
+            "no sections means nothing to load"
+        );
     }
 
     #[test]
@@ -619,9 +686,16 @@ mod tests {
             CrawlBudget::default(),
         );
 
-        assert_eq!(plan.section_segment, 1);
+        assert_eq!(
+            plan.section_segment, 1,
+            "a locale root puts sections one segment deeper"
+        );
         assert_eq!(segments(&plan), ["deals", "news"]);
-        assert_eq!(plan.targets().len(), 4);
+        assert_eq!(
+            plan.targets().len(),
+            4,
+            "each section contributes a landing page and an article"
+        );
     }
 
     #[test]
@@ -643,6 +717,86 @@ mod tests {
             segments(&plan),
             ["archive.htm", "news", "story.php"],
             "only directory-index documents should be excluded by extension"
+        );
+    }
+
+    #[test]
+    fn a_two_letter_section_root_is_not_read_as_a_locale() {
+        // `/tv`, `/ai` and `/us` are section roots, not locales. Reading them as
+        // locales moves the section segment to 1, so article slugs become
+        // "sections" and the root's real siblings are discarded.
+        for root_path in ["/tv", "/ai", "/us"] {
+            let section_root = Url::parse(&format!("https://publisher.example{root_path}"))
+                .expect("should parse root");
+            let plan = plan_crawl(
+                &section_root,
+                &[
+                    nav(&format!("{root_path}/story-one")),
+                    nav(&format!("{root_path}/story-two")),
+                ],
+                &[],
+                CrawlBudget::default(),
+            );
+
+            assert_eq!(
+                plan.section_segment, 0,
+                "`{root_path}` should be a section root, not a locale prefix"
+            );
+            assert_eq!(
+                segments(&plan),
+                [root_path.trim_start_matches('/')],
+                "articles below `{root_path}` should stay one section"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_language_prefix_is_still_read_as_a_locale() {
+        for root_path in ["/en", "/fr", "/pt-br"] {
+            let locale_root = Url::parse(&format!("https://publisher.example{root_path}"))
+                .expect("should parse root");
+            let plan = plan_crawl(
+                &locale_root,
+                &[nav(&format!("{root_path}/news"))],
+                &[],
+                CrawlBudget::default(),
+            );
+
+            assert_eq!(
+                plan.section_segment, 1,
+                "`{root_path}` is a locale prefix, so sections start one segment in"
+            );
+            assert_eq!(segments(&plan), ["news"]);
+        }
+    }
+
+    #[test]
+    fn a_section_reachable_only_by_its_index_document_collapses_to_the_parent() {
+        let plan = plan_crawl(
+            &root(),
+            &[
+                nav("/news/index.html"),
+                nav("/deals/index.php"),
+                nav("/sport/home.htm"),
+            ],
+            &[],
+            CrawlBudget::default(),
+        );
+
+        assert_eq!(
+            segments(&plan),
+            ["deals", "news", "sport"],
+            "an index document names its section rather than disqualifying it"
+        );
+        let targets: Vec<String> = plan
+            .targets()
+            .iter()
+            .map(|url| url.path().to_string())
+            .collect();
+        assert_eq!(
+            targets,
+            ["/deals", "/news", "/sport"],
+            "the parent directory is what gets loaded"
         );
     }
 

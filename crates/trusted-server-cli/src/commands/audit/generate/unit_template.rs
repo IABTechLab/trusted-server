@@ -384,9 +384,12 @@ fn build_template(slot: &SlotEvidence, varying: usize) -> String {
 
 /// Replays `template` through the runtime renderer against every observation.
 ///
-/// This is the gate that catches a section slug the path cannot reproduce — a
-/// publisher whose `/site-news` pages request `.../sitenews`, say, where
-/// the derived section and the observed segment differ.
+/// Defense in depth rather than the primary gate: [`analyse_slot`] already
+/// refuses to call a slot templatable when the derived section and the observed
+/// segment disagree — a publisher whose `/site-news` pages request
+/// `.../sitenews`, say — so a mismatch reaching here would mean inference and
+/// the runtime renderer disagree. The template is then dropped instead of
+/// written, and the diagnostic names the paths that did not reproduce.
 fn verify_round_trip(
     template: &str,
     slot: &SlotEvidence,

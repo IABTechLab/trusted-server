@@ -229,22 +229,29 @@ survives alongside the homepage's.
 A wrong ad-unit template makes the publisher bid against inventory that does not
 exist, so the command prefers a narrow literal path over a plausible guess.
 
-| Situation                                                                               | Result                                                                                                                                  |
-| --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| Only one page was crawled                                                               | Literal path. One observation cannot distinguish a literal from a template.                                                             |
-| The ad unit never varied by section                                                     | Literal path.                                                                                                                           |
-| A section's slug is not derivable from its URL (`/site-news` requesting `.../sitenews`) | The slot is omitted and the reason is reported.                                                                                         |
-| No root page was seen, so `section_root` is unknown                                     | The slot is omitted rather than writing a guessed fallback.                                                                             |
-| Two path segments could both be the section                                             | No template; the ambiguity is reported.                                                                                                 |
-| The ad unit varies by device, geo, or anything the URL cannot supply                    | The refused slot is omitted and the reason is written as a note.                                                                        |
-| Crawled pages report different GAM network ids                                          | The run fails; the pages are not one property.                                                                                          |
-| More than a quarter of crawled pages return no slots                                    | The run fails. That is the signature of bot protection serving challenge pages, and writing from it would silently narrow the slot set. |
+| Situation                                                                               | Result                                                                                                                                                               |
+| --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Only one page was crawled                                                               | Literal path. One observation cannot distinguish a literal from a template.                                                                                          |
+| The ad unit never varied by section                                                     | Literal path.                                                                                                                                                        |
+| A section's slug is not derivable from its URL (`/site-news` requesting `.../sitenews`) | The slot is omitted; the note lists the ad-unit paths it used and says none generalized.                                                                             |
+| No root page was seen, so `section_root` is unknown                                     | The slot is omitted rather than writing a guessed fallback.                                                                                                          |
+| Two path segments could both be the section                                             | No template; the ambiguity is reported.                                                                                                                              |
+| The ad unit varies by device, geo, or anything the URL cannot supply                    | The refused slot is omitted and the reason is written as a note.                                                                                                     |
+| Crawled pages report different GAM network ids                                          | The run fails; the pages are not one property.                                                                                                                       |
+| More than a quarter of crawled pages return no slots                                    | The run fails. That is the signature of bot protection serving challenge pages, and writing from it would silently narrow the slot set.                              |
+| Several live elements normalize onto one div-id prefix                                  | The whole group is omitted, on every page of the crawl. A prefix resolves to at most one element and the exact ids change per render; the prefix is named in a note. |
+| A per-render token sits before the placement part of a div id                           | The slot is omitted from a single observation and the family prefix is named in a note; no stable prefix identifies one element.                                     |
 
 Every run checks that the config it produced still loads before replacing the
 file, and `--dry-run` runs the same check — a clean preview is evidence the
 config loads, not just that it parses. Dry-run stdout is a zero-context unified
 diff containing only the managed creative-opportunity fields; notes and refusal
-reasons go to stderr, so unrelated config and secrets are not printed.
+reasons go to stderr, so unrelated config and secrets are not printed. Crawl
+progress also goes to stderr, one line per phase and page — for example
+`Auditing desktop [2/17]: /news`. Progress renders the path only, never the
+origin, userinfo, query, or fragment, and there is no flag to suppress it. A
+`--dry-run` that changes nothing says so on stderr too, leaving stdout an empty
+diff.
 
 ### Bounding and steering the crawl
 
@@ -268,7 +275,17 @@ hand-tuned fields and gains this run's patterns and newly observed formats, and 
 `gam_unit_path` template is preserved. `--replace` discards existing slots
 instead, which also discards any template you wrote by hand.
 
-Locale-prefixed sites are inferred at their observed section depth. For
+A merge refuses to change the section policy that preserved `{section}` slots
+were written against: if the config already sets `section_root` (or
+`section_segment`) and this run infers different values, the run fails and asks
+for `--replace` as an explicit migration. A config whose `{section}` slots have
+no `section_root` at all is a different case — the runtime rejects such a file
+outright — so the first merge adopts the inferred policy and makes it loadable
+instead of demanding `--replace`.
+
+Locale-prefixed sites are inferred at their observed section depth. Only real
+ISO 639-1 language codes are read as a locale prefix, so a two-letter _section_
+root such as `/tv` or `/us` keeps sections at the first segment. For
 example, `/en/news/story` can produce `section_segment = 1`; generated patterns
 retain the locale prefix (`/en/news` and `/en/news/*`). The crawler never
 invents an unwitnessed locale or section.
@@ -407,10 +424,12 @@ ts audit ad-templates verify https://publisher.example/ --allow-cross-origin-red
 
 Verification accepts multiple URLs and reuses one browser/profile. Add
 `--strict` to return exit 1 when a confirmable slot is missing or partially
-confirmed, and `--json` for the stable machine-readable report. Video, native,
-and out-of-page slots are reported as `unconfirmable`; that records a checker
-limitation and does not fail strict mode. `--scroll` enables the optional second
-evidence phase and labels evidence first seen after the deterministic scroll.
+confirmed, and `--json` for the stable machine-readable report. Video- and
+native-only slots are reported as `unconfirmable`; that records a checker
+limitation and does not fail strict mode. A live out-of-page slot with no sizes
+against banner-configured formats is reported `partial` and does fail strict
+mode. `--scroll` enables the optional second evidence phase and labels evidence
+first seen after the deterministic scroll.
 
 Browser-backed ad-template generation and verification share `--chrome`,
 `--headful`, `--browser-proxy`, `--no-assume-consent`,
