@@ -32,6 +32,8 @@ The typed `TsjsApi` surface will document this field as internal lifecycle state
 
 On body-length mismatch or metadata-encoding failure, `FastlyTemplateReservation::insert` will call `cancel_insert_or_update` before returning the validation error. If cancellation itself fails, return a `TemplateCacheError` that reports the cancellation failure with the original validation context attached or included, following the adapter's existing concrete error style. Successful validation retains the current insertion path.
 
+Two Fastly Core Cache regression tests will reserve distinct cold keys, fail `insert` through body-length mismatch and metadata-encoding rejection respectively, assert the original validation reason, and immediately reserve the same key again. Receiving a second reservation proves the first transaction discharged its insert obligation instead of leaving collapsed waiters blocked. Because the simulator exposes no deterministic way to make `cancel_insert_or_update` itself fail, cancellation-error composition will be isolated behind a small private mapper and unit-tested with an injected failure value; that test will assert that both the original validation reason and cancellation failure remain visible.
+
 The direct-write comment will be corrected to state the actual safety mechanism: an unfinished write is never finished, and fallible reads plus declared-versus-observed body-length validation prevent partial data from being accepted.
 
 ### Focused coverage and documentation cleanup
@@ -41,7 +43,7 @@ The remediation will also:
 - add CR/LF rejection cases for metadata policy-header names and `content_type`, completing coverage of all encoded string fields;
 - cover both comment-form and element-form publisher ESI in the end-to-end cache-bypass test;
 - document that the `[nonce]` structural handler is the load-bearing CSP nonce safety net when a meta policy uses entity-encoded quotes;
-- update the stale seam-collision assertion message to describe terminal emission and repeated-marker rejection rather than removed normalization;
+- update both the stale seam-collision assertion message and the `queue_html_that_collides_with_the_marker` fixture documentation to describe terminal placeholder emission, repeated-marker rejection, and template-cache bypass rather than removed normalization;
 - add a local C1/C3 glossary near the publisher cache terminology and use it to re-anchor the remaining references;
 - qualify the configuration guide's request `max-age` inventory so `max-age=0` reload reuse agrees with the detailed paragraph;
 - leave the explicitly accepted inert double-collision residue unchanged.
@@ -60,6 +62,7 @@ Each behavioral change starts with a regression test and the narrowest relevant 
 - `cargo test-fastly`, `cargo test-axum`, `cargo test-cloudflare`, and `cargo test-spin`;
 - `cargo clippy-fastly`, `cargo clippy-axum`, `cargo clippy-cloudflare`, `cargo clippy-cloudflare-wasm`, `cargo clippy-spin-native`, and `cargo clippy-spin-wasm`;
 - documentation formatting;
-- the parity and native CLI suites when their local prerequisites are available.
+- `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity` as a required local gate, or explicit confirmation of the corresponding green `cargo test (cross-adapter parity)` CI check if an adapter executable prerequisite prevents a local run;
+- the native CLI suite when its local prerequisites are available.
 
 After the implementation is pushed, rerun the failed browser integration job. A green rerun resolves the CI finding. A repeated timeout during Playwright installation will be recorded as runner-side infrastructure evidence and will not trigger an unapproved workflow redesign.
