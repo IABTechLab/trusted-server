@@ -222,11 +222,17 @@ replacement prose; the goal is that nothing documented is false.
   `.env.dev`.
 - `docs/guide/getting-started.md:141`: `[gdpr]` does not exist; the section
   is `[consent]`.
+- Remove the nonexistent `.with_asset(...)` builder method from
+  `docs/guide/creative-processing.md:808` and
+  `docs/guide/integration-guide.md:84,248`, replacing it with the real
+  registration builder API (`with_proxy`, `with_head_injector`,
+  `with_deferred_js`, ...). Closes #277.
 
 Acceptance: grepping all tracked markdown and example config (the docs tree
 plus root files and crate READMEs) for `first-party/ad`, `third-party/ad`,
 `equativ`, `ad_servers`, `RequestWrapper`, `trackImpression`, `SEQUENCE.md`,
-`synthetic_id`, `providers/your_provider`, and `mock = true` (APS context)
+`synthetic_id`, `providers/your_provider`, `with_asset`, and `mock = true`
+(APS context)
 returns nothing; no sidebar entry points at a nonexistent integration.
 
 ### WP3: Configuration reference completion
@@ -325,6 +331,13 @@ route names its handler file.
   reference section, not as a partner integration page. Add
   `docs/guide/integrations/adserver_mock.md` for the mock auction provider
   used in local development, currently unmentioned in all docs.
+- Extend `docs/guide/integration-guide.md` with the script-guard mechanism
+  (`crates/trusted-server-js/lib/src/shared/script_guard.ts`, the
+  per-integration guards such as `gpt/script_guard.ts` and
+  `datadome/script_guard.ts`, and `shared/beacon_guard.ts`): what guards
+  intercept, when an integration needs one, and how to add one. Today
+  `script_guard` is mentioned only in `docs/guide/integrations/gpt.md`.
+  Closes #341.
 - Extend `docs/guide/integrations/gpt.md` with the slot handoff mechanism
   (edge-injected `gpt_bootstrap.js`, the full shim takeover, targeting, APS
   renderer bridge, SPA hook); "handoff" currently appears nowhere in docs.
@@ -613,6 +626,10 @@ Compact index of audit findings driving WP1/WP2; each was verified against
   `[ad_servers]`, `trackImpression`); `docs/guide/architecture.md:97-104`
   (`RequestWrapper`); `docs/guide/integration-guide.md:313` (equativ bidder).
 - Wrong config names: `docs/guide/getting-started.md:141` (`[gdpr]`).
+- Nonexistent builder method: `.with_asset(...)` in
+  `docs/guide/creative-processing.md:808`,
+  `docs/guide/integration-guide.md:84,248` (issue #277).
+- Script-guard mechanism absent from the integration guide (issue #341).
 - Old crate layout: `docs/roadmap.md:21-22` (the only surviving instance).
 - Adapter maturity contradictions: `docs/index.md:27`,
   `docs/guide/what-is-trusted-server.md:32`, `docs/roadmap.md:19,34-38` vs
