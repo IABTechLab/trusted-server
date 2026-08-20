@@ -292,7 +292,7 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
     &[
         // This must remain first: attribute rewriters chain replacements and short-circuit removals.
         IntegrationBuilder {
-            id: "js_asset_proxy",
+            id: js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID,
             build: js_asset_proxy::register,
         },
         IntegrationBuilder {

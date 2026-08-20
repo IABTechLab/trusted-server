@@ -787,7 +787,8 @@ pub async fn proxy_request(
         ProxyRedirectPolicy {
             follow_redirects,
             stream_passthrough,
-            stream_response,
+            stream_response: stream_response
+                && services.http_client().supports_streaming_responses(),
             allowed_domains,
             require_https,
         },
@@ -1004,6 +1005,7 @@ async fn send_asset_origin_request(
     outbound_headers: &http::HeaderMap,
     stream_response: bool,
 ) -> Result<AssetProxyResponse, Report<TrustedServerError>> {
+    let stream_response = stream_response && services.http_client().supports_streaming_responses();
     let mut platform_req =
         build_asset_platform_request(method, target_url, outbound_headers, backend_name)?;
     if stream_response {
@@ -1206,7 +1208,10 @@ pub async fn handle_asset_proxy_request(
     if let Some(image_optimizer) = image_optimizer {
         platform_req = platform_req.with_image_optimizer(image_optimizer);
     }
-    platform_req = platform_req.with_stream_response();
+    let stream_response = services.http_client().supports_streaming_responses();
+    if stream_response {
+        platform_req = platform_req.with_stream_response();
+    }
 
     let platform_resp = services
         .http_client()
@@ -1216,7 +1221,11 @@ pub async fn handle_asset_proxy_request(
             message: "Failed to proxy asset request".to_string(),
         })?;
 
-    let mut response = platform_response_to_fastly_asset(platform_resp);
+    let mut response = if stream_response {
+        platform_response_to_fastly_asset(platform_resp)
+    } else {
+        platform_response_to_fastly(platform_resp).map(AssetProxyResponse::origin_controlled)?
+    };
     strip_asset_proxy_response_headers(response.response_mut());
 
     Ok(response)
@@ -2390,6 +2399,10 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl PlatformHttpClient for StreamingResponseHttpClient {
+        fn supports_streaming_responses(&self) -> bool {
+            true
+        }
+
         async fn send(
             &self,
             _request: PlatformHttpRequest,
@@ -3856,6 +3869,7 @@ mod tests {
             use crate::platform::test_support::StubHttpClient;
 
             let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
             stub.push_response(200, b"ok".to_vec());
             let services = build_services_with_http_client(
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
@@ -4182,6 +4196,7 @@ mod tests {
             use crate::platform::test_support::StubHttpClient;
 
             let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(false);
             stub.push_response(200, b"ok".to_vec());
             let services = build_services_with_http_client(
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
@@ -4247,6 +4262,11 @@ mod tests {
                 .into_response()
                 .expect("should return buffered asset response");
             assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                stub.recorded_stream_response_flags(),
+                vec![false],
+                "unsupported platforms should buffer asset proxy responses"
+            );
 
             let all_headers = stub.recorded_request_headers();
             assert_eq!(all_headers.len(), 1, "should have captured one request");
@@ -4308,6 +4328,29 @@ mod tests {
                 header_value("x-custom-test").is_none(),
                 "should not forward unrelated custom headers"
             );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_streams_when_supported() {
+        futures::executor::block_on(async {
+            use crate::platform::test_support::StubHttpClient;
+
+            let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
+            stub.push_response(200, b"ok".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+            let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
+            let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+
+            handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy streaming asset response");
+
+            assert_eq!(stub.recorded_stream_response_flags(), vec![true]);
         });
     }
 
@@ -4579,6 +4622,7 @@ mod tests {
     fn handle_asset_proxy_request_attaches_image_optimizer_metadata() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
             stub.push_response(200, b"ok".to_vec());
             let services = build_services_with_http_client(
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
@@ -4806,6 +4850,7 @@ mod tests {
     fn handle_asset_proxy_request_preflights_s3_before_image_optimizer() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
             stub.push_response(200, Vec::new());
             stub.push_response(200, b"optimized".to_vec());
             let services = build_services_with_secret_and_http_client(
@@ -4865,6 +4910,7 @@ mod tests {
     fn handle_asset_proxy_request_returns_raw_s3_error_before_image_optimizer() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
             stub.push_response(404, Vec::new());
             stub.push_response_with_headers(
                 404,
@@ -4941,6 +4987,7 @@ mod tests {
     fn handle_asset_proxy_request_does_not_preflight_when_io_disabled() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(true);
             stub.push_response(200, b"raw".to_vec());
             let services = build_services_with_secret_and_http_client(
                 HashMapSecretStore::new(test_s3_secrets()),

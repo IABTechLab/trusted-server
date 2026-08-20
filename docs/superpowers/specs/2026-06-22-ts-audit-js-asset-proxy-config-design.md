@@ -208,7 +208,7 @@ When config output is selected:
 3. Patch publisher fields and known integration fields as today.
 4. Replace the sample `[integrations.js_asset_proxy]` block with an audited block:
    - `enabled = false`;
-   - keep or set `cache_ttl_seconds = 3600`;
+   - include commented `cache_ttl_seconds = 3600` guidance so generated candidates inherit upstream cache headers by default;
    - emit one disabled asset entry for each eligible candidate;
    - remove the example placeholder asset from the output.
 5. Append manual-review comments for skipped or known-integration candidates when
@@ -225,7 +225,8 @@ example placeholder asset. It may output:
 ```toml
 [integrations.js_asset_proxy]
 enabled = false
-cache_ttl_seconds = 3600
+# Uncomment to override upstream cache headers for every asset below.
+# cache_ttl_seconds = 3600
 # No eligible third-party HTTPS script assets were detected by `ts audit`.
 ```
 
@@ -235,12 +236,13 @@ cache_ttl_seconds = 3600
 
 The generated config is safe by default:
 
-| Field                                 | Generated value              | Rationale                                                          |
-| ------------------------------------- | ---------------------------- | ------------------------------------------------------------------ |
-| `integrations.js_asset_proxy.enabled` | `false`                      | Prevent route registration and rewriting until reviewed.           |
-| `assets[].proxy`                      | `disabled`                   | Keep candidate inventory without rewriting, proxying, or blocking. |
-| `assets[].path`                       | opaque random `/assets/*.js` | Avoid exposing vendor names in first-party URLs.                   |
-| `assets[].origin_url`                 | audited URL                  | Match JS Asset Proxy's normalized URL matching behavior.           |
+| Field                                 | Generated value              | Rationale                                                                 |
+| ------------------------------------- | ---------------------------- | ------------------------------------------------------------------------- |
+| `integrations.js_asset_proxy.enabled` | `false`                      | Prevent route registration and rewriting until reviewed.                  |
+| `assets[].proxy`                      | `disabled`                   | Keep candidate inventory without rewriting, proxying, or blocking.        |
+| `assets[].path`                       | opaque random `/assets/*.js` | Avoid exposing vendor names in first-party URLs.                          |
+| `assets[].origin_url`                 | audited URL                  | Match JS Asset Proxy's normalized URL matching behavior.                  |
+| `cache_ttl_seconds`                   | commented guidance           | Preserve upstream cache policy until an operator explicitly overrides it. |
 
 The operator can choose among:
 
@@ -259,6 +261,8 @@ Therefore, some generated candidates may be runtime-only scripts injected by tag
 managers or other JavaScript. Those entries are still useful as inventory, but
 enabling them may not cause rewriting unless a matching `src` URL appears in
 origin HTML processed by Trusted Server.
+
+URLs with query strings are emitted as distinct candidates because matching is exact. Their generated entries warn operators that the query string must remain stable.
 
 The generated config should include a warning comment near the asset proxy block:
 

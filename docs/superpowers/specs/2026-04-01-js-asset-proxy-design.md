@@ -124,7 +124,7 @@ For a matching request:
 
 1. Identify the enabled configured asset by exact request path.
 2. Build an upstream `GET` request to the asset's configured `origin_url`.
-3. Use the existing proxy request infrastructure with streaming passthrough and platform response streaming enabled.
+3. Use the existing proxy request infrastructure with streaming passthrough. Fastly preserves the upstream response stream; adapters without streaming-response support buffer the response instead.
 4. Do not append EC IDs or any other per-user identifiers to the upstream URL.
 5. Do not perform server-side JavaScript rewriting.
 6. Finalize the response with the header policy below.
@@ -294,7 +294,7 @@ Expected code changes:
 - `crates/trusted-server-core/src/integrations/mod.rs`
 - `trusted-server.toml`
 
-No adapter entry-point changes are expected if the existing integration registry dispatch is sufficient.
+The integration registry dispatches routes on every adapter. The shared HTTP client capability gate requests platform response streaming only where the adapter supports it; unsupported adapters buffer the response without changing their request contract.
 
 ---
 

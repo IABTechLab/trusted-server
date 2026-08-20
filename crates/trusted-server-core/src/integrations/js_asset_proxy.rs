@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
-use http::{header, Method, Request, Response, StatusCode};
+use http::{Method, Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use url::Url;
 use validator::{Validate, ValidationError, ValidationErrors};
@@ -25,10 +25,10 @@ use crate::integrations::{
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
 use crate::platform::RuntimeServices;
-use crate::proxy::{proxy_request, ProxyRequestConfig};
+use crate::proxy::{ProxyRequestConfig, proxy_request};
 use crate::settings::{IntegrationConfig, Settings};
 
-const JS_ASSET_PROXY_INTEGRATION_ID: &str = "js_asset_proxy";
+pub(crate) const JS_ASSET_PROXY_INTEGRATION_ID: &str = "js_asset_proxy";
 const HEADER_X_TS_JS_ASSET_PROXY: &str = "X-TS-JS-Asset-Proxy";
 const HEADER_X_TS_ERROR: &str = "X-TS-Error";
 const ERROR_ORIGIN_UNREACHABLE: &str = "js-asset-origin-unreachable";
@@ -76,6 +76,16 @@ pub enum JsAssetProxyMode {
     Blocked,
 }
 
+impl JsAssetProxyConfig {
+    fn normalize_origin_urls(&mut self) {
+        for asset in &mut self.assets {
+            if let Some(origin_url) = normalize_origin_url(&asset.origin_url) {
+                asset.origin_url = origin_url;
+            }
+        }
+    }
+}
+
 impl IntegrationConfig for JsAssetProxyConfig {
     fn is_enabled(&self) -> bool {
         self.enabled
@@ -97,7 +107,9 @@ impl Validate for JsAssetProxyConfig {
             if !paths.insert(asset.path.as_str()) {
                 errors.add("asset_path", ValidationError::new("duplicate_asset_path"));
             }
-            if !origin_urls.insert(asset.origin_url.as_str()) {
+            let origin_url =
+                normalize_origin_url(&asset.origin_url).unwrap_or_else(|| asset.origin_url.clone());
+            if !origin_urls.insert(origin_url) {
                 errors.add(
                     "asset_origin_url",
                     ValidationError::new("duplicate_asset_origin_url"),
@@ -119,6 +131,9 @@ impl Validate for JsAssetProxyAsset {
 
         if !self.path.starts_with('/') {
             errors.add("path", ValidationError::new("path_must_start_with_slash"));
+        }
+        if self.path == "/" {
+            errors.add("path", ValidationError::new("path_must_not_be_root"));
         }
         if self.path.starts_with("//") {
             errors.add(
@@ -190,6 +205,19 @@ fn path_contains_parent_segment(path: &str) -> bool {
     path.split('/').any(|segment| segment == "..")
 }
 
+fn normalize_origin_url(origin_url: &str) -> Option<String> {
+    let mut url = Url::parse(origin_url).ok()?;
+    let has_default_port = matches!(
+        (url.scheme(), url.port()),
+        ("http", Some(80)) | ("https", Some(443))
+    );
+    if has_default_port {
+        url.set_port(None).ok()?;
+    }
+
+    Some(url.to_string())
+}
+
 fn normalize_script_src(script_src: &str, request_scheme: &str) -> Option<String> {
     let candidate = if script_src.starts_with("//") {
         let request_scheme = request_scheme.to_ascii_lowercase();
@@ -201,16 +229,7 @@ fn normalize_script_src(script_src: &str, request_scheme: &str) -> Option<String
         script_src.to_string()
     };
 
-    let mut url = Url::parse(&candidate).ok()?;
-    let has_default_port = matches!(
-        (url.scheme(), url.port()),
-        ("http", Some(80)) | ("https", Some(443))
-    );
-    if has_default_port {
-        url.set_port(None).ok()?;
-    }
-
-    Some(url.to_string())
+    normalize_origin_url(&candidate)
 }
 
 /// JavaScript asset proxy integration implementation.
@@ -305,6 +324,19 @@ impl JsAssetProxyIntegration {
             .expect("should build JS asset proxy upstream status response")
     }
 
+    fn combined_header_values(
+        headers: &http::HeaderMap,
+        header_name: &http::header::HeaderName,
+    ) -> Option<String> {
+        let values = headers
+            .get_all(header_name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+
+        (!values.is_empty()).then(|| values.join(", "))
+    }
+
     fn vary_with_accept_encoding(upstream_vary: Option<&str>) -> String {
         match upstream_vary.map(str::trim) {
             Some("*") => "*".to_string(),
@@ -337,12 +369,9 @@ impl JsAssetProxyIntegration {
         let content_encoding = parts.headers.get(header::CONTENT_ENCODING).cloned();
         let etag = parts.headers.get(header::ETAG).cloned();
         let last_modified = parts.headers.get(header::LAST_MODIFIED).cloned();
-        let upstream_vary = parts
-            .headers
-            .get(header::VARY)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let upstream_cache_control = parts.headers.get(header::CACHE_CONTROL).cloned();
+        let upstream_vary = Self::combined_header_values(&parts.headers, &header::VARY);
+        let upstream_cache_control =
+            Self::combined_header_values(&parts.headers, &header::CACHE_CONTROL);
 
         let mut finalized = Response::new(body);
         *finalized.status_mut() = status;
@@ -390,9 +419,11 @@ impl JsAssetProxyIntegration {
                     .expect("should build JS asset proxy Cache-Control header"),
             );
         } else if let Some(cache_control) = upstream_cache_control {
-            finalized
-                .headers_mut()
-                .insert(header::CACHE_CONTROL, cache_control);
+            finalized.headers_mut().insert(
+                header::CACHE_CONTROL,
+                http::HeaderValue::from_str(&cache_control)
+                    .expect("should preserve JS asset proxy upstream Cache-Control header"),
+            );
         }
 
         finalized
@@ -402,11 +433,12 @@ impl JsAssetProxyIntegration {
 fn build(
     settings: &Settings,
 ) -> Result<Option<Arc<JsAssetProxyIntegration>>, Report<TrustedServerError>> {
-    let Some(config) =
+    let Some(mut config) =
         settings.integration_config::<JsAssetProxyConfig>(JS_ASSET_PROXY_INTEGRATION_ID)?
     else {
         return Ok(None);
     };
+    config.normalize_origin_urls();
 
     Ok(Some(JsAssetProxyIntegration::new(config)))
 }
@@ -526,10 +558,11 @@ mod tests {
     use std::sync::Arc;
 
     use crate::constants::{HEADER_REFERER, HEADER_X_FORWARDED_FOR, HEADER_X_TS_EC};
-    use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
+    use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
     use crate::integrations::{
         AttributeRewriteAction, IntegrationAttributeRewriter, IntegrationRegistry,
     };
+    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::create_test_settings;
     use http::header;
@@ -590,6 +623,8 @@ mod tests {
             ad_slots_script: None,
             ad_bids_state: Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         });
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
@@ -948,6 +983,7 @@ mod tests {
             "/assets/{vendor}.js",
             "/assets/vendor.js?v=1",
             "/assets/vendor.js#v1",
+            "/",
             "/assets/vendor js",
             "/assets/vendor\n.js",
         ] {
@@ -1207,6 +1243,186 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("public, max-age=300")
         );
+    }
+
+    #[test]
+    fn configured_origin_urls_are_canonicalized_for_matching_and_duplicates() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                JS_ASSET_PROXY_INTEGRATION_ID,
+                &json!({
+                    "enabled": true,
+                    "assets": [{
+                        "path": "/assets/vendor.js",
+                        "origin_url": "HTTPS://CDN.EXAMPLE.COM:443/vendor.js"
+                    }]
+                }),
+            )
+            .expect("should insert integration config");
+        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+        let processed = process_html_with_registry(
+            r#"<script src="https://cdn.example.com/vendor.js"></script>"#,
+            registry,
+        );
+
+        assert!(processed.contains(r#"<script src="/assets/vendor.js"></script>"#));
+
+        let config = config_with_assets(vec![
+            asset(
+                "/assets/one.js",
+                "https://cdn.example.com/vendor.js",
+                JsAssetProxyMode::Enabled,
+            ),
+            asset(
+                "/assets/two.js",
+                "HTTPS://CDN.EXAMPLE.COM:443/vendor.js",
+                JsAssetProxyMode::Enabled,
+            ),
+        ]);
+        assert!(
+            config.validate().is_err(),
+            "canonical duplicate origin URLs should be rejected"
+        );
+    }
+
+    #[test]
+    fn finalize_asset_response_preserves_repeated_vary_and_cache_control_headers() {
+        let configured_asset = asset(
+            "/assets/vendor.js",
+            "https://cdn.example.com/vendor.js",
+            JsAssetProxyMode::Enabled,
+        );
+        let integration =
+            JsAssetProxyIntegration::new(config_with_assets(vec![configured_asset.clone()]));
+        let upstream = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_ENCODING, "gzip")
+            .header(header::VARY, "Origin")
+            .header(header::VARY, "User-Agent")
+            .header(header::CACHE_CONTROL, "public, max-age=60")
+            .header(header::CACHE_CONTROL, "immutable")
+            .body(EdgeBody::from("body"))
+            .expect("should build upstream JS asset response");
+
+        let response = integration.finalize_asset_response(&configured_asset, upstream);
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::VARY)
+                .and_then(|value| value.to_str().ok()),
+            Some("Origin, User-Agent, Accept-Encoding")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("public, max-age=60, immutable")
+        );
+    }
+
+    #[test]
+    fn handle_maps_upstream_outcomes_and_respects_streaming_capability() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let integration = JsAssetProxyIntegration::new(config_with_assets(vec![asset(
+                "/assets/vendor.js",
+                "https://cdn.example.com/vendor.js",
+                JsAssetProxyMode::Enabled,
+            )]));
+
+            let buffered_stub = Arc::new(StubHttpClient::new());
+            buffered_stub.set_streaming_responses_supported(false);
+            buffered_stub.push_response(200, b"ok".to_vec());
+            let buffered_services = build_services_with_http_client(
+                Arc::clone(&buffered_stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let success = integration
+                .handle(
+                    &settings,
+                    &buffered_services,
+                    build_http_request(
+                        Method::GET,
+                        "https://publisher.example.com/assets/vendor.js",
+                    ),
+                )
+                .await
+                .expect("should proxy buffered asset response");
+            assert_eq!(success.status(), StatusCode::OK);
+            assert_eq!(buffered_stub.recorded_stream_response_flags(), vec![false]);
+
+            let streaming_stub = Arc::new(StubHttpClient::new());
+            streaming_stub.set_streaming_responses_supported(true);
+            streaming_stub.push_response(200, b"ok".to_vec());
+            let streaming_services = build_services_with_http_client(
+                Arc::clone(&streaming_stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let success = integration
+                .handle(
+                    &settings,
+                    &streaming_services,
+                    build_http_request(
+                        Method::GET,
+                        "https://publisher.example.com/assets/vendor.js",
+                    ),
+                )
+                .await
+                .expect("should proxy streaming asset response");
+            assert_eq!(success.status(), StatusCode::OK);
+            assert_eq!(streaming_stub.recorded_stream_response_flags(), vec![true]);
+
+            let unavailable_stub = Arc::new(StubHttpClient::new());
+            let unavailable_services = build_services_with_http_client(
+                Arc::clone(&unavailable_stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+            );
+            let unavailable = integration
+                .handle(
+                    &settings,
+                    &unavailable_services,
+                    build_http_request(
+                        Method::GET,
+                        "https://publisher.example.com/assets/vendor.js",
+                    ),
+                )
+                .await
+                .expect("should map unavailable origin response");
+            assert_eq!(unavailable.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                unavailable
+                    .headers()
+                    .get(HEADER_X_TS_ERROR)
+                    .and_then(|value| value.to_str().ok()),
+                Some(ERROR_ORIGIN_UNREACHABLE)
+            );
+
+            let status_stub = Arc::new(StubHttpClient::new());
+            status_stub.push_response(404, Vec::new());
+            let status_services = build_services_with_http_client(
+                Arc::clone(&status_stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let status = integration
+                .handle(
+                    &settings,
+                    &status_services,
+                    build_http_request(
+                        Method::GET,
+                        "https://publisher.example.com/assets/vendor.js",
+                    ),
+                )
+                .await
+                .expect("should map non-success origin response");
+            assert_eq!(status.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                status
+                    .headers()
+                    .get(HEADER_X_TS_ERROR)
+                    .and_then(|value| value.to_str().ok()),
+                Some(ERROR_ORIGIN_STATUS)
+            );
+        });
     }
 
     #[test]
