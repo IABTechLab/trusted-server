@@ -180,6 +180,12 @@ under `docs/superpowers/`, legitimately contain every retired term):
 - No release-management policy changes. The CHANGELOG's 10-month untagged
   `[Unreleased]` backlog and the governance doc's unfulfilled commitments are
   flagged for maintainers, with only mechanical repairs in scope.
+- No dedicated accessibility audit gate. The site uses the stock VitePress
+  theme with no custom interactive components; WP5 adds the pieces with
+  direct accessibility value (prose equivalents for mermaid diagrams,
+  local search, `lastUpdated` context), and anything beyond that
+  (keyboard/contrast/screen-reader smoke checks) is deliberately deferred
+  until the site carries custom components that need it.
 - Not chasing 100% rustdoc item coverage. In-code doc work targets module
   orientation (`//!`) and the highest-traffic public surfaces, not a
   `missing_docs` blanket.
