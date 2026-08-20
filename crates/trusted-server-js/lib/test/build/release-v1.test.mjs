@@ -430,6 +430,7 @@ test('generated first-display components self-register through one authenticated
           if (id === 'gpt_initial') {
             return Object.freeze({
               bindings: Object.freeze({
+                gam: function() { return true; },
                 observe: function() {},
                 register: function(protocol) {
                   window.__firstDisplayEvents.push('gpt:' + protocol.id);

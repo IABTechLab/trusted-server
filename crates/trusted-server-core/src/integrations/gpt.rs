@@ -492,14 +492,6 @@ impl IntegrationHeadInjector for GptIntegration {
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
         Vec::new()
     }
-
-    fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
-        if self.config.gam_attribution_enabled {
-            vec![("data-ts-gam-attribution", "true")]
-        } else {
-            Vec::new()
-        }
-    }
 }
 
 // Default value functions

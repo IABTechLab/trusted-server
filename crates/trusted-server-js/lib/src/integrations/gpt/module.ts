@@ -1660,6 +1660,7 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
   if (!isGptIntegrationConfigV1(context.config)) {
     throw new TypeError('GPT integration config is invalid');
   }
+  const config = context.config;
   const auction = exactCapability<ProductionAuctionCapability>(context.interfaces, 'auction.v1');
   const slotCapability = exactCapability<ProductionSlotsCapability>(context.interfaces, 'slots.v1');
   const aps = exactCapability<ProductionApsCapability>(context.interfaces, 'aps.v1');
@@ -1888,14 +1889,19 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
           : undefined;
         if (
           selected === undefined ||
+          (config.gamAttributionEnabled && !selected) ||
           (selected &&
             (!initialState ||
-              initialState.values.length !== 1 ||
-              initialState.values[0]?.[0] !== 'protocol_version' ||
-              initialState.values[0][1] !== 1))
+              initialState.values.length !== 2 ||
+              initialState.values[0]?.[0] !== 'gam' ||
+              initialState.values[0][1] !== config.gamAttributionEnabled ||
+              initialState.values[1]?.[0] !== 'v' ||
+              initialState.values[1][1] !== 1))
         ) {
           throw new TypeError('GPT first-display parser state is invalid');
         }
+      } else if (config.gamAttributionEnabled && !googletag.enqueueGamAttribution()) {
+        throw new TypeError('GPT GAM attribution is unavailable');
       }
       const diagnosticsEventRelease: { current?: () => void } = {};
       const diagnosticsRelease: { current?: () => void } = {};

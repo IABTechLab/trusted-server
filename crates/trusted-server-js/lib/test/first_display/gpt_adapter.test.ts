@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
 
 import { createFirstDisplayGoogletagBatch } from '../../src/first_display/adapters/googletag';
+import { enqueueFirstDisplayGamAttribution } from '../../src/core/adapters/gam_attribution';
 import { snapshotFirstDisplayBatchV1 } from '../../src/first_display/leaf/projection';
 
 const RESERVATION_ID = `r1_${'a'.repeat(22)}`;
@@ -156,6 +157,53 @@ function protocol() {
 }
 
 describe('first-display GPT adapter', () => {
+  it('owns enabled GAM attribution before publisher parser work without a winning bid', () => {
+    const dom = new JSDOM('<!doctype html><div id="slot-1"></div>', {
+      url: 'https://publisher.example/',
+    });
+    const commands: Array<() => void> = [];
+    const order: string[] = [];
+    const setConfig = vi.fn(() => order.push('trusted-server'));
+    Object.defineProperty(dom.window, 'tsjs', {
+      configurable: true,
+      value: { adInit: true },
+    });
+    Object.defineProperty(dom.window, 'googletag', {
+      configurable: true,
+      value: { cmd: commands, setConfig },
+      writable: true,
+    });
+    expect(enqueueFirstDisplayGamAttribution(dom.window as unknown as Window)).toBe(true);
+    commands.push(() => order.push('publisher'));
+    commands.splice(0).forEach((command) => command());
+
+    expect(order).toEqual(['trusted-server', 'publisher']);
+    expect(setConfig).toHaveBeenCalledExactlyOnceWith({ targeting: { ts: 'true' } });
+  });
+
+  it('creates an absent GPT queue and isolates a missing or throwing targeting API', () => {
+    const absent: { googletag?: unknown } = {};
+    expect(enqueueFirstDisplayGamAttribution(absent as unknown as Window)).toBe(true);
+    const created = absent.googletag as { cmd: Array<() => void> };
+    expect(created.cmd).toHaveLength(1);
+    expect(() => created.cmd[0]?.()).not.toThrow();
+
+    const publisher = vi.fn();
+    const commands: Array<() => void> = [];
+    const throwing = {
+      googletag: {
+        cmd: commands,
+        setConfig: () => {
+          throw new Error('targeting unavailable');
+        },
+      },
+    };
+    expect(enqueueFirstDisplayGamAttribution(throwing as unknown as Window)).toBe(true);
+    commands.push(publisher);
+    expect(() => commands.splice(0).forEach((command) => command())).not.toThrow();
+    expect(publisher).toHaveBeenCalledOnce();
+  });
+
   it('observes publisher GPT calls, events, and targeting until ingress closes', () => {
     const dom = new JSDOM('<!doctype html><div id="slot-1"></div>', {
       url: 'https://publisher.example/',

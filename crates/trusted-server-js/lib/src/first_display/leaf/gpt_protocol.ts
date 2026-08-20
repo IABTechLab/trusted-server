@@ -24,7 +24,8 @@ export interface FirstDisplayGptProtocolV1 {
 }
 
 interface GptInitialBindings {
-  readonly observe: (name: 'protocol_version', value: number) => void;
+  readonly gam: () => boolean;
+  readonly observe: (name: 'gam' | 'v', value: boolean | number) => void;
   readonly register: (protocol: FirstDisplayGptProtocolV1) => () => void;
 }
 
@@ -75,8 +76,11 @@ function bindings(candidate: unknown): GptInitialBindings | undefined {
     ) {
       return undefined;
     }
-    const fields = exactRecord(candidate, ['observe', 'register']);
-    return fields && typeof fields.observe === 'function' && typeof fields.register === 'function'
+    const fields = exactRecord(candidate, ['gam', 'observe', 'register']);
+    return fields &&
+      typeof fields.gam === 'function' &&
+      typeof fields.observe === 'function' &&
+      typeof fields.register === 'function'
       ? (fields as unknown as GptInitialBindings)
       : undefined;
   } catch {
@@ -135,10 +139,19 @@ function classifyRenderEnded(candidate: unknown): 'gam_empty' | 'nonempty_gam' |
 export function installGptInitial(
   candidate: unknown,
   own: FirstDisplaySliceActivationContext['own'],
-  createBatch: FirstDisplayGptBatchFactoryV1
+  createBatch: FirstDisplayGptBatchFactoryV1,
+  configCandidate: unknown
 ): Readonly<{ version: 1; id: 'gpt' }> {
   const value = bindings(candidate);
-  if (!value || typeof own !== 'function' || typeof createBatch !== 'function') {
+  const gamAttributionEnabled = (
+    configCandidate as Readonly<{ gamAttributionEnabled?: unknown }> | undefined
+  )?.gamAttributionEnabled;
+  if (
+    !value ||
+    typeof own !== 'function' ||
+    typeof createBatch !== 'function' ||
+    typeof gamAttributionEnabled !== 'boolean'
+  ) {
     throw new TypeError('tsjs');
   }
   const protocol: FirstDisplayGptProtocolV1 = Object.freeze({
@@ -158,6 +171,8 @@ export function installGptInitial(
   const release = value.register(protocol);
   if (typeof release !== 'function') throw new TypeError('tsjs');
   own(release);
-  value.observe('protocol_version', 1);
+  value.observe('gam', gamAttributionEnabled);
+  value.observe('v', 1);
+  if (gamAttributionEnabled && !value.gam()) throw new TypeError('tsjs');
   return Object.freeze({ version: 1, id: 'gpt' });
 }

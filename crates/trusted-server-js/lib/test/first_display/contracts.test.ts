@@ -81,8 +81,11 @@ function handoff(overrides: Record<string, unknown> = {}): Record<string, unknow
     parserState: [
       {
         sliceId: 'gpt_initial',
-        observations: ['protocol_version'],
-        values: [['protocol_version', 1]],
+        observations: ['gam', 'v'],
+        values: [
+          ['gam', false],
+          ['v', 1],
+        ],
       },
     ],
     gptDiagnostics: {
@@ -230,9 +233,10 @@ describe('first-display immutable contracts', () => {
           parserState: [
             {
               sliceId: 'gpt_initial',
-              observations: ['protocol_version', 'extra'],
+              observations: ['gam', 'v', 'extra'],
               values: [
-                ['protocol_version', 1],
+                ['gam', false],
+                ['v', 1],
                 ['extra', true],
               ],
             },

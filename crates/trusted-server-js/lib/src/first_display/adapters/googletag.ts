@@ -270,7 +270,7 @@ function winnerRows(projection: FirstDisplayProjectionV1): readonly Readonly<{
 }
 
 class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
-  private readonly cycles = new Map<object, ActiveCycle>();
+  private readonly cycleMap = new Map<object, ActiveCycle>();
   private readonly createdSlots = new Set<object>();
   private readonly diagnosticFacts: Readonly<FirstDisplayGptFactV1>[] = [];
   private readonly diagnosticListeners = new Map<string, (event: unknown) => void>();
@@ -354,7 +354,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       this.ingressClosed ||
       this.ingressClosing ||
       !this.started ||
-      [...this.cycles.values()].some((cycle) => !cycle.settled) ||
+      [...this.cycleMap.values()].some((cycle) => !cycle.settled) ||
       !Array.isArray(committedSlotIds)
     ) {
       return false;
@@ -363,7 +363,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     if (committed.size !== committedSlotIds.length) return false;
     const retainedSlots = new Set<object>();
     for (const slotId of committed) {
-      const matches = [...this.cycles.values()].filter((cycle) => cycle.slotId === slotId);
+      const matches = [...this.cycleMap.values()].filter((cycle) => cycle.slotId === slotId);
       if (matches.length !== 1 || !matches[0]?.settled) return false;
       retainedSlots.add(matches[0].physicalSlot);
     }
@@ -422,7 +422,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
   public captureHandoff(): readonly FirstDisplayGptHandoffCycleV1[] | undefined {
     if (this.disposed || !this.ingressClosed) return undefined;
     return Object.freeze(
-      [...this.cycles.values()].map((cycle) => {
+      [...this.cycleMap.values()].map((cycle) => {
         const targetingOwnership =
           this.sealedTargetingOwnership.get(cycle.physicalSlot) ?? Object.freeze([]);
         return Object.freeze({
@@ -444,7 +444,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     if (this.disposed || !this.ingressClosed) return undefined;
     return Object.freeze({
       cycles: Object.freeze(
-        [...this.cycles.values()].map((cycle) =>
+        [...this.cycleMap.values()].map((cycle) =>
           Object.freeze({
             nextCycleOrdinal: cycle.nextDiagnosticCycleOrdinal,
             quarantines: Object.freeze([]),
@@ -479,7 +479,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     if (requested.size !== slotIds.length) return false;
     const selected: object[] = [];
     for (const slotId of requested) {
-      const matches = [...this.cycles.values()].filter((cycle) => cycle.slotId === slotId);
+      const matches = [...this.cycleMap.values()].filter((cycle) => cycle.slotId === slotId);
       if (matches.length !== 1 || !matches[0]?.settled) return false;
       selected.push(matches[0].physicalSlot);
     }
@@ -515,7 +515,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       }
     }
     this.createdSlots.clear();
-    this.cycles.clear();
+    this.cycleMap.clear();
     this.sealedTargetingOwnership.clear();
     if (this.detachedSlots.size === 0) this.restoreCreatedBinding();
     else this.createdBinding = undefined;
@@ -653,7 +653,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         traceToken,
         unknownPriorCycle: ownership === 'publisher',
       };
-      this.cycles.set(slot, cycle);
+      this.cycleMap.set(slot, cycle);
       callbacks.onBound(
         Object.freeze({
           bid: cycle.bid,
@@ -672,7 +672,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       }
     }
 
-    for (const cycle of this.cycles.values()) {
+    for (const cycle of this.cycleMap.values()) {
       if (this.disposed || cycle.settled) continue;
       try {
         for (let index = 0; index < cycle.operations.length; index += 1) {
@@ -710,7 +710,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       if (this.disposed || this.requestedListener !== requestedListener) return;
       this.notifyNativeMutation();
       const slot = physicalSlot(member(event, 'slot'));
-      const cycle = slot ? this.cycles.get(slot) : undefined;
+      const cycle = slot ? this.cycleMap.get(slot) : undefined;
       if (!cycle) {
         if (slot) {
           this.invalidateCyclesForElement(this.readPhysicalElementId(slot), slot, callbacks);
@@ -735,7 +735,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       if (this.disposed || this.renderListener !== renderListener) return;
       this.notifyNativeMutation();
       const slot = physicalSlot(member(event, 'slot'));
-      const cycle = slot ? this.cycles.get(slot) : undefined;
+      const cycle = slot ? this.cycleMap.get(slot) : undefined;
       if (!cycle) return;
       if (cycle.settled) {
         this.captureDiagnosticFact(SLOT_RENDER_ENDED, cycle, event);
@@ -779,7 +779,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
           if (this.disposed || this.diagnosticListeners.get(eventType) !== listener) return;
           this.notifyNativeMutation();
           const slot = physicalSlot(member(event, 'slot'));
-          const cycle = slot ? this.cycles.get(slot) : undefined;
+          const cycle = slot ? this.cycleMap.get(slot) : undefined;
           if (cycle) this.captureDiagnosticFact(eventType, cycle, event);
         };
         this.diagnosticListeners.set(eventType, listener);
@@ -997,12 +997,12 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
   private snapshotDestroyedCycles(arguments_: readonly unknown[]): readonly ActiveCycle[] {
     try {
       const targets = arguments_[0];
-      if (targets === undefined) return Object.freeze([...this.cycles.values()]);
+      if (targets === undefined) return Object.freeze([...this.cycleMap.values()]);
       if (!Array.isArray(targets)) return Object.freeze([]);
       const cycles = new Set<ActiveCycle>();
       for (let index = 0; index < targets.length; index += 1) {
         const target = physicalSlot(targets[index]);
-        const cycle = target ? this.cycles.get(target) : undefined;
+        const cycle = target ? this.cycleMap.get(target) : undefined;
         if (cycle) cycles.add(cycle);
       }
       return Object.freeze([...cycles]);
@@ -1017,7 +1017,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     callbacks: FirstDisplayGoogletagBatchCallbacks
   ): void {
     if (!elementId) return;
-    for (const cycle of this.cycles.values()) {
+    for (const cycle of this.cycleMap.values()) {
       if (cycle.physicalSlot !== replacement && cycle.elementId === elementId) {
         this.retireCycle(cycle, callbacks);
       }

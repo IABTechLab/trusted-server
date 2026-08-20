@@ -9,6 +9,7 @@ import type { PreparedKernelTakeover } from '../kernel/integration_registry';
 import type { FirstDisplaySliceId } from '../kernel/release_catalog';
 import type { FirstDisplaySliceActivationContext } from '../shared/first_display_transaction';
 
+import { enqueueFirstDisplayGamAttribution } from './adapters/gam_attribution';
 import { snapshotBootstrapInputV1, type BootstrapInputSnapshotV1 } from './contracts/boot';
 import { integrationConfigValueV1 } from './contracts/integration_configs';
 import { EMBEDDED_RELEASE_ID } from './release_id';
@@ -506,7 +507,13 @@ function installBootstrap({ target, boot, outline }: BootstrapInputSnapshotV1): 
         if (protocols.get(id) === value) protocols.delete(id);
       };
     };
-    if (id === 'gpt_initial') return Object.freeze({ observe, register });
+    if (id === 'gpt_initial') {
+      return Object.freeze({
+        gam: () => enqueueFirstDisplayGamAttribution(window),
+        observe,
+        register,
+      });
+    }
     if (id === 'aps_initial') {
       return Object.freeze({ observe, publisherOrigin: location.origin, register });
     }

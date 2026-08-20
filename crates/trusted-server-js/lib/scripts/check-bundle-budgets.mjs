@@ -105,6 +105,7 @@ const CURRENT_PROVIDER_SOURCE_OWNERS = Object.freeze({
   'src/integrations/sourcepoint/consent.ts': 'sourcepoint_consent',
 });
 const CURRENT_EXACT_SOURCE_OWNERS = Object.freeze({
+  'src/core/adapters/gam_attribution.ts': 'bootstrap',
   'src/core/bootstrap.ts': 'bootstrap',
   'src/core/contracts/boot.ts': 'bootstrap',
   'src/core/contracts/integration_configs.ts': 'bootstrap',

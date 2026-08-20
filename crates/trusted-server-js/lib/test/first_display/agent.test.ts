@@ -676,8 +676,11 @@ describe('bounded first-display agent', () => {
         Object.freeze([
           Object.freeze({
             sliceId: 'gpt_initial',
-            observations: Object.freeze(['protocol_version']),
-            values: Object.freeze([Object.freeze(['protocol_version', 1] as const)]),
+            observations: Object.freeze(['gam', 'v']),
+            values: Object.freeze([
+              Object.freeze(['gam', false] as const),
+              Object.freeze(['v', 1] as const),
+            ]),
           }),
         ]),
       handoff: Object.freeze({
@@ -703,8 +706,11 @@ describe('bounded first-display agent', () => {
       parserState: [
         {
           sliceId: 'gpt_initial',
-          observations: ['protocol_version'],
-          values: [['protocol_version', 1]],
+          observations: ['gam', 'v'],
+          values: [
+            ['gam', false],
+            ['v', 1],
+          ],
         },
       ],
       attempts: [
