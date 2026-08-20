@@ -2107,7 +2107,7 @@ mod tests {
 
         let request = Request::builder()
             .method(Method::GET)
-            .uri("/integrations/aps/renderer/v1")
+            .uri("/integrations/aps/renderer/v2")
             .header(HEADER_X_TS_EC.clone(), "caller-controlled")
             .body(EdgeBody::empty())
             .expect("should build reserved APS request");
@@ -2756,7 +2756,7 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_static_transport_precomputes_every_configuration_permitted_first_display_mask() {
+    fn tsjs_static_transport_precomputes_every_size_admitted_first_display_mask() {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings
             .integrations
@@ -2786,14 +2786,8 @@ mod tests {
         let prebid = bit("prebid_initial");
         assert_eq!(
             masks,
-            vec![
-                fixed,
-                fixed | gpt,
-                fixed | gpt | aps,
-                fixed | gpt | prebid,
-                fixed | gpt | aps | prebid,
-            ],
-            "registry should enumerate every permitted participation combination"
+            vec![fixed, fixed | gpt, fixed | gpt | aps, fixed | gpt | prebid,],
+            "registry should enumerate every configuration-reachable mask admitted by the fixed transfer ceiling"
         );
         for mask in masks {
             let selected = trusted_server_js::all_first_display_ids()

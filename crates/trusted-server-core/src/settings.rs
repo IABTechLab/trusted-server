@@ -2896,7 +2896,7 @@ impl Settings {
     ) -> Result<Vec<&str>, Report<TrustedServerError>> {
         const REPRESENTATIVE_PATHS: &[&str] = &[
             "/integrations/aps",
-            "/integrations/aps/renderer/v1",
+            "/integrations/aps/renderer/v2",
             "/integrations/aps/runner.js",
         ];
         let mut patterns = Vec::new();

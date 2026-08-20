@@ -11,8 +11,6 @@ import type {
 } from '../../services/render';
 import type { ApsSlotMountBinding } from '../../services/slots';
 
-import { APS_PERMANENT_SANDBOX, generateApsDataDocumentsV1 } from './documents';
-
 const objectFreezeIntrinsic = Object.freeze;
 const objectGetPrototypeOfIntrinsic = Object.getPrototypeOf;
 const regexpTestIntrinsic = RegExp.prototype.test;
@@ -84,11 +82,12 @@ const iframeSourceGetter = directDomAvailable
   : undefined;
 
 export { parseApsRendererDescriptor, validateApsRenderer } from '../../core/contracts/aps_renderer';
-export { APS_PERMANENT_SANDBOX, generateApsDataDocumentsV1 };
 
-export const APS_RENDERER_V1_PATH = '/integrations/aps/renderer/v1';
+export const APS_RENDERER_V2_PATH = '/integrations/aps/renderer/v2';
 export const APS_RENDERER_SANDBOX =
   'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation';
+export const APS_PERMANENT_SANDBOX =
+  'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts allow-top-navigation-by-user-activation';
 
 /** Validate, copy, and freeze one APS tagged render source. */
 export function prepareApsRenderSource(
@@ -134,7 +133,7 @@ function freeze<Value extends object>(value: Value): Readonly<Value> {
   return Reflect.apply(objectFreezeIntrinsic, Object, [value]) as Readonly<Value>;
 }
 
-export function resolveApsRendererV1Url(publisherOrigin: string): string | undefined {
+export function resolveApsRendererV2Url(publisherOrigin: string): string | undefined {
   try {
     const origin = new URL(publisherOrigin);
     const loopbackHttp =
@@ -150,10 +149,10 @@ export function resolveApsRendererV1Url(publisherOrigin: string): string | undef
     ) {
       return undefined;
     }
-    const rendererUrl = new URL(APS_RENDERER_V1_PATH, origin);
+    const rendererUrl = new URL(APS_RENDERER_V2_PATH, origin);
     if (
       rendererUrl.origin !== origin.origin ||
-      rendererUrl.pathname !== APS_RENDERER_V1_PATH ||
+      rendererUrl.pathname !== APS_RENDERER_V2_PATH ||
       rendererUrl.search !== '' ||
       rendererUrl.hash !== ''
     ) {
@@ -319,11 +318,18 @@ export function mountApsTopPageAttempt(options: ApsTopPageAttemptOptions): boole
     exactDocumentOrigin = false;
   }
   const renderer = prepareApsRenderSource(sourceCandidate, publisherOrigin);
-  const rendererUrl = resolveApsRendererV1Url(publisherOrigin);
+  const rendererUrl = resolveApsRendererV2Url(publisherOrigin);
+  let creativeOrigin: string | undefined;
+  try {
+    creativeOrigin = renderer ? new URL(renderer.creativeUrl).origin : undefined;
+  } catch {
+    creativeOrigin = undefined;
+  }
   if (
     !exactDocumentOrigin ||
     !renderer ||
     !rendererUrl ||
+    !creativeOrigin ||
     (mode === 'puc_overlay' && !expectedContainerId)
   ) {
     try {
@@ -445,13 +451,6 @@ export function mountApsTopPageAttempt(options: ApsTopPageAttemptOptions): boole
 
   const bootstrapNonce = issuedBootstrap.nonce;
   const rendererNonce = issuedRenderer.nonce;
-  const documents = generateApsDataDocumentsV1({
-    renderer,
-    publisherOrigin,
-    bootstrapNonce,
-    rendererNonce,
-  });
-  if (!documents) return fail('winner_not_renderable');
 
   let iframe: HTMLIFrameElement;
   try {
@@ -922,10 +921,12 @@ export function mountApsTopPageAttempt(options: ApsTopPageAttemptOptions): boole
         return;
       }
       const navigation = JSON.stringify({
-        message: 'TS APS Bootstrap Navigate',
-        version: 1,
+        message: 'TS APS Bootstrap Configure',
+        version: 2,
         bootstrapNonce,
-        containerUrl: documents.outerUrl,
+        rendererNonce,
+        creativeOrigin,
+        tagType: renderer.tagType,
       });
       if (
         Reflect.apply(postWindowMethod, messaging, [frameSource, navigation, '*', []]) !== true ||

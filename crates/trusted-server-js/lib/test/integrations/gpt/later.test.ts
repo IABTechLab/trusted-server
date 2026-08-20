@@ -21,7 +21,7 @@ type NavigationResult =
       current: boolean;
     }>;
 
-function harness() {
+function harness(pageBidsEnabled = true) {
   const navigationGeneration = Object.freeze({});
   const navigate = vi.fn<(_path: string) => Promise<NavigationResult>>(async (_path: string) =>
     Object.freeze({ status: 'committed', navigationGeneration, current: true })
@@ -40,7 +40,7 @@ function harness() {
   });
   const prepared = createGptLaterIntegrationRegistration(RELEASE_ID).prepare(
     Object.freeze({
-      config: Object.freeze({ gamAttributionEnabled: false }),
+      config: Object.freeze({ gamAttributionEnabled: false, pageBidsEnabled }),
       interfaces,
       onDispose: (callback: () => void) => preparationDisposers.push(callback),
       signal: new AbortController().signal,
@@ -81,6 +81,27 @@ describe('GPT deferred navigation and reconciliation owner', () => {
 
     owner.preparationDisposers.reverse().forEach((release) => release());
     expect(owner.activateLaterLifecycle).not.toHaveBeenCalled();
+  });
+
+  it('owns reconciliation without installing SPA hooks when page-bids delivery is disabled', async () => {
+    vi.useFakeTimers();
+    const beforePush = Object.getOwnPropertyDescriptor(window.history, 'pushState');
+    const beforeReplace = Object.getOwnPropertyDescriptor(window.history, 'replaceState');
+    const owner = harness(false);
+
+    owner.prepared.activate(owner.activationContext);
+
+    expect(owner.activateLaterLifecycle).toHaveBeenCalledOnce();
+    expect(Object.getOwnPropertyDescriptor(window.history, 'pushState')).toEqual(beforePush);
+    expect(Object.getOwnPropertyDescriptor(window.history, 'replaceState')).toEqual(beforeReplace);
+    window.history.pushState({}, '', '/disabled-page-bids');
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    await vi.runAllTimersAsync();
+    expect(owner.navigate).not.toHaveBeenCalled();
+
+    owner.activationDisposers.reverse().forEach((release) => release());
+    expect(owner.release).toHaveBeenCalledOnce();
+    owner.preparationDisposers.reverse().forEach((release) => release());
   });
 
   it('owns one deferred history listener and coalesced navigation timer across repeated routes', async () => {

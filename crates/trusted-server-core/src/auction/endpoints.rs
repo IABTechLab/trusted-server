@@ -759,6 +759,96 @@ mod tests {
         }
     }
 
+    struct CallRecordingProvider {
+        called: Arc<Mutex<bool>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for CallRecordingProvider {
+        fn provider_name(&self) -> &'static str {
+            "call_recording_provider"
+        }
+
+        async fn request_bids(
+            &self,
+            _request: &AuctionRequest,
+            _context: &AuctionContext<'_>,
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+            *self.called.lock().expect("should lock provider call flag") = true;
+            Err(Report::new(TrustedServerError::Auction {
+                message: "call recorded".to_string(),
+            }))
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            _response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            panic!("parse_response must not run when the launch returns an error");
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            100
+        }
+
+        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
+            Some("call-recording-backend".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_creative_opportunities_do_not_disable_direct_auction() {
+        let mut settings = create_test_settings();
+        settings.creative_opportunities = Some(
+            toml::from_str("enabled = false\ngam_network_id = \"12345\"\n")
+                .expect("should build disabled creative opportunity config"),
+        );
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["call_recording_provider".to_string()],
+            timeout_ms: 2_000,
+            mediator: None,
+            ..Default::default()
+        };
+        let called = Arc::new(Mutex::new(false));
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(CallRecordingProvider {
+            called: Arc::clone(&called),
+        }));
+        let services = noop_services();
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let body = json!({
+            "adUnits": [{
+                "code": "div-gpt-ad-1",
+                "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+            }]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &ec_context,
+            &services,
+            req,
+        )
+        .await;
+
+        assert!(
+            *called.lock().expect("should lock provider call flag"),
+            "direct /auction must remain live when publisher template delivery is disabled"
+        );
+    }
+
     #[tokio::test]
     async fn auction_endpoint_consent_gate_returns_no_bid_without_contacting_providers() {
         // GDPR/unknown jurisdiction lacking effective TCF Purpose 1 must not run

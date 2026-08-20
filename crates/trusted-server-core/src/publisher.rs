@@ -1071,6 +1071,7 @@ fn configured_assembly_mode(settings: &Settings) -> AssemblyMode {
     settings
         .creative_opportunities
         .as_ref()
+        .filter(|config| config.enabled)
         .map(CreativeOpportunitiesConfig::assembly_mode)
         .unwrap_or_default()
 }
@@ -2630,17 +2631,15 @@ pub(crate) fn should_run_server_side_ad_stack(
     is_navigation: bool,
     is_prefetch: bool,
     is_bot: bool,
-    has_matched_slots: bool,
+    has_active_matched_slots: bool,
     consent_allows_auction: bool,
     auction_enabled: bool,
-    ad_templates_enabled: bool,
 ) -> bool {
-    ad_templates_enabled
-        && is_get
+    is_get
         && is_navigation
         && !is_prefetch
         && !is_bot
-        && has_matched_slots
+        && has_active_matched_slots
         && consent_allows_auction
         && auction_enabled
 }
@@ -3393,6 +3392,7 @@ pub async fn handle_publisher_request(
         settings
             .creative_opportunities
             .as_ref()
+            .filter(|co_config| co_config.enabled)
             .map_or_else(Vec::new, |co_config| {
                 match_renderable_slots(auction.slots, co_config, &request_path)
             })
@@ -3413,10 +3413,6 @@ pub async fn handle_publisher_request(
         !matched_slots.is_empty(),
         consent_allows_auction,
         auction.orchestrator.is_enabled(),
-        settings
-            .creative_opportunities
-            .as_ref()
-            .is_some_and(|config| config.enabled),
     );
     let should_run_auction = should_run_ad_stack;
     // Diagnostic: shows which gate suppresses the server-side auction. Pair with
@@ -3949,19 +3945,11 @@ pub async fn handle_publisher_request(
     if is_html_content_type(origin_content_type) {
         if should_run_ad_stack {
             enforce_synthesized_html_cache_privacy(&mut response);
-        } else {
+        } else if is_get && response.status().is_success() {
             // Server-side ad templates are inactive for this response, so the
             // document carries no per-navigation auction state and stays
             // cacheable — unless the origin already marked it private.
-            let origin_cache_control = response
-                .headers()
-                .get(header::CACHE_CONTROL)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_ascii_lowercase);
-            if !origin_cache_control
-                .as_deref()
-                .is_some_and(|value| value.contains("private") || value.contains("no-store"))
-            {
+            if !response_cache_control_is_private_or_no_store(&response) {
                 response.headers_mut().insert(
                     header::CACHE_CONTROL,
                     HeaderValue::from_static("max-age=60"),
@@ -5168,10 +5156,12 @@ pub async fn handle_page_bids(
     let path_param = normalize_page_bids_path(&requested_page);
     let page_path_and_query = normalize_page_bids_path_and_query(&requested_page);
 
-    let matched_slots = match_renderable_slots(auction.slots, co_config, &path_param);
+    let matched_slots = if co_config.enabled {
+        match_renderable_slots(auction.slots, co_config, &path_param)
+    } else {
+        Vec::new()
+    };
     let browser_slots = build_browser_slots_v1(&matched_slots, co_config, &path_param);
-
-    let matched_slots = match_renderable_slots(auction.slots, co_config, &path_param);
 
     let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
     let ec_id = ec_context.ec_value().filter(|_| ec_context.ec_allowed());
@@ -8204,6 +8194,16 @@ mod tests {
                 .expect("should parse settings with auction and creative opportunities enabled")
         }
 
+        fn settings_with_disabled_creative_opportunities() -> Settings {
+            let toml = format!(
+                "{}\n[auction]\nenabled = true\n\n\
+                 [creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\nassembly_mode = \"esi\"\n",
+                crate_test_settings_str()
+            );
+            Settings::from_toml(&toml)
+                .expect("should parse settings with creative opportunities disabled")
+        }
+
         fn settings_with_dispatching_provider() -> Settings {
             let toml = format!(
                 "{}\n[auction]\nenabled = true\nproviders = [\"{UNEXPECTED_304_PROVIDER}\"]\n\n\
@@ -8512,6 +8512,184 @@ mod tests {
                     "publisher response without matched slots should preserve {header_name}"
                 );
             }
+        }
+
+        #[tokio::test]
+        async fn disabled_creative_opportunities_keep_matching_navigation_inactive() {
+            let settings = settings_with_disabled_creative_opportunities();
+            assert_eq!(
+                configured_assembly_mode(&settings),
+                AssemblyMode::Inline,
+                "disabled template delivery must not activate configured assembly machinery"
+            );
+            let stub = Arc::new(StubHttpClient::new());
+            queue_cacheable_html_response(&stub);
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let slots = [article_slot()];
+
+            let response = run_with_slots(
+                &settings,
+                &services,
+                &slots,
+                conditional_navigation_request(),
+            )
+            .await;
+            let response_head = response_head(response);
+
+            assert_eq!(
+                stub.recorded_cache_bypass_flags(),
+                vec![false],
+                "disabled template delivery must not bypass the publisher cache"
+            );
+            assert_eq!(
+                response_head
+                    .headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("max-age=60"),
+                "disabled template delivery should use the inactive HTML policy"
+            );
+            assert_eq!(
+                response_head.headers.get(header::ETAG),
+                Some(&HeaderValue::from_static(ORIGIN_ETAG)),
+                "disabled template delivery must preserve the origin validator"
+            );
+        }
+
+        #[tokio::test]
+        async fn inactive_html_failure_preserves_origin_cache_policy() {
+            let settings = settings_with_enabled_auction_and_creative_opportunities();
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                500,
+                b"<html><body>origin failure</body></html>".to_vec(),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("cache-control", "public, max-age=300"),
+                    ("etag", ORIGIN_ETAG),
+                ],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+
+            let response =
+                run_with_slots(&settings, &services, &[], conditional_navigation_request()).await;
+            let response_head = response_head(response);
+
+            assert_eq!(response_head.status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(
+                response_head
+                    .headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("public, max-age=300"),
+                "failed publisher HTML must retain the origin cache policy"
+            );
+            assert_eq!(
+                response_head.headers.get(header::ETAG),
+                Some(&HeaderValue::from_static(ORIGIN_ETAG)),
+                "failed publisher HTML must retain origin validators"
+            );
+        }
+
+        #[tokio::test]
+        async fn inactive_html_post_preserves_origin_cache_policy() {
+            let settings = settings_with_enabled_auction_and_creative_opportunities();
+            let stub = Arc::new(StubHttpClient::new());
+            queue_cacheable_html_response(&stub);
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://ts.example.com/article")
+                .header(header::HOST, "ts.example.com")
+                .body(EdgeBody::empty())
+                .expect("should build publisher POST request");
+
+            let response = run_with_slots(&settings, &services, &[], req).await;
+            let response_head = response_head(response);
+
+            assert_eq!(response_head.status, StatusCode::OK);
+            assert_eq!(
+                response_head
+                    .headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("public, max-age=300"),
+                "non-GET publisher HTML must retain the origin cache policy"
+            );
+        }
+
+        #[tokio::test]
+        async fn inactive_html_preserves_case_insensitive_private_origin_policy() {
+            let settings = settings_with_enabled_auction_and_creative_opportunities();
+
+            for origin_policy in ["PuBlIc, PrIvAtE, max-age=300", "public, NO-STORE"] {
+                let stub = Arc::new(StubHttpClient::new());
+                stub.push_response_with_headers(
+                    200,
+                    b"<html><body>origin</body></html>".to_vec(),
+                    vec![
+                        ("content-type", "text/html; charset=utf-8"),
+                        ("cache-control", origin_policy),
+                    ],
+                );
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+
+                let response =
+                    run_with_slots(&settings, &services, &[], conditional_navigation_request())
+                        .await;
+                let response_head = response_head(response);
+
+                assert_eq!(
+                    response_head
+                        .headers
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(origin_policy),
+                    "inactive HTML must preserve origin private/no-store directives"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn inactive_html_preserves_private_policy_on_a_repeated_header_line() {
+            let settings = settings_with_enabled_auction_and_creative_opportunities();
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                b"<html><body>origin</body></html>".to_vec(),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("cache-control", "public, max-age=300"),
+                    ("cache-control", "PrIvAtE"),
+                ],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+
+            let response =
+                run_with_slots(&settings, &services, &[], conditional_navigation_request()).await;
+            let response_head = response_head(response);
+            let policies = response_head
+                .headers
+                .get_all(header::CACHE_CONTROL)
+                .iter()
+                .map(|value| value.to_str().expect("cache policy should be ASCII"))
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                policies,
+                ["public, max-age=300", "PrIvAtE"],
+                "a private directive on any origin header line must prevent the inactive rewrite"
+            );
         }
 
         #[tokio::test]
@@ -9032,7 +9210,12 @@ mod tests {
             body.contains(r#""renderTraceOverlay":true"#),
             "the exact server-owned trace cookie must populate DiagnosticsBootV1: {body}"
         );
-        assert_eq!(body.matches(r#""renderTraceOverlay""#).count(), 1);
+        assert_eq!(
+            body.matches(r#""diagnostics":{"version":1,"renderTraceOverlay":true"#)
+                .count(),
+            1,
+            "the immutable server boot must carry one active diagnostics object"
+        );
     }
 
     #[tokio::test]
@@ -9676,41 +9859,37 @@ mod tests {
     #[test]
     fn server_side_ad_stack_runs_only_when_all_auction_gates_pass() {
         assert!(
-            should_run_server_side_ad_stack(true, true, false, false, true, true, true, true),
+            should_run_server_side_ad_stack(true, true, false, false, true, true, true),
             "GET, real navigation, matched slots, and consent should run TS ad stack"
         );
 
         assert!(
-            !should_run_server_side_ad_stack(false, true, false, false, true, true, true, true),
+            !should_run_server_side_ad_stack(false, true, false, false, true, true, true),
             "non-GET requests should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, false, false, false, true, true, true, true),
+            !should_run_server_side_ad_stack(true, false, false, false, true, true, true),
             "non-document requests should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, true, false, true, true, true, true),
+            !should_run_server_side_ad_stack(true, true, true, false, true, true, true),
             "prefetch requests should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, true, true, true, true, true),
+            !should_run_server_side_ad_stack(true, true, false, true, true, true, true),
             "bot requests should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, false, true, true, true),
+            !should_run_server_side_ad_stack(true, true, false, false, false, true, true),
             "requests with no matching slots should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, true, false, true, true),
+            !should_run_server_side_ad_stack(true, true, false, false, true, false, true),
             "requests without required consent should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, true, true, false, true),
+            !should_run_server_side_ad_stack(true, true, false, false, true, true, false),
             "disabled [auction].enabled kill switch should skip TS ad stack and injection"
-        );
-        assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, true, true, true, false),
-            "disabled creative-opportunity delivery should skip publisher template work"
         );
     }
 
@@ -12892,6 +13071,15 @@ mod tests {
             Settings::from_toml(&toml).expect("should parse settings with creative_opportunities")
         }
 
+        fn settings_with_co_disabled() -> Settings {
+            let toml = format!(
+                "{}\n[auction]\nenabled = true\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
+                crate_test_settings_str()
+            );
+            Settings::from_toml(&toml)
+                .expect("should parse settings with creative opportunity delivery disabled")
+        }
+
         async fn run_page_bids(
             settings: &Settings,
             orchestrator: &AuctionOrchestrator,
@@ -13103,8 +13291,7 @@ mod tests {
 
         #[tokio::test]
         async fn empty_slots_file_returns_an_exact_empty_projection() {
-            // Spec §8 kill-switch: creative-opportunities.toml with zero slots disables
-            // all server-side auction activity and injection.
+            // An enabled configuration with no matching definitions has no work.
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let req = make_page_bids_request("/2024/01/my-article/");
@@ -13120,6 +13307,22 @@ mod tests {
                 "empty slots should produce zero bids"
             );
             assert_eq!(body["slots"], serde_json::json!([]));
+        }
+
+        #[tokio::test]
+        async fn disabled_creative_opportunities_return_an_exact_empty_projection() {
+            let settings = settings_with_co_disabled();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let slots = article_slot();
+            let req = make_page_bids_request("/2024/01/my-article/");
+
+            let body = run_page_bids_consent_allowed(&settings, &orchestrator, &slots, req).await;
+
+            assert_eq!(body["version"], 1);
+            assert_eq!(body["auction"]["version"], 1);
+            assert_eq!(body["auction"]["results"], serde_json::json!([]));
+            assert_eq!(body["slots"], serde_json::json!([]));
+            assert_eq!(body["bids"], serde_json::json!([]));
         }
 
         #[tokio::test]

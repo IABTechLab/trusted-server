@@ -117,7 +117,7 @@ function harness(kind: 'adm' | 'aps' = 'adm', onNativeMutation?: () => boolean) 
             version: 1 as const,
             id: 'aps' as const,
             publisherOrigin: 'https://publisher.example',
-            rendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
+            rendererUrl: 'https://publisher.example/integrations/aps/renderer/v2',
             sandbox:
               'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation',
             permanentSandbox:
@@ -136,16 +136,10 @@ function harness(kind: 'adm' | 'aps' = 'adm', onNativeMutation?: () => boolean) 
               typeof candidate === 'string' && /^b1_[A-Za-z0-9_-]{22}$/.test(candidate),
             isRendererNonce: (candidate: unknown): candidate is string =>
               typeof candidate === 'string' && /^n1_[A-Za-z0-9_-]{22}$/.test(candidate),
-            generateDocuments: (
-              _renderer: unknown,
-              bootstrapNonce: string,
-              rendererNonce: string
-            ) =>
+            bootstrapPolicy: () =>
               Object.freeze({
-                outerUrl:
-                  'data:text/html;charset=utf-8,' +
-                  encodeURIComponent(`rendererNonce=${rendererNonce}`) +
-                  `#${bootstrapNonce}`,
+                creativeOrigin: 'https://creative.example',
+                tagType: 'iframe' as const,
               }),
             createRenderBridge: () => {
               throw new Error('the full bridge fixture already owns construction');
@@ -317,12 +311,7 @@ function startApsDocument(h: ReturnType<typeof harness>) {
     string,
     unknown
   >;
-  const decodedOuter = decodeURIComponent(
-    (navigation.containerUrl as string)
-      .slice('data:text/html;charset=utf-8,'.length)
-      .split('#')[0] ?? ''
-  );
-  const nonce = /rendererNonce=(n1_[A-Za-z0-9_-]{22})/.exec(decodedOuter)?.[1];
+  const nonce = navigation.rendererNonce;
   if (!nonce) throw new Error('expected the renderer nonce');
   const documentPort = new FakePort();
   h.dispatch({
@@ -723,21 +712,19 @@ describe('bounded first-display render bridge', () => {
       unknown
     >;
     expect(navigation).toMatchObject({
-      message: 'TS APS Bootstrap Navigate',
-      version: 1,
+      message: 'TS APS Bootstrap Configure',
+      version: 2,
       bootstrapNonce,
-      containerUrl: expect.stringMatching(/^data:text\/html;charset=utf-8,/),
+      rendererNonce: expect.stringMatching(/^n1_[A-Za-z0-9_-]{22}$/),
+      creativeOrigin: 'https://creative.example',
+      tagType: 'iframe',
     });
+    expect(navigation).not.toHaveProperty('containerUrl');
     expect(postMessage.mock.calls[0]?.slice(1)).toEqual(['*', []]);
     expect(frame?.getAttribute('sandbox')).toBe(
       'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts allow-top-navigation-by-user-activation'
     );
-    const decodedOuter = decodeURIComponent(
-      (navigation.containerUrl as string)
-        .slice('data:text/html;charset=utf-8,'.length)
-        .split('#')[0] ?? ''
-    );
-    const nonce = /rendererNonce=(n1_[A-Za-z0-9_-]{22})/.exec(decodedOuter)?.[1];
+    const nonce = navigation.rendererNonce as string;
     expect(nonce).toMatch(/^n1_[A-Za-z0-9_-]{22}$/);
     const documentPort = new FakePort();
     h.dispatch({
@@ -804,12 +791,7 @@ describe('bounded first-display render bridge', () => {
       string,
       unknown
     >;
-    const decodedOuter = decodeURIComponent(
-      (navigation.containerUrl as string)
-        .slice('data:text/html;charset=utf-8,'.length)
-        .split('#')[0] ?? ''
-    );
-    const rendererNonce = /rendererNonce=(n1_[A-Za-z0-9_-]{22})/.exec(decodedOuter)?.[1];
+    const rendererNonce = navigation.rendererNonce;
     const documentPort = new FakePort();
     h.dispatch({
       data: JSON.stringify({

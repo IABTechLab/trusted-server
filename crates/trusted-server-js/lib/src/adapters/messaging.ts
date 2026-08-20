@@ -135,11 +135,11 @@ export const PROTOCOL_MESSAGE_SCHEMAS_V1 = Object.freeze({
     message: TSJS_MESSAGE_PROTOCOL_V1.message.apsBootstrapReady,
     version: 1,
   }),
-  apsBootstrapNavigate: schema(
+  apsBootstrapConfigure: schema(
     'global-json',
-    ['message', 'version', 'bootstrapNonce', 'containerUrl'],
-    { message: TSJS_MESSAGE_PROTOCOL_V1.message.apsBootstrapNavigate, version: 1 },
-    196_800
+    ['message', 'version', 'bootstrapNonce', 'rendererNonce', 'creativeOrigin', 'tagType'],
+    { message: TSJS_MESSAGE_PROTOCOL_V1.message.apsBootstrapConfigure, version: 2 },
+    16_384
   ),
   apsInnerReady: schema('global-json', ['message', 'version', 'rendererNonce'], {
     message: TSJS_MESSAGE_PROTOCOL_V1.message.apsInnerReady,
@@ -373,25 +373,6 @@ function exactHttpOrigin(value: unknown): value is string {
       parsed.search === '' &&
       parsed.hash === ''
     );
-  } catch {
-    return false;
-  }
-}
-
-function apsContainerUrl(value: unknown, bootstrapNonce: unknown): value is string {
-  if (
-    !capability(bootstrapNonce, 'bootstrapNonce') ||
-    !boundedString(value, 196_663, { controls: true }) ||
-    !value.startsWith('data:text/html;charset=utf-8,')
-  ) {
-    return false;
-  }
-  const suffix = `#${bootstrapNonce}`;
-  if (!value.endsWith(suffix)) return false;
-  const encoded = value.slice('data:text/html;charset=utf-8,'.length, -suffix.length);
-  if (encoded.length === 0 || encoded.includes('#')) return false;
-  try {
-    return encodeURIComponent(decodeURIComponent(encoded)) === encoded;
   } catch {
     return false;
   }
@@ -680,10 +661,13 @@ function validProtocolFields(
       );
     case 'apsBootstrapReady':
       return capability(record['bootstrapNonce'], 'bootstrapNonce');
-    case 'apsBootstrapNavigate':
+    case 'apsBootstrapConfigure':
       return (
         capability(record['bootstrapNonce'], 'bootstrapNonce') &&
-        apsContainerUrl(record['containerUrl'], record['bootstrapNonce'])
+        capability(record['rendererNonce'], 'nonce') &&
+        exactHttpOrigin(record['creativeOrigin']) &&
+        (record['creativeOrigin'] as string).startsWith('https://') &&
+        (record['tagType'] === 'iframe' || record['tagType'] === 'script')
       );
     case 'apsInnerReady':
     case 'apsInnerBind':

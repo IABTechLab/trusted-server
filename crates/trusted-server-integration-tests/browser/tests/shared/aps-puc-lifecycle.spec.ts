@@ -12,7 +12,7 @@ const GPT_FIXTURE = runtimeTsjsFixture(["render_runtime", "aps", "gpt"]);
 
 const SLOT = "puc-lifecycle-slot";
 const RESERVATION_ID = "r1_AAAAAAAAAAAAAAAAAAAAAA";
-const APS_RENDERER_URL = "https://puc.test/integrations/aps/renderer/v1";
+const APS_RENDERER_URL = "https://puc.test/integrations/aps/renderer/v2";
 const APS_RUNNER_URL = "https://puc.test/integrations/aps/runner.js";
 const FICTIONAL_APS_RUNNER = readFileSync(
   resolve(__dirname, "../../fixtures/fictional-aps-runner.js"),
@@ -104,7 +104,7 @@ async function openLifecyclePage(
 ): Promise<void> {
   await installGptStub(page);
   const rendererResponse = await page.request.get(
-    runtimeUrl("/integrations/aps/renderer/v1"),
+    runtimeUrl("/integrations/aps/renderer/v2"),
   );
   expect(rendererResponse.status()).toBe(200);
   const rendererDocument = await rendererResponse.text();

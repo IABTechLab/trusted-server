@@ -72,6 +72,7 @@ export function createGptLaterIntegrationRegistration(releaseId: string): Integr
       ) {
         throw new TypeError('GPT later capability graph is invalid');
       }
+      const pageBidsEnabled = config.pageBidsEnabled;
       return Object.freeze({
         activate: ({ onDispose }: IntegrationActivationContext) => {
           const candidateView = runtime.document.defaultView;
@@ -176,6 +177,7 @@ export function createGptLaterIntegrationRegistration(releaseId: string): Integr
             ) {
               throw new TypeError('GPT later lifecycle owner is invalid');
             }
+            if (!pageBidsEnabled) return;
             wrappedPushState = wrap(pushState);
             wrappedReplaceState = wrap(replaceState);
             Object.defineProperty(history, 'pushState', {

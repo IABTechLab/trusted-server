@@ -436,7 +436,7 @@ test('generated first-display components self-register through one authenticated
                   return function() {};
                 }
               }),
-              config: Object.freeze({gamAttributionEnabled: false})
+              config: Object.freeze({gamAttributionEnabled: false, pageBidsEnabled: false})
             });
           }
           return undefined;
@@ -720,7 +720,7 @@ test('co-bundled render_runtime and independent GPT start one branded display fl
           version: 1,
           entries: freeze([freeze({
             id: 'gpt',
-            config: freeze({ gamAttributionEnabled: false })
+            config: freeze({ gamAttributionEnabled: false, pageBidsEnabled: false })
           })])
         }),
         creative: freeze({

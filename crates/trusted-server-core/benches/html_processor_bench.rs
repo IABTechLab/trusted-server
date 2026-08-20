@@ -17,6 +17,7 @@ fn make_config() -> HtmlProcessorConfig {
         gpt_diagnostics: None,
         render_trace_overlay: false,
         suppress_datadome_client_side_tag: false,
+        body_close: BodyCloseInjection::None,
     }
 }
 

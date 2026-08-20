@@ -693,7 +693,7 @@ describe('browser messaging adapter', () => {
         admLoaded: 'TS ADM Loaded',
         admFailed: 'TS ADM Failed',
         apsBootstrapReady: 'TS APS Bootstrap Ready',
-        apsBootstrapNavigate: 'TS APS Bootstrap Navigate',
+        apsBootstrapConfigure: 'TS APS Bootstrap Configure',
         apsInnerReady: 'TS APS Inner Ready',
         apsInnerBind: 'TS APS Inner Bind',
         apsContainerReady: 'TS APS Container Ready',
@@ -773,13 +773,19 @@ describe('browser messaging adapter', () => {
     const adapter = createBrowserMessagingAdapter(createTarget());
     const bootstrapNonce = `b1_${'b'.repeat(22)}`;
     const rendererNonce = `n1_${'n'.repeat(22)}`;
-    const documentSource = '<!doctype html><p>container</p>';
-    const containerUrl = `data:text/html;charset=utf-8,${encodeURIComponent(documentSource)}#${bootstrapNonce}`;
+    const creativeOrigin = 'https://creative.example';
     const messages = [
       ['apsBootstrapReady', { message: 'TS APS Bootstrap Ready', version: 1, bootstrapNonce }],
       [
-        'apsBootstrapNavigate',
-        { message: 'TS APS Bootstrap Navigate', version: 1, bootstrapNonce, containerUrl },
+        'apsBootstrapConfigure',
+        {
+          message: 'TS APS Bootstrap Configure',
+          version: 2,
+          bootstrapNonce,
+          rendererNonce,
+          creativeOrigin,
+          tagType: 'iframe',
+        },
       ],
       ['apsInnerReady', { message: 'TS APS Inner Ready', version: 1, rendererNonce }],
       ['apsInnerBind', { message: 'TS APS Inner Bind', version: 1, rendererNonce }],
@@ -801,46 +807,46 @@ describe('browser messaging adapter', () => {
     }
     expect(
       adapter.parseProtocolMessage(
-        'apsBootstrapNavigate',
-        `{"message":"TS APS Bootstrap Navigate","version":1,"bootstrapNonce":"${bootstrapNonce}","bootstrapNonce":"${bootstrapNonce}","containerUrl":${JSON.stringify(containerUrl)}}`
+        'apsBootstrapConfigure',
+        `{"message":"TS APS Bootstrap Configure","version":2,"bootstrapNonce":"${bootstrapNonce}","bootstrapNonce":"${bootstrapNonce}","rendererNonce":"${rendererNonce}","creativeOrigin":"${creativeOrigin}","tagType":"iframe"}`
       )
     ).toBeUndefined();
     expect(
       adapter.parseProtocolMessage(
-        'apsBootstrapNavigate',
+        'apsBootstrapConfigure',
         JSON.stringify({
-          message: 'TS APS Bootstrap Navigate',
-          version: 1,
+          message: 'TS APS Bootstrap Configure',
+          version: 2,
           bootstrapNonce,
-          containerUrl: `${containerUrl}x`,
+          rendererNonce,
+          creativeOrigin: 'http://creative.example',
+          tagType: 'iframe',
         })
       )
     ).toBeUndefined();
-    const dataPrefix = 'data:text/html;charset=utf-8,';
-    const nonceSuffix = `#${bootstrapNonce}`;
-    const boundaryUrl = `${dataPrefix}${'a'.repeat(
-      196_663 - dataPrefix.length - nonceSuffix.length
-    )}${nonceSuffix}`;
-    expect(new TextEncoder().encode(boundaryUrl)).toHaveLength(196_663);
     expect(
       adapter.parseProtocolMessage(
-        'apsBootstrapNavigate',
+        'apsBootstrapConfigure',
         JSON.stringify({
-          message: 'TS APS Bootstrap Navigate',
-          version: 1,
+          message: 'TS APS Bootstrap Configure',
+          version: 2,
           bootstrapNonce,
-          containerUrl: boundaryUrl,
+          rendererNonce,
+          creativeOrigin,
+          tagType: 'script',
         })
       )
     ).toBeDefined();
     expect(
       adapter.parseProtocolMessage(
-        'apsBootstrapNavigate',
+        'apsBootstrapConfigure',
         JSON.stringify({
-          message: 'TS APS Bootstrap Navigate',
-          version: 1,
+          message: 'TS APS Bootstrap Configure',
+          version: 2,
           bootstrapNonce,
-          containerUrl: `${boundaryUrl.slice(0, -nonceSuffix.length)}a${nonceSuffix}`,
+          rendererNonce,
+          creativeOrigin,
+          tagType: 'image',
         })
       )
     ).toBeUndefined();
@@ -1081,7 +1087,7 @@ describe('browser messaging adapter', () => {
     expect(
       adapter.parseProtocolMessage('apsTopMountStarted', {
         ...message,
-        rendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
+        rendererUrl: 'https://publisher.example/integrations/aps/renderer/v2',
       })
     ).toBeUndefined();
   });
@@ -1096,7 +1102,7 @@ describe('browser messaging adapter', () => {
     });
     const adapter = createBrowserMessagingAdapter(createTarget(), {
       expectedPublisherOrigin: 'https://publisher.example',
-      expectedRendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
+      expectedRendererUrl: 'https://publisher.example/integrations/aps/renderer/v2',
       validateApsRenderer: validator,
     });
     const parsed = adapter.parseProtocolMessage('apsEnvelope', {
@@ -1118,7 +1124,7 @@ describe('browser messaging adapter', () => {
     const validator = vi.fn(() => true);
     const adapter = createBrowserMessagingAdapter(createTarget(), {
       expectedPublisherOrigin: 'https://publisher.example',
-      expectedRendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
+      expectedRendererUrl: 'https://publisher.example/integrations/aps/renderer/v2',
       validateApsRenderer: validator,
     });
     const parse = (renderer: unknown) =>

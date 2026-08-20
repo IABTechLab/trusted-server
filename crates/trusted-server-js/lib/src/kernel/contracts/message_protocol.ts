@@ -15,7 +15,7 @@ export const TSJS_MESSAGE_PROTOCOL_V1 = Object.freeze({
     admLoaded: 'TS ADM Loaded' as const,
     admFailed: 'TS ADM Failed' as const,
     apsBootstrapReady: 'TS APS Bootstrap Ready' as const,
-    apsBootstrapNavigate: 'TS APS Bootstrap Navigate' as const,
+    apsBootstrapConfigure: 'TS APS Bootstrap Configure' as const,
     apsInnerReady: 'TS APS Inner Ready' as const,
     apsInnerBind: 'TS APS Inner Bind' as const,
     apsContainerReady: 'TS APS Container Ready' as const,

@@ -9,6 +9,13 @@ import type { FirstDisplayApsProtocolV1 } from './leaf/aps_protocol';
 
 const ADM_SANDBOX =
   'allow-forms allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation';
+const RENDERER_DOCUMENT_NO_LOAD = 'renderer_document_no_load';
+const INTERNAL_ERROR = 'internal_error';
+const RUNNER_FAILED = 'runner_failed';
+const ADM_DOCUMENT_NO_LOAD = 'adm_document_no_load';
+const WINNER_NOT_RENDERABLE = 'winner_not_renderable';
+const NAVIGATION_DISPOSED = 'navigation_disposed';
+const SLOT_UNRESOLVED = 'slot_unresolved';
 const CLAIM_DEADLINE_MS = 3_000;
 const ADM_LOAD_DEADLINE_MS = 5_000;
 const TICKET_TTL_MS = 3_000;
@@ -62,7 +69,6 @@ interface Attempt {
   readonly onTerminal: (result: 'accepted' | 'failed' | 'cancelled', reason: string | null) => void;
   readonly reservationId: string;
   active: boolean;
-  apsContainerUrl: string | undefined;
   bootstrapNavigated: boolean;
   bootstrapNonce: string | undefined;
   bootstrapSource: object | undefined;
@@ -89,7 +95,11 @@ interface Attempt {
   rendererNonce: string | undefined;
   ownerSource: object | undefined;
   pendingDocumentTerminal:
-    'completed' | 'winner_not_renderable' | 'runner_no_load' | 'runner_failed' | undefined;
+    | 'completed'
+    | typeof WINNER_NOT_RENDERABLE
+    | 'runner_no_load'
+    | typeof RUNNER_FAILED
+    | undefined;
   phaseValue:
     | 'waiting_for_gam_and_claim'
     | 'waiting_for_owner'
@@ -839,7 +849,6 @@ export function createFirstDisplayRenderBridge(
     attempt.bootstrapNavigated = false;
     attempt.bootstrapNonce = undefined;
     attempt.bootstrapSource = undefined;
-    attempt.apsContainerUrl = undefined;
     attempt.rendererNonce = undefined;
     retireTicket(attempt);
     retireReservation(attempt);
@@ -880,7 +889,7 @@ export function createFirstDisplayRenderBridge(
   const settle = (
     attempt: Attempt,
     result: 'accepted' | 'failed' | 'cancelled',
-    reason = result === 'cancelled' ? 'navigation_disposed' : 'internal_error'
+    reason = result === 'cancelled' ? NAVIGATION_DISPOSED : INTERNAL_ERROR
   ): boolean => {
     if (!attempt.active) return false;
     attempt.active = false;
@@ -1023,33 +1032,36 @@ export function createFirstDisplayRenderBridge(
       const inspection = inspectPorts(event, messageEventPrototype);
       if (!inspection?.exact || inspection.originalCount !== 0 || inspection.ports.length !== 0) {
         for (const port of inspection?.ports ?? []) closePort(port);
-        fail(attempt, 'renderer_document_no_load');
+        fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
         return true;
       }
       const aps = apsProtocol();
       if (!aps || attempt.bootstrapNavigated || !exactApsFrame(attempt, false)) {
-        fail(attempt, 'renderer_document_no_load');
+        fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
         return true;
       }
-      const containerUrl = attempt.apsContainerUrl;
-      if (!containerUrl) {
-        fail(attempt, 'winner_not_renderable');
+      const rendererNonce = attempt.rendererNonce;
+      const policy = aps.bootstrapPolicy(attempt.cycle.bid.renderSource);
+      if (!rendererNonce || !policy) {
+        fail(attempt, WINNER_NOT_RENDERABLE);
         return true;
       }
       try {
         attempt.directFrame?.setAttribute('sandbox', aps.permanentSandbox);
       } catch {
-        fail(attempt, 'renderer_document_no_load');
+        fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
         return true;
       }
       const navigation = JSON.stringify({
-        message: 'TS APS Bootstrap Navigate',
-        version: 1,
+        message: 'TS APS Bootstrap Configure',
+        version: 2,
         bootstrapNonce,
-        containerUrl,
+        rendererNonce,
+        creativeOrigin: policy.creativeOrigin,
+        tagType: policy.tagType,
       });
       if (!exactApsFrame(attempt, true) || !postWindow(source, navigation)) {
-        fail(attempt, 'renderer_document_no_load');
+        fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
         return true;
       }
       attempt.bootstrapNavigated = true;
@@ -1095,17 +1107,17 @@ export function createFirstDisplayRenderBridge(
       !exactApsFrame(attempt, true)
     ) {
       for (const candidate of inspection?.ports ?? []) closePort(candidate);
-      fail(attempt, 'renderer_document_no_load');
+      fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
       return true;
     }
     attempt.documentPort = port;
     attempt.documentRelease = listen(
       port,
       (portEvent) => handleApsDocument(attempt, portEvent),
-      () => fail(attempt, attempt.documentAccepted ? 'runner_failed' : 'renderer_document_no_load')
+      () => fail(attempt, attempt.documentAccepted ? RUNNER_FAILED : RENDERER_DOCUMENT_NO_LOAD)
     );
     if (!attempt.documentRelease) {
-      fail(attempt, 'renderer_document_no_load');
+      fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
       return true;
     }
     bootstrapNonces.delete(bootstrapNonce);
@@ -1120,7 +1132,7 @@ export function createFirstDisplayRenderBridge(
       }) ||
       !exactApsFrame(attempt, true)
     ) {
-      fail(attempt, 'renderer_document_no_load');
+      fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
     }
     return true;
   };
@@ -1129,12 +1141,12 @@ export function createFirstDisplayRenderBridge(
     const aps = apsProtocol();
     if (!attempt.active || !attempt.rendererNonce || !aps) return;
     if (!exactApsFrame(attempt, true)) {
-      fail(attempt, attempt.documentAccepted ? 'runner_failed' : 'renderer_document_no_load');
+      fail(attempt, attempt.documentAccepted ? RUNNER_FAILED : RENDERER_DOCUMENT_NO_LOAD);
       return;
     }
     const inspection = inspectPorts(event, messageEventPrototype);
     if (!inspection?.exact || inspection.originalCount !== 0 || inspection.ports.length !== 0) {
-      fail(attempt, attempt.documentAccepted ? 'runner_failed' : 'renderer_document_no_load');
+      fail(attempt, attempt.documentAccepted ? RUNNER_FAILED : RENDERER_DOCUMENT_NO_LOAD);
       return;
     }
     const parsed = aps.parseDocumentMessage(
@@ -1142,7 +1154,7 @@ export function createFirstDisplayRenderBridge(
       attempt.rendererNonce
     );
     if (!parsed) {
-      fail(attempt, attempt.documentAccepted ? 'runner_failed' : 'renderer_document_no_load');
+      fail(attempt, attempt.documentAccepted ? RUNNER_FAILED : RENDERER_DOCUMENT_NO_LOAD);
       return;
     }
     const acceptDocument = (): void => {
@@ -1154,10 +1166,7 @@ export function createFirstDisplayRenderBridge(
       attempt.documentAcceptancePending = false;
       clearOwnedTimer(attempt.documentTimer);
       attempt.documentTimer = undefined;
-      attempt.completionTimer = arm(
-        () => fail(attempt, 'runner_failed'),
-        aps.deadlines.completionMs
-      );
+      attempt.completionTimer = arm(() => fail(attempt, RUNNER_FAILED), aps.deadlines.completionMs);
       const pending = attempt.pendingDocumentTerminal;
       attempt.pendingDocumentTerminal = undefined;
       if (pending === 'completed') completeAps(attempt);
@@ -1176,36 +1185,36 @@ export function createFirstDisplayRenderBridge(
       if (attempt.documentAccepted) completeAps(attempt);
       else if (attempt.documentAcceptancePending && !attempt.pendingDocumentTerminal) {
         attempt.pendingDocumentTerminal = 'completed';
-      } else fail(attempt, 'renderer_document_no_load');
+      } else fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
       return;
     }
     const failureReason =
-      parsed.reason === 'descriptor_invalid' ? 'winner_not_renderable' : parsed.reason;
+      parsed.reason === 'descriptor_invalid' ? WINNER_NOT_RENDERABLE : parsed.reason;
     if (attempt.documentAccepted) fail(attempt, failureReason);
     else if (attempt.documentAcceptancePending && !attempt.pendingDocumentTerminal) {
       attempt.pendingDocumentTerminal = failureReason;
-    } else fail(attempt, 'renderer_document_no_load');
+    } else fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
   }
 
   function completeAps(attempt: Attempt): void {
     if (!attempt.active || !exactApsFrame(attempt, true)) {
-      fail(attempt, 'slot_unresolved');
+      fail(attempt, SLOT_UNRESOLVED);
       return;
     }
     if (attempt.overlay) {
       try {
         const frame = attempt.directFrame;
         if (!frame) {
-          fail(attempt, 'slot_unresolved');
+          fail(attempt, SLOT_UNRESOLVED);
           return;
         }
         frame.style.setProperty('visibility', 'visible');
         if (frame.style.getPropertyValue('visibility') !== 'visible') {
-          fail(attempt, 'internal_error');
+          fail(attempt, INTERNAL_ERROR);
           return;
         }
       } catch {
-        fail(attempt, 'internal_error');
+        fail(attempt, INTERNAL_ERROR);
         return;
       }
     }
@@ -1218,10 +1227,7 @@ export function createFirstDisplayRenderBridge(
     clearOwnedTimer(attempt.insertionTimer);
     attempt.insertionTimer = undefined;
     if (attempt.cycle.bid.renderSource.type === 'adm') {
-      attempt.documentTimer = arm(
-        () => fail(attempt, 'adm_document_no_load'),
-        ADM_LOAD_DEADLINE_MS
-      );
+      attempt.documentTimer = arm(() => fail(attempt, ADM_DOCUMENT_NO_LOAD), ADM_LOAD_DEADLINE_MS);
     } else if (attempt.documentAcceptancePending) {
       const nonce = attempt.rendererNonce;
       if (nonce) {
@@ -1233,7 +1239,7 @@ export function createFirstDisplayRenderBridge(
     } else {
       const aps = apsProtocol();
       attempt.documentTimer = arm(
-        () => fail(attempt, 'renderer_document_no_load'),
+        () => fail(attempt, RENDERER_DOCUMENT_NO_LOAD),
         aps?.deadlines.documentAcceptanceMs ?? 3_000
       );
     }
@@ -1243,7 +1249,7 @@ export function createFirstDisplayRenderBridge(
     if (!attempt.active) return;
     const ports = inspectPorts(event, messageEventPrototype);
     if (!ports?.exact || ports.originalCount !== 0 || ports.ports.length !== 0) {
-      fail(attempt, 'internal_error');
+      fail(attempt, INTERNAL_ERROR);
       return;
     }
     const data = eventField(event, 'data', messageEventPrototype);
@@ -1259,7 +1265,7 @@ export function createFirstDisplayRenderBridge(
       return;
     }
     if (attempt.cycle.bid.renderSource.type !== 'adm') {
-      fail(attempt, 'internal_error');
+      fail(attempt, INTERNAL_ERROR);
       return;
     }
     const loaded = exactRecord(data, ['message', 'version', 'lifecycleTicket']);
@@ -1277,10 +1283,10 @@ export function createFirstDisplayRenderBridge(
       loaded.version === 1 &&
       loaded.lifecycleTicket === ticket
     ) {
-      fail(attempt, 'adm_document_no_load');
+      fail(attempt, ADM_DOCUMENT_NO_LOAD);
       return;
     }
-    fail(attempt, 'adm_document_no_load');
+    fail(attempt, ADM_DOCUMENT_NO_LOAD);
   };
 
   const startOwner = (attempt: Attempt): boolean => {
@@ -1300,7 +1306,7 @@ export function createFirstDisplayRenderBridge(
         source: attempt.cycle.bid.renderSource,
       });
     }
-    if (!aps) return fail(attempt, 'winner_not_renderable');
+    if (!aps) return fail(attempt, WINNER_NOT_RENDERABLE);
     attempt.overlay = true;
     if (!renderAps(attempt)) return false;
     return (
@@ -1308,7 +1314,7 @@ export function createFirstDisplayRenderBridge(
         message: 'TS APS Top Mount Started',
         version: 1,
         lifecycleTicket: ticket,
-      }) || fail(attempt, 'internal_error')
+      }) || fail(attempt, INTERNAL_ERROR)
     );
   };
 
@@ -1356,7 +1362,7 @@ export function createFirstDisplayRenderBridge(
     } catch {
       post(responsePort, ownerRefused(attempt.reservationId));
       closePort(responsePort);
-      fail(attempt, 'internal_error');
+      fail(attempt, INTERNAL_ERROR);
       return;
     }
     attempt.ownerTicket = ticket;
@@ -1367,7 +1373,7 @@ export function createFirstDisplayRenderBridge(
       () =>
         fail(
           attempt,
-          attempt.cycle.bid.renderSource.type === 'adm' ? 'adm_document_no_load' : 'internal_error'
+          attempt.cycle.bid.renderSource.type === 'adm' ? ADM_DOCUMENT_NO_LOAD : INTERNAL_ERROR
         )
     );
     attempt.phaseValue = 'waiting_for_insertion';
@@ -1382,7 +1388,7 @@ export function createFirstDisplayRenderBridge(
     closePort(responsePort);
     closePort(channel.port2);
     if (!posted || !startOwner(attempt)) {
-      if (attempt.active) fail(attempt, 'internal_error');
+      if (attempt.active) fail(attempt, INTERNAL_ERROR);
     }
   };
 
@@ -1463,7 +1469,7 @@ export function createFirstDisplayRenderBridge(
     const posted = utf8Length(response) <= MAX_RESPONSE_BYTES && post(claim.port, response);
     closePort(claim.port);
     if (!posted || !attempt.active) {
-      if (attempt.active) fail(attempt, 'internal_error');
+      if (attempt.active) fail(attempt, INTERNAL_ERROR);
       return false;
     }
     attempt.ownerSource = claim.source;
@@ -1537,17 +1543,14 @@ export function createFirstDisplayRenderBridge(
           settle(attempt, 'accepted');
         }
       };
-      frame.onerror = () => fail(attempt, 'adm_document_no_load');
+      frame.onerror = () => fail(attempt, ADM_DOCUMENT_NO_LOAD);
       frame.srcdoc = intended;
       attempt.directFrame = frame;
-      attempt.documentTimer = arm(
-        () => fail(attempt, 'adm_document_no_load'),
-        ADM_LOAD_DEADLINE_MS
-      );
+      attempt.documentTimer = arm(() => fail(attempt, ADM_DOCUMENT_NO_LOAD), ADM_LOAD_DEADLINE_MS);
       attempt.cycle.element.appendChild(frame);
       return true;
     } catch {
-      return fail(attempt, 'adm_document_no_load');
+      return fail(attempt, ADM_DOCUMENT_NO_LOAD);
     }
   };
 
@@ -1561,42 +1564,33 @@ export function createFirstDisplayRenderBridge(
         aps.deadlines.insertionMs
       );
     }
-    if (attempt.insertionTimer === undefined) return fail(attempt, 'internal_error');
+    if (attempt.insertionTimer === undefined) return fail(attempt, INTERNAL_ERROR);
     const bootstrapNonce = issueBootstrapNonce(attempt);
     const rendererNonce = issueRendererNonce(attempt);
     if (!bootstrapNonce || !rendererNonce) return fail(attempt, 'capability_registry_full');
-    let documents: ReturnType<FirstDisplayApsProtocolV1['generateDocuments']>;
+    let policy: ReturnType<FirstDisplayApsProtocolV1['bootstrapPolicy']>;
     try {
-      documents = aps.generateDocuments(source, bootstrapNonce, rendererNonce);
+      policy = aps.bootstrapPolicy(source);
     } catch {
-      documents = undefined;
+      policy = undefined;
     }
-    if (
-      !documents ||
-      typeof documents.outerUrl !== 'string' ||
-      !documents.outerUrl.startsWith('data:text/html;charset=utf-8,') ||
-      !documents.outerUrl.endsWith('#' + bootstrapNonce) ||
-      utf8Length(documents.outerUrl) > 196_663
-    ) {
-      return fail(attempt, 'winner_not_renderable');
-    }
+    if (!policy) return fail(attempt, WINNER_NOT_RENDERABLE);
     try {
       const frame = options.document.createElement('iframe');
       configureFrame(frame, source.width, source.height, aps.sandbox, attempt.overlay);
       const intended = aps.rendererUrl + '#' + bootstrapNonce;
-      frame.onerror = () => fail(attempt, 'renderer_document_no_load');
+      frame.onerror = () => fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
       frame.src = intended;
-      attempt.apsContainerUrl = documents.outerUrl;
       attempt.directFrame = frame;
-      if (!acquireOverlayPosition(attempt)) return fail(attempt, 'slot_unresolved');
+      if (!acquireOverlayPosition(attempt)) return fail(attempt, SLOT_UNRESOLVED);
       attempt.cycle.element.appendChild(frame);
       const intendedWindow = frame.contentWindow;
-      if (!intendedWindow) return fail(attempt, 'renderer_document_no_load');
+      if (!intendedWindow) return fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
       attempt.bootstrapSource = intendedWindow;
       ownerInserted(attempt);
-      return exactApsFrame(attempt, false) || fail(attempt, 'renderer_document_no_load');
+      return exactApsFrame(attempt, false) || fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
     } catch {
-      return fail(attempt, 'renderer_document_no_load');
+      return fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
     }
   };
 
@@ -1697,7 +1691,6 @@ export function createFirstDisplayRenderBridge(
       }
       const attempt: Attempt = {
         active: true,
-        apsContainerUrl: undefined,
         bootstrapNavigated: false,
         bootstrapNonce: undefined,
         bootstrapSource: undefined,
@@ -1756,7 +1749,7 @@ export function createFirstDisplayRenderBridge(
       if (result === 'gam_empty') return renderDirectFallback(attempt);
       if (attempt.claim) return join(attempt);
       attempt.claimTimer = arm(() => fail(attempt, 'bridge_claim_timeout'), CLAIM_DEADLINE_MS);
-      return attempt.claimTimer !== undefined || fail(attempt, 'internal_error');
+      return attempt.claimTimer !== undefined || fail(attempt, INTERNAL_ERROR);
     },
     recordFailure: (cycle: FirstDisplayGptBoundCycleV1): boolean => {
       const attempt = attempts.get(cycle.bid.rendererReservationId);
@@ -1861,7 +1854,7 @@ export function createFirstDisplayRenderBridge(
         }
       }
       for (const attempt of [...attempts.values()]) {
-        if (attempt.active) settle(attempt, 'cancelled', 'navigation_disposed');
+        if (attempt.active) settle(attempt, 'cancelled', NAVIGATION_DISPOSED);
       }
       for (const handle of [...timers]) clearOwnedTimer(handle);
       if (!committedArtifactsDetached) {

@@ -714,7 +714,7 @@ describe('render_runtime provider', () => {
     };
     const renderer = vi.fn(() => true);
     const origin = window.location.origin;
-    const rendererUrl = new URL('/integrations/aps/renderer/v1', origin).href;
+    const rendererUrl = new URL('/integrations/aps/renderer/v2', origin).href;
     const validation = Object.freeze({
       expectedPublisherOrigin: origin,
       expectedRendererUrl: rendererUrl,

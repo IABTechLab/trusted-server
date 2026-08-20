@@ -1549,9 +1549,18 @@ publisher-specific. Startup fails if `{section}` is used without a valid
 `section_root`. Startup rejects a blank `gam_network_id` only when an absent
 path/default or a `{network_id}` template consumes it; static paths and
 templates without `{network_id}` do not consume it. A
-`enabled = false` explicitly disables publisher and page-bids template delivery.
-An enabled block with no slots has no templates to match, so its `gam_network_id`
-is not checked. The `enabled` key is required whenever the table is present.
+`enabled = false` explicitly disables publisher and page-bids template delivery:
+Trusted Server performs no publisher slot matching or automatic auction, injects no
+initial slot/auction projection, and does not install SPA page-bids navigation hooks.
+`/_ts/page-bids` returns the canonical empty projection. Direct `POST /auction`
+remains live under its ordinary auction and consent gates. A successful inactive
+publisher HTML `GET` receives `Cache-Control: max-age=60` unless the origin policy
+contains `private` or `no-store` (case-insensitive); origin validators and
+surrogate/CDN directives remain intact. Non-HTML, failed, and non-`GET` responses
+retain the origin cache policy. An enabled block with no slots has no templates to
+match, so its `gam_network_id` is not checked. The `enabled` key is required whenever
+the table is present, and disabling delivery does not bypass startup validation of
+its slots, assembly mode, or template-cache fields.
 
 Both knobs are config-driven, so the URL→section convention stays with the
 publisher: `section_segment` selects which segment names the section, and

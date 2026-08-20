@@ -125,7 +125,7 @@ function configProduct(id: string): string | undefined {
 
 function defaultConfig(id: string): Readonly<Record<string, unknown>> {
   if (id === 'didomi') return { proxyPath: '/integrations/didomi/sdk.js' };
-  if (id === 'gpt') return { gamAttributionEnabled: false };
+  if (id === 'gpt') return { gamAttributionEnabled: false, pageBidsEnabled: true };
   if (id === 'prebid') {
     return { accountId: 'test', timeout: 1_000, debug: false, bidders: [] };
   }
@@ -983,7 +983,7 @@ describe('Runtime bootstrap owner', () => {
     const tracePresentationCapability = Object.freeze({ attachPresentation: traceAttach });
     const gptLaterRelease = vi.fn();
     const prebidLaterRelease = vi.fn();
-    const gptConfig = { gamAttributionEnabled: true };
+    const gptConfig = { gamAttributionEnabled: true, pageBidsEnabled: true };
     const prebidConfig = { accountId: 'publisher' };
     const gptLater = Object.freeze({
       activate: vi.fn(() => gptLaterRelease),

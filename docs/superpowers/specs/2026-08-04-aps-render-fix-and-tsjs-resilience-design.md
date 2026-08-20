@@ -1556,7 +1556,7 @@ hold capacity until the 15-minute tombstone expiry as a live entry.
 
 ### 3.6 Static renderer and APS runner proxy endpoints
 
-`/integrations/aps/renderer/v1` and `/integrations/aps/runner.js` are always-reserved
+`/integrations/aps/renderer/v2` and `/integrations/aps/runner.js` are always-reserved
 Trusted Server routes. When APS is enabled, `GET` returns the local static bootstrap
 or proxies the APS-hosted creative runner respectively. When APS is disabled, `GET`
 returns a local `404 no-store`; neither route ever falls through to a publisher
@@ -1572,10 +1572,14 @@ anonymous. A configured `[[handlers]]` pattern that matches
 renderer or runner. Operator-required admission control, rate limiting, and request
 shielding live at the deployment platform.
 
-The renderer v1 response is an immutable, descriptor-free bootstrap served with a
-long-lived immutable cache policy. It is not the document that receives the bid or
-loads the runner. Its TS-created iframe initially has exactly this sandbox token set,
-serialized in this order:
+The renderer v2 response is an immutable, descriptor-free materialization bootstrap
+served with a long-lived immutable cache policy. It embeds the TS-authored outer and
+inner document templates, the generated ES5 descriptor validator, and the fixed
+same-origin runner-proxy path. It contains no attempt descriptor, concrete bid or
+creative value, vendor bytes, publisher DOM authority, or pre-navigation network
+operation. It is not the document that receives the bid or executes the runner. Its
+TS-created iframe initially has exactly this sandbox token set, serialized in this
+order:
 
 ```text
 allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation
@@ -1589,22 +1593,44 @@ response CSP is:
 default-src 'none'; sandbox allow-scripts; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'self'; form-action 'none';
 ```
 
-The bootstrap can only validate its exact `b1_` fragment nonce, receive one exact
-navigation instruction from its checked parent carrying that same
-`bootstrapNonce`, and replace its own location with the supplied
-`data:text/html;charset=utf-8,` container URL. It has no descriptor, runner, creative
-URL path, price, bid id, network capability, child frame, or publisher DOM access.
-The response also has
+The bootstrap validates its exact `b1_` fragment nonce, sends readiness only to its
+actual `parent`, and accepts one canonical JSON configuration from that exact
+`WindowProxy`, with an exact browser-reported HTTP(S) sender origin and no transferred
+ports. It has no `document.referrer` dependency, so a publisher's stricter referrer
+policy cannot disable the handshake:
+
+```ts
+{
+  message: 'TS APS Bootstrap Configure'
+  version: 2
+  bootstrapNonce: string
+  rendererNonce: string
+  creativeOrigin: string
+  tagType: 'iframe' | 'script'
+}
+```
+
+The complete configuration is capped at 16,384 UTF-8 bytes. `creativeOrigin` must
+be an exact HTTPS origin distinct from the parent, and the two nonces must have their
+exact independent `b1_` and `n1_` forms. The bootstrap then substitutes only those
+policy values into the checked templates, enforces the separate 65,536-byte document
+caps and 196,663-byte encoded-container cap, and replaces its own location with the
+fresh outer `data:text/html;charset=utf-8,` URL. It receives no descriptor and cannot
+make a runner or creative request before that navigation. The response also has
 exactly `Content-Type: text/html; charset=utf-8`,
 `Cache-Control: public, max-age=31536000, immutable`,
 `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer`. It deliberately
 omits `X-Frame-Options`; `frame-ancestors 'self'` is mandatory because both direct and
 PUC paths mount the bootstrap from the publisher top page, never beneath GAM,
 Universal Creative, or bidder content. The TS-authored container and inner renderer
-are checked-in templates encoded into per-attempt `data:` URLs by TSJS; they are not
-HTTP artifacts and contain no third-party bytes. Any shipped bootstrap body/header
-or data-document protocol change before this release updates the single v1 contract;
-after release it requires a new route/protocol version.
+remain `data:` documents rather than separately addressable HTTP artifacts and
+contain no third-party bytes. The checked-in generator materializes their source into
+the server-owned v2 response at build time; neither the first-display nor persistent
+TSJS production graph imports the document templates or generated ES5 validator.
+The abandoned renderer-v1 route is a local `404`, with no compatibility branch. Any
+shipped bootstrap body/header or data-document protocol change before this release
+updates the single v2 contract; after release it requires a new route/protocol
+version.
 
 When APS is enabled, final response privacy appends a separate
 `Content-Security-Policy: frame-ancestors 'self'` policy after operator headers. CSP
@@ -1728,7 +1754,7 @@ new CustomEvent('prebid/creative/render', {
 ```
 
 `resolve` and `reject` are the Promise's one-shot functions and are the only
-non-serializable fields. The top-page owner encodes its exact validated HTTP(S)
+non-serializable fields. The server-owned v2 materializer encodes the exact validated HTTP(S)
 Trusted Server origin and absolute `/integrations/aps/runner.js` URL into the
 TS-authored inner data document before navigation. The inner CSP permits that exact
 origin as its only external script source, and the renderer loads only that route. It creates the
@@ -1751,7 +1777,7 @@ upstream. Load failure, explicit rejection, and silence fail closed through the
 existing APS-completion deadline. A changed or compromised APS runner can invoke
 `resolve` prematurely or incorrectly; this is an accepted external-dependency risk
 that the outer renderer cannot detect. Real-browser DOM/network conformance reduces
-but does not eliminate it. V1 never loads the APS URL directly from the browser,
+but does not eliminate it. This design never loads the APS URL directly from the browser,
 executes a stored fallback, treats script `load` as completion, or uses a reusable
 global `postMessage` acknowledgement.
 
@@ -2050,7 +2076,7 @@ publisher destruction, DOM-integrity loss, or navigation disposal as applicable.
 
 The mount has three document phases:
 
-1. Create one iframe at the immutable renderer-v1 bootstrap URL with the attempt's
+1. Create one iframe at the immutable renderer-v2 bootstrap URL with the attempt's
    `b1_` bootstrap nonce in its fragment and the initial sandbox from §3.6. The
    bootstrap is publisher-origin by URL but opaque because `allow-same-origin` is
    absent. It can only send exact
@@ -2059,12 +2085,14 @@ The mount has three document phases:
 2. After exact element, parent, `src`, `WindowProxy`, generation, and bootstrap-nonce
    checks,
    add `allow-same-origin` to the sandbox and post exact
-   `{message:'TS APS Bootstrap Navigate',version:1,bootstrapNonce,containerUrl}`.
-   The URL must be the attempt-owned `data:text/html;charset=utf-8,` container with
-   that same `b1_` fragment. The previously loaded bootstrap remains opaque while it
-   performs `location.replace`; the destination is naturally opaque because it is
+   `{message:'TS APS Bootstrap Configure',version:2,bootstrapNonce,rendererNonce,creativeOrigin,tagType}`.
+   No descriptor or generated document URL crosses this channel. The bootstrap
+   verifies the exact parent, configuration, nonces, creative origin, and tag type,
+   materializes the attempt-owned outer and inner data documents, and performs
+   `location.replace`. The previously loaded bootstrap remains opaque while it
+   performs that navigation; the destination is naturally opaque because it is
    `data:`.
-3. The outer data container creates one inner data renderer whose `data:` URL
+3. The materialized outer data container creates one inner data renderer whose `data:` URL
    fragment is the independent `n1_` renderer nonce and whose permanent sandbox
    contains the §3.6 tokens plus
    `allow-same-origin`. Both final documents remain naturally opaque. After the
@@ -2186,7 +2214,7 @@ The inner renderer sends only these exact document-port messages:
   where `reason` is
   `descriptor_invalid | runner_no_load | runner_failed`.
 
-Insertion has a one-second deadline. Bootstrap readiness, data navigation,
+Insertion has a one-second deadline. Bootstrap readiness, configuration/materialization navigation,
 container-channel creation, descriptor transfer, and inner document acceptance share
 one three-second deadline from outer iframe insertion. The kernel is the sole owner
 of the ten-second APS-completion deadline beginning at inner document acceptance.
@@ -2331,12 +2359,13 @@ The shared protocol corpus fixes these bounds and encodings:
 
 - before `JSON.parse`, an inbound top-page global-dispatcher string is at most 4,096
   UTF-8 bytes; a larger value is unrecognizable and causes no property access or
-  state lookup. The distinct top-page-to-bootstrap navigation parser accepts only
-  its exact expected parent and `b1_` nonce and caps the complete JSON instruction at
-  `MAX_APS_BOOTSTRAP_NAVIGATION_MESSAGE_BYTES = 196_800`; its `containerUrl` is at
-  most 196,663 UTF-8 bytes (29-byte data prefix + worst-case 3 × 65,536-byte encoded
-  document + 26-byte `#b1_…` fragment). No other global message receives this larger
-  allowance;
+  state lookup. The distinct top-page-to-bootstrap configuration parser accepts only
+  its exact expected parent, exact `b1_`/`n1_` nonces, exact HTTPS creative origin,
+  and `iframe | script` tag type, and caps the complete canonical JSON instruction at
+  16,384 UTF-8 bytes. The bootstrap-created outer `containerUrl` never crosses that
+  channel; it is capped internally at 196,663 UTF-8 bytes (29-byte data prefix +
+  worst-case 3 × 65,536-byte encoded document + 26-byte `#b1_…` fragment). No other
+  global message receives a larger allowance;
 - a TS `adId` is exactly the 25-character `r1_` reservation form; a lifecycle ticket,
   bootstrap nonce, renderer nonce, and attempt id are exactly the respective
   25-character `t1_`, `b1_`, `n1_`, and `a1_` forms from §2.2;
@@ -2344,7 +2373,7 @@ The shared protocol corpus fixes these bounds and encodings:
   exact PUC-shape conformance and is never a fetch target or authority;
 - `publisherOrigin` is at most 2,048 UTF-8 bytes and must serialize an exact HTTP(S)
   origin with no path/query/fragment. The mount service locally derives the absolute
-  `/integrations/aps/renderer/v1` URL from that trusted origin, verifies no query or
+  `/integrations/aps/renderer/v2` URL from that trusted origin, verifies no query or
   fragment, and appends the exact `b1_` bootstrap-nonce fragment. `rendererUrl` is
   never serialized in a v4 window or port message. The generated inner `data:` URL
   independently appends its exact `n1_` renderer-nonce fragment;
@@ -4151,7 +4180,11 @@ subscription methods. The final schema is:
 ```ts
 type RenderTracePathV1 = 'auction' | 'ssat' | 'gam-refresh'
 type RenderTraceServedFromV1 =
-  'inline' | 'gam' | 'debug-adm' | 'pbs-cache' | 'prebid'
+  | 'inline'
+  | 'gam'
+  | 'debug-adm'
+  | 'pbs-cache'
+  | 'prebid'
 
 interface RenderTraceRecord {
   readonly slotId: string
@@ -4325,7 +4358,10 @@ interface GptDiagnosticsAdManagerIdentity {
 }
 
 type GptDiagnosticsResponseClass =
-  'empty' | 'backfill' | 'reservation' | 'unclassified_non_empty'
+  | 'empty'
+  | 'backfill'
+  | 'reservation'
+  | 'unclassified_non_empty'
 
 type GptDiagnosticsRequestPath =
   | 'trusted_server_direct'
@@ -4335,7 +4371,9 @@ type GptDiagnosticsRequestPath =
   | 'unattributed'
 
 type GptDiagnosticsTrustedServerOpportunity =
-  'renderable_candidate' | 'unrenderable_candidate' | 'no_candidate'
+  | 'renderable_candidate'
+  | 'unrenderable_candidate'
+  | 'no_candidate'
 
 type GptDiagnosticsCreativeFailure =
   | 'missing_render_source'

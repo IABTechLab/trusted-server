@@ -1313,10 +1313,8 @@ mod tests {
     };
     use bytes::Bytes;
     use edgezero_core::body::Body;
-    use edgezero_core::context::RequestContext;
     use edgezero_core::http::{Method, Response, StatusCode, header, request_builder};
     use edgezero_core::key_value_store::NoopKvStore;
-    use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Mutex;
@@ -1471,7 +1469,7 @@ mod tests {
     #[cfg(feature = "aps-runner-proxy-integration-test")]
     #[test]
     fn aps_cutover_renderer_and_family_failures_are_local() {
-        let response = route_reserved(empty_request(Method::GET, "/integrations/aps/renderer/v1"));
+        let response = route_reserved(empty_request(Method::GET, "/integrations/aps/renderer/v2"));
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers()[header::CONTENT_TYPE],
@@ -1485,9 +1483,9 @@ mod tests {
         let body = response.into_body().into_bytes().unwrap_or_default();
         let body = std::str::from_utf8(&body).expect("renderer should be UTF-8");
         assert!(body.contains("TS APS Bootstrap Ready"));
-        assert!(!body.contains("/integrations/aps/runner.js"));
-        assert!(!body.contains("aaxResponse"));
-        assert!(!body.contains("creativeUrl"));
+        assert!(body.contains("TS APS Bootstrap Configure"));
+        assert!(body.contains("/integrations/aps/runner.js"));
+        assert!(body.contains("data:text/html;charset=utf-8,"));
         assert!(!body.contains("client.aps.amazon-adsystem.com"));
 
         for (method, path, expected) in [
@@ -1498,17 +1496,17 @@ mod tests {
             ),
             (
                 Method::TRACE,
-                "/integrations/aps/renderer/v1",
+                "/integrations/aps/renderer/v2",
                 StatusCode::METHOD_NOT_ALLOWED,
             ),
             (
                 Method::CONNECT,
-                "/integrations/aps/renderer/v1",
+                "/integrations/aps/renderer/v2",
                 StatusCode::METHOD_NOT_ALLOWED,
             ),
             (
                 Method::from_bytes(b"PROPFIND").expect("PROPFIND should be a valid method"),
-                "/integrations/aps/renderer/v1",
+                "/integrations/aps/renderer/v2",
                 StatusCode::METHOD_NOT_ALLOWED,
             ),
             (
@@ -1518,7 +1516,7 @@ mod tests {
             ),
             (
                 Method::GET,
-                "/integrations/aps/renderer/v2",
+                "/integrations/aps/renderer/v1",
                 StatusCode::NOT_FOUND,
             ),
             (

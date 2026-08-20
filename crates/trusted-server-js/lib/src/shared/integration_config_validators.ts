@@ -75,9 +75,19 @@ function frozenStringArray(candidate: unknown): candidate is readonly string[] {
   }
 }
 
-export function isGptIntegrationConfigV1(candidate: unknown): boolean {
-  const config = exactFrozenRecord(candidate, ['gamAttributionEnabled']);
-  return typeof config?.gamAttributionEnabled === 'boolean';
+export interface GptIntegrationConfigV1 {
+  readonly gamAttributionEnabled: boolean;
+  readonly pageBidsEnabled: boolean;
+}
+
+export function isGptIntegrationConfigV1(
+  candidate: unknown
+): candidate is Readonly<GptIntegrationConfigV1> {
+  const config = exactFrozenRecord(candidate, ['gamAttributionEnabled', 'pageBidsEnabled']);
+  return (
+    typeof config?.gamAttributionEnabled === 'boolean' &&
+    typeof config.pageBidsEnabled === 'boolean'
+  );
 }
 
 export function isDidomiIntegrationConfigV1(candidate: unknown): boolean {

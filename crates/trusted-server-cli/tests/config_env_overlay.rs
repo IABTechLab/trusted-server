@@ -44,11 +44,12 @@ fn migrated_legacy_project() -> MigratedProject {
     let mut document = LEGACY_CONFIG
         .parse::<DocumentMut>()
         .expect("should parse legacy integration config");
-    // EdgeZero v0.0.4 environment overlays cannot create missing TOML leaves,
-    // so a migrated config must carry both creative-processing leaves for the
-    // corresponding environment variables to take effect.
+    // EdgeZero environment overlays cannot create missing TOML leaves, so a
+    // migrated config must carry every leaf that an environment variable can
+    // override.
     document["auction"]["rewrite_creatives"] = value(true);
     document["auction"]["sanitize_creatives"] = value(false);
+    document["integrations"]["gpt"]["gam_attribution_enabled"] = value(false);
     fs::write(&config_path, document.to_string()).expect("should write migrated config");
     fs::write(&manifest_path, MANIFEST).expect("should write test manifest");
     MigratedProject {
@@ -152,7 +153,7 @@ fn migrated_legacy_config_applies_gam_attribution_environment_override() {
     assert_eq!(
         envelope["data"]["integrations"]["gpt"]["gam_attribution_enabled"],
         serde_json::Value::Bool(true),
-        "pushed config should contain the GAM attribution environment override"
+        "pushed config should contain the GAM attribution environment override: {envelope}"
     );
 }
 

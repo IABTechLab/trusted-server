@@ -83,7 +83,7 @@ test.describe("protected real-GAM test network", () => {
     ).toBe("third-party");
     expect(
       classifyRealGamNetworkUrl(
-        "https://third-party.example/integrations/aps/renderer/v1",
+        "https://third-party.example/integrations/aps/renderer/v2",
         pageOrigin,
       ),
     ).toBe("third-party");

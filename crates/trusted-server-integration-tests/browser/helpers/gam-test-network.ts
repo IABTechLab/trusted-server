@@ -14,7 +14,7 @@ import {
 type BrowserName = "chromium" | "firefox" | "webkit";
 
 const RELEASE_ID_PATTERN = /^[0-9a-f]{64}$/u;
-const APS_RENDERER_PATH = "/integrations/aps/renderer/v1";
+const APS_RENDERER_PATH = "/integrations/aps/renderer/v2";
 const APS_RUNNER_PATH = "/integrations/aps/runner.js";
 const EVIDENCE_ROOT = resolve(__dirname, "../real-gam-evidence");
 const TERMINAL_STATE = "terminal";

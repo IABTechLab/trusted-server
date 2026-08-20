@@ -1355,7 +1355,7 @@ mod tests {
         let config_path = temp.path().join("trusted-server.toml");
         fs::write(
             &config_path,
-            "[creative_opportunities]\ngam_network_id = \"111\"\n",
+            "[creative_opportunities]\nenabled = true\ngam_network_id = \"111\"\n",
         )
         .expect("should write config");
         // The requested URL redirects; slots are scraped from the final page.
@@ -1408,7 +1408,7 @@ mod tests {
     fn update_slots_rejects_invalid_page_pattern_without_touching_config() {
         let temp = TempDir::new().expect("should create temp dir");
         let config_path = temp.path().join("trusted-server.toml");
-        let original = "[creative_opportunities]\ngam_network_id = \"111\"\n";
+        let original = "[creative_opportunities]\nenabled = true\ngam_network_id = \"111\"\n";
         fs::write(&config_path, original).expect("should write config");
         let collector = FakeCollector::new(collected_page_with_header_slot());
         let mut out = Vec::new();
@@ -1448,7 +1448,7 @@ mod tests {
         let config_path = temp.path().join("trusted-server.toml");
         fs::write(
             &config_path,
-            "[creative_opportunities]\ngam_network_id = \"111\"\n",
+            "[creative_opportunities]\nenabled = true\ngam_network_id = \"111\"\n",
         )
         .expect("should write config");
         let collector = FakeCollector::new(collected_page_with_header_slot());
@@ -1484,7 +1484,7 @@ mod tests {
         let config_path = temp.path().join("trusted-server.toml");
         fs::write(
             &config_path,
-            "[creative_opportunities]\ngam_network_id = \"111\"\n",
+            "[creative_opportunities]\nenabled = true\ngam_network_id = \"111\"\n",
         )
         .expect("should write config");
         let collector = FakeCollector::new(collected_page_with_header_slot());

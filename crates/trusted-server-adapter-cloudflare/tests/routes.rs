@@ -124,7 +124,7 @@ fn routes_build_without_panic() {
 async fn aps_cutover_renderer_and_family_failures_are_local() {
     let renderer = request_builder()
         .method("GET")
-        .uri("/integrations/aps/renderer/v1")
+        .uri("/integrations/aps/renderer/v2")
         .header("authorization", "Bearer must-not-reach-publisher")
         .body(edgezero_core::body::Body::empty())
         .expect("should build APS renderer request");
@@ -142,18 +142,18 @@ async fn aps_cutover_renderer_and_family_failures_are_local() {
     let body = response.into_body().into_bytes().unwrap_or_default();
     let body = std::str::from_utf8(&body).expect("renderer should be UTF-8");
     assert!(body.contains("TS APS Bootstrap Ready"));
-    assert!(!body.contains("/integrations/aps/runner.js"));
-    assert!(!body.contains("aaxResponse"));
-    assert!(!body.contains("creativeUrl"));
+    assert!(body.contains("TS APS Bootstrap Configure"));
+    assert!(body.contains("/integrations/aps/runner.js"));
+    assert!(body.contains("data:text/html;charset=utf-8,"));
     assert!(!body.contains("client.aps.amazon-adsystem.com"));
 
     for (method, path, expected) in [
         ("POST", "/integrations/aps/runner.js", 405),
-        ("TRACE", "/integrations/aps/renderer/v1", 405),
-        ("CONNECT", "/integrations/aps/renderer/v1", 405),
-        ("PROPFIND", "/integrations/aps/renderer/v1", 405),
+        ("TRACE", "/integrations/aps/renderer/v2", 405),
+        ("CONNECT", "/integrations/aps/renderer/v2", 405),
+        ("PROPFIND", "/integrations/aps/renderer/v2", 405),
         ("GET", "/integrations/aps/renderer", 404),
-        ("GET", "/integrations/aps/renderer/v2", 404),
+        ("GET", "/integrations/aps/renderer/v1", 404),
         ("GET", "/integrations/aps/runner/v1.js", 404),
         ("GET", "/integrations/aps", 404),
     ] {

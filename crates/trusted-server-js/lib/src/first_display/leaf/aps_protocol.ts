@@ -1,5 +1,4 @@
 import type { FirstDisplaySliceActivationContext } from '../../shared/first_display_transaction';
-import { generateApsDataDocumentsV1 } from '../../shared/aps_documents';
 import {
   createFirstDisplayRenderBridge,
   type FirstDisplayRenderBridgeOptionsV1,
@@ -14,8 +13,9 @@ export type FirstDisplayApsDocumentMessageV1 =
       reason: 'descriptor_invalid' | 'runner_no_load' | 'runner_failed';
     }>;
 
-export interface FirstDisplayApsDocumentsV1 {
-  readonly outerUrl: string;
+export interface FirstDisplayApsBootstrapPolicyV2 {
+  readonly creativeOrigin: string;
+  readonly tagType: 'iframe' | 'script';
 }
 
 export interface FirstDisplayApsProtocolV1 {
@@ -35,11 +35,9 @@ export interface FirstDisplayApsProtocolV1 {
   readonly isLifecycleTicket: (candidate: unknown) => candidate is string;
   readonly isBootstrapNonce: (candidate: unknown) => candidate is string;
   readonly isRendererNonce: (candidate: unknown) => candidate is string;
-  readonly generateDocuments: (
-    renderer: unknown,
-    bootstrapNonce: string,
-    rendererNonce: string
-  ) => Readonly<FirstDisplayApsDocumentsV1> | undefined;
+  readonly bootstrapPolicy: (
+    renderer: unknown
+  ) => Readonly<FirstDisplayApsBootstrapPolicyV2> | undefined;
   readonly parseDocumentMessage: (
     candidate: unknown,
     expectedNonce: string
@@ -172,6 +170,63 @@ function parseDocumentMessage(
   return undefined;
 }
 
+function bootstrapPolicy(
+  candidate: unknown,
+  publisherOrigin: string
+): Readonly<FirstDisplayApsBootstrapPolicyV2> | undefined {
+  try {
+    const renderer = exactRecord(
+      candidate,
+      Object.prototype.hasOwnProperty.call(candidate, 'creativeId')
+        ? [
+            'aaxResponse',
+            'accountId',
+            'bidId',
+            'creativeId',
+            'creativeUrl',
+            'height',
+            'tagType',
+            'type',
+            'version',
+            'width',
+          ]
+        : [
+            'aaxResponse',
+            'accountId',
+            'bidId',
+            'creativeUrl',
+            'height',
+            'tagType',
+            'type',
+            'version',
+            'width',
+          ]
+    );
+    if (
+      !renderer ||
+      renderer.type !== 'aps' ||
+      renderer.version !== 1 ||
+      (renderer.tagType !== 'iframe' && renderer.tagType !== 'script') ||
+      typeof renderer.creativeUrl !== 'string'
+    ) {
+      return undefined;
+    }
+    const creative = new URL(renderer.creativeUrl);
+    if (
+      creative.protocol !== 'https:' ||
+      creative.hostname === '' ||
+      creative.username !== '' ||
+      creative.password !== '' ||
+      creative.origin === publisherOrigin
+    ) {
+      return undefined;
+    }
+    return Object.freeze({ creativeOrigin: creative.origin, tagType: renderer.tagType });
+  } catch {
+    return undefined;
+  }
+}
+
 /** Register the exact APS reservation identity and renderer-document protocol. */
 export function installApsInitial(
   candidate: unknown,
@@ -179,7 +234,7 @@ export function installApsInitial(
 ): Readonly<{ version: 1; id: 'aps' }> {
   const value = bindings(candidate);
   if (!value || typeof own !== 'function') throw new TypeError('tsjs');
-  const rendererUrl = new URL('/integrations/aps/renderer/v1', value.publisherOrigin).href;
+  const rendererUrl = new URL('/integrations/aps/renderer/v2', value.publisherOrigin).href;
   const protocol: FirstDisplayApsProtocolV1 = Object.freeze({
     version: 1,
     id: 'aps',
@@ -197,15 +252,7 @@ export function installApsInitial(
     isLifecycleTicket: (input: unknown): input is string => exactOpaqueId(input, 't1_'),
     isBootstrapNonce: (input: unknown): input is string => exactOpaqueId(input, 'b1_'),
     isRendererNonce: (input: unknown): input is string => exactOpaqueId(input, 'n1_'),
-    generateDocuments: (renderer: unknown, bootstrapNonce: string, rendererNonce: string) => {
-      const documents = generateApsDataDocumentsV1({
-        renderer,
-        publisherOrigin: value.publisherOrigin,
-        bootstrapNonce,
-        rendererNonce,
-      });
-      return documents ? Object.freeze({ outerUrl: documents.outerUrl }) : undefined;
-    },
+    bootstrapPolicy: (renderer: unknown) => bootstrapPolicy(renderer, value.publisherOrigin),
     parseDocumentMessage,
     createRenderBridge: (options: Omit<FirstDisplayRenderBridgeOptionsV1, 'getAps'>) =>
       createFirstDisplayRenderBridge({ ...options, getAps: () => protocol }),

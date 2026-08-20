@@ -40,7 +40,7 @@ use crate::platform::{
 use crate::settings::{IntegrationConfig, Settings};
 
 const APS_INTEGRATION_ID: &str = "aps";
-pub const APS_RENDERER_V1_ROUTE: &str = "/integrations/aps/renderer/v1";
+pub const APS_RENDERER_V2_ROUTE: &str = "/integrations/aps/renderer/v2";
 pub const APS_RUNNER_ROUTE: &str = "/integrations/aps/runner.js";
 pub const APS_RUNNER_UPSTREAM_URL: &str =
     "https://client.aps.amazon-adsystem.com/prebid-creative.js";
@@ -68,11 +68,11 @@ pub const APS_RUNNER_BLOCKING_READ_TIMEOUT: Duration = Duration::from_millis(250
 pub fn is_aps_family_path(path: &str) -> bool {
     path == "/integrations/aps" || path.starts_with("/integrations/aps/")
 }
-const APS_RENDERER_V1_CSP: &str = "default-src 'none'; sandbox allow-scripts; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'self'; form-action 'none';";
+const APS_RENDERER_V2_CSP: &str = "default-src 'none'; sandbox allow-scripts; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'self'; form-action 'none';";
 
-// This document is served with an immutable v1 URL. Any semantic change must
-// ship at a new versioned route so cached v1 bytes retain their contract.
-const APS_RENDERER_V1_DOCUMENT: &str = include_str!("generated/aps_renderer_bootstrap_v1.html");
+// This document is served with an immutable v2 URL. Any semantic change must
+// ship at a new versioned route so cached v2 bytes retain their contract.
+const APS_RENDERER_V2_DOCUMENT: &str = include_str!("generated/aps_renderer_bootstrap_v2.html");
 
 /// Configuration for the APS `OpenRTB` integration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -1251,11 +1251,11 @@ impl ApsV1Integration {
             .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
             .header("x-content-type-options", "nosniff")
             .header("referrer-policy", "no-referrer")
-            .header(header::CONTENT_SECURITY_POLICY, APS_RENDERER_V1_CSP)
-            .body(EdgeBody::from(APS_RENDERER_V1_DOCUMENT))
+            .header(header::CONTENT_SECURITY_POLICY, APS_RENDERER_V2_CSP)
+            .body(EdgeBody::from(APS_RENDERER_V2_DOCUMENT))
             .change_context(TrustedServerError::Integration {
                 integration: APS_INTEGRATION_ID.to_string(),
-                message: "Failed to build APS renderer v1 response".to_string(),
+                message: "Failed to build APS renderer v2 response".to_string(),
             })
             .map(Self::mark_exact_headers)
     }
@@ -1462,7 +1462,7 @@ impl IntegrationProxy for ApsV1Integration {
             return Self::local_status(StatusCode::METHOD_NOT_ALLOWED, true);
         }
         match path {
-            APS_RENDERER_V1_ROUTE => Self::renderer_response(),
+            APS_RENDERER_V2_ROUTE => Self::renderer_response(),
             APS_RUNNER_ROUTE => match Self::runner_response(services).await {
                 Ok(response) => Ok(response),
                 Err(reason) => {
@@ -3276,7 +3276,7 @@ mod tests {
         let settings = create_test_settings();
         let services = noop_services();
 
-        for path in [APS_RENDERER_V1_ROUTE, APS_RUNNER_ROUTE] {
+        for path in [APS_RENDERER_V2_ROUTE, APS_RUNNER_ROUTE] {
             let disabled_get = http::Request::builder()
                 .method(Method::GET)
                 .uri(path)
@@ -3334,9 +3334,9 @@ mod tests {
 
         for path in [
             "/integrations/aps/renderer",
-            "/integrations/aps/renderer/v2",
+            "/integrations/aps/renderer/v1",
             "/integrations/aps/runner/v1.js",
-            "/integrations/aps/renderer/v1/extra",
+            "/integrations/aps/renderer/v2/extra",
             "/integrations/aps/not-a-route",
         ] {
             let request = http::Request::builder()
@@ -3355,7 +3355,7 @@ mod tests {
     #[test]
     fn aps_family_classifier_has_an_exact_segment_boundary() {
         assert!(is_aps_family_path("/integrations/aps"));
-        assert!(is_aps_family_path("/integrations/aps/renderer/v1"));
+        assert!(is_aps_family_path("/integrations/aps/renderer/v2"));
         assert!(!is_aps_family_path("/integrations/apsx"));
         assert!(!is_aps_family_path("/integrations/ap"));
     }
@@ -3365,7 +3365,7 @@ mod tests {
         let integration = ApsV1Integration { enabled: true };
         let request = http::Request::builder()
             .method(Method::GET)
-            .uri(APS_RENDERER_V1_ROUTE)
+            .uri(APS_RENDERER_V2_ROUTE)
             .body(EdgeBody::empty())
             .expect("should build versioned renderer request");
         let response = futures::executor::block_on(integration.handle(
@@ -3388,11 +3388,11 @@ mod tests {
         assert_eq!(response.headers()["referrer-policy"], "no-referrer");
         assert_eq!(
             response.headers()[header::CONTENT_SECURITY_POLICY],
-            APS_RENDERER_V1_CSP
+            APS_RENDERER_V2_CSP
         );
         assert!(!response.headers().contains_key("x-frame-options"));
         assert_eq!(
-            APS_RENDERER_V1_CSP,
+            APS_RENDERER_V2_CSP,
             "default-src 'none'; sandbox allow-scripts; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'self'; form-action 'none';"
         );
         assert_eq!(
@@ -3406,23 +3406,20 @@ mod tests {
                 .into_bytes_bounded(APS_RUNNER_MAX_RESPONSE_BYTES),
         )
         .expect("renderer body should stay within the runner cap");
-        assert_eq!(body.as_ref(), APS_RENDERER_V1_DOCUMENT.as_bytes());
-        assert!(APS_RENDERER_V1_DOCUMENT.contains("TS APS Bootstrap Ready"));
-        assert!(APS_RENDERER_V1_DOCUMENT.contains("TS APS Bootstrap Navigate"));
-        assert!(APS_RENDERER_V1_DOCUMENT.contains("data:text/html;charset=utf-8,"));
+        assert_eq!(body.as_ref(), APS_RENDERER_V2_DOCUMENT.as_bytes());
+        assert!(APS_RENDERER_V2_DOCUMENT.contains("TS APS Bootstrap Ready"));
+        assert!(APS_RENDERER_V2_DOCUMENT.contains("TS APS Bootstrap Configure"));
+        assert!(APS_RENDERER_V2_DOCUMENT.contains("data:text/html;charset=utf-8,"));
+        assert!(APS_RENDERER_V2_DOCUMENT.contains("/integrations/aps/runner.js"));
         for forbidden in [
-            "runner",
-            "aaxResponse",
-            "accountId",
-            "bidId",
-            "creativeId",
-            "creativeUrl",
-            "createElement",
-            "iframe",
+            "client.aps.amazon-adsystem.com",
+            "example-account",
+            "bid-123",
+            "creative.example/render",
         ] {
             assert!(
-                !APS_RENDERER_V1_DOCUMENT.contains(forbidden),
-                "renderer bootstrap should not contain {forbidden}"
+                !APS_RENDERER_V2_DOCUMENT.contains(forbidden),
+                "renderer bootstrap should not contain a concrete descriptor or vendored runner value: {forbidden}"
             );
         }
     }

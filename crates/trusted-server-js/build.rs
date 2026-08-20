@@ -514,7 +514,6 @@ fn copy_bundle(filename: &str, crate_dir: &Path, dist_dir: &Path, out_dir: &Path
             });
             return;
         }
-        return;
     }
     panic!("tsjs: bundle {filename} was not generated");
 }

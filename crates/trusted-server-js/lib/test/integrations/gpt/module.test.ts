@@ -39,7 +39,7 @@ import type { SlotRequestOutcome } from '../../../src/services/slots';
 
 const RELEASE_ID = 'a'.repeat(64);
 const RESERVATION_ID = `r1_${'a'.repeat(22)}`;
-const GPT_CONFIG = Object.freeze({ gamAttributionEnabled: false });
+const GPT_CONFIG = Object.freeze({ gamAttributionEnabled: false, pageBidsEnabled: true });
 
 describe('GPT first-display diagnostics adoption', () => {
   it('hydrates exact physical-slot cycle state before slot adoption', () => {

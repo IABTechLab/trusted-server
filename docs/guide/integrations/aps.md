@@ -158,7 +158,7 @@ Trusted Server does not insert APS creative markup into the publisher document. 
 
 Seats, `impid`, markup, notifications, user-sync data, sibling bids, losing seats, and unknown fields are not exposed. The browser decodes this envelope and cross-checks the ID, dimensions, URL, and tag type before any DOM mutation or message suppression.
 
-Both rendering paths use `GET /integrations/aps/renderer/v1`, a versioned static Trusted Server document with its own restrictive CSP. The document initializes the account-keyed APS queue and then loads the live runner through the fixed first-party proxy at `GET /integrations/aps/runner.js`. Trusted Server neither vendors nor pins the upstream runner bytes.
+Both rendering paths use `GET /integrations/aps/renderer/v2`, a versioned static Trusted Server materializer with its own restrictive CSP. After the first APS action, the top page sends only independent nonces, the validated creative origin, and tag type. The materializer creates the opaque outer and inner data documents; only the inner document receives and validates the descriptor, initializes the account-keyed APS queue, and loads the live runner through the fixed first-party proxy at `GET /integrations/aps/runner.js`. Trusted Server neither vendors nor pins the upstream runner bytes.
 
 Both paths are reserved before configured `[[handlers]]` are evaluated. They are
 browser-facing and intentionally anonymous; Basic Auth handler patterns do not
@@ -182,7 +182,7 @@ allow-scripts
 allow-top-navigation-by-user-activation
 ```
 
-It deliberately omits `allow-same-origin`, so APS and bidder execution remains below an opaque-origin boundary. The renderer response repeats these restrictions with a CSP `sandbox` directive, preventing another embedding path from restoring publisher-origin execution by omitting the iframe attribute. Trusted Server generates a fresh 128-bit nonce, binds it in the iframe URL fragment before navigation, and requires the same one-time nonce in the parent message and renderer acknowledgement. Existing slot content is retained until the static renderer has accepted the descriptor and loaded the fixed runner.
+It deliberately omits `allow-same-origin` during bootstrap, so APS and bidder execution remains below an opaque-origin boundary. The renderer response repeats these restrictions with a CSP `sandbox` directive, preventing another embedding path from restoring publisher-origin execution by omitting the iframe attribute. Trusted Server generates independent 128-bit bootstrap and renderer nonces, binds each to its own phase, and accepts each exactly once. No descriptor or data-document URL crosses the bootstrap configuration channel. Existing slot content is retained until the inner renderer has accepted the descriptor and APS reports render completion.
 
 ### Direct `/auction`
 
@@ -259,7 +259,7 @@ Use fictional values in source-controlled configuration and fixtures. Supply con
 
 ### Winner targets but does not render
 
-- Confirm `GET /integrations/aps/renderer/v1` returns HTML with its CSP and `Referrer-Policy: no-referrer`.
+- Confirm `GET /integrations/aps/renderer/v2` returns HTML with its CSP and `Referrer-Policy: no-referrer`.
 - Confirm publisher CSP permits `frame-src 'self'`.
 - Confirm the GAM creative uses the supported Prebid Universal Creative bridge and the winning `hb_adid`.
 - For client-side `trustedServer` adapter auctions, confirm the bid joins the server-minted `r1_` reservation and that the private PUC bridge accepts exactly one claim for it.

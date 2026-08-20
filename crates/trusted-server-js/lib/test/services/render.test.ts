@@ -10,10 +10,10 @@ import type { RenderAttemptScope, WinnerContext } from '../../src/kernel/session
 import {
   APS_PERMANENT_SANDBOX,
   APS_RENDERER_SANDBOX,
-  APS_RENDERER_V1_PATH,
+  APS_RENDERER_V2_PATH,
   renderDirectApsAttempt,
   renderPucApsAttempt,
-  resolveApsRendererV1Url,
+  resolveApsRendererV2Url,
 } from '../../src/integrations/aps/render';
 import {
   bindCommittedArtifactGuard,
@@ -1221,7 +1221,7 @@ describe('direct APS attempt rendering', () => {
       const source = frame.contentWindow!;
       const postMessage = vi.spyOn(source, 'postMessage');
       expect(frame.getAttribute('src')).toBe(
-        `${window.location.origin}${APS_RENDERER_V1_PATH}#${bootstrapNonce}`
+        `${window.location.origin}${APS_RENDERER_V2_PATH}#${bootstrapNonce}`
       );
       expect(frame.getAttribute('sandbox')).toBe(APS_RENDERER_SANDBOX);
       expect(document.querySelectorAll('#fictional-slot iframe')).toHaveLength(1);
@@ -1244,12 +1244,12 @@ describe('direct APS attempt rendering', () => {
       expect(navigation).toBeTypeOf('string');
       const parsedNavigation = JSON.parse(navigation as string) as Record<string, unknown>;
       expect(parsedNavigation).toEqual({
-        message: 'TS APS Bootstrap Navigate',
-        version: 1,
+        message: 'TS APS Bootstrap Configure',
+        version: 2,
         bootstrapNonce,
-        containerUrl: expect.stringMatching(
-          new RegExp(`^data:text/html;charset=utf-8,.*#${bootstrapNonce}$`)
-        ),
+        rendererNonce,
+        creativeOrigin: 'https://creative.example',
+        tagType: 'iframe',
       });
       expect(navigation).toBe(JSON.stringify(parsedNavigation));
       expect(postMessage.mock.calls[0]?.slice(1)).toEqual(['*', []]);
@@ -1564,7 +1564,7 @@ describe('direct APS attempt rendering', () => {
     try {
       mutated.frame?.setAttribute(
         'src',
-        window.location.origin + APS_RENDERER_V1_PATH + '#b1_9999999999999999999999'
+        window.location.origin + APS_RENDERER_V2_PATH + '#b1_9999999999999999999999'
       );
       mutated.bootstrapReady();
       expect(mutated.render.snapshot().outcome).toEqual({
@@ -1691,19 +1691,19 @@ describe('direct APS attempt rendering', () => {
   });
 
   it('allows HTTPS and loopback HTTP renderer origins but rejects production HTTP', () => {
-    expect(resolveApsRendererV1Url('https://publisher.example')).toBe(
-      'https://publisher.example/integrations/aps/renderer/v1'
+    expect(resolveApsRendererV2Url('https://publisher.example')).toBe(
+      'https://publisher.example/integrations/aps/renderer/v2'
     );
-    expect(resolveApsRendererV1Url('http://localhost:8080')).toBe(
-      'http://localhost:8080/integrations/aps/renderer/v1'
+    expect(resolveApsRendererV2Url('http://localhost:8080')).toBe(
+      'http://localhost:8080/integrations/aps/renderer/v2'
     );
-    expect(resolveApsRendererV1Url('http://127.0.0.1:8080')).toBe(
-      'http://127.0.0.1:8080/integrations/aps/renderer/v1'
+    expect(resolveApsRendererV2Url('http://127.0.0.1:8080')).toBe(
+      'http://127.0.0.1:8080/integrations/aps/renderer/v2'
     );
-    expect(resolveApsRendererV1Url('http://[::1]:8080')).toBe(
-      'http://[::1]:8080/integrations/aps/renderer/v1'
+    expect(resolveApsRendererV2Url('http://[::1]:8080')).toBe(
+      'http://[::1]:8080/integrations/aps/renderer/v2'
     );
-    expect(resolveApsRendererV1Url('http://publisher.example')).toBeUndefined();
+    expect(resolveApsRendererV2Url('http://publisher.example')).toBeUndefined();
   });
 
   it('keeps a PUC APS overlay hidden until completion and preserves the slot host', () => {

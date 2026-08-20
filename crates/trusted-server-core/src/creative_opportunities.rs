@@ -1854,14 +1854,13 @@ mod tests {
 
     #[test]
     fn validate_runtime_allows_blank_network_id_when_no_slots_configured() {
-        // An empty slot list disables the feature, so the id is never rendered.
-        // Failing startup there would break a deploy over an unused value.
+        // With no slot definitions, the network id is not consumed.
         let mut config = make_config_with_section_template(Some("home"));
         config.gam_network_id = String::new();
         config.slot.clear();
         config
             .validate_runtime()
-            .expect("a disabled creative_opportunities stack should not fail on a blank id");
+            .expect("an unused creative_opportunities network id should not fail validation");
     }
 
     #[test]
@@ -2214,6 +2213,51 @@ mod tests {
             .unwrap_or_else(|error| panic!("explicit enabled={enabled} should parse: {error}"));
             assert_eq!(config.enabled, enabled);
         }
+    }
+
+    #[test]
+    fn disabled_creative_opportunities_still_validate_every_field() {
+        let invalid_slot: CreativeOpportunitiesConfig = toml::from_str(
+            r#"
+                enabled = false
+                gam_network_id = "99999"
+
+                [[slot]]
+                id = "invalid-pattern"
+                page_patterns = ["["]
+                formats = [{ width = 300, height = 250 }]
+            "#,
+        )
+        .expect("disabled slot shape should deserialize before runtime validation");
+        assert!(
+            invalid_slot.validate_runtime().is_err(),
+            "disabled delivery must not bypass slot validation"
+        );
+
+        let invalid_cache: CreativeOpportunitiesConfig = toml::from_str(
+            r#"
+                enabled = false
+                gam_network_id = "99999"
+                template_cache_vary = ["not a header"]
+            "#,
+        )
+        .expect("disabled cache shape should deserialize before runtime validation");
+        assert!(
+            invalid_cache.validate_runtime().is_err(),
+            "disabled delivery must not bypass cache-field validation"
+        );
+
+        assert!(
+            toml::from_str::<CreativeOpportunitiesConfig>(
+                r#"
+                    enabled = false
+                    gam_network_id = "99999"
+                    assembly_mode = "client_fill"
+                "#,
+            )
+            .is_err(),
+            "disabled delivery must not bypass assembly-mode parsing"
+        );
     }
 
     #[test]

@@ -430,7 +430,7 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 
 ## Phase 2 — Harden APS containment and top-page ownership
 
-### Task 5: Replace renderer v1 with the descriptor-free bootstrap contract
+### Task 5: Hard-cut the renderer route to the v2 materialization bootstrap
 
 **Files:**
 
@@ -439,6 +439,8 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 - Modify: `crates/trusted-server-js/lib/test/fixtures/aps-renderer-v1-corpus.json`
 - Modify: `scripts/generate-aps-renderer-contract.mjs`
 - Modify generated: `crates/trusted-server-core/src/integrations/generated/aps_renderer_validator_v1.js`
+- Delete generated: `crates/trusted-server-core/src/integrations/generated/aps_renderer_bootstrap_v1.html`
+- Create generated: `crates/trusted-server-core/src/integrations/generated/aps_renderer_bootstrap_v2.html`
 - Modify: `crates/trusted-server-core/src/integrations/aps.rs`
 - Modify: `crates/trusted-server-core/src/publisher.rs`
 - Modify: `scripts/integration-tests-aps-runner-proxy.sh`
@@ -447,12 +449,13 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 - Test: colocated APS Rust tests
 - Test: `scripts/integration-tests-aps-runner-proxy.sh`
 
-- [ ] **Step 1: Add failing renderer response tests.** The HTTP response is an
-      immutable descriptor-free bootstrap with exact CSP, content type, cache,
-      nosniff, no-referrer, no X-Frame-Options, and exact initial sandbox. It accepts
-      only its `b1_` fragment, exact checked-parent navigation message, and bounded
-      `data:text/html;charset=utf-8,` container URL. It contains no runner,
-      descriptor, price, bid id, creative URL, child frame, or publisher DOM access.
+- [ ] **Step 1: Add failing renderer response tests.** The v2 HTTP response is an
+      immutable descriptor-free materialization bootstrap with exact CSP, content
+      type, cache, nosniff, no-referrer, no X-Frame-Options, and exact initial
+      sandbox. It accepts only its `b1_` fragment and one canonical v2 policy
+      configuration from the exact parent. It embeds TS-authored templates, the ES5
+      validator, and the fixed runner-proxy path, but no concrete descriptor value,
+      vendor bytes, publisher DOM authority, or pre-navigation network operation.
 
 - [ ] **Step 2: Add failing route/security tests.** APS-enabled final publisher
       responses append an independent `Content-Security-Policy: frame-ancestors
@@ -470,8 +473,9 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 
 - [ ] **Step 4: Update the single renderer generator and generated contract.** Keep
       the schema's `x-*` semantic markers documentary; generator code remains the
-      enforcement authority. Generate deterministic ES5-compatible bootstrap bytes
-      and reuse the shared corpus across Rust, TypeScript, and Node tests.
+      enforcement authority. Generate deterministic ES5-compatible v2 bootstrap
+      bytes, reuse the shared corpus across Rust, TypeScript, and Node tests, delete
+      the v1 body, and serve v1 as an unknown local `404` with no compatibility path.
 
 - [ ] **Step 5: Preserve the live runner proxy exactly.** Keep its fixed target,
       credential/referrer stripping, duplicate-header evidence, identity encoding,
@@ -481,7 +485,7 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 
 - [ ] **Step 6: Make the Cloudflare/Wrangler readiness proof exact.** Before the
       adversarial corpus starts, require two consecutive
-      `PROPFIND /integrations/aps/renderer/v1` responses with the complete local 405
+      `PROPFIND /integrations/aps/renderer/v2` responses with the complete local 405
       contract, including `Allow: GET` and `Cache-Control: no-store`. Any other
       result resets the consecutive count. Implement this in the actual adapter
       harness `crates/trusted-server-integration-tests/tests/aps_runner_proxy.rs`;
@@ -507,15 +511,17 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 - [ ] **Step 8: Commit.**
 
   ```bash
-  git add crates/trusted-server-js/lib/test/fixtures/aps-renderer-v1.schema.json crates/trusted-server-js/lib/test/fixtures/aps-renderer-v1.json crates/trusted-server-js/lib/test/fixtures/aps-renderer-v1-corpus.json scripts/generate-aps-renderer-contract.mjs scripts/integration-tests-aps-runner-proxy.sh crates/trusted-server-integration-tests/tests/aps_runner_proxy.rs crates/trusted-server-core/src/integrations/generated/aps_renderer_validator_v1.js crates/trusted-server-core/src/integrations/aps.rs crates/trusted-server-core/src/publisher.rs
-  git commit -m "Make the APS renderer endpoint a bounded bootstrap"
+  git add crates/trusted-server-js/lib/test/fixtures/aps-renderer-v1.schema.json crates/trusted-server-js/lib/test/fixtures/aps-renderer-v1.json crates/trusted-server-js/lib/test/fixtures/aps-renderer-v1-corpus.json scripts/generate-aps-renderer-contract.mjs scripts/integration-tests-aps-runner-proxy.sh crates/trusted-server-integration-tests/tests/aps_runner_proxy.rs crates/trusted-server-core/src/integrations/generated/aps_renderer_validator_v1.js crates/trusted-server-core/src/integrations/generated/aps_renderer_bootstrap_v2.html crates/trusted-server-core/src/integrations/generated/aps_renderer_bootstrap_v1.html crates/trusted-server-core/src/integrations/aps.rs crates/trusted-server-core/src/publisher.rs
+  git commit -m "Hard-cut APS rendering to the v2 bootstrap"
   ```
 
-### Task 6: Generate the exact outer and inner APS data documents
+### Task 6: Materialize the exact APS data documents after first action
 
 **Files:**
 
-- Create: `crates/trusted-server-js/lib/src/integrations/aps/documents.ts`
+- Modify: `crates/trusted-server-js/lib/src/shared/aps_documents.ts`
+- Modify: `scripts/generate-aps-renderer-contract.mjs`
+- Modify generated: `crates/trusted-server-core/src/integrations/generated/aps_renderer_bootstrap_v2.html`
 - Modify: `crates/trusted-server-js/lib/src/core/contracts/aps_renderer.ts`
 - Modify: `crates/trusted-server-js/lib/src/adapters/messaging.ts`
 - Modify: `crates/trusted-server-js/lib/src/integrations/aps/render.ts`
@@ -525,7 +531,8 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 - Test: `crates/trusted-server-js/lib/test/adapters/messaging.test.ts`
 - Test: `crates/trusted-server-js/lib/test/first_display/slices.test.ts`
 
-- [ ] **Step 1: Add failing template tests.** Generate detached documents using
+- [ ] **Step 1: Add failing template tests.** Have the v2 server bootstrap generate
+      detached documents only after it receives the first-action policy message, using
       independent `b1_` and `n1_` nonces, exact origin validation, exact permanent
       sandbox order, sentinel-once substitution, context escaping, and separate
       65,536-byte pre-encoding caps. The outer document contains only origins,
@@ -551,7 +558,12 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
   npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/aps/documents.test.ts test/integrations/aps/render.test.ts test/adapters/messaging.test.ts test/first_display/slices.test.ts
   ```
 
-- [ ] **Step 5: Implement pure document generation and exact parsers.** The inner
+- [ ] **Step 5: Implement build-time document materialization and exact parsers.**
+      Keep the templates and ES5 validator as generator/test authorities, emit them
+      into the server-owned v2 response, and remove them from both first-display and
+      persistent production TSJS graphs. The top page sends only exact nonces,
+      creative origin, and tag type; no descriptor or generated URL crosses that
+      channel. The inner
       clears its fragment, queues the APS event with one-shot resolve/reject, loads
       only the same-origin proxy with anonymous CORS/no-referrer, treats script load
       as progress, and sends completion/failure only on callback settlement.
@@ -568,8 +580,8 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 - [ ] **Step 7: Commit.**
 
   ```bash
-  git add crates/trusted-server-js/lib/src/integrations/aps crates/trusted-server-js/lib/src/core/contracts/aps_renderer.ts crates/trusted-server-js/lib/src/adapters/messaging.ts crates/trusted-server-js/lib/src/first_display/leaf/aps_protocol.ts crates/trusted-server-js/lib/test/integrations/aps crates/trusted-server-js/lib/test/adapters/messaging.test.ts crates/trusted-server-js/lib/test/first_display/slices.test.ts
-  git commit -m "Generate isolated APS data documents"
+  git add crates/trusted-server-js/lib/src/shared/aps_documents.ts crates/trusted-server-js/lib/src/integrations/aps crates/trusted-server-js/lib/src/core/contracts/aps_renderer.ts crates/trusted-server-js/lib/src/adapters/messaging.ts crates/trusted-server-js/lib/src/first_display crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs scripts/generate-aps-renderer-contract.mjs crates/trusted-server-core/src/integrations/generated/aps_renderer_bootstrap_v2.html crates/trusted-server-js/lib/test
+  git commit -m "Materialize APS documents after first action"
   ```
 
 ### Task 7: Mount direct APS through the three-phase top-page protocol
@@ -595,7 +607,8 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 
 - [ ] **Step 2: Add failing direct-mount state-machine tests.** Create only the
       bootstrap iframe initially. Require exact node/parent/src/WindowProxy/
-      generation/nonce checks before sandbox mutation/navigation, then exact outer
+      generation/nonce checks before sandbox mutation and the v2 policy-only
+      configuration message, then exact materialized outer
       readiness and one port before sending the envelope. Enforce one-second
       insertion, one shared three-second document deadline, and the kernel-owned
       ten-second completion deadline beginning at document acceptance.
@@ -613,9 +626,10 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
   ```
 
 - [ ] **Step 5: Implement the shared top-page mount service for direct APS.** Keep
-      descriptor generation before DOM mutation, permanent sandbox after bootstrap
-      readiness, exact winning size/layout, and one terminal latch. Direct mount is
-      an ordinary child and does not acquire overlay styling.
+      descriptor validation before DOM mutation, permanent sandbox after bootstrap
+      readiness, policy-only server materialization after first action, exact winning
+      size/layout, and one terminal latch. Direct mount is an ordinary child and does
+      not acquire overlay styling.
 
 - [ ] **Step 6: Run GREEN and adjacent direct-ADM regressions.**
 
@@ -1025,6 +1039,11 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
       paired GPT/APS <=1.10 timing/transfer, APS action/completion/paint/heap ceilings,
       and the common 4 MiB retained-heap ceiling. Require real User Timing marks and
       no persistent/deferred request, preload, prepare, or execution before paint.
+      The production source graph must prove that neither first-display nor
+      persistent artifacts reach `shared/aps_documents.ts` or the document-form ES5
+      validator; those authorities exist only in the generator and contract tests.
+      The mandatory APS + creative + GPT first-display mask must pass the unchanged
+      90,000/30,000/26,000 raw/gzip/Brotli ceilings.
 
 - [ ] **Step 4: Keep CI logic in scripts.** Workflow YAML may set immutable inputs,
       install toolchains, and invoke checked-in scripts. Put Git ancestry validation,

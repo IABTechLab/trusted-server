@@ -48,7 +48,7 @@ import {
 } from '../core/registry';
 import { prepareAdmIframe } from '../core/render';
 import {
-  APS_RENDERER_V1_PATH,
+  APS_RENDERER_V2_PATH,
   renderDirectApsAttempt,
   renderPucApsAttempt,
 } from '../integrations/aps/render';
@@ -317,7 +317,7 @@ function testConfigProduct(id: string): string | undefined {
 
 function defaultBrowserTestConfig(id: string): Readonly<Record<string, unknown>> {
   if (id === 'didomi') return { proxyPath: '/integrations/didomi/consent/' };
-  if (id === 'gpt') return { gamAttributionEnabled: false };
+  if (id === 'gpt') return { gamAttributionEnabled: false, pageBidsEnabled: true };
   if (id === 'prebid') {
     return {
       accountId: 'test',
@@ -762,7 +762,7 @@ export function createBrowserComposition(
       const expectedPublisherOrigin = window.location.origin;
       return {
         expectedPublisherOrigin,
-        expectedRendererUrl: new URL('/integrations/aps/renderer/v1', expectedPublisherOrigin).href,
+        expectedRendererUrl: new URL('/integrations/aps/renderer/v2', expectedPublisherOrigin).href,
         validateApsRenderer: defaultValidator,
         ...options.messagingValidation,
       };
@@ -1592,7 +1592,7 @@ export function createTestBrowserRuntimeComposition(
       // to redirect the APS endpoint by predefining that creative-only stamp.
       const publisherOrigin = trustedDocumentHttpOrigin(window.location.origin);
       if (!publisherOrigin) throw new Error('Trusted publisher origin is unavailable');
-      const rendererUrl = new URL(APS_RENDERER_V1_PATH, publisherOrigin).href;
+      const rendererUrl = new URL(APS_RENDERER_V2_PATH, publisherOrigin).href;
       const renderDirectAdm = Object.freeze(
         (attempt: RenderAttempt, container: HTMLElement): boolean => {
           try {

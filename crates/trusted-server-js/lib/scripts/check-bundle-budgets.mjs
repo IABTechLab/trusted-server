@@ -177,7 +177,7 @@ const CURRENT_EXACT_SOURCE_OWNERS = Object.freeze({
 const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
   'src/core/auction.ts': Object.freeze(['core']),
   'src/core/config.ts': Object.freeze(['bootstrap', 'core']),
-  'src/core/contracts/aps_renderer.ts': Object.freeze(['bootstrap', 'core', 'aps_initial', 'aps']),
+  'src/core/contracts/aps_renderer.ts': Object.freeze(['bootstrap', 'core', 'aps']),
   'src/core/contracts/auction_projection.ts': Object.freeze([
     'bootstrap',
     'core',
@@ -187,14 +187,8 @@ const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
   'src/core/contracts/generated/renderer_validator_v1.ts': Object.freeze([
     'bootstrap',
     'core',
-    'aps_initial',
     'aps',
   ]),
-  'src/core/contracts/generated/renderer_validator_document_v1.ts': Object.freeze([
-    'aps_initial',
-    'aps',
-  ]),
-  'src/shared/aps_documents.ts': Object.freeze(['aps_initial', 'aps']),
   'src/core/contracts/request_ads.ts': Object.freeze(['bootstrap', 'core']),
   'src/core/index.ts': Object.freeze(['core']),
   'src/core/log.ts': Object.freeze([
