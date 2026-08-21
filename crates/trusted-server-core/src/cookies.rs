@@ -66,6 +66,19 @@ pub fn handle_request_cookies(
     }
 }
 
+/// Returns the named value from the request's selected `Cookie` header.
+///
+/// Values are trimmed and may contain additional `=` characters. A missing or
+/// non-UTF-8 selected header returns `None`.
+#[must_use]
+pub fn extract_cookie_value<B>(req: &Request<B>, name: &str) -> Option<String> {
+    let cookie_header = req.headers().get(header::COOKIE)?.to_str().ok()?;
+    cookie_header.split(';').find_map(|pair| {
+        let (key, value) = pair.trim().split_once('=')?;
+        (key.trim() == name).then(|| value.trim().to_owned())
+    })
+}
+
 /// Strips named cookies from a `Cookie` header value string.
 ///
 /// Parses the semicolon-separated cookie pairs, filters out any whose name
@@ -240,6 +253,37 @@ mod tests {
             ),
             "should return InvalidHeaderValue for non-UTF-8 cookie header"
         );
+    }
+
+    #[test]
+    fn extract_cookie_value_returns_none_without_cookie_header() {
+        let req = build_request(None);
+
+        assert_eq!(extract_cookie_value(&req, "session"), None);
+    }
+
+    #[test]
+    fn extract_cookie_value_trims_pairs_and_preserves_embedded_equals() {
+        let req = build_request(Some("first=one; token = abc== ; last=three"));
+
+        assert_eq!(
+            extract_cookie_value(&req, "token").as_deref(),
+            Some("abc==")
+        );
+        assert_eq!(extract_cookie_value(&req, "last").as_deref(), Some("three"));
+    }
+
+    #[test]
+    fn extract_cookie_value_returns_none_for_selected_non_utf8_header() {
+        let invalid = HeaderValue::from_bytes(b"\xff=value").expect("should build header value");
+        let mut req = build_request(None);
+        req.headers_mut().append(header::COOKIE, invalid);
+        req.headers_mut().append(
+            header::COOKIE,
+            HeaderValue::from_static("session=from-later-header"),
+        );
+
+        assert_eq!(extract_cookie_value(&req, "session"), None);
     }
 
     // ---------------------------------------------------------------
