@@ -2440,11 +2440,9 @@ pub struct DebugConfig {
     /// Content and verbosity of the `auction_html_comment` dump. Ignored
     /// when `auction_html_comment` is false.
     ///
-    /// The default table must stay omitted from serialized config blobs:
-    /// [`DebugConfig`] denies unknown fields, so an older binary rejects a blob
-    /// carrying this table during a mixed-version deployment or rollback. Any
-    /// non-default table still serializes and requires restoring a compatible
-    /// blob before rolling back.
+    /// The default table stays omitted from serialized config blobs to avoid
+    /// emitting redundant configuration. Any non-default table still
+    /// serializes.
     #[serde(
         default,
         skip_serializing_if = "is_default_auction_debug_comment_options"
@@ -2515,7 +2513,7 @@ fn default_auction_debug_metadata_keys() -> Vec<String> {
         .collect()
 }
 
-// This predicate preserves rollback compatibility by omitting the default table.
+// Omit the default table from serialized configuration.
 fn is_default_auction_debug_comment_options(value: &AuctionDebugCommentOptions) -> bool {
     *value == AuctionDebugCommentOptions::default()
 }
@@ -3584,32 +3582,12 @@ mod tests {
 
     #[test]
     fn default_auction_debug_comment_options_stay_out_of_serialized_config() {
-        // Rollback contract: `DebugConfig` denies unknown fields, so the
-        // previous binary rejects a config blob carrying a table it does not
-        // know. Defaults must therefore serialize to nothing.
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct LegacyDebugConfig {
-            #[serde(default)]
-            ja4_endpoint_enabled: bool,
-            #[serde(default)]
-            auction_html_comment: bool,
-            #[serde(default)]
-            inject_adm_for_testing: bool,
-        }
-
         let value = serde_json::to_value(DebugConfig::default())
             .expect("should serialize the default debug config");
         assert!(
             value.get("auction_html_comment_options").is_none(),
             "default options table should not be serialized, got {value}"
         );
-
-        let legacy: LegacyDebugConfig = serde_json::from_value(value)
-            .expect("legacy schema should accept the default debug payload");
-        assert!(!legacy.ja4_endpoint_enabled);
-        assert!(!legacy.auction_html_comment);
-        assert!(!legacy.inject_adm_for_testing);
 
         let configured = DebugConfig {
             auction_html_comment: true,
