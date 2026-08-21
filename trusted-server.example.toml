@@ -57,6 +57,16 @@ client_side_bidders = []
 adapters = ["rubicon"]
 # user_id_modules = ["sharedIdSystem"]
 
+# Optional managed LiveRamp RampID configuration. The external Prebid bundle
+# must contain identityLinkIdSystem. Obtain the Placement ID and approve the
+# publisher origin with LiveRamp before enabling.
+# [integrations.prebid.liveramp]
+# placement_id = "999"
+# not_use_3p = false
+# storage_type = "cookie"
+# expires_days = 15
+# refresh_in_seconds = 1800
+
 [integrations.nextjs]
 enabled = false
 rewrite_attributes = ["href", "link", "siteBaseUrl", "siteProductionDomain", "url"]

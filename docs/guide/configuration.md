@@ -1049,22 +1049,27 @@ apply when the integration section exists in `trusted-server.toml`.
 
 **Section**: `[integrations.prebid]`
 
-| Field                      | Type          | Default                                                                | Description                                                                                                                                           |
-| -------------------------- | ------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enabled`                  | Boolean       | `true`                                                                 | Enable Prebid integration                                                                                                                             |
-| `server_url`               | String        | Required                                                               | Prebid Server endpoint URL                                                                                                                            |
-| `timeout_ms`               | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                                                                       |
-| `bidders`                  | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                                                               |
-| `bid_param_overrides`      | Table         | `{}`                                                                   | Static per-bidder param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                           |
-| `bid_param_zone_overrides` | Table         | `{}`                                                                   | Per-bidder, per-zone param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                        |
-| `bid_param_override_rules` | Array[Table]  | `[]`                                                                   | Canonical ordered override rules with `when` matchers and `set` objects; evaluated after compatibility fields so later rules win on conflicts         |
-| `suppress_nurl`            | Boolean       | `false`                                                                | Strip `nurl` and `burl` from every PBS bid when the PBS deployment fires win/billing notifications server-side                                        |
-| `suppress_nurl_bidders`    | Array[String] | `[]`                                                                   | Bidder seats whose `nurl` and `burl` should be stripped while preserving client-side win/billing pixels for other bidders                             |
-| `debug`                    | Boolean       | `false`                                                                | Enable debug mode (sets `ext.prebid.debug` and `returnallbidstatus`; surfaces debug metadata in responses)                                            |
-| `test_mode`                | Boolean       | `false`                                                                | Set OpenRTB `test: 1` flag for non-billable test traffic (independent of `debug`)                                                                     |
-| `debug_query_params`       | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                             |
-| `client_side_bidders`      | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side (see [Prebid docs](/guide/integrations/prebid#client-side-bidders)) |
-| `script_patterns`          | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                           |
+| Field                         | Type          | Default                                                                | Description                                                                                                                                           |
+| ----------------------------- | ------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                     | Boolean       | `true`                                                                 | Enable Prebid integration                                                                                                                             |
+| `server_url`                  | String        | Required                                                               | Prebid Server endpoint URL                                                                                                                            |
+| `timeout_ms`                  | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                                                                       |
+| `bidders`                     | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                                                               |
+| `bid_param_overrides`         | Table         | `{}`                                                                   | Static per-bidder param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                           |
+| `bid_param_zone_overrides`    | Table         | `{}`                                                                   | Per-bidder, per-zone param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                        |
+| `bid_param_override_rules`    | Array[Table]  | `[]`                                                                   | Canonical ordered override rules with `when` matchers and `set` objects; evaluated after compatibility fields so later rules win on conflicts         |
+| `suppress_nurl`               | Boolean       | `false`                                                                | Strip `nurl` and `burl` from every PBS bid when the PBS deployment fires win/billing notifications server-side                                        |
+| `suppress_nurl_bidders`       | Array[String] | `[]`                                                                   | Bidder seats whose `nurl` and `burl` should be stripped while preserving client-side win/billing pixels for other bidders                             |
+| `debug`                       | Boolean       | `false`                                                                | Enable debug mode (sets `ext.prebid.debug` and `returnallbidstatus`; surfaces debug metadata in responses)                                            |
+| `test_mode`                   | Boolean       | `false`                                                                | Set OpenRTB `test: 1` flag for non-billable test traffic (independent of `debug`)                                                                     |
+| `debug_query_params`          | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                             |
+| `client_side_bidders`         | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side (see [Prebid docs](/guide/integrations/prebid#client-side-bidders)) |
+| `script_patterns`             | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                           |
+| `liveramp.placement_id`       | String        | Required when subsection exists                                        | Numeric LiveRamp Placement ID for Prebid IdentityLink                                                                                                 |
+| `liveramp.not_use_3p`         | Boolean       | `false`                                                                | Disable cookie-recognized RampID envelopes when `true`                                                                                                |
+| `liveramp.storage_type`       | String        | `cookie`                                                               | Browser storage used by IdentityLink: `cookie` or `html5`                                                                                             |
+| `liveramp.expires_days`       | Integer       | `15`                                                                   | Envelope storage lifetime in days; valid range is 1–30                                                                                                |
+| `liveramp.refresh_in_seconds` | Integer       | `1800`                                                                 | Positive interval before retrieving a potentially refreshed envelope                                                                                  |
 
 APS is configured exclusively under `[integrations.aps]`. `aps` entries in
 `bidders` or `client_side_bidders` are logged and removed case-insensitively so
@@ -1088,6 +1093,13 @@ client_side_bidders = ["rubicon"]
 
 # Customize script interception (optional)
 script_patterns = ["/prebid.js", "/prebid.min.js"]
+
+[integrations.prebid.liveramp]
+placement_id = "999"
+not_use_3p = false
+storage_type = "cookie"
+expires_days = 15
+refresh_in_seconds = 1800
 
 [integrations.prebid.bid_param_overrides.criteo]
 networkId = 99999
@@ -1117,7 +1129,14 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=false
 TRUSTED_SERVER__INTEGRATIONS__PREBID__TEST_MODE=false
 TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG_QUERY_PARAMS=debug=1
 TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_PATTERNS='["/prebid.js","/prebid.min.js"]'
+TRUSTED_SERVER__INTEGRATIONS__PREBID__LIVERAMP__PLACEMENT_ID=999
 ```
+
+The LiveRamp storage name is fixed to `idl_env`. The Placement ID and an
+approved publisher origin are operational prerequisites, and the external
+Prebid bundle must include `identityLinkIdSystem`. See
+[Managed LiveRamp RampID](/guide/integrations/prebid#managed-liveramp-rampid)
+for consent, timing, privacy, degraded behavior, and live validation guidance.
 
 **Script Pattern Matching**:
 
