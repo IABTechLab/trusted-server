@@ -934,9 +934,11 @@ mod tests {
 
     #[test]
     fn rust_and_javascript_evidence_entry_caps_match() {
+        let expected_declaration = format!("const __ts_max_entries = {MAX_EVIDENCE_ENTRIES}");
         assert!(
             AD_TEMPLATE_COLLECTOR_JS
-                .contains(&format!("const __ts_max_entries = {MAX_EVIDENCE_ENTRIES}")),
+                .lines()
+                .any(|line| line.trim() == expected_declaration),
             "should keep the JS cap equal to MAX_EVIDENCE_ENTRIES"
         );
     }

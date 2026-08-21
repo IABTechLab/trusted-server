@@ -454,7 +454,47 @@ mod tests {
     #[test]
     fn audit_page_subcommand_parses() {
         let args = parse(&["ts", "audit", "page", "https://www.example.com/"]);
-        assert!(matches!(args.command, Command::Audit(_)));
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        let Some(crate::commands::audit::AuditSubcommand::Page(page)) = audit.command else {
+            panic!("expected audit page command");
+        };
+        assert_eq!(page.browser.settle_quiet_ms, 750);
+        assert_eq!(page.browser.settle_max_ms, 10_000);
+    }
+
+    #[test]
+    fn audit_generate_subcommands_use_generation_settle_defaults() {
+        let args = parse(&["ts", "audit", "generate", "https://www.example.com/"]);
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        let Some(crate::commands::audit::AuditSubcommand::Generate(generate)) = audit.command
+        else {
+            panic!("expected audit generate command");
+        };
+        assert_eq!(generate.browser.settle_quiet_ms, 750);
+        assert_eq!(generate.browser.settle_max_ms, 12_000);
+
+        let args = parse(&[
+            "ts",
+            "audit",
+            "ad-templates",
+            "generate",
+            "https://www.example.com/",
+        ]);
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        let Some(crate::commands::audit::AuditSubcommand::AdTemplates(
+            crate::commands::audit::AuditAdTemplatesCommand::Generate(generate),
+        )) = audit.command
+        else {
+            panic!("expected audit ad-templates generate command");
+        };
+        assert_eq!(generate.browser.settle_quiet_ms, 750);
+        assert_eq!(generate.browser.settle_max_ms, 12_000);
     }
 
     #[test]

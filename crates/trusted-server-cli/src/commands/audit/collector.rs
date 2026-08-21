@@ -40,10 +40,10 @@ pub struct BrowserOpts {
     pub browser_proxy: Option<String>,
     /// Quiet window in milliseconds (no new network resources) that marks the
     /// page settled.
-    #[arg(long, default_value_t = GENERATE_SETTLE_QUIET_MS)]
+    #[arg(long, default_value_t = 750)]
     pub settle_quiet_ms: u64,
     /// Hard cap in milliseconds on waiting for the page to settle.
-    #[arg(long, default_value_t = GENERATE_SETTLE_MAX_MS)]
+    #[arg(long, default_value_t = 10_000)]
     pub settle_max_ms: u64,
     /// Navigate to origins whose TLS certificate does not validate.
     ///
@@ -73,10 +73,10 @@ pub struct GenerateBrowserOpts {
     #[arg(long, value_name = "HOST:PORT")]
     pub browser_proxy: Option<String>,
     /// Quiet window in milliseconds that marks the page settled.
-    #[arg(long, default_value_t = 750)]
+    #[arg(long, default_value_t = GENERATE_SETTLE_QUIET_MS)]
     pub settle_quiet_ms: u64,
     /// Hard cap in milliseconds on waiting for the page to settle.
-    #[arg(long, default_value_t = 10_000)]
+    #[arg(long, default_value_t = GENERATE_SETTLE_MAX_MS)]
     pub settle_max_ms: u64,
     /// Navigate to origins whose TLS certificate does not validate.
     ///
