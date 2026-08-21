@@ -489,7 +489,7 @@ pub fn tsjs_bootstrap_fixture_fragment_v1(
                 "didomi" => serde_json::json!({ "proxyPath": "/integrations/didomi/" }),
                 "gpt" => serde_json::json!({
                     "gamAttributionEnabled": false,
-                    "pageBidsEnabled": false,
+                    "pageBidsEnabled": true,
                 }),
                 "prebid" => serde_json::json!({
                     "accountId": "fixture",
