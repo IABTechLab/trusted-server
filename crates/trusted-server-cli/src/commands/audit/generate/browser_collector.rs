@@ -15,7 +15,9 @@ use crate::commands::audit::browser::{
     BrowserLaunchOptions, CONSENT_STUB_SCRIPT as SHARED_CONSENT_STUB_SCRIPT, build_browser_config,
     resolve_chrome, set_browser_cookies,
 };
-use crate::commands::audit::collector::GenerateBrowserOpts;
+use crate::commands::audit::collector::{
+    GENERATE_SETTLE_MAX_MS, GENERATE_SETTLE_QUIET_MS, GenerateBrowserOpts,
+};
 use crate::commands::audit::generate::collector::{
     AuditCollector, CONSENT_STUB_WARNING, CollectedGptSlot, CollectedLink, CollectedPage,
     CollectedRequest, CollectedScriptTag, CollectionProgress, ControlFlow, PageSink, ProgressSink,
@@ -23,9 +25,7 @@ use crate::commands::audit::generate::collector::{
 };
 use crate::error::{CliResult, report_error};
 
-const SETTLE_QUIET_PERIOD: Duration = Duration::from_millis(750);
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const SETTLE_MAX_WAIT: Duration = Duration::from_secs(12);
 /// How long to wait for the navigation `load` event (and, separately, the main
 /// document response) before falling through to the settle loop. Ad-heavy pages
 /// (video players, continuous ad refresh) may never fire `load`, so this is a
@@ -148,8 +148,8 @@ impl Default for BrowserAuditCollector {
             proxy: None,
             accept_invalid_certs: false,
             chrome: None,
-            settle_quiet: SETTLE_QUIET_PERIOD,
-            settle_max: SETTLE_MAX_WAIT,
+            settle_quiet: Duration::from_millis(GENERATE_SETTLE_QUIET_MS),
+            settle_max: Duration::from_millis(GENERATE_SETTLE_MAX_MS),
         }
     }
 }
@@ -167,6 +167,7 @@ impl BrowserAuditCollector {
         self.settle_max = Duration::from_millis(options.settle_max_ms);
         self
     }
+
     /// A collector emulating `profile`.
     #[must_use]
     pub(crate) fn with_profile(profile: DeviceProfile) -> Self {

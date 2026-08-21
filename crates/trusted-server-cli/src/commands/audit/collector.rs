@@ -10,6 +10,11 @@ use clap::{Args, ValueEnum};
 
 use crate::ad_templates::compare::BrowserAdEvidence;
 
+/// Default quiet window for generation's browser collector.
+pub(crate) const GENERATE_SETTLE_QUIET_MS: u64 = 750;
+/// Default maximum settle wait for generation's browser collector.
+pub(crate) const GENERATE_SETTLE_MAX_MS: u64 = 12_000;
+
 /// Operator-tunable browser options shared by `ts audit page` and
 /// `ts audit ad-templates verify`.
 ///
@@ -35,10 +40,10 @@ pub struct BrowserOpts {
     pub browser_proxy: Option<String>,
     /// Quiet window in milliseconds (no new network resources) that marks the
     /// page settled.
-    #[arg(long, default_value_t = 750)]
+    #[arg(long, default_value_t = GENERATE_SETTLE_QUIET_MS)]
     pub settle_quiet_ms: u64,
     /// Hard cap in milliseconds on waiting for the page to settle.
-    #[arg(long, default_value_t = 10_000)]
+    #[arg(long, default_value_t = GENERATE_SETTLE_MAX_MS)]
     pub settle_max_ms: u64,
     /// Navigate to origins whose TLS certificate does not validate.
     ///
@@ -94,8 +99,8 @@ impl Default for GenerateBrowserOpts {
             headful: false,
             no_assume_consent: false,
             browser_proxy: None,
-            settle_quiet_ms: 750,
-            settle_max_ms: 10_000,
+            settle_quiet_ms: GENERATE_SETTLE_QUIET_MS,
+            settle_max_ms: GENERATE_SETTLE_MAX_MS,
             danger_accept_invalid_certs: false,
         }
     }
@@ -229,6 +234,14 @@ pub fn build_ad_template_init_script(config: &AdTemplateCollectorConfig) -> Resu
 mod tests {
     use super::*;
     use crate::ad_templates::compare::BrowserAdEvidence;
+
+    #[test]
+    fn generation_browser_defaults_preserve_the_established_settle_window() {
+        let options = GenerateBrowserOpts::default();
+
+        assert_eq!(options.settle_quiet_ms, 750);
+        assert_eq!(options.settle_max_ms, 12_000);
+    }
 
     #[test]
     fn init_script_embeds_config_and_read_only_hooks() {

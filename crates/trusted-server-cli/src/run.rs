@@ -378,6 +378,17 @@ mod tests {
             "--force",
             "--cookie",
             "session=example",
+            "--chrome",
+            "/tmp/test-chrome",
+            "--headful",
+            "--no-assume-consent",
+            "--browser-proxy",
+            "127.0.0.1:8080",
+            "--settle-quiet-ms",
+            "900",
+            "--settle-max-ms",
+            "13000",
+            "--danger-accept-invalid-certs",
         ]);
         let Command::Audit(audit) = args.command else {
             panic!("expected audit command");
@@ -394,6 +405,49 @@ mod tests {
         assert_eq!(
             audit.legacy_generate.cookies,
             [("session".to_string(), "example".to_string())]
+        );
+        assert_eq!(
+            audit.legacy_generate.browser.chrome,
+            Some(PathBuf::from("/tmp/test-chrome"))
+        );
+        assert!(audit.legacy_generate.browser.headful);
+        assert!(audit.legacy_generate.browser.no_assume_consent);
+        assert_eq!(
+            audit.legacy_generate.browser.browser_proxy.as_deref(),
+            Some("127.0.0.1:8080")
+        );
+        assert_eq!(audit.legacy_generate.browser.settle_quiet_ms, 900);
+        assert_eq!(audit.legacy_generate.browser.settle_max_ms, 13_000);
+        assert!(audit.legacy_generate.browser.danger_accept_invalid_certs);
+    }
+
+    #[test]
+    fn audit_help_does_not_advertise_hidden_legacy_browser_flags() {
+        let error =
+            Args::try_parse_from(["ts", "audit", "--help"]).expect_err("should render audit help");
+        let help = error.to_string();
+
+        assert!(!help.contains("--chrome"), "got {help}");
+        assert!(!help.contains("--settle-max-ms"), "got {help}");
+        assert!(
+            !help.contains("--danger-accept-invalid-certs"),
+            "got {help}"
+        );
+    }
+
+    #[test]
+    fn audit_rejects_parent_browser_flags_before_a_subcommand() {
+        assert!(
+            Args::try_parse_from([
+                "ts",
+                "audit",
+                "--chrome",
+                "/tmp/test-chrome",
+                "generate",
+                "https://www.example.com/",
+            ])
+            .is_err(),
+            "a parent-level browser flag must not be silently ignored"
         );
     }
 
