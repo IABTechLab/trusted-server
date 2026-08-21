@@ -709,6 +709,10 @@ struct IntegrationRegistryInner {
     html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
     head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    /// JS module IDs to include in the bundle that come from a source other than
+    /// a registered integration, for example a module tied to the selected Edge
+    /// Cookie provider. Populated in [`IntegrationRegistry::new`] from settings.
+    extra_js_module_ids: Vec<&'static str>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -730,6 +734,7 @@ impl Default for IntegrationRegistryInner {
             html_post_processors: Vec::new(),
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
+            extra_js_module_ids: Vec::new(),
         }
     }
 }
@@ -865,6 +870,15 @@ impl IntegrationRegistry {
                     inner.deferred_js_ids.push(registration.integration_id);
                 }
             }
+        }
+
+        // A client-cycle Edge Cookie provider ships a page script that posts its
+        // result to the resolve endpoint. The script rides the tsjs bundle, so
+        // include its module when that provider is selected. The same module
+        // list drives both the served bundle and the injected `<script>` hash,
+        // so they stay consistent.
+        if settings.ec.provider.as_deref() == Some("client-fixed") {
+            inner.extra_js_module_ids.push("ec_client_fixed");
         }
 
         Ok(Self {
@@ -1160,6 +1174,14 @@ impl IntegrationRegistry {
             }
         }
 
+        // Modules not tied to a registered integration, for example the
+        // client-cycle provider's page script.
+        for id in &self.inner.extra_js_module_ids {
+            if !ids.contains(id) {
+                ids.push(id);
+            }
+        }
+
         ids
     }
 
@@ -1219,6 +1241,7 @@ impl IntegrationRegistry {
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
+                extra_js_module_ids: Vec::new(),
             }),
         }
     }
@@ -1248,6 +1271,7 @@ impl IntegrationRegistry {
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
+                extra_js_module_ids: Vec::new(),
             }),
         }
     }
@@ -1273,6 +1297,7 @@ impl IntegrationRegistry {
                 request_filters,
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
+                extra_js_module_ids: Vec::new(),
             }),
         }
     }
@@ -1338,6 +1363,7 @@ impl IntegrationRegistry {
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
+                extra_js_module_ids: Vec::new(),
             }),
         }
     }
@@ -2168,6 +2194,20 @@ mod tests {
     }
 
     #[test]
+    fn js_module_ids_include_client_fixed_when_provider_selected() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.ec.provider = Some("client-fixed".to_owned());
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+
+        assert!(
+            registry
+                .js_module_ids_immediate()
+                .contains(&"ec_client_fixed"),
+            "selecting the client-fixed provider should inject its demo page script"
+        );
+    }
+
+    #[test]
     fn js_module_ids_include_explicitly_enabled_cmp_mirrors() {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings
@@ -2195,6 +2235,20 @@ mod tests {
         assert!(
             metadata.iter().any(|integration| integration.id == "osano"),
             "should include JS-only Osano registration in metadata"
+        );
+    }
+
+    #[test]
+    fn js_module_ids_exclude_client_fixed_without_provider() {
+        let registry =
+            IntegrationRegistry::new(&crate::test_support::tests::create_test_settings())
+                .expect("should create registry");
+
+        assert!(
+            !registry
+                .js_module_ids_immediate()
+                .contains(&"ec_client_fixed"),
+            "the demo page script should not ship unless the client-fixed provider is selected"
         );
     }
 
