@@ -40,12 +40,20 @@ pub fn config_key(env: &EnvConfig) -> String {
 }
 
 /// Returns the default `EdgeZero` app-config store name.
+///
+/// Process-environment overrides apply to native adapters such as Axum. Fastly
+/// has no process environment, so it uses the manifest default as the logical
+/// name and resolves the physical store through a resource link.
 #[must_use]
 pub fn default_config_store_name() -> StoreName {
     config_store_name(&EnvConfig::from_env())
 }
 
 /// Returns the default config-store key containing the app-config blob.
+///
+/// Process-environment overrides apply to native adapters such as Axum. Fastly
+/// has no process environment, so its custom entry point uses the manifest
+/// default key.
 #[must_use]
 pub fn default_config_key() -> String {
     config_key(&EnvConfig::from_env())
