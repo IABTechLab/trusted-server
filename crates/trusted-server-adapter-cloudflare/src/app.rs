@@ -15,6 +15,11 @@ use trusted_server_core::config_payload::CONFIG_BLOB_KEY;
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
+use trusted_server_core::ec::admin::{
+    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
+    deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
+};
+use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::RuntimeServices;
@@ -312,6 +317,10 @@ fn admin_key_management_not_supported() -> Response {
     response
 }
 
+fn admin_ec_lookup_not_supported() -> Response {
+    core_admin_ec_lookup_not_supported()
+}
+
 /// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
 /// aliases on the Cloudflare adapter.
 ///
@@ -431,6 +440,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         ) -> Result<Response, EdgeError> {
             let services = build_per_request_services(&ctx);
             let mut req = ctx.into_request();
+            if let Some(response) = deny_admin_diagnostic_fallback(&req) {
+                return Ok(response);
+            }
             if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
                 &state.settings,
                 &mut req,
@@ -537,6 +549,26 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post("/_ts/admin/keys/deactivate", |_ctx: RequestContext| async {
                 Ok::<Response, EdgeError>(admin_key_management_not_supported())
             })
+            // Admin EC lookup routes. Registered explicitly (like the key
+            // routes above) so they never fall through to the publisher
+            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
+            // coverage. The EC identity graph is Fastly KV backed, so this
+            // adapter has no store to read.
+            .get("/_ts/admin/ec", |_ctx: RequestContext| async {
+                Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
+            })
+            .get("/_ts/admin/ec/{id}", |_ctx: RequestContext| async {
+                Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
+            })
+            // Admin EIDs echo: pure request inspection (no KV), so this
+            // adapter serves the real handler.
+            .get(
+                "/_ts/admin/eids",
+                make_handler(Arc::clone(&state), |s, _services, req| async move {
+                    let partner_registry = PartnerRegistry::from_config(&s.settings.ec.partners)?;
+                    handle_admin_eids_lookup(&partner_registry, &req)
+                }),
+            )
             .post(
                 "/auction",
                 make_handler(Arc::clone(&state), |s, services, req| async move {

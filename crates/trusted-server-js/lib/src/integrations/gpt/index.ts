@@ -287,6 +287,8 @@ type GptWindow = Window & {
   __tsjs_slim_prebid_url?: string;
 };
 
+const executingPublisherScript = typeof document === 'undefined' ? null : document.currentScript;
+
 // ------------------------------------------------------------------
 // Shim implementation
 // ------------------------------------------------------------------
@@ -305,6 +307,25 @@ function ensureGoogleTagStub(win: GptWindow): Partial<GoogleTag> {
   const tag = (win.googletag = win.googletag ?? {});
   tag.cmd = tag.cmd ?? [];
   return tag;
+}
+
+function installTrustedServerPageTargeting(): void {
+  if (executingPublisherScript?.getAttribute('data-ts-gam-attribution') !== 'true') {
+    return;
+  }
+
+  const win = window as GptWindow;
+  const tag = ensureGoogleTagStub(win);
+  tag.cmd!.push(() => {
+    try {
+      const gpt = win.googletag;
+      if (typeof gpt?.setConfig === 'function') {
+        gpt.setConfig({ targeting: { ts: 'true' } });
+      }
+    } catch (error) {
+      log.warn('[tsjs-gpt] GAM attribution targeting failed', error);
+    }
+  });
 }
 
 /**
@@ -1052,21 +1073,15 @@ export function installTsAdInit(): void {
         // Diagnostics are observational only. A missing or malformed debug
         // implementation must never interrupt slot mapping or delivery.
         try {
+          const requestedSlotSizes = ts.gptSlotHandoffs?.[slotDivId2]?.formats;
           const opportunity = trustedServerOpportunity(bid);
-          if (bid.hb_auction_id !== undefined) {
-            ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
-              gptSlot,
-              slot.id,
-              opportunity,
-              bid.hb_auction_id
-            );
-          } else {
-            ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
-              gptSlot,
-              slot.id,
-              opportunity
-            );
-          }
+          ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
+            gptSlot,
+            slot.id,
+            opportunity,
+            bid.hb_auction_id,
+            requestedSlotSizes
+          );
         } catch {
           // Diagnostics must not alter ad delivery.
         }
@@ -1892,6 +1907,7 @@ if (typeof window !== 'undefined') {
     installGptShim();
   }
 
+  installTrustedServerPageTargeting();
   installTsAdInit();
   installSpaAuctionHook();
   installSlimPrebidLoader();
