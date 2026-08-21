@@ -39,7 +39,7 @@ Three independent levers. Two are config-gated and default off, so shipping the 
 - **Merge-safety rule:** only calls whose request object consists solely of `adUnits`, `timeout`, and `bidsBackHandler` (with a non-empty explicit `adUnits` array) are held. Any other call — extra keys such as `ortb2` or `labels`, or an implicit global-ad-units call — first flushes the pending queue synchronously, then dispatches solo. This preserves relative call order and never reinterprets options the merge logic does not understand.
 - **Default `0`:** the wrapper dispatches immediately, byte-for-byte the current behavior.
 
-**Return value:** held calls return `undefined` from `pbjs.requestBids`. This matches the wrapper's existing contract in practice, and the flag's opt-in nature means an operator enabling it accepts this for their property.
+**Return value:** Prebid 10's `requestBids` returns a promise, and the wrapper currently passes it through. Every held call therefore returns a promise that settles when the merged underlying `requestBids` promise settles, so callers awaiting the promise keep working; they observe the merged auction's completion rather than a per-call auction's.
 
 ### Lever B — GAM preconnect hint
 
@@ -59,15 +59,19 @@ Unconditional: it is a pure hint with no behavioral effect, and every GPT-enable
 
 **Config:** `[integrations.prebid] prefetch_first_refresh_auction` — `bool`, default `false`. Injected as `prefetchFirstRefreshAuction`, omitted when `false`.
 
-**Behavior:** When enabled, the first refresh auction's `/auction` request is dispatched as soon as all of the following hold, without waiting for `window.load`:
+**Mechanism today:** the `window.load` gate is `installSlimPrebidLoader` in the unified GPT bundle — the slim-Prebid module that runs refresh auctions is not even _loaded_ until `load` fires, and its first auction follows its post-load initialization. (The post-`load` + double-`rAF` defer from the React #418 fix belongs to the server-side-template `adInit` path and is not part of this flow.)
+
+**Behavior when enabled:** the unified GPT bundle — which is loaded from head-start — dispatches the first refresh auction's `/auction` request as soon as all of the following hold, without waiting for `window.load`:
 
 - consent has resolved (the existing consent gate is unchanged),
-- the GPT slots that the auction would target have been observed,
+- the GPT slots the auction would target have been observed,
 - `DOMContentLoaded` has fired.
 
-The response is held in memory and applied at the **unchanged** post-`load` + double-`rAF` application point. DOM work therefore keeps the exact hydration-safety timing the React #418 fix established; only the network round trip moves earlier.
+The response is stashed on `window.tsjs`. The slim-Prebid module, still loaded at the unchanged `window.load` point, consumes the stash during its existing initialization instead of issuing a fresh request. Only the network round trip moves earlier; script loading, targeting application, and the GPT refresh that triggers rendering keep their current post-load timing, so no render work moves into the hydration window.
 
-**Fallback:** if the prefetched response has not arrived by the time the application point runs, the path degrades to today's behavior (issue the request then). A prefetch failure is discarded and the normal path retries; no new error surface.
+**Alternative considered and rejected:** loading the slim-Prebid script itself at `DOMContentLoaded`. Simpler, but it would also pull GPT refresh — and therefore ad rendering into publisher containers — earlier into the hydration window, the same territory as React #418 and the ad-container hydration gating tracked in #969.
+
+**Fallback:** if the stash is absent or its request has not resolved when slim-Prebid initializes, the module issues its own request exactly as today. A failed prefetch is discarded; no new error surface.
 
 ## Config-blob compatibility
 
@@ -81,7 +85,8 @@ Both new fields serialize only at non-default values, matching the repository's 
 - a call with extra option keys flushes the queue first and dispatches solo, preserving order;
 - a throwing first handler does not prevent the second handler from running;
 - window `0` / absent config leaves per-call dispatch unchanged (existing suite must pass untouched);
-- prefetch: response held and applied at the application point; unresolved prefetch falls back to the current request-then-apply path.
+- prefetch: a stashed response is consumed by slim-Prebid initialization without a second `/auction` request; an absent or unresolved stash falls back to the current request path;
+- held `requestBids` calls return a promise that settles with the merged auction.
 
 **Rust:**
 
