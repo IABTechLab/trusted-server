@@ -9,10 +9,19 @@ cookie_domain = "localhost"
 origin_url = "http://127.0.0.1:8888"
 proxy_secret = "integration-test-proxy-secret"
 
+# The lifecycle scenarios need a resolved jurisdiction for the consent gate,
+# and Viceroy supplies the host geo lookup. The permission model replaces this
+# with a [geo] default_country baseline in the next PR of the series.
+[geo]
+provider = "platform"
+
 [ec]
-passphrase = "integration-test-ec-secret-padded-32"
+provider = "hmac"
 ec_store = "ec_identity_store"
 pull_sync_concurrency = 3
+
+[ec.providers.hmac]
+passphrase = "integration-test-ec-secret-padded-32"
 
 [[ec.partners]]
 name = "Integration Test Partner"

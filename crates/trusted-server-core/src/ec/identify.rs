@@ -10,7 +10,6 @@ use http::{Request, Response, StatusCode};
 use url::Url;
 
 use super::auth::authenticate_bearer;
-use super::consent::ec_consent_granted;
 use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
 use crate::settings::Settings;
@@ -62,7 +61,7 @@ pub fn handle_identify(
         );
     };
 
-    if !ec_consent_granted(ec_context.consent()) {
+    if !ec_context.ec_allowed() {
         return json_response_with_origin(
             StatusCode::FORBIDDEN,
             &serde_json::json!({ "consent": "denied" }),
@@ -332,7 +331,6 @@ fn apply_cors_headers(response: &mut Response<EdgeBody>, origin: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
     use crate::ec::registry::PartnerRegistry;
     use crate::redacted::Redacted;
@@ -352,13 +350,12 @@ mod tests {
         );
     }
 
-    fn make_ec_context(jurisdiction: Jurisdiction, ec_value: Option<&str>) -> EcContext {
+    fn make_ec_context(ec_allowed: bool, ec_value: Option<&str>) -> EcContext {
         let consent = ConsentContext {
-            jurisdiction,
             source: ConsentSource::Cookie,
             ..ConsentContext::default()
         };
-        EcContext::new_for_test(ec_value.map(str::to_owned), consent)
+        EcContext::new_for_test_gated(ec_value.map(str::to_owned), consent, ec_allowed)
     }
 
     fn make_test_partner(source_domain: &str, api_token: &str) -> EcPartner {
@@ -472,7 +469,7 @@ mod tests {
             .uri("https://edge.test-publisher.com/identify")
             .body(EdgeBody::empty())
             .expect("should build test request");
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let ec_context = make_ec_context(true, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should construct unauthorized response");
@@ -514,7 +511,7 @@ mod tests {
             .header("authorization", "Bearer wrong-token")
             .body(EdgeBody::empty())
             .expect("should build test request");
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let ec_context = make_ec_context(true, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should construct unauthorized response");
@@ -539,7 +536,7 @@ mod tests {
             .header("authorization", format!("Bearer {VALID_API_TOKEN}"))
             .body(EdgeBody::empty())
             .expect("should build test request");
-        let ec_context = make_ec_context(Jurisdiction::Unknown, None);
+        let ec_context = make_ec_context(false, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should construct denied response");
@@ -573,7 +570,7 @@ mod tests {
             .header("authorization", format!("Bearer {VALID_API_TOKEN}"))
             .body(EdgeBody::empty())
             .expect("should build test request");
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let ec_context = make_ec_context(true, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should construct no-content response");
@@ -599,7 +596,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build test request");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let ec_context = make_ec_context(true, Some(&ec_id));
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should construct degraded identify response");
@@ -652,7 +649,7 @@ mod tests {
             .header("origin", "https://evil.example")
             .body(EdgeBody::empty())
             .expect("should build test request");
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let ec_context = make_ec_context(true, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should construct forbidden response");
@@ -678,7 +675,7 @@ mod tests {
             .header("origin", "https://www.test-publisher.com")
             .body(EdgeBody::empty())
             .expect("should build test request");
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let ec_context = make_ec_context(true, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
             .expect("should construct no-content response with CORS headers");

@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/device/fastly",
+    "crates/geo/fastly",
     "crates/trusted-server-adapter-axum",
     "crates/trusted-server-adapter-cloudflare",
     "crates/trusted-server-adapter-fastly",
@@ -107,6 +109,8 @@ toml = "1.1"
 toml_edit = "0.23.10"
 tower = "0.4"
 trusted-server-core = { path = "crates/trusted-server-core" }
+trusted-server-device-fastly = { path = "crates/device/fastly" }
+trusted-server-geo-fastly = { path = "crates/geo/fastly" }
 trusted-server-js = { path = "crates/trusted-server-js" }
 trusted-server-openrtb = { path = "crates/trusted-server-openrtb" }
 url = "2.5.8"
