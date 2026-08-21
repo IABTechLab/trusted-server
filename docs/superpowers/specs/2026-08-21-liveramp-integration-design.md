@@ -306,11 +306,13 @@ Publisher commands may already be waiting in `window.pbjs.que`, including a
 Prebid processes existing commands in insertion order, so a publisher auction
 could run before the new entry.
 
-When LiveRamp is configured, the shim instead installs a narrowly scoped,
-idempotent wrapper around `pbjs.setConfig` before calling `pbjs.processQueue()`:
+When LiveRamp is configured, the shim instead installs narrowly scoped,
+idempotent wrappers around the public `pbjs.setConfig` and `pbjs.mergeConfig`
+APIs before calling `pbjs.processQueue()`:
 
-1. Capture and bind the real `pbjs.setConfig` implementation.
-2. Replace `pbjs.setConfig` with a wrapper that only normalizes calls containing
+1. Capture and bind the real `pbjs.setConfig` and, when present,
+   `pbjs.mergeConfig` implementations.
+2. Replace both public APIs with wrappers that only normalize calls containing
    `userSync.userIds`. Other configuration calls pass through unchanged.
 3. For a `userSync.userIds` call, preserve every non-`identityLink` entry,
    remove all publisher-supplied `identityLink` entries, and append exactly one
@@ -322,11 +324,17 @@ idempotent wrapper around `pbjs.setConfig` before calling `pbjs.processQueue()`:
    after the external Prebid bundle loaded but before the deferred TSJS shim.
    An absent or malformed effective list degrades to an empty publisher list.
    Complete this step before processing any existing queue entries.
-5. Call `pbjs.processQueue()`. Queued publisher `setConfig` calls flow through
-   the wrapper, so a later queued `requestBids` observes the managed entry.
-6. Keep the wrapper installed after queue processing so later publisher
-   `setConfig` calls cannot silently replace or delete the operator-owned
-   LiveRamp policy. Repeated TSJS installation must not stack wrappers.
+5. Call `pbjs.processQueue()`. Queued publisher `setConfig` and `mergeConfig`
+   calls flow through the wrappers, so a later queued `requestBids` observes
+   the managed entry.
+6. Keep the wrappers installed after queue processing so later publisher calls
+   through either public configuration API cannot silently replace or delete
+   the operator-owned LiveRamp policy. Repeated TSJS installation must not
+   stack wrappers.
+
+This is configuration ownership for supported Prebid API usage, not a security
+boundary against adversarial same-origin JavaScript that retained an earlier
+function reference or mutates internal configuration objects directly.
 
 This policy gives the operator ownership of the single `identityLink` entry
 when `[integrations.prebid.liveramp]` exists. Publishers retain ownership of all
@@ -351,7 +359,7 @@ sequenceDiagram
 
     O->>TS: Configure integrations.prebid.liveramp
     TS-->>B: Inject liveRamp config and managed Prebid bundle
-    B->>B: Install setConfig guard and synchronously merge identityLink
+    B->>B: Guard setConfig/mergeConfig and synchronously merge identityLink
     B->>LR: Prebid identityLink module resolves/refreshes envelope
     LR-->>B: Opaque RampID envelope
     B->>B: pbjs.getUserIdsAsEids()
@@ -439,9 +447,11 @@ Add tests in
   while the managed `identityLink` entry is added;
 - malformed pre-install `userSync.userIds` state degrades to the managed entry
   without throwing;
-- a publisher `identityLink` update after `processQueue()` is normalized back
-  to the operator-managed values;
-- repeated installation does not stack `setConfig` wrappers;
+- queued and late publisher `identityLink` updates through `mergeConfig` are
+  normalized back to the operator-managed values;
+- a publisher `identityLink` update through `setConfig` after `processQueue()`
+  is normalized back to the operator-managed values;
+- repeated installation does not stack either configuration wrapper;
 - configuration calls unrelated to `userSync.userIds` pass through unchanged;
 - missing `identityLinkIdSystem` appears in existing diagnostics;
 - `getUserIdsAsEids()` output for `liveramp.com` enters the current auction;
