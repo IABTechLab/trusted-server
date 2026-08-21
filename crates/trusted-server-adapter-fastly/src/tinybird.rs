@@ -399,6 +399,7 @@ mod tests {
             region: None,
             is_mobile: 0,
             is_known_browser: 1,
+            browser_family: Some("chrome".to_owned()),
             gdpr_applies: 0,
             consent_present: 0,
             terminal_status: Some("completed".to_owned()),
