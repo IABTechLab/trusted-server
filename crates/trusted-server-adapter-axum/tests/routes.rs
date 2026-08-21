@@ -461,6 +461,10 @@ async fn authenticated_admin_diagnostic_fallback_is_denied_locally() {
         "/admin/keys/rotate/extra".to_owned(),
         "/admin/keys%2Frotate".to_owned(),
         "/admin%2fkeys/rotate".to_owned(),
+        // Multi-encoded separators survive a single decode, so the reservation
+        // decodes to a fixed point before the publisher fallback runs.
+        "/admin%252Fkeys/rotate".to_owned(),
+        "/_ts%252Fadmin/ec".to_owned(),
     ] {
         for method in ["GET", "POST"] {
             let request = Request::builder()
