@@ -4,7 +4,7 @@
 
 **Goal:** Make Trusted Server's existing Prebid RampID EID path first-class by adding validated operator configuration, deterministic `identityLink` setup, bundle diagnostics, tests, and documentation.
 
-**Architecture:** Add an optional typed `liveramp` subsection to `PrebidIntegrationConfig` and serialize it into the existing `window.__tsjs_prebid` bootstrap. The TSJS Prebid shim installs an idempotent `pbjs.setConfig` normalizer before `processQueue()`, synchronously merges the operator-owned `identityLink` entry with effective publisher User ID entries, and preserves all unrelated configuration. Existing `/auction`, OpenRTB `user.ext.eids`, `ts-eids`, consent, and EC/KV paths remain unchanged.
+**Architecture:** Add an optional typed `liveramp` subsection to `PrebidIntegrationConfig` and serialize it into the existing `window.__tsjs_prebid` bootstrap. The TSJS Prebid shim installs idempotent `pbjs.setConfig` and `pbjs.mergeConfig` normalizers before `processQueue()`, synchronously merges the operator-owned `identityLink` entry with effective publisher User ID entries, and preserves all unrelated configuration. Existing `/auction`, OpenRTB `user.ext.eids`, `ts-eids`, consent, and EC/KV paths remain unchanged.
 
 **Tech Stack:** Rust 2024, Serde, validator, TypeScript, Prebid.js 10, Vitest, JSDOM, Vite, VitePress/Markdown, Cargo workspace aliases.
 
@@ -302,11 +302,12 @@ git commit -m "feat: configure LiveRamp for managed Prebid"
 
 - [ ] **Step 1: Reset mutable Prebid methods in the test harness**
 
-The new feature intentionally wraps `pbjs.setConfig`. In each relevant
+The new feature intentionally wraps `pbjs.setConfig` and `pbjs.mergeConfig`. In each relevant
 `beforeEach`, restore:
 
 ```typescript
 mockPbjs.setConfig = mockSetConfig
+mockPbjs.mergeConfig = mockMergeConfig
 mockPbjs.processQueue = mockProcessQueue
 delete mockPbjs['__tsLiveRampSetConfigInstalled']
 ```
@@ -341,8 +342,8 @@ const EXPECTED_IDENTITY_LINK = {
 
 Add tests proving:
 
-1. Absent `liveRamp` config does not replace `mockPbjs.setConfig` and adds no
-   `identityLink` call.
+1. Absent `liveRamp` config does not replace `mockPbjs.setConfig` or
+   `mockPbjs.mergeConfig` and adds no `identityLink` call.
 2. Already-effective `getConfig('userSync.userIds')` entries are preserved and
    an existing `identityLink` is replaced exactly once.
 3. An existing malformed effective value degrades to only the managed entry
@@ -353,13 +354,15 @@ Add tests proving:
    entry.
 6. A publisher `setConfig` after `processQueue()` cannot delete or replace the
    managed entry.
-7. Calls unrelated to `userSync.userIds` retain their exact object shape.
-8. A second installation does not stack wrappers.
-9. The diagnostics report configured name `identityLink` and report it missing
-   when the external manifest omits `identityLinkIdSystem`.
-10. Empty-string and structurally malformed LiveRamp EIDs are dropped before
+7. Queued and late publisher `mergeConfig` calls cannot append, delete, or
+   replace the managed entry.
+8. Calls unrelated to `userSync.userIds` retain their exact object shape.
+9. A second installation does not stack either configuration wrapper.
+10. The diagnostics report configured name `identityLink` and report it missing
+    when the external manifest omits `identityLinkIdSystem`.
+11. Empty-string and structurally malformed LiveRamp EIDs are dropped before
     the auction request is serialized.
-11. A valid opaque LiveRamp envelope survives the `ts-eids` cookie round trip
+12. A valid opaque LiveRamp envelope survives the `ts-eids` cookie round trip
     byte-for-byte without being decoded.
 
 Use a local `mockProcessQueue` implementation that drains `mockPbjs.que` in
@@ -424,6 +427,31 @@ expect(configuredUserIds).toEqual(
 Retain the current real `/auction` request assertion. Network remains stubbed;
 the test must not contact LiveRamp.
 
+After the initial managed-entry assertion, call the real public merge API and
+prove it cannot append a publisher-owned duplicate:
+
+```javascript
+pageWindow.pbjs.mergeConfig({
+  userSync: {
+    userIds: [
+      { name: 'sharedId' },
+      { name: 'identityLink', params: { pid: 'publisher-value' } },
+    ],
+  },
+})
+
+const mergedUserIds = pageWindow.pbjs.getConfig('userSync.userIds')
+expect(mergedUserIds.filter(({ name }) => name === 'identityLink')).toEqual([
+  expect.objectContaining({
+    name: 'identityLink',
+    params: { pid: '999', notUse3P: false },
+  }),
+])
+expect(mergedUserIds).toEqual(
+  expect.arrayContaining([expect.objectContaining({ name: 'sharedId' })])
+)
+```
+
 - [ ] **Step 5: Run the focused unit and artifact suites and verify failures**
 
 Run:
@@ -434,8 +462,8 @@ npx vitest run test/integrations/prebid/index.test.ts
 npx vitest run test/prebid-artifact-integration.test.mjs
 ```
 
-Expected: LiveRamp ownership tests fail because the injected shape and
-`setConfig` normalizer do not exist, and the artifact test fails because no
+Expected: LiveRamp ownership tests fail because the injected shape and public
+configuration normalizers do not exist, and the artifact test fails because no
 managed entry is installed. The transport-only characterizations may already
 pass; retain them as evidence of the pre-existing path.
 
@@ -540,20 +568,21 @@ fresh arrays. The spread operations preserve top-level properties and sibling
 `userSync` properties. Do not mutate publisher-owned arrays or objects in
 place.
 
-- [ ] **Step 9: Install the idempotent `setConfig` guard before queue processing**
+- [ ] **Step 9: Install idempotent public configuration guards before queue processing**
 
 In `installPrebidNpm`, after confirming the real Prebid API and before the
 existing base configuration and `processQueue()` call:
 
 1. If injected `liveRamp` is absent, do nothing.
-2. Capture and bind the current `pbjs.setConfig`.
-3. Replace it with a wrapper that normalizes only calls containing
-   `userSync.userIds`; pass all other calls through unchanged.
+2. Capture and bind the current `pbjs.setConfig` and optional
+   `pbjs.mergeConfig`.
+3. Replace both public APIs with wrappers that share one normalizer for calls
+   containing `userSync.userIds`; pass all other calls through unchanged.
 4. Mark the Prebid object with the sentinel so installation cannot stack.
 5. Read effective User ID entries through `pbjs.getConfig`.
 6. Call the wrapper synchronously with the effective list, producing one
    managed entry before any queued auction.
-7. Leave the wrapper installed across `processQueue()` and later calls.
+7. Leave both wrappers installed across `processQueue()` and later calls.
 
 Use logic equivalent to:
 
@@ -561,9 +590,10 @@ Use logic equivalent to:
 const managedPbjs = pbjs as typeof pbjs & Record<string, unknown>
 if (managedPbjs[LIVE_RAMP_SET_CONFIG_SENTINEL] !== true) {
   const originalSetConfig = pbjs.setConfig.bind(pbjs)
+  const originalMergeConfig = pbjs.mergeConfig?.bind(pbjs)
   const managedEntry = liveRampUserId(config.liveRamp)
 
-  pbjs.setConfig = (publisherConfig) => {
+  const normalizePublisherConfig = (publisherConfig) => {
     let nextConfig = publisherConfig
     try {
       if (hasUserIdsPath(publisherConfig)) {
@@ -572,7 +602,14 @@ if (managedPbjs[LIVE_RAMP_SET_CONFIG_SENTINEL] !== true) {
     } catch {
       log.error('Prebid LiveRamp configuration could not be normalized')
     }
-    return originalSetConfig(nextConfig)
+    return nextConfig
+  }
+
+  pbjs.setConfig = (publisherConfig) =>
+    originalSetConfig(normalizePublisherConfig(publisherConfig))
+  if (originalMergeConfig) {
+    pbjs.mergeConfig = (publisherConfig) =>
+      originalMergeConfig(normalizePublisherConfig(publisherConfig))
   }
   managedPbjs[LIVE_RAMP_SET_CONFIG_SENTINEL] = true
 
@@ -582,10 +619,10 @@ if (managedPbjs[LIVE_RAMP_SET_CONFIG_SENTINEL] !== true) {
 ```
 
 Adapt the callback and return types to the repository's actual `pbjs` typing.
-The original method is invoked exactly once, its return value is preserved,
+Each original method is invoked exactly once, its return value is preserved,
 and normalization errors never log values. The sentinel lives on `pbjs`, not
 on the page-level shim state: a test must deliberately reset only
-`__tsjsPrebidShimInstalled`, reinstall, and prove the wrapper reference is
+`__tsjsPrebidShimInstalled`, reinstall, and prove both wrapper references are
 unchanged and publisher calls are normalized once.
 
 - [ ] **Step 10: Run focused unit and artifact tests and make them pass**
@@ -599,8 +636,9 @@ npx vitest run test/prebid-artifact-integration.test.mjs
 ```
 
 Expected: unit tests pass; the real bundle advertises both User ID modules, the
-shim configures one `identityLink` entry, and the controlled auction still
-reaches `/auction`.
+shim configures one `identityLink` entry, a real `mergeConfig` call retains
+exactly that managed entry, and the controlled auction still reaches
+`/auction`.
 
 - [ ] **Step 11: Format, lint, and commit Task 2**
 
@@ -765,8 +803,10 @@ In `docs/guide/integrations/prebid.md`, document:
 - prerequisites: Placement ID, approved origin, CMP/LiveRamp consent posture,
   and an external bundle containing `identityLinkIdSystem`;
 - the exact TOML example and `ts prebid bundle` selection;
-- operator ownership of the single `identityLink` entry while preserving other
-  User ID modules;
+- operator ownership of the single `identityLink` entry for calls through the
+  supported public `pbjs.setConfig` and `pbjs.mergeConfig` APIs while preserving
+  other User ID modules; explicitly state that this is not a security boundary
+  against retained pre-wrapper references or direct internal mutation;
 - asynchronous resolution: a new browser's first auction may have no RampID;
 - the existing flow through `getUserIdsAsEids()`, `/auction`,
   `user.ext.eids`, `ts-eids`, and EC/KV;
