@@ -315,8 +315,13 @@ idempotent wrapper around `pbjs.setConfig` before calling `pbjs.processQueue()`:
 3. For a `userSync.userIds` call, preserve every non-`identityLink` entry,
    remove all publisher-supplied `identityLink` entries, and append exactly one
    operator-managed entry. Preserve sibling `userSync` and top-level fields.
-4. Apply the operator-managed entry synchronously through the captured function
-   before processing any existing queue entries.
+4. Read the already-effective `pbjs.getConfig('userSync.userIds')` value,
+   normalize its supported array/config shape, preserve its non-`identityLink`
+   entries, append the managed entry, and apply that merged list synchronously
+   through the captured function. This covers publisher configuration that ran
+   after the external Prebid bundle loaded but before the deferred TSJS shim.
+   An absent or malformed effective list degrades to an empty publisher list.
+   Complete this step before processing any existing queue entries.
 5. Call `pbjs.processQueue()`. Queued publisher `setConfig` calls flow through
    the wrapper, so a later queued `requestBids` observes the managed entry.
 6. Keep the wrapper installed after queue processing so later publisher
@@ -346,7 +351,7 @@ sequenceDiagram
 
     O->>TS: Configure integrations.prebid.liveramp
     TS-->>B: Inject liveRamp config and managed Prebid bundle
-    B->>B: Queue identityLink configuration
+    B->>B: Install setConfig guard and synchronously merge identityLink
     B->>LR: Prebid identityLink module resolves/refreshes envelope
     LR-->>B: Opaque RampID envelope
     B->>B: pbjs.getUserIdsAsEids()
@@ -430,6 +435,10 @@ Add tests in
   `requestBids` call;
 - queued publisher `setConfig` followed by `requestBids` preserves other User
   ID entries while the auction observes the managed `identityLink` entry;
+- User ID entries already effective before TSJS installation are preserved
+  while the managed `identityLink` entry is added;
+- malformed pre-install `userSync.userIds` state degrades to the managed entry
+  without throwing;
 - a publisher `identityLink` update after `processQueue()` is normalized back
   to the operator-managed values;
 - repeated installation does not stack `setConfig` wrappers;
