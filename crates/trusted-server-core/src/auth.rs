@@ -20,7 +20,9 @@ const BASIC_AUTH_REALM: &str = r#"Basic realm="Trusted Server""#;
 /// Admin endpoints are protected by requiring a handler during settings
 /// finalization; see [`Settings::from_toml`]. Credential checks use constant-time
 /// comparison for both username and password, and evaluate both regardless of
-/// individual match results to avoid timing oracles.
+/// individual match results to avoid timing oracles. Runtime requests within
+/// the reserved admin namespace fail closed if no handler matches, providing
+/// defense in depth for malformed and parameterized paths.
 ///
 /// # Errors
 ///
@@ -30,7 +32,13 @@ pub fn enforce_basic_auth(
     settings: &Settings,
     req: &Request<EdgeBody>,
 ) -> Result<Option<Response<EdgeBody>>, Report<TrustedServerError>> {
-    let Some(handler) = settings.handler_for_path(req.uri().path())? else {
+    let path = req.uri().path();
+    let Some(handler) = settings.handler_for_path(path)? else {
+        if Settings::is_admin_path(path) {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!("Admin path `{path}` has no configured handler"),
+            }));
+        }
         return Ok(None);
     };
 
@@ -115,6 +123,29 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_str(value).expect("should build authorization header"),
         );
+    }
+
+    #[test]
+    fn encoded_admin_separator_path_is_auth_gated() {
+        // `^/_ts/admin` matches the raw path, so a percent-encoded separator
+        // still consumes admin credentials. The publisher-fallback boundary
+        // reserves the same paths so those credentials are never forwarded
+        // upstream (see `ec::admin::deny_admin_diagnostic_fallback`).
+        let settings = create_test_settings();
+
+        for path in ["/_ts/admin%2Fec", "/_ts/admin%2fec"] {
+            let req = build_request(Method::GET, &format!("https://example.com{path}"));
+
+            let response = enforce_basic_auth(&settings, &req)
+                .expect("should evaluate auth")
+                .unwrap_or_else(|| panic!("should challenge {path}"));
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "should require credentials for {path}"
+            );
+        }
     }
 
     #[test]
@@ -303,5 +334,54 @@ mod tests {
             .expect("should evaluate auth")
             .expect("should challenge admin path with missing credentials");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn concrete_admin_path_without_matching_handler_fails_closed() {
+        let config = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/[{]id[}]$"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+        let settings: Settings =
+            toml::from_str(&config).expect("should deserialize settings without finalization");
+        let ec_id = format!("{}.abc123", "a".repeat(64));
+        let req = build_request(
+            Method::GET,
+            &format!("https://example.com/_ts/admin/ec/{ec_id}"),
+        );
+
+        let error = enforce_basic_auth(&settings, &req)
+            .expect_err("should fail closed without a matching admin handler");
+        assert!(
+            error.to_string().contains("no configured handler"),
+            "should describe the missing admin handler"
+        );
+    }
+
+    #[test]
+    fn similar_non_admin_prefix_without_handler_remains_public() {
+        let config = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin""#,
+            r#"path = "^/_ts/admin/keys/rotate$""#,
+        );
+        let settings: Settings =
+            toml::from_str(&config).expect("should deserialize settings without finalization");
+        let req = build_request(Method::GET, "https://example.com/_ts/administrator");
+
+        assert!(
+            enforce_basic_auth(&settings, &req)
+                .expect("should evaluate auth")
+                .is_none(),
+            "should not classify a similar prefix as the admin namespace"
+        );
     }
 }
