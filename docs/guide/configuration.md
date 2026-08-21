@@ -116,7 +116,7 @@ base TOML configuration by `ts config validate`, `ts config diff`, and
 stored in the app-config blob. Changing an environment variable requires
 rerunning validation and pushing the resolved config, not rebuilding the binary.
 
-EdgeZero v0.0.4 only overrides leaves that already exist in the parsed TOML; it
+EdgeZero's env overlay only overrides leaves that already exist in the parsed TOML; it
 does not create missing fields. Add newly introduced defaulted fields to an
 existing config before relying on their environment overrides. Pass `--no-env`
 to use file values without the overlay.
@@ -1498,7 +1498,7 @@ remove that field's non-default value (and any environment override), run
 `ts config validate`, push the resulting default-compatible blob, and only then
 roll back the binary.
 
-**Environment overlays:** EdgeZero v0.0.4 overlays cannot create missing TOML
+**Environment overlays:** EdgeZero's env overlays cannot create missing TOML
 leaves. Existing configs must add **both** leaves under `[auction]`
 (`rewrite_creatives` and `sanitize_creatives`) before
 `TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES` /
@@ -2008,7 +2008,7 @@ trusted-server.dev.toml      # Development overrides
 **Environment Variables Not Applied**:
 
 - Run the override through `ts config validate`, `ts config diff`, or `ts config push`
-- Verify the target leaf already exists in `trusted-server.toml`; EdgeZero v0.0.4 does not create missing fields
+- Verify the target leaf already exists in `trusted-server.toml`; the env overlay does not create missing fields
 - Verify prefix: `TRUSTED_SERVER__`
 - Check separator: `__` (double underscore)
 - Confirm the variable is exported: `echo $VARIABLE_NAME`

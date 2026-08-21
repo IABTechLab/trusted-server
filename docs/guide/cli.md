@@ -76,6 +76,29 @@ Trusted Server settings JSON. This blob model is intentional because full
 Trusted Server configs can exceed Fastly limits when split into one config-store
 entry per setting.
 
+Reclaim orphaned chunk entries leaked from prior oversized pushes:
+
+```bash
+ts config gc --adapter fastly
+```
+
+Without `--yes`, `config gc` only previews: it reports what it would delete and
+deletes nothing. `--dry-run` states that intent explicitly and conflicts with
+`--yes`. To actually delete, pass `--yes` together with `--older-than <window>`
+(`s`/`m`/`h`/`d` suffixes, e.g. `7d`; a bare number means seconds):
+
+```bash
+ts config gc --adapter fastly --yes --older-than 7d
+```
+
+`config gc` sweeps every root in the selected physical store, so `--older-than`
+is a safety assertion about the whole store: nothing in it changed within the
+window and no writer is targeting it. Unlike the other `config` subcommands,
+`gc` never loads the typed app config; its `--no-env` flag instead ignores
+`EDGEZERO__STORES__CONFIG__<ID>__NAME` when resolving which physical store to
+sweep. On a destructive run, check the store id `gc` reports before passing
+`--yes`.
+
 ### Diagnose ad-template configuration
 
 The static `ts config ad-templates` commands evaluate local configuration
