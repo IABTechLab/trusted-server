@@ -34,7 +34,7 @@ beforeAll(async () => {
     '--adapters',
     'adf',
     '--user-id-modules',
-    'sharedIdSystem',
+    'sharedIdSystem,identityLinkIdSystem',
     '--out',
     outputDirectory,
   ]);
@@ -132,7 +132,16 @@ describe('external bundle + served shim evaluated together', () => {
     // Mirror the server's head-injected state, which always precedes the
     // bundle script in document order.
     pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
-    pageWindow.__tsjs_prebid = { clientSideBidders: [] };
+    pageWindow.__tsjs_prebid = {
+      clientSideBidders: [],
+      liveRamp: {
+        placementId: '999',
+        notUse3P: false,
+        storageType: 'cookie',
+        expiresDays: 15,
+        refreshInSeconds: 1800,
+      },
+    };
 
     pageWindow.eval(bundleCode);
 
@@ -144,7 +153,10 @@ describe('external bundle + served shim evaluated together', () => {
       'adform',
       'adformOpenRTB',
     ]);
-    expect([...pageWindow.__tsjs_prebid_bundle.userIdModules]).toEqual(['sharedIdSystem']);
+    expect([...pageWindow.__tsjs_prebid_bundle.userIdModules]).toEqual([
+      'sharedIdSystem',
+      'identityLinkIdSystem',
+    ]);
 
     // Count trustedServer registrations across repeated shim evaluations.
     const originalRegisterBidAdapter = pageWindow.pbjs.registerBidAdapter.bind(pageWindow.pbjs);
@@ -153,6 +165,16 @@ describe('external bundle + served shim evaluated together', () => {
 
     pageWindow.eval(shimCode);
     const wrappedRequestBids = pageWindow.pbjs.requestBids;
+
+    expect(pageWindow.pbjs.getConfig('userSync.userIds')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: 'identityLink',
+          params: { pid: '999', notUse3P: false },
+          storage: expect.objectContaining({ name: 'idl_env' }),
+        }),
+      ])
+    );
 
     // A second evaluation (double script inclusion, or a legacy bundle that
     // still carries a baked-in shim running after this one) must be a no-op.

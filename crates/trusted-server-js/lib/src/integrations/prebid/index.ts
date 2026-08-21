@@ -131,6 +131,9 @@ const TS_REFRESH_TARGETING_KEYS = [
 const MAX_PUBLISHER_AD_UNIT_SNAPSHOTS = 256;
 const MAX_PENDING_PUBLISHER_BIDS = 2048;
 const PENDING_PUBLISHER_DELIVERY_TTL_MS = 5000;
+const IDENTITY_LINK_CONFIG_NAME = 'identityLink';
+const IDENTITY_LINK_STORAGE_NAME = 'idl_env';
+const LIVE_RAMP_SET_CONFIG_SENTINEL = '__tsLiveRampSetConfigInstalled';
 
 /** Configuration options for the Prebid integration. */
 export interface PrebidNpmConfig {
@@ -155,7 +158,19 @@ interface InjectedPrebidConfig {
   clientSideBidders?: string[];
   /** GAM ad-unit-path suffixes excluded from refresh auctions. */
   excludedGamAdUnitPathSuffixes?: string[];
+  /** Operator-owned LiveRamp IdentityLink configuration. */
+  liveRamp?: InjectedLiveRampConfig;
 }
+
+interface InjectedLiveRampConfig {
+  placementId: string;
+  notUse3P: boolean;
+  storageType: 'cookie' | 'html5';
+  expiresDays: number;
+  refreshInSeconds: number;
+}
+
+type PrebidUserIdConfigEntry = Record<string, unknown> & { name: string };
 
 interface PrebidUserIdDiagnostics {
   includedModules: string[];
@@ -187,29 +202,74 @@ export function collectBidders(adUnits: Array<{ bids?: Array<{ bidder?: string }
   return [...bidders];
 }
 
-function configuredUserIdNamesFromConfig(config: unknown): string[] {
-  const userIds = Array.isArray(config)
-    ? config
-    : config && typeof config === 'object'
-      ? ((
-          config as {
-            userSync?: { userIds?: Array<{ name?: unknown }> };
-            userIds?: Array<{ name?: unknown }>;
-          }
-        ).userSync?.userIds ?? (config as { userIds?: Array<{ name?: unknown }> }).userIds)
-      : undefined;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
 
-  if (!Array.isArray(userIds)) {
-    return [];
+function configuredUserIdEntries(config: unknown): PrebidUserIdConfigEntry[] {
+  let userIds: unknown;
+  if (Array.isArray(config)) {
+    userIds = config;
+  } else if (isRecord(config)) {
+    userIds = isRecord(config.userSync) ? config.userSync.userIds : undefined;
+    if (!Array.isArray(userIds)) {
+      userIds = config.userIds;
+    }
   }
 
-  return [
-    ...new Set(
-      userIds
-        .map((entry) => entry?.name)
-        .filter((name): name is string => typeof name === 'string' && name.length > 0)
-    ),
-  ].sort();
+  if (!Array.isArray(userIds)) return [];
+
+  return userIds.filter(
+    (entry): entry is PrebidUserIdConfigEntry =>
+      isRecord(entry) && typeof entry.name === 'string' && entry.name.length > 0
+  );
+}
+
+function hasUserIdsPath(config: unknown): config is Record<string, unknown> & {
+  userSync: Record<string, unknown> & { userIds: unknown };
+} {
+  return (
+    isRecord(config) &&
+    isRecord(config.userSync) &&
+    Object.prototype.hasOwnProperty.call(config.userSync, 'userIds')
+  );
+}
+
+function configuredUserIdNamesFromConfig(config: unknown): string[] {
+  const userIds = configuredUserIdEntries(config);
+
+  return [...new Set(userIds.map((entry) => entry.name))].sort();
+}
+
+function liveRampUserId(config: InjectedLiveRampConfig): PrebidUserIdConfigEntry {
+  return {
+    name: IDENTITY_LINK_CONFIG_NAME,
+    params: { pid: config.placementId, notUse3P: config.notUse3P },
+    storage: {
+      type: config.storageType,
+      name: IDENTITY_LINK_STORAGE_NAME,
+      expires: config.expiresDays,
+      refreshInSeconds: config.refreshInSeconds,
+    },
+  };
+}
+
+function withManagedLiveRampUserId(
+  config: Record<string, unknown>,
+  managedEntry: PrebidUserIdConfigEntry
+): Record<string, unknown> {
+  if (!hasUserIdsPath(config)) return config;
+
+  const retained = configuredUserIdEntries(config.userSync.userIds).filter(
+    (entry) => entry.name !== IDENTITY_LINK_CONFIG_NAME
+  );
+  return {
+    ...config,
+    userSync: {
+      ...config.userSync,
+      userIds: [...retained, managedEntry],
+    },
+  };
 }
 
 function readConfiguredUserIdNames(): string[] {
@@ -1105,6 +1165,32 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     timeout: config?.timeout ?? injected?.timeout,
     debug: config?.debug ?? injected?.debug,
   };
+
+  const managedPbjs = pbjs as typeof pbjs & Record<string, unknown>;
+  if (injected?.liveRamp && managedPbjs[LIVE_RAMP_SET_CONFIG_SENTINEL] !== true) {
+    const originalSetConfig = pbjs.setConfig.bind(pbjs);
+    const managedEntry = liveRampUserId(injected.liveRamp);
+
+    pbjs.setConfig = ((publisherConfig: PbjsConfig) => {
+      let nextConfig = publisherConfig;
+      try {
+        if (hasUserIdsPath(publisherConfig)) {
+          nextConfig = withManagedLiveRampUserId(publisherConfig, managedEntry) as PbjsConfig;
+        }
+      } catch {
+        log.error('[tsjs-prebid] LiveRamp configuration could not be normalized');
+      }
+      return originalSetConfig(nextConfig);
+    }) as typeof pbjs.setConfig;
+    managedPbjs[LIVE_RAMP_SET_CONFIG_SENTINEL] = true;
+
+    const getConfig = (pbjs as unknown as { getConfig?: (key?: string) => unknown }).getConfig;
+    const effectiveUserIds =
+      typeof getConfig === 'function'
+        ? configuredUserIdEntries(getConfig.call(pbjs, 'userSync.userIds'))
+        : [];
+    pbjs.setConfig({ userSync: { userIds: effectiveUserIds } } as PbjsConfig);
+  }
 
   auctionEndpoint = merged.endpoint ?? '/auction';
   const apsRendererSupported = hasApsRendererApi();

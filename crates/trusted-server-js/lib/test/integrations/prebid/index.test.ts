@@ -27,6 +27,25 @@ const DEFAULT_BUNDLE_MANIFEST = {
   userIdModules: ['sharedIdSystem'],
 };
 
+const LIVE_RAMP_CONFIG = {
+  placementId: '999',
+  notUse3P: false,
+  storageType: 'cookie' as const,
+  expiresDays: 15,
+  refreshInSeconds: 1800,
+};
+
+const EXPECTED_IDENTITY_LINK = {
+  name: 'identityLink',
+  params: { pid: '999', notUse3P: false },
+  storage: {
+    type: 'cookie',
+    name: 'idl_env',
+    expires: 15,
+    refreshInSeconds: 1800,
+  },
+};
+
 /** Loose bid shape used by the requestBids shim tests. */
 interface TestBid {
   bidder: string;
@@ -47,6 +66,7 @@ interface InjectedPrebidTestConfig {
   bidders?: string[];
   clientSideBidders?: string[];
   excludedGamAdUnitPathSuffixes?: unknown;
+  liveRamp?: typeof LIVE_RAMP_CONFIG;
 }
 
 interface TestGoogletag {
@@ -210,6 +230,9 @@ import envelope from '../../fixtures/aps-renderer-v1.json';
 // self-init above already set it), so every test starts from a clean page.
 beforeEach(() => {
   delete testWindow.__tsjsPrebidShimInstalled;
+  mockPbjs.setConfig = mockSetConfig;
+  mockPbjs.processQueue = mockProcessQueue;
+  delete mockPbjs['__tsLiveRampSetConfigInstalled'];
 });
 
 describe('prebid/collectBidders', () => {
@@ -403,9 +426,14 @@ describe('prebid/auctionBidsToPrebidBids', () => {
 describe('prebid/installPrebidNpm', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockSetConfig.mockReset();
+    mockProcessQueue.mockReset();
     // Reset requestBids to the mock so each test starts fresh
     mockPbjs.requestBids = mockRequestBids;
+    mockPbjs.setConfig = mockSetConfig;
+    mockPbjs.processQueue = mockProcessQueue;
     mockPbjs.adUnits = [];
+    mockPbjs.que = [];
     mockGetUserIdsAsEids.mockReset();
     mockGetUserIdsAsEids.mockReturnValue([]);
     mockGetConfig.mockReset();
@@ -414,6 +442,7 @@ describe('prebid/installPrebidNpm', () => {
     delete testWindow.__tsjs_prebid_diagnostics;
     delete testWindow.tsjs;
     delete mockPbjs['__tsApsBidResponseListenerInstalled'];
+    delete mockPbjs['__tsLiveRampSetConfigInstalled'];
     delete mockPbjs.bidderSettings;
   });
 
@@ -785,6 +814,158 @@ describe('prebid/installPrebidNpm', () => {
     expect(mockProcessQueue).toHaveBeenCalledTimes(1);
   });
 
+  it('leaves setConfig unchanged when LiveRamp is not configured', () => {
+    const originalSetConfig = mockPbjs.setConfig;
+
+    installPrebidNpm();
+
+    expect(mockPbjs.setConfig).toBe(originalSetConfig);
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+  });
+
+  it('preserves effective User ID entries and replaces identityLink exactly once', () => {
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds'
+        ? [
+            { name: 'sharedId', storage: { name: '_sharedid' } },
+            { name: 'identityLink', params: { pid: 'publisher-value' } },
+            { name: 'identityLink', params: { pid: 'duplicate-value' } },
+          ]
+        : {}
+    );
+    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+
+    installPrebidNpm();
+
+    const managedCall = mockSetConfig.mock.calls.find(([value]) => value?.userSync?.userIds);
+    expect(managedCall?.[0]).toEqual({
+      userSync: {
+        userIds: [{ name: 'sharedId', storage: { name: '_sharedid' } }, EXPECTED_IDENTITY_LINK],
+      },
+    });
+    expect(
+      managedCall?.[0].userSync.userIds.filter(
+        (entry: { name?: string }) => entry.name === 'identityLink'
+      )
+    ).toHaveLength(1);
+  });
+
+  it('drops malformed effective User ID state and installs the managed entry', () => {
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [null, 'invalid', {}, { name: '' }, { name: 'sharedId' }] : {}
+    );
+    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+
+    expect(() => installPrebidNpm()).not.toThrow();
+
+    const managedCall = mockSetConfig.mock.calls.find(([value]) => value?.userSync?.userIds);
+    expect(managedCall?.[0].userSync.userIds).toEqual([
+      { name: 'sharedId' },
+      EXPECTED_IDENTITY_LINK,
+    ]);
+  });
+
+  it('installs the managed entry before processing the publisher queue', () => {
+    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+
+    installPrebidNpm();
+
+    const managedCallOrder = mockSetConfig.mock.invocationCallOrder.find(
+      (_, index) => mockSetConfig.mock.calls[index][0]?.userSync?.userIds
+    );
+    expect(managedCallOrder).toBeLessThan(mockProcessQueue.mock.invocationCallOrder[0]);
+  });
+
+  it('normalizes queued User ID config before a queued auction observes it', () => {
+    let observedUserIds: unknown;
+    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    mockPbjs.que = [
+      () =>
+        mockPbjs.setConfig({
+          userSync: {
+            syncDelay: 50,
+            userIds: [
+              { name: 'sharedId' },
+              { name: 'identityLink', params: { pid: 'publisher-value' } },
+            ],
+          },
+          auctionOptions: { suppressStaleRender: true },
+        }),
+      () => {
+        observedUserIds = mockSetConfig.mock.calls.at(-1)?.[0]?.userSync?.userIds;
+      },
+    ];
+    mockProcessQueue.mockImplementation(() => {
+      for (const callback of mockPbjs.que.splice(0)) callback();
+    });
+
+    installPrebidNpm();
+
+    expect(observedUserIds).toEqual([{ name: 'sharedId' }, EXPECTED_IDENTITY_LINK]);
+    const queuedConfig = mockSetConfig.mock.calls.at(-1)?.[0];
+    expect(queuedConfig.userSync.syncDelay).toBe(50);
+    expect(queuedConfig.auctionOptions).toEqual({ suppressStaleRender: true });
+  });
+
+  it('normalizes publisher identityLink updates after processQueue', () => {
+    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    installPrebidNpm();
+
+    mockPbjs.setConfig({
+      userSync: {
+        userIds: [
+          { name: 'id5Id', params: { partner: 1 } },
+          { name: 'identityLink', params: { pid: 'publisher-value' } },
+        ],
+      },
+    });
+
+    expect(mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([
+      { name: 'id5Id', params: { partner: 1 } },
+      EXPECTED_IDENTITY_LINK,
+    ]);
+  });
+
+  it('passes unrelated publisher configuration through by reference', () => {
+    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    installPrebidNpm();
+    const publisherConfig = { priceGranularity: 'medium', userSync: { syncDelay: 50 } };
+
+    mockPbjs.setConfig(publisherConfig);
+
+    expect(mockSetConfig.mock.calls.at(-1)?.[0]).toBe(publisherConfig);
+  });
+
+  it('does not stack the LiveRamp setConfig wrapper across shim reinstallations', () => {
+    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    installPrebidNpm();
+    const managedSetConfig = mockPbjs.setConfig;
+    delete testWindow.__tsjsPrebidShimInstalled;
+
+    installPrebidNpm();
+
+    expect(mockPbjs.setConfig).toBe(managedSetConfig);
+    mockPbjs.setConfig({ userSync: { userIds: [] } });
+    expect(mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([EXPECTED_IDENTITY_LINK]);
+  });
+
+  it('reports identityLink missing when its bundle module is absent', () => {
+    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    testWindow.__tsjs_prebid_bundle = { userIdModules: [] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [EXPECTED_IDENTITY_LINK] : {}
+    );
+
+    installPrebidNpm();
+
+    expect(testWindow.__tsjs_prebid_diagnostics.userIdModules).toEqual({
+      includedModules: [],
+      configuredUserIdNames: ['identityLink'],
+      missingConfiguredUserIdNames: ['identityLink'],
+    });
+    testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
+  });
+
   it('reports the User ID modules selected by the generated bundle', () => {
     installPrebidNpm();
 
@@ -933,6 +1114,90 @@ describe('prebid/installPrebidNpm', () => {
           uids: [{ id: 'pair_123', atype: 571187 }],
         },
       ]);
+    });
+
+    it('forwards the opaque LiveRamp envelope as a liveramp.com EID', () => {
+      const spec = getAdapterSpec();
+      mockGetUserIdsAsEids.mockReturnValue([
+        {
+          source: 'liveramp.com',
+          uids: [{ id: 'opaque-test-envelope', atype: 3 }],
+        },
+      ]);
+
+      const request = spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidId: 'bid-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+
+      expect(JSON.parse(request.data).eids).toEqual([
+        {
+          source: 'liveramp.com',
+          uids: [{ id: 'opaque-test-envelope', atype: 3 }],
+        },
+      ]);
+    });
+
+    it('drops empty and malformed LiveRamp envelope values', () => {
+      const spec = getAdapterSpec();
+      mockGetUserIdsAsEids.mockReturnValue([
+        {
+          source: 'liveramp.com',
+          uids: [
+            { id: '' },
+            { id: undefined as unknown as string },
+            { id: 'opaque-valid-envelope', atype: 3 },
+          ],
+        },
+        { source: '', uids: [{ id: 'opaque-invalid-source' }] },
+      ]);
+
+      const request = spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+
+      expect(JSON.parse(request.data).eids).toEqual([
+        {
+          source: 'liveramp.com',
+          uids: [{ id: 'opaque-valid-envelope', atype: 3 }],
+        },
+      ]);
+    });
+
+    it('never writes an opaque LiveRamp envelope to logs', () => {
+      const sentinel = 'opaque-envelope-must-not-be-logged';
+      const spies = [
+        vi.spyOn(log, 'debug').mockImplementation(() => {}),
+        vi.spyOn(log, 'info').mockImplementation(() => {}),
+        vi.spyOn(log, 'warn').mockImplementation(() => {}),
+        vi.spyOn(log, 'error').mockImplementation(() => {}),
+      ];
+      const spec = getAdapterSpec();
+      mockGetUserIdsAsEids.mockReturnValue([
+        { source: 'liveramp.com', uids: [{ id: sentinel, atype: 3 }] },
+      ]);
+
+      spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+
+      const logged = spies.flatMap((spy) => spy.mock.calls).flat();
+      expect(logged.some((value) => JSON.stringify(value).includes(sentinel))).toBe(false);
     });
 
     it('buildRequests clears stale ts-eids cookie when current Prebid EIDs are absent', () => {
@@ -1385,6 +1650,32 @@ describe('prebid/installPrebidNpm', () => {
             { id: 'shared_123', atype: 3 },
             { id: 'shared_456', ext: { provider: 'example' } },
           ],
+        },
+      ]);
+    });
+
+    it('preserves an opaque LiveRamp envelope in the ts-eids cookie', () => {
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+      });
+      mockGetUserIdsAsEids.mockReturnValue([
+        {
+          source: 'liveramp.com',
+          uids: [{ id: 'opaque-test-envelope', atype: 3 }],
+        },
+      ]);
+
+      const pbjs = installPrebidNpm();
+      pbjs.requestBids({
+        adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
+      } as unknown as RequestBidsArg);
+
+      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
+      expect(cookieValue).toBeDefined();
+      expect(JSON.parse(atob(cookieValue!))).toEqual([
+        {
+          source: 'liveramp.com',
+          uids: [{ id: 'opaque-test-envelope', atype: 3 }],
         },
       ]);
     });
