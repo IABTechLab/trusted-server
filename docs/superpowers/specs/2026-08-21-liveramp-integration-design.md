@@ -161,8 +161,9 @@ operators cannot audit it alongside the generated bundle manifest.
 ### 5.1 Selected: typed LiveRamp configuration within Prebid
 
 Add an optional LiveRamp subsection to `PrebidIntegrationConfig`, inject it
-through `window.__tsjs_prebid`, and let the TSJS Prebid shim configure the
-existing `identityLinkIdSystem` before queued Prebid work is processed.
+through `window.__tsjs_prebid`, and let the TSJS Prebid shim install an
+operator-owned `identityLinkIdSystem` configuration before queued Prebid work
+is processed.
 
 Benefits:
 
@@ -300,13 +301,32 @@ The TSJS Prebid shim translates the injected object into:
 }
 ```
 
-Publisher commands may already be waiting in `window.pbjs.que`. The managed
-LiveRamp configuration must be appended to that queue before
-`pbjs.processQueue()` rather than applied immediately. When executed, it reads
-the effective `userSync.userIds`, preserves unrelated publisher User ID
-entries, and replaces or appends exactly one `identityLink` entry with the
-operator-managed values. This ordering makes the Trusted Server configuration
-deterministic without deleting other publisher identity modules.
+Publisher commands may already be waiting in `window.pbjs.que`, including a
+`requestBids` command. Appending the managed configuration would be too late:
+Prebid processes existing commands in insertion order, so a publisher auction
+could run before the new entry.
+
+When LiveRamp is configured, the shim instead installs a narrowly scoped,
+idempotent wrapper around `pbjs.setConfig` before calling `pbjs.processQueue()`:
+
+1. Capture and bind the real `pbjs.setConfig` implementation.
+2. Replace `pbjs.setConfig` with a wrapper that only normalizes calls containing
+   `userSync.userIds`. Other configuration calls pass through unchanged.
+3. For a `userSync.userIds` call, preserve every non-`identityLink` entry,
+   remove all publisher-supplied `identityLink` entries, and append exactly one
+   operator-managed entry. Preserve sibling `userSync` and top-level fields.
+4. Apply the operator-managed entry synchronously through the captured function
+   before processing any existing queue entries.
+5. Call `pbjs.processQueue()`. Queued publisher `setConfig` calls flow through
+   the wrapper, so a later queued `requestBids` observes the managed entry.
+6. Keep the wrapper installed after queue processing so later publisher
+   `setConfig` calls cannot silently replace or delete the operator-owned
+   LiveRamp policy. Repeated TSJS installation must not stack wrappers.
+
+This policy gives the operator ownership of the single `identityLink` entry
+when `[integrations.prebid.liveramp]` exists. Publishers retain ownership of all
+other Prebid and User ID configuration. Omitting the subsection installs no
+wrapper and preserves current publisher behavior exactly.
 
 After queue processing, the existing bundle diagnostics confirm that
 `identityLinkIdSystem` is present in the external bundle. A missing module is a
@@ -406,7 +426,14 @@ Add tests in
 - enabled config creates the exact documented Prebid object;
 - an unrelated publisher `userIds` list is preserved;
 - a publisher-provided `identityLink` entry is replaced, not duplicated;
-- managed configuration runs after earlier queued publisher configuration;
+- managed configuration is active before an already-queued publisher
+  `requestBids` call;
+- queued publisher `setConfig` followed by `requestBids` preserves other User
+  ID entries while the auction observes the managed `identityLink` entry;
+- a publisher `identityLink` update after `processQueue()` is normalized back
+  to the operator-managed values;
+- repeated installation does not stack `setConfig` wrappers;
+- configuration calls unrelated to `userSync.userIds` pass through unchanged;
 - missing `identityLinkIdSystem` appears in existing diagnostics;
 - `getUserIdsAsEids()` output for `liveramp.com` enters the current auction;
 - malformed and empty envelope values are dropped;
