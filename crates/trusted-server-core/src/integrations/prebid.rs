@@ -220,28 +220,28 @@ fn validate_liveramp_placement_id(value: &str) -> Result<(), ValidationError> {
     Err(error)
 }
 
-/// Browser storage mechanism used by Prebid's LiveRamp IdentityLink module.
+/// Browser storage mechanism used by Prebid's `LiveRamp` `IdentityLink` module.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PrebidLiveRampStorageType {
-    /// Store the opaque RampID envelope in a browser cookie.
+    /// Store the opaque `RampID` envelope in a browser cookie.
     #[default]
     Cookie,
-    /// Store the opaque RampID envelope in browser local storage.
+    /// Store the opaque `RampID` envelope in browser local storage.
     Html5,
 }
 
-/// Operator-owned configuration for Prebid's LiveRamp IdentityLink module.
+/// Operator-owned configuration for Prebid's `LiveRamp` `IdentityLink` module.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct PrebidLiveRampConfig {
-    /// Numeric Placement ID assigned by LiveRamp for the approved publisher origin.
+    /// Numeric Placement ID assigned by `LiveRamp` for the approved publisher origin.
     #[validate(custom(function = "validate_liveramp_placement_id"))]
     pub placement_id: String,
     /// Disable third-party-cookie recognition when `true`.
     #[serde(default)]
     pub not_use_3p: bool,
-    /// Browser storage mechanism for the opaque RampID envelope.
+    /// Browser storage mechanism for the opaque `RampID` envelope.
     #[serde(default)]
     pub storage_type: PrebidLiveRampStorageType,
     /// Number of days for which the browser stores the opaque envelope.
@@ -265,7 +265,7 @@ pub struct PrebidIntegrationConfig {
     /// it in JavaScript.
     #[serde(default)]
     pub account_id: Option<String>,
-    /// Optional managed LiveRamp RampID configuration for Prebid.js.
+    /// Optional managed `LiveRamp` `RampID` configuration for Prebid.js.
     #[serde(default)]
     #[validate(nested)]
     pub liveramp: Option<PrebidLiveRampConfig>,
