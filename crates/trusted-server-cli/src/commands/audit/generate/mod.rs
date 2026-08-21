@@ -99,6 +99,7 @@ pub(crate) struct GenerateArgs {
     /// cookie) so the origin serves the real page instead of a challenge.
     #[arg(long = "cookie", value_name = "NAME=VALUE", value_parser = crate::commands::audit::parse_cookie)]
     pub(crate) cookies: Vec<(String, String)>,
+    /// Browser and consent options shared with `ts audit ad-templates generate`.
     #[command(flatten)]
     pub(crate) browser: GenerateBrowserOpts,
 }
@@ -1768,7 +1769,7 @@ mod tests {
         };
 
         validate_merge_policy(Some(&existing), Some(&inferred), false)
-            .expect("an unset section_root is no policy to preserve");
+            .expect("should have no policy to preserve when section_root is unset");
     }
 
     #[test]

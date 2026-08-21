@@ -49,7 +49,7 @@ mistaken for a bot challenge. Cross-page slot inference, merging, and
 those stages.
 
 Some ad stacks build IDs as `<family>_<render token>_<placement>`, where the
-render token — at least eight leading digits followed by more alphanumerics,
+render token — at least ten leading digits followed by more alphanumerics,
 that is, a millisecond timestamp plus entropy — sits _before_ the part that
 distinguishes one placement from the next. Such an ID can be written neither
 literally nor as a prefix: the only stable prefix stops at the token and reaches
@@ -67,8 +67,8 @@ collision check.
 The generator prefers omission over a configuration that cannot match future
 renders. For an observed desktop crawl of a site with this mix, replacement
 output should therefore contain the stable `ad-header-0` and `ad-fixed_bottom-0`
-slots, while the in-content collision group, the volatile-token family, and the
-section-varying sidebar are explained in notes.
+slots, while the in-content collision group and the volatile-token family are
+explained in notes.
 
 ## Tests
 
