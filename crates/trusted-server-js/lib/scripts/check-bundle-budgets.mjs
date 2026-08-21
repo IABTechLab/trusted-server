@@ -153,6 +153,7 @@ const CURRENT_EXACT_SOURCE_OWNERS = Object.freeze({
   'src/integrations/gpt_diagnostics/observer.ts': 'gpt_diagnostics',
   'src/integrations/gpt_diagnostics/overlay.ts': 'diagnostics_presentation',
   'src/integrations/gpt_diagnostics/presentation.ts': 'diagnostics_presentation',
+  'src/integrations/gpt_diagnostics/presentation_helpers.ts': 'diagnostics_presentation',
   'src/integrations/lockr/index.ts': 'lockr',
   'src/integrations/lockr/module.ts': 'lockr',
   'src/integrations/lockr/script_guard.ts': 'lockr',
