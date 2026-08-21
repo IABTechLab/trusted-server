@@ -72,7 +72,7 @@
 - Modify: `crates/trusted-server-cli/src/commands/audit/generate/gpt_slots.rs`
 
 - [ ] Add failing registry and request tests for a single `<family>_<render-token>_<placement>` observation.
-- [ ] Add a recognizer keyed on the token shape — eight or more leading digits followed by more alphanumerics — in any position that still has placement content after it.
+- [ ] Add a recognizer keyed on the token shape — ten or more leading digits followed by more alphanumerics — in any position that has a non-empty family prefix before it and placement content after it.
 - [ ] Omit matching slots while preserving evidence/network discovery and emit one deduplicated actionable diagnostic naming the family prefix.
 - [ ] Add negative tests proving IDs with no token, a bare digit run, or a trailing token remain eligible.
 - [ ] Run the focused tests, then repeat Task 3 verification and delivery.

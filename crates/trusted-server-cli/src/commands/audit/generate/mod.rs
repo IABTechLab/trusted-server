@@ -99,6 +99,7 @@ pub(crate) struct GenerateArgs {
     /// cookie) so the origin serves the real page instead of a challenge.
     #[arg(long = "cookie", value_name = "NAME=VALUE", value_parser = crate::commands::audit::parse_cookie)]
     pub(crate) cookies: Vec<(String, String)>,
+    /// Browser and consent options shared with `ts audit ad-templates generate`.
     #[command(flatten)]
     pub(crate) browser: GenerateBrowserOpts,
 }
@@ -585,7 +586,13 @@ pub(crate) fn run_update_slots(
                     Ok(page) => {
                         let final_url = page.final_url().unwrap_or_else(|_| url.clone());
                         if let Err(error) =
-                            fold_collected(&mut table, &final_url, &page, &mut notes)
+                            fold_collected(
+                                &mut table,
+                                &final_url,
+                                &page,
+                                first_label,
+                                &mut notes,
+                            )
                         {
                             fold_error = Some(error);
                             return Ok(collector::ControlFlow::Stop);
@@ -617,8 +624,10 @@ pub(crate) fn run_update_slots(
     // counts as a redirect worth reporting.
     if without_fragment(&root_url) != without_fragment(&target_url) {
         notes.push(format!(
-            "followed a root redirect from `{}` to `{}`; slots and page patterns are derived from the final URL",
+            "followed a root redirect from `{}{}` to `{}{}`; slots and page patterns are derived from the final URL",
+            target_url.origin().ascii_serialization(),
             target_url.path(),
+            root_url.origin().ascii_serialization(),
             root_url.path()
         ));
     }
@@ -944,6 +953,7 @@ fn fold_collected(
     table: &mut evidence::EvidenceTable,
     url: &Url,
     collected: &collector::CollectedPage,
+    profile_label: &str,
     notes: &mut Vec<String>,
 ) -> CliResult<()> {
     // `analyze_collected_page` already carries the collector's warnings forward,
@@ -956,14 +966,14 @@ fn fold_collected(
         let note = if warning == collector::CONSENT_STUB_WARNING {
             warning.clone()
         } else {
-            format!("`{}`: {warning}", url.path())
+            format!("`{}` on {profile_label}: {warning}", url.path())
         };
         if !notes.contains(&note) {
             notes.push(note);
         }
     }
     if let Some(reason) = looks_like_an_interstitial(&artifact) {
-        notes.push(format!("`{}`: {reason}", url.path()));
+        notes.push(format!("`{}` on {profile_label}: {reason}", url.path()));
     }
     let page_has_prebid = artifact
         .detected_integrations
@@ -1027,7 +1037,9 @@ fn crawl_sections(
                     Ok(page) => {
                         successful_pages += 1;
                         let final_url = page.final_url().unwrap_or_else(|_| url.clone());
-                        if let Err(error) = fold_collected(table, &final_url, &page, notes) {
+                        if let Err(error) =
+                            fold_collected(table, &final_url, &page, profile_label, notes)
+                        {
                             fold_error = Some(error);
                             return Ok(collector::ControlFlow::Stop);
                         }
@@ -1091,11 +1103,18 @@ fn validate_merge_policy(
     let Some(inferred) = inferred.filter(|_| preserves_template) else {
         return Ok(());
     };
+    if let Some(configured_segment) = existing.section_segment
+        && configured_segment != inferred.section_segment
+    {
+        return cli_error(format!(
+            "refusing to change the section_segment used by preserved templated slots during merge: configured section_segment={configured_segment}; inferred section_segment={}. Re-run with --replace only for an intentional migration",
+            inferred.section_segment
+        ));
+    }
     // A `{section}` slot with no `section_root` cannot load at all —
-    // `validate_runtime` requires one — so there is no working policy to
-    // preserve and nothing for the inferred one to contradict. Adopting it is
-    // what makes such a config loadable, and `check_candidate` still gates the
-    // result, so this is not the refusal case.
+    // `validate_runtime` requires one — so there is no root value to preserve.
+    // Adopting the inferred root makes such a config loadable, provided the
+    // independently configured section segment above still agrees.
     let Some(configured_root) = existing
         .section_root
         .as_deref()
@@ -1132,6 +1151,21 @@ fn build_render_slots(
     let explicit = !request.page_patterns.is_empty();
     if explicit {
         validate_page_patterns(request.page_patterns)?;
+        if let Some(outcome) = inference
+            && !outcome.borrowed_section_root.is_empty()
+        {
+            let affected = outcome
+                .borrowed_section_root
+                .iter()
+                .map(|stem| format!("`{stem}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return cli_error(format!(
+                "cannot apply --page-pattern to slot(s) {affected} because their {{section}} \
+                 templates borrow section_root; remove --page-pattern so patterns can be \
+                 derived from the paths where each slot was observed"
+            ));
+        }
     }
     let section_segment = policy.map_or(fallback_section_segment, |policy| policy.section_segment);
 
@@ -1627,6 +1661,7 @@ mod tests {
                 &mut table,
                 &Url::parse(url).expect("should parse fixture URL"),
                 &collected_page_with_ambiguous_slots(url),
+                "desktop",
                 &mut notes,
             )
             .expect("should fold ambiguous page evidence");
@@ -1678,6 +1713,7 @@ mod tests {
                 &mut table,
                 &Url::parse(url).expect("should parse fixture URL"),
                 &page,
+                "desktop",
                 &mut notes,
             )
             .expect("should fold page evidence");
@@ -1688,6 +1724,30 @@ mod tests {
             [collector::CONSENT_STUB_WARNING.to_string()],
             "a run-wide fact should appear once, without a page path"
         );
+    }
+
+    #[test]
+    fn page_warnings_remain_distinct_across_profiles() {
+        let mut table = evidence::EvidenceTable::default();
+        let mut notes = Vec::new();
+        let mut page = collected_page();
+        page.requested_url = "https://publisher.example/news".to_string();
+        page.final_url = page.requested_url.clone();
+        page.warnings.push("navigation did not settle".to_string());
+        let url = Url::parse(&page.final_url).expect("should parse fixture URL");
+
+        fold_collected(&mut table, &url, &page, "desktop", &mut notes)
+            .expect("should fold desktop evidence");
+        fold_collected(&mut table, &url, &page, "mobile", &mut notes)
+            .expect("should fold mobile evidence");
+
+        assert_eq!(
+            notes.len(),
+            2,
+            "profile-specific warnings must not collapse"
+        );
+        assert!(notes.iter().any(|note| note.contains("on desktop")));
+        assert!(notes.iter().any(|note| note.contains("on mobile")));
     }
 
     #[test]
@@ -1709,7 +1769,34 @@ mod tests {
         };
 
         validate_merge_policy(Some(&existing), Some(&inferred), false)
-            .expect("an unset section_root is no policy to preserve");
+            .expect("should have no policy to preserve when section_root is unset");
+    }
+
+    #[test]
+    fn merge_preserves_an_explicit_segment_when_section_root_is_unset() {
+        let existing: CreativeOpportunitiesConfig = toml::from_str(
+            "gam_network_id = \"123\"\nsection_segment = 1\n\
+             [[slot]]\nid = \"header\"\ndiv_id = \"ad-header\"\n\
+             gam_unit_path = \"/{network_id}/site/{section}\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 728, height = 90 }]\n",
+        )
+        .expect("should parse creative config");
+        let mismatched = unit_template::SectionPolicy {
+            section_root: "homepage".to_string(),
+            section_segment: 0,
+        };
+
+        let error = validate_merge_policy(Some(&existing), Some(&mismatched), false)
+            .expect_err("should preserve an explicitly configured segment");
+
+        assert!(format!("{error:?}").contains("section_segment=1"));
+
+        let matching = unit_template::SectionPolicy {
+            section_root: "homepage".to_string(),
+            section_segment: 1,
+        };
+        validate_merge_policy(Some(&existing), Some(&matching), false)
+            .expect("should adopt a root without changing the configured segment");
     }
 
     #[test]
@@ -2197,7 +2284,10 @@ mod tests {
         );
         let notes = String::from_utf8(notes).expect("notes should be UTF-8");
         assert!(
-            notes.contains("followed a root redirect"),
+            notes.contains(
+                "followed a root redirect from `http://publisher.example/` to \
+                 `https://publisher.example/`"
+            ),
             "an accepted redirect should say the run switched URLs, got {notes:?}"
         );
     }
@@ -2306,6 +2396,72 @@ mod tests {
             fs::read_to_string(&config_path).expect("should read config"),
             original,
             "a rejected pattern must leave the operator config untouched"
+        );
+    }
+
+    #[test]
+    fn explicit_page_patterns_refuse_a_template_that_borrows_section_root() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        let original = loadable_config();
+        fs::write(&config_path, &original).expect("should write config");
+
+        let nav = ["/news", "/deals"];
+        let root = site_page(
+            "https://publisher.example/",
+            "/123456789/site/homepage",
+            &nav,
+        );
+        let mut news = site_page(
+            "https://publisher.example/news",
+            "/123456789/site/news",
+            &nav,
+        );
+        news.gpt_slots.push(collector::CollectedGptSlot {
+            gam_unit_path: "/123456789/site/news".to_string(),
+            div_id: "ad-sidebar".to_string(),
+            sizes: vec![(300, 250)],
+        });
+        let mut deals = site_page(
+            "https://publisher.example/deals",
+            "/123456789/site/deals",
+            &nav,
+        );
+        deals.gpt_slots.push(collector::CollectedGptSlot {
+            gam_unit_path: "/123456789/site/deals".to_string(),
+            div_id: "ad-sidebar".to_string(),
+            sizes: vec![(300, 250)],
+        });
+        let collector = SiteCollector::new(vec![
+            ("https://publisher.example/", root),
+            ("https://publisher.example/news", news),
+            ("https://publisher.example/deals", deals),
+        ]);
+
+        let error = run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &["/".to_string(), "/*".to_string()],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &collector)],
+            &mut std::io::sink(),
+            &mut std::io::sink(),
+        )
+        .expect_err("explicit patterns cannot preserve borrowed-root safety");
+
+        let message = format!("{error:?}");
+        assert!(message.contains("--page-pattern"), "got {message}");
+        assert!(message.contains("ad-sidebar"), "got {message}");
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("should read config"),
+            original,
+            "a refused override must leave the config unchanged"
         );
     }
 
