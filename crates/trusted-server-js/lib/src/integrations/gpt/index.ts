@@ -1079,10 +1079,10 @@ export function installTsAdInit(): void {
           if (bid[key]) gptSlot.setTargeting(key, String(bid[key]!));
         });
         gptSlot.setTargeting(TS_INITIAL_TARGETING_KEY, '1');
-        const requestedSlotSizes = ts.gptSlotHandoffs?.[slotDivId2]?.formats;
         // Diagnostics are observational only. A missing or malformed debug
         // implementation must never interrupt slot mapping or delivery.
         try {
+          const requestedSlotSizes = ts.gptSlotHandoffs?.[slotDivId2]?.formats;
           const opportunity = trustedServerOpportunity(bid);
           ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
             gptSlot,

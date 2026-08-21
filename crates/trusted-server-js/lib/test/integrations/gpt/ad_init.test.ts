@@ -395,6 +395,54 @@ describe('installTsAdInit', () => {
     );
   });
 
+  it('forwards configured formats when defining a Trusted Server GPT slot', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const formats: Array<[number, number]> = [
+      [300, 250],
+      [728, 90],
+    ];
+    const { mockPubads, mockSlot } = configureOpportunityDiagnostics(
+      undefined,
+      recordTrustedServerOpportunity,
+      formats
+    );
+    mockPubads.getSlots.mockReturnValue([]);
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'no_candidate',
+      undefined,
+      formats
+    );
+  });
+
+  it('keeps slot delivery running when requested-size diagnostics access throws', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const { mockPubads, mockSlot } = configureOpportunityDiagnostics(
+      undefined,
+      recordTrustedServerOpportunity
+    );
+    Object.defineProperty((window as TestWindow).tsjs!, 'gptSlotHandoffs', {
+      configurable: true,
+      get: () => {
+        throw new Error('diagnostics handoff unavailable');
+      },
+    });
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+
+    expect(() => (window as TestWindow).tsjs!.adInit!()).not.toThrow();
+    expect(recordTrustedServerOpportunity).not.toHaveBeenCalled();
+    expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
+    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+  });
+
   it('records no_candidate when the resolved slot has no bid', async () => {
     const recordTrustedServerOpportunity = vi.fn();
     const { mockSlot } = configureOpportunityDiagnostics(undefined, recordTrustedServerOpportunity);

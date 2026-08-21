@@ -4763,6 +4763,13 @@ pub async fn handle_publisher_request(
         .unwrap_or_default()
         .to_string();
 
+    apply_datadome_client_tag_cache_privacy(
+        &mut response,
+        &request_method,
+        suppress_datadome_client_side_tag,
+        &content_type,
+    );
+
     let status = response.status();
 
     let content_encoding = response
@@ -4856,13 +4863,6 @@ pub async fn handle_publisher_request(
                 "Streaming response - Content-Type: {}, Content-Encoding: {}",
                 content_type,
                 content_encoding
-            );
-
-            apply_datadome_client_tag_cache_privacy(
-                &mut response,
-                &request_method,
-                suppress_datadome_client_side_tag,
-                &content_type,
             );
 
             let body = std::mem::replace(response.body_mut(), EdgeBody::empty());
