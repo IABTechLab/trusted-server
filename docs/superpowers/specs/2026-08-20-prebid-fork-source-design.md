@@ -161,10 +161,22 @@ Introduce a `PrebidSource` enum in `prebid_bundle.rs`:
 Classification: strings starting with `https://`, `git@`, or `ssh://`
 parse as git, with an optional trailing `#<ref>` split off; everything
 else is a path. `http://` is rejected with an error suggesting
-`https://`. An `https://` URL containing userinfo (anything before an
-`@` in the authority, such as an embedded token) is rejected with an
-error directing the operator to git credential helpers or SSH:
-credential-bearing URLs would otherwise leak into command arguments,
+`https://`.
+
+Git URLs are parsed structurally (scheme, userinfo, host, path,
+query), not by prefix sniffing, and credential-bearing forms are
+rejected with an error directing the operator to git credential
+helpers or SSH keys:
+
+- any userinfo on an `https://` URL (tokens are conventionally carried
+  there and `https://` userinfo has no legitimate git-hosting use);
+- a password component in userinfo for any scheme (`ssh://user:pass@`
+  is rejected; the standard bare-username forms `ssh://git@host/...`
+  and `git@host:path` remain valid);
+- any query string (git clone URLs do not use them; query parameters
+  are a token side channel).
+
+Credential-bearing URLs would otherwise leak into command arguments,
 the cache directory's git config, CLI output, and a potentially
 publicly hosted manifest.
 
@@ -183,9 +195,14 @@ pub(crate) trait PrebidSourceResolver {
 ```
 
 `ResolvedPrebidSource` carries the package directory to hand to the
-generator (`None` for `Npm`) and the provenance to stamp into the
-manifest. The production implementation shells out to `git`, `npm`, and
-`npx` (the CLI already shells out to npm; no libgit2 dependency).
+generator (`None` for `Npm`), the provenance to stamp into the
+manifest, and ownership of the per-URL lock guard for git sources (see
+Design section 4). Owning the guard makes the lock lifetime
+structural: `run_bundle` keeps the resolved source alive until the
+generator finishes, so the lock cannot be released between resolution
+and generation. The production implementation shells out to `git`,
+`npm`, and `npx` (the CLI already shells out to npm; no libgit2
+dependency).
 
 ### 3. Path sources: validate, never mutate
 
@@ -217,24 +234,46 @@ For `Git`:
    a bundle from one commit with provenance for another. A held lock
    makes the second run wait, with a periodic "waiting for
    concurrent build" message.
-3. Clone the URL there if absent; otherwise `git fetch`.
-4. Resolve the requested ref (default: the remote default branch) to a
-   commit OID against the freshly fetched remote state:
-   `refs/remotes/origin/<ref>` for branches, `refs/tags/<ref>` for
-   tags, and the OID itself for a full or abbreviated SHA. Never
-   resolve a bare local branch name: after the first checkout a local
-   branch would pin the old commit while `origin/<ref>` advances,
-   silently skipping rebuilds of a moving branch.
-5. Check out that OID detached (`git checkout --detach <oid>`), so no
-   local branch state exists to go stale.
-6. Read the stamp file `.ts-prebid-build-stamp` in the checkout. If it
-   names the same OID and `dist/src/` exists, skip the build.
-7. Otherwise run `npm ci` then `npx gulp build` in the checkout,
-   forwarding stdout/stderr like the generator does, and write the
-   stamp file on success.
-8. Validate the result with the same checks as a path source, then
-   treat the checkout directory as the package directory. The lock is
-   held until the generator has finished reading from the checkout.
+3. Clone the URL there if absent; otherwise fetch with explicit
+   refspecs so every ref mode is refreshed regardless of what the
+   default refspec would bring:
+   `git fetch --prune --prune-tags --force origin
+'+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*'`.
+4. Resolve the requested ref to a commit OID against the freshly
+   fetched remote state: `refs/remotes/origin/<ref>` for branches,
+   `refs/tags/<ref>` for tags, and the OID itself for a full or
+   abbreviated SHA. When no ref is given, query the remote's current
+   default branch with `git ls-remote --symref origin HEAD` rather
+   than trusting a possibly stale local `origin/HEAD`. Never resolve a
+   bare local branch name: after the first checkout a local branch
+   would pin the old commit while `origin/<ref>` advances, silently
+   skipping rebuilds of a moving branch.
+5. Read the stamp file `.ts-prebid-build-stamp` in the checkout. Skip
+   the build only when it names the same OID and the full built-layout
+   validation from Design section 3 passes (`package.json`,
+   `dist/src/`, `metadata/modules/`, `node_modules/`). A stamp that
+   matches but fails layout validation (for example, a deleted
+   `node_modules/`) triggers an automatic rebuild, not an error.
+6. When building: delete the stamp file first, then force the
+   checkout to the exact commit content with
+   `git checkout --detach <oid>`, `git reset --hard <oid>`, and
+   `git clean -dff`. A detached checkout alone preserves
+   non-conflicting tracked modifications, so leftovers from a failed
+   earlier build could otherwise be bundled while the clean OID gets
+   stamped. Deleting the stamp before mutating also means a run that
+   dies mid-build leaves no stamp, and the next run at any OID
+   rebuilds from reset state instead of trusting a contaminated
+   checkout.
+7. Run `npm ci` then `npx --no-install gulp build` in the checkout
+   (gulp is one of Prebid's dev dependencies, so it is present after
+   `npm ci`; `--no-install` prevents npx from fetching an arbitrary
+   gulp from the registry), forwarding stdout/stderr like the
+   generator does.
+8. Re-run the full built-layout validation, and only then write the
+   stamp file with the built OID. The checkout directory becomes the
+   package directory, and the lock guard travels inside
+   `ResolvedPrebidSource` so it is held until the generator has
+   finished reading from the checkout.
 
 Build failures surface the underlying exit status and never touch the
 operator's config. The first build of a fork takes minutes (Prebid's
@@ -289,6 +328,11 @@ new `source` key in `manifest.json`:
 }
 ```
 
+The recorded `url` is the sanitized form: userinfo is stripped even in
+the allowed bare-username SSH forms, so the manifest never republishes
+the operator's original authority string. Cloning always uses the URL
+as the operator supplied it; only the provenance is sanitized.
+
 For a path source, provenance is best effort: the CLI records
 `{ "kind": "path", "path": "/abs/path" }` and, when the path sits
 inside a git work tree, adds the checkout's `HEAD` commit and a
@@ -321,7 +365,10 @@ prints the resolved source in its summary output.
 - Path validation: missing `dist/src/` or `node_modules/` fails with
   build-command guidance; a valid built layout passes; the source
   directory is never written to.
-- URL hygiene: an `https://` URL with embedded userinfo is rejected.
+- URL hygiene: `https://` userinfo, a userinfo password on any scheme,
+  and query strings are rejected; `ssh://git@host/...` and
+  `git@host:path` forms are accepted; recorded provenance URLs are
+  sanitized of userinfo.
 - Relative path resolution: a relative config `source` resolves
   against the config file's directory; a relative `--prebid-source`
   resolves against the working directory.
@@ -334,15 +381,23 @@ prints the resolved source in its summary output.
 - The production resolver itself is tested, not only its callers. The
   resolver takes a command-runner seam (mirroring how
   `PrebidBundleGenerator` isolates npm) so unit tests can script git
-  and build outcomes: clone-vs-fetch selection, remote-side ref
-  resolution, detached checkout, stamp read/write, build skip on
-  matching OID, lock acquisition, and process failures. In addition,
-  integration tests drive the real git logic against temporary local
-  repositories created in the test (`git init` fixtures with the
-  built-package layout committed), with only the npm/gulp build step
-  stubbed through the runner. These cover the moving-branch case: the
-  fixture branch advances between two resolves and the second run must
-  rebuild at the new OID rather than reuse the stale one.
+  and build outcomes: clone-vs-fetch selection, the explicit fetch
+  refspecs, remote-side ref resolution including the
+  `ls-remote --symref` default-branch query, reset-and-clean before a
+  build, stamp deletion before mutation and stamp write only after
+  post-build validation, build skip requiring both a matching OID and
+  the full built-layout validation, lock acquisition, and process
+  failures. In addition, integration tests drive the real git logic
+  against temporary local repositories created in the test (`git init`
+  fixtures with the built-package layout committed), with only the
+  npm/gulp build step stubbed through the runner. These cover the
+  moving-branch case (the fixture branch advances between two resolves
+  and the second run must rebuild at the new OID rather than reuse the
+  stale one) and the dirty-checkout case (tracked files modified after
+  a simulated failed build must not survive into the next build).
+- Lock lifetime is structural rather than test-only:
+  `ResolvedPrebidSource` owns the guard, and a test asserts the lock
+  is still held while the generator callback runs.
 - Existing default-flow tests continue to pass unchanged.
 
 ### Generator tests (`test/build-prebid-external.test.mjs`)
@@ -368,7 +423,11 @@ fixtures with the build step stubbed.
 
 - `docs/guide/cli.md`: document `--prebid-source`, the config key,
   precedence, ref resolution, the cache location, and the built-package
-  requirement for path sources.
+  requirement for path sources. State the trust boundary explicitly: a
+  fork source executes arbitrary code on the operator's machine
+  (`npm ci` lifecycle scripts and the fork's gulp build), so only
+  trusted forks should be configured, and CI use should pin a commit
+  SHA rather than a moving branch.
 - `docs/guide/integrations/prebid.md`: document fork workflows, that
   git URLs are the shareable form for teams while local paths are for
   local iteration, and the `source` manifest field.
