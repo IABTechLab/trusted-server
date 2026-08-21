@@ -129,6 +129,7 @@ interface TestAdapterSpec {
 // of mocking module imports.
 const {
   mockSetConfig,
+  mockMergeConfig,
   mockProcessQueue,
   mockRequestBids,
   mockRegisterBidAdapter,
@@ -140,6 +141,9 @@ const {
   mockPbjs,
 } = vi.hoisted(() => {
   const mockSetConfig = vi.fn();
+  // Prebid's public mergeConfig closes over its internal setConfig rather than
+  // calling pbjs.setConfig, so wrapping setConfig alone cannot intercept it.
+  const mockMergeConfig = vi.fn((config: unknown) => mockSetConfig(config));
   const mockProcessQueue = vi.fn();
   const mockRequestBids = vi.fn();
   const mockRegisterBidAdapter = vi.fn();
@@ -160,6 +164,7 @@ const {
   });
   const mockPbjs: {
     setConfig: typeof mockSetConfig;
+    mergeConfig: typeof mockMergeConfig;
     processQueue: typeof mockProcessQueue;
     requestBids: typeof mockRequestBids;
     registerBidAdapter: typeof mockRegisterBidAdapter;
@@ -172,6 +177,7 @@ const {
     [key: string]: unknown;
   } = {
     setConfig: mockSetConfig,
+    mergeConfig: mockMergeConfig,
     processQueue: mockProcessQueue,
     requestBids: mockRequestBids,
     registerBidAdapter: mockRegisterBidAdapter,
@@ -201,6 +207,7 @@ const {
 
   return {
     mockSetConfig,
+    mockMergeConfig,
     mockProcessQueue,
     mockRequestBids,
     mockRegisterBidAdapter,
@@ -231,6 +238,7 @@ import envelope from '../../fixtures/aps-renderer-v1.json';
 beforeEach(() => {
   delete testWindow.__tsjsPrebidShimInstalled;
   mockPbjs.setConfig = mockSetConfig;
+  mockPbjs.mergeConfig = mockMergeConfig;
   mockPbjs.processQueue = mockProcessQueue;
   delete mockPbjs['__tsLiveRampSetConfigInstalled'];
 });
@@ -431,6 +439,7 @@ describe('prebid/installPrebidNpm', () => {
     // Reset requestBids to the mock so each test starts fresh
     mockPbjs.requestBids = mockRequestBids;
     mockPbjs.setConfig = mockSetConfig;
+    mockPbjs.mergeConfig = mockMergeConfig;
     mockPbjs.processQueue = mockProcessQueue;
     mockPbjs.adUnits = [];
     mockPbjs.que = [];
@@ -814,12 +823,14 @@ describe('prebid/installPrebidNpm', () => {
     expect(mockProcessQueue).toHaveBeenCalledTimes(1);
   });
 
-  it('leaves setConfig unchanged when LiveRamp is not configured', () => {
+  it('leaves the public config APIs unchanged when LiveRamp is not configured', () => {
     const originalSetConfig = mockPbjs.setConfig;
+    const originalMergeConfig = mockPbjs.mergeConfig;
 
     installPrebidNpm();
 
     expect(mockPbjs.setConfig).toBe(originalSetConfig);
+    expect(mockPbjs.mergeConfig).toBe(originalMergeConfig);
     expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
   });
 
@@ -926,6 +937,50 @@ describe('prebid/installPrebidNpm', () => {
     ]);
   });
 
+  it('normalizes queued identityLink updates made through mergeConfig', () => {
+    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    mockPbjs.que = [
+      () =>
+        mockPbjs.mergeConfig({
+          userSync: {
+            userIds: [
+              { name: 'sharedId' },
+              { name: 'identityLink', params: { pid: 'publisher-value' } },
+            ],
+          },
+        }),
+    ];
+    mockProcessQueue.mockImplementation(() => {
+      for (const callback of mockPbjs.que.splice(0)) callback();
+    });
+
+    installPrebidNpm();
+
+    expect(mockMergeConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([
+      { name: 'sharedId' },
+      EXPECTED_IDENTITY_LINK,
+    ]);
+  });
+
+  it('normalizes late identityLink updates made through mergeConfig', () => {
+    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    installPrebidNpm();
+
+    mockPbjs.mergeConfig({
+      userSync: {
+        userIds: [
+          { name: 'id5Id', params: { partner: 1 } },
+          { name: 'identityLink', params: { pid: 'publisher-value' } },
+        ],
+      },
+    });
+
+    expect(mockMergeConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([
+      { name: 'id5Id', params: { partner: 1 } },
+      EXPECTED_IDENTITY_LINK,
+    ]);
+  });
+
   it('passes unrelated publisher configuration through by reference', () => {
     testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
     installPrebidNpm();
@@ -936,15 +991,17 @@ describe('prebid/installPrebidNpm', () => {
     expect(mockSetConfig.mock.calls.at(-1)?.[0]).toBe(publisherConfig);
   });
 
-  it('does not stack the LiveRamp setConfig wrapper across shim reinstallations', () => {
+  it('does not stack the LiveRamp config wrappers across shim reinstallations', () => {
     testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
     installPrebidNpm();
     const managedSetConfig = mockPbjs.setConfig;
+    const managedMergeConfig = mockPbjs.mergeConfig;
     delete testWindow.__tsjsPrebidShimInstalled;
 
     installPrebidNpm();
 
     expect(mockPbjs.setConfig).toBe(managedSetConfig);
+    expect(mockPbjs.mergeConfig).toBe(managedMergeConfig);
     mockPbjs.setConfig({ userSync: { userIds: [] } });
     expect(mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([EXPECTED_IDENTITY_LINK]);
   });

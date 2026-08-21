@@ -476,7 +476,7 @@ client-side bidder adapter modules.
 Trusted Server can configure Prebid's `identityLink` User ID submodule and
 forward the resulting RampID identity envelope through the existing EID path.
 This feature does not collect email addresses, hash identifiers, call a
-server-to-server ATS API, or expose the encrypted envelope to application code.
+server-to-server ATS API, or add a new application-facing envelope API.
 
 ### Prerequisites
 
@@ -529,14 +529,14 @@ booleans, and status codes are sufficient for diagnostics.
 
 ### Degraded behavior
 
-| Condition                                         | Result                                                                 |
-| ------------------------------------------------- | ---------------------------------------------------------------------- |
-| Consent is absent or the user opts out            | No LiveRamp EID is forwarded; the auction continues                    |
-| LiveRamp cannot recognize the browser             | IdentityLink yields no EID; the auction continues                      |
-| LiveRamp network resolution fails                 | The current auction continues without RampID                           |
-| `identityLinkIdSystem` is missing from the bundle | Existing diagnostics report the missing module; auctions continue      |
-| The origin is not approved by LiveRamp            | Resolution yields no usable EID; the auction continues                 |
-| EC/KV is unavailable                              | A current-request EID can still reach `/auction`; persistence degrades |
+| Condition                                                                    | Result                                                                 |
+| ---------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| Required consent is absent in a regulated jurisdiction, or the user opts out | No LiveRamp EID is forwarded; the auction continues                    |
+| LiveRamp cannot recognize the browser                                        | IdentityLink yields no EID; the auction continues                      |
+| LiveRamp network resolution fails                                            | The current auction continues without RampID                           |
+| `identityLinkIdSystem` is missing from the bundle                            | Existing diagnostics report the missing module; auctions continue      |
+| The origin is not approved by LiveRamp                                       | Resolution yields no usable EID; the auction continues                 |
+| EC/KV is unavailable                                                         | A current-request EID can still reach `/auction`; persistence degrades |
 
 ### Credential-based validation
 

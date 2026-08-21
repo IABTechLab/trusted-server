@@ -1169,9 +1169,13 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   const managedPbjs = pbjs as typeof pbjs & Record<string, unknown>;
   if (injected?.liveRamp && managedPbjs[LIVE_RAMP_SET_CONFIG_SENTINEL] !== true) {
     const originalSetConfig = pbjs.setConfig.bind(pbjs);
+    const prebidConfigApi = pbjs as typeof pbjs & {
+      mergeConfig?: typeof pbjs.setConfig;
+    };
+    const originalMergeConfig = prebidConfigApi.mergeConfig?.bind(pbjs);
     const managedEntry = liveRampUserId(injected.liveRamp);
 
-    pbjs.setConfig = ((publisherConfig: PbjsConfig) => {
+    const normalizePublisherConfig = (publisherConfig: PbjsConfig): PbjsConfig => {
       let nextConfig = publisherConfig;
       try {
         if (hasUserIdsPath(publisherConfig)) {
@@ -1180,8 +1184,17 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       } catch {
         log.error('[tsjs-prebid] LiveRamp configuration could not be normalized');
       }
-      return originalSetConfig(nextConfig);
+      return nextConfig;
+    };
+
+    pbjs.setConfig = ((publisherConfig: PbjsConfig) => {
+      return originalSetConfig(normalizePublisherConfig(publisherConfig));
     }) as typeof pbjs.setConfig;
+    if (originalMergeConfig) {
+      prebidConfigApi.mergeConfig = ((publisherConfig: PbjsConfig) => {
+        return originalMergeConfig(normalizePublisherConfig(publisherConfig));
+      }) as typeof pbjs.setConfig;
+    }
     managedPbjs[LIVE_RAMP_SET_CONFIG_SENTINEL] = true;
 
     const getConfig = (pbjs as unknown as { getConfig?: (key?: string) => unknown }).getConfig;
