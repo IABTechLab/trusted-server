@@ -173,6 +173,9 @@ mod tests {
             r#""creative":{"version":1,"enabled":true,"clickGuard":true,"renderGuard":false}"#
         ));
         assert!(html.contains(r#""renderTraceOverlay":true"#));
+        assert!(html.contains(
+            r#"{"id":"gpt","config":{"gamAttributionEnabled":false,"pageBidsEnabled":true}}"#
+        ));
         assert!(html.contains(r#""id":"diagnostics_presentation","phase":"deferred""#));
         assert!(html.contains(r#""id":"gpt_later","phase":"deferred""#));
         assert!(html.contains(
