@@ -8,30 +8,17 @@ import {
   APS_PREBID_CREATIVE_RUNNER_URL,
   APS_RENDERER_PATH,
   APS_RENDERER_SANDBOX,
-  APS_RENDERING_MODE_META_NAME,
+  APS_RENDERING_MODE_ATTRIBUTE_NAME,
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
   apsRendererUrl,
-  dispatchApsRendering,
+  dispatchApsRendering as dispatchDefaultApsRendering,
   getApsPrebidRenderer,
   parseApsRendererDescriptor,
   registerApsPrebidRenderer,
   renderApsCreative,
   validateApsRenderer,
 } from '../../../src/integrations/aps/render';
-
-function enablePublisherNativeMode(): void {
-  const marker = document.createElement('meta');
-  marker.name = APS_RENDERING_MODE_META_NAME;
-  marker.content = 'publisher_native';
-  document.head.appendChild(marker);
-}
-
-function disablePublisherNativeMode(): void {
-  document.head
-    .querySelectorAll(`meta[name="${APS_RENDERING_MODE_META_NAME}"]`)
-    .forEach((marker) => marker.remove());
-}
 
 function nativeRunnerState(frame: HTMLIFrameElement): {
   runner: HTMLScriptElement;
@@ -292,14 +279,51 @@ describe('Prebid APS renderer registry', () => {
   });
 });
 
+describe('APS rendering-mode authorization', () => {
+  it('ignores mode markers and duplicate script tags injected after module initialization', () => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    document.head.insertAdjacentHTML(
+      'beforeend',
+      '<meta name="trusted-server-aps-rendering-mode" content="publisher_native">' +
+        '<script data-ts-aps-rendering-mode="publisher_native"></script>'
+    );
+    const trustedServer = vi.fn(() => true);
+
+    expect(
+      dispatchDefaultApsRendering({
+        slotId: 'fictional-slot',
+        renderer: descriptor(),
+        trustedServer,
+      })
+    ).toBe(true);
+    expect(trustedServer).toHaveBeenCalledOnce();
+    expect(document.querySelector('#fictional-slot iframe')).toBeNull();
+
+    document.head
+      .querySelectorAll(
+        'meta[name="trusted-server-aps-rendering-mode"], script[data-ts-aps-rendering-mode]'
+      )
+      .forEach((element) => element.remove());
+    document.body.innerHTML = '';
+  });
+});
+
 describe('publisher-native APS runner contract tests', () => {
-  beforeEach(() => {
+  let dispatchApsRendering: typeof dispatchDefaultApsRendering;
+
+  beforeEach(async () => {
+    vi.resetModules();
     document.body.innerHTML = '<div id="fictional-slot"><span>existing</span></div>';
-    enablePublisherNativeMode();
+    const publisherScript = document.createElement('script');
+    publisherScript.setAttribute(APS_RENDERING_MODE_ATTRIBUTE_NAME, 'publisher_native');
+    const currentScriptSpy = vi
+      .spyOn(document, 'currentScript', 'get')
+      .mockReturnValue(publisherScript);
+    ({ dispatchApsRendering } = await import('../../../src/integrations/aps/render'));
+    currentScriptSpy.mockRestore();
   });
 
   afterEach(() => {
-    disablePublisherNativeMode();
     delete window.tsjs;
     vi.restoreAllMocks();
     document.body.innerHTML = '';
@@ -307,11 +331,6 @@ describe('publisher-native APS runner contract tests', () => {
 
   it('queues the exact selected response for the fixed APS runner and commits on load', async () => {
     const trustedServer = vi.fn(() => true);
-    const unrelatedMarker = document.createElement('meta');
-    unrelatedMarker.name = APS_RENDERING_MODE_META_NAME;
-    unrelatedMarker.content = 'trusted_server';
-    document.head.appendChild(unrelatedMarker);
-
     const accepted = dispatchApsRendering({
       slotId: 'fictional-slot',
       renderer: descriptor(),
@@ -405,27 +424,6 @@ describe('publisher-native APS runner contract tests', () => {
     expect(document.querySelector('#fictional-slot span')).not.toBeNull();
   });
 
-  it('lets a trusted-server dispatch supersede an older native frame', async () => {
-    const first = dispatchApsRendering({
-      slotId: 'fictional-slot',
-      renderer: descriptor(),
-      trustedServer: () => true,
-    });
-
-    disablePublisherNativeMode();
-    const trustedServer = vi.fn(() => true);
-    const second = dispatchApsRendering({
-      slotId: 'fictional-slot',
-      renderer: descriptor(),
-      trustedServer,
-    });
-
-    expect(second).toBe(true);
-    expect(trustedServer).toHaveBeenCalledOnce();
-    await expect(first).resolves.toBe(false);
-    expect(document.querySelector('#fictional-slot iframe')).toBeNull();
-  });
-
   it('resolves a logical GPT slot through the injected div mapping', async () => {
     document.body.innerHTML = '<div id="div-header"><span>existing</span></div>';
     window.tsjs = { divToSlotId: { 'div-header': 'homepage_header' } } as typeof window.tsjs;
@@ -440,6 +438,52 @@ describe('publisher-native APS runner contract tests', () => {
 
     await expect(accepted).resolves.toBe(true);
     expect(document.querySelector('#div-header span')).toBeNull();
+  });
+
+  it('renders inside the inner slot when Prebid uses its container ID', async () => {
+    document.body.innerHTML =
+      '<div id="div-header-container"><div id="div-header"><iframe></iframe></div></div>';
+    const source = document.querySelector<HTMLIFrameElement>('#div-header > iframe')!.contentWindow;
+
+    const accepted = dispatchApsRendering({
+      slotId: 'div-header-container',
+      renderer: descriptor(),
+      source,
+      trustedServer: () => true,
+    });
+    const frame = Array.from(
+      document.querySelectorAll<HTMLIFrameElement>('#div-header > iframe')
+    ).find((candidate) => candidate.title === 'Ad content')!;
+    nativeRunnerState(frame).runner.dispatchEvent(new Event('load'));
+
+    await expect(accepted).resolves.toBe(true);
+    expect(document.getElementById('div-header-container')).not.toBeNull();
+    expect(document.getElementById('div-header')).not.toBeNull();
+    expect(document.querySelectorAll('#div-header > iframe')).toHaveLength(1);
+  });
+
+  it('uses the requesting frame to resolve a dynamic slot prefix', async () => {
+    document.body.innerHTML =
+      '<div id="div-header-first"><iframe></iframe></div>' +
+      '<div id="div-header-second"><iframe></iframe></div>';
+    const source = document.querySelector<HTMLIFrameElement>(
+      '#div-header-second > iframe'
+    )!.contentWindow;
+
+    const accepted = dispatchApsRendering({
+      slotId: 'div-header-',
+      renderer: descriptor(),
+      source,
+      trustedServer: () => true,
+    });
+    const frame = Array.from(
+      document.querySelectorAll<HTMLIFrameElement>('#div-header-second > iframe')
+    ).find((candidate) => candidate.title === 'Ad content')!;
+    nativeRunnerState(frame).runner.dispatchEvent(new Event('load'));
+
+    await expect(accepted).resolves.toBe(true);
+    expect(document.querySelector('#div-header-first > iframe')).not.toBeNull();
+    expect(document.querySelectorAll('#div-header-second > iframe')).toHaveLength(1);
   });
 
   it('contains throwing publisher slot mappings without falling back', async () => {

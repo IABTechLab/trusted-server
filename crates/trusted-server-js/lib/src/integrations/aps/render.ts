@@ -3,7 +3,7 @@ import { findSlot } from '../../core/render';
 import type { ApsPrebidRendererEntry, ApsRendererV1, TsjsApi } from '../../core/types';
 
 export const APS_RENDERER_PATH = '/integrations/aps/renderer';
-export const APS_RENDERING_MODE_META_NAME = 'trusted-server-aps-rendering-mode';
+export const APS_RENDERING_MODE_ATTRIBUTE_NAME = 'data-ts-aps-rendering-mode';
 export const APS_PREBID_CREATIVE_RUNNER_URL =
   'https://client.aps.amazon-adsystem.com/prebid-creative.js';
 export const APS_NATIVE_RENDERER_TIMEOUT_MS = 10_000;
@@ -44,6 +44,9 @@ type ValidatedRendererCacheEntry = {
 };
 const validatedRendererCache = new WeakMap<object, ValidatedRendererCacheEntry>();
 const nativeDispatches = new Map<string, symbol>();
+const publisherNativeRendering =
+  typeof document !== 'undefined' &&
+  document.currentScript?.getAttribute(APS_RENDERING_MODE_ATTRIBUTE_NAME) === 'publisher_native';
 
 function releaseNativeDispatch(slotId: string, dispatch: symbol): boolean {
   if (nativeDispatches.get(slotId) !== dispatch) return false;
@@ -51,26 +54,79 @@ function releaseNativeDispatch(slotId: string, dispatch: symbol): boolean {
   return true;
 }
 
-function findApsContainer(slotId: string): HTMLElement | null {
-  const direct = findSlot(slotId);
-  if (direct) return direct;
+function sourceBelongsToElement(
+  source: MessageEventSource | null | undefined,
+  element: HTMLElement
+): boolean {
+  return source
+    ? Array.from(element.querySelectorAll('iframe')).some(
+        (iframe) => iframe.contentWindow === source
+      )
+    : false;
+}
 
+function sourceMatchedCandidates(
+  candidates: HTMLElement[],
+  source?: MessageEventSource | null
+): HTMLElement[] {
+  if (!source) return candidates;
+  const sourceMatches = candidates.filter((element) => sourceBelongsToElement(source, element));
+  return sourceMatches.length > 0 ? sourceMatches : candidates;
+}
+
+function dynamicSlotCandidates(
+  divIdPrefix: string,
+  source?: MessageEventSource | null
+): HTMLElement[] {
+  const candidates = Array.from(document.querySelectorAll<HTMLElement>('[id]')).filter(
+    (element) => element.id.startsWith(divIdPrefix) && !element.id.endsWith('-container')
+  );
+  return sourceMatchedCandidates(candidates, source);
+}
+
+function uniqueSlotCandidate(candidates: HTMLElement[]): HTMLElement | null {
+  return candidates.length === 1 ? candidates[0]! : null;
+}
+
+function findApsContainer(slotId: string, source?: MessageEventSource | null): HTMLElement | null {
   try {
-    for (const [divId, mappedSlotId] of Object.entries(window.tsjs?.divToSlotId ?? {})) {
-      if (mappedSlotId !== slotId) continue;
-      const mapped = findSlot(divId);
-      if (mapped) return mapped;
+    const mapping = window.tsjs?.divToSlotId ?? {};
+    const mappedCandidates = sourceMatchedCandidates(
+      Object.entries(mapping)
+        .filter(([, mappedSlotId]) => mappedSlotId === slotId)
+        .map(([divId]) => findSlot(divId))
+        .filter((element): element is HTMLElement => element !== null),
+      source
+    );
+    const mapped = uniqueSlotCandidate(mappedCandidates);
+    if (mapped) return mapped;
+
+    if (slotId.endsWith('-container')) {
+      const inner = findSlot(slotId.slice(0, -'-container'.length));
+      if (inner) return inner;
     }
 
+    const direct = findSlot(slotId);
+    if (direct && !direct.id.endsWith('-container')) return direct;
+
     const configuredDivId = window.tsjs?.adSlots?.find((slot) => slot.id === slotId)?.div_id;
-    return configuredDivId ? findSlot(configuredDivId) : null;
+    if (configuredDivId) {
+      const configured = findSlot(configuredDivId);
+      if (configured) return configured;
+
+      const dynamic = uniqueSlotCandidate(dynamicSlotCandidates(configuredDivId, source));
+      if (dynamic) return dynamic;
+    }
+
+    const dynamic = uniqueSlotCandidate(dynamicSlotCandidates(slotId, source));
+    return dynamic ?? direct;
   } catch {
     return null;
   }
 }
 
-function cancelPendingApsRendering(slotId: string): void {
-  const container = findApsContainer(slotId);
+function cancelPendingApsRendering(slotId: string, source?: MessageEventSource | null): void {
+  const container = findApsContainer(slotId, source);
   if (container) pendingFrameCancels.get(container)?.();
 }
 
@@ -312,18 +368,10 @@ export function consumeApsPrebidRenderer(adId: string, expected: ApsPrebidRender
   return true;
 }
 
-/** Whether the server explicitly selected the opt-in publisher-native runner mode. */
-export function isPublisherNativeApsRendering(): boolean {
-  return (
-    document.head.querySelector(
-      `meta[name="${APS_RENDERING_MODE_META_NAME}"][content="publisher_native"]`
-    ) !== null
-  );
-}
-
 export interface DispatchApsRenderingOptions {
   slotId: string;
   renderer: unknown;
+  source?: MessageEventSource | null;
   /** Existing Trusted Server owner, invoked only in the default mode. */
   trustedServer: (renderer: ApsRendererV1) => boolean;
 }
@@ -337,11 +385,12 @@ export interface DispatchApsRenderingOptions {
 export function dispatchApsRendering({
   slotId,
   renderer: input,
+  source,
   trustedServer,
 }: DispatchApsRenderingOptions): boolean | Promise<boolean> {
   // Every attempt supersedes a pending frame for this slot, including an invalid
   // replacement that fails before a new frame can be created.
-  cancelPendingApsRendering(slotId);
+  cancelPendingApsRendering(slotId, source);
   const dispatch = Symbol(slotId);
   nativeDispatches.set(slotId, dispatch);
 
@@ -351,7 +400,7 @@ export function dispatchApsRendering({
     log.warn('APS renderer: rejected descriptor');
     return false;
   }
-  if (!isPublisherNativeApsRendering()) {
+  if (!publisherNativeRendering) {
     try {
       return trustedServer(renderer);
     } finally {
@@ -361,7 +410,7 @@ export function dispatchApsRendering({
 
   let rendering: Promise<boolean>;
   try {
-    rendering = renderApsPublisherNative({ slotId, renderer });
+    rendering = renderApsPublisherNative({ slotId, renderer, source });
   } catch {
     releaseNativeDispatch(slotId, dispatch);
     log.warn('APS native renderer: failed to start publisher-origin frame');
@@ -370,16 +419,40 @@ export function dispatchApsRendering({
 
   return rendering.then((accepted) => {
     if (!releaseNativeDispatch(slotId, dispatch)) {
-      log.warn('APS native renderer: ignored stale completion');
+      if (accepted) log.warn('APS native renderer: ignored stale completion');
       return false;
     }
     return accepted;
   });
 }
 
-export interface RenderApsPublisherNativeOptions {
+interface RenderApsPublisherNativeOptions {
   slotId: string;
   renderer: unknown;
+  source?: MessageEventSource | null;
+}
+
+function prepareApsRunnerDocument(
+  frameWindow: Window & typeof globalThis,
+  frameDocument: Document
+): void {
+  for (const element of [frameDocument.documentElement, frameDocument.body]) {
+    element.style.margin = '0px';
+    element.style.padding = '0px';
+  }
+
+  const normalizeFrame = (node: Node): void => {
+    if (
+      node instanceof frameWindow.HTMLIFrameElement &&
+      node.parentElement === frameDocument.body
+    ) {
+      node.style.display = 'block';
+    }
+  };
+  Array.from(frameDocument.body.children).forEach(normalizeFrame);
+  new frameWindow.MutationObserver((records) => {
+    for (const record of records) record.addedNodes.forEach(normalizeFrame);
+  }).observe(frameDocument.body, { childList: true });
 }
 
 function prepareApsRunnerDocument(
@@ -406,12 +479,13 @@ function prepareApsRunnerDocument(
 }
 
 /** Render the exact selected response through APS's fixed runner in a friendly iframe. */
-export function renderApsPublisherNative({
+function renderApsPublisherNative({
   slotId,
   renderer: input,
+  source,
 }: RenderApsPublisherNativeOptions): Promise<boolean> {
   const renderer = validateApsRenderer(input);
-  const container = findApsContainer(slotId);
+  const container = findApsContainer(slotId, source);
   if (!renderer || !container) {
     log.warn(
       renderer ? 'APS native renderer: slot not found' : 'APS renderer: rejected descriptor'

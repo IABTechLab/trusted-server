@@ -9,15 +9,19 @@ import envelope from '../../fixtures/aps-renderer-v1.json';
 import type { AuctionBidData, TsjsApi } from '../../../src/core/types';
 import {
   APS_PREBID_CREATIVE_RUNNER_URL,
-  APS_RENDERING_MODE_META_NAME,
+  APS_RENDERING_MODE_ATTRIBUTE_NAME,
 } from '../../../src/integrations/aps/render';
 
-function enablePublisherNativeMode(): HTMLMetaElement {
-  const marker = document.createElement('meta');
-  marker.name = APS_RENDERING_MODE_META_NAME;
-  marker.content = 'publisher_native';
-  document.head.appendChild(marker);
-  return marker;
+let publisherNativeScript: HTMLScriptElement | undefined;
+
+function enablePublisherNativeMode(): { remove(): void } {
+  publisherNativeScript = document.createElement('script');
+  publisherNativeScript.setAttribute(APS_RENDERING_MODE_ATTRIBUTE_NAME, 'publisher_native');
+  return {
+    remove: () => {
+      publisherNativeScript = undefined;
+    },
+  };
 }
 
 function nativeRunnerIn(divId: string): {
@@ -2972,6 +2976,7 @@ describe('installTsRenderBridge', () => {
 
   beforeEach(() => {
     vi.resetModules();
+    publisherNativeScript = undefined;
     // Remove ALL accumulated 'message' handlers from previous test module imports
     // to prevent stale bridge listeners from intercepting our test event.
     for (const handler of allMessageHandlers) {
@@ -3032,6 +3037,9 @@ describe('installTsRenderBridge', () => {
   async function captureBridgeListener(): Promise<(e: MessageEvent) => unknown> {
     let bridgeListener: ((e: MessageEvent) => unknown) | undefined;
     const origAdd = window.addEventListener.bind(window);
+    const currentScriptSpy = publisherNativeScript
+      ? vi.spyOn(document, 'currentScript', 'get').mockReturnValue(publisherNativeScript)
+      : undefined;
     const addSpy = vi
       .spyOn(window, 'addEventListener')
       .mockImplementation(
@@ -3046,6 +3054,7 @@ describe('installTsRenderBridge', () => {
       );
     await import('../../../src/integrations/gpt/index');
     addSpy.mockRestore();
+    currentScriptSpy?.mockRestore();
 
     expect(bridgeListener, 'bridge listener should be registered').toBeDefined();
     return bridgeListener!;
@@ -3530,6 +3539,52 @@ describe('installTsRenderBridge', () => {
       expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
     } finally {
       marker.remove();
+    }
+  });
+
+  it('uses the requesting frame to resolve a registered APS dynamic slot prefix', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'native-dynamic-prebid-ad-id';
+    const markUsed = vi.fn();
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-native-',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed,
+      },
+    };
+    const marker = enablePublisherNativeMode();
+    const firstSource = createTrustedSlotIframe('div-native-first');
+    const source = createTrustedSlotIframe('div-native-second');
+
+    try {
+      const bridgeListener = await captureBridgeListener();
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+          ports: [{ postMessage: vi.fn() }],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+      const native = nativeRunnerIn('div-native-second');
+      native.runner.dispatchEvent(new Event('load'));
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(native.frame.style.display).toBe('');
+      expect(markUsed).toHaveBeenCalledOnce();
+      expect(
+        Array.from(document.querySelectorAll<HTMLIFrameElement>('#div-native-first iframe')).some(
+          (frame) => frame.contentWindow === firstSource
+        )
+      ).toBe(true);
+    } finally {
+      marker.remove();
+      document.getElementById('div-native-first')?.remove();
+      document.getElementById('div-native-second')?.remove();
     }
   });
 
