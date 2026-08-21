@@ -1494,7 +1494,9 @@ configuration and direct `POST /auction` endpoint.
 For a successful GET publisher document, Trusted Server applies the
 browser-only `Cache-Control: private, max-age=60` policy from
 [#1007](https://github.com/IABTechLab/trusted-server/issues/1007) when the
-server-side ad stack is structurally inactive. This includes an absent
+server-side ad stack is structurally inactive. Trusted Server also applies this
+policy to a subsequent `304 Not Modified` response so revalidation cannot
+restore the origin freshness policy. This includes an absent
 `[creative_opportunities]` section, `enabled = false`, no slot matching the
 path, or a disabled auction. The `private` directive prevents shared caches
 that use `Cache-Control` from storing the document. The policy replaces the
