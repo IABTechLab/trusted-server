@@ -147,21 +147,21 @@ Two mitigations, both real:
   that TS had no purge capability was wrong; it has no _wiring_, which is buildable.
 
 **But note which cache.** `InsertBuilder::surrogate_keys` belongs to the **Core Cache**
-API and applies to the transformed-template cache the ESI spike would build (C2). It has
-**no effect on the HTTP read-through cache** that Stage 0 turns on (C1). Purging C1 needs
+API and applies to the shared transformed-template cache the ESI spike would build. It has
+**no effect on the raw origin cache** that Stage 0 turns on. Purging the raw origin cache needs
 surrogate keys the _origin_ supplies on its responses, or the HTTP cache's own
 request/candidate surrogate-key surface. Confirm which is available before relying on it —
 an earlier revision of this document conflated the two.
 
-**C2's purge is locally testable; C1's is not.** Verified 2026-08-10: Viceroy 0.17
+**The shared transformed-template cache's purge is locally testable; the raw origin cache's is not.** Verified 2026-08-10: Viceroy 0.17
 implements `purge_surrogate_key` against the same in-process cache it serves reads from
 (`viceroy-lib-0.17.0/src/wiggle_abi/fastly_purge_impl.rs:10-32`), soft purge included. So
-the purge-based rollback for the C2 template cache the spike builds can be exercised end
-to end without a Fastly service. That does nothing for Stage 0, whose exposure is C1.
+the purge-based rollback for the shared template cache the spike builds can be exercised end
+to end without a Fastly service. That does nothing for Stage 0, whose exposure is the raw origin cache.
 
-Rollback is therefore: flip the flag, **then** purge C1 by whichever mechanism is actually
+Rollback is therefore: flip the flag, **then** purge the raw origin cache by whichever mechanism is actually
 available (or roll a versioned key namespace), **then** observe past the origin TTL before
-declaring the incident closed. With no C1 purge path wired, the tail is the TTL itself —
+declaring the incident closed. With no raw origin cache purge path wired, the tail is the TTL itself —
 roughly a minute here, and a recorded risk rather than a surprise.
 
 ## ESI spike Task 1 — does `esi` 0.7 build on this toolchain?
@@ -213,7 +213,7 @@ transaction and stream-back shapes.
 
 **Consequence: provisioning a Fastly service is not a prerequisite.** An earlier revision
 of the spike plan made it Task 2 and a blocker on everything downstream. Almost all of the
-correctness and safety work — the C2 cache logic, the transform, template byte-identity,
+correctness and safety work — the shared template-cache logic, the transform, template byte-identity,
 ESI assembly, DCA and dispatcher refusal, fragment-failure degradation, header ordering,
 and the leakage gates — runs locally. The plan is re-sequenced accordingly.
 
@@ -226,7 +226,7 @@ timings are meaningless for the decision.
 ### Not yet verified
 
 Compiling and a cache round-trip are not an implementation. Nothing yet exercises the
-`lol_html` transform into C2, ESI assembly, or any runtime behaviour on the publisher path,
+`lol_html` transform into the shared template cache, ESI assembly, or any runtime behaviour on the publisher path,
 and the `esi` dependency is added but unused.
 
 ## ESI spike Task 3 — implementation progress
@@ -234,14 +234,14 @@ and the `esi` dependency is added but unused.
 **Date:** 2026-08-10. All of it behaviour-neutral under the default
 `AssemblyMode::Inline`; nothing here changes a shipped code path.
 
-| Step                             | State                                                               |
-| -------------------------------- | ------------------------------------------------------------------- |
-| 1 — `AssemblyMode` setting       | **Done.** `Option<AssemblyMode>` on `CreativeOpportunitiesConfig`.  |
-| 2 — head-seam neutrality gate    | **Done.** `template_ad_slots_script`, three byte-identity tests.    |
-| 2b — body-close decoupling       | **Done.** `BodyCloseInjection`, `body_close_injection`.             |
-| 2c — emit the marker under `Esi` | **Not done.** Blocked on the fragment endpoint; see below.          |
-| 3 — C2 eligibility gate          | **Done.** `c2_bypass_reason`, eight tests. Logs only, no cache I/O. |
-| 4 — C2 cache read/write          | **Not started.** Design choice open; see below.                     |
+| Step                                | State                                                                           |
+| ----------------------------------- | ------------------------------------------------------------------------------- |
+| 1 — `AssemblyMode` setting          | **Done.** `Option<AssemblyMode>` on `CreativeOpportunitiesConfig`.              |
+| 2 — head-seam neutrality gate       | **Done.** `template_ad_slots_script`, three byte-identity tests.                |
+| 2b — body-close decoupling          | **Done.** `BodyCloseInjection`, `body_close_injection`.                         |
+| 2c — emit the marker under `Esi`    | **Not done.** Blocked on the fragment endpoint; see below.                      |
+| 3 — template-cache eligibility gate | **Done.** `template_cache_bypass_reason`, eight tests. Logs only, no cache I/O. |
+| 4 — template-cache read/write       | **Not started.** Design choice open; see below.                                 |
 
 ### What is deliberately absent
 
@@ -252,7 +252,7 @@ at it would put raw JSON where a script belongs. That endpoint does not exist, a
 marker with nothing behind it is worse than no marker. A test pins the current answer so
 it changes deliberately.
 
-**No cache read or write.** `c2_bypass_reason` has a real call site that logs its verdict,
+**No cache read or write.** `template_cache_bypass_reason` has a real call site that logs its verdict,
 which makes the decision observable during the spike without mutating anything. Task 3
 Step 4 is blocked on choosing between read-through-with-body-transform and explicit
 `cache::core` — the plan names that as a decision to make before writing code, and it is
@@ -311,7 +311,7 @@ The test derives the invariant rather than asserting per-variant: a root auction
 useful exactly when a seam will consume its result. A new mode cannot make the dispatch
 gate and the injection decisions disagree without failing it.
 
-### 2. The C2 gate ignored the forwarded client `Cookie`
+### 2. The template-cache gate ignored the forwarded client `Cookie`
 
 TS forwards client cookies to origin unchanged — there is no `Cookie` strip on the
 publisher path. So a response can be cookie-personalized while carrying no `Set-Cookie`
@@ -334,7 +334,7 @@ immutable request-scoped decision.
 
 It did not leak, but only by coincidence: `requires_private_no_store()` is a strict
 superset of the conditions under which either script is emitted, and that stamp lands
-before the C2 gate reads response headers, so the gate refused. Two independent
+before the template-cache gate reads response headers, so the gate refused. Two independent
 conditions that happened to align, with nothing enforcing the relationship.
 
 Fixed on both sides — the processor receives no diagnostics decision under shared modes,
@@ -352,11 +352,11 @@ Step 2 requires exactly that, and it remains the most valuable missing test.
 
 ### Reviewer's gate, adopted
 
-Do not proceed to Task 3 Step 4 (actual C2 read/write) or expose `AssemblyMode` to any
+Do not proceed to Task 3 Step 4 (actual template-cache read/write) or expose `AssemblyMode` to any
 test or staging traffic until the full-document byte-identity test exists. The three
 fixes above close the known holes; that test is what would catch the next one.
 
-## Task 3 complete — the C2 cache engages end to end
+## Task 3 complete — the shared template cache engages end to end
 
 `2db10639` (store), `2a2e6c6a` (lookup), plus `b688d667`/`577eb85a` for the `Vary`
 handling. A second request for the same URL is now served without touching the origin,
@@ -412,20 +412,20 @@ nothing tracked was modified. Served document:
 No executable ESI tag. One origin fetch for two requests. `private, no-store` on the hit.
 Cached template 353 bytes against 467 served, so the cache holds the pre-assembly
 template. All three fragment formats behave: script, JSON, and `400` on a typo. `Inline`
-unaffected — two fetches for two requests, no C2 activity, no markers.
+unaffected — two fetches for two requests, no template-cache activity, no markers.
 
 ### The bug only a running server could find
 
-With the auction **enabled**, C2 never engaged: two origin fetches, marker unresolved.
+With the auction **enabled**, the template cache never engaged: two origin fetches, marker unresolved.
 
-TS stamps its own `private, no-store` when `should_run_ad_stack` is true. The C2 gate ran
+TS stamps its own `private, no-store` when `should_run_ad_stack` is true. The template-cache gate ran
 after that stamp, read it as the origin's declaration, concluded `OriginNotShareable`, and
 refused — **on every page that serves ads**, which is every page that matters.
 
 The more important half is why no test caught it. The fixture left the auction disabled
 and passed `slots: &[]`, so `should_run_ad_stack` was false in every test, the stamp never
-fired, and the ordering was unobservable. Every C2 assertion had been made against the one
-configuration where C2's hardest condition does not apply.
+fired, and the ordering was unobservable. Every template-cache assertion had been made against the one
+configuration where the template cache's hardest condition does not apply.
 
 Demonstrated both ways: with the old fixture, reintroducing the bug passes all seven
 tests; with the corrected fixture it fails six.
@@ -436,8 +436,8 @@ Five bugs now share one shape — compiled, passed every existing test, and were
 
 1. The head-seam gate silently disabled body-close injection (`d9e05973`).
 2. The key held the encoding the origin _chose_, so the cache could never hit (`2a2e6c6a`).
-3. A C2 hit served with no `Cache-Control` at all (`0adb578e`).
-4. A C2 hit dropped its in-flight auction, billing SSPs for nothing (`b3ac59a6`).
+3. A template-cache hit served with no `Cache-Control` at all (`0adb578e`).
+4. A template-cache hit dropped its in-flight auction, billing SSPs for nothing (`b3ac59a6`).
 5. The gate read TS's own header as the origin's (`4c557347`).
 
 Three were found by writing the test the plan asked for. One needed a running server. None
@@ -461,7 +461,7 @@ and a page. Fixed at key construction, since the key governs lookup and store al
 **`Vary: Accept-Encoding` disqualified everything.** The key has a dedicated
 `accept_encoding` field, so such an origin is already keyed correctly — but the coverage
 check consulted only the operator-configured list and reported a gap. Every compressing
-origin sends that header, so **C2 would have stored nothing against any real origin**.
+origin sends that header, so **the shared template cache would have stored nothing against any real origin**.
 This is worse than a plain bug: the spike would have measured a hit rate near zero and
 reported it as a result.
 

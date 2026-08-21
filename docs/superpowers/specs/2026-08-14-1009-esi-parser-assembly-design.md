@@ -8,8 +8,8 @@
 
 ## Goal
 
-Use the repaired `stackpop/esi` streaming parser for an authorized C2 cold miss while
-preserving the current fast, portable byte-seam stream for a warm C2 hit.
+Use the repaired `stackpop/esi` streaming parser for an authorized template-cache cold miss while
+preserving the current fast, portable byte-seam stream for a warm template-cache hit.
 
 The operator-facing mode remains:
 
@@ -39,7 +39,7 @@ head-first stream and waits for the auction only at the final seam.
 
 ## Cached representation
 
-C2 continues to store exactly one inert marker:
+The template cache continues to store exactly one inert marker:
 
 ```html
 <!--ts-ad-seam-->
@@ -57,9 +57,9 @@ part of the cache schema.
 
 1. Fetch and transform the origin response.
 2. Normalize and validate the single inert marker.
-3. Refuse C2 storage and platform parsing if publisher bytes contain any `<esi:`
+3. Refuse template-cache storage and platform parsing if publisher bytes contain any `<esi:`
    directive; serve that response with the safe byte seam instead.
-4. Store the reader-neutral template in C2.
+4. Store the reader-neutral template in the shared template cache.
 5. Build the current reader's combined slots-and-bids seam script.
 6. Ask the platform template assembler to assemble the stored template.
 7. The Fastly assembler replaces the one inert marker in its private working copy with a
@@ -112,12 +112,12 @@ The Fastly adapter:
   replaced; any truncation or unrelated parser mutation triggers fallback.
 
 Any violation returns an assembler error and core uses the safe byte-seam fallback.
-Core performs the publisher-ESI rejection before C2 storage as the primary guard; the
+Core performs the publisher-ESI rejection before template-cache storage as the primary guard; the
 adapter repeats it as defense in depth.
 
 ## Request-visible diagnostics
 
-Assembled C2 responses carry an `x-ts-assembly` header:
+Assembled template-cache responses carry an `x-ts-assembly` header:
 
 | Path                                                                                    | Value                |
 | --------------------------------------------------------------------------------------- | -------------------- |
@@ -125,7 +125,7 @@ Assembled C2 responses carry an `x-ts-assembly` header:
 | Cold response whose platform parser is unavailable, disallowed, or rejects the document | `byte-seam-fallback` |
 | Warm cache hit                                                                          | `byte-seam`          |
 
-Together with `x-ts-c2-cache`, this lets an operator prove the internal path with two
+Together with `x-ts-template-cache`, this lets an operator prove the internal path with two
 ordinary requests instead of inferring it from timing.
 
 ## Testing

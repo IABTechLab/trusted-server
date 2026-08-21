@@ -16,7 +16,10 @@
 //! auth-gated and operator-facing, responses intentionally include full
 //! internal detail (raw consent strings, partner UIDs, parse errors).
 
-use http::{Request, Response, StatusCode, header};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+
+use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
@@ -24,6 +27,7 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt as _};
 
 use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EC, COOKIE_TS_EIDS};
+use crate::cookies::extract_cookie_value;
 use crate::error::TrustedServerError;
 use crate::openrtb::Eid;
 
@@ -34,13 +38,120 @@ use super::kv_backend::EcKvLookup;
 use super::kv_types::{KvEntry, KvMetadata};
 use super::log_id;
 use super::prebid_eids::{
-    collect_prebid_eid_updates, collect_sharedid_update, dedupe_partner_updates,
-    parse_prebid_eids_cookie,
+    analyze_prebid_eids_cookie, collect_sharedid_update, dedupe_partner_updates, is_valid_eid_uid,
 };
 use super::registry::PartnerRegistry;
 
 /// Route prefix shared by the cookie-based and explicit-ID lookup routes.
 const ADMIN_EC_PATH: &str = "/_ts/admin/ec";
+
+/// Route used by the request-only EID cookie diagnostic.
+const ADMIN_EIDS_PATH: &str = "/_ts/admin/eids";
+
+/// Reserved Trusted Server admin prefix.
+///
+/// Mirrors the documented `^/_ts/admin` basic-auth handler regex, so every
+/// path that handler authenticates is also reserved at the fallback boundary.
+/// Matching on the bare prefix — rather than on `/_ts/admin` plus a literal
+/// `/` — also covers percent-encoded separators such as `/_ts/admin%2Fec`,
+/// which the auth handler matches but a literal-slash check does not.
+const ADMIN_NAMESPACE_PREFIX: &str = "/_ts/admin";
+
+/// Retired non-`/_ts` admin key alias prefix.
+///
+/// The exact `/admin/keys/rotate` and `/admin/keys/deactivate` aliases are
+/// routed to a local deny by each adapter; the rest of the retired namespace
+/// (trailing, descendant, and encoded-separator forms) is reserved here.
+const RETIRED_ADMIN_KEYS_PREFIX: &str = "/admin/keys";
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum AdminDiagnosticShape {
+    ValidResource,
+    Malformed,
+}
+
+fn admin_diagnostic_shape(path: &str) -> Option<AdminDiagnosticShape> {
+    if path == ADMIN_EC_PATH || path == ADMIN_EIDS_PATH {
+        return Some(AdminDiagnosticShape::ValidResource);
+    }
+
+    if let Some(remainder) = path.strip_prefix("/_ts/admin/ec/") {
+        return Some(if !remainder.is_empty() && !remainder.contains('/') {
+            AdminDiagnosticShape::ValidResource
+        } else {
+            AdminDiagnosticShape::Malformed
+        });
+    }
+
+    // Reserve the complete admin namespace at the publisher-fallback boundary.
+    // A successfully authenticated malformed or future admin path must never
+    // forward its Authorization header or body to the publisher origin.
+    let reserved = is_reserved_admin_path(path)
+        || percent_decoded_path(path).is_some_and(|decoded| is_reserved_admin_path(&decoded));
+
+    reserved.then_some(AdminDiagnosticShape::Malformed)
+}
+
+/// Returns whether `path` sits in a namespace that must never reach publisher
+/// fallback, because doing so would forward Trusted Server admin credentials
+/// and request bodies to the publisher origin.
+fn is_reserved_admin_path(path: &str) -> bool {
+    // `/_ts/admin` is matched on the bare prefix because the unanchored
+    // `^/_ts/admin` auth regex authenticates those paths too. No auth handler
+    // matches the retired `/admin/keys` alias, so only the alias itself and its
+    // separator descendants are reserved — a bare prefix there would also deny
+    // unrelated publisher paths such as `/admin/keystore`.
+    path.starts_with(ADMIN_NAMESPACE_PREFIX)
+        || path == RETIRED_ADMIN_KEYS_PREFIX
+        || path
+            .strip_prefix(RETIRED_ADMIN_KEYS_PREFIX)
+            .is_some_and(|remainder| remainder.starts_with('/'))
+}
+
+/// Percent-decodes `path` once, returning `None` when the path contains no
+/// escape sequence or decodes to invalid UTF-8.
+///
+/// Routers and the basic-auth matcher both operate on the raw path, so an
+/// encoded separator can shift a request out of the literal admin namespace
+/// while still matching the admin auth handler. Checking the decoded form as
+/// well keeps the reservation closed for `%2F`, `%2f`, and their
+/// double-encoded variants.
+fn percent_decoded_path(path: &str) -> Option<String> {
+    if !path.contains('%') {
+        return None;
+    }
+
+    urlencoding::decode(path).ok().map(Cow::into_owned)
+}
+
+/// Returns a local denial response when an admin diagnostic request reaches
+/// an adapter's publisher fallback.
+///
+/// Valid diagnostic resources reject non-GET methods with `405 Method Not
+/// Allowed`. Malformed, trailing, unknown, and any valid GET admin route that
+/// unexpectedly reaches fallback return `404 Not Found`. The reservation
+/// spans the whole `/_ts/admin` prefix — including percent-encoded separators
+/// such as `/_ts/admin%2Fec` — plus the retired `/admin/keys` alias namespace,
+/// evaluated on both the raw and the percent-decoded path. Paths outside those
+/// namespaces return `None`, preserving normal fallback.
+#[must_use]
+pub fn deny_admin_diagnostic_fallback(req: &Request<EdgeBody>) -> Option<Response<EdgeBody>> {
+    let shape = admin_diagnostic_shape(req.uri().path())?;
+    let mut response =
+        if shape == AdminDiagnosticShape::ValidResource && req.method() != Method::GET {
+            json_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+        } else {
+            json_error(StatusCode::NOT_FOUND, "admin diagnostic route not found")
+        };
+
+    if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+        response
+            .headers_mut()
+            .insert(header::ALLOW, HeaderValue::from_static("GET"));
+    }
+
+    Some(response)
+}
 
 /// Successful admin EC lookup payload.
 #[derive(Debug, Serialize)]
@@ -52,26 +163,26 @@ struct AdminEcLookupResponse {
     /// Store generation marker for the entry.
     generation: u64,
     /// `true` when the entry is a consent-withdrawal tombstone
-    /// (`consent.ok = false`). Absent when the body failed to parse.
+    /// (`consent.ok = false`). Absent when the body failed to parse as JSON or
+    /// deserialize as a [`KvEntry`].
     #[serde(skip_serializing_if = "Option::is_none")]
     tombstone: Option<bool>,
-    /// The stored entry, re-serialized verbatim except for derived
+    /// The stored entry, preserved as raw JSON except for derived
     /// `created_iso` / `updated_iso` companions added next to the stored
     /// unix-seconds timestamps for readability. Absent when the body
-    /// failed to deserialize (see `entry_error` / `raw_body`).
+    /// was not valid JSON (see `entry_error` / `raw_body`).
     #[serde(skip_serializing_if = "Option::is_none")]
     entry: Option<JsonValue>,
-    /// Deserialization or validation failure detail for the entry body.
+    /// JSON parsing, schema deserialization, or validation failure detail.
     #[serde(skip_serializing_if = "Option::is_none")]
     entry_error: Option<String>,
-    /// Raw entry body (lossy UTF-8) when it could not be deserialized.
+    /// Raw entry body (lossy UTF-8) when it was not valid JSON.
     #[serde(skip_serializing_if = "Option::is_none")]
     raw_body: Option<String>,
-    /// The stored KV metadata mirror, when present and parseable.
+    /// The stored KV metadata JSON, when present and parseable.
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<JsonValue>,
-    /// Deserialization failure detail for the metadata, including its raw
-    /// value.
+    /// JSON parsing or schema deserialization failure detail for metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata_error: Option<String>,
     /// Derived auction view. Present only when the entry deserializes and
@@ -127,10 +238,7 @@ pub fn handle_admin_ec_lookup(
     req: &Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let Some(kv) = kv else {
-        return Ok(json_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "EC identity graph is not configured on this deployment",
-        ));
+        return Ok(admin_ec_lookup_not_supported());
     };
 
     let ec_id = match requested_ec_id(req) {
@@ -154,6 +262,15 @@ pub fn handle_admin_ec_lookup(
             message: "failed to serialize admin EC lookup response".to_owned(),
         })?;
     Ok(json_response(StatusCode::OK, body))
+}
+
+/// Returns the portable response used when an adapter has no EC KV backend.
+#[must_use]
+pub fn admin_ec_lookup_not_supported() -> Response<EdgeBody> {
+    json_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "EC identity graph is not configured on this deployment",
+    )
 }
 
 /// Resolves the EC ID to look up from the path or the `ts-ec` cookie.
@@ -216,36 +333,49 @@ fn build_lookup_response(
         auction: None,
     };
 
-    match serde_json::from_slice::<KvEntry>(&lookup.body) {
-        Ok(entry) => {
-            payload.tombstone = Some(!entry.consent.ok);
-            match entry.validate() {
-                Ok(()) => payload.auction = Some(build_auction_view(registry, &entry)),
-                Err(message) => {
-                    payload.entry_error = Some(format!(
-                        "entry failed validation (auction reads fail closed \
-                         and attach no EIDs): {message}"
-                    ));
+    match serde_json::from_slice::<JsonValue>(&lookup.body) {
+        Ok(mut entry_json) => {
+            add_iso_timestamp_companions(&mut entry_json);
+            payload.entry = Some(entry_json);
+
+            match serde_json::from_slice::<KvEntry>(&lookup.body) {
+                Ok(entry) => {
+                    payload.tombstone = Some(!entry.consent.ok);
+                    match entry.validate() {
+                        Ok(()) => payload.auction = Some(build_auction_view(registry, &entry)),
+                        Err(message) => {
+                            payload.entry_error = Some(format!(
+                                "entry failed validation (auction reads fail closed \
+                                 and attach no EIDs): {message}"
+                            ));
+                        }
+                    }
+                }
+                Err(error) => {
+                    payload.entry_error =
+                        Some(format!("failed to deserialize entry schema: {error}"));
                 }
             }
-            payload.entry = Some(entry_json_with_iso_timestamps(&entry));
         }
         Err(error) => {
-            payload.entry_error = Some(format!("failed to deserialize entry: {error}"));
+            payload.entry_error = Some(format!("failed to parse entry JSON: {error}"));
             payload.raw_body = Some(String::from_utf8_lossy(&lookup.body).into_owned());
         }
     }
 
     match &lookup.metadata {
         None => {}
-        Some(bytes) => match serde_json::from_slice::<KvMetadata>(bytes) {
-            Ok(metadata) => {
-                payload.metadata =
-                    Some(serde_json::to_value(&metadata).expect("should serialize KvMetadata"));
+        Some(bytes) => match serde_json::from_slice::<JsonValue>(bytes) {
+            Ok(metadata_json) => {
+                payload.metadata = Some(metadata_json);
+                if let Err(error) = serde_json::from_slice::<KvMetadata>(bytes) {
+                    payload.metadata_error =
+                        Some(format!("failed to deserialize metadata schema: {error}"));
+                }
             }
             Err(error) => {
                 payload.metadata_error = Some(format!(
-                    "failed to deserialize metadata: {error} (raw: {})",
+                    "failed to parse metadata JSON: {error} (raw: {})",
                     String::from_utf8_lossy(bytes)
                 ));
             }
@@ -255,26 +385,31 @@ fn build_lookup_response(
     payload
 }
 
-/// Serializes an entry, adding derived ISO 8601 companions next to the
+/// Adds derived ISO 8601 companions next to the
 /// stored unix-seconds timestamps (`created_iso`, `consent.updated_iso`).
 ///
-/// The stored numeric values stay untouched so the echo remains faithful to
-/// what is in KV; the ISO fields exist purely for operator readability.
-fn entry_json_with_iso_timestamps(entry: &KvEntry) -> JsonValue {
-    let mut entry_json = serde_json::to_value(entry).expect("should serialize KvEntry");
-
+/// Every stored value, including pre-existing ISO companions, stays untouched.
+/// The derived fields exist purely for operator readability when absent.
+fn add_iso_timestamp_companions(entry_json: &mut JsonValue) {
+    let created = entry_json.get("created").and_then(JsonValue::as_u64);
+    let updated = entry_json
+        .get("consent")
+        .and_then(|consent| consent.get("updated"))
+        .and_then(JsonValue::as_u64);
     if let Some(object) = entry_json.as_object_mut() {
-        if let Some(iso) = iso_timestamp(entry.created) {
-            object.insert("created_iso".to_owned(), JsonValue::String(iso));
+        if let Some(iso) = created.and_then(iso_timestamp) {
+            object
+                .entry("created_iso".to_owned())
+                .or_insert(JsonValue::String(iso));
         }
         if let Some(consent) = object.get_mut("consent").and_then(JsonValue::as_object_mut)
-            && let Some(iso) = iso_timestamp(entry.consent.updated)
+            && let Some(iso) = updated.and_then(iso_timestamp)
         {
-            consent.insert("updated_iso".to_owned(), JsonValue::String(iso));
+            consent
+                .entry("updated_iso".to_owned())
+                .or_insert(JsonValue::String(iso));
         }
     }
-
-    entry_json
 }
 
 /// Formats a unix-seconds timestamp as ISO 8601 (`yyyy-MM-ddTHH:mm:ss.SSSZ`).
@@ -339,8 +474,8 @@ struct IngestPreview {
     /// Cookie sources matched to a configured partner, with the UID that
     /// would be stored (deduplicated exactly like the ingestion path).
     matched: Vec<MatchedPartnerId>,
-    /// `ts-eids` sources with no configured partner; dropped on ingestion.
-    unmatched: Vec<String>,
+    /// `ts-eids` sources dropped on ingestion, with the reason.
+    unmatched: Vec<DroppedEidSource>,
 }
 
 /// A cookie-derived partner UID that ingestion would store.
@@ -350,6 +485,21 @@ struct MatchedPartnerId {
     source_domain: String,
     /// The UID that would be stored.
     uid: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DroppedEidSource {
+    /// EID source from the cookie.
+    source: String,
+    /// Why ingestion would drop the source.
+    reason: DroppedEidReason,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DroppedEidReason {
+    NoPartner,
+    NoValidUid,
 }
 
 /// Handles `GET /_ts/admin/eids`.
@@ -373,13 +523,20 @@ pub fn handle_admin_eids_lookup(
     let eids_cookie = extract_cookie_value(req, COOKIE_TS_EIDS);
     let sharedid_cookie = extract_cookie_value(req, COOKIE_SHAREDID);
 
-    let (eids, parse_error) = match &eids_cookie {
-        None => (None, None),
-        Some(value) => match parse_prebid_eids_cookie(value) {
-            Ok(parsed) => (Some(parsed), None),
+    let (eids, parse_error, diagnostic_sources, mut updates) = match &eids_cookie {
+        None => (None, None, Vec::new(), Vec::new()),
+        Some(value) => match analyze_prebid_eids_cookie(value, registry) {
+            Ok(analysis) => (
+                Some(analysis.eids),
+                None,
+                analysis.diagnostic_sources,
+                analysis.updates,
+            ),
             Err(error) => (
                 None,
                 Some(format!("failed to parse ts-eids cookie: {error}")),
+                Vec::new(),
+                Vec::new(),
             ),
         },
     };
@@ -387,10 +544,6 @@ pub fn handle_admin_eids_lookup(
     // Mirror the ingestion path (`ingest_eid_cookies`): collect matches from
     // both cookies, then dedupe the same way so the preview reports exactly
     // what a navigation would store.
-    let mut updates = Vec::new();
-    if let Some(value) = &eids_cookie {
-        updates.extend(collect_prebid_eid_updates(value, registry));
-    }
     if let Some(value) = &sharedid_cookie
         && let Some(update) = collect_sharedid_update(value, registry)
     {
@@ -404,16 +557,30 @@ pub fn handle_admin_eids_lookup(
         })
         .collect();
 
-    let unmatched = eids
-        .as_ref()
-        .map(|parsed| {
-            parsed
-                .iter()
-                .filter(|eid| registry.find_by_source_domain(&eid.source).is_none())
-                .map(|eid| eid.source.clone())
-                .collect()
+    let mut source_has_valid_uid = BTreeMap::new();
+    for diagnostic_source in diagnostic_sources {
+        let has_valid_uid = diagnostic_source
+            .uids
+            .iter()
+            .any(|uid| is_valid_eid_uid(uid));
+        source_has_valid_uid
+            .entry(diagnostic_source.source)
+            .and_modify(|source_has_valid_uid| *source_has_valid_uid |= has_valid_uid)
+            .or_insert(has_valid_uid);
+    }
+    let unmatched = source_has_valid_uid
+        .into_iter()
+        .filter_map(|(source, has_valid_uid)| {
+            let reason = if registry.find_by_source_domain(&source).is_none() {
+                DroppedEidReason::NoPartner
+            } else if !has_valid_uid {
+                DroppedEidReason::NoValidUid
+            } else {
+                return None;
+            };
+            Some(DroppedEidSource { source, reason })
         })
-        .unwrap_or_default();
+        .collect();
 
     let payload = AdminEidsResponse {
         cookie_present: eids_cookie.is_some(),
@@ -431,22 +598,6 @@ pub fn handle_admin_eids_lookup(
     Ok(json_response(StatusCode::OK, body))
 }
 
-fn extract_cookie_value(req: &Request<EdgeBody>, name: &str) -> Option<String> {
-    let cookie_header = req
-        .headers()
-        .get(header::COOKIE)
-        .and_then(|value| value.to_str().ok())?;
-    for pair in cookie_header.split(';') {
-        let pair = pair.trim();
-        if let Some((key, value)) = pair.split_once('=')
-            && key.trim() == name
-        {
-            return Some(value.trim().to_owned());
-        }
-    }
-    None
-}
-
 fn json_error(status: StatusCode, message: &str) -> Response<EdgeBody> {
     let body = serde_json::json!({ "error": message });
     json_response(status, body.to_string())
@@ -457,6 +608,7 @@ fn json_response(status: StatusCode, body: String) -> Response<EdgeBody> {
         .status(status)
         .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
         .header(header::CACHE_CONTROL, "no-store")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(EdgeBody::from(body.into_bytes()))
         .expect("should build admin EC lookup response")
 }
@@ -520,6 +672,14 @@ mod tests {
             .expect("should build test request")
     }
 
+    fn request_with_method(method: http::Method, path: &str) -> Request<EdgeBody> {
+        Request::builder()
+            .method(method)
+            .uri(format!("https://edge.example.com{path}"))
+            .body(EdgeBody::empty())
+            .expect("should build test request")
+    }
+
     fn kv_with_entry(ec_id: &str, entry: &KvEntry) -> KvIdentityGraph {
         let kv = KvIdentityGraph::in_memory("test-store");
         kv.create(ec_id, entry).expect("should seed KV entry");
@@ -528,13 +688,17 @@ mod tests {
 
     fn kv_with_raw_body(ec_id: &str, body: &str) -> KvIdentityGraph {
         let metadata = serde_json::json!({ "ok": true, "country": "US", "v": 1 }).to_string();
+        kv_with_raw_body_and_metadata(ec_id, body, &metadata)
+    }
+
+    fn kv_with_raw_body_and_metadata(ec_id: &str, body: &str, metadata: &str) -> KvIdentityGraph {
         let store = InMemoryEcKv::new("test-store");
         store
             .insert(
                 ec_id,
                 EcKvWrite {
                     body,
-                    metadata: &metadata,
+                    metadata,
                     ttl: Duration::from_secs(60),
                     mode: EcKvWriteMode::Add,
                 },
@@ -563,6 +727,156 @@ mod tests {
             },
         );
         entry
+    }
+
+    #[test]
+    fn admin_diagnostic_fallback_rejects_wrong_methods_locally() {
+        let ec_id = test_ec_id();
+        let paths = [
+            "/_ts/admin/ec".to_owned(),
+            format!("/_ts/admin/ec/{ec_id}"),
+            "/_ts/admin/eids".to_owned(),
+        ];
+        let methods = [
+            http::Method::POST,
+            http::Method::HEAD,
+            http::Method::OPTIONS,
+            http::Method::PUT,
+            http::Method::PATCH,
+            http::Method::DELETE,
+        ];
+
+        for path in paths {
+            for method in &methods {
+                let request = request_with_method(method.clone(), &path);
+                let response = deny_admin_diagnostic_fallback(&request)
+                    .unwrap_or_else(|| panic!("should deny {method} {path} locally"));
+
+                assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+                assert_eq!(
+                    response.headers().get(header::ALLOW),
+                    Some(&http::HeaderValue::from_static("GET")),
+                    "should advertise GET for {path}"
+                );
+                assert_eq!(
+                    response.headers().get(header::CACHE_CONTROL),
+                    Some(&http::HeaderValue::from_static("no-store")),
+                    "should prevent caching for {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn admin_diagnostic_fallback_rejects_malformed_paths_locally() {
+        let ec_id = test_ec_id();
+        let paths = [
+            "/_ts/admin/ec/".to_owned(),
+            format!("/_ts/admin/ec/{ec_id}/extra"),
+            "/_ts/admin/eids/".to_owned(),
+            "/_ts/admin/eids/extra".to_owned(),
+            "/_ts/admin/eids.json".to_owned(),
+            "/_ts/admin/ec;foo".to_owned(),
+            format!("/_ts/admin/ec%2F{ec_id}"),
+            "/_ts/admin/unknown".to_owned(),
+        ];
+
+        for path in paths {
+            for method in [http::Method::GET, http::Method::POST] {
+                let request = request_with_method(method.clone(), &path);
+                let response = deny_admin_diagnostic_fallback(&request)
+                    .unwrap_or_else(|| panic!("should deny {method} {path} locally"));
+
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                assert_eq!(
+                    response.headers().get(header::CACHE_CONTROL),
+                    Some(&http::HeaderValue::from_static("no-store")),
+                    "should prevent caching for {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn admin_diagnostic_fallback_reserves_encoded_admin_separators() {
+        // `/_ts/admin%2Fec` matches the documented `^/_ts/admin` basic-auth
+        // handler, so it is authenticated, but a literal-slash namespace check
+        // misses it. Reaching publisher fallback would forward the caller's
+        // `Authorization` header and body to the origin.
+        let paths = [
+            "/_ts/admin%2Fec",
+            "/_ts/admin%2fec",
+            "/_ts/admin%2Fkeys/rotate",
+            "/_ts/admin%252Fec",
+            "/_ts/admin%5Cec",
+            "/_ts/adminec",
+            "/%5Fts/admin/ec",
+        ];
+
+        for path in paths {
+            for method in [http::Method::GET, http::Method::POST] {
+                let request = request_with_method(method.clone(), path);
+                let response = deny_admin_diagnostic_fallback(&request)
+                    .unwrap_or_else(|| panic!("should deny {method} {path} locally"));
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "should deny {path} before publisher fallback"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn admin_diagnostic_fallback_reserves_retired_admin_keys_namespace() {
+        // The retired non-`/_ts` aliases are not covered by the `^/_ts/admin`
+        // basic-auth handler. Only the two exact paths are routed to a local
+        // deny, so trailing, descendant, and encoded-separator forms must be
+        // denied at the shared fallback boundary instead.
+        let paths = [
+            "/admin/keys",
+            "/admin/keys/",
+            "/admin/keys/rotate/",
+            "/admin/keys/rotate/extra",
+            "/admin/keys%2Frotate",
+            "/admin/keys%2frotate",
+            "/admin%2Fkeys/rotate",
+            "/admin%2fkeys%2Frotate",
+        ];
+
+        for path in paths {
+            for method in [http::Method::GET, http::Method::POST] {
+                let request = request_with_method(method.clone(), path);
+                let response = deny_admin_diagnostic_fallback(&request)
+                    .unwrap_or_else(|| panic!("should deny {method} {path} locally"));
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "should deny {path} before publisher fallback"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn admin_diagnostic_fallback_ignores_unrelated_publisher_paths() {
+        for path in [
+            "/articles/example",
+            "/admin",
+            "/admin/login",
+            "/admin/keyboards",
+            "/admin/keystore",
+            "/_ts/api/v1/batch-sync",
+        ] {
+            let request = request_with_method(http::Method::POST, path);
+
+            assert!(
+                deny_admin_diagnostic_fallback(&request).is_none(),
+                "should leave unrelated publisher fallback unchanged for {path}"
+            );
+        }
     }
 
     #[test]
@@ -632,6 +946,84 @@ mod tests {
     }
 
     #[test]
+    fn preserves_raw_entry_and_metadata_shapes() {
+        let ec_id = test_ec_id();
+        let body = serde_json::json!({
+            "v": 1,
+            "created": 1_741_824_000_u64,
+            "created_iso": "stored-created-iso",
+            "future_top_level": { "enabled": true },
+            "consent": {
+                "ok": true,
+                "updated": 1_741_824_000_u64,
+                "updated_iso": "stored-updated-iso",
+                "future_consent": "preserve-me"
+            },
+            "geo": { "country": "US" },
+            "pub_properties": {
+                "origin_domain": "example.com",
+                "seen_domains": {
+                    "example.com": { "first": 1000, "last": 1200, "visits": 3 }
+                }
+            },
+            "ids": {
+                "bidstream.example": { "uid": "uid-live", "synced": 1100 }
+            }
+        })
+        .to_string();
+        let metadata = serde_json::json!({
+            "ok": true,
+            "country": "US",
+            "v": 1,
+            "future_metadata": { "source": "edge" }
+        })
+        .to_string();
+        let kv = kv_with_raw_body_and_metadata(&ec_id, &body, &metadata);
+        let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
+
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+            .expect("should handle lookup");
+        let json = response_json(response);
+
+        assert_eq!(json["entry"]["future_top_level"]["enabled"], true);
+        assert_eq!(json["entry"]["consent"]["future_consent"], "preserve-me");
+        assert_eq!(json["entry"]["ids"]["bidstream.example"]["synced"], 1100);
+        assert!(
+            json["entry"]["pub_properties"]["seen_domains"].is_object(),
+            "legacy map-shaped seen_domains should remain unchanged"
+        );
+        assert_eq!(json["entry"]["created_iso"], "stored-created-iso");
+        assert_eq!(
+            json["entry"]["consent"]["updated_iso"],
+            "stored-updated-iso"
+        );
+        assert_eq!(json["metadata"]["future_metadata"]["source"], "edge");
+        assert_eq!(json["auction"]["eids"][0]["source"], "bidstream.example");
+    }
+
+    #[test]
+    fn valid_json_with_invalid_entry_schema_remains_visible() {
+        let ec_id = test_ec_id();
+        let body = serde_json::json!({ "future": "value" }).to_string();
+        let kv = kv_with_raw_body(&ec_id, &body);
+        let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
+
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+            .expect("should handle lookup");
+        let json = response_json(response);
+
+        assert_eq!(json["entry"]["future"], "value");
+        assert!(
+            json["entry_error"]
+                .as_str()
+                .expect("should have entry_error")
+                .contains("failed to deserialize entry schema")
+        );
+        assert!(json.get("raw_body").is_none());
+        assert!(json.get("auction").is_none());
+    }
+
+    #[test]
     fn reports_tombstone_entries() {
         let ec_id = test_ec_id();
         let kv = KvIdentityGraph::in_memory("test-store");
@@ -695,7 +1087,7 @@ mod tests {
             json["entry_error"]
                 .as_str()
                 .expect("should have entry_error")
-                .contains("failed to deserialize"),
+                .contains("failed to parse entry JSON"),
             "should describe the parse failure"
         );
         assert_eq!(json["raw_body"], "not json at all");
@@ -790,6 +1182,30 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_ec_lookup_response_is_json_and_no_store() {
+        let response = admin_ec_lookup_not_supported();
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/json"))
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        assert_eq!(
+            response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+        assert!(
+            response_json(response)["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("not configured"))
+        );
+    }
+
+    #[test]
     fn kv_read_failure_propagates() {
         let kv = KvIdentityGraph::failing("broken-store");
         let req = get_request(&format!("/_ts/admin/ec/{}", test_ec_id()));
@@ -811,6 +1227,10 @@ mod tests {
             handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
         let json = response_json(response);
         assert_eq!(json["cookie_present"], false);
         assert_eq!(json["sharedid_present"], false);
@@ -864,7 +1284,72 @@ mod tests {
             .as_array()
             .expect("should have unmatched list");
         assert_eq!(unmatched.len(), 1, "should report the unregistered source");
-        assert_eq!(unmatched[0], "unknown.example");
+        assert_eq!(unmatched[0]["source"], "unknown.example");
+        assert_eq!(unmatched[0]["reason"], "no_partner");
+    }
+
+    #[test]
+    fn eids_lookup_reports_configured_source_without_valid_uid() {
+        let oversized_uid = "x".repeat(513);
+        let cookie = eids_cookie_for(&serde_json::json!([{
+            "source": "bidstream.example",
+            "uids": [
+                { "id": "", "atype": 1 },
+                { "id": "   ", "atype": 1 },
+                { "id": oversized_uid, "atype": 1 }
+            ]
+        }]));
+        let req = get_request_with_cookie("/_ts/admin/eids", &format!("ts-eids={cookie}"));
+
+        let response =
+            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+        let json = response_json(response);
+
+        assert!(
+            json["ingest"]["matched"]
+                .as_array()
+                .expect("should have matched list")
+                .is_empty(),
+            "invalid UIDs should not be matched"
+        );
+        let unmatched = json["ingest"]["unmatched"]
+            .as_array()
+            .expect("should have unmatched list");
+        assert_eq!(unmatched.len(), 1, "should report one dropped source");
+        assert_eq!(unmatched[0]["source"], "bidstream.example");
+        assert_eq!(unmatched[0]["reason"], "no_valid_uid");
+    }
+
+    #[test]
+    fn eids_lookup_does_not_drop_duplicate_source_with_valid_uid() {
+        let cookie = eids_cookie_for(&serde_json::json!([
+            {
+                "source": "bidstream.example",
+                "uids": [{ "id": "   ", "atype": 1 }]
+            },
+            {
+                "source": "bidstream.example",
+                "uids": [{ "id": "uid-valid", "atype": 1 }]
+            }
+        ]));
+        let req = get_request_with_cookie("/_ts/admin/eids", &format!("ts-eids={cookie}"));
+
+        let response =
+            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+        let json = response_json(response);
+
+        let matched = json["ingest"]["matched"]
+            .as_array()
+            .expect("should have matched list");
+        assert_eq!(matched.len(), 1, "should match the valid duplicate source");
+        assert_eq!(matched[0]["uid"], "uid-valid");
+        assert!(
+            json["ingest"]["unmatched"]
+                .as_array()
+                .expect("should have unmatched list")
+                .is_empty(),
+            "a valid duplicate should suppress no_valid_uid"
+        );
     }
 
     #[test]

@@ -177,7 +177,7 @@ pub struct RuntimeServices {
     /// per-request basis by cloning [`RuntimeServices`] with
     /// [`RuntimeServices::with_kv_store`].
     pub(crate) kv_store: Arc<dyn PlatformKvStore>,
-    /// Shared transformed-template cache (C2). Defaults to
+    /// Shared transformed-template cache. Defaults to
     /// [`UnavailableTemplateCache`], so adapters without one degrade to transforming
     /// per request rather than failing. Spike-only; see
     /// [`crate::platform::template_cache`].

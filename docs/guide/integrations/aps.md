@@ -245,11 +245,12 @@ Use fictional values in source-controlled configuration and fixtures. Supply con
 
 1. Obtain APS account-team confirmation for edge-originated OpenRTB traffic.
 2. Enable Trusted Server APS only for an isolated cohort and disable native APS demand there.
-3. Keep `allow_script_creatives = false` and observe iframe bids through direct and GAM paths.
-4. Confirm outbound privacy fields, aggregate diagnostics, decoded-price competition, line-item targeting, dimensions, click-throughs, and opaque-origin isolation.
-5. Run the restrictive-CSP browser proof for script behavior.
-6. Only then enable script creatives for the isolated cohort and validate them in a real browser.
-7. Expand traffic only after APS confirmation and successful controlled validation.
+3. Keep `allow_script_creatives = false`; observe iframe bids through direct and GAM paths.
+4. Confirm `/integrations/aps/runner.js` streams the live upstream runner through the fixed-target proxy without a Trusted Server success-cache policy.
+5. Confirm outbound privacy fields, aggregate diagnostics, decoded-price competition, line-item targeting, dimensions, click-throughs, and opaque-origin isolation.
+6. Confirm the publisher CSP permits the same-origin renderer while the renderer CSP permits only the runner and creative resources it needs.
+7. Only after reviewing the opaque-frame security boundary, enable script creatives for the isolated cohort and validate them in a real browser.
+8. Expand traffic only after APS confirmation and successful controlled validation.
 
 ## Troubleshooting
 

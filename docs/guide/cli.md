@@ -76,6 +76,44 @@ Trusted Server settings JSON. This blob model is intentional because full
 Trusted Server configs can exceed Fastly limits when split into one config-store
 entry per setting.
 
+### Diagnose ad-template configuration
+
+The static `ts config ad-templates` commands evaluate local configuration
+without launching a browser:
+
+| Command                                  | Purpose                                                                   |
+| ---------------------------------------- | ------------------------------------------------------------------------- |
+| `lint`                                   | Summarize configuration and report invalid slot page patterns.            |
+| `match <path-or-url> [--details]`        | List matching slots; `--details` includes divs, paths, formats/providers. |
+| `check <path-or-url> --expected-slot ID` | Assert the exact matching slot set; repeat `--expected-slot`.             |
+| `check <path-or-url> --expect-no-slots`  | Assert that no slots match.                                               |
+| `explain <path-or-url>`                  | Print every runtime ad-stack gate and its final yes/no verdict.           |
+
+`check --allow-extra-slots` permits matches beyond the repeated
+`--expected-slot` values. It conflicts with `--expect-no-slots`.
+
+`explain` models a GET navigation with consent allowed by default. Use
+`--method <METHOD>`, `--non-navigation`, `--prefetch`, `--bot`, or
+`--consent-denied` to model another request. Provider configuration is printed
+as a separate advisory; it does not change the runtime gate verdict.
+
+Every `ts config ad-templates ...` and `ts audit ad-templates ...` command
+accepts the same config-location flags:
+
+| Flag                  | Behavior                                                                      |
+| --------------------- | ----------------------------------------------------------------------------- |
+| `--app-config <PATH>` | Read this app config instead of deriving `<app.name>.toml` from the manifest. |
+| `--manifest <PATH>`   | Read this manifest; defaults to `edgezero.toml`.                              |
+| `--no-env`            | Disable `TRUSTED_SERVER__...` overlays for read-only commands.                |
+
+The mutating audit generator always edits file-backed values and never writes
+environment-only overlays into TOML, including during `--dry-run`.
+
+For CI-oriented assertions, exit code 0 means the assertion passed, 1 means the
+command ran and found drift (`config ad-templates check` or audit verification
+with `--strict`), and 2 means argument parsing, configuration, browser launch,
+or another tool operation failed.
+
 ## Lifecycle commands
 
 Lifecycle commands delegate to the selected EdgeZero adapter:
@@ -192,20 +230,29 @@ survives alongside the homepage's.
 A wrong ad-unit template makes the publisher bid against inventory that does not
 exist, so the command prefers a narrow literal path over a plausible guess.
 
-| Situation                                                                                     | Result                                                                                                                                  |
-| --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| Only one page was crawled                                                                     | Literal path. One observation cannot distinguish a literal from a template.                                                             |
-| The ad unit never varied by section                                                           | Literal path.                                                                                                                           |
-| A section's slug is not derivable from its URL (`/car-research` requesting `.../carresearch`) | Literal path; the round-trip check catches it.                                                                                          |
-| No root page was seen, so `section_root` is unknown                                           | Literal path rather than a guessed fallback.                                                                                            |
-| Two path segments could both be the section                                                   | No template; the ambiguity is reported.                                                                                                 |
-| The ad unit varies by device, geo, or anything the URL cannot supply                          | **No `gam_unit_path` at all** for that slot.                                                                                            |
-| Crawled pages report different GAM network ids                                                | The run fails; the pages are not one property.                                                                                          |
-| More than a quarter of crawled pages return no slots                                          | The run fails. That is the signature of bot protection serving challenge pages, and writing from it would silently narrow the slot set. |
+| Situation                                                                               | Result                                                                                                                                                                                                                        |
+| --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Only one page was crawled                                                               | Literal path. One observation cannot distinguish a literal from a template.                                                                                                                                                   |
+| The ad unit never varied by section                                                     | Literal path.                                                                                                                                                                                                                 |
+| A section's slug is not derivable from its URL (`/site-news` requesting `.../sitenews`) | The slot is omitted; the note lists the ad-unit paths it used and says none generalized.                                                                                                                                      |
+| No crawled page lacked a section segment, so `section_root` is unwitnessed              | No template is written and the reason names the crawl gap. A slot that merely never appears on the root (a sidebar, an in-article unit) still templates, borrowing the `section_root` another slot witnessed; a note says so. |
+| Two path segments could both be the section                                             | No template; the ambiguity is reported.                                                                                                                                                                                       |
+| The ad unit varies by device, geo, or anything the URL cannot supply                    | The refused slot is omitted and the reason is written as a note.                                                                                                                                                              |
+| Crawled pages report different GAM network ids                                          | The run fails; the pages are not one property.                                                                                                                                                                                |
+| More than a quarter of crawled pages return no slots                                    | The run fails. That is the signature of bot protection serving challenge pages, and writing from it would silently narrow the slot set.                                                                                       |
+| Several live elements normalize onto one div-id prefix                                  | The whole group is omitted, on every page of the crawl. A prefix resolves to at most one element and the exact ids change per render; the prefix is named in a note.                                                          |
+| A per-render token sits before the placement part of a div id                           | The slot is omitted from a single observation and the family prefix is named in a note; no stable prefix identifies one element.                                                                                              |
 
 Every run checks that the config it produced still loads before replacing the
 file, and `--dry-run` runs the same check — a clean preview is evidence the
-config loads, not just that it parses.
+config loads, not just that it parses. Dry-run stdout is a zero-context unified
+diff containing only the managed creative-opportunity fields; notes and refusal
+reasons go to stderr, so unrelated config and secrets are not printed. Crawl
+progress also goes to stderr, one line per phase and page — for example
+`Auditing desktop [2/17]: /news`. Progress renders the path only, never the
+origin, userinfo, query, or fragment, and there is no flag to suppress it. A
+`--dry-run` that changes nothing says so on stderr too, leaving stdout an empty
+diff.
 
 ### Bounding and steering the crawl
 
@@ -225,9 +272,24 @@ ts audit ad-templates generate https://publisher.example/ --dry-run
 ```
 
 Re-running merges into the existing slots: a slot seen again keeps its
-hand-tuned fields and gains this run's patterns, and a hand-written
+hand-tuned fields and gains this run's patterns and newly observed formats, and a hand-written
 `gam_unit_path` template is preserved. `--replace` discards existing slots
 instead, which also discards any template you wrote by hand.
+
+A merge refuses to change the section policy that preserved `{section}` slots
+were written against: if the config already sets `section_root` (or
+`section_segment`) and this run infers different values, the run fails and asks
+for `--replace` as an explicit migration. A config whose `{section}` slots have
+no `section_root` at all is a different case — the runtime rejects such a file
+outright — so the first merge adopts the inferred policy and makes it loadable
+instead of demanding `--replace`.
+
+Locale-prefixed sites are inferred at their observed section depth. Only real
+ISO 639-1 language codes are read as a locale prefix, so a two-letter _section_
+root such as `/tv` or `/us` keeps sections at the first segment. For
+example, `/en/news/story` can produce `section_segment = 1`; generated patterns
+retain the locale prefix (`/en/news` and `/en/news/*`). The crawler never
+invents an unwitnessed locale or section.
 
 Behind bot protection, pass a valid clearance cookie. The crawl reuses one
 browser session, so clearance earned on the first page carries to the rest, and
@@ -296,8 +358,8 @@ declines to write them and reports the group instead:
 
 ```text
 note: skipped 3 slot(s) that look like one placement under a per-render div id
-      on `/12345678/example.com_Overlay` (kso_2632930aBc_overlay_1, …);
-      they share the prefix `kso`. Add it once by hand with a div_id prefix
+      on `/123456789/publisher/overlay` (ex_slot_a1_overlay_1, …);
+      they share the prefix `ex_slot`. Add it once by hand with a div_id prefix
       that is stable across renders
 ```
 
@@ -320,8 +382,8 @@ ts audit ad-templates generate https://publisher.example/ --profiles desktop,mob
 ```
 
 Each page is loaded once per profile. Where the profiles disagree, the slot is
-written with its div and formats but **no** `gam_unit_path`, so the runtime
-falls back to the default unit rather than bidding on one that does not exist.
+omitted and the diagnostic explains the conflicting paths. The generator does
+not fall back to a fabricated default ad unit.
 
 ### Deploy ordering for templated config
 
@@ -360,6 +422,25 @@ for a known redirect between your own properties (for example apex to `www`):
 ```bash
 ts audit ad-templates verify https://publisher.example/ --allow-cross-origin-redirect
 ```
+
+Verification accepts multiple URLs and reuses one browser/profile. Add
+`--strict` to return exit 1 when a confirmable slot is missing or partially
+confirmed, and `--json` for the stable machine-readable report. Video- and
+native-only slots are reported as `unconfirmable`; that records a checker
+limitation and does not fail strict mode. A live out-of-page slot with no sizes
+against banner-configured formats is reported `partial` and does fail strict
+mode. `--scroll` enables the optional second evidence phase and labels evidence
+first seen after the deterministic scroll.
+
+Browser-backed ad-template generation and verification share `--chrome`,
+`--headful`, `--browser-proxy`, `--no-assume-consent`,
+`--settle-quiet-ms`, `--settle-max-ms`, and
+`--danger-accept-invalid-certs`. Verification also accepts
+`--browser-profile desktop|mobile`; generation uses
+`--profiles desktop,mobile` to compare both profiles. `--cookie NAME=VALUE` is
+repeatable and creates host-only, root-path cookies; HTTPS targets also mark
+them Secure. Verification refuses cookies when URLs span multiple origins. The quiet settle window
+must not exceed the maximum.
 
 `ts audit` is not an EdgeZero adapter command. It has no `--adapter` option and
 it does not provision resources, push config, build, deploy, or contact platform

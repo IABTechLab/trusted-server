@@ -6,6 +6,22 @@
 
 use core::fmt;
 
+/// Whether publisher bytes contain an ESI directive form understood by the parser.
+///
+/// Both ordinary `<esi:...>` elements and `<!--esi ...-->` comment blocks are active
+/// parser input. The conservative byte scan also rejects these sequences inside scripts:
+/// bypassing shared processing is safer than treating publisher data as edge instructions.
+#[must_use]
+pub fn contains_publisher_esi_directive(bytes: &[u8]) -> bool {
+    [b"<esi:".as_slice(), b"<!--esi".as_slice()]
+        .into_iter()
+        .any(|prefix| {
+            bytes
+                .windows(prefix.len())
+                .any(|window| window.eq_ignore_ascii_case(prefix))
+        })
+}
+
 /// Why a platform assembler could not produce a document.
 #[derive(Debug, derive_more::Display)]
 pub enum TemplateAssemblyError {
@@ -73,5 +89,24 @@ mod tests {
             assembler.assemble(b"template", b"fragment"),
             Err(TemplateAssemblyError::Unsupported)
         ));
+    }
+
+    #[test]
+    fn publisher_esi_detection_covers_elements_and_comment_blocks() {
+        for directive in [
+            b"<esi:include src=\"/fragment\"/>".as_slice(),
+            b"<ESI:REMOVE>secret</ESI:REMOVE>".as_slice(),
+            b"<!--esi anything-->".as_slice(),
+            b"<!--ESI anything-->".as_slice(),
+        ] {
+            assert!(
+                contains_publisher_esi_directive(directive),
+                "should detect publisher ESI bytes: {directive:?}"
+            );
+        }
+        assert!(
+            !contains_publisher_esi_directive(b"<!--ts-ad-seam-->"),
+            "should not classify the inert TS seam as publisher ESI"
+        );
     }
 }

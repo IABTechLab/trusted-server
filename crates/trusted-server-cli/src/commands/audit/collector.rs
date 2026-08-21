@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 
 use crate::ad_templates::compare::BrowserAdEvidence;
 
@@ -21,6 +21,18 @@ pub struct BrowserOpts {
     /// auto-detection on `PATH` and standard install locations.
     #[arg(long)]
     pub chrome: Option<PathBuf>,
+    /// Browser device profile used for viewport and user-agent emulation.
+    #[arg(long = "browser-profile", value_enum, default_value_t = BrowserProfile::Desktop)]
+    pub profile: BrowserProfile,
+    /// Run a visible browser instead of Chrome's new headless mode.
+    #[arg(long)]
+    pub headful: bool,
+    /// Do not answer the standard IAB consent APIs for the fresh audit profile.
+    #[arg(long)]
+    pub no_assume_consent: bool,
+    /// Route the browser through this proxy, as `host:port` or a full URL.
+    #[arg(long, value_name = "HOST:PORT")]
+    pub browser_proxy: Option<String>,
     /// Quiet window in milliseconds (no new network resources) that marks the
     /// page settled.
     #[arg(long, default_value_t = 750)]
@@ -37,6 +49,89 @@ pub struct BrowserOpts {
     /// known self-signed certificate.
     #[arg(long)]
     pub danger_accept_invalid_certs: bool,
+}
+
+/// Browser options for generation, whose device selection is controlled by
+/// `--profiles` rather than the verifier's singular `--browser-profile`.
+#[derive(Debug, Clone, Args)]
+pub struct GenerateBrowserOpts {
+    /// Path to the Chrome/Chromium executable. Falls back to `$CHROME`, then auto-detection.
+    #[arg(long)]
+    pub chrome: Option<PathBuf>,
+    /// Run a visible browser instead of Chrome's new headless mode.
+    #[arg(long)]
+    pub headful: bool,
+    /// Do not answer the standard IAB consent APIs for the fresh audit profile.
+    #[arg(long)]
+    pub no_assume_consent: bool,
+    /// Route the browser through this proxy, as `host:port` or a full URL.
+    #[arg(long, value_name = "HOST:PORT")]
+    pub browser_proxy: Option<String>,
+    /// Quiet window in milliseconds that marks the page settled.
+    #[arg(long, default_value_t = 750)]
+    pub settle_quiet_ms: u64,
+    /// Hard cap in milliseconds on waiting for the page to settle.
+    #[arg(long, default_value_t = 10_000)]
+    pub settle_max_ms: u64,
+    /// Navigate to origins whose TLS certificate does not validate.
+    ///
+    /// DANGEROUS: the audit sends any `--cookie` session to the origin and
+    /// treats what it reads back as the evidence it writes config from, so an
+    /// invalid certificate could mean an impersonator is harvesting the session
+    /// and fabricating the evidence. Use only against a host you control with a
+    /// known self-signed certificate.
+    #[arg(long)]
+    pub danger_accept_invalid_certs: bool,
+}
+
+/// Defaults mirroring the `#[arg(default_value_t)]` values above, so a path that
+/// builds these options in code (the legacy `ts audit <url>` form) behaves like
+/// the parsed command.
+impl Default for GenerateBrowserOpts {
+    fn default() -> Self {
+        Self {
+            chrome: None,
+            headful: false,
+            no_assume_consent: false,
+            browser_proxy: None,
+            settle_quiet_ms: 750,
+            settle_max_ms: 10_000,
+            danger_accept_invalid_certs: false,
+        }
+    }
+}
+
+impl GenerateBrowserOpts {
+    /// Validates relationships between independently parsed browser flags.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_settle_window(self.settle_quiet_ms, self.settle_max_ms)
+    }
+}
+
+/// Browser device profile shared by page audits and ad-template verification.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum BrowserProfile {
+    /// Desktop Chrome at 1280×800.
+    #[default]
+    Desktop,
+    /// Mobile-sized viewport with a mobile user agent.
+    Mobile,
+}
+
+impl BrowserOpts {
+    /// Validates relationships between independently parsed browser flags.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_settle_window(self.settle_quiet_ms, self.settle_max_ms)
+    }
+}
+
+fn validate_settle_window(quiet_ms: u64, max_ms: u64) -> Result<(), String> {
+    if quiet_ms > max_ms {
+        return Err(format!(
+            "--settle-quiet-ms ({quiet_ms}) cannot exceed --settle-max-ms ({max_ms})"
+        ));
+    }
+    Ok(())
 }
 
 /// A request to collect a single page.
@@ -85,19 +180,32 @@ pub trait AuditCollector {
     /// Returns a user-facing string when the browser cannot be launched or the
     /// navigation fails before any result can be produced.
     fn collect_page(&self, request: BrowserCollectRequest) -> Result<CollectedPage, String>;
+
+    /// Collects several pages, preserving request order.
+    ///
+    /// Browser-backed implementations override this to reuse one runtime,
+    /// browser, and profile. The default keeps in-memory test collectors and
+    /// other simple implementations source-compatible.
+    fn collect_pages(
+        &self,
+        requests: &[BrowserCollectRequest],
+    ) -> Vec<Result<CollectedPage, String>> {
+        requests
+            .iter()
+            .cloned()
+            .map(|request| self.collect_page(request))
+            .collect()
+    }
 }
 
 /// Configuration handed to the read-only ad-template collector script.
 ///
-/// Only the configured div prefixes and APS slot IDs are embedded — no page data
-/// is requested. Serialized into the injected `__TS_CONFIG`.
+/// Only configured div prefixes are embedded — no page data is requested.
 // Assembled by the ad-template verifier from the configured slots.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct AdTemplateCollectorConfig {
     /// Configured slot div ID prefixes to match in the DOM.
     pub div_prefixes: Vec<String>,
-    /// Configured APS slot IDs (reserved for provider-scoped filtering).
-    pub aps_slot_ids: Vec<String>,
 }
 
 /// Builds the read-only ad-template init script, embedding `config` as `__TS_CONFIG`.
@@ -126,7 +234,6 @@ mod tests {
     fn init_script_embeds_config_and_read_only_hooks() {
         let config = AdTemplateCollectorConfig {
             div_prefixes: vec!["ad-atf-".to_string()],
-            aps_slot_ids: vec!["atf".to_string()],
         };
         let script = build_ad_template_init_script(&config).expect("should build script");
 
@@ -143,14 +250,35 @@ mod tests {
             !script.contains("ad-not-configured-"),
             "should not embed other prefixes"
         );
-        // Read-only instrumentation markers (googletag/apstag wrapping + on-demand scrape).
+        // Bounded GPT instrumentation plus on-demand scrape.
         assert!(
             script.contains("__ts_install(\"googletag\""),
             "should install googletag hook"
         );
-        assert!(script.contains("cmd.push"), "should wrap cmd.push");
+        assert!(
+            !script.contains("googletag.cmd.push = function"),
+            "must not replace the publisher's variadic cmd.push"
+        );
         assert!(script.contains("defineSlot"), "should record defineSlot");
-        assert!(script.contains("fetchBids"), "should wrap apstag.fetchBids");
+        assert!(!script.contains("fetchBids"), "APS should not be mutated");
+        assert!(
+            script.contains("new WeakSet()"),
+            "should track wrapped objects without publisher-visible markers"
+        );
+        assert!(
+            script.contains("Object.getOwnPropertyDescriptor(")
+                && script.contains("\"defineSlot\"")
+                && script.contains("enumerable: descriptor ? descriptor.enumerable : true"),
+            "wrapped methods should preserve the publisher's enumerability"
+        );
+        assert!(
+            script.contains("4294967295"),
+            "sizes above Rust's u32 range must be rejected in-page"
+        );
+        assert!(
+            script.contains("slice(0, __ts_max_string_length)"),
+            "publisher-controlled strings should be capped in-page"
+        );
         assert!(
             script.contains("window.__tsCollectAdTemplateEvidence"),
             "should expose the on-demand scrape function"

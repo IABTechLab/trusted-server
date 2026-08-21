@@ -3,6 +3,7 @@ import type { GptDiagnosticsRequestCycle } from '../../core/types';
 
 import type { GptDiagnosticsBindingManager } from './binding';
 import { unhandledCase } from './exhaustive';
+import { formatSizes, scheduleFrame } from './presentation_helpers';
 import type { GptDiagnosticsStoreSlotSnapshot, GptDiagnosticsStoreSnapshot } from './store';
 
 export const GPT_DIAGNOSTICS_HOST_ID = 'trusted-server-gpt-diagnostics';
@@ -98,20 +99,6 @@ const PANEL_STYLES = `
     white-space: pre-line;
   }
 `;
-
-function defaultScheduleFrame(callback: () => void): () => void {
-  if (typeof requestAnimationFrame === 'function' && typeof cancelAnimationFrame === 'function') {
-    const frame = requestAnimationFrame(() => callback());
-    return () => cancelAnimationFrame(frame);
-  }
-  let active = true;
-  queueMicrotask(() => {
-    if (active) callback();
-  });
-  return () => {
-    active = false;
-  };
-}
 
 function latestCycle(
   slot: GptDiagnosticsStoreSlotSnapshot
@@ -290,11 +277,7 @@ function cycleFacts(cycle: GptDiagnosticsRequestCycle): string[] {
   if (cycle.viewableAtMs !== undefined) facts.push('GPT impressionViewable observed');
   if (cycle.incompleteSequence) facts.push('Incomplete sequence');
   if (cycle.requestedSlotSizes) {
-    facts.push(
-      `Requested slot sizes ${cycle.requestedSlotSizes
-        .map((size) => `${size[0]}×${size[1]}`)
-        .join(', ')}`
-    );
+    facts.push(`Requested slot sizes ${formatSizes(cycle.requestedSlotSizes)}`);
   }
   if (cycle.size) facts.push(`GPT-reported fill size ${cycle.size[0]}×${cycle.size[1]}`);
   if (cycle.observedSlotSize) {
@@ -381,7 +364,8 @@ export class GptDiagnosticsOverlay {
     this.bindings = bindings;
     this.window = options.window ?? (window as unknown as OverlayWindow);
     this.document = options.document ?? document;
-    this.scheduleFrame = options.scheduleFrame ?? defaultScheduleFrame;
+    this.scheduleFrame =
+      options.scheduleFrame ?? ((callback) => scheduleFrame(this.window, callback));
     this.onExport = options.onExport ?? (() => undefined);
     this.onShadowRoot = options.onShadowRoot;
     this.onBadgeLayerChange = options.onBadgeLayerChange;

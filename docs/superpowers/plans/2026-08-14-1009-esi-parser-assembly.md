@@ -3,9 +3,9 @@
 > **Execution note:** Implemented inline in the current checkout, without a worktree or
 > subagents, as requested. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Use the repaired ESI parser on authorized cold C2 misses without changing the existing warm-hit streaming behavior.
+**Goal:** Use the repaired ESI parser on authorized cold template-cache misses without changing the existing warm-hit streaming behavior.
 
-**Architecture:** C2 retains the inert schema-v4 seam. Core delegates cold assembly through a platform trait; Fastly converts the seam to one synthetic ESI include and resolves it from the already-collected per-reader script. Parser failure falls back to core's validated byte split, while warm hits continue to stream by byte seam.
+**Architecture:** The template cache retains the inert schema-v4 seam. Core delegates cold assembly through a platform trait; Fastly converts the seam to one synthetic ESI include and resolves it from the already-collected per-reader script. Parser failure falls back to core's validated byte split, while warm hits continue to stream by byte seam.
 
 **Tech Stack:** Rust 1.95, `wasm32-wasip1`, Fastly Compute/Viceroy, `stackpop/esi` pinned by Git revision, `error-stack`.
 
@@ -33,7 +33,7 @@
 - Modify: `crates/trusted-server-core/src/publisher.rs`
 - Test: `crates/trusted-server-core/src/publisher.rs`
 
-- [x] Add a recording assembler to the C2 end-to-end tests.
+- [x] Add a recording assembler to the template-cache end-to-end tests.
 - [x] Add a test asserting one platform call on a cold miss and no additional call on the
       subsequent warm hit.
 - [x] Add a test asserting platform failure returns a complete byte-seam response.
@@ -41,8 +41,8 @@
 - [x] Run each test first and confirm the expected failure.
 - [x] Change `assemble_if_shared` to call the platform assembler after storage, fall back
       to the validated byte split on error, and return the assembly method.
-- [x] Set `x-ts-assembly` without changing `x-ts-c2-cache` or privacy headers.
-- [x] Re-run the C2 end-to-end test module.
+- [x] Set `x-ts-assembly` without changing `x-ts-template-cache` or privacy headers.
+- [x] Re-run the template-cache end-to-end test module.
 
 ### Task 3: Add the repaired Fastly ESI adapter
 
@@ -73,7 +73,7 @@
 
 - Modify: `docs/superpowers/specs/2026-08-11-1009-streaming-assembly-architecture.md`
 - Modify: `docs/guide/configuration.md`
-- Modify: `scripts/c2-local-test.sh`
+- Modify: `scripts/template-cache-local-test.sh`
 - Test: `crates/trusted-server-core/src/platform/template_cache.rs`
 
 - [x] Add/adjust tests proving schema version 4 and the inert stored marker remain
@@ -96,7 +96,7 @@
       `cargo test-spin`.
 - [x] Run the integration parity test.
 - [x] Run JS tests/build/format and docs format.
-- [x] Run the C2 local harness when Viceroy and its certificate environment are
+- [x] Run the template-cache local harness when Viceroy and its certificate environment are
       available; otherwise report that environmental gap explicitly.
 - [x] Run `git diff --check`, inspect staged scope, and confirm no operator configuration
       or secrets are staged.

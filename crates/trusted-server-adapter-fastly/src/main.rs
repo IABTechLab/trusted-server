@@ -24,6 +24,7 @@ use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
+use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
 
 mod app;
@@ -399,7 +400,11 @@ fn apply_terminal_response_effects(
     request_filter_effects: Option<&RequestFilterEffects>,
 ) {
     let must_remain_private =
-        trusted_server_core::response_privacy::is_private_or_no_store(response.headers());
+        trusted_server_core::response_privacy::is_private_or_no_store(response.headers())
+            || response
+                .extensions()
+                .get::<TerminalPrivateResponse>()
+                .is_some();
     if let Some(effects) = request_filter_effects {
         effects.apply_to_response(response);
     }
@@ -629,6 +634,7 @@ mod tests {
             .header("etag", "\"reader-document\"")
             .body(EdgeBody::empty())
             .expect("should build response");
+        response.extensions_mut().insert(TerminalPrivateResponse);
         let effects = RequestFilterEffects {
             request_headers: Vec::new(),
             response_headers: vec![

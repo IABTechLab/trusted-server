@@ -5,14 +5,8 @@
 //! Field names and declaration order are load-bearing: `serde` serializes struct
 //! fields in declaration order, so the order here must match the spec examples.
 //!
-//! The model is consumed by the `ts audit ad-templates verify` orchestrator
-//! (Task 9), which assembles these wire types from the URL/gate context and the
-//! pure comparison result. Until that consumer lands, the types are exercised only
-//! by tests, hence the module-scoped `dead_code` allow.
-#![allow(
-    dead_code,
-    reason = "wire model assembled by the audit verifier in a later task"
-)]
+//! The model is consumed by the `ts audit ad-templates verify` orchestrator,
+//! which assembles these wire types from the URL/gate context and comparison result.
 
 use std::borrow::Cow;
 
@@ -49,7 +43,10 @@ pub fn escape_terminal_text(value: &str) -> Cow<'_, str> {
 /// Whether `ch` can act as a terminal control code (C0, DEL, or C1).
 fn is_terminal_control(ch: char) -> bool {
     let code = ch as u32;
-    code < 0x20 || (0x7f..=0x9f).contains(&code)
+    code < 0x20
+        || (0x7f..=0x9f).contains(&code)
+        || (0x202a..=0x202e).contains(&code)
+        || (0x2066..=0x2069).contains(&code)
 }
 
 /// Confirmation status for a single configured slot.
@@ -62,6 +59,8 @@ pub enum SlotStatus {
     Partial,
     /// No DOM or GPT evidence confirms the slot.
     Missing,
+    /// The checker does not support confirming this slot type.
+    Unconfirmable,
 }
 
 /// JSON rendering of the runtime ad-stack expectation.
@@ -130,6 +129,10 @@ pub struct VerificationReport {
     /// One entry per requested URL, in input order.
     pub pages: Vec<PageJson>,
     /// Run-level warnings not attributable to a single page.
+    ///
+    /// Always empty today — every warning the verifier raises belongs to a page
+    /// or a slot. Kept because the JSON schema declares it, so a consumer can
+    /// read it unconditionally.
     pub warnings: Vec<Warning>,
 }
 
@@ -195,7 +198,8 @@ pub struct SlotJson {
     /// The slot's confirmation status.
     pub status: SlotStatus,
     /// The phase the confirming evidence was observed in.
-    pub phase: EvidencePhaseJson,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<EvidencePhaseJson>,
     /// The configured shape of the slot (no `id`/`page_patterns` per §8).
     pub configured: ConfiguredJson,
     /// The live evidence observed for this slot.
@@ -292,7 +296,7 @@ impl VerificationReport {
                 slots: vec![SlotJson {
                     id: "atf".to_string(),
                     status: SlotStatus::Confirmed,
-                    phase: EvidencePhaseJson::InitialLoad,
+                    phase: Some(EvidencePhaseJson::InitialLoad),
                     configured: ConfiguredJson {
                         div_id: "ad-atf-".to_string(),
                         gam_unit_path: Some("/123/news/atf".to_string()),
@@ -393,6 +397,11 @@ mod tests {
             "del\\u{007F}c1\\u{009B}",
             "DEL and the C1 range should be escaped too"
         );
+        assert_eq!(
+            escape_terminal_text("safe\u{202E}forged\u{2066}tail"),
+            "safe\\u{202E}forged\\u{2066}tail",
+            "Unicode bidi controls should be rendered inert"
+        );
     }
 
     #[test]
@@ -440,5 +449,32 @@ mod tests {
             "matched_slot_count absent on error page"
         );
         assert_eq!(value["ok"], false);
+    }
+
+    #[test]
+    fn missing_slot_json_omits_evidence_phase() {
+        let slot = SlotJson {
+            id: "missing".to_string(),
+            status: SlotStatus::Missing,
+            phase: None,
+            configured: ConfiguredJson {
+                div_id: "ad-missing-".to_string(),
+                gam_unit_path: Some("/123/publisher/missing".to_string()),
+                formats: Vec::new(),
+                providers: Vec::new(),
+            },
+            evidence: SlotEvidenceJson {
+                dom_id: None,
+                gpt: None,
+            },
+            warnings: Vec::new(),
+        };
+
+        let value = serde_json::to_value(slot).expect("should serialize missing slot");
+
+        assert!(
+            value.get("phase").is_none(),
+            "missing evidence should not claim an initial-load phase"
+        );
     }
 }

@@ -449,7 +449,42 @@ async fn authenticated_admin_ec_routes_return_501() {
             501,
             "{path} should report that Axum EC lookup is unsupported"
         );
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_ec_route_without_credentials_returns_401() {
+    let mut svc = make_service();
+    let req = Request::builder()
+        .method("GET")
+        .uri("/_ts/admin/ec")
+        .body(AxumBody::empty())
+        .expect("should build unauthenticated admin EC request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+
+    assert_eq!(resp.status().as_u16(), 401);
+    assert!(
+        resp.headers().contains_key("www-authenticate"),
+        "admin EC 401 should include the Basic authentication challenge"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -475,6 +510,97 @@ async fn authenticated_admin_eids_route_returns_200() {
         200,
         "/_ts/admin/eids should serve the real EIDs echo handler"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_admin_diagnostic_fallback_is_denied_locally() {
+    let ec_id = format!("{}.abc123", "a".repeat(64));
+    let valid_paths = [
+        "/_ts/admin/ec".to_owned(),
+        format!("/_ts/admin/ec/{ec_id}"),
+        "/_ts/admin/eids".to_owned(),
+    ];
+
+    for path in valid_paths {
+        for method in ["POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+            let request = Request::builder()
+                .method(method)
+                .uri(&path)
+                .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                .body(AxumBody::from("sensitive-admin-body"))
+                .expect("should build authenticated admin request");
+            let response = make_service()
+                .ready()
+                .await
+                .expect("should be ready")
+                .call(request)
+                .await
+                .expect("should respond");
+
+            assert_eq!(response.status().as_u16(), 405);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("allow")
+                    .and_then(|v| v.to_str().ok()),
+                Some("GET")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store")
+            );
+        }
+    }
+
+    for path in [
+        "/_ts/admin/ec/".to_owned(),
+        format!("/_ts/admin/ec/{ec_id}/extra"),
+        "/_ts/admin/eids/".to_owned(),
+        "/_ts/admin/eids/extra".to_owned(),
+        "/_ts/admin/eids.json".to_owned(),
+        "/_ts/admin/ec;foo".to_owned(),
+        format!("/_ts/admin/ec%2F{ec_id}"),
+        // Percent-encoded separators match the `^/_ts/admin` basic-auth
+        // handler but not a literal-slash namespace check, so they must be
+        // reserved before publisher fallback forwards credentials upstream.
+        "/_ts/admin%2Fec".to_owned(),
+        "/_ts/admin%2fec".to_owned(),
+        // Retired non-`/_ts` alias namespace: only the two exact paths are
+        // routed to a local deny, so descendants and encoded separators must
+        // be reserved at the shared fallback boundary.
+        "/admin/keys".to_owned(),
+        "/admin/keys/rotate/extra".to_owned(),
+        "/admin/keys%2Frotate".to_owned(),
+        "/admin%2fkeys/rotate".to_owned(),
+    ] {
+        for method in ["GET", "POST"] {
+            let request = Request::builder()
+                .method(method)
+                .uri(&path)
+                .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                .body(AxumBody::from("sensitive-admin-body"))
+                .expect("should build malformed admin request");
+            let response = make_service()
+                .ready()
+                .await
+                .expect("should be ready")
+                .call(request)
+                .await
+                .expect("should respond");
+
+            assert_eq!(response.status().as_u16(), 404);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store")
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

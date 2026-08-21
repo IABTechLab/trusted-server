@@ -141,8 +141,8 @@ TypeScript/Vitest, Viceroy, shell harness.
 - [x] Write a failing warm-cache test activated by diagnostics query and another by diagnostics
       cookie.
 - [x] Make `requires_private_no_store()` a lookup/store disqualifier.
-- [x] Verify ordinary diagnostics-disabled requests still hit C2.
-- [x] Run focused diagnostics/C2 tests and commit.
+- [x] Verify ordinary diagnostics-disabled requests still hit the template cache.
+- [x] Run focused diagnostics/template-cache tests and commit.
 
 ### Task 8: Re-encode assembled responses for the reader
 
@@ -181,12 +181,12 @@ TypeScript/Vitest, Viceroy, shell harness.
 - Modify: `crates/trusted-server-core/src/platform/template_cache.rs`
 - Modify: `crates/trusted-server-core/src/publisher.rs`
 - Modify: `crates/trusted-server-adapter-fastly/src/template_cache.rs`
-- Modify: `scripts/c2-local-test.sh`
+- Modify: `scripts/template-cache-local-test.sh`
 - Modify: `.github/workflows/test.yml`
 
-- [x] Write failing tests for distinct backend-error versus not-found status and C2 response-state
+- [x] Write failing tests for distinct backend-error versus not-found status and template-cache response-state
       reporting.
-- [x] Preserve backend errors and emit bounded C2 status without exposing key material.
+- [x] Preserve backend errors and emit bounded template-cache status without exposing key material.
 - [x] Change the harness to operate on a temporary manifest and fail on missing/non-numeric probe
       output or empty response bodies.
 - [x] Test both cold and warm integrity and execute the generated scheduler payload contract.
@@ -199,12 +199,12 @@ TypeScript/Vitest, Viceroy, shell harness.
 
 - Modify: `trusted-server.example.toml`
 - Modify: `docs/guide/configuration.md`
-- Modify: `docs/superpowers/plans/2026-08-10-1009-esi-validation-spike.md`
+- Modify: `docs/superpowers/archive/2026-08-10-1009-esi-validation-spike.md`
 - Modify: `docs/superpowers/specs/2026-08-11-1009-streaming-assembly-architecture.md`
 - Modify: relevant #1009 findings documents
 
-- [x] Document that `esi` means Fastly C2 plus byte-seam assembly, not parser execution or final
-      HTTP shared caching.
+- [x] Document that `esi` means Fastly shared template cache plus byte-seam assembly, not parser execution or final
+      assembled-response caching.
 - [x] Document `template_cache_vary`, cookie independence, freshness, metrics, purge, rollback
       ordering, and limitations on non-Fastly adapters.
 - [x] Close or supersede stale spike checkboxes and remove claims contradicted by the final code.
@@ -220,7 +220,7 @@ TypeScript/Vitest, Viceroy, shell harness.
 - [x] Build the Fastly release WASM.
 - [x] Run JS tests, build, and format under pinned Node 24.12.0.
 - [x] Run docs format/build.
-- [x] Run `scripts/c2-local-test.sh esi` and `inline` if the environment exposes the required
+- [x] Run `scripts/template-cache-local-test.sh esi` and `inline` if the environment exposes the required
       local certificate store; otherwise report the exact environment blocker.
 - [x] Run `git diff --check`, inspect the merge graph, and confirm the worktree contains only
       intended changes.
@@ -241,7 +241,7 @@ TypeScript/Vitest, Viceroy, shell harness.
       malformed directives fail closed.
 - [x] Parse only Fastly's supported `max-age`, `stale-while-revalidate`, and `stale-if-error`
       directives; continue refusing every other vendor CDN policy field.
-- [x] Keep request `Cache-Control: max-age=0` as an intentional C2 bypass so reload preserves its
+- [x] Keep request `Cache-Control: max-age=0` as an intentional template-cache bypass so reload preserves its
       revalidation semantics.
 - [x] Run focused tests, `cargo test-fastly`, target-matched formatting/clippy, both local harness
       modes, and verify the observed publisher policy progresses from `miss-stored` to `hit` in
@@ -250,7 +250,7 @@ TypeScript/Vitest, Viceroy, shell harness.
 ### Task 14: Allow browser reloads to reuse a fresh ESI template
 
 Task 14 supersedes Task 13's conservative request `max-age=0` bypass after end-to-end testing
-proved that C2 reuses only the neutral template and still creates a new private response and
+proved that the template cache reuses only the neutral template and still creates a new private response and
 auction.
 
 **Files:**
@@ -260,7 +260,7 @@ auction.
 
 - [x] Write a failing end-to-end test proving `Cache-Control: max-age=0` reruns the auction but
       does not refetch the reader-neutral publisher template.
-- [x] Treat only a valid zero request max age as compatible with C2; continue bypassing positive
+- [x] Treat only a valid zero request max age as compatible with the template cache; continue bypassing positive
       or malformed constraints and every explicit revalidation directive.
 - [x] Verify the focused tests, formatting, and Fastly clippy, then commit independently.
 
@@ -285,7 +285,7 @@ Fastly edge precedence while retaining restrictive directives as hard refusals.
       ceiling for the observed `Cache-Control: max-age=60` plus
       `Surrogate-Control: max-age=1200` response.
 - [x] Implement `template_cache_max_age_seconds` under `[creative_opportunities]` and thread its
-      resolved duration into C2 eligibility.
+      resolved duration into template-cache eligibility.
 - [x] Remove the Fastly adapter's second hard-coded 60-second cap; the already-authorized
       per-entry max age becomes the sole insertion lifetime.
 - [x] Update the example and operator guide, without editing the tracked deployment

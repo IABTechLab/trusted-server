@@ -1660,6 +1660,21 @@ mod tests {
     }
 
     #[test]
+    fn tsjs_unified_helpers_use_unversioned_fallback_without_registry() {
+        let src = tsjs_unified_script_src();
+
+        assert_eq!(
+            src, "/static/tsjs=tsjs-unified.min.js",
+            "registry-free unified helper should not emit an unverifiable hash"
+        );
+        assert_eq!(
+            tsjs_unified_script_tag(),
+            format!(r#"<script src="{src}" id="trustedserver-js"></script>"#),
+            "should wrap the registry-free unified source"
+        );
+    }
+
+    #[test]
     fn tsjs_single_module_script_src_formats_known_module_url_with_hash() {
         let src =
             tsjs_single_module_script_src("prebid_later").expect("should name a deferred module");

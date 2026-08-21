@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Local harness for the #1009 shared-template cache (C2).
+# Local harness for the #1009 shared template cache.
 #
 # Runs Trusted Server under Viceroy against a stub origin and asserts the cache
 # behaves. Everything it needs is generated into a temp directory; your
@@ -8,10 +8,8 @@
 # modified, including while the harness is running.
 #
 # Usage:
-#   ./scripts/c2-local-test.sh              # esi mode (shared template + edge assembly)
-#   ./scripts/c2-local-test.sh inline       # today's shipped behaviour, as a control
-#
-# Spike-only. Remove with the spike.
+#   ./scripts/template-cache-local-test.sh              # esi mode (shared template + edge assembly)
+#   ./scripts/template-cache-local-test.sh inline       # today's shipped behaviour, as a control
 
 set -euo pipefail
 
@@ -201,7 +199,7 @@ s = s.replace('[auction]\nenabled = false', '[auction]\nenabled = true', 1)
 s = s.replace('auction_timeout_ms = 500', 'auction_timeout_ms = 3000', 1)
 s = s.replace('timeout_ms = 2000', 'timeout_ms = 3000', 1)
 
-# The spike keys go directly under the table header. The slot is a table of its own
+# The template-cache keys go directly under the table header. The slot is a table of its own
 # and must go at the end: inserted here it would swallow every scalar key that
 # follows into `[[creative_opportunities.slot]]`.
 scalars = f'''assembly_mode = "{mode}"
@@ -309,13 +307,13 @@ check "second request returns 200" "$CODE2" "200"
 # it. Asserted in both modes: a shared-mode failure that inline shares would otherwise
 # read as "the fixture never bids" rather than "the seam drops bids".
 WINNING_BID='\"hb_pb\":\"4.25\"'
-# Must stay in step with `AD_ASSEMBLY_SEAM` in publisher.rs. C2 stores this inert
-# comment. The cold response turns it into a synthetic ESI include only in a private
+# Must stay in step with `AD_ASSEMBLY_SEAM` in publisher.rs. The template cache stores
+# this inert comment. The cold response turns it into a synthetic ESI include only in a private
 # working copy; the warm response splits these bytes directly.
 SEAM_MARKER='<!--ts-ad-seam-->'
 
-c2_state() {
-  awk 'tolower($1) == "x-ts-c2-cache:" { gsub(/\r/, "", $2); print $2 }' "$1" | tail -1
+template_cache_state() {
+  awk 'tolower($1) == "x-ts-template-cache:" { gsub(/\r/, "", $2); print $2 }' "$1" | tail -1
 }
 
 assembly_state() {
@@ -346,13 +344,13 @@ check_post_reaches_origin() {
 if [ "$MODE" = "inline" ]; then
   check "inline fetches the origin every time" "$FETCHES" "2"
   check "inline writes no shared template" \
-    "$(grep -c 'c2_template_cache stored' "$WORK/viceroy.log" || true)" "0"
+    "$(grep -c 'template_cache stored' "$WORK/viceroy.log" || true)" "0"
   check "inline delivers the winning bid" \
     "$(grep -cF "$WINNING_BID" "$SERVED" || true)" "1"
 else
   check "second request is served from cache" "$FETCHES" "1"
-  check "cold request reports a stored miss" "$(c2_state "$WORK/r1.html.headers")" "miss-stored"
-  check "warm request reports a cache hit" "$(c2_state "$WORK/r2.html.headers")" "hit"
+  check "cold request reports a stored miss" "$(template_cache_state "$WORK/r1.html.headers")" "miss-stored"
+  check "warm request reports a cache hit" "$(template_cache_state "$WORK/r2.html.headers")" "hit"
   check "cold response uses the repaired ESI parser" \
     "$(assembly_state "$WORK/r1.html.headers")" "esi-parser"
   check "warm response keeps the streaming byte seam" \
@@ -496,7 +494,7 @@ fi
 if [ "$MODE" = "esi" ]; then
   info "Where the marker actually lives"
   echo "  The cached template (the shared copy — has a hole where bids go):"
-  grep -oE "c2_template_cache stored [0-9]+ bytes \(seam marker present: [a-z]+\)" \
+  grep -oE "template_cache stored [0-9]+ bytes \(seam marker present: [a-z]+\)" \
     "$WORK/viceroy.log" | sort -u | sed 's/^/    /'
   echo
   echo "  What the reader receives (hole filled, no marker):"
@@ -505,7 +503,7 @@ if [ "$MODE" = "esi" ]; then
     "$(grep -c 'window\.tsjs' "$SERVED" || true)"
   cat <<'EOF'
 
-  The marker is never visible in page source. It remains inert in C2. A cold miss
+  The marker is never visible in page source. It remains inert in the template cache. A cold miss
   converts it to one synthetic ESI include in a private working copy; a warm hit
   byte-splits it directly. Both replace it before sending the response.
   `seam marker present: true` above proves the stored copy is reader-agnostic.
@@ -579,28 +577,29 @@ COMPLETE=$(echo "$B_LINE" | sed -n 's/.*complete=\([0-9]*\)ms.*/\1/p')
 
 if ! [[ "$FIRST_BODY" =~ ^[0-9]+$ && "$COMPLETE" =~ ^[0-9]+$ ]]; then
   bad "socket probe did not return numeric body timings: '$B_LINE'"
-  FIRST_BODY=0
-  COMPLETE=0
+else
+  if [ "$MODE" = "inline" ]; then
+    check "inline delivers the article before the auction resolves" \
+      "$(awk -v f="$FIRST_BODY" -v c="$COMPLETE" 'BEGIN { print (f < c / 3) ? "yes" : "no" }')" \
+      "yes"
+  else
+    # The property the unit tests cannot reach: in-process there is no bid provider, so
+    # there is no auction to wait on and reordering the stream is unobservable. Here the
+    # bid endpoint really sleeps, so the first body byte either beats it or does not.
+    check "cache hit streams: the article is delivered before the auction resolves" \
+      "$(awk -v f="$FIRST_BODY" -v c="$COMPLETE" 'BEGIN { print (f < c / 3) ? "yes" : "no" }')" \
+      "yes"
+  fi
+  printf '    first body byte %sms, complete %sms\n\n' "$FIRST_BODY" "$COMPLETE"
 fi
 
-if [ "$MODE" = "inline" ]; then
-  check "inline delivers the article before the auction resolves" \
-    "$(awk -v f="$FIRST_BODY" -v c="$COMPLETE" 'BEGIN { print (f < c / 3) ? "yes" : "no" }')" \
-    "yes"
-else
-  # The property the unit tests cannot reach: in-process there is no bid provider, so
-  # there is no auction to wait on and reordering the stream is unobservable. Here the
-  # bid endpoint really sleeps, so the first body byte either beats it or does not.
+if [ "$MODE" != "inline" ]; then
   # Guards a regression where assembly rewrote a reader's accepted gzip origin request
   # to identity, making the origin send ~674KB where it would have sent ~100KB. The
   # cache still stores identity; that does not require changing what this reader accepts.
   check "the origin fetch stays compressed" \
     "$(grep -c 'served PLAINTEXT' "$WORK/origin.log" || true)" "0"
-  check "cache hit streams: the article is delivered before the auction resolves" \
-    "$(awk -v f="$FIRST_BODY" -v c="$COMPLETE" 'BEGIN { print (f < c / 3) ? "yes" : "no" }')" \
-    "yes"
 fi
-printf '    first body byte %sms, complete %sms\n\n' "$FIRST_BODY" "$COMPLETE"
 
 info "Result"
 printf '  %d passed, %d failed\n\n' "$PASS" "$FAIL"

@@ -70,11 +70,11 @@ jobs:
       - name: Run tests
         run: cargo test-fastly
 
-      - name: Run C2 ESI local harness
-        run: ./scripts/c2-local-test.sh esi
+      - name: Run template cache ESI local harness
+        run: BID_DELAY=3 ./scripts/template-cache-local-test.sh esi
 
       - name: Run inline control harness
-        run: ./scripts/c2-local-test.sh inline
+        run: BID_DELAY=3 ./scripts/template-cache-local-test.sh inline
 
   test-axum:
     name: cargo test (axum native)
@@ -242,8 +242,14 @@ jobs:
         run: |
           cargo clippy --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --all-targets -- -D warnings
 
+      - name: Set up Chrome for browser fixture tests
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+
       - name: cargo test
         run: ./scripts/test-cli.sh
+        env:
+          CHROME: ${{ steps.setup-chrome.outputs.chrome-path }}
 
   test-typescript:
     name: vitest

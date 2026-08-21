@@ -13,7 +13,9 @@ use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::handle_admin_eids_lookup;
+use trusted_server_core::ec::admin::{
+    admin_ec_lookup_not_supported, deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
+};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -267,6 +269,10 @@ async fn dispatch_fallback(
     services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
+    if let Some(response) = deny_admin_diagnostic_fallback(&req) {
+        return Ok(response);
+    }
+
     trusted_server_core::integrations::gpt_diagnostics::prepare_request(&state.settings, &mut req)?;
     let path = req.uri().path().to_string();
     let method = req.method().clone();
@@ -527,17 +533,7 @@ fn named_route_handler(
                     NamedRouteHandler::AdminEcNotSupported => {
                         // The EC identity graph is Fastly KV backed; the Axum
                         // dev server has no store to read.
-                        let body = edgezero_core::body::Body::from(
-                            "Admin EC lookup is not supported on the Axum dev server.\n\
-                             Use the Fastly adapter (via Viceroy or deployed) to inspect EC entries.\n",
-                        );
-                        let mut resp = Response::new(body);
-                        *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
-                        resp.headers_mut().insert(
-                            header::CONTENT_TYPE,
-                            HeaderValue::from_static("text/plain; charset=utf-8"),
-                        );
-                        Ok(resp)
+                        Ok(admin_ec_lookup_not_supported())
                     }
                     NamedRouteHandler::AdminEidsLookup => {
                         let partner_registry =

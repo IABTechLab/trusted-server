@@ -27,18 +27,13 @@ pub struct ExpectedSlot {
     /// Resolved GAM unit path: the rendered `gam_unit_path` template (or
     /// `/<gam_network_id>/<id>` when the slot has none).
     ///
-    /// `None` when a dynamic template renders beyond GAM's unit-path byte limit
-    /// for this path's section. Runtime validation rejects such a config, so
-    /// this only occurs for a config that would fail to load; the slot is then
-    /// reported unconfirmable rather than matched against a wrong path.
+    /// `None` only for manually constructed comparison fixtures. Projection
+    /// omits a slot when the runtime cannot render it for this path.
     pub gam_unit_path: Option<String>,
     /// Configured ad formats.
     pub formats: Vec<ExpectedFormat>,
     /// Configured provider names, in `aps`, `prebid` order.
     pub providers: Vec<String>,
-    /// Configured APS slot ID, when the `aps` provider is set. Used to match
-    /// `apstag.fetchBids` evidence; not part of the §8 JSON output.
-    pub aps_slot_id: Option<String>,
     /// Glob patterns configured for this slot.
     pub page_patterns: Vec<String>,
 }
@@ -50,8 +45,8 @@ pub struct ExpectedFormat {
     pub width: u32,
     /// Creative height in pixels.
     pub height: u32,
-    /// Media type rendered as a stable string (`banner`, `video`, `native`).
-    pub media_type: String,
+    /// Configured media type.
+    pub media_type: MediaType,
 }
 
 /// Projects the slots matching `path` into stable expected-slot records.
@@ -71,36 +66,30 @@ pub fn expected_slots_for_path(path: &str, config: &CreativeOpportunitiesConfig)
     let section = config.section_for_path(path);
     let slots = match_slots(&config.slot, path)
         .into_iter()
-        .map(|slot| ExpectedSlot {
-            id: slot.id.clone(),
-            div_id: slot.resolved_div_id().to_string(),
-            gam_unit_path: slot.render_gam_unit_path(&config.gam_network_id, &section),
-            formats: slot
-                .formats
-                .iter()
-                .map(|format| ExpectedFormat {
-                    width: format.width,
-                    height: format.height,
-                    media_type: media_type_str(&format.media_type).to_string(),
-                })
-                .collect(),
-            providers: provider_names(slot),
-            aps_slot_id: slot.providers.aps.as_ref().map(|aps| aps.slot_id.clone()),
-            page_patterns: slot.page_patterns.clone(),
+        .filter_map(|slot| {
+            let gam_unit_path = slot.render_gam_unit_path(&config.gam_network_id, &section)?;
+            Some(ExpectedSlot {
+                id: slot.id.clone(),
+                div_id: slot.resolved_div_id().to_string(),
+                gam_unit_path: Some(gam_unit_path),
+                formats: slot
+                    .formats
+                    .iter()
+                    .map(|format| ExpectedFormat {
+                        width: format.width,
+                        height: format.height,
+                        media_type: format.media_type.clone(),
+                    })
+                    .collect(),
+                providers: provider_names(slot),
+                page_patterns: slot.page_patterns.clone(),
+            })
         })
         .collect();
 
     ExpectedSlots {
         path: path.to_string(),
         slots,
-    }
-}
-
-fn media_type_str(media_type: &MediaType) -> &'static str {
-    match media_type {
-        MediaType::Banner => "banner",
-        MediaType::Video => "video",
-        MediaType::Native => "native",
     }
 }
 
@@ -126,7 +115,14 @@ fn provider_names(
 ///
 /// Returns a user-facing string when a `scheme://` input cannot be parsed as a URL.
 pub fn normalize_path_or_url(input: &str) -> Result<String, String> {
-    if input.contains("://") {
+    let path_input = input.split(['?', '#']).next().unwrap_or(input);
+    let scheme_prefix = path_input.split_once("://").map(|(scheme, _)| scheme);
+    let has_url_scheme = scheme_prefix.is_some_and(|scheme| {
+        let mut chars = scheme.chars();
+        chars.next().is_some_and(|ch| ch.is_ascii_alphabetic())
+            && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+    });
+    if has_url_scheme {
         let url = Url::parse(input).map_err(|err| format!("invalid URL `{input}`: {err}"))?;
         let path = url.path();
         return Ok(if path.is_empty() {
@@ -136,18 +132,13 @@ pub fn normalize_path_or_url(input: &str) -> Result<String, String> {
         });
     }
 
-    let without_fragment = input.split('#').next().unwrap_or(input);
-    let path = without_fragment
-        .split('?')
-        .next()
-        .unwrap_or(without_fragment);
-    if path.is_empty() {
-        Ok("/".to_string())
-    } else if path.starts_with('/') {
-        Ok(path.to_string())
-    } else {
-        Ok(format!("/{path}"))
-    }
+    let base = Url::parse("https://path-normalizer.example/")
+        .expect("should parse static path normalization base");
+    let relative = input.trim_start_matches('/');
+    let normalized = base
+        .join(&format!("./{relative}"))
+        .map_err(|error| format!("invalid path `{input}`: {error}"))?;
+    Ok(normalized.path().to_string())
 }
 
 #[cfg(test)]
@@ -205,7 +196,7 @@ mod tests {
             vec![ExpectedFormat {
                 width: 300,
                 height: 250,
-                media_type: "banner".to_string(),
+                media_type: MediaType::Banner,
             }]
         );
     }
@@ -266,10 +257,10 @@ mod tests {
     }
 
     #[test]
-    fn expected_slots_report_unrenderable_dynamic_template_as_none() {
+    fn expected_slots_omit_dynamic_template_the_runtime_cannot_render() {
         // A `{section}` template that renders past GAM's 100-byte unit-path
-        // limit. `validate_runtime` rejects this config, so the verifier reports
-        // the slot as unconfirmable rather than matching a truncated path.
+        // limit. The runtime omits this slot for the request path, so diagnostics
+        // must not match it against a truncated or otherwise different path.
         let toml = "enabled = true\n\
              gam_network_id = \"99999\"\n\
              section_root = \"homepage\"\n\
@@ -286,9 +277,9 @@ mod tests {
         let long_path = format!("/{}", "a".repeat(60));
         let expected = expected_slots_for_path(&long_path, &config);
 
-        assert_eq!(
-            expected.slots[0].gam_unit_path, None,
-            "an over-limit dynamic render should project as None"
+        assert!(
+            expected.slots.is_empty(),
+            "the runtime omits an over-limit dynamic slot on this path"
         );
     }
 
@@ -312,5 +303,38 @@ mod tests {
             "/"
         );
         assert_eq!(normalize_path_or_url("").expect("should normalize"), "/");
+    }
+
+    #[test]
+    fn normalize_path_or_url_uses_identical_url_rules_for_bare_paths() {
+        assert_eq!(
+            normalize_path_or_url("/a/../b").expect("should normalize bare dot segment"),
+            "/b"
+        );
+        assert_eq!(
+            normalize_path_or_url("https://example.com/a/../b")
+                .expect("should normalize URL dot segment"),
+            "/b"
+        );
+        assert_eq!(
+            normalize_path_or_url("/a b").expect("should encode bare path"),
+            "/a%20b"
+        );
+        assert_eq!(
+            normalize_path_or_url("/r?to=https://example.com")
+                .expect("query URL should not change input classification"),
+            "/r"
+        );
+        assert_eq!(
+            normalize_path_or_url("/news:latest").expect("colon should stay in bare path"),
+            "/news:latest",
+            "a colon in the first segment must not be parsed as a URL scheme"
+        );
+        assert_eq!(
+            normalize_path_or_url("https://example.com/news:latest")
+                .expect("colon should stay in URL path"),
+            "/news:latest",
+            "bare and absolute forms should normalize identically"
+        );
     }
 }

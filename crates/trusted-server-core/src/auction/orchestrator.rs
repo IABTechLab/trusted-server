@@ -108,15 +108,28 @@ impl DispatchedAuction {
 
 const PROVIDER_ERROR_MESSAGE_CHARS: usize = 500;
 
-const ERROR_TYPE_PARSE_RESPONSE: &str = "parse_response";
-const ERROR_TYPE_LAUNCH_FAILED: &str = "launch_failed";
-const ERROR_TYPE_TRANSPORT: &str = "transport";
-const ERROR_TYPE_TIMEOUT: &str = "timeout";
+pub(crate) const ERROR_TYPE_PARSE_RESPONSE: &str = "parse_response";
+pub(crate) const ERROR_TYPE_LAUNCH_FAILED: &str = "launch_failed";
+pub(crate) const ERROR_TYPE_TRANSPORT: &str = "transport";
+pub(crate) const ERROR_TYPE_TIMEOUT: &str = "timeout";
 /// A non-2xx HTTP status from an upstream SSP (e.g. a PBS 4xx/5xx). Distinct
 /// from [`ERROR_TYPE_TRANSPORT`] (a connection-level failure) so telemetry can
 /// bucket it separately. `pub(crate)` so producers such as the prebid provider
 /// tag errors with the exact value the telemetry layer recognises.
 pub(crate) const ERROR_TYPE_HTTP_STATUS: &str = "http_status";
+
+/// Every server-owned `error_type` classification.
+///
+/// Consumers that reproduce these values — notably the `ts-debug` redaction
+/// layer in [`crate::publisher`] — validate against this list so a new
+/// classification cannot silently disappear from their output.
+pub(crate) const ERROR_TYPE_ALL: &[&str] = &[
+    ERROR_TYPE_PARSE_RESPONSE,
+    ERROR_TYPE_LAUNCH_FAILED,
+    ERROR_TYPE_TRANSPORT,
+    ERROR_TYPE_TIMEOUT,
+    ERROR_TYPE_HTTP_STATUS,
+];
 
 // SECURITY: the returned string is included verbatim (truncated to
 // PROVIDER_ERROR_MESSAGE_CHARS) in the public /auction response via

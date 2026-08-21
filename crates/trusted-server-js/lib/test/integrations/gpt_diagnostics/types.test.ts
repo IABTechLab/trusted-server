@@ -11,6 +11,7 @@ import type {
   GptDiagnosticsRequestPath,
   GptDiagnosticsResponseClass,
   GptDiagnosticsSlotExport,
+  Size,
 } from '../../../src/core/types';
 
 describe('GPT diagnostics public types', () => {
@@ -108,6 +109,8 @@ describe('GPT diagnostics public types', () => {
       requestPath: 'publisher_refresh',
       requestIntentId: 7,
       trustedServerAuctionId: 'ts-auc-example',
+      requestedSlotSizes: [[300, 250]],
+      observedSlotSize: [728, 90],
       opportunityToRequestMs: 24,
       replacedRequestNumber: 1,
       previousRenderToRequestMs: 6048,
@@ -144,6 +147,8 @@ describe('GPT diagnostics public types', () => {
     expectTypeOf(evidenceCycle.requestPath).toEqualTypeOf<GptDiagnosticsRequestPath | undefined>();
     expectTypeOf(evidenceCycle.requestIntentId).toEqualTypeOf<number | undefined>();
     expectTypeOf(evidenceCycle.trustedServerAuctionId).toEqualTypeOf<string | undefined>();
+    expectTypeOf(evidenceCycle.requestedSlotSizes).toEqualTypeOf<ReadonlyArray<Size> | undefined>();
+    expectTypeOf(evidenceCycle.observedSlotSize).toEqualTypeOf<Size | undefined>();
     expectTypeOf(evidenceSnapshot.attributionIssues).toEqualTypeOf<
       readonly Readonly<GptDiagnosticsAttributionIssue>[]
     >();

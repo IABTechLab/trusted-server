@@ -3,6 +3,7 @@ import { realmOwnedElement, realmOwnedHtmlElement } from '../../shared/realm';
 
 import type { GptDiagnosticsBindingManager } from './binding';
 import { unhandledCase } from './exhaustive';
+import { formatSizes, scheduleFrame } from './presentation_helpers';
 import type {
   GptDiagnosticsBindingInput,
   GptDiagnosticsStoreSlotSnapshot,
@@ -27,25 +28,12 @@ type BadgeWindow = Window & {
 
 const BADGE_MAX_WIDTH_PX = 260;
 const BADGE_EDGE_GUTTER_PX = 4;
+const MAX_BADGE_REQUESTED_SLOT_SIZES = 3;
 
 interface BadgeOptions {
   window?: BadgeWindow | undefined;
   document?: Document | undefined;
   scheduleFrame?: ((callback: () => void) => () => void) | undefined;
-}
-
-function defaultScheduleFrame(callback: () => void): () => void {
-  if (typeof requestAnimationFrame === 'function' && typeof cancelAnimationFrame === 'function') {
-    const frame = requestAnimationFrame(() => callback());
-    return () => cancelAnimationFrame(frame);
-  }
-  let active = true;
-  queueMicrotask(() => {
-    if (active) callback();
-  });
-  return () => {
-    active = false;
-  };
 }
 
 function intersectsViewport(rectangle: DOMRect, window: Window): boolean {
@@ -117,10 +105,6 @@ function deliveryLabel(cycle: GptDiagnosticsRequestCycle): string | undefined {
   }
 }
 
-function formatSizes(sizes: ReadonlyArray<readonly [number, number]>): string {
-  return sizes.map((size) => `${size[0]}×${size[1]}`).join(', ');
-}
-
 /** Format one observed GPT request cycle for both badge and accessible text surfaces. */
 export function formatGptDiagnosticsBadgeText(cycle: GptDiagnosticsRequestCycle): string {
   const firstLine: string[] = [];
@@ -132,7 +116,13 @@ export function formatGptDiagnosticsBadgeText(cycle: GptDiagnosticsRequestCycle)
   if (delivery) firstLine.push(delivery);
   if (cycle.requestPath === 'competing') firstLine.push('Competing paths');
   if (cycle.requestedSlotSizes) {
-    firstLine.push(`Requested ${formatSizes(cycle.requestedSlotSizes)}`);
+    const displayedSizes = cycle.requestedSlotSizes.slice(0, MAX_BADGE_REQUESTED_SLOT_SIZES);
+    const remainingSizeCount = cycle.requestedSlotSizes.length - displayedSizes.length;
+    firstLine.push(
+      `Requested ${formatSizes(displayedSizes)}${
+        remainingSizeCount > 0 ? ` +${remainingSizeCount}` : ''
+      }`
+    );
   }
   if (cycle.size) firstLine.push(`GPT fill ${cycle.size[0]}×${cycle.size[1]}`);
   if (cycle.observedSlotSize) {
@@ -185,7 +175,8 @@ export class GptDiagnosticsBadgeManager {
       options.window ??
       (this.document.defaultView as unknown as BadgeWindow | null) ??
       (window as unknown as BadgeWindow);
-    this.scheduleFrame = options.scheduleFrame ?? defaultScheduleFrame;
+    this.scheduleFrame =
+      options.scheduleFrame ?? ((callback) => scheduleFrame(this.window, callback));
     this.refreshSlotElementIds();
     this.unsubscribeStore = this.store.subscribe(() => {
       this.refreshSlotElementIds();

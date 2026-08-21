@@ -1505,13 +1505,6 @@ impl IntegrationRegistry {
         ids
     }
 
-    /// Return whether an integration is enabled, including integrations whose
-    /// JavaScript is delivered outside the standard module bundles.
-    #[must_use]
-    pub fn is_enabled(&self, integration_id: &str) -> bool {
-        self.inner.enabled_integration_ids.contains(&integration_id)
-    }
-
     /// Return JS module IDs for the main (synchronous) bundle, excluding
     /// modules registered with [`with_deferred_js`](IntegrationRegistrationBuilder::with_deferred_js).
     #[must_use]

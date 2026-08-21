@@ -13,6 +13,7 @@
 //! - [`PlatformHttpClient`] — outbound HTTP client
 //! - [`PlatformGeo`] — geographic information lookup
 //! - [`PlatformTemplateAssembler`] — cold-response shared-template assembly
+//! - [`PlatformTemplateCache`] — shared transformed-template caching
 //!
 //! ## Platform-Agnostic Components
 //!
@@ -58,12 +59,13 @@ pub use image_optimizer::{
 pub use kv::UnavailableKvStore;
 pub use template_assembly::{
     PlatformTemplateAssembler, TemplateAssemblyError, UnavailableTemplateAssembler,
+    contains_publisher_esi_directive,
 };
-pub use template_cache::REPLAYABLE_POLICY_HEADERS;
 pub use template_cache::{
-    PlatformTemplateCache, PlatformTemplateCacheReservation, TEMPLATE_SCHEMA_VERSION,
-    TemplateCacheError, TemplateCacheKey, TemplateCacheLookup, TemplateCacheMiss,
-    TemplateCacheReservation, TemplateEntry, TemplateMetadata, UnavailableTemplateCache,
+    PlatformTemplateCache, PlatformTemplateCacheReservation, REPLAYABLE_POLICY_HEADERS,
+    TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY, TEMPLATE_SCHEMA_VERSION, TemplateCacheError,
+    TemplateCacheKey, TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation,
+    TemplateEntry, TemplateMetadata, TemplateMetadataEncodeError, UnavailableTemplateCache,
     VaryHeaderValues, VarySpec,
 };
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};

@@ -833,7 +833,6 @@ auction_html_comment = true
 include_provider_responses = true
 include_mediator_response = false
 include_bids = false
-metadata_keys = ["error_type", "http_status", "message"]
 verbosity = "full"
 format = "pretty"
 ```
@@ -849,14 +848,18 @@ responses without spending the dump budget on winning creatives. Raw PBS
 `debug.httpcalls` and `resolvedrequest` metadata also require
 `debug = true` under `[integrations.prebid]`.
 
-| Option                       | Default                                | Behavior                                                                |
-| ---------------------------- | -------------------------------------- | ----------------------------------------------------------------------- |
-| `include_provider_responses` | `true`                                 | Include the provider response array                                     |
-| `include_mediator_response`  | `true`                                 | Include the mediator response when a mediator ran                       |
-| `include_bids`               | `true`                                 | Include bid objects; when `false`, provider status and metadata remain  |
-| `metadata_keys`              | `error_type`, `http_status`, `message` | Select a subset of the fixed validated metadata keys in `redacted` mode |
-| `verbosity`                  | `redacted`                             | Select `redacted`, `upstream`, or `full` sensitivity                    |
-| `format`                     | `compact`                              | Use compact outer JSON or indented outer JSON with `pretty`             |
+| Option                       | Default                                | Behavior                                                                                       |
+| ---------------------------- | -------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `include_provider_responses` | `true`                                 | Include the provider response array                                                            |
+| `include_mediator_response`  | `true`                                 | Include the mediator response when a mediator ran                                              |
+| `include_bids`               | `true`                                 | Include bid objects; when `false`, provider status and metadata remain                         |
+| `metadata_keys`              | `error_type`, `http_status`, `message` | Subset of the fixed validated keys; gates them in `redacted` and `upstream`, ignored in `full` |
+| `verbosity`                  | `redacted`                             | Select `redacted`, `upstream`, or `full` sensitivity                                           |
+| `format`                     | `compact`                              | Use compact outer JSON or indented outer JSON with `pretty`                                    |
+
+`metadata_keys` is a subset selector against a fixed allowlist —
+`error_type`, `http_status`, and `message` — never a way to add keys. Any other
+entry fails config load rather than being silently ignored.
 
 The verbosity modes form an explicit sensitivity ladder:
 
@@ -864,11 +867,14 @@ The verbosity modes form an explicit sensitivity ladder:
   server-generated `message`, intersected with `metadata_keys`. A successful
   provider response can therefore have `metadata: {}`.
 - `upstream` adds provider-controlled errors, warnings, response timings, bid
-  statuses, and bounded upstream-message fields. It does not include raw PBS
-  `httpcalls` or `resolvedrequest`.
-- `full` includes raw response metadata and untruncated creatives. It can expose
-  IP addresses, geo data, identifiers, consent strings, request signatures, and
-  complete provider request/response bodies.
+  statuses, and bounded upstream-message fields. It builds on the redacted
+  metadata, so `metadata_keys` still gates the three validated keys, while the
+  provider diagnostics are unlocked by `verbosity` alone. It does not include
+  raw PBS `httpcalls` or `resolvedrequest`.
+- `full` includes raw response metadata and untruncated creatives, ignoring
+  `metadata_keys` entirely. It can expose IP addresses, geo data, identifiers,
+  consent strings, request signatures, and complete provider request/response
+  bodies.
 
 `format = "pretty"` indents only the outer dump. JSON-looking fields such as
 `requestbody` and `responsebody` remain strings exactly as captured, so their

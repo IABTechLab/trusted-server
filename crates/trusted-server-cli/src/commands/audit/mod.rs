@@ -14,8 +14,10 @@ pub mod page;
 use clap::{Args, Subcommand};
 
 use crate::app_config::AppConfigArgs;
-use crate::commands::audit::collector::BrowserOpts;
+use crate::commands::audit::collector::{BrowserOpts, GenerateBrowserOpts};
 use crate::commands::audit::page::PageAuditArgs;
+use crate::error::{CliResult, cli_error};
+use crate::run::RunOutcome;
 
 /// Parses and validates an `http`/`https` URL, rejecting all other schemes.
 ///
@@ -52,6 +54,7 @@ pub(crate) fn parse_cookie(raw: &str) -> Result<(String, String), String> {
 
 /// `ts audit` arguments: an optional subcommand plus a hidden legacy URL positional.
 #[derive(Debug, Args)]
+#[command(arg_required_else_help = true)]
 pub(crate) struct AuditArgs {
     #[command(subcommand)]
     pub(crate) command: Option<AuditSubcommand>,
@@ -89,6 +92,8 @@ pub(crate) struct LegacyGenerateArgs {
         requires = "legacy_url"
     )]
     pub(crate) cookies: Vec<(String, String)>,
+    #[command(flatten)]
+    pub(crate) browser: GenerateBrowserOpts,
 }
 
 /// `ts audit` subcommands.
@@ -164,40 +169,8 @@ pub(crate) struct AuditAdTemplatesGenerateArgs {
     /// empties the rest of the run.
     #[arg(long, default_value_t = 750)]
     pub page_delay_ms: u64,
-    /// Run a visible browser instead of a headless one.
-    ///
-    /// Headless Chrome is trivially detectable and scored heavily by bot
-    /// protection, so an origin that serves the real page to a normal browser
-    /// may answer the same request headless with a challenge. Requires a desktop
-    /// session; it opens a real window.
-    #[arg(long)]
-    pub headful: bool,
-    /// Do not answer the IAB consent APIs on behalf of the audit browser.
-    ///
-    /// Publishers gate slot definition behind their consent platform, and a
-    /// fresh audit profile has no consent cookie, so by default the crawl
-    /// answers the standard TCF v2 and US Privacy interfaces as a consenting,
-    /// out-of-scope reader. Without that, such a site reports no ad slots at
-    /// all. Pass this to observe the un-consented page instead.
-    #[arg(long)]
-    pub no_assume_consent: bool,
-    /// Route the audit browser through a proxy, as `host:port`.
-    ///
-    /// Pairs with `ts dev proxy`, which serves a production hostname from a
-    /// local Trusted Server. Auditing through it means the page's origin,
-    /// cookie scope, and any origin checks in the ad stack match production
-    /// rather than `localhost`.
-    #[arg(long, value_name = "HOST:PORT")]
-    pub browser_proxy: Option<String>,
-    /// Accept TLS certificates that do not validate.
-    ///
-    /// DANGEROUS against a real origin: the audit sends any `--cookie` session
-    /// upstream and treats the response as evidence, so an invalid certificate
-    /// could mean an impersonator is harvesting the session and fabricating the
-    /// result. Intended for a local MITM proxy whose CA the browser profile does
-    /// not trust; prefer installing that CA (`ts dev proxy ca`) over this flag.
-    #[arg(long)]
-    pub danger_accept_invalid_certs: bool,
+    #[command(flatten)]
+    pub browser: GenerateBrowserOpts,
 }
 
 impl AuditAdTemplatesGenerateArgs {
@@ -272,21 +245,25 @@ pub(crate) struct AuditAdTemplatesVerifyArgs {
 ///
 /// Returns a user-facing string when no URL or subcommand is provided, or when
 /// the underlying command fails.
-pub(crate) fn run_audit(args: &AuditArgs) -> Result<(), String> {
+pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
     match &args.command {
-        Some(AuditSubcommand::Page(page_args)) => page::run_page(page_args),
+        Some(AuditSubcommand::Page(page_args)) => {
+            page::run_page(page_args).map(|()| RunOutcome::Success)
+        }
         Some(AuditSubcommand::AdTemplates(AuditAdTemplatesCommand::Generate(gen_args))) => {
-            let loaded = crate::app_config::load_file_settings(&gen_args.config)?;
+            gen_args.browser.validate()?;
+            let app_config_path = crate::app_config::resolve_app_config_file(&gen_args.config)?;
+            let raw_config = std::fs::read_to_string(&app_config_path).map_err(|error| {
+                format!("failed to read {}: {error}", app_config_path.display())
+            })?;
+            let existing_creative = creative_config(&raw_config)?;
             let profiles = gen_args.profiles()?;
             let collectors: Vec<generate::browser_collector::BrowserAuditCollector> = profiles
                 .iter()
                 .map(|profile| {
                     generate::browser_collector::BrowserAuditCollector::with_profile(*profile)
                         .with_page_delay(std::time::Duration::from_millis(gen_args.page_delay_ms))
-                        .headful(gen_args.headful)
-                        .assume_consent(!gen_args.no_assume_consent)
-                        .with_proxy(gen_args.browser_proxy.clone())
-                        .accept_invalid_certs(gen_args.danger_accept_invalid_certs)
+                        .with_browser_options(&gen_args.browser)
                 })
                 .collect();
             let selected: Vec<(&str, &dyn generate::collector::AuditCollector)> = profiles
@@ -301,11 +278,13 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<(), String> {
                 .collect();
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
+            let stderr = std::io::stderr();
+            let mut err = stderr.lock();
             generate::run_update_slots(
                 &generate::UpdateSlotsRequest {
                     url: gen_args.url.as_str(),
-                    config_path: &loaded.app_config_path,
-                    existing_creative: loaded.settings.creative_opportunities.as_ref(),
+                    config_path: &app_config_path,
+                    existing_creative: existing_creative.as_ref(),
                     page_patterns: &gen_args.page_patterns,
                     replace: gen_args.replace,
                     cookies: &gen_args.cookies,
@@ -314,34 +293,77 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<(), String> {
                 },
                 &selected,
                 &mut out,
+                &mut err,
             )
+            .map(|()| RunOutcome::Success)
         }
         Some(AuditSubcommand::AdTemplates(AuditAdTemplatesCommand::Verify(verify_args))) => {
             ad_templates::run_verify(verify_args)
         }
         Some(AuditSubcommand::Generate(generate_args)) => {
+            generate_args.browser.validate()?;
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
-            let collector = generate::browser_collector::BrowserAuditCollector::default();
+            let collector = generate::browser_collector::BrowserAuditCollector::default()
+                .with_browser_options(&generate_args.browser);
             generate::run_generate(generate_args, &collector, &mut out)
+                .map(|()| RunOutcome::Success)
         }
-        None => match &args.legacy_url {
-            Some(_) => {
-                let generate_args = legacy_generate_args(args)
-                    .expect("should build generation args when legacy URL is present");
+        None => match args.legacy_url.as_ref() {
+            Some(url) => {
+                args.legacy_generate.browser.validate()?;
+                let generate_args = legacy_generate_args(args, url);
                 let stdout = std::io::stdout();
                 let mut out = stdout.lock();
-                let collector = generate::browser_collector::BrowserAuditCollector::default();
+                let collector = generate::browser_collector::BrowserAuditCollector::default()
+                    .with_browser_options(&generate_args.browser);
                 generate::run_generate(&generate_args, &collector, &mut out)
+                    .map(|()| RunOutcome::Success)
             }
-            None => Err("provide a URL or a subcommand (`page`, `ad-templates`)".to_string()),
+            None => Err(
+                "provide a URL or a subcommand (`generate`, `page`, `ad-templates`)".to_string(),
+            ),
         },
     }
 }
 
-fn legacy_generate_args(args: &AuditArgs) -> Option<generate::GenerateArgs> {
-    let url = args.legacy_url.as_ref()?;
-    Some(generate::GenerateArgs {
+/// Reads the config's `[creative_opportunities]` section, when it has one.
+///
+/// An unrelated invalid setting elsewhere in the document must not hide the
+/// section — the runtime rejects such a file, but the operator still has to be
+/// able to update slots in it — so the document is read as plain TOML rather
+/// than through [`Settings`](trusted_server_core::settings::Settings).
+///
+/// A section that is present but unreadable is *not* treated as absent.
+/// `CreativeOpportunitiesConfig` uses `deny_unknown_fields`, so one mistyped key
+/// would otherwise leave the merge with nothing to merge into and replace the
+/// operator's entire slot array.
+///
+/// # Errors
+///
+/// Returns a user-facing error when the section is present but cannot be
+/// deserialized.
+fn creative_config(
+    document: &str,
+) -> CliResult<Option<trusted_server_core::creative_opportunities::CreativeOpportunitiesConfig>> {
+    let Some(section) = toml::from_str::<toml::Value>(document)
+        .ok()
+        .and_then(|value| value.get("creative_opportunities").cloned())
+    else {
+        return Ok(None);
+    };
+    match section.try_into() {
+        Ok(config) => Ok(Some(config)),
+        Err(error) => cli_error(format!(
+            "failed to read the existing `[creative_opportunities]` section, so generating \
+             slots would discard the configured ones: {error}. Fix the section (or delete it) \
+             and re-run"
+        )),
+    }
+}
+
+fn legacy_generate_args(args: &AuditArgs, url: &url::Url) -> generate::GenerateArgs {
+    generate::GenerateArgs {
         url: url.to_string(),
         js_assets: args.legacy_generate.js_assets.clone(),
         config: args.legacy_generate.config.clone(),
@@ -349,7 +371,8 @@ fn legacy_generate_args(args: &AuditArgs) -> Option<generate::GenerateArgs> {
         no_config: args.legacy_generate.no_config,
         force: args.legacy_generate.force,
         cookies: args.legacy_generate.cookies.clone(),
-    })
+        browser: args.legacy_generate.browser.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -371,6 +394,51 @@ mod tests {
         let (name, value) = parse_cookie("session=").expect("should parse empty value");
         assert_eq!(name, "session");
         assert!(value.is_empty(), "empty value should be allowed");
+    }
+
+    #[test]
+    fn invalid_setting_outside_the_section_still_yields_creative_config() {
+        let document = "unknown_runtime_key = true\n\
+            [creative_opportunities]\nenabled = true\ngam_network_id = \"123\"\n";
+
+        let creative = creative_config(document)
+            .expect("an unrelated invalid setting must not hide creative config")
+            .expect("the section is present");
+
+        assert_eq!(creative.gam_network_id, "123");
+    }
+
+    #[test]
+    fn absent_section_reads_as_absent() {
+        let creative =
+            creative_config("[auction]\nenabled = true\n").expect("should read the document");
+
+        assert!(
+            creative.is_none(),
+            "a document with no `[creative_opportunities]` has no configured slots"
+        );
+    }
+
+    #[test]
+    fn unreadable_section_is_refused_rather_than_read_as_absent() {
+        // `deny_unknown_fields` makes one mistyped key inside the section fail
+        // to deserialize. Reading that as "no slots configured" would let a
+        // merge replace the operator's entire slot array.
+        let document = "[creative_opportunities]\n\
+            gam_network_id = \"123\"\n\
+            gam_netwrok_id = \"123\"\n\
+            [[creative_opportunities.slot]]\n\
+            id = \"header\"\n\
+            div_id = \"ad-header\"\n\
+            page_patterns = [\"/\"]\n\
+            formats = [{ width = 728, height = 90 }]\n";
+
+        let error = creative_config(document).expect_err("should refuse an unreadable section");
+
+        assert!(
+            error.contains("would discard the configured ones"),
+            "error should say what merging would cost, got {error}"
+        );
     }
 
     #[test]
@@ -402,10 +470,17 @@ mod tests {
                 no_config: false,
                 force: true,
                 cookies: vec![("session".to_string(), "example".to_string())],
+                browser: GenerateBrowserOpts {
+                    headful: true,
+                    ..GenerateBrowserOpts::default()
+                },
             },
         };
 
-        let generate = legacy_generate_args(&args).expect("should build generation args");
+        let generate = legacy_generate_args(
+            &args,
+            args.legacy_url.as_ref().expect("should have legacy URL"),
+        );
 
         assert_eq!(generate.url, "https://www.example.com/");
         assert_eq!(
@@ -420,6 +495,10 @@ mod tests {
         assert_eq!(
             generate.cookies,
             [("session".to_string(), "example".to_string())]
+        );
+        assert!(
+            generate.browser.headful,
+            "browser flags passed to the legacy form should reach generation"
         );
     }
 }

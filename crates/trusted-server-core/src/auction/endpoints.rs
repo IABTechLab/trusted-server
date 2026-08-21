@@ -11,6 +11,7 @@ use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::COOKIE_TS_EIDS;
+use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::kv::KvIdentityGraph;
@@ -490,22 +491,6 @@ pub(crate) fn resolve_auction_eids(
 
     let resolved = resolve_partner_ids(registry, &entry);
     Some(to_eids(&resolved))
-}
-
-fn extract_cookie_value(req: &Request<EdgeBody>, name: &str) -> Option<String> {
-    let cookie_header = req
-        .headers()
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())?;
-    for pair in cookie_header.split(';') {
-        let pair = pair.trim();
-        if let Some((key, value)) = pair.split_once('=')
-            && key.trim() == name
-        {
-            return Some(value.trim().to_owned());
-        }
-    }
-    None
 }
 
 pub(crate) fn resolve_client_auction_eids(

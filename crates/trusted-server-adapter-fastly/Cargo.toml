@@ -23,7 +23,7 @@ derive_more = { workspace = true }
 edgezero-adapter-fastly = { workspace = true, features = ["fastly"] }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
-esi = { git = "https://github.com/stackpop/esi.git", rev = "4c53feab4d22ad9a84641b4c46f3f63bc6d197e2" }
+esi = { workspace = true }
 fastly = { workspace = true }
 fern = { workspace = true }
 futures = { workspace = true }

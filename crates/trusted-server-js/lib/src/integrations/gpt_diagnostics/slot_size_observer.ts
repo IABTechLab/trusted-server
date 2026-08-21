@@ -2,6 +2,7 @@ import type { Size } from '../../core/types';
 import { realmOwnedHtmlElement } from '../../shared/realm';
 
 import type { GptDiagnosticsBindingManager } from './binding';
+import { scheduleFrame } from './presentation_helpers';
 import type { GptDiagnosticsStoreSnapshot } from './store';
 
 interface SlotSizeStore {
@@ -16,6 +17,7 @@ interface SlotSizeBindings {
 }
 
 type SlotSizeWindow = Window & {
+  HTMLElement: typeof HTMLElement;
   ResizeObserver?: typeof ResizeObserver;
 };
 
@@ -27,14 +29,6 @@ interface SlotSizeObserverOptions {
 interface ObservedCycle {
   runtimeSlotNumber: number;
   requestNumber: number;
-}
-
-function defaultScheduleFrame(callback: () => void): void {
-  if (typeof requestAnimationFrame === 'function') {
-    requestAnimationFrame(() => callback());
-  } else {
-    queueMicrotask(callback);
-  }
 }
 
 function latestFilledCycle(
@@ -71,7 +65,8 @@ export class GptDiagnosticsSlotSizeObserver {
     this.store = store;
     this.bindings = bindings;
     this.window = options.window ?? (window as unknown as SlotSizeWindow);
-    this.scheduleFrame = options.scheduleFrame ?? defaultScheduleFrame;
+    this.scheduleFrame =
+      options.scheduleFrame ?? ((callback) => scheduleFrame(this.window, callback));
     this.unsubscribeStore = this.store.subscribe(this.scheduleRefresh);
     this.unsubscribeBindings = this.bindings.subscribe(this.scheduleRefresh);
     this.refresh();
@@ -125,6 +120,8 @@ export class GptDiagnosticsSlotSizeObserver {
   }
 
   private measure(element: HTMLElement, cycle: ObservedCycle): void {
+    if (this.destroyed) return;
+
     const binding = this.bindings.get(cycle.runtimeSlotNumber);
     if (binding.binding.status !== 'bound' || binding.element !== element || !element.isConnected) {
       return;
@@ -140,8 +137,8 @@ export class GptDiagnosticsSlotSizeObserver {
       return;
     }
     this.store.recordObservedSlotSize(cycle.runtimeSlotNumber, cycle.requestNumber, [
-      rectangle.width,
-      rectangle.height,
+      Math.round(rectangle.width),
+      Math.round(rectangle.height),
     ]);
   }
 }

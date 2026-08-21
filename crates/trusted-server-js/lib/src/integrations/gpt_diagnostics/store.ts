@@ -732,7 +732,9 @@ export class GptDiagnosticsStore {
     }
 
     const record = this.slots.get(runtimeSlotNumber);
-    const cycle = record?.requests.find((candidate) => candidate.requestNumber === requestNumber);
+    if (!record) return;
+
+    const cycle = record.requests.find((candidate) => candidate.requestNumber === requestNumber);
     if (
       !record ||
       !cycle ||

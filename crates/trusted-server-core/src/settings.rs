@@ -2151,13 +2151,26 @@ impl CacheAssetRule {
 
         let preset_is_content_addressed =
             matches!(self.preset, Some(CacheAssetPreset::NextJsStatic));
-        if !preset_is_content_addressed && self.fingerprint_style.is_none() {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "cache.asset_rules `{}` sets immutable without fingerprint_style or a content-addressed preset",
-                    self.id
-                ),
-            }));
+        if !preset_is_content_addressed {
+            match self.fingerprint_style {
+                None => {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "cache.asset_rules `{}` sets immutable without fingerprint_style or a content-addressed preset",
+                            self.id
+                        ),
+                    }));
+                }
+                Some(CacheAssetFingerprintStyle::ViteBase64Url) => {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "cache.asset_rules `{}` cannot set immutable with vite-base64-url; use a content-addressed preset or an unambiguous fingerprint_style",
+                            self.id
+                        ),
+                    }));
+                }
+                Some(_) => {}
+            }
         }
 
         Ok(())
@@ -2273,15 +2286,30 @@ fn compile_cache_asset_glob_patterns(
     pattern: &str,
     compiled: &mut Vec<Pattern>,
 ) -> Result<(), String> {
-    compiled.push(Pattern::new(pattern).map_err(|err| err.to_string())?);
+    let mut variants = vec![pattern.to_string()];
+    let mut variant_index = 0;
 
-    if let Some(optional_recursive_start) = pattern.find("**/") {
-        let without_recursive_segment = format!(
-            "{}{}",
-            &pattern[..optional_recursive_start],
-            &pattern[optional_recursive_start + "**/".len()..]
-        );
-        compile_cache_asset_glob_patterns(&without_recursive_segment, compiled)?;
+    while variant_index < variants.len() {
+        let variant = variants[variant_index].clone();
+        let optional_segments = variant
+            .match_indices("**/")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for segment_start in optional_segments {
+            let without_segment = format!(
+                "{}{}",
+                &variant[..segment_start],
+                &variant[segment_start + "**/".len()..]
+            );
+            if !variants.contains(&without_segment) {
+                variants.push(without_segment);
+            }
+        }
+        variant_index += 1;
+    }
+
+    for variant in variants {
+        compiled.push(Pattern::new(&variant).map_err(|err| err.to_string())?);
     }
 
     Ok(())
@@ -2330,7 +2358,7 @@ fn path_extension(path: &str) -> Option<String> {
     (!extension.is_empty()).then(|| extension.to_ascii_lowercase())
 }
 
-/// Operator-selected filename fingerprint convention for an immutable custom rule.
+/// Operator-selected filename fingerprint convention for a cache rule.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum CacheAssetFingerprintStyle {
@@ -2338,7 +2366,7 @@ pub enum CacheAssetFingerprintStyle {
     Hex,
     /// An eight-character uppercase Base32 suffix, such as `app-VRTVD5R5.js`.
     EsbuildBase32,
-    /// An eight-character `Base64URL` suffix, such as `index-BsELY24f.js`.
+    /// An eight-character `Base64URL` suffix for non-immutable rules, such as `index-BsELY24f.js`.
     ViteBase64Url,
 }
 
@@ -2411,7 +2439,16 @@ pub struct DebugConfig {
 
     /// Content and verbosity of the `auction_html_comment` dump. Ignored
     /// when `auction_html_comment` is false.
-    #[serde(default)]
+    ///
+    /// The default table must stay omitted from serialized config blobs:
+    /// [`DebugConfig`] denies unknown fields, so an older binary rejects a blob
+    /// carrying this table during a mixed-version deployment or rollback. Any
+    /// non-default table still serializes and requires restoring a compatible
+    /// blob before rolling back.
+    #[serde(
+        default,
+        skip_serializing_if = "is_default_auction_debug_comment_options"
+    )]
     pub auction_html_comment_options: AuctionDebugCommentOptions,
 
     /// Enable the testing-only direct GAM-replace path and the verbose per-bid
@@ -2478,6 +2515,11 @@ fn default_auction_debug_metadata_keys() -> Vec<String> {
         .collect()
 }
 
+// This predicate preserves rollback compatibility by omitting the default table.
+fn is_default_auction_debug_comment_options(value: &AuctionDebugCommentOptions) -> bool {
+    *value == AuctionDebugCommentOptions::default()
+}
+
 /// Behavior of the `<!-- ts-debug: ... -->` auction dump. Only consulted when
 /// [`DebugConfig::auction_html_comment`] is true.
 ///
@@ -2485,7 +2527,7 @@ fn default_auction_debug_metadata_keys() -> Vec<String> {
 /// structs in this file, including the `DebugConfig` this struct nests
 /// under: an operator typo (e.g. `metadata_key` instead of `metadata_keys`)
 /// must fail config load loudly, not be silently ignored.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuctionDebugCommentOptions {
     /// Include the `provider_responses` section at all.
@@ -2501,9 +2543,15 @@ pub struct AuctionDebugCommentOptions {
     pub include_bids: bool,
 
     /// Subset of [`AUCTION_DEBUG_METADATA_ALLOWLIST`] to surface in
-    /// [`AuctionDebugCommentVerbosity::Redacted`] mode. Keys outside the
-    /// fixed allowlist are always dropped, config or not. This selector cannot
-    /// unlock provider diagnostics. Ignored when `verbosity` is `Full`.
+    /// [`AuctionDebugCommentVerbosity::Redacted`] mode. This selector cannot
+    /// unlock provider diagnostics, and entries outside the fixed allowlist are
+    /// rejected at config load by
+    /// [`validate_metadata_keys`](Self::validate_metadata_keys).
+    ///
+    /// [`AuctionDebugCommentVerbosity::Upstream`] builds on the redacted
+    /// metadata, so this subset still gates those three keys there; the six
+    /// upstream diagnostics are unlocked by `verbosity` alone. Ignored entirely
+    /// when `verbosity` is [`AuctionDebugCommentVerbosity::Full`].
     #[serde(default = "default_auction_debug_metadata_keys")]
     pub metadata_keys: Vec<String>,
 
@@ -2547,6 +2595,39 @@ impl AuctionDebugCommentOptions {
             .map(|key| key.trim().to_string())
             .filter(|key| !key.is_empty())
             .collect();
+    }
+
+    /// Reject [`Self::metadata_keys`] entries outside
+    /// [`AUCTION_DEBUG_METADATA_ALLOWLIST`].
+    ///
+    /// Render time intersects the configured list with the allowlist, so an
+    /// entry outside it is dead config that silently renders `metadata: {}`.
+    /// Fail the load loudly instead, matching the `deny_unknown_fields`
+    /// contract on this struct. The render-time intersection stays as
+    /// defense-in-depth for config paths that bypass this check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] naming every unknown key.
+    pub(crate) fn validate_metadata_keys(&self) -> Result<(), Report<TrustedServerError>> {
+        let unknown: Vec<&str> = self
+            .metadata_keys
+            .iter()
+            .map(String::as_str)
+            .filter(|key| !AUCTION_DEBUG_METADATA_ALLOWLIST.contains(key))
+            .collect();
+
+        if unknown.is_empty() {
+            return Ok(());
+        }
+
+        Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "debug.auction_html_comment_options.metadata_keys contains unsupported keys [{}]; supported keys are [{}]",
+                unknown.join(", "),
+                AUCTION_DEBUG_METADATA_ALLOWLIST.join(", ")
+            ),
+        }))
     }
 }
 
@@ -2726,13 +2807,17 @@ impl Settings {
     /// # Errors
     ///
     /// Returns a configuration error if any cached runtime artifact cannot be
-    /// prepared, if any handler path regex does not compile, or if a creative
-    /// opportunity slot is invalid.
+    /// prepared, if any handler path regex does not compile, if a creative
+    /// opportunity slot is invalid, or if
+    /// [`AuctionDebugCommentOptions::metadata_keys`] names an unsupported key.
     pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.image_optimizer.prepare_runtime()?;
         self.cache.prepare_runtime()?;
         self.proxy.prepare_runtime()?;
         self.tinybird.prepare_runtime()?;
+        self.debug
+            .auction_html_comment_options
+            .validate_metadata_keys()?;
         self.validate_asset_image_optimizer_profile_sets()?;
 
         for handler in &self.handlers {
@@ -2915,6 +3000,13 @@ impl Settings {
         Ok(patterns)
     }
 
+    /// Returns whether `path` is within the reserved Trusted Server admin
+    /// namespace.
+    #[must_use]
+    pub(crate) fn is_admin_path(path: &str) -> bool {
+        path == "/_ts/admin" || path.starts_with("/_ts/admin/")
+    }
+
     /// Known admin endpoint paths that must be covered by a handler.
     ///
     /// [`from_toml`](Self::from_toml) rejects configurations
@@ -2923,10 +3015,10 @@ impl Settings {
     /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
     /// admin routes to `crates/trusted-server-adapter-fastly/src/app.rs`.
     ///
-    /// The `/_ts/admin/ec/{id}` entry is the literal router pattern; handler
-    /// path regexes are matched against it verbatim, so prefix-style admin
-    /// regexes (e.g. `^/_ts/admin`) cover it while regexes too narrow to
-    /// cover the parameterized route are rejected fail-closed.
+    /// The `/_ts/admin/ec/{id}` entry is the canonical router pattern. Its
+    /// coverage is checked via [`admin_auth_probes`](Self::admin_auth_probes),
+    /// while validation errors continue to report this operator-facing route
+    /// template.
     pub(crate) const ADMIN_ENDPOINTS: &[&str] = &[
         "/_ts/admin/keys/rotate",
         "/_ts/admin/keys/deactivate",
@@ -2934,6 +3026,36 @@ impl Settings {
         "/_ts/admin/ec/{id}",
         "/_ts/admin/eids",
     ];
+
+    /// Probes that establish handler coverage for the dynamic
+    /// `/_ts/admin/ec/{id}` route.
+    ///
+    /// Coverage cannot be sampled: the router accepts any single segment after
+    /// `/_ts/admin/ec/` and basic auth runs on the raw path before routing, so
+    /// a handler that matches only some ID shapes leaves the rest of the route
+    /// surface — including malformed IDs, which still reach the admin handler —
+    /// unauthenticated at configuration time and fail-closed at runtime.
+    ///
+    /// Both probes must match the same configuration for the route to count as
+    /// covered. The bare prefix rejects handlers anchored to specific ID
+    /// shapes; the concrete ID rejects handlers anchored to the prefix itself
+    /// (`^/_ts/admin/ec/$`). Together they admit only prefix-level matchers
+    /// such as `^/_ts/admin` or `^/_ts/admin/ec/`.
+    const ADMIN_EC_ID_AUTH_PROBES: [&str; 2] = [
+        "/_ts/admin/ec/",
+        concat!(
+            "/_ts/admin/ec/",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ".Ab12Z9",
+        ),
+    ];
+
+    fn admin_auth_probes(path: &'static str) -> [&'static str; 2] {
+        match path {
+            "/_ts/admin/ec/{id}" => Self::ADMIN_EC_ID_AUTH_PROBES,
+            path => [path, path],
+        }
+    }
 
     /// Returns admin endpoint paths that no configured handler covers.
     ///
@@ -2949,12 +3071,16 @@ impl Settings {
     ) -> Result<Vec<&'static str>, Report<TrustedServerError>> {
         let mut uncovered = Vec::new();
         for &path in Self::ADMIN_ENDPOINTS {
-            let mut covered = false;
-            for h in &self.handlers {
-                if h.matches_path(path)? {
-                    covered = true;
-                    break;
+            let mut covered = true;
+            for probe in Self::admin_auth_probes(path) {
+                let mut probe_covered = false;
+                for handler in &self.handlers {
+                    if handler.matches_path(probe)? {
+                        probe_covered = true;
+                        break;
+                    }
                 }
+                covered &= probe_covered;
             }
             if !covered {
                 uncovered.push(path);
@@ -2984,18 +3110,19 @@ impl Settings {
         }))
     }
 
+    /// Rejects placeholder and well-known weak handler passwords.
+    ///
+    /// Applies to every handler rather than to handlers inferred to cover an
+    /// admin endpoint: handler selection is first-match-wins over operator
+    /// regexes, so a narrow handler can shadow the admin namespace for paths no
+    /// probe enumerates. Handlers are Trusted Server's own basic-auth gates, so
+    /// a placeholder password is never valid on any of them.
     fn validate_admin_handler_passwords(&self) -> Result<(), Report<TrustedServerError>> {
         for handler in &self.handlers {
-            let covers_admin = Self::ADMIN_ENDPOINTS
-                .iter()
-                .try_fold(false, |covered, path| {
-                    handler.matches_path(path).map(|matches| covered || matches)
-                })?;
-
-            if covers_admin && is_admin_placeholder_password(handler.password.expose()) {
+            if is_admin_placeholder_password(handler.password.expose()) {
                 return Err(Report::new(TrustedServerError::Configuration {
                     message: format!(
-                        "Admin handler `{}` uses a placeholder password; configure a strong secret",
+                        "Handler `{}` uses a placeholder password; configure a strong secret",
                         handler.path
                     ),
                 }));
@@ -3417,6 +3544,90 @@ mod tests {
     }
 
     #[test]
+    fn auction_debug_comment_options_unknown_metadata_key_fails_config_load() {
+        let toml = format!(
+            "{}\n[debug]\nauction_html_comment = true\n\n[debug.auction_html_comment_options]\nmetadata_keys = [\"http_staus\", \"errors\"]\n",
+            crate_test_settings_str()
+        );
+        let error = Settings::from_toml(&toml)
+            .expect_err("should reject metadata keys outside the fixed allowlist");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("http_staus") && rendered.contains("errors"),
+            "error should name every unsupported key, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_allowlisted_metadata_keys_load() {
+        let toml = format!(
+            "{}\n[debug]\nauction_html_comment = true\n\n[debug.auction_html_comment_options]\nmetadata_keys = [\" message \"]\n",
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml).expect("should accept an allowlisted key");
+        assert_eq!(
+            settings.debug.auction_html_comment_options.metadata_keys,
+            vec!["message".to_string()],
+            "normalize should trim before validation runs"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_unknown_field_fails_config_load() {
+        let result: Result<AuctionDebugCommentOptions, _> =
+            toml::from_str(r#"metadata_key = ["message"]"#);
+        assert!(
+            result.is_err(),
+            "a misspelled field must fail config load, not be silently ignored"
+        );
+    }
+
+    #[test]
+    fn default_auction_debug_comment_options_stay_out_of_serialized_config() {
+        // Rollback contract: `DebugConfig` denies unknown fields, so the
+        // previous binary rejects a config blob carrying a table it does not
+        // know. Defaults must therefore serialize to nothing.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyDebugConfig {
+            #[serde(default)]
+            ja4_endpoint_enabled: bool,
+            #[serde(default)]
+            auction_html_comment: bool,
+            #[serde(default)]
+            inject_adm_for_testing: bool,
+        }
+
+        let value = serde_json::to_value(DebugConfig::default())
+            .expect("should serialize the default debug config");
+        assert!(
+            value.get("auction_html_comment_options").is_none(),
+            "default options table should not be serialized, got {value}"
+        );
+
+        let legacy: LegacyDebugConfig = serde_json::from_value(value)
+            .expect("legacy schema should accept the default debug payload");
+        assert!(!legacy.ja4_endpoint_enabled);
+        assert!(!legacy.auction_html_comment);
+        assert!(!legacy.inject_adm_for_testing);
+
+        let configured = DebugConfig {
+            auction_html_comment: true,
+            auction_html_comment_options: AuctionDebugCommentOptions {
+                include_bids: false,
+                ..AuctionDebugCommentOptions::default()
+            },
+            ..DebugConfig::default()
+        };
+        let value =
+            serde_json::to_value(&configured).expect("should serialize a configured debug config");
+        assert!(
+            value.get("auction_html_comment_options").is_some(),
+            "non-default options must still serialize, got {value}"
+        );
+    }
+
+    #[test]
     fn tinybird_defaults_to_disabled_placeholders() {
         let settings = Settings::from_toml(&crate_test_settings_str())
             .expect("should parse settings without tinybird block");
@@ -3617,11 +3828,6 @@ mod tests {
                 "/assets/app-VRTVD5R5.js",
                 "/assets/index-BsELY24f.js",
             ),
-            (
-                "vite-base64-url",
-                "/assets/index-BsELY24f.js",
-                "/assets/app.0123abcd.js",
-            ),
         ] {
             let toml_str = format!(
                 r#"{}
@@ -3658,55 +3864,61 @@ mod tests {
     }
 
     #[test]
-    fn filename_fingerprint_gate_matches_only_the_selected_style() {
-        for (style, path, expected) in [
-            (
-                CacheAssetFingerprintStyle::Hex,
-                "/assets/app.0123abcd.js",
-                true,
-            ),
-            (
-                CacheAssetFingerprintStyle::Hex,
-                "/assets/hero-Portrait.jpg",
-                false,
-            ),
-            (
-                CacheAssetFingerprintStyle::EsbuildBase32,
-                "/assets/app-VRTVD5R5.js",
-                true,
-            ),
-            (
-                CacheAssetFingerprintStyle::EsbuildBase32,
-                "/assets/hero-Portrait.jpg",
-                false,
-            ),
-            (
-                CacheAssetFingerprintStyle::ViteBase64Url,
-                "/assets/index-BsELY24f.js",
-                true,
-            ),
-            (
-                CacheAssetFingerprintStyle::ViteBase64Url,
-                "/assets/hero-Portrait.jpg",
-                true,
-            ),
-            (
-                CacheAssetFingerprintStyle::ViteBase64Url,
-                "/assets/app.js",
-                false,
-            ),
-            (
-                CacheAssetFingerprintStyle::ViteBase64Url,
-                "/assets/deadbeef.js",
-                false,
-            ),
+    fn immutable_vite_style_cannot_cache_human_named_assets() {
+        let rule = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "vite-assets"
+            enabled = true
+            path_globs = ["/assets/**/*.js", "/assets/**/*.jpg", "/assets/**/*.png", "/assets/**/*.svg"]
+            fingerprint_style = "vite-base64-url"
+            visibility = "public"
+            browser_ttl_seconds = 31536000
+            edge_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+
+        for path in [
+            "/assets/hero-Portrait.jpg",
+            "/assets/logo-DarkMode.svg",
+            "/assets/banner-Summer24.png",
         ] {
-            assert_eq!(
-                filename_contains_fingerprint(path, style),
-                expected,
-                "{style:?} fingerprint result should match for {path}"
+            let error = Settings::from_toml(&rule)
+                .expect_err("should reject immutable Vite-style cache rule");
+            assert!(
+                format!("{error:?}").contains("cannot set immutable with vite-base64-url"),
+                "{path} must not receive an immutable policy through a Vite-style rule"
             );
         }
+    }
+
+    #[test]
+    fn non_immutable_vite_style_remains_available_for_cache_matching() {
+        let toml = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "vite-assets"
+            enabled = true
+            path_glob = "/assets/*.js"
+            fingerprint_style = "vite-base64-url"
+            browser_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let settings =
+            Settings::from_toml(&toml).expect("should allow Vite-style matching without immutable");
+
+        assert!(
+            settings
+                .asset_cache_policy_for_path("/assets/index-BsELY24f.js")
+                .expect("should evaluate Vite-style cache rule")
+                .is_some(),
+            "non-immutable Vite-style rule should still match a Vite output filename"
+        );
     }
 
     #[test]
@@ -3751,6 +3963,32 @@ mod tests {
                     .expect("should evaluate recursive asset rule")
                     .is_some(),
                 "double-star glob should match {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_asset_rule_globs_expand_each_optional_recursive_segment() {
+        let toml = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "nested-assets"
+            enabled = true
+            path_glob = "/a/**/b/**/c.js"
+            browser_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse recursive cache rule");
+
+        for path in ["/a/x/b/y/c.js", "/a/b/y/c.js", "/a/x/b/c.js", "/a/b/c.js"] {
+            assert!(
+                settings
+                    .asset_cache_policy_for_path(path)
+                    .expect("should evaluate recursive cache rule")
+                    .is_some(),
+                "recursive pattern should match {path}"
             );
         }
     }
@@ -6534,6 +6772,185 @@ adSlot = "67890"
             ],
             "should detect the admin endpoints not covered by the narrow handler"
         );
+    }
+
+    #[test]
+    fn from_toml_rejects_literal_parameter_template_auth_coverage() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/[{]id[}]$"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject literal parameter-template auth coverage");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("/_ts/admin/ec/{id}"),
+            "should identify the concrete EC route as uncovered, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_lowercase_only_dynamic_admin_ec_auth_coverage() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/[a-f0-9]{64}[.][a-z0-9]{6}$"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject lowercase-only dynamic EC auth coverage");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("/_ts/admin/ec/{id}"),
+            "should identify the mixed-case EC route as uncovered, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_placeholder_password_on_shadowing_admin_handler() {
+        // Handler selection is first-match-wins, so a narrow handler placed
+        // ahead of the admin matcher governs the EC IDs it matches. No probe
+        // enumerates those IDs, so the placeholder check cannot be limited to
+        // handlers inferred to cover an admin endpoint.
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/ec/[a-f0-9]{64}[.]zzzzzz$"
+            username = "admin"
+            password = "change-me-admin-password"
+
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject placeholder password on shadowing admin handler");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("placeholder password"),
+            "should identify the placeholder handler password, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_weak_password_on_non_admin_handler() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/private"
+            username = "admin"
+            password = "changeme""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject a weak password on any handler");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("placeholder password"),
+            "should identify the weak handler password, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_sampled_id_only_dynamic_admin_ec_auth_coverage() {
+        // A handler anchored to the full EC ID grammar still leaves the rest of
+        // the route surface (malformed IDs, which the router accepts and the
+        // admin handler rejects with 400) unauthenticated, so coverage must not
+        // be inferred from ID-shaped samples.
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/[a-f0-9]{64}[.][A-Za-z0-9]{6}$"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject ID-sampled dynamic EC auth coverage");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("/_ts/admin/ec/{id}"),
+            "should identify the dynamic EC route as uncovered, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_prefix_anchored_admin_ec_auth_coverage() {
+        // `^/_ts/admin/ec/$` matches the prefix probe but no actual lookup.
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/$"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject prefix-anchored dynamic EC auth coverage");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("/_ts/admin/ec/{id}"),
+            "should identify the dynamic EC route as uncovered, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_accepts_prefix_matcher_admin_ec_auth_coverage() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        Settings::from_toml(&toml_str)
+            .expect("should accept a prefix-level matcher for the dynamic EC route");
     }
 
     #[test]

@@ -5,15 +5,9 @@
 //! [`PageVerificationResult`] with per-slot statuses, warnings, and unmatched
 //! extra evidence, mirroring spec §5.3–§5.6.
 //!
-//! Consumed by the browser collector decode (Task 8) and the audit verifier
-//! (Task 9); exercised by tests until then, hence the module-scoped allow.
-#![allow(
-    dead_code,
-    reason = "consumed by the browser collector and audit verifier in later tasks"
-)]
-
 use serde::Deserialize;
 
+use trusted_server_core::auction::types::MediaType;
 use trusted_server_core::creative_opportunities::RuntimeAdStackExpected;
 
 use crate::ad_templates::expected::ExpectedSlot;
@@ -51,8 +45,17 @@ pub struct GptSlotEvidence {
     pub phase: EvidencePhase,
 }
 
-/// An `apstag.fetchBids` call observed on the page (spec §5.5).
+/// An `apstag.fetchBids` call the page made, if any were recorded.
+///
+/// The collector no longer hooks `apstag`: server-side APS configuration is
+/// metadata rather than a client assertion, so a missing client call is not a
+/// finding. The field and this shape stay for the evidence payload's schema, and
+/// the list arrives empty.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(
+    dead_code,
+    reason = "decoded for schema stability; the collector records no APS calls"
+)]
 pub struct ApsFetchBidsEvidence {
     /// The APS slot ID requested.
     pub slot_id: String,
@@ -67,6 +70,10 @@ pub struct ApsFetchBidsEvidence {
 /// DEFERRED in Phase 1: kept as forward scaffolding so the decoded evidence shape
 /// stays forward-compatible. Not populated by the collector or surfaced in JSON.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(
+    dead_code,
+    reason = "reserved decoded shape for the optional bids phase"
+)]
 pub struct PageBidsEvidence {
     /// The slot ID present in the page-bids response.
     pub slot_id: String,
@@ -85,6 +92,7 @@ pub struct BrowserAdEvidence {
     pub aps_calls: Vec<ApsFetchBidsEvidence>,
     /// `/__ts/page-bids` observations (deferred; default empty).
     #[serde(default)]
+    #[allow(dead_code, reason = "reserved for the optional bids phase")]
     pub page_bids: Vec<PageBidsEvidence>,
     /// Collector-level warnings (no page HTML/cookies/storage).
     #[serde(default)]
@@ -126,6 +134,8 @@ pub enum SlotStatus {
     Partial,
     /// No DOM or GPT evidence confirms the slot.
     Missing,
+    /// The checker cannot confirm this slot type; this is not page drift.
+    Unconfirmable,
 }
 
 /// The verification result for one audited page.
@@ -164,7 +174,7 @@ pub struct SlotResult {
     /// The confirmation status.
     pub status: SlotStatus,
     /// The phase the confirming evidence was observed in.
-    pub phase: EvidencePhase,
+    pub phase: Option<EvidencePhase>,
     /// The live evidence observed for this slot.
     pub evidence: SlotEvidence,
     /// Slot-level warnings (size, provider, etc.).
@@ -183,7 +193,8 @@ pub struct SlotEvidence {
 /// Live ad-slot evidence with no matching configured slot.
 #[derive(Debug, Clone)]
 pub struct ExtraEvidence {
-    /// Evidence kind: `dom`, `gpt`, or `aps`.
+    /// Evidence kind. Only `gpt` is produced today; the field is a string so a
+    /// later evidence source can be added without changing the JSON schema.
     pub kind: String,
     /// The phase it was observed in.
     pub phase: EvidencePhase,
@@ -233,7 +244,7 @@ fn banner_sizes(expected: &ExpectedSlot) -> Vec<(u32, u32)> {
     expected
         .formats
         .iter()
-        .filter(|format| format.media_type == "banner")
+        .filter(|format| format.media_type == MediaType::Banner)
         .map(|format| (format.width, format.height))
         .collect()
 }
@@ -262,12 +273,16 @@ pub fn compare_page_evidence(
 
         let banner = banner_sizes(slot);
         let mut warnings = Vec::new();
+        // `expected_slots_for_path` drops a slot whose template does not render,
+        // so on the verify path this arm is unreachable; it exists for callers
+        // that build expected slots directly, and as a guard if that filter ever
+        // changes.
         if slot.gam_unit_path.is_none() {
             warnings.push(warning(
                 "gam_unit_path_unrenderable",
                 format!(
                     "slot `{}` gam_unit_path template renders past GAM's unit-path byte limit \
-                     for this page's section; the runtime rejects this config",
+                     for this page's section; the runtime omits this slot on this path",
                     slot.id
                 ),
             ));
@@ -285,7 +300,12 @@ pub fn compare_page_evidence(
                         slot.id
                     ),
                 ));
-                (SlotStatus::Partial, dom_id, Some(gpt.clone()), gpt.phase)
+                (
+                    SlotStatus::Unconfirmable,
+                    dom_id,
+                    Some(gpt.clone()),
+                    Some(gpt.phase),
+                )
             } else if gpt.sizes.is_empty() {
                 warnings.push(warning(
                     "out_of_page_slot",
@@ -294,7 +314,12 @@ pub fn compare_page_evidence(
                         slot.id
                     ),
                 ));
-                (SlotStatus::Partial, dom_id, Some(gpt.clone()), gpt.phase)
+                (
+                    SlotStatus::Partial,
+                    dom_id,
+                    Some(gpt.clone()),
+                    Some(gpt.phase),
+                )
             } else if banner.iter().any(|size| gpt.sizes.contains(size)) {
                 let extra: Vec<(u32, u32)> = gpt
                     .sizes
@@ -322,7 +347,12 @@ pub fn compare_page_evidence(
                         ),
                     ));
                 }
-                (SlotStatus::Confirmed, dom_id, Some(gpt.clone()), gpt.phase)
+                (
+                    SlotStatus::Confirmed,
+                    dom_id,
+                    Some(gpt.clone()),
+                    Some(gpt.phase),
+                )
             } else {
                 warnings.push(warning(
                     "incompatible_sizes",
@@ -331,7 +361,12 @@ pub fn compare_page_evidence(
                         slot.id
                     ),
                 ));
-                (SlotStatus::Partial, dom_id, Some(gpt.clone()), gpt.phase)
+                (
+                    SlotStatus::Partial,
+                    dom_id,
+                    Some(gpt.clone()),
+                    Some(gpt.phase),
+                )
             }
         } else if let Some(dom) = resolved {
             warnings.push(warning(
@@ -342,24 +377,11 @@ pub fn compare_page_evidence(
                 SlotStatus::Partial,
                 Some(dom.dom_id.clone()),
                 None,
-                dom.phase,
+                Some(dom.phase),
             )
         } else {
-            (SlotStatus::Missing, None, None, EvidencePhase::InitialLoad)
+            (SlotStatus::Missing, None, None, None)
         };
-
-        if let Some(aps_slot_id) = &slot.aps_slot_id {
-            let matched = evidence
-                .aps_calls
-                .iter()
-                .any(|call| &call.slot_id == aps_slot_id);
-            if !matched {
-                warnings.push(warning(
-                    "aps_evidence_missing",
-                    format!("configured APS slot `{aps_slot_id}` had no fetchBids evidence"),
-                ));
-            }
-        }
 
         slots.push(SlotResult {
             id: slot.id.clone(),
@@ -454,11 +476,10 @@ mod tests {
                 .map(|&(width, height)| ExpectedFormat {
                     width,
                     height,
-                    media_type: "banner".to_string(),
+                    media_type: MediaType::Banner,
                 })
                 .collect(),
             providers: providers.iter().copied().map(String::from).collect(),
-            aps_slot_id: providers.contains(&"aps").then(|| id.to_string()),
             page_patterns: Vec::new(),
         }
     }
@@ -471,10 +492,9 @@ mod tests {
             formats: vec![ExpectedFormat {
                 width: 0,
                 height: 0,
-                media_type: "video".to_string(),
+                media_type: MediaType::Video,
             }],
             providers: Vec::new(),
-            aps_slot_id: None,
             page_patterns: Vec::new(),
         }
     }
@@ -669,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn non_banner_only_slot_is_partial() {
+    fn non_banner_only_slot_is_unconfirmable_and_does_not_fail_strict() {
         let expected = expected_slot_video("video", "ad-video-", "/123/news/video");
         let evidence = evidence(
             vec![dom("ad-video-0")],
@@ -683,12 +703,16 @@ mod tests {
             RuntimeGateSummary::unknown_allowed(),
         );
 
-        assert_eq!(result.slots[0].status, SlotStatus::Partial);
+        assert_eq!(result.slots[0].status, SlotStatus::Unconfirmable);
         assert!(
             result.slots[0]
                 .warnings
                 .iter()
                 .any(|w| w.code == "unsupported_format")
+        );
+        assert!(
+            !result.strict_failed(),
+            "checker limitations should not fail strict"
         );
     }
 
@@ -719,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn out_of_page_gpt_slot_warns_and_does_not_confirm() {
+    fn sizeless_live_slot_is_partial_when_config_declares_banner_sizes() {
         let expected = expected_slot(
             "interstitial",
             "ad-oop-",
@@ -739,12 +763,16 @@ mod tests {
             RuntimeGateSummary::unknown_allowed(),
         );
 
-        assert_ne!(result.slots[0].status, SlotStatus::Confirmed);
+        assert_eq!(result.slots[0].status, SlotStatus::Partial);
         assert!(
             result.slots[0]
                 .warnings
                 .iter()
                 .any(|w| w.code == "out_of_page_slot")
+        );
+        assert!(
+            result.strict_failed(),
+            "a live sizeless slot drifting from configured banner sizes must fail strict"
         );
     }
 
@@ -774,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn aps_missing_warns_but_keeps_confirmed() {
+    fn server_side_aps_config_does_not_require_client_fetch_bids_evidence() {
         let expected = expected_slot("atf", "ad-atf-", "/123/news/atf", &[(300, 250)], &["aps"]);
         let evidence = evidence(
             vec![dom("ad-atf-0")],
@@ -793,12 +821,7 @@ mod tests {
             SlotStatus::Confirmed,
             "missing APS does not flip status"
         );
-        assert!(
-            result.slots[0]
-                .warnings
-                .iter()
-                .any(|w| w.code == "aps_evidence_missing")
-        );
+        assert!(result.slots[0].warnings.is_empty());
         assert!(
             !result.strict_failed(),
             "provider warning alone must not fail strict"
