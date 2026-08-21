@@ -76,9 +76,9 @@ commit produced the hosted artifact.
 2. **Ref pinning:** any ref is accepted; the CLI always resolves it to
    a commit SHA and stamps that SHA into the manifest.
 3. **Build owner:** cloned forks live in a CLI-owned cache and are
-   built there automatically (`npm ci` then `npx gulp build`), skipped
-   when the stamped last-built SHA matches. Local paths must already be
-   built.
+   built there automatically (`npm ci --include=dev` then
+   `npx --no-install gulp build`), skipped when the stamped last-built
+   SHA matches. Local paths must already be built.
 4. **Flag shape:** one flag/key with classification by shape
    (`https://`, `git@`, or `ssh://` means git; anything else is a
    path), not separate `--prebid-dir` and `--prebid-repo` options.
@@ -242,12 +242,17 @@ For `Git`:
 4. Resolve the requested ref to a commit OID against the freshly
    fetched remote state: `refs/remotes/origin/<ref>` for branches,
    `refs/tags/<ref>` for tags, and the OID itself for a full or
-   abbreviated SHA. When no ref is given, query the remote's current
-   default branch with `git ls-remote --symref origin HEAD` rather
-   than trusting a possibly stale local `origin/HEAD`. Never resolve a
-   bare local branch name: after the first checkout a local branch
-   would pin the old commit while `origin/<ref>` advances, silently
-   skipping rebuilds of a moving branch.
+   abbreviated SHA. Every candidate is resolved through
+   `git rev-parse --verify '<candidate>^{commit}'` so annotated and
+   signed tags peel to the commit they point at; resolving
+   `refs/tags/<ref>` directly would yield the tag-object OID, not the
+   commit OID the manifest promises. When no ref is given, query the
+   remote's current default branch with
+   `git ls-remote --symref origin HEAD` rather than trusting a
+   possibly stale local `origin/HEAD`. Never resolve a bare local
+   branch name: after the first checkout a local branch would pin the
+   old commit while `origin/<ref>` advances, silently skipping
+   rebuilds of a moving branch.
 5. Read the stamp file `.ts-prebid-build-stamp` in the checkout. Skip
    the build only when it names the same OID and the full built-layout
    validation from Design section 3 passes (`package.json`,
@@ -256,19 +261,24 @@ For `Git`:
    `node_modules/`) triggers an automatic rebuild, not an error.
 6. When building: delete the stamp file first, then force the
    checkout to the exact commit content with
-   `git checkout --detach <oid>`, `git reset --hard <oid>`, and
-   `git clean -dff`. A detached checkout alone preserves
-   non-conflicting tracked modifications, so leftovers from a failed
-   earlier build could otherwise be bundled while the clean OID gets
-   stamped. Deleting the stamp before mutating also means a run that
-   dies mid-build leaves no stamp, and the next run at any OID
-   rebuilds from reset state instead of trusting a contaminated
+   `git checkout --force --detach <oid>`, `git reset --hard <oid>`,
+   and `git clean -dffx`. The `--force` matters because a plain
+   detached checkout can refuse to move off a dirty tree, wedging the
+   cache before the reset runs; a non-forced checkout also preserves
+   non-conflicting tracked modifications. The `-x` matters because
+   Prebid gitignores its build output (`dist/` and friends), so a
+   plain `clean -dff` would carry stale artifacts from a previous OID
+   into the next build. Deleting the stamp before mutating also means
+   a run that dies mid-build leaves no stamp, and the next run at any
+   OID rebuilds from reset state instead of trusting a contaminated
    checkout.
-7. Run `npm ci` then `npx --no-install gulp build` in the checkout
-   (gulp is one of Prebid's dev dependencies, so it is present after
-   `npm ci`; `--no-install` prevents npx from fetching an arbitrary
-   gulp from the registry), forwarding stdout/stderr like the
-   generator does.
+7. Run `npm ci --include=dev` then `npx --no-install gulp build` in
+   the checkout, forwarding stdout/stderr like the generator does.
+   gulp is one of Prebid's dev dependencies, and `--include=dev`
+   guarantees it installs even under ambient npm configuration that
+   omits dev dependencies (for example `NODE_ENV=production`);
+   `--no-install` prevents npx from fetching an arbitrary gulp from
+   the registry.
 8. Re-run the full built-layout validation, and only then write the
    stamp file with the built OID. The checkout directory becomes the
    package directory, and the lock guard travels inside
@@ -328,17 +338,21 @@ new `source` key in `manifest.json`:
 }
 ```
 
-The recorded `url` is the sanitized form: userinfo is stripped even in
-the allowed bare-username SSH forms, so the manifest never republishes
-the operator's original authority string. Cloning always uses the URL
-as the operator supplied it; only the provenance is sanitized.
+The recorded `url` is the URL as supplied, which the rejection rules
+in Design section 2 already guarantee is credential-free. Allowed
+bare-username SSH forms keep their username: stripping `git@` from
+`ssh://git@example.com/...` or from the SCP-style form would record a
+URL that no longer clones the same remote, defeating provenance.
 
 For a path source, provenance is best effort: the CLI records
 `{ "kind": "path", "path": "/abs/path" }` and, when the path sits
 inside a git work tree, adds the checkout's `HEAD` commit and a
-`dirty` flag from `git status --porcelain`. A dirty or non-git path
-source cannot pin an exact commit, which is the documented trade-off
-of path mode against git mode.
+`dirty` flag from `git --no-optional-locks status --porcelain`. The
+`--no-optional-locks` flag keeps the inspection read-only: a default
+`git status` refreshes stat information into the index, which would
+violate the never-mutate guarantee for path sources. A dirty or
+non-git path source cannot pin an exact commit, which is the
+documented trade-off of path mode against git mode.
 
 The CLI always passes `--source`, including `{ "kind": "npm" }` for
 the default mode; the generator's own default (writing
@@ -367,8 +381,8 @@ prints the resolved source in its summary output.
   directory is never written to.
 - URL hygiene: `https://` userinfo, a userinfo password on any scheme,
   and query strings are rejected; `ssh://git@host/...` and
-  `git@host:path` forms are accepted; recorded provenance URLs are
-  sanitized of userinfo.
+  `git@host:path` forms are accepted and recorded as supplied,
+  username included, so the provenance URL stays clone-equivalent.
 - Relative path resolution: a relative config `source` resolves
   against the config file's directory; a relative `--prebid-source`
   resolves against the working directory.
@@ -383,18 +397,22 @@ prints the resolved source in its summary output.
   `PrebidBundleGenerator` isolates npm) so unit tests can script git
   and build outcomes: clone-vs-fetch selection, the explicit fetch
   refspecs, remote-side ref resolution including the
-  `ls-remote --symref` default-branch query, reset-and-clean before a
-  build, stamp deletion before mutation and stamp write only after
-  post-build validation, build skip requiring both a matching OID and
-  the full built-layout validation, lock acquisition, and process
-  failures. In addition, integration tests drive the real git logic
-  against temporary local repositories created in the test (`git init`
-  fixtures with the built-package layout committed), with only the
-  npm/gulp build step stubbed through the runner. These cover the
-  moving-branch case (the fixture branch advances between two resolves
-  and the second run must rebuild at the new OID rather than reuse the
-  stale one) and the dirty-checkout case (tracked files modified after
-  a simulated failed build must not survive into the next build).
+  `ls-remote --symref` default-branch query and `^{commit}` peeling,
+  the forced checkout/reset/clean sequence before a build, stamp
+  deletion before mutation and stamp write only after post-build
+  validation, build skip requiring both a matching OID and the full
+  built-layout validation, lock acquisition, dev-dependency-forcing
+  install flags, and process failures. In addition, integration tests
+  drive the real git logic against temporary local repositories
+  created in the test (`git init` fixtures with the built-package
+  layout committed), with only the npm/gulp build step stubbed through
+  the runner. These cover the moving-branch case (the fixture branch
+  advances between two resolves and the second run must rebuild at the
+  new OID rather than reuse the stale one), an annotated-tag fixture
+  (the resolved OID must be the peeled commit, not the tag object),
+  and the dirty-checkout case (tracked modifications and gitignored
+  leftovers from a simulated failed build must not survive into the
+  next build).
 - Lock lifetime is structural rather than test-only:
   `ResolvedPrebidSource` owns the guard, and a test asserts the lock
   is still held while the generator callback runs.
