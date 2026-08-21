@@ -1,7 +1,7 @@
 # Documentation Refresh (Full Surface)
 
 **Date:** 2026-08-19
-**Revised:** 2026-08-21 (round 6; addresses all six pre-implementation reviews)
+**Revised:** 2026-08-21 (round 7; addresses all seven pre-implementation reviews)
 **Status:** Draft, pending review
 **Scope:** Documentation and doc tooling. No runtime behavior changes.
 Baseline audited at `main` commit `2e85a1cdc` (2026-08-18); realigned and
@@ -20,7 +20,7 @@ Trusted Server's documentation spans four surfaces: the VitePress site
 (`docs/`), root and per-crate markdown, in-code documentation (rustdoc, clap
 help, JSDoc), and configuration templates (`trusted-server.example.toml`,
 `fastly.toml`, `edgezero.toml`, `.env.example`, `.env.dev`). A four-track
-audit of `main`, hardened by six pre-implementation reviews, found systemic
+audit of `main`, hardened by seven pre-implementation reviews, found systemic
 drift in every surface. The failures fall into six categories:
 
 1. **Fabricated or dead content presented as real.** The API reference
@@ -415,8 +415,15 @@ fences with no classification.
   credential fixture (e.g. the `fastly.toml` local JWKS material),
   historical example, service ID - each entry carrying owner, rationale,
   and expiry/review date; the scanner rejects expired or orphaned
-  entries. The scanner and allowlist scaffolding land in WP8a so this
-  pass can use them. `CLAUDE.md`'s example-domains-only policy gains a
+  entries, plus a hash-pinned test-fixture category for fixtures that
+  are semantically necessary as-is. Remediation of non-document tracked
+  files the all-tracked scan surfaces (e.g. the scraped
+  `html_processor.test.html` fixture carrying real-looking domains,
+  author names, and social identities) is owned by this WP2 pass:
+  fixtures are re-cut with reserved `.example` data and their regression
+  tests re-run; binaries and generated outputs are excluded by
+  manifest-listed path. The scanner and allowlist scaffolding land in
+  WP8a so this pass can use them. `CLAUDE.md`'s example-domains-only policy gains a
   sentence describing the exception model (WP6 makes that edit).
 - Re-verify the pages touched by the final six rc commits:
   `docs/guide/integrations/datadome.md` (the staging requirement was
@@ -552,8 +559,11 @@ integrations can skip typed deserialization entirely.
   `cargo metadata` acceptance are all unchanged and the new `syn`
   dependency never enters the workspace lockfile. It is run as
   `cargo run --manifest-path tools/docs-parity/Cargo.toml -- check|generate`
-  with a JSON output schema checked into the tool, ships its own README,
-  and gets explicit host `fmt`/`clippy`/`test` steps in WP8b CI. It parses the config struct definitions and
+  with a JSON output schema checked into the tool. It ships its own
+  README and a committed `Cargo.lock`, gets a Dependabot `cargo` entry
+  for `/tools/docs-parity` and a CI cache key tied to that nested
+  lockfile (WP8b), and gets explicit host `fmt`/`clippy`/`test` steps in
+  WP8b CI. It parses the config struct definitions and
   their serde attributes - field-level (`rename`, `alias`, `default`,
   `flatten`, `skip`, `skip_deserializing`, `deserialize_with`) AND
   container/variant-level (`rename_all`, `deny_unknown_fields`, `tag`,
@@ -574,14 +584,23 @@ integrations can skip typed deserialization entirely.
   Rust serde surface to machine inventory to template to generated
   markdown, checked in both directions: a newly added field breaks CI
   until inventory, template, and reference are updated. The inventory
-  carries semantics, not just names and shapes: resolved default (from
-  `default =` functions), requiredness, accepted grammar, units, ranges
+  carries semantics, not just names and shapes: resolved defaults,
+  requiredness, accepted grammar, units, ranges
   (the extractor also parses `#[validate(...)]` attributes; manual
   normalization and cross-field rules live in the companion manifest),
   sensitivity (Redacted-typed fields), deprecation/alias status, and a
   source anchor - so a published default, range, or conditional
   requirement that contradicts the code fails parity rather than passing
-  as a matching field name. `serde(skip)` implementation fields (e.g.
+  as a matching field name. Defaults use a realizable mechanism, not
+  AST evaluation: `syn` cannot execute the ~87 `default_*` functions
+  (some build vectors, nested structs, or call generated helpers), so
+  the extractor records only literal defaults directly; every
+  nonliteral or type-level (`#[serde(default)]`) default requires a
+  companion-manifest value, fail-closed, and a compiled probe test in
+  core's suite deserializes a minimal document per struct and asserts
+  each documented default equals the actually resolved value - the
+  manifest is tested against real deserialization, never trusted.
+  `serde(skip)` implementation fields (e.g.
   `Handler`'s compiled regex) are never documented config paths, and the
   extractor asserts that. Reconcile
   `docs/guide/configuration.md`'s field tables against that inventory. This audits the five existing integration
@@ -676,7 +695,19 @@ path) agree with the published tables.
   - `docs/guide/cloudflare.md`: wrangler config, `TRUSTED_SERVER_KV`
     binding, `TRUSTED_SERVER_CONFIG` var with blob envelope, missing
     `/health`, no asset routes/filters/telemetry (per the capability
-    matrix).
+    matrix). The lifecycle has the same disconnect as Axum, documented
+    honestly: `ts provision`/`ts config push` write the blob into the
+    EdgeZero config store (Wrangler KV), but Worker startup reads only
+    the `TRUSTED_SERVER_CONFIG` `[vars]` JSON - so the generic
+    push-then-deploy journey can exit 0 while producing a Worker that
+    fails startup. Decided fix, docs-only: the guide documents the
+    bridge - transfer the generated blob envelope into the Wrangler
+    variable (the integration suite already starts the Worker this way)
+    - with an end-to-end Cloudflare first-success smoke, and warns that
+      a green push does not configure the Worker. A named follow-up
+      (below) makes the Worker read the EdgeZero config store natively;
+      the support matrix row says "deployable with a documented config
+      bridge" until it lands.
   - `docs/guide/axum-dev.md`: explicitly a local-development guide
     (env-var-backed stores, `PORT`, unsupported admin ops), not a
     deployment target.
@@ -749,6 +780,13 @@ path) agree with the published tables.
   behavior claims. Update `docs/guide/testing.md` to cover
   cloudflare/spin/parity/CLI/browser suites and replace the fictional
   two-job CI YAML with the real seven-job layout.
+- Secret-exposure warning, owned here and in WP3's config docs:
+  `TrustedServerAppConfig::secret_fields()` is intentionally empty, so
+  configuration secrets travel inline in the blob - `ts config diff`,
+  `--dry-run`, and push output can therefore print secret values, and
+  the CLI and configuration pages must warn operators not to paste that
+  output into issues or retain it in public CI logs. Redaction or
+  secret-store migration is a separately tracked code follow-up.
 - `docs/guide/cli.md`: full command reference generated from the built
   binary's recursive help tree (Appendix D). rc already covers
   `config diff`, `ts dev proxy`, `audit generate`, and the ad-template
@@ -828,6 +866,14 @@ serve`; link the deployment guides; refresh the doc-site link table.
 - `.claude/skills/**`: audit the operator-facing skills (including the
   Fastly deployment skill) against current commands and config, same truth
   standard as the command files.
+- Retired-token cleanup for the active maintained internal set happens
+  HERE, not in WP6, because WP2's own checkpoint acceptance greps these
+  files: `.claude/agents/code-architect.md:16` (`RequestWrapper`),
+  `.claude/agents/issue-creator.md:85` (Equativ affected-area entry), and
+  any sibling occurrences. WP6 keeps the deeper agent-instruction audit;
+  WP2 only removes falsehoods. Checkpoint acceptance is scoped to the
+  surfaces the package touches; the full-set greps run again at final
+  HEAD.
 - Human-facing workflow comments join the maintained truth set. Two
   known-false comments are repaired: `.github/workflows/test.yml` (Spin
   release-build comment claims environment overrides make the artifact
@@ -855,8 +901,9 @@ serve`; link the deployment guides; refresh the doc-site link table.
 Acceptance: every workspace package reported by `cargo metadata` has a
 README (the metadata-based WP8 check is authoritative);
 every pre-existing root/crate/skill document has a recorded
-verified/rewritten/retired disposition; README quick start commands all run
-against the PR HEAD.
+verified/rewritten/retired disposition; README quick start journeys satisfy
+their first-success contracts (Axum and Fastly smokes in Verification),
+not merely "commands run".
 
 ### WP7: In-code documentation
 
@@ -1003,7 +1050,13 @@ Semantic parity checks (each catches a class of drift this audit found):
 - Route parity: a test per adapter asserting its registered route set,
   methods, and response semantics/status for guarded routes match the
   machine-readable inventory that feeds the api-reference generated
-  regions. Route definitions expose only path, methods, and handler, so
+  regions. Fastly, Axum, and Spin expose named route collections;
+  Cloudflare builds routes inline in `build_router` with catch-all
+  fallbacks, and black-box tests cannot prove no undocumented route
+  exists - so `docs-parity` additionally source-parses the Cloudflare
+  builder chain's registration calls (string-literal paths and methods)
+  and asserts equality with the checked inventory, with catch-alls
+  represented as family entries. Route definitions expose only path, methods, and handler, so
   the generated regions cover the route/availability tables; the
   per-endpoint contract prose (auth, schemas, headers, cache/CORS, config
   gates, rate limits) is explicitly manually owned, marked as such in the
@@ -1063,7 +1116,14 @@ Semantic parity checks (each catches a class of drift this audit found):
   fences compile; JS/TS and YAML fences parse (typecheck where cheap);
   HTTP fences are checked against the route inventory (method and path
   must exist); HTML/CSS fences get structural checks or explicit manual
-  waivers. Manual waivers are not an open escape hatch: each
+  waivers. Deliberately wrong examples are first-class, not perpetual
+  waivers: modes `compile_with_harness`, `expected_compile_failure`, and
+  `expected_validation_failure` (each with the expected error
+  code/pattern) plus `illustrative_fragment` (with source anchor) cover
+  the error-reference style of intentionally malformed TOML and invalid
+  values, and a negative example FAILS CI when it unexpectedly becomes
+  valid or stops producing its documented error. Manual waivers remain
+  for the rest and are not an open escape hatch: each
   carries owner, reason, expiry/review date, and source anchor, and CI
   fails on expired waivers and on unclassified new fences.
 - Domain/credential scanner: a deterministic scan for secrets, PII,
@@ -1076,6 +1136,11 @@ Semantic parity checks (each catches a class of drift this audit found):
   finds is scrubbed from the current tree; whether a finding warrants
   credential rotation or history rewriting is escalated to the
   maintainer as a per-finding decision, recorded in the audit inventory.
+- The disposition schema covers non-page surfaces too: workflow/action
+  files, script usage headers, adapter-manifest comment surfaces, agent
+  and skill files get region-level dispositions with source anchors
+  (membership in the maintained-source manifest proves enumeration, not
+  review; the disposition proves review).
 - Disposition inventory closure: pages and READMEs created by later
   packages (WP5, WP6) enter the inventory with a `created` disposition,
   and the WP8b inventory gate requires exact equality between the
@@ -1085,23 +1150,28 @@ Semantic parity checks (each catches a class of drift this audit found):
 - Repo inventory: a CI script checking workspace members each have a
   README (via `cargo metadata`, the authoritative package list, not a
   `find` over directories) and every active public page is reachable from
-  the sidebar or an explicit orphan allowlist.
+  the sidebar or an explicit orphan allowlist; the allowlist has a typed
+  `tombstone` entry kind, valid only for pages carrying canonical
+  successor metadata and covered by an old-route smoke, so the gam/kargo
+  tombstones pass the no-orphan gate by declaration, not exception.
 - Gate manifest: one checked manifest of the canonical CI gates, compared
   against the workflows, with an enumerated surface list and a mode per
-  surface: generated regions in `CLAUDE.md`, `TESTING.md`, and
-  `docs/guide/testing.md` (the documents that reproduce the full list);
-  link-only for `AGENTS.md`, `.claude/commands/*.md`,
-  `.claude/agents/**`, `CONTRIBUTING.md`, and the PR template, which
-  point at the canonical region instead of copying it. The checker fails
-  on any gate-list-shaped reproduction outside a managed region, so
-  WP8b's own gate additions cannot silently invalidate WP1's alignment
-  of those same files at the final commit.
+  surface: generated regions in `CLAUDE.md`, `AGENTS.md` (it is the
+  fallback for agents that cannot read `CLAUDE.md`, so it must carry the
+  list, not a link), `TESTING.md`, and `docs/guide/testing.md`;
+  link-only for `.claude/commands/*.md`, `.claude/agents/**`,
+  `CONTRIBUTING.md`, and the PR template, which point at the canonical
+  region instead of copying it. Every package's acceptance is
+  mode-aware (WP1's alignment of the command files means converting
+  them to links), and the checker fails on any gate-list-shaped
+  reproduction outside a managed region, so WP8b's own gate additions
+  cannot silently invalidate WP1's alignment of those same files at the
+  final commit.
 - `CLAUDE.md` CI gates section: update to the real gate list (it omits
   ESLint, the CLI/codegen clippy jobs, the bench compile check, the release
   WASM builds, and the entire integration-tests workflow), regenerated
-  from the gate manifest above together with `AGENTS.md`, the command
-  files, and the PR template, so all four surfaces change in the same
-  commit.
+  from the gate manifest above together with every other manifest
+  surface in its declared mode, all in the same commit.
 - A scoped `jsdoc/*` ESLint rule set over the WP7 TypeScript files is
   mandatory (a PR-description grep count provides no recurrence
   protection); the plugin is already installed with zero rules enabled.
@@ -1116,8 +1186,9 @@ unclassified or expired-waiver snippet fence, a missing JSDoc block in a
 WP7-scoped file, a route/CLI/config/integration inventory change without
 the matching regenerated markdown region (including a macOS-only CLI
 divergence), a missing crate README or unlisted orphan page, a gate-list
-mismatch in any of the four human-facing surfaces, and a removed
-manual-ownership marker. Static configuration assertions - checked once
+mismatch in any gate-manifest surface (the fixture iterates every
+manifest entry in its declared mode, not a hard-coded list), and a
+removed manual-ownership marker. Static configuration assertions - checked once
 in review with the evidence linked in the PR description, not fixtures:
 CodeQL branch triggers, normalized cache keys, Dependabot roots, pinned
 Wrangler/checker versions. Regenerating all generated regions and both
@@ -1171,6 +1242,17 @@ Before the rc PR is marked ready, at its final HEAD:
   publisher-proxy request against a local stub origin returns the
   expected rewritten HTML; the run and cleanup steps are recorded in the
   PR description.
+- A Fastly quick start smoke with the same first-success contract: the
+  checked-in Viceroy config store is empty and Fastly startup swaps in a
+  startup-error router on load failure, so "the process starts" is false
+  confidence. The contract: initialize and validate a config,
+  `ts config push --adapter fastly --local`, start
+  `fastly compute serve`, assert `/health`, exercise one publisher
+  request against a stub origin, then clean up (the local push mutates
+  `fastly.toml`, so the smoke restores it).
+- The Cloudflare first-success smoke per the WP5 bridge: push, transfer
+  the blob into the Wrangler variable, `wrangler dev`, assert a
+  non-health route serves.
 
 ## Open questions
 
@@ -1227,6 +1309,12 @@ where stated.
   the WP5 Spin deployment
   guide; until fixed, docs label Spin experimental. A `spin up` smoke test
   proving non-health traffic belongs to the fix's acceptance criteria.
+- The Cloudflare Worker does not read the EdgeZero config store that
+  `ts provision`/`ts config push --adapter cloudflare` write (Wrangler
+  KV); startup consumes only the `TRUSTED_SERVER_CONFIG` `[vars]` JSON.
+  Wire the store read natively so the documented bridge (WP5) becomes
+  unnecessary; until then the bridge is the documented path and the
+  support matrix says so.
 - `ts serve --adapter axum` does not consume the local config store that
   `ts config push --adapter axum --local` writes; the server reads only
   `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` environment variables. Wire the
@@ -1324,8 +1412,12 @@ registry API exposes all of it, so WP8 tests them separately:
 Named sets and expected counts, so the set-equality assertions are
 unambiguous: deploy/config-validated integration IDs (14), Rust registry
 registrations (13; no `adserver_mock`), auction-provider IDs (3: prebid,
-aps, adserver_mock), JS bundle modules (core, per-integration bundles,
-plus the always-injected `creative`). The overview table renders the 14
+aps, adserver_mock), JS integration module IDs (12 `index.ts` modules -
+13 integration directories, but `aps` ships only a render helper with no
+bundle - including the always-injected `creative`), and emitted bundle
+outputs (13: the 12 modules plus the core bundle; core is a build
+artifact, not an integration, and the capability record never represents
+it). The overview table renders the 14
 configurable IDs plus one separate row for JS-only `creative` (15 rows
 total). "All 14 integration IDs" elsewhere in this spec means the
 deploy/config-validated set.
