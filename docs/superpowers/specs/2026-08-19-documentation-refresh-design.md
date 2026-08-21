@@ -1,7 +1,7 @@
 # Documentation Refresh (Full Surface)
 
 **Date:** 2026-08-19
-**Revised:** 2026-08-20 (round 4; addresses all four pre-implementation reviews)
+**Revised:** 2026-08-21 (round 5; addresses all five pre-implementation reviews)
 **Status:** Draft, pending review
 **Scope:** Documentation and doc tooling. No runtime behavior changes.
 Baseline audited at `main` commit `2e85a1cdc` (2026-08-18); realigned and
@@ -20,7 +20,7 @@ Trusted Server's documentation spans four surfaces: the VitePress site
 (`docs/`), root and per-crate markdown, in-code documentation (rustdoc, clap
 help, JSDoc), and configuration templates (`trusted-server.example.toml`,
 `fastly.toml`, `edgezero.toml`, `.env.example`, `.env.dev`). A four-track
-audit of `main`, hardened by four pre-implementation reviews, found systemic
+audit of `main`, hardened by five pre-implementation reviews, found systemic
 drift in every surface. The failures fall into six categories:
 
 1. **Fabricated or dead content presented as real.** The API reference
@@ -157,7 +157,8 @@ under `docs/superpowers/`, legitimately contain every retired term):
 - **Active public set:** everything VitePress builds, i.e. `docs/**`
   excluding the WP1 `srcExclude` list. This is what site visitors see.
 - **Active repo set:** root markdown (`README.md`, `CONTRIBUTING.md`,
-  `TESTING.md`, `CHANGELOG.md`, `ProjectGovernance.md`, `AGENTS.md`,
+  `TESTING.md`, `CHANGELOG.md`, `FAQ_POC.md` until it is actually
+  retired, `ProjectGovernance.md`, `AGENTS.md`,
   `CLAUDE.md`), crate READMEs, config templates
   (`trusted-server.example.toml`, `fastly.toml`, `edgezero.toml`,
   `.env.example`, `.env.dev`), and `.claude/commands/*.md`.
@@ -224,7 +225,9 @@ under `docs/superpowers/`, legitimately contain every retired term):
   WP5's no-orphan acceptance (the page presents planned headless-browser
   malvertising detection as shipped while the roadmap calls it planned).
   Open question 4 records the alternative of an evidence-based rewrite in
-  this pass. `docs/roadmap.md` gets a
+  this pass. While it remains in the repository unpublished, the source
+  file carries a prominent top banner stating it is unverified and
+  excluded from the site. `docs/roadmap.md` gets a
   factual status pass (shipped/active/deferred labels, correct crate names),
   not a strategy rewrite.
 - No release-management policy changes. The CHANGELOG's 10-month untagged
@@ -258,10 +261,15 @@ the live site until rc merges to main. Therefore:
   straight to `main` so the exposure closes immediately. Its contents are
   exactly: the `srcExclude` change (covering `superpowers/**`,
   `internal/**`, `epics/**`, `guide/onboarding.md`, `README.md`, and
-  `business-use-cases.md`) and the onboarding move/scrub. Nothing else -
-  neither the CNAME resolution nor the marketing-page disposition blocks
-  or rides in it. The rc PR carries the same changes; the rc→main merge
-  reconciles to an identical state.
+  `business-use-cases.md`), the onboarding move/scrub, the filled Guide
+  landing page (`docs/guide/index.md` is empty today, and the post-deploy
+  smoke asserts it), and the navigation edits that removing pages forces:
+  retarget the top-nav Guide link at the landing page and drop the
+  Business Value nav item. Removing every link to an excluded source is a
+  containment invariant - a build that navigates to excluded pages fails.
+  Nothing else - neither the CNAME resolution nor the marketing-page
+  content disposition blocks or rides in it. The rc PR carries the same
+  changes; the rc→main merge reconciles to an identical state.
 - Everything else lands only in the single rc PR.
 - CodeQL today analyzes only PRs targeting `main`, so the rc PR carrying
   new workflows, generators, and scripts would go unanalyzed. Decision:
@@ -349,10 +357,10 @@ the continuing control. Token greps establish that retired names are
 gone; they cannot validate commands, APIs, auth, or behavior, so each
 "verified" disposition means the page's commands and examples were actually
 checked against code, and executable fences are governed by the WP8
-snippet manifest: every Rust/shell/TOML/JSON fence in every non-historical
-set gets a checked-in disposition (graded modes per WP8, from compile and
+snippet manifest: every nonempty fence in every non-historical set gets a
+checked-in disposition (graded modes per WP8, from compile and
 typed-validation down to expiring manual waivers), and CI fails on new
-executable fences with no classification.
+fences with no classification.
 
 - `docs/guide/api-reference.md`: delete `GET /first-party/ad` and
   `POST /third-party/ad` sections (endpoints do not exist). The full
@@ -382,10 +390,14 @@ executable fences with no classification.
   values; sweep both sets for other real domains, customer names, or
   credential-shaped strings. Reviewed canonical vendor endpoints (e.g. real
   GPT/DataDome CDN hosts an integration genuinely proxies) stay, everything
-  else becomes fictional. Legitimate vendor endpoints are recorded in a
-  checked-in allowlist (category, rationale, owner) that the WP8 scanner
-  reads; `CLAUDE.md`'s example-domains-only policy gains a sentence
-  describing this vendor-endpoint exception (WP6 makes that edit).
+  else becomes fictional. All exceptions live in ONE typed allowlist
+  schema - entry categories: vendor URL, exact-path/hash-pinned fake
+  credential fixture (e.g. the `fastly.toml` local JWKS material),
+  historical example, service ID - each entry carrying owner, rationale,
+  and expiry/review date; the scanner rejects expired or orphaned
+  entries. The scanner and allowlist scaffolding land in WP8a so this
+  pass can use them. `CLAUDE.md`'s example-domains-only policy gains a
+  sentence describing the exception model (WP6 makes that edit).
 - Re-verify the pages touched by the final six rc commits:
   `docs/guide/integrations/datadome.md` (the staging requirement was
   removed from protection behavior in the same commit that rewrote the
@@ -412,14 +424,15 @@ executable fences with no classification.
   development only. Fix `docs/roadmap.md:21-22` old crate names (`/common/`,
   `/cloudflare/`) and give roadmap line items shipped/active/deferred
   status labels.
-- Retire `docs/guide/integrations/gam.md` and `kargo.md` (delete pages,
-  remove sidebar entries). Neither integration exists; GAM ad serving is
-  already covered factually via GPT/creative-opportunities docs. Before
-  deletion, leave a static tombstone at EVERY previously published route
-  (successor link, canonical metadata, optional meta refresh) - inbound
-  discovery cannot find bookmarks or unindexed links, so tombstones are
-  unconditional, and old-route smoke tests assert they serve; a
-  client-side stub is not an HTTP redirect and is not claimed to be one.
+- Retire `docs/guide/integrations/gam.md` and `kargo.md`: the markdown
+  files are REPLACED with tombstone content (successor link, canonical
+  metadata, optional meta refresh) so every previously published route
+  keeps serving, unconditionally - inbound discovery cannot find
+  bookmarks or unindexed links; a client-side stub is not an HTTP
+  redirect and is not claimed to be one. Sidebar entries are removed;
+  old-route smoke tests assert the tombstones serve. Neither integration
+  exists; GAM ad serving is already covered factually via
+  GPT/creative-opportunities docs.
 - Retire `FAQ_POC.md`: its headline answer ("NOT ready for use", two-partner
   Fastly+Equativ POC) is false on every axis. Delete it (git history
   preserves it); fold any still-true answers into
@@ -501,11 +514,18 @@ integrations can skip typed deserialization entirely.
   `[cache]` section, promote the commented `[[cache.asset_rules]]` examples
   to a complete worked block covered by the WP8 example harness.
 - Field-path inventories, exact implementation (decided): a Serde-aware
-  AST extractor - a dev-only tool (`syn`-based, living with the WP8
-  checks, touching no production structs or dependencies) that parses the
-  config struct definitions and their serde attributes (`rename`,
-  `alias`, `default`, `flatten`, `skip`, `deserialize_with`,
-  `deny_unknown_fields`) into the machine inventory. A serializer walk is
+  AST extractor - a new dev-only tool crate, `tools/docs-parity`
+  (host-target, outside workspace default-members, the only place the new
+  `syn` dependency lives, so production crates and their dependency
+  closure are untouched), run as
+  `cargo run -p docs-parity -- check|generate` with a JSON output schema
+  checked into the tool. It parses the config struct definitions and
+  their serde attributes - field-level (`rename`, `alias`, `default`,
+  `flatten`, `skip`, `skip_deserializing`, `deserialize_with`) AND
+  container/variant-level (`rename_all`, `deny_unknown_fields`, `tag`,
+  `content`, `untagged`), since renamed/tagged enums change accepted
+  values - into the machine inventory, and FAILS CLOSED on any
+  shape-changing serde attribute it does not recognize. A serializer walk is
   explicitly rejected: it cannot see deserialization-only aliases
   (`pub_id` in `aps.rs`, `s3_sig_v4` in `settings.rs`), custom
   `deserialize_with` shapes, defaulted/`Option` fields, the flattened
@@ -691,8 +711,12 @@ path) agree with the published tables.
   journeys (evaluator, local developer, operator, integration author) as
   explicit acceptance walks.
 - Release identity: add a global banner stating the site is rolling
-  documentation of the unreleased `main` line, audited against a recorded
-  SHA. No versioned-docs machinery exists (Pages publishes one `main`
+  documentation of the unreleased `main` line. Provenance is mechanical:
+  the Pages build injects `GITHUB_SHA` (local builds use
+  `git rev-parse HEAD`), the banner links the exact build SHA, and the
+  deploy smoke asserts the built HTML contains it; the content-audit
+  baseline SHA (recorded in the audit inventory) is a distinct value and
+  labeled as such. No versioned-docs machinery exists (Pages publishes one `main`
   build; the blob envelope is an integrity check, not a schema/version
   handshake), so the banner promises none: per-release documentation, if
   ever wanted, is a separately designed follow-up. Compatibility guidance
@@ -749,6 +773,13 @@ serve`; link the deployment guides; refresh the doc-site link table.
 - `.claude/skills/**`: audit the operator-facing skills (including the
   Fastly deployment skill) against current commands and config, same truth
   standard as the command files.
+- Human-facing workflow comments join the maintained truth set. Two
+  known-false comments are repaired: `.github/workflows/test.yml` (Spin
+  release-build comment claims environment overrides make the artifact
+  boot with usable settings, but the Spin adapter loads the checked-in
+  example TOML directly; and the `test-cli` comment claims a workspace
+  default target that `.cargo/config.toml` does not set - the mechanism
+  is `Cargo.toml` `default-members`).
 - `.claude/agents/**`: audit every agent instruction file; they currently
   describe a three-crate Fastly-only workspace, cite the nonexistent
   `RequestWrapper` trait (`code-architect.md:11`, `repo-explorer.md:12`),
@@ -766,7 +797,8 @@ serve`; link the deployment guides; refresh the doc-site link table.
 - Add `readme = "README.md"` to each crate's `Cargo.toml` once the READMEs
   exist.
 
-Acceptance: `find crates -maxdepth 2 -name README.md` returns one per crate;
+Acceptance: every workspace package reported by `cargo metadata` has a
+README (the metadata-based WP8 check is authoritative);
 every pre-existing root/crate/skill document has a recorded
 verified/rewritten/retired disposition; README quick start commands all run
 against the PR HEAD.
@@ -775,12 +807,14 @@ against the PR HEAD.
 
 Targeted, not exhaustive. The worklist below is the acceptance scope.
 
-1. `core/src/lib.rs` module index: currently lists 12 of 40+ public modules
+1. `core/src/lib.rs` module index: currently lists 12 of 37 public modules
    and links a `test_support` module; make it complete and grouped
    (identity, consent, auction, HTML pipeline, proxy, platform, config).
-2. `core/src/platform/` (2/8 files documented): module docs for `traits.rs`,
-   `types.rs`, `kv.rs`, `http.rs`, `error.rs`. This is the cross-adapter
-   contract and the highest-value rustdoc gap in the repo.
+2. `core/src/platform/` (on rc: 4 of 10 files carry `//!` - `mod.rs`,
+   `image_optimizer.rs`, `template_assembly.rs`, `template_cache.rs`):
+   module docs for `traits.rs`, `types.rs`, `kv.rs`, `http.rs`,
+   `error.rs`; the test-only module stays excluded. This is the
+   cross-adapter contract and the highest-value rustdoc gap in the repo.
 3. Crate-level `//!` headers for the crates missing them:
    `adapter-fastly` (`main.rs`), `adapter-cloudflare`, `trusted-server-js`,
    and `trusted-server-cli` (whose `lib.rs` already contains the right prose
@@ -892,16 +926,20 @@ Semantic parity checks (each catches a class of drift this audit found):
   (a) applies a deterministic substitution of the known placeholders and
   deliberately invalid disabled-block values (e.g. empty IDs) with
   synthetic valid values, and asserts the substituted template fully
-  parses and finalizes; (b) enumerates every `[integrations.*]` table in
-  the template - commented or uncommented, enabled or disabled (runtime
-  typed parsing deliberately skips explicitly disabled integrations, so
-  full-template finalization alone would false-green on them) - plus
-  every marker-delimited commented example block, and deserializes each
-  directly into its config struct with ignored-key detection (several
-  structs, including Permutive's, do not reject unknown fields), runs its
-  `Validate::validate`, and exercises the integration-specific
-  deploy/startup checks from `core/src/config.rs`, all independent of
-  `enabled`;
+  parses and finalizes; (b) groups the template's `[integrations.*]`
+  tables by their first-segment integration ID (nested tables such as
+  `[integrations.prebid.bundle]` are part of their parent's subtree, not
+  standalone configs), and for each of the 14 IDs deserializes the
+  complete subtree into its typed config struct with ignored-key
+  detection (several structs, including Permutive's, do not reject
+  unknown fields) and runs `Validate::validate`; because the runtime
+  path (`Settings::get_typed` and the deploy checks that delegate
+  through it) deliberately returns `None` for disabled integrations, the
+  harness then constructs an isolated `Settings` fixture per integration
+  with that integration forced enabled (14 named fixtures, with any
+  inter-integration dependencies stated explicitly) and runs the real
+  deploy/startup validation from `core/src/config.rs` against it; the
+  same treatment applies to marker-delimited commented example blocks;
   and (c) separately asserts the distributed template still contains the
   placeholder markers, so a template that would deploy without
   customization fails CI.
@@ -922,28 +960,42 @@ Semantic parity checks (each catches a class of drift this audit found):
   gated to macOS, and CI already runs the CLI suite on both hosts),
   merged into a platform-annotated union (including the dependency-owned
   `edgezero-cli` lifecycle flags at the locked version) that feeds the
-  cli.md generated region.
+  cli.md generated region. The generated projection is defined: command
+  and flag names, argument shapes, and defaults are generated verbatim;
+  description text passes through the same retired/internal-term gate as
+  prose, and descriptions that fail it (the vendored help currently
+  leaks internal spec references like "5.4" and "spec 3.3 Model A") are
+  replaced from a checked description-override table until the upstream
+  fix lands, so known-internal strings are never published.
 - Integration parity: a checked capability record, keyed by stable
-  integration/provider ID and including conditional expressions (e.g.
-  APS's proxy conditional on rendering mode), is the single source that
-  both the parity tests assert against the three inventories (registry
-  `builders()`, auction `provider_builders()`, JS module registry
-  including `JS_ALWAYS`) and the integrations-overview generated region
-  renders from. This record exists because no single registry API is
+  integration/provider ID, is the single source that both the parity
+  tests assert against the three inventories (registry `builders()`,
+  auction `provider_builders()`, JS module registry including
+  `JS_ALWAYS`) and the integrations-overview generated region renders
+  from. Conditions (APS's proxy conditional on rendering mode, DataDome's
+  request filter conditional on protection) use a small typed grammar -
+  capability, config predicate - not prose, and a fixture matrix
+  evaluates every condition in both states; the parity test requires set
+  equality against each inventory, not subset containment. This record exists because no single registry API is
   sufficient: `IntegrationMetadata` omits HTML post-processors and JS
   loading modes, and `provider_builders()` is a private list of bare
   function pointers without stable IDs.
 - Config parity: the field-path inventories from WP3 feed the
   configuration.md field tables' generated regions.
-- Snippet manifest: a checked-in manifest classifying every executable
+- Snippet manifest: a checked-in manifest classifying every nonempty
   fence in every non-historical set (active public, active repo, and
   active maintained internal - root READMEs, TESTING.md, agent and
-  command files included). Modes are graded to actually catch the
-  failures this audit found: shell fences distinguish syntax-only
+  command files included), all languages, not only the four the audit
+  started from (the active public pages alone carry ~30 HTML, ~13 HTTP,
+  ~8 JS/TS, ~5 CSS, and 1 YAML fence). Modes are graded to actually catch
+  the failures this audit found: shell fences distinguish syntax-only
   (`bash -n`) from command/flag-existence and help/dry-run checks, which
   are required for operator instructions; config fences use typed/schema
   validation via the WP3 inventory, not bare TOML/JSON parsing; Rust
-  fences compile. Manual waivers are not an open escape hatch: each
+  fences compile; JS/TS and YAML fences parse (typecheck where cheap);
+  HTTP fences are checked against the route inventory (method and path
+  must exist); HTML/CSS fences get structural checks or explicit manual
+  waivers. Manual waivers are not an open escape hatch: each
   carries owner, reason, expiry/review date, and source anchor, and CI
   fails on expired waivers and on unclassified new fences.
 - Domain/credential scanner: a deterministic scan for secrets, PII,
@@ -957,18 +1009,26 @@ Semantic parity checks (each catches a class of drift this audit found):
   credential rotation or history rewriting is escalated to the
   maintainer as a per-finding decision, recorded in the audit inventory.
 - Repo inventory: a CI script checking workspace members each have a
-  README, every active public page is reachable from the sidebar or an
-  explicit orphan allowlist, and the CI gate list in `CLAUDE.md` names the
-  jobs that actually exist in the workflows.
+  README (via `cargo metadata`, the authoritative package list, not a
+  `find` over directories) and every active public page is reachable from
+  the sidebar or an explicit orphan allowlist.
+- Gate manifest: one checked manifest of the canonical CI gates, compared
+  against the workflows AND against every human-facing copy - `CLAUDE.md`,
+  `AGENTS.md`, `.claude/commands/*.md`, and the PR template - so WP8b's
+  own gate additions cannot silently invalidate WP1's alignment of those
+  same files at the final commit.
 - `CLAUDE.md` CI gates section: update to the real gate list (it omits
   ESLint, the CLI/codegen clippy jobs, the bench compile check, the release
-  WASM builds, and the entire integration-tests workflow) so agents and the
-  slash commands stay aligned with reality.
+  WASM builds, and the entire integration-tests workflow), regenerated
+  from the gate manifest above together with `AGENTS.md`, the command
+  files, and the PR template, so all four surfaces change in the same
+  commit.
 - A scoped `jsdoc/*` ESLint rule set over the WP7 TypeScript files is
   mandatory (a PR-description grep count provides no recurrence
   protection); the plugin is already installed with zero rules enabled.
 
-Acceptance: every gate above is exercised by at least one negative
+Acceptance, in two explicitly separated classes. Executable regression
+fixtures - every runtime gate is exercised by at least one negative
 fixture proving it fails on the regression it exists to catch: a dead
 internal docs link, a broken intra-doc link, a failing doctest, an invalid
 or unknown-keyed example-config block (including a disabled integration
@@ -976,9 +1036,14 @@ table), a planted non-allowlisted domain or credential-shaped string, an
 unclassified or expired-waiver snippet fence, a missing JSDoc block in a
 WP7-scoped file, a route/CLI/config/integration inventory change without
 the matching regenerated markdown region (including a macOS-only CLI
-divergence), and a removed manual-ownership marker. Regenerating all
-generated regions and both CLI goldens at the final PR HEAD produces no
-diff; the scheduled link reporter's fixture test passes.
+divergence), a missing crate README or unlisted orphan page, a gate-list
+mismatch in any of the four human-facing surfaces, and a removed
+manual-ownership marker. Static configuration assertions - checked once
+in review with the evidence linked in the PR description, not fixtures:
+CodeQL branch triggers, normalized cache keys, Dependabot roots, pinned
+Wrangler/checker versions. Regenerating all generated regions and both
+CLI goldens at the final PR HEAD produces no diff; the scheduled link
+reporter's fixture test passes.
 
 ## Sequencing and estimate
 
@@ -996,7 +1061,8 @@ diff; the scheduled link reporter's fixture test passes.
 | 9     | WP8b gate activation                        | M    | WP2-WP7 (all gates must start green)                        |
 
 Commits land in this order within the single rc PR, after the spec commit;
-WP8 comes last so the new CI gates turn green on the same PR.
+WP8b comes last so the new CI gates turn green on the same PR (WP8a is
+deliberately early).
 
 ## Verification
 
@@ -1032,25 +1098,35 @@ Owner for all: the repo maintainer driving this refresh. Each question
 blocks the named package; none blocks starting WP2-WP7 content work except
 where stated.
 
-1. `fastly.toml` `service_id` (ops-owned follow-up; blocks nothing here):
-   needs an owner, a replacement mechanism, a non-production deployment
-   test, and rollback instructions.
+1. `fastly.toml` `service_id` (ops-owned follow-up): the allowlist entry
+   that lets the scanner pass requires an owner and review date up front,
+   so naming that owner blocks WP8a's scanner activation (not content
+   work); the migration itself (replacement mechanism, non-production
+   deployment test, rollback instructions) blocks nothing here.
 2. `docs/public/CNAME` (blocks only its own follow-up commit, never the
-   containment PR): delete (recommended, matches the `/trusted-server`
-   base path) or configure a real custom domain?
+   containment PR). Both branches are specified: delete (recommended,
+   matches the `/trusted-server` base path; smoke re-runs against project
+   URLs), or configure a real custom domain, which requires `base: '/'`,
+   Pages custom-domain + DNS + TLS configuration, and canonical-URL and
+   asset-URL smoke tests before it ships.
 3. `FAQ_POC.md` and the `gam.md`/`kargo.md` pages (blocks their WP2
-   deletions): this spec recommends deletion with an inbound-link inventory
-   and redirect stubs where referenced; confirm.
+   retirements): this spec recommends retiring them, with the gam/kargo
+   routes unconditionally preserved as tombstones. If deletion of
+   `FAQ_POC.md` is rejected, the defined fallback is archival under the
+   historical tree or a factual rewrite - it does not silently stay; it
+   remains in the active repo set until one of those happens.
 4. `docs/business-use-cases.md` (does not block containment - the default
    exclusion ships in it): default is exclusion from the built site until
    quantitative claims carry dated evidence and unshipped features are
    labeled; the alternative is an evidence-based rewrite in this pass.
-5. CHANGELOG release cut (blocks nothing; mechanical repairs are in WP2
-   either way): should a release be cut to drain the seven breaking
-   entries in `[Unreleased]`? If no release is cut, the deterministic WP2
-   edit is: keep the `[1.2.0]` section with an explicit "(tag v1.2.0 was
-   never published)" annotation, repoint the link references to
-   resolvable compares, and leave entries untouched.
+5. CHANGELOG (blocks nothing): release management stays out of scope
+   entirely - cutting a release to drain the seven breaking `[Unreleased]`
+   entries is a maintainer decision outside this project. The
+   deterministic WP2 edit assumes no release: keep the `[1.2.0]` section
+   with an explicit "(tag v1.2.0 was never published)" annotation, repoint
+   the link references to resolvable compares, and leave entries
+   untouched. If a release lands externally before this PR merges, the
+   branch rebases and re-audits rather than absorbing release work.
 6. Governance ownership (blocks the WP6 governance edit only): who owns
    naming maintainers/CODEOWNERS and the meeting-minutes commitment?
 7. Delivery shape (blocks starting implementation): confirm the shape in
@@ -1064,9 +1140,10 @@ where stated.
 ## Follow-up issues to file (code, not docs)
 
 - Spin adapter builds runtime settings from the checked-in
-  `trusted-server.example.toml` (`adapter-spin/src/app.rs:52`) and serves a
-  blanket 503 on startup failure while `/health` returns 200
-  (`adapter-spin/src/app.rs:404`). Blocking for the WP5 Spin deployment
+  `trusted-server.example.toml` (`build_state()` in
+  `adapter-spin/src/app.rs`) and serves a blanket 503 on startup failure
+  while `/health` returns 200 (`startup_error_router()`). Blocking for
+  the WP5 Spin deployment
   guide; until fixed, docs label Spin experimental. A `spin up` smoke test
   proving non-health traffic belongs to the fix's acceptance criteria.
 - Vendored `edgezero-cli` help text leaks internal spec references
@@ -1245,9 +1322,10 @@ baseline and re-verified on rc/202608 where marked.
 - Adapter support contradictions: `docs/index.md:27`,
   `docs/guide/what-is-trusted-server.md:32`, `docs/roadmap.md:19,34-38` vs
   `docs/guide/architecture.md:154-159`; Axum described as a deployment
-  target; Spin described as production-capable despite
-  `adapter-spin/src/app.rs:52` (settings from the checked-in example toml)
-  and `:404` (blanket 503 on startup failure); asset routes, request
+  target; Spin described as production-capable despite `build_state()`
+  loading the checked-in example toml and `startup_error_router()`
+  serving a blanket 503 on startup failure (`adapter-spin/src/app.rs`);
+  asset routes, request
   filters, image optimizer, and Tinybird emission are Fastly-only but
   documented as generic.
 - Aspirational sidebar pages: `docs/guide/integrations/gam.md` (no such
