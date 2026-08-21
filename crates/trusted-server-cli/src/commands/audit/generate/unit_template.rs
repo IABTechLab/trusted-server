@@ -145,9 +145,14 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
             root_witness_missing |= analyses
                 .values()
                 .any(|analysis| matches!(analysis, SlotAnalysis::RootUnwitnessed { .. }));
-            root_unwitnessed_stems.extend(analyses.iter().filter_map(|(stem, analysis)| {
-                matches!(analysis, SlotAnalysis::RootUnwitnessed { .. }).then(|| stem.clone())
-            }));
+            root_unwitnessed_stems.extend(
+                analyses
+                    .iter()
+                    .filter(|(_, analysis)| {
+                        matches!(analysis, SlotAnalysis::RootUnwitnessed { .. })
+                    })
+                    .map(|(stem, _)| stem.clone()),
+            );
             continue;
         };
         if roots.len() > 1 {
