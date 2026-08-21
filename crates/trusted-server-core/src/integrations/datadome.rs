@@ -68,7 +68,6 @@ use serde_json::Value as JsonValue;
 use url::Url;
 use validator::Validate;
 
-use crate::constants::ENV_FASTLY_IS_STAGING;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
@@ -90,7 +89,7 @@ pub use protection_scope::{
 use protection_scope::ProtectionScope;
 
 pub(crate) const DATADOME_INTEGRATION_ID: &str = "datadome";
-/// Fixed request header used by the staging-only protection test bypass.
+/// Fixed request header used by the configuration-gated protection test bypass.
 pub(crate) const HEADER_DATADOME_TEST_BYPASS: &str = "x-ts-datadome-bypass";
 
 /// Request marker indicating that Trusted Server should omit its automatic
@@ -122,7 +121,7 @@ static DATADOME_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Temporary static-header bypass for server-side `DataDome` protection.
 ///
-/// This is intended only for an access-controlled staging environment. A
+/// This is intended only for an access-controlled test environment. A
 /// matching `x-ts-datadome-bypass` header bypasses the server-side Protection
 /// API and is removed before the publisher origin receives the request. The
 /// credential itself is loaded from the Secret Store at runtime.
@@ -224,7 +223,7 @@ pub struct DataDomeConfig {
     )]
     pub protection_exclusion_rules: Vec<ProtectionExclusionRuleConfig>,
 
-    /// Temporary static-header bypass for access-controlled staging tests.
+    /// Temporary static-header bypass for access-controlled tests.
     #[serde(default)]
     pub protection_test_bypass: Option<ProtectionTestBypassConfig>,
 
@@ -478,10 +477,6 @@ impl DataDomeIntegration {
     }
 
     fn active_protection_test_bypass(&self) -> Option<&ProtectionTestBypassConfig> {
-        if std::env::var(ENV_FASTLY_IS_STAGING).as_deref() != Ok("1") {
-            return None;
-        }
-
         self.config
             .protection_test_bypass
             .as_ref()
@@ -945,17 +940,7 @@ fn build(
     };
 
     let integration = DataDomeIntegration::try_new(config)?;
-    let protection_test_bypass_configured = integration
-        .config
-        .protection_test_bypass
-        .as_ref()
-        .is_some_and(|bypass| bypass.enabled);
     let protection_test_bypass_active = integration.active_protection_test_bypass().is_some();
-    if protection_test_bypass_configured && !protection_test_bypass_active {
-        log::warn!(
-            "[datadome] DataDome test bypass is configured but inactive because FASTLY_IS_STAGING is not 1"
-        );
-    }
     log::info!(
         "[datadome] Registering integration (sdk_origin: {}, rewrite_sdk: {}, enable_protection: {}, protection_test_bypass: {})",
         integration.config.sdk_origin,
@@ -963,8 +948,6 @@ fn build(
         integration.config.enable_protection,
         if protection_test_bypass_active {
             "active"
-        } else if protection_test_bypass_configured {
-            "configured-inactive"
         } else {
             "disabled"
         },

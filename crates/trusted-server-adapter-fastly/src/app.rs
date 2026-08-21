@@ -265,6 +265,11 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(Arc::clone(&state.default_kv_store))
+        // Spike-only (#1009). Constructed unconditionally, but only read when the
+        // assembly mode is a shared-template one — which defaults to Inline, so this
+        // is inert until an operator opts in.
+        .template_cache(Arc::new(crate::template_cache::FastlyTemplateCache::new()))
+        .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(Arc::new(FastlyPlatformGeo))
@@ -1299,13 +1304,16 @@ mod tests {
 
     use super::{
         AppState, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
-        TrustedServerApp, build_state_from_settings, startup_error_router,
+        TrustedServerApp, build_per_request_services, build_state_from_settings,
+        startup_error_router,
     };
     use base64::Engine as _;
     use bytes::Bytes;
     use edgezero_core::body::Body;
+    use edgezero_core::context::RequestContext;
     use edgezero_core::http::{Method, Response, StatusCode, header, request_builder};
     use edgezero_core::key_value_store::NoopKvStore;
+    use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Mutex;
@@ -1438,6 +1446,36 @@ mod tests {
     fn test_router() -> RouterService {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         TrustedServerApp::routes_for_state(&state)
+    }
+
+    #[test]
+    fn per_request_services_register_the_fastly_template_assembler() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = RequestContext::new(
+            empty_request(Method::GET, "/article"),
+            PathParams::default(),
+        );
+
+        let services = build_per_request_services(&state, &context);
+        let template = format!(
+            "<html><body>article{}</body></html>",
+            trusted_server_core::publisher::AD_ASSEMBLY_SEAM
+        );
+        let fragment = b"<script>reader state</script>";
+        let assembled = services
+            .template_assembler()
+            .assemble(template.as_bytes(), fragment)
+            .expect("Fastly services should provide ESI assembly");
+
+        assert_eq!(
+            assembled,
+            template
+                .replace(
+                    trusted_server_core::publisher::AD_ASSEMBLY_SEAM,
+                    std::str::from_utf8(fragment).expect("fragment should be UTF-8")
+                )
+                .into_bytes()
+        );
     }
 
     /// Builds a router whose `AppState` uses a registry containing the given
@@ -2157,13 +2195,27 @@ mod tests {
             server_region: Some("US-East".to_string()),
         });
 
-        let _ = route(&router, req);
+        let response = route(&router, req);
 
         let observed = captured
             .lock()
             .expect("should lock captured client info")
             .clone()
             .expect("request filter should have observed the entry-point ClientInfo");
+        assert_eq!(
+            observed.client_ip,
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
+            "request-scoped services should preserve the resolved client IP used by EC"
+        );
+        let finalize = response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("fallback response should carry EC finalization state");
+        assert_eq!(
+            finalize.ec_context.client_ip(),
+            Some("203.0.113.7"),
+            "EC should capture the resolved client IP from request-scoped services"
+        );
         assert_eq!(
             observed.tls_protocol.as_deref(),
             Some("TLSv1.3"),

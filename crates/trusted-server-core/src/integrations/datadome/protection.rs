@@ -836,7 +836,7 @@ fn truncate_utf8(value: &str, limit: i32) -> String {
 mod tests {
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use crate::integrations::datadome::{
         DataDomeConfig, ProtectionExclusionRuleConfig, ProtectionMatcherConfig,
@@ -851,8 +851,6 @@ mod tests {
     use crate::settings::Settings;
 
     use super::*;
-
-    static FASTLY_IS_STAGING_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn protection_integration() -> Arc<DataDomeIntegration> {
         let config = DataDomeConfig {
@@ -871,24 +869,19 @@ mod tests {
             .expect("should build filter request")
     }
 
-    fn filter_with_staging(
+    fn filter_request(
         integration: &DataDomeIntegration,
         settings: &Settings,
         services: &RuntimeServices,
         request: &mut Request<EdgeBody>,
     ) -> RequestFilterDecision {
-        let _guard = FASTLY_IS_STAGING_ENV_LOCK
-            .lock()
-            .expect("should lock staging environment test guard");
-        temp_env::with_var(crate::constants::ENV_FASTLY_IS_STAGING, Some("1"), || {
-            futures::executor::block_on(integration.filter_protection_request(RequestFilterInput {
-                settings,
-                services,
-                request,
-                geo_info: None,
-                is_integration_route: false,
-            }))
-        })
+        futures::executor::block_on(integration.filter_protection_request(RequestFilterInput {
+            settings,
+            services,
+            request,
+            geo_info: None,
+            is_integration_route: false,
+        }))
     }
 
     fn filter_marks_request(
@@ -973,7 +966,7 @@ mod tests {
             edgezero_core::http::HeaderValue::from_static("temporary-test-credential-32-bytes!"),
         );
 
-        let decision = filter_with_staging(&integration, &settings, &services, &mut request);
+        let decision = filter_request(&integration, &settings, &services, &mut request);
 
         assert!(
             matches!(decision, RequestFilterDecision::Continue(_)),
@@ -1036,7 +1029,7 @@ mod tests {
                 edgezero_core::http::HeaderValue::from_static("stale-test-credential"),
             );
 
-            let decision = filter_with_staging(&integration, &settings, &services, &mut request);
+            let decision = filter_request(&integration, &settings, &services, &mut request);
 
             assert!(
                 matches!(decision, RequestFilterDecision::Continue(_)),
@@ -1062,7 +1055,7 @@ mod tests {
     }
 
     #[test]
-    fn protection_test_bypass_is_inactive_outside_staging() {
+    fn protection_test_bypass_works_without_staging_environment() {
         let config = DataDomeConfig {
             enabled: true,
             enable_protection: true,
@@ -1076,19 +1069,10 @@ mod tests {
         let integration = DataDomeIntegration::try_new(config).expect("should create integration");
         let mut secrets = HashMap::new();
         secrets.insert(
-            "datadome_server_side_key".to_string(),
-            b"server-side-key".to_vec(),
-        );
-        secrets.insert(
             "datadome_test_bypass".to_string(),
             b"temporary-test-credential-32-bytes!".to_vec(),
         );
         let http_client = Arc::new(StubHttpClient::new());
-        http_client.push_response_with_headers(
-            200,
-            Vec::new(),
-            vec![(HEADER_DATADOME_RESPONSE, "200")],
-        );
         let services = build_services_with_secret_and_http_client(
             HashMapSecretStore::new(secrets),
             http_client.clone(),
@@ -1100,44 +1084,26 @@ mod tests {
             edgezero_core::http::HeaderValue::from_static("temporary-test-credential-32-bytes!"),
         );
 
-        let _guard = FASTLY_IS_STAGING_ENV_LOCK
-            .lock()
-            .expect("should lock staging environment test guard");
-        let decision = temp_env::with_var(
-            crate::constants::ENV_FASTLY_IS_STAGING,
-            None::<&str>,
-            || {
-                futures::executor::block_on(integration.filter_protection_request(
-                    RequestFilterInput {
-                        settings: &settings,
-                        services: &services,
-                        request: &mut request,
-                        geo_info: None,
-                        is_integration_route: false,
-                    },
-                ))
-            },
-        );
+        let decision = filter_request(&integration, &settings, &services, &mut request);
 
         assert!(
             matches!(decision, RequestFilterDecision::Continue(_)),
-            "an allowed Protection API response should continue"
+            "a matching test credential should continue without a staging environment"
+        );
+        assert!(
+            has_client_tag_suppression_marker(&request),
+            "the bypass should suppress the automatic DataDome client tag"
         );
         assert!(
             request
                 .headers()
                 .get(super::super::HEADER_DATADOME_TEST_BYPASS)
                 .is_none(),
-            "the bypass credential must be stripped outside staging"
+            "the bypass credential must not reach the publisher origin"
         );
         assert!(
-            !has_client_tag_suppression_marker(&request),
-            "the bypass must not suppress the DataDome client tag outside staging"
-        );
-        assert_eq!(
-            http_client.recorded_backend_names().len(),
-            1,
-            "the bypass must still call the Protection API outside staging"
+            http_client.recorded_backend_names().is_empty(),
+            "a matching test credential must not call the Protection API"
         );
     }
 
@@ -1179,7 +1145,7 @@ mod tests {
             edgezero_core::http::HeaderValue::from_static("temporary-test-credential-32-bytes!"),
         );
 
-        let decision = filter_with_staging(&integration, &settings, &services, &mut request);
+        let decision = filter_request(&integration, &settings, &services, &mut request);
 
         assert!(
             matches!(decision, RequestFilterDecision::Continue(_)),
@@ -1234,7 +1200,7 @@ mod tests {
             edgezero_core::http::HeaderValue::from_static("wrong-credential"),
         );
 
-        let decision = filter_with_staging(&integration, &settings, &services, &mut request);
+        let decision = filter_request(&integration, &settings, &services, &mut request);
 
         assert!(
             matches!(decision, RequestFilterDecision::Continue(_)),
@@ -1302,7 +1268,7 @@ mod tests {
             );
         }
 
-        let decision = filter_with_staging(&integration, &settings, &services, &mut request);
+        let decision = filter_request(&integration, &settings, &services, &mut request);
 
         assert!(matches!(decision, RequestFilterDecision::Continue(_)));
         assert!(
@@ -1368,7 +1334,7 @@ mod tests {
                     .expect("should build bypass header"),
             );
 
-            let decision = filter_with_staging(&integration, &settings, &services, &mut request);
+            let decision = filter_request(&integration, &settings, &services, &mut request);
 
             assert!(matches!(decision, RequestFilterDecision::Continue(_)));
             assert_eq!(has_client_tag_suppression_marker(&request), should_match);

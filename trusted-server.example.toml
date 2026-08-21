@@ -11,6 +11,13 @@ origin_url = "https://origin.example.com"
 # origin_host_header_override = "www.example.com"
 proxy_secret = "change-me-proxy-secret"
 
+# Optional: trust a fronting CDN's reader IP only when it also supplies the
+# matching shared secret. The front door must overwrite both headers.
+# [trusted_client_ip]
+# ip_header = "fastly-client-ip"
+# auth_header = "x-ts-client-ip-auth"
+# shared_secret = "replace-with-a-random-shared-secret"
+
 [ec]
 passphrase = "trusted-server-placeholder-secret"
 ec_store = "ec_identity_store"
@@ -184,6 +191,9 @@ debug = false
 # inventory_page_origin = "https://www.publisher.example"
 # Script creatives require separate security validation before opt-in.
 allow_script_creatives = false
+# Default: Trusted Server's opaque static renderer route. Set publisher_native only
+# for the controlled publisher-origin friendly-frame experiment.
+rendering_mode = "trusted_server"
 
 [integrations.google_tag_manager]
 enabled = false
@@ -201,15 +211,36 @@ example_segments = "segments"
 [debug]
 ja4_endpoint_enabled = false
 
-# Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` dumping a
-# redacted per-provider auction result: pipeline stats plus every provider
-# response, with each bid's creative previewed (not the full markup) and
-# provider metadata filtered to a fail-closed allowlist.
-# Visible in page source and injects (bounded) raw HTML from SSPs. NEVER enable
-# in production.
+# NEVER enable in production. Injects an auction dump before `</body>`.
+# "redacted" validates response metadata but still includes bid-level fields
+# and creative previews; it is not a fully anonymized dump.
 auction_html_comment = false
 
+[debug.auction_html_comment_options]
+include_provider_responses = true
+include_mediator_response = true
+include_bids = true
+# Subset of the fixed validated metadata keys shown in "redacted" (and, for
+# these three keys, "upstream") mode. Any other key fails config load.
+metadata_keys = ["error_type", "http_status", "message"]
+# "redacted" (default), "upstream", or "full".
+# "upstream" exposes six untyped provider diagnostic values that may contain
+# request or identity data. "full" additionally exposes all response metadata
+# and untruncated creatives. Never use either sensitive mode in production.
+verbosity = "redacted"
+# "compact" (default) or "pretty". Pretty formats only the outer dump;
+# JSON request/response bodies remain strings exactly as captured.
+format = "compact"
+
 [creative_opportunities]
+# Set to false to disable server-side ad templates while retaining slot definitions
+# and direct POST /auction callers. Structurally inactive templates use the
+# browser-only Cache-Control: private, max-age=60 policy; this setting is one cause.
+# Origin private/no-store policies and bot, prefetch, or consent-denied requests
+# retain their origin policy. CDN-specific cache headers remain unchanged.
+# Before rolling back to a binary that predates this setting, restore true, re-push
+# and finalize the config first.
+enabled = true
 gam_network_id = "123456789"
 # FCP is not affected by this value — body content above </body> has already
 # streamed and painted before the hold begins. What this caps is the slip on
@@ -219,6 +250,37 @@ gam_network_id = "123456789"
 # the DCL slip is acceptable.
 auction_timeout_ms = 500  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS
 price_granularity = "dense"
+
+# Initial-page delivery mode. `inline` is the default and current production
+# behaviour. `esi` is an opt-in Fastly Core Cache experiment. The shared template cache stores an inert
+# comment; a cold miss validates the repaired ESI parser in a private working
+# copy, while warm hits use the streaming byte seam. No fragment HTTP request or
+# publisher-controlled ESI is allowed.
+# This and the three cache-safety keys below belong in this
+# [creative_opportunities] table. See docs/guide/configuration.md before enabling.
+# assembly_mode = "inline"
+
+# Request headers (other than Accept-Encoding, whose supported content coding TS
+# decodes to identity before storage) that the origin may name in Vary. Values
+# are keyed losslessly and the origin response is checked for drift before
+# storage. Every emitted Vary name must be covered or storage is refused. Never
+# include Cookie: shared templates must be reader-neutral.
+# template_cache_vary = [
+#   "rsc",
+#   "next-router-state-tree",
+#   "next-router-prefetch",
+#   "next-router-segment-prefetch",
+# ]
+
+# Safety ceiling for one reader-neutral shared template, in seconds. The origin must
+# still authorize shared freshness; TS uses the smaller of that remaining edge
+# freshness and this value. Defaults to 60. Valid range: 1 through 86400.
+# template_cache_max_age_seconds = 1200  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__TEMPLATE_CACHE_MAX_AGE_SECONDS
+
+# Unsafe unless independently verified at the publisher origin. The default
+# excludes every cookie-bearing request from the template cache. Set true only when origin HTML
+# is byte-independent of Cookie; an origin Vary: Cookie is still refused.
+# origin_is_cookie_independent = false
 
 # `gam_unit_path` may be a template. Supported placeholders:
 #   {network_id} -> gam_network_id

@@ -2,18 +2,18 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 use edgezero_cli::args::{
-    AuthArgs, BuildArgs, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DeployArgs,
-    ProvisionArgs, ServeArgs,
+    ActiveVersionArgs, AuthArgs, BuildArgs, ConfigDiffArgs, ConfigGcArgs, ConfigPushArgs,
+    ConfigValidateArgs, DeployArgs, HealthcheckArgs, ProvisionArgs, RollbackArgs, ServeArgs,
 };
 use trusted_server_core::config::TrustedServerAppConfig;
 
-use crate::commands::audit::AuditArgs;
-use crate::commands::audit::browser_collector::BrowserAuditCollector;
+use crate::commands::audit::{AuditArgs, run_audit};
+use crate::commands::config::ad_templates::{AdTemplatesCommand, run_ad_templates};
 use crate::commands::config::init::{ConfigInitArgs, run_config_init};
 use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
 
 #[derive(Debug, Parser)]
-#[command(name = "ts", about = "Trusted Server CLI")]
+#[command(name = "ts", version, about = "Trusted Server CLI")]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -21,8 +21,10 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Audit a public page and write draft Trusted Server artifacts.
-    Audit(AuditArgs),
+    /// Print the currently active deployment version for a target adapter.
+    ActiveVersion(ActiveVersionArgs),
+    /// Browser-backed page and ad-template audits.
+    Audit(Box<AuditArgs>),
     /// Sign in / out / status against an `EdgeZero` adapter.
     Auth(AuthArgs),
     /// Build the project for a target adapter.
@@ -32,10 +34,14 @@ enum Command {
     Config(ConfigCommand),
     /// Deploy the project through a target adapter.
     Deploy(DeployArgs),
+    /// Probe a deployed version until it reports healthy.
+    Healthcheck(HealthcheckArgs),
     /// Trusted Server Prebid commands.
     Prebid(PrebidArgs),
     /// Provision platform resources through a target adapter.
     Provision(ProvisionArgs),
+    /// Roll a service back to a previously active deployment version.
+    Rollback(RollbackArgs),
     /// Serve the project locally through a target adapter.
     Serve(ServeArgs),
     /// Local developer tools (e.g. the macOS-only production-hostname proxy).
@@ -45,10 +51,15 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
+    /// Diagnose server-side ad-template configuration and path matching.
+    #[command(name = "ad-templates", subcommand)]
+    AdTemplates(AdTemplatesCommand),
     /// Initialize a Trusted Server config file from the example template.
     Init(ConfigInitArgs),
     /// Diff `trusted-server.toml` against the live `EdgeZero` config.
     Diff(ConfigDiffArgs),
+    /// Reclaim orphaned chunk entries leaked from prior oversized pushes.
+    Gc(ConfigGcArgs),
     /// Push `trusted-server.toml` as a blob envelope through `EdgeZero`.
     Push(ConfigPushArgs),
     /// Validate `edgezero.toml` and the typed Trusted Server config.
@@ -67,41 +78,71 @@ enum PrebidCommand {
     Bundle(PrebidBundleArgs),
 }
 
+/// Process-level outcome for commands that distinguish drift from tool errors.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RunOutcome {
+    /// Command completed without drift.
+    Success,
+    /// Command ran successfully and found assertion drift.
+    AssertionFailed,
+}
+
+impl RunOutcome {
+    /// Stable process exit code for this outcome.
+    #[must_use]
+    pub const fn exit_code(self) -> i32 {
+        match self {
+            Self::Success => 0,
+            Self::AssertionFailed => 1,
+        }
+    }
+}
+
 /// Run the CLI using process arguments.
 ///
 /// # Errors
 ///
 /// Returns an error when command parsing, config validation, `EdgeZero`
 /// delegation, audit collection, config initialization, or Prebid bundle generation fails.
-pub fn run_from_env() -> Result<(), String> {
+pub fn run_from_env() -> Result<RunOutcome, String> {
     dispatch(Args::parse())
 }
 
-fn dispatch(args: Args) -> Result<(), String> {
+fn dispatch(args: Args) -> Result<RunOutcome, String> {
     match args.command {
-        Command::Audit(args) => {
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            let collector = BrowserAuditCollector;
-            crate::commands::audit::run_audit(&args, &collector, &mut out)
+        Command::ActiveVersion(args) => {
+            edgezero_cli::run_active_version(&args).map(|()| RunOutcome::Success)
         }
-        Command::Auth(args) => edgezero_cli::run_auth(&args),
-        Command::Build(args) => edgezero_cli::run_build(&args),
-        Command::Config(ConfigCommand::Init(args)) => run_config_init(&args),
+        Command::Auth(args) => edgezero_cli::run_auth(&args).map(|()| RunOutcome::Success),
+        Command::Audit(args) => run_audit(&args),
+        Command::Build(args) => edgezero_cli::run_build(&args).map(|()| RunOutcome::Success),
+        Command::Config(ConfigCommand::AdTemplates(args)) => run_ad_templates(&args),
+        Command::Config(ConfigCommand::Init(args)) => {
+            run_config_init(&args).map(|()| RunOutcome::Success)
+        }
         Command::Config(ConfigCommand::Diff(args)) => {
             match edgezero_cli::run_config_diff_typed::<TrustedServerAppConfig>(&args) {
-                Ok(edgezero_cli::DiffExit { code: 0 }) => Ok(()),
+                Ok(edgezero_cli::DiffExit { code: 0 }) => Ok(RunOutcome::Success),
+                Ok(edgezero_cli::DiffExit { code: 1 }) => Ok(RunOutcome::AssertionFailed),
                 Ok(edgezero_cli::DiffExit { code }) => process::exit(code),
                 Err(err) => Err(err),
             }
         }
+        Command::Config(ConfigCommand::Gc(args)) => {
+            edgezero_cli::run_config_gc(&args).map(|()| RunOutcome::Success)
+        }
         Command::Config(ConfigCommand::Push(args)) => {
             edgezero_cli::run_config_push_typed::<TrustedServerAppConfig>(&args)
+                .map(|()| RunOutcome::Success)
         }
         Command::Config(ConfigCommand::Validate(args)) => {
             edgezero_cli::run_config_validate_typed::<TrustedServerAppConfig>(&args)
+                .map(|()| RunOutcome::Success)
         }
-        Command::Deploy(args) => edgezero_cli::run_deploy(&args),
+        Command::Deploy(args) => edgezero_cli::run_deploy(&args).map(|()| RunOutcome::Success),
+        Command::Healthcheck(args) => {
+            edgezero_cli::run_healthcheck(&args).map(|()| RunOutcome::Success)
+        }
         Command::Prebid(prebid) => {
             let mut generator = NpmPrebidBundleGenerator;
             let mut stdout = std::io::stdout();
@@ -109,12 +150,16 @@ fn dispatch(args: Args) -> Result<(), String> {
             match prebid.command {
                 PrebidCommand::Bundle(args) => {
                     run_bundle(&args, &mut generator, &mut stdout, &mut stderr)
+                        .map(|()| RunOutcome::Success)
                 }
             }
         }
-        Command::Provision(args) => edgezero_cli::run_provision(&args),
-        Command::Serve(args) => edgezero_cli::run_serve(&args),
-        Command::Dev(command) => crate::commands::dev::run(command),
+        Command::Provision(args) => {
+            edgezero_cli::run_provision(&args).map(|()| RunOutcome::Success)
+        }
+        Command::Rollback(args) => edgezero_cli::run_rollback(&args).map(|()| RunOutcome::Success),
+        Command::Serve(args) => edgezero_cli::run_serve(&args).map(|()| RunOutcome::Success),
+        Command::Dev(command) => crate::commands::dev::run(command).map(|()| RunOutcome::Success),
     }
 }
 
@@ -132,44 +177,195 @@ mod tests {
     }
 
     #[test]
-    fn parses_audit_with_default_outputs() {
-        let args = parse(&["ts", "audit", "https://publisher.example"]);
-        let Command::Audit(audit) = args.command else {
-            panic!("expected audit command");
+    fn parses_active_version() {
+        let args = parse(&[
+            "ts",
+            "active-version",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+        ]);
+        let Command::ActiveVersion(active_version) = args.command else {
+            panic!("expected active-version command");
         };
-        assert_eq!(audit.url, "https://publisher.example");
-        assert_eq!(audit.js_assets, None);
-        assert_eq!(audit.config, None);
-        assert!(!audit.no_js_assets);
-        assert!(!audit.no_config);
-        assert!(!audit.force);
+        assert_eq!(active_version.adapter, "fastly");
+        assert_eq!(active_version.service_id, "service-123");
     }
 
     #[test]
-    fn parses_audit_with_custom_outputs() {
+    fn parses_healthcheck_with_retry_defaults() {
         let args = parse(&[
             "ts",
-            "audit",
-            "https://publisher.example",
-            "--js-assets",
-            "audit/js-assets.toml",
-            "--config",
-            "audit/trusted-server.toml",
-            "--no-js-assets",
-            "--no-config",
-            "--force",
+            "healthcheck",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+            "--version",
+            "7",
+            "--domain",
+            "edge.example",
         ]);
-        let Command::Audit(audit) = args.command else {
-            panic!("expected audit command");
+        let Command::Healthcheck(healthcheck) = args.command else {
+            panic!("expected healthcheck command");
         };
-        assert_eq!(audit.js_assets, Some(PathBuf::from("audit/js-assets.toml")));
+        assert_eq!(healthcheck.domain, "edge.example");
+        assert_eq!(healthcheck.version, "7");
+        assert_eq!(healthcheck.retry, 3, "should default to 3 retries");
         assert_eq!(
-            audit.config,
-            Some(PathBuf::from("audit/trusted-server.toml"))
+            healthcheck.retry_delay, 5,
+            "should default to a 5s retry delay"
         );
-        assert!(audit.no_js_assets);
-        assert!(audit.no_config);
-        assert!(audit.force);
+        assert_eq!(healthcheck.timeout, 10, "should default to a 10s timeout");
+        assert!(!healthcheck.staging, "should probe production by default");
+    }
+
+    #[test]
+    fn parses_healthcheck_with_staging_overrides() {
+        let args = parse(&[
+            "ts",
+            "healthcheck",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+            "--version",
+            "7",
+            "--domain",
+            "edge.example",
+            "--staging",
+            "--retry",
+            "9",
+            "--retry-delay",
+            "2",
+            "--timeout",
+            "30",
+        ]);
+        let Command::Healthcheck(healthcheck) = args.command else {
+            panic!("expected healthcheck command");
+        };
+        assert!(healthcheck.staging);
+        assert_eq!(healthcheck.retry, 9);
+        assert_eq!(healthcheck.retry_delay, 2);
+        assert_eq!(healthcheck.timeout, 30);
+    }
+
+    #[test]
+    fn healthcheck_requires_domain() {
+        Args::try_parse_from([
+            "ts",
+            "healthcheck",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+            "--version",
+            "7",
+        ])
+        .expect_err("should reject healthcheck without a domain");
+    }
+
+    #[test]
+    fn parses_rollback_with_explicit_target() {
+        let args = parse(&[
+            "ts",
+            "rollback",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+            "--version",
+            "8",
+            "--rollback-to",
+            "7",
+        ]);
+        let Command::Rollback(rollback) = args.command else {
+            panic!("expected rollback command");
+        };
+        assert_eq!(rollback.version, "8");
+        assert_eq!(rollback.rollback_to, Some("7".to_owned()));
+        assert!(!rollback.staging);
+    }
+
+    #[test]
+    fn parses_staging_rollback_without_target() {
+        let args = parse(&[
+            "ts",
+            "rollback",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+            "--version",
+            "8",
+            "--staging",
+        ]);
+        let Command::Rollback(rollback) = args.command else {
+            panic!("expected rollback command");
+        };
+        assert!(rollback.staging);
+        assert_eq!(
+            rollback.rollback_to, None,
+            "staging rollback should not need an explicit target"
+        );
+    }
+
+    #[test]
+    fn rollback_requires_service_id() {
+        Args::try_parse_from(["ts", "rollback", "--adapter", "fastly", "--version", "8"])
+            .expect_err("should reject rollback without a service id");
+    }
+
+    #[test]
+    fn parses_deploy_with_staging_flags() {
+        let args = parse(&[
+            "ts",
+            "deploy",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+            "--staging",
+        ]);
+        let Command::Deploy(deploy) = args.command else {
+            panic!("expected deploy command");
+        };
+        assert_eq!(deploy.service_id, Some("service-123".to_owned()));
+        assert!(deploy.staging);
+    }
+
+    #[test]
+    fn deploy_rejects_renamed_stage_flag_before_separator() {
+        // `--stage` was renamed to `--staging`, and adapter passthrough is
+        // `last = true` (only captured after `--`). A stray `--stage` before the
+        // separator must fail closed at parse time rather than being swallowed as
+        // passthrough, which would leave `staging` false and route a
+        // staging-intended deploy to production.
+        Args::try_parse_from(["ts", "deploy", "--adapter", "fastly", "--stage"])
+            .expect_err("should reject the renamed-away --stage flag, not route it to production");
+    }
+
+    #[test]
+    fn deploy_captures_adapter_passthrough_after_separator() {
+        let args = parse(&[
+            "ts",
+            "deploy",
+            "--adapter",
+            "fastly",
+            "--",
+            "--comment",
+            "ci",
+        ]);
+        let Command::Deploy(deploy) = args.command else {
+            panic!("expected deploy command");
+        };
+        assert!(!deploy.staging, "should default to a production deploy");
+        assert_eq!(
+            deploy.adapter_args,
+            vec!["--comment", "ci"],
+            "should capture args after -- as adapter passthrough"
+        );
     }
 
     #[test]
@@ -187,6 +383,12 @@ mod tests {
                 || error.to_string().contains("Found argument"),
             "error should explain unsupported option"
         );
+    }
+
+    #[test]
+    fn run_outcomes_use_documented_exit_codes() {
+        assert_eq!(RunOutcome::Success.exit_code(), 0);
+        assert_eq!(RunOutcome::AssertionFailed.exit_code(), 1);
     }
 
     #[test]
@@ -271,6 +473,54 @@ mod tests {
     }
 
     #[test]
+    fn config_gc_previews_by_default() {
+        let args = parse(&["ts", "config", "gc", "--adapter", "fastly"]);
+        let Command::Config(ConfigCommand::Gc(gc)) = args.command else {
+            panic!("expected config gc command");
+        };
+        assert_eq!(gc.adapter, "fastly");
+        assert_eq!(
+            gc.older_than, None,
+            "should not require an older-than window to preview"
+        );
+        assert!(!gc.dry_run);
+        assert!(!gc.no_env);
+    }
+
+    #[test]
+    fn config_gc_parses_destructive_sweep() {
+        let args = parse(&[
+            "ts",
+            "config",
+            "gc",
+            "--adapter",
+            "fastly",
+            "--yes",
+            "--older-than",
+            "7d",
+        ]);
+        let Command::Config(ConfigCommand::Gc(gc)) = args.command else {
+            panic!("expected config gc command");
+        };
+        assert!(gc.yes);
+        assert_eq!(gc.older_than, Some("7d".to_owned()));
+    }
+
+    #[test]
+    fn config_gc_rejects_dry_run_with_yes() {
+        Args::try_parse_from([
+            "ts",
+            "config",
+            "gc",
+            "--adapter",
+            "fastly",
+            "--dry-run",
+            "--yes",
+        ])
+        .expect_err("should reject conflicting --dry-run and --yes");
+    }
+
+    #[test]
     fn config_validate_uses_edgezero_app_config_flag() {
         let args = parse(&[
             "ts",
@@ -290,6 +540,357 @@ mod tests {
 
         let default_validate = ConfigValidateArgs::default();
         assert_eq!(validate.manifest, default_validate.manifest);
+    }
+
+    #[test]
+    fn config_ad_templates_match_parses_app_config_flags() {
+        let args = parse(&[
+            "ts",
+            "config",
+            "ad-templates",
+            "match",
+            "--app-config",
+            "publisher-a.toml",
+            "--no-env",
+            "--details",
+            "/news/story",
+        ]);
+        let Command::Config(ConfigCommand::AdTemplates(AdTemplatesCommand::Match(match_args))) =
+            args.command
+        else {
+            panic!("expected ad-templates match command");
+        };
+        assert_eq!(
+            match_args.config.app_config,
+            Some(PathBuf::from("publisher-a.toml"))
+        );
+        assert!(match_args.config.no_env);
+        assert!(match_args.details);
+        assert_eq!(match_args.path_or_url, "/news/story");
+    }
+
+    #[test]
+    fn config_ad_templates_check_parses_expected_slots() {
+        let args = parse(&[
+            "ts",
+            "config",
+            "ad-templates",
+            "check",
+            "/sports/game",
+            "--expected-slot",
+            "atf",
+            "--expected-slot",
+            "sports-sidebar",
+            "--allow-extra-slots",
+        ]);
+        let Command::Config(ConfigCommand::AdTemplates(AdTemplatesCommand::Check(check_args))) =
+            args.command
+        else {
+            panic!("expected ad-templates check command");
+        };
+        assert_eq!(check_args.path_or_url, "/sports/game");
+        assert_eq!(check_args.expected_slots, ["atf", "sports-sidebar"]);
+        assert!(check_args.allow_extra_slots);
+        assert!(!check_args.expect_no_slots);
+    }
+
+    #[test]
+    fn config_ad_templates_check_requires_an_expectation_mode() {
+        assert!(Args::try_parse_from(["ts", "config", "ad-templates", "check", "/news"]).is_err());
+    }
+
+    #[test]
+    fn config_ad_templates_check_rejects_extra_slots_with_no_slots_mode() {
+        assert!(
+            Args::try_parse_from([
+                "ts",
+                "config",
+                "ad-templates",
+                "check",
+                "/news",
+                "--expect-no-slots",
+                "--allow-extra-slots",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn config_ad_templates_explain_rejects_removed_edgezero_model() {
+        assert!(
+            Args::try_parse_from([
+                "ts",
+                "config",
+                "ad-templates",
+                "explain",
+                "/news",
+                "--edgezero-enabled",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bare_audit_namespace_displays_help_as_an_error() {
+        let error = Args::try_parse_from(["ts", "audit"]).expect_err("should require audit mode");
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+    }
+
+    #[test]
+    fn audit_legacy_url_parses_with_artifact_generation_flags() {
+        let args = parse(&[
+            "ts",
+            "audit",
+            "https://www.example.com/",
+            "--js-assets",
+            "audit/assets.toml",
+            "--config",
+            "audit/config.toml",
+            "--force",
+            "--cookie",
+            "session=example",
+            "--chrome",
+            "/tmp/test-chrome",
+            "--headful",
+            "--no-assume-consent",
+            "--browser-proxy",
+            "127.0.0.1:8080",
+            "--settle-quiet-ms",
+            "900",
+            "--settle-max-ms",
+            "13000",
+            "--danger-accept-invalid-certs",
+        ]);
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        assert_eq!(
+            audit.legacy_generate.js_assets,
+            Some(PathBuf::from("audit/assets.toml"))
+        );
+        assert_eq!(
+            audit.legacy_generate.config,
+            Some(PathBuf::from("audit/config.toml"))
+        );
+        assert!(audit.legacy_generate.force);
+        assert_eq!(
+            audit.legacy_generate.cookies,
+            [("session".to_string(), "example".to_string())]
+        );
+        assert_eq!(
+            audit.legacy_generate.browser.chrome,
+            Some(PathBuf::from("/tmp/test-chrome"))
+        );
+        assert!(audit.legacy_generate.browser.headful);
+        assert!(audit.legacy_generate.browser.no_assume_consent);
+        assert_eq!(
+            audit.legacy_generate.browser.browser_proxy.as_deref(),
+            Some("127.0.0.1:8080")
+        );
+        assert_eq!(audit.legacy_generate.browser.settle_quiet_ms, 900);
+        assert_eq!(audit.legacy_generate.browser.settle_max_ms, 13_000);
+        assert!(audit.legacy_generate.browser.danger_accept_invalid_certs);
+    }
+
+    #[test]
+    fn audit_help_does_not_advertise_hidden_legacy_browser_flags() {
+        let error =
+            Args::try_parse_from(["ts", "audit", "--help"]).expect_err("should render audit help");
+        let help = error.to_string();
+
+        assert!(!help.contains("--chrome"), "got {help}");
+        assert!(!help.contains("--settle-max-ms"), "got {help}");
+        assert!(
+            !help.contains("--danger-accept-invalid-certs"),
+            "got {help}"
+        );
+    }
+
+    #[test]
+    fn audit_rejects_parent_browser_flags_before_a_subcommand() {
+        assert!(
+            Args::try_parse_from([
+                "ts",
+                "audit",
+                "--chrome",
+                "/tmp/test-chrome",
+                "generate",
+                "https://www.example.com/",
+            ])
+            .is_err(),
+            "a parent-level browser flag must not be silently ignored"
+        );
+    }
+
+    #[test]
+    fn audit_page_subcommand_parses() {
+        let args = parse(&["ts", "audit", "page", "https://www.example.com/"]);
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        let Some(crate::commands::audit::AuditSubcommand::Page(page)) = audit.command else {
+            panic!("expected audit page command");
+        };
+        assert_eq!(page.browser.settle_quiet_ms, 750);
+        assert_eq!(page.browser.settle_max_ms, 10_000);
+    }
+
+    #[test]
+    fn audit_generate_subcommands_use_generation_settle_defaults() {
+        let args = parse(&["ts", "audit", "generate", "https://www.example.com/"]);
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        let Some(crate::commands::audit::AuditSubcommand::Generate(generate)) = audit.command
+        else {
+            panic!("expected audit generate command");
+        };
+        assert_eq!(generate.browser.settle_quiet_ms, 750);
+        assert_eq!(generate.browser.settle_max_ms, 12_000);
+
+        let args = parse(&[
+            "ts",
+            "audit",
+            "ad-templates",
+            "generate",
+            "https://www.example.com/",
+        ]);
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        let Some(crate::commands::audit::AuditSubcommand::AdTemplates(
+            crate::commands::audit::AuditAdTemplatesCommand::Generate(generate),
+        )) = audit.command
+        else {
+            panic!("expected audit ad-templates generate command");
+        };
+        assert_eq!(generate.browser.settle_quiet_ms, 750);
+        assert_eq!(generate.browser.settle_max_ms, 12_000);
+    }
+
+    #[test]
+    fn audit_ad_templates_verify_parses() {
+        let args = parse(&[
+            "ts",
+            "audit",
+            "ad-templates",
+            "verify",
+            "https://www.example.com/",
+        ]);
+        assert!(matches!(args.command, Command::Audit(_)));
+    }
+
+    #[test]
+    fn audit_browser_options_are_shared_by_generate_and_verify() {
+        for mode in ["generate", "verify"] {
+            let args = parse(&[
+                "ts",
+                "audit",
+                "ad-templates",
+                mode,
+                "https://www.example.com/",
+                "--chrome",
+                "/tmp/test-chrome",
+                "--headful",
+                "--browser-proxy",
+                "127.0.0.1:8080",
+                "--no-assume-consent",
+                "--settle-quiet-ms",
+                "100",
+                "--settle-max-ms",
+                "200",
+            ]);
+            let Command::Audit(audit) = args.command else {
+                panic!("expected audit command");
+            };
+            let (chrome, headful, no_assume_consent, browser_proxy, validation) =
+                match audit.command.expect("should parse audit subcommand") {
+                    crate::commands::audit::AuditSubcommand::AdTemplates(
+                        crate::commands::audit::AuditAdTemplatesCommand::Generate(args),
+                    ) => {
+                        let validation = args.browser.validate();
+                        (
+                            args.browser.chrome,
+                            args.browser.headful,
+                            args.browser.no_assume_consent,
+                            args.browser.browser_proxy,
+                            validation,
+                        )
+                    }
+                    crate::commands::audit::AuditSubcommand::AdTemplates(
+                        crate::commands::audit::AuditAdTemplatesCommand::Verify(args),
+                    ) => {
+                        let validation = args.browser.validate();
+                        (
+                            args.browser.chrome,
+                            args.browser.headful,
+                            args.browser.no_assume_consent,
+                            args.browser.browser_proxy,
+                            validation,
+                        )
+                    }
+                    _ => panic!("expected ad-template mode"),
+                };
+            assert_eq!(chrome, Some(PathBuf::from("/tmp/test-chrome")));
+            assert!(headful);
+            assert!(no_assume_consent);
+            assert_eq!(browser_proxy.as_deref(), Some("127.0.0.1:8080"));
+            validation.expect("should validate settle bounds");
+        }
+    }
+
+    #[test]
+    fn audit_generate_does_not_expose_the_ignored_browser_profile_flag() {
+        assert!(
+            Args::try_parse_from([
+                "ts",
+                "audit",
+                "ad-templates",
+                "generate",
+                "https://www.example.com/",
+                "--browser-profile",
+                "mobile",
+            ])
+            .is_err(),
+            "generation device selection must use --profiles"
+        );
+    }
+
+    #[test]
+    fn browser_settle_quiet_cannot_exceed_maximum() {
+        let args = parse(&[
+            "ts",
+            "audit",
+            "page",
+            "https://www.example.com/",
+            "--settle-quiet-ms",
+            "201",
+            "--settle-max-ms",
+            "200",
+        ]);
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        let crate::commands::audit::AuditSubcommand::Page(page) =
+            audit.command.expect("should parse page subcommand")
+        else {
+            panic!("expected page audit");
+        };
+        assert!(page.browser.validate().is_err());
+    }
+
+    #[test]
+    fn audit_ad_templates_without_verify_is_error() {
+        assert!(Args::try_parse_from(["ts", "audit", "ad-templates"]).is_err());
+    }
+
+    #[test]
+    fn audit_rejects_non_http_url() {
+        assert!(Args::try_parse_from(["ts", "audit", "ftp://www.example.com/"]).is_err());
     }
 
     #[test]

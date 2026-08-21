@@ -5,11 +5,13 @@ use glob::{MatchOptions, Pattern};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
+use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::Duration;
+use subtle::ConstantTimeEq as _;
 use url::Url;
 use validator::{Validate, ValidationError};
 
@@ -2379,15 +2381,26 @@ pub struct DebugConfig {
     #[serde(default)]
     pub ja4_endpoint_enabled: bool,
 
-    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` dumping a
-    /// redacted per-provider auction result: pipeline stats (SSP count, mediator
-    /// status, winning bid count) plus every provider response — each bid's
-    /// creative previewed (not the full `adm` markup) and provider metadata
-    /// filtered to a fail-closed allowlist that drops identity-bearing keys.
-    /// Never enable in production — visible in page source and injects (bounded)
-    /// raw HTML from SSPs.
+    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` dumping
+    /// per-provider auction diagnostics. The default validates response-level
+    /// metadata, but bid fields and bounded creative previews remain visible;
+    /// this is not a fully anonymized dump. Never enable in production.
     #[serde(default)]
     pub auction_html_comment: bool,
+
+    /// Content and verbosity of the `auction_html_comment` dump. Ignored
+    /// when `auction_html_comment` is false.
+    ///
+    /// The default table must stay omitted from serialized config blobs:
+    /// [`DebugConfig`] denies unknown fields, so an older binary rejects a blob
+    /// carrying this table during a mixed-version deployment or rollback. Any
+    /// non-default table still serializes and requires restoring a compatible
+    /// blob before rolling back.
+    #[serde(
+        default,
+        skip_serializing_if = "is_default_auction_debug_comment_options"
+    )]
+    pub auction_html_comment_options: AuctionDebugCommentOptions,
 
     /// Enable the testing-only direct GAM-replace path and the verbose per-bid
     /// `debug_bid` blob in `window.tsjs.bids`.
@@ -2404,12 +2417,287 @@ pub struct DebugConfig {
     pub inject_adm_for_testing: bool,
 }
 
+/// Metadata keys safe to surface in the `ts-debug` auction comment.
+///
+/// Fail-closed superset: any key not listed here — notably `debug`, which
+/// carries the resolved `OpenRTB` request (EC ID, `user.ext.eids`, the TC
+/// consent string, `device.ip`, `device.geo`) plus per-bidder `httpcalls` —
+/// is dropped in [`AuctionDebugCommentVerbosity::Redacted`] mode regardless
+/// of what an operator lists in [`AuctionDebugCommentOptions::metadata_keys`].
+/// `metadata_keys` is a subset selector against this const, never a way to
+/// add new keys.
+pub(crate) const AUCTION_DEBUG_METADATA_ALLOWLIST: &[&str] =
+    &["error_type", "http_status", "message"];
+
+/// Provider-controlled diagnostic keys exposed only by `Upstream` or `Full`.
+///
+/// Values remain untyped upstream JSON and may contain request or identity
+/// data. Keeping this list separate prevents [`AuctionDebugCommentOptions::metadata_keys`]
+/// from widening the default response-metadata boundary.
+pub(crate) const AUCTION_DEBUG_UPSTREAM_METADATA_KEYS: &[&str] = &[
+    "errors",
+    "warnings",
+    "responsetimemillis",
+    "bidstatus",
+    "upstream_message",
+    "upstream_message_truncated",
+];
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_auction_debug_metadata_keys() -> Vec<String> {
+    AUCTION_DEBUG_METADATA_ALLOWLIST
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect()
+}
+
+// This predicate preserves rollback compatibility by omitting the default table.
+fn is_default_auction_debug_comment_options(value: &AuctionDebugCommentOptions) -> bool {
+    *value == AuctionDebugCommentOptions::default()
+}
+
+/// Behavior of the `<!-- ts-debug: ... -->` auction dump. Only consulted when
+/// [`DebugConfig::auction_html_comment`] is true.
+///
+/// `deny_unknown_fields` matches the convention used by sibling config
+/// structs in this file, including the `DebugConfig` this struct nests
+/// under: an operator typo (e.g. `metadata_key` instead of `metadata_keys`)
+/// must fail config load loudly, not be silently ignored.
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuctionDebugCommentOptions {
+    /// Include the `provider_responses` section at all.
+    #[serde(default = "default_true")]
+    pub include_provider_responses: bool,
+
+    /// Include `mediator_response` when a mediator ran.
+    #[serde(default = "default_true")]
+    pub include_mediator_response: bool,
+
+    /// Include each provider's `bids` array (vs. status/metadata only).
+    #[serde(default = "default_true")]
+    pub include_bids: bool,
+
+    /// Subset of [`AUCTION_DEBUG_METADATA_ALLOWLIST`] to surface in
+    /// [`AuctionDebugCommentVerbosity::Redacted`] mode. This selector cannot
+    /// unlock provider diagnostics, and entries outside the fixed allowlist are
+    /// rejected at config load by
+    /// [`validate_metadata_keys`](Self::validate_metadata_keys).
+    ///
+    /// [`AuctionDebugCommentVerbosity::Upstream`] builds on the redacted
+    /// metadata, so this subset still gates those three keys there; the six
+    /// upstream diagnostics are unlocked by `verbosity` alone. Ignored entirely
+    /// when `verbosity` is [`AuctionDebugCommentVerbosity::Full`].
+    #[serde(default = "default_auction_debug_metadata_keys")]
+    pub metadata_keys: Vec<String>,
+
+    /// `Redacted` (default): validated `metadata_keys` subset only, with
+    /// creative previews truncated to `MAX_BID_CREATIVE_DUMP_BYTES`.
+    /// `Upstream`: redacted fields plus six untyped provider diagnostics;
+    /// creative previews remain truncated.
+    /// `Full`: raw `response.metadata` verbatim, including the `debug`
+    /// subtree (httpcalls/resolvedrequest) when present, and no creative
+    /// truncation. The total dump byte cap and comment-terminator
+    /// neutralization still apply unconditionally.
+    ///
+    /// NEVER enable `Upstream` or `Full` in production — identity-bearing
+    /// request/response data may become visible via view-source.
+    #[serde(default)]
+    pub verbosity: AuctionDebugCommentVerbosity,
+
+    /// JSON representation used for the outer auction dump.
+    #[serde(default)]
+    pub format: AuctionDebugCommentFormat,
+}
+
+impl Default for AuctionDebugCommentOptions {
+    fn default() -> Self {
+        Self {
+            include_provider_responses: true,
+            include_mediator_response: true,
+            include_bids: true,
+            metadata_keys: default_auction_debug_metadata_keys(),
+            verbosity: AuctionDebugCommentVerbosity::Redacted,
+            format: AuctionDebugCommentFormat::Compact,
+        }
+    }
+}
+
+impl AuctionDebugCommentOptions {
+    pub(crate) fn normalize(&mut self) {
+        self.metadata_keys = self
+            .metadata_keys
+            .drain(..)
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty())
+            .collect();
+    }
+
+    /// Reject [`Self::metadata_keys`] entries outside
+    /// [`AUCTION_DEBUG_METADATA_ALLOWLIST`].
+    ///
+    /// Render time intersects the configured list with the allowlist, so an
+    /// entry outside it is dead config that silently renders `metadata: {}`.
+    /// Fail the load loudly instead, matching the `deny_unknown_fields`
+    /// contract on this struct. The render-time intersection stays as
+    /// defense-in-depth for config paths that bypass this check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] naming every unknown key.
+    pub(crate) fn validate_metadata_keys(&self) -> Result<(), Report<TrustedServerError>> {
+        let unknown: Vec<&str> = self
+            .metadata_keys
+            .iter()
+            .map(String::as_str)
+            .filter(|key| !AUCTION_DEBUG_METADATA_ALLOWLIST.contains(key))
+            .collect();
+
+        if unknown.is_empty() {
+            return Ok(());
+        }
+
+        Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "debug.auction_html_comment_options.metadata_keys contains unsupported keys [{}]; supported keys are [{}]",
+                unknown.join(", "),
+                AUCTION_DEBUG_METADATA_ALLOWLIST.join(", ")
+            ),
+        }))
+    }
+}
+
+/// Verbosity of the `ts-debug` auction comment. See
+/// [`AuctionDebugCommentOptions::verbosity`].
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuctionDebugCommentVerbosity {
+    #[default]
+    Redacted,
+    Upstream,
+    Full,
+}
+
+/// JSON representation used for the outer `ts-debug` auction dump.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuctionDebugCommentFormat {
+    #[default]
+    Compact,
+    Pretty,
+}
+
 /// Tester-cookie endpoint configuration.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct TesterCookieConfig {
     /// Enable tester-cookie endpoints that set and clear `ts-tester`.
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// Authenticated forwarding configuration for a trusted client IP header.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+#[validate(schema(function = validate_trusted_client_ip))]
+pub struct TrustedClientIpConfig {
+    /// Header containing the client IP address supplied by the trusted edge.
+    pub ip_header: String,
+    /// Header containing the shared-secret authentication value.
+    pub auth_header: String,
+    /// Shared secret required before accepting the forwarded client IP address.
+    #[validate(custom(function = validate_redacted_not_empty))]
+    pub shared_secret: Redacted<String>,
+}
+
+impl TrustedClientIpConfig {
+    /// Placeholder shared secrets shipped in the example configuration and docs.
+    pub const SHARED_SECRET_PLACEHOLDERS: &[&str] = &["replace-with-a-random-shared-secret"];
+
+    /// Minimum accepted `shared_secret` length.
+    ///
+    /// Matches `Ec::MIN_PASSPHRASE_LENGTH`. This secret is the only gate on
+    /// forging the client address that geolocation, EC identity derivation, and
+    /// bot protection consume, so it is held to the same strength as the EC
+    /// passphrase.
+    const MIN_SHARED_SECRET_LENGTH: usize = Ec::MIN_PASSPHRASE_LENGTH;
+
+    /// Returns `true` if `shared_secret` matches a known placeholder value
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_shared_secret(shared_secret: &str) -> bool {
+        Self::SHARED_SECRET_PLACEHOLDERS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(shared_secret))
+    }
+
+    /// Returns whether `candidate` exactly matches the configured shared secret.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::redacted::Redacted;
+    /// use trusted_server_core::settings::TrustedClientIpConfig;
+    ///
+    /// let config = TrustedClientIpConfig {
+    ///     ip_header: "fastly-client-ip".to_owned(),
+    ///     auth_header: "x-trusted-client-auth".to_owned(),
+    ///     shared_secret: Redacted::new("fictional-shared-secret-0123456789".to_owned()),
+    /// };
+    ///
+    /// assert!(config.authenticates("fictional-shared-secret-0123456789"));
+    /// assert!(!config.authenticates("fictional-wrong-secret"));
+    /// ```
+    #[must_use]
+    pub fn authenticates(&self, candidate: &str) -> bool {
+        let configured_digest = Sha256::digest(self.shared_secret.expose().as_bytes());
+        let candidate_digest = Sha256::digest(candidate.as_bytes());
+
+        configured_digest.ct_eq(&candidate_digest).into()
+    }
+}
+
+fn validate_trusted_client_ip(config: &TrustedClientIpConfig) -> Result<(), ValidationError> {
+    let ip_header = http::HeaderName::from_bytes(config.ip_header.as_bytes())
+        .map_err(|_| ValidationError::new("invalid_trusted_client_ip_header"))?;
+    let auth_header = http::HeaderName::from_bytes(config.auth_header.as_bytes())
+        .map_err(|_| ValidationError::new("invalid_trusted_client_ip_auth_header"))?;
+
+    if ip_header == auth_header {
+        return Err(ValidationError::new("identical_trusted_client_ip_headers"));
+    }
+
+    for header in [&ip_header, &auth_header] {
+        if matches!(header.as_str(), "x-ts-tls-protocol" | "x-ts-tls-cipher") {
+            return Err(ValidationError::new("reserved_trusted_client_ip_header"));
+        }
+    }
+
+    if ip_header.as_str() != "fastly-client-ip" && !ip_header.as_str().starts_with("x-") {
+        return Err(ValidationError::new("unsafe_trusted_client_ip_header"));
+    }
+    if !auth_header.as_str().starts_with("x-") {
+        return Err(ValidationError::new("unsafe_trusted_client_ip_auth_header"));
+    }
+
+    let shared_secret = config.shared_secret.expose();
+    if shared_secret.len() < TrustedClientIpConfig::MIN_SHARED_SECRET_LENGTH {
+        return Err(ValidationError::new(
+            "short_trusted_client_ip_shared_secret",
+        ));
+    }
+    if !shared_secret
+        .bytes()
+        .all(|byte| matches!(byte, b'!'..=b'~'))
+    {
+        return Err(ValidationError::new(
+            "invalid_trusted_client_ip_shared_secret",
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
@@ -2419,6 +2707,10 @@ pub struct Settings {
     pub publisher: Publisher,
     #[serde(default)]
     pub tester_cookie: TesterCookieConfig,
+    /// Optional authenticated trusted client IP forwarding configuration.
+    #[serde(default)]
+    #[validate(nested)]
+    pub trusted_client_ip: Option<TrustedClientIpConfig>,
     #[serde(default)]
     #[validate(nested)]
     pub ec: Ec,
@@ -2525,6 +2817,7 @@ impl Settings {
         settings.cache.normalize();
         settings.proxy.normalize();
         settings.image_optimizer.normalize();
+        settings.debug.auction_html_comment_options.normalize();
         settings.consent.validate();
 
         settings.prepare_runtime()?;
@@ -2552,13 +2845,17 @@ impl Settings {
     /// # Errors
     ///
     /// Returns a configuration error if any cached runtime artifact cannot be
-    /// prepared, if any handler path regex does not compile, or if a creative
-    /// opportunity slot is invalid.
+    /// prepared, if any handler path regex does not compile, if a creative
+    /// opportunity slot is invalid, or if
+    /// [`AuctionDebugCommentOptions::metadata_keys`] names an unsupported key.
     pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.image_optimizer.prepare_runtime()?;
         self.cache.prepare_runtime()?;
         self.proxy.prepare_runtime()?;
         self.tinybird.prepare_runtime()?;
+        self.debug
+            .auction_html_comment_options
+            .validate_metadata_keys()?;
         self.validate_asset_image_optimizer_profile_sets()?;
 
         for handler in &self.handlers {
@@ -2600,13 +2897,14 @@ impl Settings {
         Ok(())
     }
 
-    /// Returns compiled creative opportunity slots, or empty slice if feature is disabled.
+    /// Returns compiled creative opportunity slots when template delivery is enabled.
     #[must_use]
     pub fn creative_opportunity_slots(
         &self,
     ) -> &[crate::creative_opportunities::CreativeOpportunitySlot] {
         self.creative_opportunities
             .as_ref()
+            .filter(|co| co.enabled)
             .map(|co| co.slot.as_slice())
             .unwrap_or(&[])
     }
@@ -2625,6 +2923,13 @@ impl Settings {
         }
         if Publisher::is_placeholder_proxy_secret(self.publisher.proxy_secret.expose()) {
             insecure_fields.push("publisher.proxy_secret".to_owned());
+        }
+        if let Some(trusted_client_ip) = &self.trusted_client_ip
+            && TrustedClientIpConfig::is_placeholder_shared_secret(
+                trusted_client_ip.shared_secret.expose(),
+            )
+        {
+            insecure_fields.push("trusted_client_ip.shared_secret".to_owned());
         }
         for partner in &self.ec.partners {
             if EcPartner::is_placeholder_api_token(partner.api_token.expose()) {
@@ -3163,6 +3468,613 @@ mod tests {
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+
+    fn trusted_client_ip_toml(ip_header: &str, auth_header: &str, shared_secret: &str) -> String {
+        format!(
+            "{}\n[trusted_client_ip]\nip_header = \"{ip_header}\"\nauth_header = \"{auth_header}\"\nshared_secret = \"{shared_secret}\"\n",
+            crate_test_settings_str()
+        )
+    }
+
+    #[test]
+    fn trusted_client_ip_is_absent_by_default() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without trusted client IP configuration");
+
+        assert!(
+            settings.trusted_client_ip.is_none(),
+            "should leave trusted client IP configuration disabled by default"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_parses_and_redacts_shared_secret_in_debug_output() {
+        let settings = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        ))
+        .expect("should parse valid trusted client IP configuration");
+        let config = settings
+            .trusted_client_ip
+            .expect("should retain trusted client IP configuration");
+
+        assert_eq!(config.ip_header, "fastly-client-ip");
+        assert_eq!(config.auth_header, "x-trusted-client-auth");
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("[REDACTED]"),
+            "should redact trusted client IP shared secret in debug output"
+        );
+        assert!(
+            !debug.contains("fictional-shared-secret-0123456789"),
+            "should not expose trusted client IP shared secret in debug output"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_accepts_x_prefixed_ip_header() {
+        let settings = Settings::from_toml(&trusted_client_ip_toml(
+            "x-trusted-client-ip",
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        ))
+        .expect("should accept an x-prefixed trusted client IP header");
+        let config = settings
+            .trusted_client_ip
+            .expect("should retain trusted client IP configuration");
+
+        assert_eq!(
+            config.ip_header, "x-trusted-client-ip",
+            "should retain the x-prefixed trusted client IP header"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_authentication_requires_an_exact_match() {
+        let settings = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        ))
+        .expect("should parse valid trusted client IP configuration");
+        let config = settings
+            .trusted_client_ip
+            .expect("should retain trusted client IP configuration");
+
+        assert!(
+            config.authenticates("fictional-shared-secret-0123456789"),
+            "should authenticate an exact shared secret match"
+        );
+        assert!(
+            !config.authenticates("fictional-wrong-secret"),
+            "should reject a different shared secret"
+        );
+        assert!(
+            !config.authenticates(" fictional-shared-secret-0123456789"),
+            "should reject a leading-whitespace shared secret"
+        );
+        assert!(
+            !config.authenticates("fictional-shared-secret-0123456789 "),
+            "should reject a trailing-whitespace shared secret"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_identical_header_names() {
+        for (ip_header, auth_header) in [
+            ("x-trusted-client", "x-trusted-client"),
+            ("X-Trusted-Client", "x-trusted-client"),
+        ] {
+            let error = Settings::from_toml(&trusted_client_ip_toml(
+                ip_header,
+                auth_header,
+                "fictional-shared-secret-0123456789",
+            ))
+            .expect_err("should reject identical trusted client IP header names");
+
+            assert!(
+                format!("{error:?}").contains("identical_trusted_client_ip_headers"),
+                "should identify duplicate trusted client IP header names"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_unsafe_header_names() {
+        for (ip_header, auth_header, expected_code) in [
+            (
+                "host",
+                "x-trusted-client-auth",
+                "unsafe_trusted_client_ip_header",
+            ),
+            (
+                "fastly-client-ip",
+                "authorization",
+                "unsafe_trusted_client_ip_auth_header",
+            ),
+        ] {
+            let error = Settings::from_toml(&trusted_client_ip_toml(
+                ip_header,
+                auth_header,
+                "fictional-shared-secret-0123456789",
+            ))
+            .expect_err("should reject unsafe trusted client IP header names");
+            let message = format!("{error:?}");
+
+            assert!(
+                message.contains(expected_code),
+                "should identify unsafe trusted client IP header names"
+            );
+            assert!(
+                !message.contains("fictional-shared-secret-0123456789"),
+                "should not include the shared secret in validation errors"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_reserved_tls_bridge_headers() {
+        for (ip_header, auth_header) in [
+            ("x-ts-tls-protocol", "x-trusted-client-auth"),
+            ("x-ts-tls-cipher", "x-trusted-client-auth"),
+            ("fastly-client-ip", "x-ts-tls-protocol"),
+            ("fastly-client-ip", "x-ts-tls-cipher"),
+        ] {
+            let error = Settings::from_toml(&trusted_client_ip_toml(
+                ip_header,
+                auth_header,
+                "fictional-shared-secret-0123456789",
+            ))
+            .expect_err("should reject reserved TLS bridge headers");
+
+            assert!(
+                format!("{error:?}").contains("reserved_trusted_client_ip_header"),
+                "should identify reserved TLS bridge headers"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_empty_secret_malformed_names_and_incomplete_sections() {
+        let empty_secret = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            "",
+        ));
+        assert!(
+            empty_secret.is_err(),
+            "should reject an empty trusted client IP shared secret"
+        );
+
+        for (ip_header, auth_header, expected_code) in [
+            (
+                "invalid header",
+                "x-trusted-client-auth",
+                "invalid_trusted_client_ip_header",
+            ),
+            (
+                "fastly-client-ip",
+                "invalid header",
+                "invalid_trusted_client_ip_auth_header",
+            ),
+        ] {
+            let error = Settings::from_toml(&trusted_client_ip_toml(
+                ip_header,
+                auth_header,
+                "fictional-shared-secret-0123456789",
+            ))
+            .expect_err("should reject malformed trusted client IP header names");
+            assert!(
+                format!("{error:?}").contains(expected_code),
+                "should identify malformed trusted client IP header names"
+            );
+        }
+
+        for section in [
+            "[trusted_client_ip]\nauth_header = \"x-trusted-client-auth\"\nshared_secret = \"fictional-shared-secret-0123456789\"",
+            "[trusted_client_ip]\nip_header = \"fastly-client-ip\"\nshared_secret = \"fictional-shared-secret-0123456789\"",
+            "[trusted_client_ip]\nip_header = \"fastly-client-ip\"\nauth_header = \"x-trusted-client-auth\"",
+            "[trusted_client_ip]\nip_header = \"fastly-client-ip\"\nauth_header = \"x-trusted-client-auth\"\nshared_secret = \"fictional-shared-secret-0123456789\"\nunknown_field = true",
+        ] {
+            let result =
+                Settings::from_toml(&format!("{}\n{section}\n", crate_test_settings_str()));
+            assert!(
+                result.is_err(),
+                "should reject incomplete or unknown trusted client IP configuration"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_control_byte_auth_header_without_exposing_secret() {
+        let mut settings = serde_json::to_value(
+            Settings::from_toml(&crate_test_settings_str())
+                .expect("should parse base settings for JSON validation"),
+        )
+        .expect("should serialize base settings for JSON validation");
+        settings["trusted_client_ip"] = json!({
+            "ip_header": "fastly-client-ip",
+            "auth_header": "x-trusted\u{0000}client-auth",
+            "shared_secret": "fictional-control-byte-secret-0123",
+        });
+
+        let error = Settings::from_json_value(settings)
+            .expect_err("should reject a control byte in the trusted client IP auth header");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("invalid_trusted_client_ip_auth_header"),
+            "should identify the malformed trusted client IP auth header"
+        );
+        assert!(
+            !message.contains("fictional-control-byte-secret-0123"),
+            "should not expose the trusted client IP shared secret in validation errors"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_a_31_byte_shared_secret_without_exposing_it() {
+        let shared_secret = "1234567890123456789012345678901";
+        let error = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            shared_secret,
+        ))
+        .expect_err("should reject a shared secret below the minimum length");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("short_trusted_client_ip_shared_secret"),
+            "should identify the undersized trusted client IP shared secret"
+        );
+        assert!(
+            !message.contains(shared_secret),
+            "should not expose the undersized trusted client IP shared secret"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_accepts_an_exactly_32_byte_ascii_graphic_shared_secret() {
+        let shared_secret = "0123456789abcdef0123456789ABCDEF";
+        let settings = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            shared_secret,
+        ))
+        .expect("should accept an exactly 32-byte ASCII graphic shared secret");
+        let config = settings
+            .trusted_client_ip
+            .expect("should retain trusted client IP configuration");
+
+        assert_eq!(
+            config.shared_secret.expose(),
+            shared_secret,
+            "should retain the accepted shared secret"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_a_non_ascii_shared_secret_without_exposing_it() {
+        let shared_secret = "ascii-graphic-secret-0123456789é";
+        let error = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            shared_secret,
+        ))
+        .expect_err("should reject a non-ASCII shared secret that exceeds 32 bytes");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("invalid_trusted_client_ip_shared_secret"),
+            "should identify the non-header-safe trusted client IP shared secret"
+        );
+        assert!(
+            !message.contains(shared_secret),
+            "should not expose the non-ASCII trusted client IP shared secret"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_a_shared_secret_with_an_embedded_space_without_exposing_it() {
+        let shared_secret = "valid-shared-secret-with space-012345";
+        let error = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            shared_secret,
+        ))
+        .expect_err("should reject a shared secret containing an ASCII space");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("invalid_trusted_client_ip_shared_secret"),
+            "should identify the non-header-safe trusted client IP shared secret"
+        );
+        assert!(
+            !message.contains(shared_secret),
+            "should not expose the shared secret containing an ASCII space"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_a_shared_secret_with_an_embedded_tab_without_exposing_it() {
+        let shared_secret = "valid-shared-secret-with\t-tab-012345";
+        let mut settings = serde_json::to_value(
+            Settings::from_toml(&crate_test_settings_str())
+                .expect("should parse base settings for JSON validation"),
+        )
+        .expect("should serialize base settings for JSON validation");
+        settings["trusted_client_ip"] = json!({
+            "ip_header": "fastly-client-ip",
+            "auth_header": "x-trusted-client-auth",
+            "shared_secret": shared_secret,
+        });
+
+        let error = Settings::from_json_value(settings)
+            .expect_err("should reject a shared secret containing a horizontal tab");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("invalid_trusted_client_ip_shared_secret"),
+            "should identify the non-header-safe trusted client IP shared secret"
+        );
+        assert!(
+            !message.contains(shared_secret),
+            "should not expose the shared secret containing a horizontal tab"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_a_shared_secret_with_del_without_exposing_it() {
+        let shared_secret = "valid-shared-secret-with\u{007f}-del-012345";
+        let mut settings = serde_json::to_value(
+            Settings::from_toml(&crate_test_settings_str())
+                .expect("should parse base settings for JSON validation"),
+        )
+        .expect("should serialize base settings for JSON validation");
+        settings["trusted_client_ip"] = json!({
+            "ip_header": "fastly-client-ip",
+            "auth_header": "x-trusted-client-auth",
+            "shared_secret": shared_secret,
+        });
+
+        let error = Settings::from_json_value(settings)
+            .expect_err("should reject a shared secret containing DEL");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("invalid_trusted_client_ip_shared_secret"),
+            "should identify the non-header-safe trusted client IP shared secret"
+        );
+        assert!(
+            !message.contains(shared_secret),
+            "should not expose the shared secret containing DEL"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_a_shared_secret_with_a_control_byte_without_exposing_it() {
+        let shared_secret = "valid-shared-secret-with\u{0001}-control-012345";
+        let mut settings = serde_json::to_value(
+            Settings::from_toml(&crate_test_settings_str())
+                .expect("should parse base settings for JSON validation"),
+        )
+        .expect("should serialize base settings for JSON validation");
+        settings["trusted_client_ip"] = json!({
+            "ip_header": "fastly-client-ip",
+            "auth_header": "x-trusted-client-auth",
+            "shared_secret": shared_secret,
+        });
+
+        let error = Settings::from_json_value(settings)
+            .expect_err("should reject a shared secret containing a control byte");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("invalid_trusted_client_ip_shared_secret"),
+            "should identify the non-header-safe trusted client IP shared secret"
+        );
+        assert!(
+            !message.contains(shared_secret),
+            "should not expose the shared secret containing a control byte"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_placeholder_shared_secrets() {
+        for placeholder in TrustedClientIpConfig::SHARED_SECRET_PLACEHOLDERS {
+            assert!(
+                TrustedClientIpConfig::is_placeholder_shared_secret(placeholder),
+                "should detect placeholder shared secret '{placeholder}'"
+            );
+            assert!(
+                TrustedClientIpConfig::is_placeholder_shared_secret(&placeholder.to_uppercase()),
+                "should detect placeholder shared secret case-insensitively"
+            );
+
+            let settings = Settings::from_toml(&trusted_client_ip_toml(
+                "fastly-client-ip",
+                "x-trusted-client-auth",
+                placeholder,
+            ))
+            .expect("should parse a placeholder trusted client IP shared secret");
+            let error = settings
+                .reject_placeholder_secrets()
+                .expect_err("should reject a placeholder trusted client IP shared secret");
+
+            assert!(
+                format!("{error:?}").contains("trusted_client_ip.shared_secret"),
+                "should name the placeholder trusted client IP shared secret field"
+            );
+        }
+    }
+
+    #[test]
+    fn auction_debug_comment_options_default_matches_serde_defaults() {
+        let opts = AuctionDebugCommentOptions::default();
+        assert!(opts.include_provider_responses, "should default to true");
+        assert!(opts.include_mediator_response, "should default to true");
+        assert!(opts.include_bids, "should default to true");
+        assert_eq!(
+            opts.metadata_keys,
+            vec![
+                "error_type".to_string(),
+                "http_status".to_string(),
+                "message".to_string(),
+            ],
+            "should default to only schema-validated response metadata"
+        );
+        assert_eq!(
+            opts.verbosity,
+            AuctionDebugCommentVerbosity::Redacted,
+            "should default to Redacted"
+        );
+        assert_eq!(
+            opts.format,
+            AuctionDebugCommentFormat::Compact,
+            "should default to compact output"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_normalize_trims_and_drops_empty_keys() {
+        let mut opts = AuctionDebugCommentOptions {
+            metadata_keys: vec![
+                " http_status ".to_string(),
+                "".to_string(),
+                "debug".to_string(),
+            ],
+            ..AuctionDebugCommentOptions::default()
+        };
+        opts.normalize();
+        assert_eq!(
+            opts.metadata_keys,
+            vec!["http_status".to_string(), "debug".to_string()]
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_deserializes_upstream_verbosity() {
+        let options: AuctionDebugCommentOptions = toml::from_str(r#"verbosity = "upstream""#)
+            .expect("should deserialize upstream verbosity");
+        assert_eq!(options.verbosity, AuctionDebugCommentVerbosity::Upstream);
+    }
+
+    #[test]
+    fn auction_debug_comment_options_deserializes_pretty_format() {
+        let options: AuctionDebugCommentOptions =
+            toml::from_str(r#"format = "pretty""#).expect("should deserialize pretty format");
+        assert_eq!(options.format, AuctionDebugCommentFormat::Pretty);
+    }
+
+    #[test]
+    fn auction_debug_comment_options_bad_format_fails_config_load() {
+        let result: Result<AuctionDebugCommentOptions, _> =
+            toml::from_str(r#"format = "expanded""#);
+        assert!(
+            result.is_err(),
+            "unrecognized format must fail to deserialize, not silently fall back"
+        );
+    }
+
+    #[test]
+    fn bad_verbosity_string_fails_config_load() {
+        // Deserialize AuctionDebugCommentOptions directly, not a full Settings —
+        // Settings has required fields with no #[serde(default)] (e.g.
+        // `publisher`), so a full-Settings fixture missing them would fail with
+        // "missing field `publisher`" regardless of whether `verbosity` itself
+        // deserialized correctly, testing the wrong thing.
+        let result: Result<AuctionDebugCommentOptions, _> =
+            toml::from_str(r#"verbosity = "everything""#);
+        assert!(
+            result.is_err(),
+            "unrecognized verbosity must fail to deserialize, not silently fall back"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_unknown_metadata_key_fails_config_load() {
+        let toml = format!(
+            "{}\n[debug]\nauction_html_comment = true\n\n[debug.auction_html_comment_options]\nmetadata_keys = [\"http_staus\", \"errors\"]\n",
+            crate_test_settings_str()
+        );
+        let error = Settings::from_toml(&toml)
+            .expect_err("should reject metadata keys outside the fixed allowlist");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("http_staus") && rendered.contains("errors"),
+            "error should name every unsupported key, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_allowlisted_metadata_keys_load() {
+        let toml = format!(
+            "{}\n[debug]\nauction_html_comment = true\n\n[debug.auction_html_comment_options]\nmetadata_keys = [\" message \"]\n",
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml).expect("should accept an allowlisted key");
+        assert_eq!(
+            settings.debug.auction_html_comment_options.metadata_keys,
+            vec!["message".to_string()],
+            "normalize should trim before validation runs"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_unknown_field_fails_config_load() {
+        let result: Result<AuctionDebugCommentOptions, _> =
+            toml::from_str(r#"metadata_key = ["message"]"#);
+        assert!(
+            result.is_err(),
+            "a misspelled field must fail config load, not be silently ignored"
+        );
+    }
+
+    #[test]
+    fn default_auction_debug_comment_options_stay_out_of_serialized_config() {
+        // Rollback contract: `DebugConfig` denies unknown fields, so the
+        // previous binary rejects a config blob carrying a table it does not
+        // know. Defaults must therefore serialize to nothing.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyDebugConfig {
+            #[serde(default)]
+            ja4_endpoint_enabled: bool,
+            #[serde(default)]
+            auction_html_comment: bool,
+            #[serde(default)]
+            inject_adm_for_testing: bool,
+        }
+
+        let value = serde_json::to_value(DebugConfig::default())
+            .expect("should serialize the default debug config");
+        assert!(
+            value.get("auction_html_comment_options").is_none(),
+            "default options table should not be serialized, got {value}"
+        );
+
+        let legacy: LegacyDebugConfig = serde_json::from_value(value)
+            .expect("legacy schema should accept the default debug payload");
+        assert!(!legacy.ja4_endpoint_enabled);
+        assert!(!legacy.auction_html_comment);
+        assert!(!legacy.inject_adm_for_testing);
+
+        let configured = DebugConfig {
+            auction_html_comment: true,
+            auction_html_comment_options: AuctionDebugCommentOptions {
+                include_bids: false,
+                ..AuctionDebugCommentOptions::default()
+            },
+            ..DebugConfig::default()
+        };
+        let value =
+            serde_json::to_value(&configured).expect("should serialize a configured debug config");
+        assert!(
+            value.get("auction_html_comment_options").is_some(),
+            "non-default options must still serialize, got {value}"
+        );
+    }
 
     #[test]
     fn tinybird_defaults_to_disabled_placeholders() {
@@ -6212,6 +7124,10 @@ formats = [{ width = 300, height = 250 }]
         let co = settings
             .creative_opportunities
             .expect("should have creative_opportunities");
+        assert!(
+            co.enabled,
+            "creative-opportunity templates should default to enabled"
+        );
         assert_eq!(co.gam_network_id, "21765378893");
         assert_eq!(co.auction_timeout_ms, Some(500));
         assert_eq!(
@@ -6219,6 +7135,45 @@ formats = [{ width = 300, height = 250 }]
             Some(0),
             "startup finalization should materialize the dynamic-template compatibility marker"
         );
+    }
+
+    #[test]
+    fn settings_disables_creative_opportunity_slots_when_configured_off() {
+        let toml = format!(
+            "{}\n[creative_opportunities]\nenabled = false\ngam_network_id = \"21765378893\"\n\n[[creative_opportunities.slot]]\nid = \"atf\"\npage_patterns = [\"/\"]\nformats = [{{ width = 300, height = 250 }}]\n",
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse disabled templates");
+        assert!(
+            settings.creative_opportunity_slots().is_empty(),
+            "disabled template delivery should expose no runtime slots"
+        );
+    }
+
+    #[test]
+    fn settings_creative_opportunity_enabled_flag_supports_environment_override() {
+        let toml = format!(
+            "{}\n[creative_opportunities]\nenabled = true\ngam_network_id = \"21765378893\"\n",
+            crate_test_settings_str()
+        );
+        let env_key = format!(
+            "{}{}CREATIVE_OPPORTUNITIES{}ENABLED",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+
+        temp_env::with_var(env_key, Some("false"), || {
+            let settings = Settings::from_toml_and_env(&toml)
+                .expect("should parse template enabled environment override");
+            assert!(
+                !settings
+                    .creative_opportunities
+                    .expect("should have creative opportunities")
+                    .enabled,
+                "environment override should disable template delivery"
+            );
+        });
     }
 
     #[test]

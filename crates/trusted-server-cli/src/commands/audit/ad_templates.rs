@@ -1,0 +1,1007 @@
+//! Browser-backed `ts audit ad-templates verify` orchestration.
+//!
+//! For each URL: collect live evidence through an [`AuditCollector`], match
+//! configured slots against the **final** (post-redirect) path, evaluate the
+//! runtime gate, compare evidence, and assemble the stable §8 wire result. The
+//! orchestration is collector-agnostic so it is fully tested with an in-memory
+//! fake collector, with no Chrome dependency.
+
+use std::io::{self, Write};
+
+use trusted_server_core::auction::types::MediaType;
+use trusted_server_core::creative_opportunities::{
+    AdStackGateInput, CreativeOpportunitiesConfig, evaluate_ad_stack_gate,
+};
+
+use crate::ad_templates::compare::{
+    BrowserAdEvidence, EvidencePhase, ExtraEvidence, RuntimeGateSummary, SlotEvidence, SlotResult,
+    SlotStatus as CompareStatus, compare_page_evidence,
+};
+use crate::ad_templates::expected::{ExpectedSlot, expected_slots_for_path, normalize_path_or_url};
+use crate::ad_templates::output::{
+    ConfiguredJson, EvidencePhaseJson, ExtraEvidenceJson, FormatJson, GateState, Gates,
+    GptEvidenceJson, PageJson, RuntimeAdStackExpectedJson, SlotEvidenceJson, SlotJson, SlotStatus,
+    VerificationReport, Warning, escape_terminal_text,
+};
+use crate::commands::audit::AuditAdTemplatesVerifyArgs;
+use crate::commands::audit::collector::{
+    AdTemplateCollectorConfig, AuditCollector, BrowserCollectRequest, build_ad_template_init_script,
+};
+use crate::run::RunOutcome;
+
+/// Verifies configured ad-template slots against live page evidence.
+///
+/// # Errors
+///
+/// Returns a user-facing string when config loading fails, or when verification
+/// surfaces a page-level error or a `--strict` failure (after writing output).
+pub(crate) fn run_verify(args: &AuditAdTemplatesVerifyArgs) -> Result<RunOutcome, String> {
+    args.browser.validate()?;
+    validate_cookie_scope(&args.urls, &args.cookies)?;
+    let loaded = crate::app_config::load_settings(&args.config)?;
+    let collector = crate::commands::audit::browser::BrowserCollector::from_opts(&args.browser);
+    let report = build_report(
+        &collector,
+        loaded.settings.creative_opportunities.as_ref(),
+        loaded.settings.auction.enabled,
+        &args.urls,
+        VerifyOptions {
+            strict: args.strict,
+            scroll: args.scroll,
+            allow_cross_origin_redirect: args.allow_cross_origin_redirect,
+        },
+        &args.cookies,
+    )?;
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    if args.json {
+        write_json(&mut out, &report)?;
+    } else {
+        write_human(&mut out, &report)?;
+    }
+
+    if report.pages.iter().any(|page| page.error.is_some()) {
+        Err("ad-template verification reported problems".to_string())
+    } else if report.ok {
+        Ok(RunOutcome::Success)
+    } else {
+        Ok(RunOutcome::AssertionFailed)
+    }
+}
+
+fn validate_cookie_scope(urls: &[url::Url], cookies: &[(String, String)]) -> Result<(), String> {
+    if cookies.is_empty() {
+        return Ok(());
+    }
+    let origins: std::collections::BTreeSet<String> = urls
+        .iter()
+        .map(|url| url.origin().ascii_serialization())
+        .collect();
+    if origins.len() > 1 {
+        return Err(
+            "--cookie may be used only when every verification URL has one origin; split this run so credentials are never copied to another origin"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Run-level verification switches.
+#[derive(Debug, Clone, Copy)]
+struct VerifyOptions {
+    /// Exit non-zero when a matched slot is missing or only partially confirmed.
+    strict: bool,
+    /// Perform a deterministic scroll pass after the initial settle.
+    scroll: bool,
+    /// Accept evidence from a page that redirected to a different origin.
+    allow_cross_origin_redirect: bool,
+}
+
+/// Builds the verification report for `urls` using `collector`.
+///
+/// `creative` is the effective `[creative_opportunities]` config (if any) and
+/// `auction_enabled` is the `[auction].enabled` kill switch.
+fn build_report(
+    collector: &dyn AuditCollector,
+    creative: Option<&CreativeOpportunitiesConfig>,
+    auction_enabled: bool,
+    urls: &[url::Url],
+    options: VerifyOptions,
+    cookies: &[(String, String)],
+) -> Result<VerificationReport, String> {
+    let init_script = build_init_script(creative)?;
+
+    let requests: Vec<_> = urls
+        .iter()
+        .map(|url| BrowserCollectRequest {
+            url: url.clone(),
+            init_scripts: vec![init_script.clone()],
+            scroll: options.scroll,
+            collect_ad_evidence: true,
+            cookies: cookies.to_vec(),
+        })
+        .collect();
+    let collected_pages = collector.collect_pages(&requests);
+
+    let mut pages = Vec::with_capacity(urls.len());
+    let mut any_error = false;
+    let mut any_strict_fail = false;
+
+    for (url, collected) in urls.iter().zip(collected_pages) {
+        match collected {
+            Err(message) => {
+                any_error = true;
+                pages.push(error_page(url, &message));
+            }
+            // Slots are matched on the *final* path, so a redirect to a
+            // different origin would let an unrelated site's evidence satisfy
+            // `--strict` — and the path-equality redirect warning would not even
+            // fire when the paths happen to agree. Reject unless opted in.
+            Ok(collected)
+                if !options.allow_cross_origin_redirect
+                    && origin_changed(url, &collected.final_url) =>
+            {
+                any_error = true;
+                pages.push(cross_origin_page(url, &collected.final_url));
+            }
+            Ok(collected) => {
+                let (page, strict_failed) = build_page(url, &collected, creative, auction_enabled);
+                if options.strict && strict_failed {
+                    any_strict_fail = true;
+                }
+                pages.push(page);
+            }
+        }
+    }
+
+    let ok = !(any_error || (options.strict && any_strict_fail));
+    Ok(VerificationReport {
+        ok,
+        strict: options.strict,
+        pages,
+        warnings: Vec::new(),
+    })
+}
+
+/// The URL without its fragment, for comparisons the server can observe.
+pub(super) fn without_fragment(url: &url::Url) -> url::Url {
+    let mut url = url.clone();
+    url.set_fragment(None);
+    url
+}
+
+/// Whether navigation left the requested URL's origin (scheme, host, or port).
+///
+/// A same-host default-port `http:80` to `https:443` redirect is *not* a change:
+/// the host is the cookie boundary, and that upgrade is the ordinary canonical
+/// redirect. Host changes, port changes, and HTTPS downgrades all are.
+pub(super) fn origin_changed(requested: &url::Url, final_url: &url::Url) -> bool {
+    if requested.host_str() != final_url.host_str() {
+        return true;
+    }
+
+    match (requested.scheme(), final_url.scheme()) {
+        ("http", "https") => {
+            requested.port_or_known_default() != Some(80)
+                || final_url.port_or_known_default() != Some(443)
+        }
+        (requested_scheme @ ("http" | "https"), final_scheme)
+            if requested_scheme == final_scheme =>
+        {
+            requested.port_or_known_default() != final_url.port_or_known_default()
+        }
+        // Refuse HTTPS downgrades and any unexpected scheme transition.
+        _ => true,
+    }
+}
+
+/// Builds the read-only collector init script from the configured slots.
+fn build_init_script(creative: Option<&CreativeOpportunitiesConfig>) -> Result<String, String> {
+    let config = AdTemplateCollectorConfig {
+        div_prefixes: creative
+            .map(|creative| {
+                creative
+                    .slot
+                    .iter()
+                    .map(|slot| slot.resolved_div_id().to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    build_ad_template_init_script(&config)
+}
+
+/// Assembles a successful page result, returning the wire `PageJson` and whether
+/// the page would fail `--strict`.
+fn build_page(
+    requested: &url::Url,
+    collected: &crate::commands::audit::collector::CollectedPage,
+    creative: Option<&CreativeOpportunitiesConfig>,
+    auction_enabled: bool,
+) -> (PageJson, bool) {
+    let requested_path = normalize_path_or_url(requested.as_str()).unwrap_or_else(|_| "/".into());
+    let final_url = &collected.final_url;
+    let final_path = normalize_path_or_url(final_url.as_str()).unwrap_or_else(|_| "/".into());
+
+    let expected = creative
+        .map(|creative| expected_slots_for_path(&final_path, creative).slots)
+        .unwrap_or_default();
+    let matched = !expected.is_empty();
+
+    let gate = evaluate_ad_stack_gate(AdStackGateInput {
+        method_get: true,
+        navigation: true,
+        prefetch: false,
+        bot: false,
+        matched_slots: matched,
+        consent_allows_auction: None,
+        auction_enabled,
+    });
+
+    let evidence = collected.ad_evidence.clone().unwrap_or_else(empty_evidence);
+    let result = compare_page_evidence(
+        &expected,
+        &evidence,
+        RuntimeGateSummary::from_expected(gate.expected),
+    );
+    let strict_failed = result.strict_failed();
+
+    let mut warnings: Vec<Warning> = collected.warnings.to_vec();
+    warnings.extend(evidence.warnings.iter().map(|warning| Warning {
+        code: format!("page_{}", warning.code),
+        message: warning.message.clone(),
+    }));
+    // Fragments never reach the server, so a fragment-only difference is not a
+    // redirect and slots match on the path either way.
+    if without_fragment(requested) != without_fragment(final_url) {
+        warnings.push(Warning {
+            code: "redirected".to_string(),
+            message: format!("navigation redirected from {requested} to {final_url}"),
+        });
+    }
+
+    let slots = expected
+        .iter()
+        .zip(result.slots.iter())
+        .map(|(expected_slot, slot_result)| to_slot_json(expected_slot, slot_result))
+        .collect();
+    let extra_evidence = result.extra_evidence.iter().map(to_extra_json).collect();
+
+    let page = PageJson {
+        url: requested.to_string(),
+        final_url: Some(final_url.to_string()),
+        requested_path,
+        path: Some(final_path),
+        error: None,
+        runtime_ad_stack_expected: Some(RuntimeAdStackExpectedJson::from(
+            result.runtime_ad_stack_expected,
+        )),
+        gates: Some(to_gates(matched, auction_enabled)),
+        matched_slot_count: Some(expected.len()),
+        slots,
+        extra_evidence,
+        warnings,
+    };
+    (page, strict_failed)
+}
+
+/// Builds a page-level navigation-failure result (spec §8 `navigation_failed`).
+fn error_page(requested: &url::Url, message: &str) -> PageJson {
+    let requested_path = normalize_path_or_url(requested.as_str()).unwrap_or_else(|_| "/".into());
+    PageJson {
+        url: requested.to_string(),
+        final_url: None,
+        requested_path,
+        path: None,
+        error: Some(Warning {
+            code: "navigation_failed".to_string(),
+            message: message.to_string(),
+        }),
+        runtime_ad_stack_expected: None,
+        gates: None,
+        matched_slot_count: None,
+        slots: Vec::new(),
+        extra_evidence: Vec::new(),
+        warnings: Vec::new(),
+    }
+}
+
+/// Builds a page-level cross-origin-redirect refusal.
+///
+/// The final URL is reported so the operator can re-run against it explicitly
+/// (or pass `--allow-cross-origin-redirect`) once they have confirmed it is
+/// their own property.
+fn cross_origin_page(requested: &url::Url, final_url: &url::Url) -> PageJson {
+    let requested_path = normalize_path_or_url(requested.as_str()).unwrap_or_else(|_| "/".into());
+    PageJson {
+        url: requested.to_string(),
+        final_url: Some(final_url.to_string()),
+        requested_path,
+        path: None,
+        error: Some(Warning {
+            code: "cross_origin_redirect".to_string(),
+            message: format!(
+                "navigation left the requested origin ({} -> {}); \
+                 evidence from another origin is not accepted as verification. \
+                 Re-run against the final URL, or pass --allow-cross-origin-redirect",
+                requested.origin().ascii_serialization(),
+                final_url.origin().ascii_serialization(),
+            ),
+        }),
+        runtime_ad_stack_expected: None,
+        gates: None,
+        matched_slot_count: None,
+        slots: Vec::new(),
+        extra_evidence: Vec::new(),
+        warnings: Vec::new(),
+    }
+}
+
+fn empty_evidence() -> BrowserAdEvidence {
+    BrowserAdEvidence {
+        dom_ids: Vec::new(),
+        gpt_slots: Vec::new(),
+        aps_calls: Vec::new(),
+        page_bids: Vec::new(),
+        warnings: Vec::new(),
+    }
+}
+
+fn to_gates(matched: bool, auction_enabled: bool) -> Gates {
+    let pass_if = |cond: bool| {
+        if cond {
+            GateState::Pass
+        } else {
+            GateState::Fail
+        }
+    };
+    Gates {
+        method_get: GateState::Pass,
+        navigation: GateState::Pass,
+        not_prefetch: GateState::Pass,
+        not_bot: GateState::Pass,
+        matched_slots: pass_if(matched),
+        auction_enabled: pass_if(auction_enabled),
+        // Live consent is not provable from a browser navigation in Phase 1.
+        consent_allows_auction: GateState::Unknown,
+    }
+}
+
+fn to_slot_json(expected: &ExpectedSlot, result: &SlotResult) -> SlotJson {
+    SlotJson {
+        id: result.id.clone(),
+        status: to_status(result.status),
+        phase: result.phase.map(to_phase),
+        configured: ConfiguredJson {
+            div_id: expected.div_id.clone(),
+            gam_unit_path: expected.gam_unit_path.clone(),
+            formats: expected
+                .formats
+                .iter()
+                .map(|format| FormatJson {
+                    width: format.width,
+                    height: format.height,
+                    media_type: media_type_label(&format.media_type).to_string(),
+                })
+                .collect(),
+            providers: expected.providers.clone(),
+        },
+        evidence: to_slot_evidence(&result.evidence),
+        warnings: result.warnings.clone(),
+    }
+}
+
+fn to_slot_evidence(evidence: &SlotEvidence) -> SlotEvidenceJson {
+    SlotEvidenceJson {
+        dom_id: evidence.dom_id.clone(),
+        gpt: evidence.gpt.as_ref().map(|gpt| GptEvidenceJson {
+            gam_unit_path: gpt.gam_unit_path.clone(),
+            div_id: gpt.div_id.clone(),
+            sizes: gpt.sizes.iter().map(|&(w, h)| [w, h]).collect(),
+        }),
+    }
+}
+
+fn to_extra_json(extra: &ExtraEvidence) -> ExtraEvidenceJson {
+    ExtraEvidenceJson {
+        kind: extra.kind.clone(),
+        phase: to_phase(extra.phase),
+        dom_id: extra.dom_id.clone(),
+        gam_unit_path: extra.gam_unit_path.clone(),
+        sizes: extra.sizes.iter().map(|&(w, h)| [w, h]).collect(),
+        reason: extra.reason.clone(),
+    }
+}
+
+fn to_status(status: CompareStatus) -> SlotStatus {
+    match status {
+        CompareStatus::Confirmed => SlotStatus::Confirmed,
+        CompareStatus::Partial => SlotStatus::Partial,
+        CompareStatus::Missing => SlotStatus::Missing,
+        CompareStatus::Unconfirmable => SlotStatus::Unconfirmable,
+    }
+}
+
+fn to_phase(phase: EvidencePhase) -> EvidencePhaseJson {
+    match phase {
+        EvidencePhase::InitialLoad => EvidencePhaseJson::InitialLoad,
+        EvidencePhase::Scroll => EvidencePhaseJson::Scroll,
+    }
+}
+
+fn media_type_label(media_type: &MediaType) -> &'static str {
+    match media_type {
+        MediaType::Banner => "banner",
+        MediaType::Video => "video",
+        MediaType::Native => "native",
+    }
+}
+
+fn write_json(out: &mut dyn Write, report: &VerificationReport) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|error| format!("failed to serialize verification report: {error}"))?;
+    writeln!(out, "{json}").map_err(write_err)
+}
+
+fn write_human(out: &mut dyn Write, report: &VerificationReport) -> Result<(), String> {
+    // Warning codes and messages can originate in the audited page (the
+    // collector forwards `String(error)` from page scripts), so escape control
+    // characters before writing them to the operator's terminal.
+    let write_warning = |out: &mut dyn Write, indent: &str, warning: &Warning| {
+        writeln!(
+            out,
+            "{indent}warning [{}]: {}",
+            escape_terminal_text(&warning.code),
+            escape_terminal_text(&warning.message)
+        )
+        .map_err(write_err)
+    };
+
+    for warning in &report.warnings {
+        write_warning(out, "", warning)?;
+    }
+    for page in &report.pages {
+        writeln!(out, "url: {}", escape_terminal_text(&page.url)).map_err(write_err)?;
+        if let Some(error) = &page.error {
+            writeln!(
+                out,
+                "  error [{}]: {}",
+                escape_terminal_text(&error.code),
+                escape_terminal_text(&error.message)
+            )
+            .map_err(write_err)?;
+            continue;
+        }
+        if let Some(path) = &page.path {
+            writeln!(out, "  path: {}", escape_terminal_text(path)).map_err(write_err)?;
+        }
+        if let Some(expected) = page.runtime_ad_stack_expected {
+            writeln!(out, "  runtime ad stack: {}", runtime_label(expected)).map_err(write_err)?;
+        }
+        if let Some(count) = page.matched_slot_count {
+            writeln!(out, "  matched slots: {count}").map_err(write_err)?;
+        }
+        if let Some(gates) = &page.gates {
+            writeln!(out, "  gates: {}", gates_label(gates)).map_err(write_err)?;
+        }
+        for slot in &page.slots {
+            writeln!(
+                out,
+                "  slot {}: {}",
+                escape_terminal_text(&slot.id),
+                status_label(slot.status)
+            )
+            .map_err(write_err)?;
+            for warning in &slot.warnings {
+                write_warning(out, "    ", warning)?;
+            }
+        }
+        for extra in &page.extra_evidence {
+            writeln!(
+                out,
+                "  extra {} evidence: div={} gam={} sizes={:?} ({})",
+                escape_terminal_text(&extra.kind),
+                escape_terminal_text(extra.dom_id.as_deref().unwrap_or("-")),
+                escape_terminal_text(extra.gam_unit_path.as_deref().unwrap_or("-")),
+                extra.sizes,
+                escape_terminal_text(&extra.reason),
+            )
+            .map_err(write_err)?;
+        }
+        for warning in &page.warnings {
+            write_warning(out, "  ", warning)?;
+        }
+    }
+    writeln!(out, "ok: {}", report.ok).map_err(write_err)
+}
+
+fn status_label(status: SlotStatus) -> &'static str {
+    match status {
+        SlotStatus::Confirmed => "confirmed",
+        SlotStatus::Partial => "partial",
+        SlotStatus::Missing => "missing",
+        SlotStatus::Unconfirmable => "unconfirmable",
+    }
+}
+
+fn runtime_label(expected: RuntimeAdStackExpectedJson) -> &'static str {
+    match expected {
+        RuntimeAdStackExpectedJson::Yes => "yes",
+        RuntimeAdStackExpectedJson::No => "no",
+        RuntimeAdStackExpectedJson::Unknown => "unknown",
+    }
+}
+
+fn gate_label(gate: GateState) -> &'static str {
+    match gate {
+        GateState::Pass => "pass",
+        GateState::Fail => "fail",
+        GateState::Unknown => "unknown",
+    }
+}
+
+fn gates_label(gates: &Gates) -> String {
+    format!(
+        "method_get={} navigation={} not_prefetch={} not_bot={} matched_slots={} auction_enabled={} consent={}",
+        gate_label(gates.method_get),
+        gate_label(gates.navigation),
+        gate_label(gates.not_prefetch),
+        gate_label(gates.not_bot),
+        gate_label(gates.matched_slots),
+        gate_label(gates.auction_enabled),
+        gate_label(gates.consent_allows_auction),
+    )
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "used as a map_err fn that receives io::Error by value"
+)]
+fn write_err(error: io::Error) -> String {
+    format!("failed to write command output: {error}")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::ad_templates::compare::{DomEvidence, GptSlotEvidence};
+    use crate::commands::audit::collector::CollectedPage;
+
+    struct FakeCollector {
+        pages: HashMap<String, Result<CollectedPage, String>>,
+        batch_calls: Cell<usize>,
+    }
+
+    impl FakeCollector {
+        fn page(requested: &str, final_url: &str, evidence: BrowserAdEvidence) -> Self {
+            let mut pages = HashMap::new();
+            pages.insert(
+                requested.to_string(),
+                Ok(CollectedPage {
+                    final_url: url::Url::parse(final_url).expect("should parse final URL"),
+                    title: String::new(),
+                    script_count: 0,
+                    resource_count: 0,
+                    warnings: Vec::new(),
+                    ad_evidence: Some(evidence),
+                }),
+            );
+            Self {
+                pages,
+                batch_calls: Cell::new(0),
+            }
+        }
+
+        fn with_error(mut self, requested: &str, message: &str) -> Self {
+            self.pages
+                .insert(requested.to_string(), Err(message.to_string()));
+            self
+        }
+    }
+
+    impl AuditCollector for FakeCollector {
+        fn collect_page(&self, request: BrowserCollectRequest) -> Result<CollectedPage, String> {
+            self.pages
+                .get(request.url.as_str())
+                .cloned()
+                .unwrap_or_else(|| Err(format!("no fake page for {}", request.url)))
+        }
+
+        fn collect_pages(
+            &self,
+            requests: &[BrowserCollectRequest],
+        ) -> Vec<Result<CollectedPage, String>> {
+            self.batch_calls.set(self.batch_calls.get() + 1);
+            requests
+                .iter()
+                .cloned()
+                .map(|request| self.collect_page(request))
+                .collect()
+        }
+    }
+
+    fn news_config() -> CreativeOpportunitiesConfig {
+        let toml = "gam_network_id = \"123\"\n\
+             \n\
+             [[slot]]\n\
+             id = \"atf\"\n\
+             gam_unit_path = \"/123/news/atf\"\n\
+             div_id = \"ad-atf-\"\n\
+             page_patterns = [\"/news/*\"]\n\
+             formats = [{ width = 300, height = 250 }]\n";
+        let mut config =
+            toml::from_str::<CreativeOpportunitiesConfig>(toml).expect("should deserialize");
+        config.compile_slots();
+        config
+    }
+
+    fn confirmed_news_evidence() -> BrowserAdEvidence {
+        BrowserAdEvidence {
+            dom_ids: vec![DomEvidence {
+                dom_id: "ad-atf-0".to_string(),
+                phase: EvidencePhase::InitialLoad,
+            }],
+            gpt_slots: vec![GptSlotEvidence {
+                gam_unit_path: "/123/news/atf".to_string(),
+                div_id: "ad-atf-0".to_string(),
+                sizes: vec![(300, 250)],
+                phase: EvidencePhase::InitialLoad,
+            }],
+            aps_calls: Vec::new(),
+            page_bids: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn report_for(
+        collector: &dyn AuditCollector,
+        auction_enabled: bool,
+        strict: bool,
+        urls: &[&str],
+    ) -> VerificationReport {
+        report_for_with_options(
+            collector,
+            auction_enabled,
+            urls,
+            VerifyOptions {
+                strict,
+                scroll: false,
+                allow_cross_origin_redirect: false,
+            },
+        )
+    }
+
+    fn report_for_with_options(
+        collector: &dyn AuditCollector,
+        auction_enabled: bool,
+        urls: &[&str],
+        options: VerifyOptions,
+    ) -> VerificationReport {
+        let config = news_config();
+        let parsed: Vec<url::Url> = urls
+            .iter()
+            .map(|url| url::Url::parse(url).expect("should parse URL"))
+            .collect();
+        build_report(
+            collector,
+            Some(&config),
+            auction_enabled,
+            &parsed,
+            options,
+            &[],
+        )
+        .expect("typed collector configuration should serialize")
+    }
+
+    #[test]
+    fn verify_uses_final_url_for_matching_after_redirect() {
+        let collector = FakeCollector::page(
+            "https://www.example.com/",
+            "https://www.example.com/news/story",
+            confirmed_news_evidence(),
+        );
+        let report = report_for(&collector, true, false, &["https://www.example.com/"]);
+        let json = serde_json::to_value(&report).expect("should serialize");
+
+        assert_eq!(json["pages"][0]["path"], "/news/story");
+        assert_eq!(json["pages"][0]["slots"][0]["status"], "confirmed");
+        let warnings = json["pages"][0]["warnings"]
+            .as_array()
+            .expect("should have warnings array");
+        assert!(
+            warnings.iter().any(|w| w["code"] == "redirected"),
+            "redirect should emit a `redirected` warning"
+        );
+    }
+
+    #[test]
+    fn cross_origin_redirect_is_rejected_even_when_paths_match() {
+        // Same path on a different origin: the redirect warning would not fire,
+        // so without the origin check this unrelated page's evidence would
+        // satisfy --strict.
+        let collector = FakeCollector::page(
+            "https://www.example.com/news/story",
+            "https://impostor.example.net/news/story",
+            confirmed_news_evidence(),
+        );
+        let report = report_for(
+            &collector,
+            true,
+            true,
+            &["https://www.example.com/news/story"],
+        );
+
+        assert!(!report.ok, "a cross-origin redirect must not report ok");
+        let json = serde_json::to_value(&report).expect("should serialize");
+        assert_eq!(json["pages"][0]["error"]["code"], "cross_origin_redirect");
+        assert!(
+            json["pages"][0]["slots"]
+                .as_array()
+                .expect("should have slots array")
+                .is_empty(),
+            "off-origin evidence must not be reported as slot verification"
+        );
+    }
+
+    #[test]
+    fn cross_origin_redirect_is_accepted_with_explicit_opt_in() {
+        let collector = FakeCollector::page(
+            "https://example.com/news/story",
+            "https://www.example.com/news/story",
+            confirmed_news_evidence(),
+        );
+        let report = report_for_with_options(
+            &collector,
+            true,
+            &["https://example.com/news/story"],
+            VerifyOptions {
+                strict: true,
+                scroll: false,
+                allow_cross_origin_redirect: true,
+            },
+        );
+
+        assert!(
+            report.ok,
+            "an opted-in apex -> www redirect should verify normally"
+        );
+        assert_eq!(report.pages[0].matched_slot_count, Some(1));
+    }
+
+    #[test]
+    fn same_origin_path_redirect_still_verifies() {
+        let collector = FakeCollector::page(
+            "https://www.example.com/",
+            "https://www.example.com/news/story",
+            confirmed_news_evidence(),
+        );
+        let report = report_for(&collector, true, true, &["https://www.example.com/"]);
+
+        assert!(
+            report.ok,
+            "a same-origin redirect should still be verified, not refused"
+        );
+    }
+
+    #[test]
+    fn same_host_http_to_https_upgrade_is_accepted() {
+        let collector = FakeCollector::page(
+            "http://www.example.com/news/story",
+            "https://www.example.com/news/story",
+            confirmed_news_evidence(),
+        );
+        let report = report_for(
+            &collector,
+            true,
+            true,
+            &["http://www.example.com/news/story"],
+        );
+
+        assert!(report.ok, "a default-port HTTPS upgrade should be accepted");
+    }
+
+    #[test]
+    fn downgrade_and_port_changes_are_rejected() {
+        for (requested, final_url) in [
+            (
+                "https://www.example.com/news/story",
+                "http://www.example.com/news/story",
+            ),
+            (
+                "https://www.example.com:8443/news/story",
+                "https://www.example.com:9443/news/story",
+            ),
+            (
+                "http://www.example.com:8080/news/story",
+                "https://www.example.com:8443/news/story",
+            ),
+        ] {
+            let collector = FakeCollector::page(requested, final_url, confirmed_news_evidence());
+            let report = report_for(&collector, true, true, &[requested]);
+            assert!(!report.ok, "redirect {requested} -> {final_url} must fail");
+        }
+    }
+
+    #[test]
+    fn confirmed_page_is_ok_in_default_mode() {
+        let collector = FakeCollector::page(
+            "https://www.example.com/news/story",
+            "https://www.example.com/news/story",
+            confirmed_news_evidence(),
+        );
+        let report = report_for(
+            &collector,
+            true,
+            false,
+            &["https://www.example.com/news/story"],
+        );
+
+        assert!(report.ok, "confirmed page should be ok");
+        assert_eq!(report.pages[0].matched_slot_count, Some(1));
+    }
+
+    #[test]
+    fn verifier_surfaces_injected_collector_warnings() {
+        let mut evidence = confirmed_news_evidence();
+        evidence.warnings.push(Warning {
+            code: "fluid_size_ignored".to_string(),
+            message: "a fluid size could not be compared".to_string(),
+        });
+        let collector = FakeCollector::page(
+            "https://www.example.com/news/story",
+            "https://www.example.com/news/story",
+            evidence,
+        );
+
+        let report = report_for(
+            &collector,
+            true,
+            false,
+            &["https://www.example.com/news/story"],
+        );
+
+        assert!(
+            report.pages[0]
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "page_fluid_size_ignored"),
+            "collector warning should be visible in the page report"
+        );
+    }
+
+    #[test]
+    fn human_output_includes_runtime_and_extra_evidence_diagnostics() {
+        let mut evidence = confirmed_news_evidence();
+        evidence.gpt_slots.push(GptSlotEvidence {
+            gam_unit_path: "/123/publisher/extra".to_string(),
+            div_id: "ad-extra-0".to_string(),
+            sizes: vec![(728, 90)],
+            phase: EvidencePhase::InitialLoad,
+        });
+        let collector = FakeCollector::page(
+            "https://www.example.com/news/story",
+            "https://www.example.com/news/story",
+            evidence,
+        );
+        let report = report_for(
+            &collector,
+            true,
+            false,
+            &["https://www.example.com/news/story"],
+        );
+        let mut output = Vec::new();
+
+        write_human(&mut output, &report).expect("should write human report");
+        let output = String::from_utf8(output).expect("should be UTF-8 output");
+
+        assert!(output.contains("runtime ad stack: unknown"));
+        assert!(output.contains("matched slots: 1"));
+        assert!(output.contains("gates: method_get=pass"));
+        assert!(output.contains("extra gpt evidence"));
+    }
+
+    #[test]
+    fn strict_missing_slot_fails() {
+        let collector = FakeCollector::page(
+            "https://www.example.com/news/story",
+            "https://www.example.com/news/story",
+            empty_evidence(),
+        );
+        let report = report_for(
+            &collector,
+            true,
+            true,
+            &["https://www.example.com/news/story"],
+        );
+
+        assert!(
+            !report.ok,
+            "strict mode with a missing slot should not be ok"
+        );
+    }
+
+    #[test]
+    fn auction_disabled_skips_strict_missing_failure() {
+        let collector = FakeCollector::page(
+            "https://www.example.com/news/story",
+            "https://www.example.com/news/story",
+            empty_evidence(),
+        );
+        // auction disabled -> runtime expected No -> strict does not fail on missing.
+        let report = report_for(
+            &collector,
+            false,
+            true,
+            &["https://www.example.com/news/story"],
+        );
+
+        assert!(
+            report.ok,
+            "missing slot must not fail strict when auction is disabled"
+        );
+        assert_eq!(
+            report.pages[0].runtime_ad_stack_expected,
+            Some(RuntimeAdStackExpectedJson::No)
+        );
+    }
+
+    #[test]
+    fn multi_url_page_error_sets_ok_false() {
+        let collector = FakeCollector::page(
+            "https://www.example.com/news/story",
+            "https://www.example.com/news/story",
+            confirmed_news_evidence(),
+        )
+        .with_error("https://www.example.com/broken", "navigation failed");
+        let report = report_for(
+            &collector,
+            true,
+            false,
+            &[
+                "https://www.example.com/news/story",
+                "https://www.example.com/broken",
+            ],
+        );
+
+        assert!(!report.ok, "a page-level error sets ok=false");
+        assert_eq!(
+            collector.batch_calls.get(),
+            1,
+            "all verifier URLs should use one collector batch"
+        );
+        let json = serde_json::to_value(&report).expect("should serialize");
+        assert_eq!(json["pages"][1]["error"]["code"], "navigation_failed");
+        assert!(json["pages"][1]["final_url"].is_null());
+    }
+
+    #[test]
+    fn supplied_cookies_are_rejected_for_multiple_origins() {
+        let urls = [
+            url::Url::parse("https://a.example/x").expect("should parse first URL"),
+            url::Url::parse("https://b.example/y").expect("should parse second URL"),
+        ];
+
+        let error = validate_cookie_scope(&urls, &[("session".to_string(), "secret".to_string())])
+            .expect_err("should not replicate one cookie across origins");
+
+        assert!(
+            error.contains("one origin"),
+            "the refusal should explain cookie scope, got {error}"
+        );
+    }
+
+    #[test]
+    fn supplied_cookies_are_allowed_for_same_origin_urls() {
+        let urls = [
+            url::Url::parse("https://a.example/x").expect("should parse first URL"),
+            url::Url::parse("https://a.example/y").expect("should parse second URL"),
+        ];
+
+        validate_cookie_scope(&urls, &[("session".to_string(), "secret".to_string())])
+            .expect("same-origin URLs share the intended cookie scope");
+    }
+}

@@ -66,17 +66,18 @@ fail and the service will return its startup-error response.
 
 ## Key Sections
 
-| Section             | Purpose                                      |
-| ------------------- | -------------------------------------------- |
-| `[publisher]`       | Domain, origin, proxy settings               |
-| `[ec]`              | Edge Cookie (EC) ID generation               |
-| `[tester_cookie]`   | Optional tester-cookie endpoint              |
-| `[proxy]`           | Proxy SSRF allowlist and asset routes        |
-| `[cache]`           | Static/rehosted asset cache policy rules     |
-| `[image_optimizer]` | Reusable Image Optimizer profile sets        |
-| `[request_signing]` | Ed25519 request signing                      |
-| `[auction]`         | Auction orchestration                        |
-| `[integrations.*]`  | Partner integrations (Prebid, Next.js, etc.) |
+| Section               | Purpose                                      |
+| --------------------- | -------------------------------------------- |
+| `[publisher]`         | Domain, origin, proxy settings               |
+| `[trusted_client_ip]` | Authenticated client-IP forwarding           |
+| `[ec]`                | Edge Cookie (EC) ID generation               |
+| `[tester_cookie]`     | Optional tester-cookie endpoint              |
+| `[proxy]`             | Proxy SSRF allowlist and asset routes        |
+| `[cache]`             | Static/rehosted asset cache policy rules     |
+| `[image_optimizer]`   | Reusable Image Optimizer profile sets        |
+| `[request_signing]`   | Ed25519 request signing                      |
+| `[auction]`           | Auction orchestration                        |
+| `[integrations.*]`    | Partner integrations (Prebid, Next.js, etc.) |
 
 ## Example: Production Setup
 
@@ -115,7 +116,7 @@ base TOML configuration by `ts config validate`, `ts config diff`, and
 stored in the app-config blob. Changing an environment variable requires
 rerunning validation and pushing the resolved config, not rebuilding the binary.
 
-EdgeZero v0.0.4 only overrides leaves that already exist in the parsed TOML; it
+EdgeZero's env overlay only overrides leaves that already exist in the parsed TOML; it
 does not create missing fields. Add newly introduced defaulted fields to an
 existing config before relying on their environment overrides. Pass `--no-env`
 to use file values without the overlay.
@@ -352,6 +353,74 @@ a zero-byte cap fails every non-empty publisher response.
 ```bash
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 ```
+
+## Trusted Client IP Configuration
+
+Use this optional section when a trusted CDN service forwards requests to the
+Fastly service running Trusted Server. It lets Trusted Server use the reader's
+address instead of the immediate fronting edge node's address. Only the Fastly
+adapter honours this section; the Cloudflare, Spin, and Axum adapters validate
+it but keep using their own runtime client address.
+
+### `[trusted_client_ip]`
+
+| Field           | Type   | Required | Description                                                                       |
+| --------------- | ------ | -------- | --------------------------------------------------------------------------------- |
+| `ip_header`     | String | Yes      | Header containing exactly one reader IP address                                   |
+| `auth_header`   | String | Yes      | Header containing exactly one shared-secret value                                 |
+| `shared_secret` | String | Yes      | Secret shared with the trusted front door, 32+ ASCII graphic bytes, no whitespace |
+
+All three fields are required when the section exists. When the section is
+absent, Trusted Server continues to use the immediate peer address.
+
+```toml
+[trusted_client_ip]
+ip_header = "fastly-client-ip"
+auth_header = "x-ts-client-ip-auth"
+shared_secret = "replace-with-a-random-shared-secret"
+```
+
+The front door must overwrite both headers on every request. Trusted Server
+accepts the forwarded address only when the request has exactly one
+`auth_header` value that matches `shared_secret` byte-for-byte and exactly one
+`ip_header` value that parses directly as IPv4 or IPv6. Values are not trimmed
+or normalized. Missing, empty, duplicate, non-UTF-8, mismatched, or malformed
+values do not reject the request; Trusted Server safely falls back to the
+immediate peer address. Both configured headers are removed before routing.
+
+Header names are validated case-insensitively. `ip_header` must be
+`fastly-client-ip` or start with `x-`, while `auth_header` must start with `x-`.
+The names must differ. Neither field may use the reserved
+`x-ts-tls-protocol` or `x-ts-tls-cipher` header. These restrictions exclude
+standard sensitive headers such as `Host`, `Content-Length`, `Cookie`, and
+`Authorization`, as well as Trusted Server's TLS bridge headers. Choose
+dedicated `x-` names that no other application or routing logic uses, because
+Trusted Server removes the configured headers before routing.
+
+Generate `shared_secret` with a cryptographically secure random generator,
+encode it as hex or base64url, store the same value only in the front door and
+Trusted Server configuration, and never commit it. The value is redacted from
+configuration debug output. Configuration requires at least 32 ASCII graphic
+bytes (`!` through `~`) with no whitespace, controls, DEL, or non-ASCII bytes,
+and startup fails when the value is still the documented placeholder.
+
+Redaction protects debug output and validation errors; it does not move the
+value into a platform secret store. `ts config push` serializes the value in the
+Trusted Server application-config blob, so restrict access to that configuration
+store. Every adapter removes the configured IP and authentication headers before
+routing, although only Fastly uses them for client-IP resolution.
+
+**Environment Overrides**:
+
+```bash
+TRUSTED_SERVER__TRUSTED_CLIENT_IP__IP_HEADER=fastly-client-ip
+TRUSTED_SERVER__TRUSTED_CLIENT_IP__AUTH_HEADER=x-ts-client-ip-auth
+TRUSTED_SERVER__TRUSTED_CLIENT_IP__SHARED_SECRET=replace-with-a-random-shared-secret
+```
+
+Because the typed environment overlay cannot create a missing section, add
+`[trusted_client_ip]` and all three fields to the TOML before using these
+overrides.
 
 ## Tester Cookie Configuration
 
@@ -1429,7 +1498,7 @@ remove that field's non-default value (and any environment override), run
 `ts config validate`, push the resulting default-compatible blob, and only then
 roll back the binary.
 
-**Environment overlays:** EdgeZero v0.0.4 overlays cannot create missing TOML
+**Environment overlays:** EdgeZero's env overlays cannot create missing TOML
 leaves. Existing configs must add **both** leaves under `[auction]`
 (`rewrite_creatives` and `sanitize_creatives`) before
 `TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES` /
@@ -1484,8 +1553,37 @@ Defines the ad slots the trusted server offers on a page: which pages each slot
 appears on (`page_patterns`), its supported sizes (`formats`), and the GAM ad
 unit it maps to (`gam_unit_path`).
 
+`enabled` is the dedicated server-side ad-template switch. It defaults to `true`
+for compatibility with existing configurations. Set it to `false` to stop
+publisher HTML and SPA page-bids template delivery while retaining the slot
+configuration and direct `POST /auction` endpoint.
+
+#### Publisher document cache policy
+
+For a successful GET publisher document, Trusted Server applies the
+browser-only `Cache-Control: private, max-age=60` policy from
+[#1007](https://github.com/IABTechLab/trusted-server/issues/1007) when the
+server-side ad stack is structurally inactive. Trusted Server also applies this
+policy to a subsequent `304 Not Modified` response so revalidation cannot
+restore the origin freshness policy. This includes an absent
+`[creative_opportunities]` section, `enabled = false`, no slot matching the
+path, or a disabled auction. The `private` directive prevents shared caches
+that use `Cache-Control` from storing the document. The policy replaces the
+origin browser cache policy except when the origin sends `private` or
+`no-store`, which are preserved. Bot, prefetch, and consent-denied requests
+also retain the origin policy because they can produce a request-specific
+representation for the same URL. Error responses and non-document requests
+retain the origin policy.
+
+Trusted Server leaves origin validators and CDN-specific cache headers
+unchanged. Those headers continue to control supporting CDNs independently of
+the browser-only policy. If a response using the generated inactive-stack
+policy later carries `Set-Cookie`, cookie privacy finalization replaces it with
+`Cache-Control: private, max-age=0` and removes the CDN-specific cache headers.
+
 ```toml
 [creative_opportunities]
+enabled = true # set to false to disable server-side ad templates
 gam_network_id = "123456789"
 price_granularity = "dense"
 
@@ -1503,6 +1601,146 @@ gam_unit_path = "/{network_id}/example/{section}"
 page_patterns = ["/", "/news", "/news/*", "/reviews", "/reviews/*"]
 formats = [{ width = 728, height = 90 }]
 ```
+
+The same switch can be overridden through the typed CLI environment overlay.
+Because EdgeZero only replaces TOML leaves that already exist, first add
+`enabled = true` to the `[creative_opportunities]` block in the base config
+before using this override. See [Environment Variable Overrides (Typed
+CLI)](#environment-variable-overrides-typed-cli) for the general overlay rules.
+
+```bash
+TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED=false
+```
+
+### Shared template assembly (`assembly_mode = "esi"`)
+
+### Shared template assembly (`assembly_mode = "esi"`)
+
+This configuration is an experimental validation spike scoped to
+[IABTechLab/trusted-server#1009](https://github.com/IABTechLab/trusted-server/issues/1009),
+not a settled production cache interface.
+
+`assembly_mode` controls how initial-page slot and bid state is delivered:
+
+- `inline` (default) transforms every origin response and injects the current
+  reader's slots and bids directly.
+- `esi` opts into a reader-neutral transformed-template cache on Fastly. The
+  cache stores identity bytes containing one inert, versioned comment. On an
+  authorized cold miss, Fastly replaces that comment in a private working copy
+  with one synthetic ESI include and resolves it from the already-built reader
+  state using the pinned `stackpop/esi` parser. No HTTP fragment request occurs.
+  Warm hits use an exact byte split instead, preserving the fast article-prefix
+  stream while the auction finishes.
+
+This is deliberately not general publisher-controlled ESI. A transformed origin
+document containing any `<esi:` directive bypasses the template cache and the parser, while the
+ordinary byte seam still produces the reader's complete response. The stored shared template
+object never contains executable ESI markup.
+
+Only Fastly currently supplies the Core Cache backend used by the shared template cache. Other adapters accept
+the mode but safely fall back to the inline transform on every request. This is
+not a top-level HTTP cache hit: Compute still runs and the final assembled
+response is always `Cache-Control: private, no-store`.
+
+All four keys below belong directly under `[creative_opportunities]`. They are
+one feature contract: `assembly_mode` selects how creative-opportunity state is
+delivered, while the other three constrain when and how long that mode may share
+its template.
+They are not a general top-level HTTP-cache configuration.
+
+```toml
+[creative_opportunities]
+assembly_mode = "esi"
+
+# Every request header, except Accept-Encoding, that the publisher origin can
+# name in Vary for these documents. Names are validated and de-duplicated.
+template_cache_vary = [
+  "rsc",
+  "next-router-state-tree",
+  "next-router-prefetch",
+  "next-router-segment-prefetch",
+]
+
+# Safety ceiling for the shared template. Defaults to 60; valid range 1–86400.
+# The origin's remaining edge freshness may make the actual lifetime shorter.
+template_cache_max_age_seconds = 1200
+
+# Default false. Enable only after proving publisher HTML ignores Cookie.
+origin_is_cookie_independent = true
+```
+
+The cache fails closed. A template is stored only for a `GET` with a processable
+`200 text/html` origin response, a supported content encoding, and explicit
+positive shared freshness. `private`, `no-store`, `no-cache`, exhausted or
+malformed freshness, `Set-Cookie`, `Vary: *`, `Vary: Cookie`, uncovered `Vary`
+names, response-bound CSP nonces, authorization, diagnostics sessions, range or
+conditional requests, positive or malformed request `max-age`, `min-fresh`, and
+unsupported CDN-specific cache policy fields all bypass the template cache. Fastly
+`Surrogate-Control` is the narrow exception: the template cache accepts exactly one positive
+`max-age` plus optional valid `stale-while-revalidate` and `stale-if-error`
+delta-seconds. Restrictive, duplicated, malformed, or unknown directives fail
+closed. Stale windows never extend template-cache freshness. Freshness follows Fastly edge
+precedence: `Surrogate-Control: max-age`, then `Cache-Control: s-maxage`,
+`Cache-Control: max-age`, then `Expires`. Restrictive directives in either policy
+still refuse sharing. Origin `Age` and apparent age from `Date` are deducted, time
+spent transforming the page continues consuming freshness, and the remaining
+lifetime is capped by `template_cache_max_age_seconds`.
+
+A browser reload commonly sends `Cache-Control: max-age=0`. TS may reuse a fresh
+reader-neutral shared template for that reload, but it still builds a new private
+response and runs a new per-reader auction. Explicit `no-cache`, `no-store`,
+positive or malformed request `max-age`, range, and conditional requests still bypass the template cache.
+Check `X-TS-Template-Cache: hit` to verify template reuse.
+
+`template_cache_vary` is necessary because lookup occurs before the origin can
+return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
+origin identity, complete template-shaping settings, TSJS content, and schema
+version all participate in an opaque SHA-256 cache key. `Accept-Encoding` does
+not: the stored template is decoded identity and the assembled result is encoded
+for each reader with `Vary: Accept-Encoding`. This assumes the origin's
+`Accept-Encoding` variants differ only by HTTP content coding, as normal
+compression negotiation does. Do not enable ESI for an origin that changes the
+document's meaning based on `Accept-Encoding`. Never put `Cookie` in
+`template_cache_vary`; startup rejects it because a per-cookie object is not a
+reader-neutral template. With `origin_is_cookie_independent = false` (the safe
+default), all cookie-bearing requests bypass. With it set to `true`, an origin
+`Vary: Cookie` still overrides the assertion and refuses storage.
+Every other name the origin emits in `Vary` must appear in the configured list;
+an uncovered name safely refuses template storage.
+
+For a canary, inspect `X-TS-Template-Cache`. Its bounded values are `hit`,
+`miss-stored`, `miss-store-error`, `miss-reserved`, `bypass-request`,
+`bypass-response`, `unsupported`, `invalid`, and `backend-error`. No URL, header
+value, or cache key is exposed. `invalid` and `backend-error` fail open to a
+fresh origin response; they do not fail the page. The corresponding
+`template_cache` logs provide server-side observability for this path.
+
+`X-TS-Assembly` identifies how the private response was assembled:
+
+- `esi-parser` — authorized cold miss assembled by the repaired parser;
+- `byte-seam` — warm template-cache hit using the streaming byte seam;
+- `byte-seam-fallback` — cold response safely assembled by byte seam because
+  the platform parser was unavailable or rejected the document.
+
+The two headers together are the reliable verification signal. Timing alone can
+vary with the origin, auction, compression, browser connection reuse, and local
+proxy buffering.
+
+Rollback must preserve configuration compatibility:
+
+1. Change `assembly_mode` to `inline` and deploy/push that configuration.
+2. Before rolling back to a binary that predates these fields, remove
+   `assembly_mode`, `template_cache_vary`, `template_cache_max_age_seconds`, and
+   `origin_is_cookie_independent`, then push the cleaned configuration. Older binaries
+   use `deny_unknown_fields` and intentionally reject unknown keys.
+3. Purge the Fastly surrogate key `ts-template` using the service's normal purge
+   tooling, or wait for the bounded origin-derived lifetime to expire.
+
+Run `scripts/template-cache-local-test.sh esi` before a rollout and
+`scripts/template-cache-local-test.sh inline` as its control. The harness uses a temporary
+manifest, never edits the tracked `fastly.toml`, verifies cold/warm origin
+counts and response integrity, and executes the generated GPT module against
+the served seam to require a real `defineSlot` call.
 
 ### `gam_unit_path` templating
 
@@ -1557,8 +1795,9 @@ publisher-specific. Startup fails if `{section}` is used without a valid
 `section_root`. Startup rejects a blank `gam_network_id` only when an absent
 path/default or a `{network_id}` template consumes it; static paths and
 templates without `{network_id}` do not consume it. A
-`[creative_opportunities]` block with no slots is disabled, so its
-`gam_network_id` is not checked.
+`[creative_opportunities]` block with `enabled = false` or no slots is
+inactive, so no publisher templates are delivered and its `gam_network_id` is
+not checked when no slot uses it.
 
 Both knobs are config-driven, so the URL→section convention stays with the
 publisher: `section_segment` selects which segment names the section, and
@@ -1775,7 +2014,7 @@ trusted-server.dev.toml      # Development overrides
 **Environment Variables Not Applied**:
 
 - Run the override through `ts config validate`, `ts config diff`, or `ts config push`
-- Verify the target leaf already exists in `trusted-server.toml`; EdgeZero v0.0.4 does not create missing fields
+- Verify the target leaf already exists in `trusted-server.toml`; the env overlay does not create missing fields
 - Verify prefix: `TRUSTED_SERVER__`
 - Check separator: `__` (double underscore)
 - Confirm the variable is exported: `echo $VARIABLE_NAME`

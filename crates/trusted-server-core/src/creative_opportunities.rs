@@ -16,6 +16,8 @@ use crate::settings::vec_from_seq_or_map;
 
 const MAX_DYNAMIC_GAM_UNIT_PATH_BYTES: usize = 100;
 const MAX_SECTION_BYTES: usize = 100;
+const DEFAULT_TEMPLATE_CACHE_MAX_AGE_SECONDS: u32 = 60;
+const MAX_TEMPLATE_CACHE_MAX_AGE_SECONDS: u32 = 86_400;
 
 /// A single parsed segment of a [`gam_unit_path`](CreativeOpportunitySlot::gam_unit_path) template.
 #[derive(Debug, Clone)]
@@ -171,8 +173,12 @@ fn sanitize_section(segment: &str) -> String {
 /// The path is used **raw** (not percent-decoded) so this stays consistent with
 /// how [`page_patterns`](CreativeOpportunitySlot::page_patterns) glob-match the
 /// same path — e.g. `/new%20s` yields `new_20s`, never the decoded `new_s`.
+///
+/// Public so operator tooling that *infers* a `{section}` template from observed
+/// ad-unit paths can check its inference against the exact derivation the
+/// runtime will perform, rather than reimplementing the sanitization rules.
 #[must_use]
-fn derive_section(path: &str, section_root: &str, section_segment: usize) -> String {
+pub fn derive_section(path: &str, section_root: &str, section_segment: usize) -> String {
     match path
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -183,10 +189,57 @@ fn derive_section(path: &str, section_root: &str, section_segment: usize) -> Str
     }
 }
 
+const fn default_enabled() -> bool {
+    true
+}
+
+const fn is_default_enabled(value: &bool) -> bool {
+    *value == default_enabled()
+}
+
+/// How per-user ad state reaches the page.
+///
+/// `Inline` is the shipped behaviour: the auction result is injected before
+/// `</body>` and the root document is therefore uncacheable. `Esi` stores a
+/// request-neutral shared template and fills its per-request byte seam at the edge.
+///
+/// Spike-only, for the #1009 ESI validation. Remove with the spike.
+///
+/// # Why the template must be request-neutral
+///
+/// Under `Esi` the template is shared across visitors, so
+/// nothing whose *presence* depends on the request may appear in it — not merely
+/// nothing whose *value* does. `tsjs.adSlots` is the trap: its content is derived
+/// from config and path, but whether it is emitted at all is gated on consent,
+/// bot classification, prefetch status and the auction kill switch. A template
+/// filled by the first request would freeze that request's decision for every
+/// later reader.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssemblyMode {
+    /// Inject bids inline before `</body>`. Root uncacheable. Shipped behaviour.
+    #[default]
+    Inline,
+    /// Serve a shared template; assemble its inert marker with an exact byte split.
+    ///
+    /// The operator-facing spelling remains `esi` for continuity, but no general
+    /// purpose ESI parser executes on this path.
+    Esi,
+}
+
 /// Top-level configuration for the creative opportunities system.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreativeOpportunitiesConfig {
+    /// Enables server-side ad template delivery on publisher HTML and page-bids requests.
+    ///
+    /// This does not disable the direct `POST /auction` endpoint. The default is
+    /// `true` so existing creative-opportunity configurations retain their behavior.
+    #[serde(
+        default = "default_enabled",
+        skip_serializing_if = "is_default_enabled"
+    )]
+    pub enabled: bool,
     /// GAM network ID used to build default unit paths.
     pub gam_network_id: String,
     /// Maximum time in milliseconds to wait for the server-side auction before
@@ -244,12 +297,102 @@ pub struct CreativeOpportunitiesConfig {
     /// [`section_root`](Self::section_root) are omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section_segment: Option<usize>,
+    /// How per-user ad state reaches the page. Absent means
+    /// [`AssemblyMode::Inline`], the shipped behaviour.
+    ///
+    /// `Option` rather than a bare enum, and `skip_serializing_if`, deliberately:
+    /// these structs use `deny_unknown_fields`, so a pushed key makes an older
+    /// binary fail configuration load. Keeping it absent when unset means a
+    /// deployment that never sets it stays rollback-compatible.
+    ///
+    /// Spike-only. See [`AssemblyMode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assembly_mode: Option<AssemblyMode>,
+    /// Request headers the origin varies on, which the shared-template cache key must
+    /// cover.
+    ///
+    /// Operator-stated because a cache **lookup happens before the fetch**, so on a cold
+    /// key the origin's `Vary` is not yet known. See `VarySpec` for why the alternatives
+    /// (two-phase lookup, or storing the list and re-keying) were not taken.
+    ///
+    /// **Unset or empty means no operator-stated header is covered, so any origin
+    /// `Vary` other than structurally covered `Accept-Encoding` disqualifies the
+    /// response.** `Cookie` may never be configured: a per-cookie object violates the
+    /// reader-neutral template contract. This fail-closed default prevents a deployment
+    /// that has not stated what its origin varies on from gaining a shared cache by
+    /// omission.
+    ///
+    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_cache_vary: Option<Vec<String>>,
+    /// Maximum time a reader-neutral transformed template may remain in the shared template cache.
+    ///
+    /// This is a safety ceiling, not freshness authorization. The origin must still
+    /// provide positive shared freshness, and the stored lifetime is the smaller of
+    /// the origin's remaining edge freshness and this value. Defaults to 60 seconds
+    /// and may be configured from 1 second through 1 day.
+    ///
+    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_cache_max_age_seconds: Option<u32>,
+    /// Operator assertion that the origin's HTML does not depend on request cookies.
+    ///
+    /// Unset or `false` disqualifies **every cookie-bearing request** from the shared
+    /// template cache, in both directions. That is safe and it is also very nearly a
+    /// disable switch: Trusted Server sets its own identity cookie, so essentially every
+    /// repeat visitor carries one. Left at the default, the cache can only ever serve
+    /// first-ever page views and cookie-less clients.
+    ///
+    /// Setting `true` asserts the origin serves the same HTML with or without cookies.
+    /// It is not taken on trust alone — if the origin ever declares `Vary: Cookie`, the
+    /// response is refused regardless of this flag or the configured key. So a wrong
+    /// assertion is caught whenever the origin is honest about it, and this only widens
+    /// the window where the origin personalizes *silently*.
+    ///
+    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_is_cookie_independent: Option<bool>,
     /// Slot templates. Empty vec = feature disabled (no auction fired, no globals injected).
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub slot: Vec<CreativeOpportunitySlot>,
 }
 
 impl CreativeOpportunitiesConfig {
+    /// Resolved assembly mode, defaulting to [`AssemblyMode::Inline`] when unset.
+    #[must_use]
+    pub fn assembly_mode(&self) -> AssemblyMode {
+        self.assembly_mode.unwrap_or_default()
+    }
+
+    /// Whether a cookie-bearing request may participate in the shared cache.
+    ///
+    /// Defaults to `false`, which is the conservative reading and also the one that
+    /// makes the cache almost inert on real traffic. See
+    /// [`Self::origin_is_cookie_independent`].
+    #[must_use]
+    pub fn origin_is_cookie_independent(&self) -> bool {
+        self.origin_is_cookie_independent.unwrap_or(false)
+    }
+
+    /// Headers the cache key covers, per operator config.
+    ///
+    /// Unset yields an empty operator spec, so any origin `Vary` other than the
+    /// structurally covered `Accept-Encoding` reads as a gap and the response is never
+    /// cached. Failing closed is deliberate: an unconfigured deployment should not
+    /// acquire a shared cache silently.
+    #[must_use]
+    pub fn template_cache_vary(&self) -> crate::platform::VarySpec {
+        crate::platform::VarySpec::new(self.template_cache_vary.clone().unwrap_or_default())
+    }
+
+    /// Safety ceiling for one shared transformed-template cache entry.
+    #[must_use]
+    pub fn template_cache_max_age(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(
+            self.template_cache_max_age_seconds
+                .unwrap_or(DEFAULT_TEMPLATE_CACHE_MAX_AGE_SECONDS),
+        ))
+    }
     /// Derives the `{section}` value for `path` under this config's section
     /// policy ([`section_root`](Self::section_root) and
     /// [`section_segment`](Self::section_segment)).
@@ -316,10 +459,32 @@ impl CreativeOpportunitiesConfig {
     /// Returns an error string when [`gam_network_id`](Self::gam_network_id) is
     /// blank but consumed by a default path or `{network_id}` template; when a
     /// slot has an invalid identifier, page pattern set, format list, or
-    /// dimensions; when a `{section}` template lacks a valid
+    /// dimensions; when `template_cache_max_age_seconds` falls outside 1–86,400;
+    /// when a `{section}` template lacks a valid
     /// [`section_root`](Self::section_root); or when configured values make a
     /// dynamic path exceed 100 UTF-8 bytes.
     pub fn validate_runtime(&self) -> Result<(), String> {
+        if self
+            .template_cache_max_age_seconds
+            .is_some_and(|seconds| !(1..=MAX_TEMPLATE_CACHE_MAX_AGE_SECONDS).contains(&seconds))
+        {
+            return Err(format!(
+                "template_cache_max_age_seconds must be between 1 and {MAX_TEMPLATE_CACHE_MAX_AGE_SECONDS}"
+            ));
+        }
+
+        if let Some(names) = &self.template_cache_vary {
+            crate::platform::VarySpec::try_new(names.clone()).map_err(|name| {
+                format!("template_cache_vary contains invalid HTTP header name `{name}`")
+            })?;
+            if names.iter().any(|name| name.eq_ignore_ascii_case("cookie")) {
+                return Err(
+                    "template_cache_vary must not include Cookie; shared templates are reader-neutral"
+                        .to_string(),
+                );
+            }
+        }
+
         // A network ID is required only when a slot renders the default
         // `/<network_id>/<slot_id>` path or substitutes `{network_id}`. Static
         // and `{slot_id}`/`{section}`-only templates leave it inert.
@@ -531,15 +696,7 @@ impl CreativeOpportunitySlot {
         // skip `compile_patterns`). Re-compiles on every call.
         self.page_patterns
             .iter()
-            .any(|pattern| match Pattern::new(pattern) {
-                Ok(p) => p.matches(path),
-                Err(_) => {
-                    let normalised = pattern.replace("**", "*");
-                    Pattern::new(&normalised)
-                        .map(|p| p.matches(path))
-                        .unwrap_or(false)
-                }
-            })
+            .any(|pattern| compile_page_pattern(pattern).is_ok_and(|p| p.matches(path)))
     }
 
     /// Compile [`page_patterns`](Self::page_patterns) into the
@@ -556,22 +713,20 @@ impl CreativeOpportunitySlot {
         self.compiled_patterns = self
             .page_patterns
             .iter()
-            .filter_map(|pattern| {
-                match Pattern::new(pattern).or_else(|_| Pattern::new(&pattern.replace("**", "*"))) {
-                    Ok(compiled) => Some(compiled),
-                    Err(_) => {
-                        // Build-time validation only requires *one* valid pattern
-                        // per slot, so a mixed valid/invalid set passes the build
-                        // with the bad pattern silently dropped here. Warn so the
-                        // operator can see the slot matches fewer pages than
-                        // configured.
-                        log::warn!(
-                            "slot `{}`: dropping page pattern '{}' — it does not compile as a glob",
-                            self.id,
-                            pattern
-                        );
-                        None
-                    }
+            .filter_map(|pattern| match compile_page_pattern(pattern) {
+                Ok(compiled) => Some(compiled),
+                Err(error) => {
+                    // Build-time validation only requires *one* valid pattern
+                    // per slot, so a mixed valid/invalid set passes the build
+                    // with the bad pattern silently dropped here. Warn so the
+                    // operator can see the slot matches fewer pages than
+                    // configured.
+                    log::warn!(
+                        "slot `{}`: dropping page pattern '{}': {error}",
+                        self.id,
+                        pattern
+                    );
+                    None
                 }
             })
             .collect();
@@ -834,6 +989,48 @@ pub struct PrebidSlotParams {
     pub bidders: HashMap<String, serde_json::Value>,
 }
 
+/// Compiles a [`page_patterns`](CreativeOpportunitySlot::page_patterns) entry
+/// using the runtime's normalisation.
+///
+/// This is the single definition of what the runtime accepts as a page glob:
+/// a direct [`Pattern::new`], falling back to the `**`→`*` rewrite that
+/// [`CreativeOpportunitySlot::compile_patterns`] and
+/// [`matches_path`](CreativeOpportunitySlot::matches_path) apply.
+///
+/// # Errors
+///
+/// Returns an error string when the pattern compiles neither directly nor after
+/// normalisation.
+pub(crate) fn compile_page_pattern(pattern: &str) -> Result<Pattern, String> {
+    Pattern::new(pattern)
+        .or_else(|_| Pattern::new(&pattern.replace("**", "*")))
+        .map_err(|error| format!("page pattern '{pattern}' is not a valid glob: {error}"))
+}
+
+/// Validates a [`page_patterns`](CreativeOpportunitySlot::page_patterns) entry
+/// using the runtime's normalisation.
+///
+/// This exposes validation without leaking the runtime's `glob::Pattern` type
+/// into the public API.
+///
+/// # Errors
+///
+/// Returns an error string when the pattern compiles neither directly nor after
+/// the runtime's `**` to `*` normalisation.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::creative_opportunities::validate_page_pattern;
+///
+/// assert!(validate_page_pattern("/news/*").is_ok());
+/// assert!(validate_page_pattern("/20**").is_ok());
+/// assert!(validate_page_pattern("[").is_err());
+/// ```
+pub fn validate_page_pattern(pattern: &str) -> Result<(), String> {
+    compile_page_pattern(pattern).map(|_| ())
+}
+
 /// Validates that a slot ID contains only safe characters.
 ///
 /// Allowed characters: ASCII alphanumerics, underscores (`_`), and hyphens (`-`).
@@ -866,9 +1063,264 @@ pub fn match_slots<'a>(
     slots.iter().filter(|s| s.matches_path(path)).collect()
 }
 
+/// Three-state outcome of the server-side ad-stack gate.
+///
+/// [`Yes`](RuntimeAdStackExpected::Yes) and [`No`](RuntimeAdStackExpected::No)
+/// are decided purely from known inputs; [`Unknown`](RuntimeAdStackExpected::Unknown)
+/// is reserved for callers (such as the operator CLI) that cannot prove the live
+/// consent state and pass `None` for `consent_allows_auction`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RuntimeAdStackExpected {
+    /// All known gates pass and consent is known to allow the auction.
+    Yes,
+    /// At least one known gate blocks the server-side ad stack.
+    No,
+    /// All known gates pass but consent is unproven.
+    Unknown,
+}
+
+/// Identifies a single gate evaluated by [`evaluate_ad_stack_gate`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AdStackGateName {
+    /// Request method is `GET`.
+    MethodGet,
+    /// Request is a top-level navigation.
+    Navigation,
+    /// Request is not a prefetch.
+    NotPrefetch,
+    /// Request is not from a known bot.
+    NotBot,
+    /// At least one configured slot matches the request path.
+    MatchedSlots,
+    /// Consent is known to allow the auction.
+    ConsentAllowsAuction,
+    /// The global `[auction].enabled` kill switch is on.
+    AuctionEnabled,
+}
+
+impl AdStackGateName {
+    const ALL: [Self; 7] = [
+        Self::MethodGet,
+        Self::Navigation,
+        Self::NotPrefetch,
+        Self::NotBot,
+        Self::MatchedSlots,
+        Self::ConsentAllowsAuction,
+        Self::AuctionEnabled,
+    ];
+
+    fn blocks(self, input: AdStackGateInput) -> bool {
+        match self {
+            Self::MethodGet => !input.method_get,
+            Self::Navigation => !input.navigation,
+            Self::NotPrefetch => input.prefetch,
+            Self::NotBot => input.bot,
+            Self::MatchedSlots => !input.matched_slots,
+            Self::ConsentAllowsAuction => input.consent_allows_auction == Some(false),
+            Self::AuctionEnabled => !input.auction_enabled,
+        }
+    }
+}
+
+/// Inputs to [`evaluate_ad_stack_gate`].
+///
+/// `consent_allows_auction` is tri-state: `Some(true)` allows, `Some(false)`
+/// blocks, and `None` means the caller cannot prove the consent state.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct AdStackGateInput {
+    /// Request method is `GET`.
+    pub method_get: bool,
+    /// Request is a top-level navigation.
+    pub navigation: bool,
+    /// Request advertises itself as a prefetch.
+    pub prefetch: bool,
+    /// Request is from a known bot.
+    pub bot: bool,
+    /// At least one configured slot matches the request path.
+    pub matched_slots: bool,
+    /// Whether consent allows the auction.
+    ///
+    /// `Some(true)` allows the auction, `Some(false)` blocks it, and `None`
+    /// means the caller cannot prove either state. Unknown consent is not a
+    /// denial: it produces [`RuntimeAdStackExpected::Unknown`] when every known
+    /// boolean gate passes.
+    pub consent_allows_auction: Option<bool>,
+    /// The global `[auction].enabled` kill switch.
+    pub auction_enabled: bool,
+}
+
+/// Result of [`evaluate_ad_stack_gate`]: the three-state expectation plus the
+/// original inputs used to derive per-gate diagnostics on demand.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AdStackGateResult {
+    /// The three-state ad-stack expectation.
+    pub expected: RuntimeAdStackExpected,
+    input: AdStackGateInput,
+}
+
+impl AdStackGateResult {
+    /// Returns the gates that blocked the server-side ad stack.
+    pub fn blocking_gates(&self) -> impl Iterator<Item = AdStackGateName> + '_ {
+        AdStackGateName::ALL
+            .into_iter()
+            .filter(|gate| gate.blocks(self.input))
+    }
+}
+
+/// Evaluates whether the server-side ad stack should run for a request.
+///
+/// Any known gate that fails sets [`No`](RuntimeAdStackExpected::No) and is
+/// recorded in [`AdStackGateResult::blocking_gates`]. When no known gate blocks,
+/// the result is [`Yes`](RuntimeAdStackExpected::Yes) if consent is known to
+/// allow the auction, or [`Unknown`](RuntimeAdStackExpected::Unknown) when
+/// `consent_allows_auction` is `None`.
+///
+/// Gate polarity mirrors the runtime publisher path: `method_get`, `navigation`,
+/// `matched_slots`, and `auction_enabled` block when `false`; `prefetch` and
+/// `bot` block when `true`.
+#[must_use]
+pub fn evaluate_ad_stack_gate(input: AdStackGateInput) -> AdStackGateResult {
+    let known_gate_blocks = !input.method_get
+        || !input.navigation
+        || input.prefetch
+        || input.bot
+        || !input.matched_slots
+        || input.consent_allows_auction == Some(false)
+        || !input.auction_enabled;
+    let expected = if known_gate_blocks {
+        RuntimeAdStackExpected::No
+    } else if input.consent_allows_auction.is_none() {
+        RuntimeAdStackExpected::Unknown
+    } else {
+        RuntimeAdStackExpected::Yes
+    };
+
+    AdStackGateResult { expected, input }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ad_stack_gate_passes_for_eligible_navigation() {
+        let result = evaluate_ad_stack_gate(AdStackGateInput {
+            method_get: true,
+            navigation: true,
+            prefetch: false,
+            bot: false,
+            matched_slots: true,
+            consent_allows_auction: Some(true),
+            auction_enabled: true,
+        });
+
+        assert_eq!(result.expected, RuntimeAdStackExpected::Yes);
+        assert_eq!(result.blocking_gates().count(), 0);
+    }
+
+    #[test]
+    fn ad_stack_gate_blocks_known_kill_switch() {
+        let result = evaluate_ad_stack_gate(AdStackGateInput {
+            method_get: true,
+            navigation: true,
+            prefetch: false,
+            bot: false,
+            matched_slots: true,
+            consent_allows_auction: Some(true),
+            auction_enabled: false,
+        });
+
+        assert_eq!(result.expected, RuntimeAdStackExpected::No);
+        assert!(
+            result
+                .blocking_gates()
+                .any(|gate| gate == AdStackGateName::AuctionEnabled)
+        );
+    }
+
+    #[test]
+    fn ad_stack_gate_is_unknown_when_consent_is_unknown() {
+        let result = evaluate_ad_stack_gate(AdStackGateInput {
+            method_get: true,
+            navigation: true,
+            prefetch: false,
+            bot: false,
+            matched_slots: true,
+            consent_allows_auction: None,
+            auction_enabled: true,
+        });
+
+        assert_eq!(result.expected, RuntimeAdStackExpected::Unknown);
+    }
+
+    // Locks the spec §5.2 mirror invariant: with Some(consent) supplied for every
+    // input combination, `expected == Yes` must equal the legacy all-AND boolean.
+    #[test]
+    fn ad_stack_gate_with_known_consent_matches_legacy_boolean() {
+        for bits in 0u8..128 {
+            let input = AdStackGateInput {
+                method_get: bits & 1 != 0,
+                navigation: bits & 2 != 0,
+                prefetch: bits & 4 != 0,
+                bot: bits & 8 != 0,
+                matched_slots: bits & 16 != 0,
+                consent_allows_auction: Some(bits & 32 != 0),
+                auction_enabled: bits & 64 != 0,
+            };
+            // Legacy semantics: all positive gates true, both negative gates false.
+            let legacy = input.method_get
+                && input.navigation
+                && !input.prefetch
+                && !input.bot
+                && input.matched_slots
+                && input.consent_allows_auction == Some(true)
+                && input.auction_enabled;
+            let got = evaluate_ad_stack_gate(input).expected == RuntimeAdStackExpected::Yes;
+            assert_eq!(got, legacy, "gate mismatch for bits={bits}");
+        }
+    }
+
+    #[test]
+    fn ad_stack_gate_with_unknown_consent_matches_known_boolean_gates() {
+        for bits in 0u8..64 {
+            let input = AdStackGateInput {
+                method_get: bits & 1 != 0,
+                navigation: bits & 2 != 0,
+                prefetch: bits & 4 != 0,
+                bot: bits & 8 != 0,
+                matched_slots: bits & 16 != 0,
+                consent_allows_auction: None,
+                auction_enabled: bits & 32 != 0,
+            };
+            let known_gates_pass = input.method_get
+                && input.navigation
+                && !input.prefetch
+                && !input.bot
+                && input.matched_slots
+                && input.auction_enabled;
+            let expected = if known_gates_pass {
+                RuntimeAdStackExpected::Unknown
+            } else {
+                RuntimeAdStackExpected::No
+            };
+
+            assert_eq!(
+                evaluate_ad_stack_gate(input).expected,
+                expected,
+                "should match unknown-consent gate semantics for bits={bits}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_page_pattern_preserves_specific_compile_error() {
+        let error = validate_page_pattern("[").expect_err("should reject invalid glob");
+
+        assert!(
+            error.contains("page pattern '[' is not a valid glob"),
+            "should retain the invalid pattern in the error: {error}"
+        );
+    }
 
     fn make_slot(id: &str, patterns: Vec<&str>) -> CreativeOpportunitySlot {
         CreativeOpportunitySlot {
@@ -1143,16 +1595,47 @@ mod tests {
         assert_eq!(derive_section("/%%%/x", "home", 0), "_");
     }
 
+    #[test]
+    fn enabled_defaults_true_and_is_omitted_from_serialized_config() {
+        let config = make_config_with_section_template(None);
+        assert!(
+            config.enabled,
+            "template delivery should default to enabled"
+        );
+        let value = serde_json::to_value(&config).expect("should serialize config");
+        assert!(
+            value.get("enabled").is_none(),
+            "default enabled value should be omitted for rollback compatibility"
+        );
+    }
+
+    #[test]
+    fn disabled_template_switch_is_serialized() {
+        let mut config = make_config_with_section_template(None);
+        config.enabled = false;
+        let value = serde_json::to_value(&config).expect("should serialize config");
+        assert_eq!(
+            value.get("enabled"),
+            Some(&serde_json::Value::Bool(false)),
+            "explicitly disabled template delivery must remain in config blobs"
+        );
+    }
+
     fn make_config_with_section_template(
         section_root: Option<&str>,
     ) -> CreativeOpportunitiesConfig {
         let mut slot = make_slot("ad-header-0", vec!["/news/*"]);
         slot.gam_unit_path = Some("/{network_id}/example/{section}".to_string());
         CreativeOpportunitiesConfig {
+            enabled: true,
             gam_network_id: "99999".to_string(),
             auction_timeout_ms: None,
             price_granularity: PriceGranularity::default(),
             section_root: section_root.map(str::to_string),
+            assembly_mode: None,
+            template_cache_vary: None,
+            template_cache_max_age_seconds: None,
+            origin_is_cookie_independent: None,
             section_segment: None,
             slot: vec![slot],
         }
@@ -1546,10 +2029,15 @@ mod tests {
         // Older binaries deserialize this struct with `deny_unknown_fields`, so
         // a pushed config blob must not carry `"section_root": null`.
         let config = CreativeOpportunitiesConfig {
+            enabled: true,
             gam_network_id: "99999".to_string(),
             auction_timeout_ms: None,
             price_granularity: PriceGranularity::default(),
             section_root: None,
+            assembly_mode: None,
+            template_cache_vary: None,
+            template_cache_max_age_seconds: None,
+            origin_is_cookie_independent: None,
             section_segment: None,
             slot: Vec::new(),
         };
@@ -1831,6 +2319,164 @@ mod tests {
         assert!(
             serde_json::from_value::<ApsSlotParams>(aps_typo).is_err(),
             "unknown APS key should be rejected"
+        );
+    }
+
+    #[test]
+    fn assembly_mode_defaults_to_inline_when_absent() {
+        // Arrange: the minimal config an existing deployment would have.
+        let toml = r#"
+            gam_network_id = "99999"
+        "#;
+
+        // Act
+        let config: CreativeOpportunitiesConfig =
+            toml::from_str(toml).expect("should deserialize without assembly_mode");
+
+        // Assert
+        assert_eq!(
+            config.assembly_mode, None,
+            "an absent key should stay absent rather than materializing a value"
+        );
+        assert_eq!(
+            config.assembly_mode(),
+            AssemblyMode::Inline,
+            "should resolve to the shipped inline behaviour"
+        );
+    }
+
+    #[test]
+    fn assembly_mode_deserializes_each_variant() {
+        for (raw, expected) in [("inline", AssemblyMode::Inline), ("esi", AssemblyMode::Esi)] {
+            let toml = format!(
+                r#"
+                    gam_network_id = "99999"
+                    assembly_mode = "{raw}"
+                "#
+            );
+            let config: CreativeOpportunitiesConfig =
+                toml::from_str(&toml).unwrap_or_else(|e| panic!("should parse {raw}: {e}"));
+            assert_eq!(
+                config.assembly_mode(),
+                expected,
+                "should resolve `{raw}` to {expected:?}"
+            );
+        }
+
+        let removed_mode = r#"
+            gam_network_id = "99999"
+            assembly_mode = "client_fill"
+        "#;
+        assert!(
+            toml::from_str::<CreativeOpportunitiesConfig>(removed_mode).is_err(),
+            "client_fill is outside #1009's ESI byte-seam design and must be rejected"
+        );
+    }
+
+    #[test]
+    fn template_cache_vary_rejects_invalid_header_names() {
+        let config: CreativeOpportunitiesConfig = toml::from_str(
+            r#"
+                gam_network_id = "99999"
+                template_cache_vary = ["rsc", "not a header"]
+            "#,
+        )
+        .expect("shape should deserialize before runtime validation");
+        let err = config
+            .validate_runtime()
+            .expect_err("invalid field names must fail configuration validation");
+        assert!(err.contains("not a header"), "unexpected error: {err}");
+
+        let cookie_key: CreativeOpportunitiesConfig = toml::from_str(
+            r#"
+                gam_network_id = "99999"
+                template_cache_vary = ["Cookie"]
+            "#,
+        )
+        .expect("shape should deserialize before runtime validation");
+        let err = cookie_key
+            .validate_runtime()
+            .expect_err("per-cookie templates violate the reader-neutral shared-template contract");
+        assert!(err.contains("Cookie"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn template_cache_max_age_accepts_a_positive_value_up_to_one_day() {
+        for seconds in [1_u32, 1_200, 86_400] {
+            let config: CreativeOpportunitiesConfig = toml::from_str(&format!(
+                r#"
+                    gam_network_id = "99999"
+                    template_cache_max_age_seconds = {seconds}
+                "#
+            ))
+            .unwrap_or_else(|error| panic!("{seconds}s should deserialize: {error}"));
+
+            config
+                .validate_runtime()
+                .unwrap_or_else(|error| panic!("{seconds}s should validate: {error}"));
+            let serialized = serde_json::to_value(config).expect("should serialize config");
+            assert_eq!(
+                serialized
+                    .get("template_cache_max_age_seconds")
+                    .and_then(serde_json::Value::as_u64),
+                Some(u64::from(seconds)),
+                "the configured ceiling must survive typed configuration"
+            );
+        }
+    }
+
+    #[test]
+    fn template_cache_max_age_rejects_zero_and_more_than_one_day() {
+        for seconds in [0_u32, 86_401] {
+            let config: CreativeOpportunitiesConfig = toml::from_str(&format!(
+                r#"
+                    gam_network_id = "99999"
+                    template_cache_max_age_seconds = {seconds}
+                "#
+            ))
+            .unwrap_or_else(|error| panic!("shape should deserialize before validation: {error}"));
+
+            let error = config
+                .validate_runtime()
+                .expect_err("an unsafe template-cache ceiling must fail startup validation");
+            assert!(
+                error.contains("template_cache_max_age_seconds"),
+                "unexpected validation error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn unset_template_cache_max_age_is_omitted_for_rollback_compatibility() {
+        let config: CreativeOpportunitiesConfig =
+            toml::from_str("gam_network_id = \"99999\"").expect("should deserialize");
+
+        assert_eq!(
+            config.template_cache_max_age(),
+            std::time::Duration::from_secs(60),
+            "an absent ceiling must preserve the spike's existing lifetime"
+        );
+        let serialized = toml::to_string(&config).expect("should serialize");
+
+        assert!(
+            !serialized.contains("template_cache_max_age_seconds"),
+            "an unset new key must not break rollback to an older binary: {serialized}"
+        );
+    }
+
+    #[test]
+    fn unset_assembly_mode_is_omitted_from_serialized_config() {
+        // `deny_unknown_fields` means a pushed key breaks config load on an older
+        // binary. A deployment that never sets this must not gain the key just by
+        // round-tripping through a newer one.
+        let config: CreativeOpportunitiesConfig =
+            toml::from_str("gam_network_id = \"99999\"").expect("should deserialize");
+
+        let serialized = toml::to_string(&config).expect("should serialize");
+
+        assert!(
+            !serialized.contains("assembly_mode"),
+            "unset assembly_mode must not be serialized, got:\n{serialized}"
         );
     }
 
