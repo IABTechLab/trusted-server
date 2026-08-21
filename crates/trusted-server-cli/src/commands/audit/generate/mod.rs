@@ -1091,11 +1091,18 @@ fn validate_merge_policy(
     let Some(inferred) = inferred.filter(|_| preserves_template) else {
         return Ok(());
     };
+    if let Some(configured_segment) = existing.section_segment
+        && configured_segment != inferred.section_segment
+    {
+        return cli_error(format!(
+            "refusing to change the section_segment used by preserved templated slots during merge: configured section_segment={configured_segment}; inferred section_segment={}. Re-run with --replace only for an intentional migration",
+            inferred.section_segment
+        ));
+    }
     // A `{section}` slot with no `section_root` cannot load at all —
-    // `validate_runtime` requires one — so there is no working policy to
-    // preserve and nothing for the inferred one to contradict. Adopting it is
-    // what makes such a config loadable, and `check_candidate` still gates the
-    // result, so this is not the refusal case.
+    // `validate_runtime` requires one — so there is no root value to preserve.
+    // Adopting the inferred root makes such a config loadable, provided the
+    // independently configured section segment above still agrees.
     let Some(configured_root) = existing
         .section_root
         .as_deref()
@@ -1132,6 +1139,21 @@ fn build_render_slots(
     let explicit = !request.page_patterns.is_empty();
     if explicit {
         validate_page_patterns(request.page_patterns)?;
+        if let Some(outcome) = inference
+            && !outcome.borrowed_section_root.is_empty()
+        {
+            let affected = outcome
+                .borrowed_section_root
+                .iter()
+                .map(|stem| format!("`{stem}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return cli_error(format!(
+                "cannot apply --page-pattern to slot(s) {affected} because their {{section}} \
+                 templates borrow section_root; remove --page-pattern so patterns can be \
+                 derived from the paths where each slot was observed"
+            ));
+        }
     }
     let section_segment = policy.map_or(fallback_section_segment, |policy| policy.section_segment);
 
@@ -1710,6 +1732,33 @@ mod tests {
 
         validate_merge_policy(Some(&existing), Some(&inferred), false)
             .expect("an unset section_root is no policy to preserve");
+    }
+
+    #[test]
+    fn merge_preserves_an_explicit_segment_when_section_root_is_unset() {
+        let existing: CreativeOpportunitiesConfig = toml::from_str(
+            "gam_network_id = \"123\"\nsection_segment = 1\n\
+             [[slot]]\nid = \"header\"\ndiv_id = \"ad-header\"\n\
+             gam_unit_path = \"/{network_id}/site/{section}\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 728, height = 90 }]\n",
+        )
+        .expect("should parse creative config");
+        let mismatched = unit_template::SectionPolicy {
+            section_root: "homepage".to_string(),
+            section_segment: 0,
+        };
+
+        let error = validate_merge_policy(Some(&existing), Some(&mismatched), false)
+            .expect_err("should preserve an explicitly configured segment");
+
+        assert!(format!("{error:?}").contains("section_segment=1"));
+
+        let matching = unit_template::SectionPolicy {
+            section_root: "homepage".to_string(),
+            section_segment: 1,
+        };
+        validate_merge_policy(Some(&existing), Some(&matching), false)
+            .expect("should adopt a root without changing the configured segment");
     }
 
     #[test]
@@ -2306,6 +2355,72 @@ mod tests {
             fs::read_to_string(&config_path).expect("should read config"),
             original,
             "a rejected pattern must leave the operator config untouched"
+        );
+    }
+
+    #[test]
+    fn explicit_page_patterns_refuse_a_template_that_borrows_section_root() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        let original = loadable_config();
+        fs::write(&config_path, &original).expect("should write config");
+
+        let nav = ["/news", "/deals"];
+        let root = site_page(
+            "https://publisher.example/",
+            "/123456789/site/homepage",
+            &nav,
+        );
+        let mut news = site_page(
+            "https://publisher.example/news",
+            "/123456789/site/news",
+            &nav,
+        );
+        news.gpt_slots.push(collector::CollectedGptSlot {
+            gam_unit_path: "/123456789/site/news".to_string(),
+            div_id: "ad-sidebar".to_string(),
+            sizes: vec![(300, 250)],
+        });
+        let mut deals = site_page(
+            "https://publisher.example/deals",
+            "/123456789/site/deals",
+            &nav,
+        );
+        deals.gpt_slots.push(collector::CollectedGptSlot {
+            gam_unit_path: "/123456789/site/deals".to_string(),
+            div_id: "ad-sidebar".to_string(),
+            sizes: vec![(300, 250)],
+        });
+        let collector = SiteCollector::new(vec![
+            ("https://publisher.example/", root),
+            ("https://publisher.example/news", news),
+            ("https://publisher.example/deals", deals),
+        ]);
+
+        let error = run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &["/".to_string(), "/*".to_string()],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &collector)],
+            &mut std::io::sink(),
+            &mut std::io::sink(),
+        )
+        .expect_err("explicit patterns cannot preserve borrowed-root safety");
+
+        let message = format!("{error:?}");
+        assert!(message.contains("--page-pattern"), "got {message}");
+        assert!(message.contains("ad-sidebar"), "got {message}");
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("should read config"),
+            original,
+            "a refused override must leave the config unchanged"
         );
     }
 

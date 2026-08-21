@@ -71,6 +71,8 @@ pub(super) struct InferenceOutcome {
     pub(super) decisions: Vec<(String, SlotDecision)>,
     /// Operator-facing notes about why inference went the way it did.
     pub(super) diagnostics: Vec<String>,
+    /// Slot stems whose templates rely on a root witnessed by another slot.
+    pub(super) borrowed_section_root: Vec<String>,
 }
 
 impl InferenceOutcome {
@@ -119,6 +121,7 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
     // both fit is a refusal, not a preference for the smaller one.
     let mut qualifying: Vec<(usize, String, BTreeMap<String, SlotAnalysis>)> = Vec::new();
     let mut root_witness_missing = false;
+    let mut root_unwitnessed_stems = BTreeSet::new();
     for segment in 0..=MAX_SECTION_SEGMENT {
         let analyses: BTreeMap<String, SlotAnalysis> = slots
             .iter()
@@ -142,6 +145,9 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
             root_witness_missing |= analyses
                 .values()
                 .any(|analysis| matches!(analysis, SlotAnalysis::RootUnwitnessed { .. }));
+            root_unwitnessed_stems.extend(analyses.iter().filter_map(|(stem, analysis)| {
+                matches!(analysis, SlotAnalysis::RootUnwitnessed { .. }).then(|| stem.clone())
+            }));
             continue;
         };
         if roots.len() > 1 {
@@ -181,14 +187,30 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
                     .to_string()
             });
         }
+        let mut decisions = literal_decisions(&slots);
+        if root_witness_missing {
+            for (stem, decision) in &mut decisions {
+                if root_unwitnessed_stems.contains(stem)
+                    && let SlotDecision::Refuse { reasons } = decision
+                {
+                    *reasons = vec![
+                        "the paths tracked the page section, but no crawled page lacked a \
+                         section segment, so `section_root` could not be witnessed"
+                            .to_string(),
+                    ];
+                }
+            }
+        }
         return InferenceOutcome {
             policy: None,
-            decisions: literal_decisions(&slots),
+            decisions,
             diagnostics,
+            borrowed_section_root: Vec::new(),
         };
     };
 
     let mut decisions = Vec::with_capacity(slots.len());
+    let mut borrowed_section_root = Vec::new();
     let mut templated = 0_usize;
     for slot in &slots {
         let analysis = analyses
@@ -214,6 +236,7 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
                     Ok(()) => {
                         templated += 1;
                         if !witnessed_root {
+                            borrowed_section_root.push(slot.div_id.clone());
                             diagnostics.push(format!(
                                 "slot `{}` was never observed on a page without a section \
                                  segment, so its `{{section}}` template relies on the \
@@ -247,6 +270,7 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
             policy: None,
             decisions,
             diagnostics,
+            borrowed_section_root: Vec::new(),
         };
     }
 
@@ -262,6 +286,7 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
         }),
         decisions,
         diagnostics,
+        borrowed_section_root,
     }
 }
 
@@ -696,9 +721,15 @@ mod tests {
         let outcome = infer_unit_templates(&table, "123");
 
         assert_eq!(outcome.policy, None);
-        let SlotDecision::Refuse { .. } = only_decision(&outcome) else {
+        let SlotDecision::Refuse { reasons } = only_decision(&outcome) else {
             panic!("two literal paths and no template is not representable as one literal");
         };
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("section_root") && reason.contains("witnessed")),
+            "the per-slot reason should name the crawl gap; got {reasons:?}"
+        );
         assert!(
             outcome
                 .diagnostics
@@ -768,6 +799,11 @@ mod tests {
             Some(&SlotDecision::Template(
                 "/{network_id}/site/{section}".to_string()
             ))
+        );
+        assert_eq!(
+            outcome.borrowed_section_root,
+            ["ad-sidebar".to_string()],
+            "the outcome should identify templates whose safety depends on derived patterns"
         );
         assert!(
             outcome.diagnostics.iter().any(|note| note
