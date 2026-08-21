@@ -1,103 +1,136 @@
-# Prebid Ad-Latency Optimizations — Design
+# Prebid Ad-Latency and Auction-Load Optimizations — Design
 
 **Date:** 2026-08-20
-**Status:** Approved design, pending implementation plan
+**Status:** Draft (returned from review; Lever C requires a discovery phase before implementation)
 **Scope:** Client-side auction properties (server-side ad templates inactive)
 
 ## Problem
 
-On properties running the client-side auction path (`creative_opportunities.enabled = false`), ads render slowly relative to what the pipeline allows. A three-run instrumented baseline against a local Trusted Server proxying the production autoblog origin (article page, consent resolved, reader-style scrolling) measured:
+On properties running the client-side auction path (`creative_opportunities.enabled = false`), ad delivery leaves measurable headroom. A three-run instrumented baseline against a local Trusted Server proxying the production autoblog origin (article page, consent resolved, reader-style scrolling) measured:
 
-| Milestone                               | Time   |
-| --------------------------------------- | ------ |
-| Prebid bundle + shim fully installed    | ~2.1 s |
-| `DOMContentLoaded`                      | ~2.1 s |
-| `window.load`                           | ~3.0 s |
-| First Trusted Server `/auction` request | ~3.3 s |
-| Publisher's first `requestBids`         | ~4.8 s |
-| First non-empty ad render               | ~5.0 s |
+| Milestone                                                            | Time   |
+| -------------------------------------------------------------------- | ------ |
+| Prebid bundle + shim installed (deferred head scripts, execute ~DCL) | ~2.1 s |
+| `DOMContentLoaded`                                                   | ~2.1 s |
+| `window.load`                                                        | ~3.0 s |
+| First Trusted Server `/auction` request                              | ~3.3 s |
+| Publisher's first `requestBids`                                      | ~4.8 s |
+| First non-empty ad render                                            | ~5.0 s |
 
-Three structural costs stand out, all in Trusted-Server-owned surfaces:
+Observed costs, each owned by a different lever below:
 
-1. **The first refresh auction waits for `window.load`.** The post-`load` + double-`requestAnimationFrame` defer exists to avoid React hydration mismatches (React #418), but only the DOM application needs that defer — the auction network fetch is hydration-neutral. `DOMContentLoaded` fires ~1.2 s before `load` on this page, and the gap grows on resource-heavy pages.
-2. **Publisher `requestBids` bursts pay one `/auction` round trip each.** The baseline captured two `requestBids` calls 1 ms apart producing two `/auction` POSTs 2 ms apart. Each call costs a full round trip plus ~865 ms median (p90 ~1075 ms) of server-side auction time.
-3. **The first GAM ad request pays fresh connection setup.** `securepubads.g.doubleclick.net` serves both the `pubads_impl` script and every ad request; no connection is warmed before first use.
+1. **The first Trusted Server auction fires ~1.2 s after `DOMContentLoaded`.** The exact trigger of the observed 3.3 s `/auction` request is not yet attributed (it did not pass through `pbjs.requestBids`, and `gpt.slim_prebid_url` is not configured on the measured property). Lever C starts with a discovery task to attribute it precisely.
+2. **Publisher `requestBids` bursts issue one `/auction` POST each.** The baseline captured two calls 1 ms apart producing two POSTs 2 ms apart. The POSTs run **concurrently**, so this is a server-load and bidder-QPS cost, not a first-render latency cost. Lever A is therefore a load/cost lever, not a latency lever.
+3. **The first direct GAM ad request pays fresh connection setup** to `securepubads.g.doubleclick.net`. GPT scripts themselves are first-party proxied (the script guard rewrites the cascade), so only the direct ad request path can benefit from a warmed connection.
 
-Not addressed here (out of scope): re-enabling server-side ad templates, GPT lazy-load fetch margins (publisher-coordinated), the publisher's own ad-framework init latency (~1.8 s after `load` before their first `requestBids`), and server-side auction duration tuning (PBS `tmax`).
+Out of scope: re-enabling server-side ad templates, GPT lazy-load fetch margins (publisher-coordinated), the publisher's own ad-framework init latency, and server-side auction duration tuning (PBS `tmax`).
+
+## Billing and impression integrity (applies to every lever)
+
+Nothing in this design may create impression, win, or billing signals for ads that never render in a slot a user could see:
+
+- Prefetched or early-dispatched auctions are **targeting-only**: they produce bids, never renders. `nurl`/`burl` and any render-bridge activity remain tied to an actual GAM render of the slot, exactly as today.
+- A prefetched bid that is never consumed expires without firing any beacon.
+- Coalescing must not cause a caller's handler to render or fire beacons for another caller's ad units (see the partitioning rule in Lever A).
+- Rollout guardrails (below) monitor duplicate-auction rate and beacon counts per rendered impression so any integrity regression is visible immediately.
 
 ## Design
 
-Three independent levers. Two are config-gated and default off, so shipping the binary changes nothing until an operator flips the flag; one is an unconditional resource hint.
+### Lever A — `requestBids` coalescing window (opt-in; load/cost reduction)
 
-### Lever A — `requestBids` coalescing window (opt-in)
+**Objective:** reduce `/auction` request count and upstream bidder QPS for bursty publisher call patterns. Explicitly **not** claimed to reduce first-render latency; the hold can only add up to the window duration for the earliest caller, and rollout must verify render latency does not regress.
 
-**Config:** `[integrations.prebid] request_bids_coalesce_ms` — `u32`, default `0`, validated `0..=500`. Serialized into the injected client config (`window.__tsjs_prebid`) as `requestBidsCoalesceMs`, omitted when `0`.
+**Config:** `[integrations.prebid] request_bids_coalesce_ms` — `u32`, default `0`, validated `0..=250`. Injected into `window.__tsjs_prebid` as `requestBidsCoalesceMs`, omitted when `0`. Default `0` preserves current behavior byte-for-byte.
 
-**Behavior:** The tsjs Prebid shim already wraps `pbjs.requestBids` (bidder injection, snapshot capture, `bidsBackHandler` chaining). With a non-zero window, the wrapper holds a transformed call for up to the window duration and merges every mergeable call that arrives within it into one underlying `requestBids`:
+**Admission (merge-safety) rules.** A call is held only when all of:
 
-- **Merged request:** union of the pending calls' ad units (in arrival order), maximum of their `timeout`s (absent if none supplied), and a combined `bidsBackHandler` that invokes each pending call's (already-wrapped) handler in arrival order with the merged auction's results. A throwing handler must not prevent later handlers from running.
-- **Merge-safety rule:** only calls whose request object consists solely of `adUnits`, `timeout`, and `bidsBackHandler` (with a non-empty explicit `adUnits` array) are held. Any other call — extra keys such as `ortb2` or `labels`, or an implicit global-ad-units call — first flushes the pending queue synchronously, then dispatches solo. This preserves relative call order and never reinterprets options the merge logic does not understand.
-- **Default `0`:** the wrapper dispatches immediately, byte-for-byte the current behavior.
+- its request object consists solely of `adUnits`, `timeout`, and `bidsBackHandler`, with a non-empty explicit `adUnits` array (any other key — `ortb2`, `labels`, `adUnitCodes`, `ttlBuffer`, `auctionId`, … — flushes the pending queue synchronously, then dispatches solo, preserving call order);
+- it is **not** one of the shim's own synthetic refresh auctions (their GPT watchdog deadline starts when the wrapper returns; holding them races the watchdog and can discard valid bids);
+- none of its ad units contains a bid entry for a configured client-side bidder (merging would merge those bidders' native auctions too, changing their request shape and analytics; if operators later want that, it is a separate, explicit decision);
+- every held ad-unit `code` is non-empty and **disjoint** from the codes already pending (the `/auction` payload builder collapses duplicate codes, keeping the first unit's media types — a merged duplicate would produce a hybrid auction neither caller requested);
+- the projected serialized payload of the merged request stays under a bound with safety margin (the endpoint rejects bodies over 256 KiB; bound pending calls, total ad units, and projected bytes — flush before admitting a call that would exceed any bound).
 
-**Return value:** Prebid 10's `requestBids` returns a promise, and the wrapper currently passes it through. Every held call therefore returns a promise that settles when the merged underlying `requestBids` promise settles, so callers awaiting the promise keep working; they observe the merged auction's completion rather than a per-call auction's.
+**Deadlines.** Each call's effective deadline is absolute: queue residence counts against it. A held call with timeout `T` arriving at `t0` must reach Prebid with an adjusted timeout of `T − (dispatch − t0)`. Calls merge only when their absolute deadlines are within a compatibility tolerance; an incompatible deadline flushes the queue. A call without a timeout uses the configured default for this computation.
 
-### Lever B — GAM preconnect hint
+**Dispatch.** One underlying `requestBids` with: the union of ad units in arrival order; the minimum adjusted deadline; and a combined `bidsBackHandler` that:
 
-The GPT integration's `head_inserts` emits, before its bootstrap scripts:
+1. first runs **all** Trusted Server bookkeeping for every constituent call (pending-publisher-bid registration, EID cookie sync) — before any publisher callback runs, so a publisher callback that immediately calls `pubads.refresh()` cannot observe a constituent call whose bookkeeping has not happened;
+2. then invokes each caller's original handler in arrival order, passing a bid map **partitioned to that caller's ad-unit codes**, with throws isolated per handler.
 
-```html
-<link
-  rel="preconnect"
-  href="https://securepubads.g.doubleclick.net"
-  crossorigin
-/>
-```
+**Promise and result semantics.** Prebid 10's `requestBids` returns a promise resolving `{bids, timedOut, auctionId}`. Every held call returns a promise that settles when the merged auction settles, with `bids` partitioned to the caller's codes and the shared `auctionId`. The shared auction id and merged event stream (one `auctionInit`/`auctionEnd` for N calls) are documented operator-visible changes; analytics consumers on the property see merged auctions. If the underlying dispatch throws synchronously, every pending promise rejects with that error and the queue resets.
 
-Unconditional: it is a pure hint with no behavioral effect, and every GPT-enabled property talks to this host. Removes DNS + TCP + TLS setup from the first ad request (and benefits the `pubads_impl` fetch).
+### Lever B — GAM preconnect hint (opt-in)
 
-### Lever C — first-auction prefetch at `DOMContentLoaded` (opt-in)
+**Config:** `[integrations.gpt] gam_preconnect` — `bool`, default `false`.
 
-**Config:** `[integrations.prebid] prefetch_first_refresh_auction` — `bool`, default `false`. Injected as `prefetchFirstRefreshAuction`, omitted when `false`.
+When enabled, GPT `head_inserts` emits `<link rel="preconnect" href="https://securepubads.g.doubleclick.net">` at head-start.
 
-**Mechanism today:** the `window.load` gate is `installSlimPrebidLoader` in the unified GPT bundle — the slim-Prebid module that runs refresh auctions is not even _loaded_ until `load` fires, and its first auction follows its post-load initialization. (The post-`load` + double-`rAF` defer from the React #418 fix belongs to the server-side-template `adInit` path and is not part of this flow.)
+**Corrections from review, reflected in scope and claims:**
 
-**Behavior when enabled:** the unified GPT bundle — which is loaded from head-start — dispatches the first refresh auction's `/auction` request as soon as all of the following hold, without waiting for `window.load`:
+- This opens a connection to Google at head-start, **before consent resolution and on pages that may never issue an ad request**. That is a deliberate per-property privacy decision — hence config-gated, default off, for operators whose consent posture permits it.
+- GPT scripts (including `pubads_impl`) are first-party proxied by the script guard; the hint can only help the **first direct ad request**. The claim is "may reduce" its connection setup; verification requires a HAR demonstrating connection reuse under the chosen credential mode.
+- Credential mode matters: ad requests are cookie-credentialed, so the hint is emitted **without** `crossorigin` (credentialed preconnect). Browsers may partially perform or skip hints; this lever is best-effort by nature.
 
-- consent has resolved (the existing consent gate is unchanged),
-- the GPT slots the auction would target have been observed,
-- `DOMContentLoaded` has fired.
+### Lever C — earlier first auction (discovery first; design contingent)
 
-The response is stashed on `window.tsjs`. The slim-Prebid module, still loaded at the unchanged `window.load` point, consumes the stash during its existing initialization instead of issuing a fresh request. Only the network round trip moves earlier; script loading, targeting application, and the GPT refresh that triggers rendering keep their current post-load timing, so no render work moves into the hydration window.
+**Status: not implementation-ready.** Two review findings block a concrete design: the previously described lifecycle seam does not exist, and a raw `/auction` response cannot be "stashed and consumed" — the adapter maps responses back to Prebid bids via the requesting auction's Prebid-generated bid-request IDs.
 
-**Alternative considered and rejected:** loading the slim-Prebid script itself at `DOMContentLoaded`. Simpler, but it would also pull GPT refresh — and therefore ad rendering into publisher containers — earlier into the hydration window, the same territory as React #418 and the ad-container hydration gating tracked in #969.
+**Phase 1 — discovery (required before any design commitment):**
 
-**Fallback:** if the stash is absent or its request has not resolved when slim-Prebid initializes, the module issues its own request exactly as today. A failed prefetch is discarded; no new error surface.
+- Attribute the observed 3.3 s first `/auction` request precisely (it bypassed `pbjs.requestBids`; `slim_prebid_url` is unset on the measured property). Identify the triggering module, its gate (`load` listener, GPT event, publisher call), and what state it needs.
+- Determine at what point the inputs a valid first auction needs are actually available: consent readiness (see below), GPT slot set with live sizes/targeting, Prebid EIDs (collected at adapter request time), and publisher bidder params.
+
+**Phase 2 — design options to evaluate against discovery output:**
+
+1. **Transport-level cache behind the real `requestBids` lifecycle:** the adapter's transport layer may reuse an in-flight or completed `/auction` HTTP exchange when — and only when — the newly transformed request is byte-identical in its auction-relevant signature. Cache entries carry: exact transformed-request signature, consent fingerprint, navigation generation, creation time, expiry, and one-shot consumed state. The response must expose a signal distinguishing consent-denied no-bid from legitimate no-bid (`/auction` currently returns HTTP 200 for both), and consent-denied responses are never cacheable.
+2. **Classified full early auction:** run the real Prebid auction earlier and accept that scripts, events, consent modules, identity work, and native client-side bidders all move earlier. Honest but larger; interacts with hydration-window rendering (React #418, ad-container gating in #969) because earlier auctions pull GPT refresh earlier.
+
+**Hard requirements for either option:**
+
+- **Consent readiness is a concrete API contract, not an assumption:** the trigger must consume the CMP signal (GPP `signalStatus: ready` / TCF `tcloaded`/`tcstring`, USP response) with a defined timeout and default action, and record the consent fingerprint used. The GPT bundle currently has no consent gate (it is documented as a future hook), so this gate must be built, not referenced.
+- **No duplicate auctions:** an unresolved early request is **awaited** by the normal path (share the promise), never replaced by a second request. Cover pending→fallback→late-success, SPA navigation, and slot-destruction cases; a navigation or slot change invalidates the entry.
+- **Billing integrity:** per the integrity section — early responses are targeting data only.
 
 ## Config-blob compatibility
 
-Both new fields serialize only at non-default values, matching the repository's rollback discipline: a blob that never sets them is accepted by older binaries, and before rolling a binary back past this feature, an operator must clear the flags and re-push (the same procedure documented for prior `[integrations.prebid]` additions).
+Integration settings are retained as raw JSON in the pushed blob (`IntegrationSettings` flattens into a `HashMap`), so an explicitly configured `0`/`false` **is** present in the blob; only omitted keys are absent. `PrebidIntegrationConfig` and `GptConfig` do not `deny_unknown_fields`, so older binaries tolerate blobs carrying the new keys — no clear-before-rollback step is required. Testing includes a new-schema blob parsed by the legacy struct shape to lock this in.
 
 ## Testing
 
-**Vitest (shim):**
+**Vitest (shim), Lever A:**
 
-- coalescing merges two mergeable calls in the window into one underlying `requestBids` with the union of ad units, and invokes both handlers in order;
-- a call with extra option keys flushes the queue first and dispatches solo, preserving order;
-- a throwing first handler does not prevent the second handler from running;
-- window `0` / absent config leaves per-call dispatch unchanged (existing suite must pass untouched);
-- prefetch: a stashed response is consumed by slim-Prebid initialization without a second `/auction` request; an absent or unresolved stash falls back to the current request path;
-- held `requestBids` calls return a promise that settles with the merged auction.
+- two mergeable calls in the window → one underlying `requestBids`, union ad units, per-caller partitioned bid maps, handlers in arrival order;
+- bookkeeping-before-callbacks: constituent-call registration observable before the first publisher callback runs;
+- non-mergeable option keys flush then dispatch solo, preserving order;
+- synthetic refresh auctions are never held (watchdog interplay covered with fake timers);
+- calls containing client-side bidder entries are never held;
+- duplicate/conflicting ad-unit codes flush before admission; payload-bound boundary flushes;
+- unequal and absent timeouts: absolute-deadline adjustment, queue time counted, incompatible deadlines flush;
+- throwing first handler does not block later handlers; synchronous dispatch failure rejects all pending promises and resets the queue;
+- held-call promise resolves `{bids (partitioned), timedOut, auctionId (shared)}`;
+- window `0` / absent config: existing suite passes untouched;
+- callback reentrancy: a handler calling `requestBids` during the combined callback dispatches correctly.
+
+**Real-artifact coverage:** the external-bundle integration test asserts the wrapper's promise return against real Prebid (the current test discards the return value; the unit mock returns `undefined` and must not be the only coverage).
 
 **Rust:**
 
-- config defaults (`request_bids_coalesce_ms = 0`, `prefetch_first_refresh_auction = false`) and the `0..=500` validation bound;
-- injected-config serialization omits both fields at their defaults and includes them otherwise;
-- GPT `head_inserts` contains the preconnect link.
+- config defaults (`request_bids_coalesce_ms = 0`, `gam_preconnect = false`) and the `0..=250` bound;
+- injected-config serialization omits `requestBidsCoalesceMs` at `0`;
+- GPT `head_inserts` includes the preconnect link only when `gam_preconnect = true`, without `crossorigin`;
+- new-schema → legacy-schema blob compatibility test.
 
-**End-to-end verification:** re-run the local baseline harness (Viceroy proxying the production origin, pre-seeded consent, identical scroll script) with each flag enabled, comparing against the recorded baseline: time to first non-empty render, `/auction` request count, and burst dedup on the publisher's paired calls.
+**Lever C tests are defined with its design after discovery** (consent denial/change, EID readiness, navigation/slot destruction, late completion, cache one-shot semantics).
+
+## Measurement methodology
+
+The three-run baseline motivates the work but does not gate it. Acceptance runs use: ≥10 runs per arm on the same machine and network, local Viceroy against the production origin with pre-seeded consent and an identical scripted scroll; medians compared, with a regression limit on first non-empty render (no worse than baseline median + 5%) and the target metric per lever (Lever A: `/auction` request count and burst dedup; Lever B: HAR-verified connection reuse on the first direct GAM request; Lever C: first-auction dispatch time).
 
 ## Rollout
 
-1. Land binary with defaults off; the preconnect hint is the only immediate change.
-2. Enable `request_bids_coalesce_ms` (initially 50 ms) and `prefetch_first_refresh_auction` on the autoblog tester property via config push.
-3. Compare live tester metrics with the harness prediction; each flag reverts independently by config push, no binary rollback.
+One lever at a time, each independently config-reversible:
+
+1. Land binary; all flags default off — zero behavior change.
+2. Enable `request_bids_coalesce_ms` (50 ms) alone on the autoblog tester property. Guardrails: fill/revenue, bid rate, timeout rate, client-side bidder traffic (must be unchanged), duplicate-auction rate, beacons per rendered impression, per-slot render latency.
+3. After A stabilizes, enable `gam_preconnect` alone; verify via HAR and consent-denied network activity monitoring (no pre-consent regressions beyond the documented connection).
+4. Lever C follows its own spec revision after discovery.
