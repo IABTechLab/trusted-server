@@ -1,9 +1,9 @@
 # APS Render Fix and TSJS Resilience Architecture — Design
 
-- **Status:** revision 42 — hard-cutover contract with a lean first-display owner,
+- **Status:** revision 43 — hard-cutover contract with a lean first-display owner,
   atomic persistent-runtime takeover, an `rc/202608` implementation base,
   retired-branch concept-gap coverage, rc behavior reconciliation, and
-  merge-blocking load-time remediation
+  merge-blocking pre-action transfer remediation
 - **Date:** 2026-08-04
 - **Implementation baseline:** fetched `origin/rc/202608` at
   `f0825604ec6740111e99dd8a178e3b880e7d772b` on 2026-08-18. The implementation
@@ -14,7 +14,7 @@
   `2e85a1cdcfe3d23814bab5b2215dd6b096f871eb` and is already an ancestor of the
   rc baseline; it is not a competing implementation authority.
 - **Final release-branch refresh:** fetched `origin/rc/202608` at
-  `67517504b1e44fe9943550cde6408cf77ed25018` on 2026-08-20. The final overlap
+  `d4cd2cc823718d64ae73bcb068e5eab03ecd901a` on 2026-08-21. The final overlap
   audit and performance comparison use that exact tip. It already contains the
   `main` ancestry selected by the release branch, so `main` is not merged
   separately.
@@ -68,6 +68,12 @@
    protected path. A page without eligible server-projected initial work loads the
    persistent runtime directly; a later programmatic first display remains correct
    but is not claimed to have the lean transfer profile.
+9. The inline controller consumes one server-sealed canonical JSON transport rather
+   than bundling the complete hostile-object validation graph. Rust remains the
+   producer authority, the controller synchronously parses, checks the critical
+   release/manifest/outline relationships, copies by parsing, and recursively freezes
+   the result before effects, and the first-display or persistent owner performs the
+   complete domain validation before using projection or product values.
 
 ### 0.2 Non-goals
 
@@ -1986,6 +1992,11 @@ The successful outer response is an exact JSON string:
 `rendererVersion:'4'` is the hard-cutover top-mount owner protocol; the old
 renderer-version value is not accepted or aliased. `renderer` is the checked-in TS
 dynamic-owner program, which owns only PUC registration and Promise settlement.
+It is returned directly in this response and remains self-contained: it does not
+fetch, import, inject, or evaluate another TSJS asset. Its implementation may be
+mechanically compacted and may share a smaller internal parser, but exact v4
+messages, source/port binding, watchdogs, ADM insertion, APS informational control,
+Promise settlement, and failure behavior are unchanged.
 `lifecycleTicket` is
 `t1_` plus 22 unpadded base64url characters from 16 CSPRNG bytes, bound to the
 attempt, generation, source, and reservation, with a fixed three-second TTL from
@@ -2273,7 +2284,8 @@ publisher-destroy, DOM-integrity, replacement, and navigation retirement rules; 
 Promise settlement is already terminal and is never repeated during retirement.
 The PUC owner owns no APS node: it closes its control port and resolves or rejects
 the renderer Promise exactly once so PUC emits its ordinary completion/failure
-event. The separate PUC ADM owner remains governed by §4.5.
+event. The same `render_owner_initial` dynamic program's PUC ADM branch remains
+governed by §4.5 and contains no APS DOM authority.
 
 When registration accepts the transferred control port, before waiting for an APS or
 ADM start message, the owner arms one fail-closed 20-second settlement/channel
@@ -2394,9 +2406,11 @@ The shared protocol corpus fixes these bounds and encodings:
   never serialized in a v4 window or port message. The generated inner `data:` URL
   independently appends its exact `n1_` renderer-nonce fragment;
 - a navigation/refresh generation is a nonnegative safe integer; and
-- the generated dynamic-owner `renderer` program is at most 64 KiB UTF-8 and the
+- the generated self-contained dynamic-owner `renderer` program is at most 64 KiB
+  UTF-8 and the
   complete successful outer-response JSON is at most 72 KiB. Build tests enforce
-  both; refusal responses contain no renderer.
+  both; refusal responses contain no renderer. The program has no external loader,
+  URL, cache dependency, or second pre-paint artifact.
 
 Across the exact global-message and structured-clone port corpora, fields use their
 own carrier's exact shape and these field-level limits: APS descriptor 256 KiB
@@ -2508,9 +2522,10 @@ the persistent runtime commits. The protected load-time claim applies to the
 server-projected agent path; subsequent programmatic work remains correct but is not
 relabeled as that measurement.
 
-The release build independently enumerates all 2,560 reachable masks: the base is
-always present, GPT may be absent for a closed no-bid batch, and APS or Prebid
-participation requires GPT. It measures and hashes every reachable composition with
+The release build independently enumerates all 3,584 reachable masks: the base is
+always present, GPT may be absent for a closed no-bid batch, APS or Prebid
+participation requires GPT, and the shared render owner is present exactly when the
+batch contains an ADM or APS reservation. It measures and hashes every reachable composition with
 the frozen raw/gzip/Brotli algorithms, then emits the exact ordered subset satisfying
 all three first-display ceilings as `permittedFirstDisplayMasks`. Server selection
 must be both semantically eligible and present in that generated allowlist. A closed
@@ -2524,10 +2539,26 @@ The agent artifact has one base entry plus only these build-catalogued slices. A
 slice absent from this table cannot enter the artifact. “Initial” means the exact
 immutable batch; it does not authorize later work from the same product:
 
+The conditional `render_owner_initial` slice owns the source-neutral attempt
+collection, terminal latch, reservation/ticket registry, v4 PUC claim and owner-
+control protocol, self-contained dynamic-owner program, committed-artifact journal,
+and handoff/retirement primitives shared by initial PUC ADM and APS. It is selected
+for an ADM or APS reservation and is absent from a no-bid/nonrendering mask; ADM-only
+therefore has the same v4 owner without importing APS. `aps_initial` requires that
+slice, composes its frozen release-private interface, and remains the sole owner of
+APS descriptors, bootstrap and renderer nonce roles, top-page mount, and renderer-
+document protocol. The only APS-specific literal or branch permitted in
+`render_owner_initial` is the exact informational `TS APS Top Mount Started` control
+message received after the APS kernel/top mount has started; it carries no descriptor,
+URL, nonce, port, or DOM authority. No other APS message, descriptor parser, nonce
+registry, renderer-document parser, mount implementation, or top-mount policy enters
+that slice, and neither slice imports or instantiates a second complete render bridge.
+
 | Slice id                     | Include iff                                                                        | Bounded obligation before transfer                                                                |
 | ---------------------------- | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | `first_display`              | an eligible initial batch exists                                                   | manifest/projection validation, provisional lifetime, timing, queue ingress, transfer coordinator |
-| `aps_initial`                | the initial GPT batch can contain APS                                              | reservation, PUC owner protocol, APS document channel                                             |
+| `render_owner_initial`       | the initial GPT batch contains an ADM or APS reservation                           | source-neutral reservation/ticket, v4 PUC owner, render journal, and handoff/retirement contract  |
+| `aps_initial`                | the initial GPT batch can contain APS                                              | thin APS-specific descriptor, nonce/top-mount, and renderer-document protocol                     |
 | `creative_initial`           | an enabled creative guard has a parser-time obligation                             | current guard defaults and initial creative observation only                                      |
 | `datadome_initial`           | DataDome is enabled                                                                | initial script/preload route guard                                                                |
 | `didomi_initial`             | Didomi is enabled                                                                  | initial configured SDK-path installation                                                          |
@@ -2584,9 +2615,65 @@ committed-artifact set. The candidate performance fixture continues to require a
 actual request action; an empty batch cannot manufacture `tsjs:first-display` or be
 included in the timing distribution.
 
+The sealed transport always carries this server-authored integrity value, including
+on a no-agent direct-runtime page:
+
+```ts
+interface ServerBootIntegrityV1 {
+  readonly version: 1
+  readonly projectionDigest: string
+  readonly integrationConfigDigest: string
+}
+```
+
+When an agent is selected, the sibling outline has this complete v1 contract; it is
+`null` on a direct-runtime page and there is no object-form compatibility shape:
+
+```ts
+interface TakeoverOutlineV1 {
+  readonly version: 1
+  readonly releaseId: string
+  readonly generation: number
+  readonly projectionDigest: string
+  readonly integrationConfigDigest: string
+  readonly slices: readonly FirstDisplaySliceId[]
+  readonly slotCount: number
+  readonly outcomeCount: number
+  readonly capabilities: readonly []
+  readonly objectKinds: readonly [] | readonly ['gpt_slot', 'dom_artifact']
+}
+```
+
+`releaseId`, both digests, and the selected slices equal the sibling boot manifest,
+always-present `ServerBootIntegrityV1`, and payload values exactly. `generation` is an
+integer in `1..2^32-1` and begins at `1` for the server projection. `slotCount` is the projection `slots.length`,
+`outcomeCount` is `auction.results.length`, both are in `1..256`, and complete
+ordered placement coverage makes them equal. `capabilities` is exactly empty in v1;
+live authority never crosses static preparation. `objectKinds` is exactly empty
+when `bids` is empty and otherwise exactly the ordered pair shown above; it is a
+capacity declaration, not evidence that an object already exists.
+
+Rust computes `integrity.projectionDigest` as lowercase SHA-256 over the exact
+canonical UTF-8 JSON bytes returned by the coordinated-cutover projection
+canonicalizer and embedded as `boot.auctionProjection`. It computes
+`integrity.integrationConfigDigest` as lowercase SHA-256 over the exact UTF-8
+`JSON.stringify`-equivalent serialization of the ordered `IntegrationConfigsV1`
+embedded as `boot.integrations`; object insertion order is the wire order and no
+insignificant whitespace is present. On an agent page Rust copies those exact values
+into the outline rather than hashing again. The compact controller checks integrity
+and outline digest form and, when the outline is non-null, their exact equality, but
+does not bundle SHA-256 or the full domain validators. The first-display owner
+completely validates the batch, retains the always-present sealed integrity values,
+and copies them into handoff. Before direct runtime use or final adoption, persistent
+core completely validates the boot and recomputes both digests from that frozen
+snapshot with the same UTF-8 SHA-256 helper; any mismatch with the sibling integrity
+value is `abi_mismatch` before persistent effects. Handoff adoption additionally
+requires exact integrity/outline/handoff digest equality. Thus no component invents a
+second canonicalization and no digest is treated as a publisher capability.
+
 The runtime bundle first performs an effect-inert **static takeover preparation**
-against only the bootstrap controller's exact immutable `TsjsBootV1` snapshot and a
-frozen `TakeoverOutlineV1`: exact release/generation, projection digest, canonical
+against only the bootstrap controller's exact immutable `TsjsBootV1` and
+`ServerBootIntegrityV1` snapshots and a frozen `TakeoverOutlineV1`: exact release/generation, projection digest, canonical
 integration-config digest, selected slice ids, counts, and the
 capabilities/object kinds that final adoption must support. The outline contains no
 slot outcome, mutable publisher/GPT state, artifact object, wrapper, observer, or
@@ -2717,13 +2804,15 @@ freezes `initialDisplayCommitted` to whether the completed protected batch conta
 at least one `accepted` result, then drains those same callbacks. Wrong
 release/source/manifest/ABI identity is `abi_mismatch`; transport/load/deadline,
 preparation/activation failure, or a live TS entry at the seal is `bundle_partial`.
-Every `requestAds` made by a drained or later callback is a new post-paint call and
-settles under the fallback membership rules below with `reason:fallbackReason`; it
-does not re-report, remove, or replay the completed initial display. Every such
-`addAdUnits` throws `TsjsUnavailableError{code:'runtime_unavailable',
-reason:fallbackReason}` before mutation, and `_internal.reason` is that same frozen
-value. No queued callback or API call remains pending, and no post-paint transient
-failure retries the runtime artifact in that document generation.
+Every `requestAds` made by a drained or later callback is a new post-paint call against
+the empty safe fallback projection defined below: omitted selection resolves
+`{slots:[]}`, while an explicit valid id resolves `slot_unresolved` (or
+`caller_aborted` for an already-aborted signal). It does not re-report, remove, or
+replay the completed initial display. Every such `addAdUnits` throws
+`TsjsUnavailableError{code:'runtime_unavailable',reason:fallbackReason}` before
+mutation, and `_internal.reason` is that same frozen value. No queued callback or API
+call remains pending, and no post-paint transient failure retries the runtime artifact
+in that document generation.
 
 Every installed effect is a repository-owned primitive with a synchronous,
 nonthrowing, identity-checked disposer. Rollback attempts physical removal/restoration
@@ -2899,19 +2988,44 @@ The server serializes each integration's explicit browser-safe projection of its
 existing typed rc configuration into this carrier and rejects a manifest/config
 predicate mismatch before emitting HTML. Server credentials, secrets, auth headers,
 cookies, private endpoint policy, and unprojected configuration fields have no
-browser type and cannot enter the carrier. The
-bootstrap admits only a non-null plain outer object with exact `version` and
-`entries` keys, exact-shaped plain entries, unique ordered ids, and plain config
-objects. Recursion admits only finite numbers, booleans, null, strings, dense plain
-Arrays, and non-null plain objects with own enumerable data properties. It rejects
-accessors, symbols, holes, custom prototypes, cycles or repeated object/Array
-aliases, non-finite numbers, duplicate
-or unknown ids/keys, depth above 16, more than 4,096 total values, a key or string
-above 4,096 UTF-8 bytes, an entry's canonical UTF-8 JSON above 65,536 bytes, or the
-complete carrier above 524,288 bytes. The bootstrap copies every admitted value into
-new ordinary objects/Arrays, recursively freezes the copy, retains that exact
-snapshot in its closure, and never again reads the server literal or a public global.
-Copy, validation, or freeze failure is `abi_mismatch` before effects.
+browser type and cannot enter the carrier.
+
+The production inline transport is one server-sealed canonical JSON string, not a
+browser-visible mutable object graph. Rust serializes exact
+`{version:1,boot,integrity,outline}` bytes only after the complete projection, manifest,
+configuration, creative, diagnostics, selection, digest, and count contracts pass;
+it then escapes that string for one inline-script lexical constant without changing
+the decoded JSON. The existing 8 MiB projection and 512 KiB integration-carrier
+limits remain authoritative, and the complete decoded transport is capped at 10 MiB
+UTF-8. The controller reads no boot global and accepts no object-form production
+transport or compatibility alias.
+
+The controller's production transport parser performs `JSON.parse` synchronously,
+which creates a fresh acyclic tree of ordinary objects, dense Arrays, and data
+properties and therefore cannot preserve a source accessor, Proxy, symbol, custom
+prototype, sparse hole, or repeated object identity. Before any DOM, timer, queue,
+GPT, attribution, or registration effect, the parser requires the exact root keys
+and version, embedded release equality, exact critical boot keys, manifest release
+and URL/mask/slice relationships, the always-present exact integrity shape and digest
+forms, null/non-null first-display and outline parity, outline
+release/slice/count/digest forms and digest equality with integrity, dedicated
+creative/diagnostics booleans, and the configured decoded-size bound. It recursively freezes the parsed tree,
+retains that exact snapshot in the controller closure, and never again reads the
+lexical string or a public global. Parse, critical validation, or freeze failure is
+`abi_mismatch` before effects.
+
+This compact production parser is deliberately not a second domain validator. The
+first-display base validates its complete immutable projection/batch before
+activation; every selected slice validates its attenuated product value before its
+effect; and persistent core performs the complete manifest, projection, carrier,
+creative, and diagnostics validation before a direct boot or takeover uses them.
+The full object-form validators retain their existing hostile-object contract for
+runtime/public/test boundaries: exact `version`/`entries`, unique ordered ids,
+plain configs, finite JSON values, dense Arrays, own enumerable data properties, no
+accessors/symbols/custom prototypes/cycles/aliases, depth 16, 4,096 values, 4,096-byte
+keys/strings, 65,536-byte entries, and the 524,288-byte carrier. The inline
+bootstrap artifact must not import those full validators or the complete auction-
+projection parser merely to revalidate the trusted lexical producer.
 
 The release catalog binds every module id to exactly one config source: its product
 entry, `creative`, `diagnostics`, or none. The integration's generated exact typed
@@ -2926,11 +3040,11 @@ Integration ids match `^[a-z0-9][a-z0-9_-]{0,63}$`, are unique, and appear in th
 server phase/injection order. Takeover entries precede deferred entries, the list
 contains exactly the enabled persistent-runtime modules for that page, and there are
 at most 20. `firstDisplay` is either exact `null` or the server-selected agent
-artifact and its canonical ordered subset of the 13 slice ids in §5.2.1; ids are
-unique and a list contains at most 13. The list and encoded mask represent exactly
+artifact and its canonical ordered subset of the 14 slice ids in §5.2.1; ids are
+unique and a list contains at most 14. The list and encoded mask represent exactly
 the same set. Its `src` is the exact same-origin
 `/static/tsjs=tsjs-first-display.min.js?m=<sliceMask>&v=<firstDisplayHash>` URL.
-`sliceMask` is exactly four lowercase hexadecimal digits encoding the 13 catalog
+`sliceMask` is exactly four lowercase hexadecimal digits encoding the 14 catalog
 rows in order; bit 0 (`first_display`) is required and unused upper bits are zero.
 The server configuration resolver enumerates the finite masks permitted by its
 enabled integration set and precomputes each exact body identity outside request
@@ -2991,7 +3105,11 @@ incurs one request and no integration waterfall. The server emits no parser-time
 for the other artifact or for a deferred module. The bootstrap alone creates the
 post-paint runtime node; after commit, core alone creates ordinary deferred nodes.
 `defer`, `async`, preload, or a post-commit callback attached to an already
-downloaded monolith does not satisfy this contract.
+downloaded monolith does not satisfy this contract. In particular, transfer
+remediation cannot add a PUC-owner script, dynamic import, fetch, preload, worker,
+blob program, or other auxiliary TSJS asset before protected paint. The existing APS
+renderer-v2 iframe navigation remains the sole post-action renderer materialization
+request and does not become a code-loader for the top-page owner.
 
 The static transport is exact and shared by Fastly, Axum, Cloudflare, and Spin.
 Only `GET` and `HEAD` for
@@ -3394,9 +3512,10 @@ rather than retained as another runtime. The minimal controller/fallback is gene
 from one TypeScript source, embedded by the server, included in the release hash and
 its own §5.12 budget, and pinned by a staleness test; behavior is not hand-maintained
 in both ES5 and TypeScript. On an agent page, later GPT/render behaviors run only after the persistent
-runtime commits. This intentionally changes the missing/partial-artifact
-case: it no longer attempts a best-effort GPT render through a duplicated degraded
-runtime, and instead settles every known slot through the terminal fallback below.
+runtime commits. This intentionally changes the missing/partial-artifact case: it no
+longer attempts a best-effort GPT render through a duplicated degraded runtime and no
+longer retains known-slot membership merely to report failure; it commits the empty
+terminal fallback below.
 
 The fallback is a terminal, non-rendering shell, not a reduced second runtime. Its
 commit atomically records one immutable boot failure reason:
@@ -3418,23 +3537,19 @@ immediate-executor `tsjs.que`, a permanently refusing internal
 constructs no runtime session, slot registry, GPT/Prebid adapter, bridge dispatcher,
 timer, listener, port, or iframe. It never exposes a compatibility API.
 
-The safe fallback boot uses the independently embedded release and exact selected
-URLs in `manifest:{version:1,releaseId,firstDisplay,runtimeSrc,integrations:[]}` and
-uses `integrations:{version:1,entries:[]}` because fallback activates no integration.
-It retains the
-server auction projection only when that projection passes its exact shape, full ordered
-placement coverage, 256-slot bounds,
-field grammars, render limits, and 8 MiB aggregate cap from §§3.1–3.2, and otherwise substitutes exactly
-`{version:1,auction:{version:1,auctionId:'fallback',results:[]},slots:[],bids:[]}`. It
-substitutes the creative/diagnostics disabled safe defaults from §§5.4/5.8 because
-no integration module commits. It never copies an accessor or
-unknown property. Fallback batch membership comes only from exact server slot ids in
-that validated immutable `tsjs.boot.auctionProjection` snapshot. Explicit valid ids present in that snapshot,
-and every omitted-slot snapshot entry in projection order, resolve once as
-`failed{path:'primary',reason:<boot failure reason>}`. An explicit id absent from the
-projection resolves `slot_unresolved`; an already-aborted signal resolves each known
-member as `cancelled{reason:'caller_aborted'}`. An empty projection plus omitted slots
-resolves `{slots:[]}`. Input-shape errors still reject with `RequestAdsInputError`.
+The safe fallback boot uses the independently embedded release and critically checked
+selected URLs in
+`manifest:{version:1,releaseId,firstDisplay,runtimeSrc,integrations:[]}` and uses
+`integrations:{version:1,entries:[]}` because fallback activates no integration. It
+always substitutes exactly
+`auctionProjection:{version:1,auction:{version:1,auctionId:'fallback',results:[]},slots:[],bids:[]}`
+and the creative/diagnostics disabled safe defaults from §§5.4/5.8. The controller
+does not retain or partially trust the server projection on a failure path and does
+not import §§3.1–3.2 merely to improve fallback reporting. Consequently
+`requestAds()` resolves `{slots:[]}`; each explicit valid id resolves
+`slot_unresolved`, or `cancelled{reason:'caller_aborted'}` when its signal is already
+aborted. Input-shape errors still reject with `RequestAdsInputError`. This deliberate
+terminal-shell behavior is not a compatibility promise or a render recovery path.
 
 After installing those surfaces, fallback drains the preexisting callback queue FIFO
 exactly once with `this === tsjs`; one callback throw does not prevent later callbacks.
@@ -3530,9 +3645,11 @@ type TsjsApi = TsjsKernelApi | TsjsFallbackApi
 
 `version` is the semantic public-API generation and changes only with a reviewed API
 contract; `releaseId` identifies the exact bundle set and equals
-`boot.releaseId`/`boot.manifest.releaseId`. The bootstrap, not a later module,
-validates, copies, and recursively freezes the complete boot snapshot before
-installing integrations. `boot.integrations` is immutable public inspection data,
+`boot.releaseId`/`boot.manifest.releaseId`. The bootstrap parses, critically validates,
+copies, and recursively freezes the sealed transport before effects. The selected
+first-display or persistent owner completes domain validation before using projection
+or integration values; fallback publishes only the independent safe boot above.
+`boot.integrations` is immutable public inspection data,
 not a mutable service locator: the composition root passes only the owning frozen
 entry through each module's preparation/activation context. The hard cutover emits
 no `window.__tsjs_*` integration-config value and deletes the old per-integration
@@ -4820,7 +4937,7 @@ by line count:
 | `core/render.ts`                     | only minimum path-independent first-display DOM/lifecycle helpers; APS/ADM live with their owner, while cache stays the rc-baseline GPT-integration implementation                               |
 | `kernel/diagnostics.ts`              | bounded data-tree snapshot ingress and one closure-private reducer callback; no integration subscriptions, pending queue, scheduler, timer, or presentation authority                            |
 | `core/trace.ts`                      | bounded correctness-fact reducer/store, public snapshots/subscriptions, and separately attenuated `trace.presentation.v1`; no DOM presentation code                                              |
-| APS maps in globals                  | runtime-owned bounded reservation capability supplied by the APS integration module                                                                                                              |
+| render-reservation maps in globals   | bounded initial capability owned by `render_owner_initial` and bounded persistent capability owned by the render service; APS contributes only descriptor/top-mount state                        |
 | diagnostics overlay/UI               | deferred owner of the sole private `trace.presentation.v1` attachment; never imported by production core or correctness producers                                                                |
 | duplicated `script_guard.ts`         | small per-integration factory compiled into the owning module; no central production root imports every matcher                                                                                  |
 | optional integration implementations | remain in their integration IIFEs and register inert factories; they are absent from core bytes                                                                                                  |
@@ -4860,6 +4977,40 @@ After that upgrade, the lockfile compiler is the authority. CI runs a checked-in
 the deferred loader uses only authenticated classic same-origin script elements as
 specified in §5.2.
 
+The first complete paired run on candidate
+`a0d8c0631a9774b5c8da8b25794a8836aa2e62f5` against exact rc base
+`d4cd2cc823718d64ae73bcb068e5eab03ecd901a` proved that correctness, load ordering,
+heap, GPT first-action timing, and every APS absolute action/completion/paint deadline
+passed, while semantic pre-action transfer still failed. The candidate GPT interval
+was 92,931 raw / 28,802 gzip / 25,779 Brotli bytes against 70,943 / 21,571 / 18,804;
+the APS interval was 128,769 / 39,645 / 34,758 against the allowed rc × 1.10 values
+78,659.9 / 24,098.8 / 21,006.7. APS first-action p90 was 616.3 ms against an allowed
+562.0 ms, while its 900 ms absolute action ceiling and every downstream deadline
+passed. This is immutable diagnostic evidence, not authority to change a comparator,
+membership rule, fixture, threshold, or baseline.
+
+Revision 43 closes that demonstrated source-graph gap without changing network
+semantics:
+
+1. the inline bootstrap uses the compact server-sealed JSON transport above and its
+   production graph cannot reach the full object-form boot, auction-projection, or
+   generic integration-carrier validators;
+2. `render_owner_initial` owns one source-neutral PUC/render journal and lifecycle
+   primitive set for ADM and APS reservations, with no duplicate full bridge, while
+   APS-only descriptor, nonce, top-mount, and document behavior stays in
+   `aps_initial` and absent from non-APS masks;
+3. the checked-in PUC dynamic owner remains the exact self-contained v4 response
+   program but is compacted in place, with no external asset or reduced adversarial
+   behavior; and
+4. source-ownership tests, focused lifecycle suites, every admitted-mask budget,
+   semantic rc comparison, and the complete paired performance run must all pass on
+   one clean pushed replacement SHA.
+
+An optimization is rejected if it merely moves bytes into an auxiliary request,
+stores executable source in boot data, weakens the top-page owner, removes mixed
+APS/ADM support, reopens a handoff/retirement race, or relies on unsafe property
+mangling across independently built protocol components.
+
 The checked-in pre-change fixture is immutable historical evidence and is never
 regenerated or rewritten. Its original `bundles` values measured a different
 artifact model: minimal contained only the old core, reference omitted the now-
@@ -4886,8 +5037,9 @@ and these semantic sets:
   reference `[first_display, creative_initial, gpt_initial, prebid_initial,
 datadome_initial]`; it does not include core or any persistent takeover module;
 - **APS first display** is the served artifact for
-  `[first_display, creative_initial, aps_initial, gpt_initial]` and drives a real
-  fictional APS/PUC contract fixture through the first request action;
+  `[first_display, render_owner_initial, aps_initial, creative_initial, gpt_initial]`
+  and drives a real fictional APS/PUC contract fixture through the first request
+  action;
 - **largest permitted first display** is the largest raw, gzip, and Brotli body
   among the generated size-admitted masks that trusted configuration can serve (the
   maximizing mask may differ per encoding); the capture enumerates all reachable
@@ -4895,7 +5047,7 @@ datadome_initial]`; it does not include core or any persistent takeover module;
   checking only the two named examples;
 - **persistent runtime** is `[core]` plus all catalogued takeover modules for the
   reference configuration, served after protected paint; and
-- **maximal total** is every first-display base/slice, production core, takeover,
+- **maximal non-bootstrap total** is every first-display base/slice, production core, takeover,
   and deferred TSJS module in
   the release, each exactly once. This gate prevents phase splitting from hiding
   total growth.
@@ -4931,12 +5083,12 @@ programmatic/direct-auction work, test seam, duplicate adapter owner, or live ob
 that cannot be disposed/transferred by §5.2.1. These independent absolute architecture
 ceilings apply to the candidate and do not derive from any candidate capture:
 
-| Semantic set                              | Raw bytes   | Gzip bytes | Brotli bytes |
-| ----------------------------------------- | ----------- | ---------- | ------------ |
-| inline bootstrap controller/fallback      | ≤ 48,000    | ≤ 16,000   | ≤ 14,000     |
-| every permitted first-display agent mask  | ≤ 90,000    | ≤ 30,000   | ≤ 26,000     |
-| reference persistent runtime after paint  | ≤ 524,288   | ≤ 163,840  | ≤ 131,072    |
-| maximal total, every production role once | ≤ 1,048,576 | ≤ 327,680  | ≤ 262,144    |
+| Semantic set                                                  | Raw bytes   | Gzip bytes | Brotli bytes |
+| ------------------------------------------------------------- | ----------- | ---------- | ------------ |
+| inline bootstrap controller/fallback                          | ≤ 48,000    | ≤ 16,000   | ≤ 14,000     |
+| every permitted first-display agent mask                      | ≤ 90,000    | ≤ 30,000   | ≤ 26,000     |
+| reference persistent runtime after paint                      | ≤ 524,288   | ≤ 163,840  | ≤ 131,072    |
+| maximal non-bootstrap total, every other production role once | ≤ 1,048,576 | ≤ 327,680  | ≤ 262,144    |
 
 The first-display ceilings are selected from the fixed 200,000-byte/s profile; the
 post-paint and maximal limits prevent phase splitting or duplicated ownership from
@@ -5421,7 +5573,9 @@ Tests must cover at least:
   9,999/10,000/10,001 ms post-paint deadline prove callback pushes remain queued
   until one commit; success drains against the full kernel, while failure freezes the
   exact true/false `initialDisplayCommitted`, drains once against fallback, makes
-  every new `requestAds` and `addAdUnits` propagate the same classified
+  every new omitted-selection `requestAds` resolve the exact empty result, every
+  explicit valid id resolve `slot_unresolved` or already-aborted `caller_aborted`, and
+  every `addAdUnits` propagate the same classified
   `abi_mismatch`/`bundle_partial` fallback reason, preserves accepted DOM, and leaves
   no pending work or artifact retry;
 - final handoff boundaries for attempt/slot/GPT-token/cycle/trace ordinals at
@@ -5488,8 +5642,9 @@ Tests must cover at least:
   immediate post-load return values, `this`, non-callables, and callback throws;
 - main bundle absence after server GPT projection, proving the old degraded bootstrap
   renderer is deliberately gone: no GPT definition/targeting/display/refresh occurs,
-  every known slot settles with the committed fallback reason, the queue drains once,
-  and a late bundle cannot revive rendering;
+  fallback retains no server-projected slot membership, omitted-selection
+  `requestAds` resolves `{slots:[]}`, explicit valid ids resolve `slot_unresolved`, the
+  queue drains once, and a late bundle cannot revive rendering;
 - explicit `requestAds` selection with exact server-projected and programmatic slot
   ids, an unknown id beside a valid sibling, GPT-path and DOM-alias collisions, and
   omitted-slot snapshot membership/order while another slot registers after
@@ -5882,13 +6037,13 @@ The design is complete when all of the following are true:
 24. No production-core import graph contains deferred integration/service/UI code,
     no-op/fake/test seams, or `*ForTest` accessors. Every production artifact appears
     exactly once in the release inventory, with the bootstrap role included once and
-    every TSJS module included in maximal total.
+    every TSJS module included in the maximal non-bootstrap total.
 25. The oversized role-correct and mechanical-remediation captures remain immutable
     report-only evidence. Every generated size-admitted first-display mask, including the named
     GPT-reference and APS masks, passes the 90,000/30,000/26,000 raw/gzip/Brotli
     ceilings; all reachable masks are measured and any other closed configuration
-    selects direct persistent boot. Bootstrap, persistent reference, and maximal total pass their
-    independent §5.12 ceilings; and the candidate's semantic pre-action transfer is
+    selects direct persistent boot. Bootstrap, persistent reference, and the maximal
+    non-bootstrap total pass their independent §5.12 ceilings; and the candidate's semantic pre-action transfer is
     no larger than a fresh rc-baseline build in each encoding.
     Boot-to-first-display passes the automatic fixed-network-profile
     candidate-versus-rc-baseline timing gate, including the candidate's real-mark

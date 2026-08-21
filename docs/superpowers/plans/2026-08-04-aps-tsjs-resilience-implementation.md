@@ -10,11 +10,12 @@
 
 **Goal:** Finish the APS render fix and resilient TSJS hard cutover on the exact
 `rc/202608` base, preserving all affected rc behavior while closing every remaining
-revision-42 contract gap.
+revision-43 contract gap.
 
 **Architecture:** Keep the already-landed single-runtime/first-display architecture
 and complete it rather than replaying its historical implementation. The browser
-receives one validated, immutable boot snapshot; no-agent pages synchronously prepare,
+receives one server-sealed canonical JSON transport, synchronously validates its
+critical release relationships, and freezes one immutable boot snapshot; no-agent pages synchronously prepare,
 activate, and commit the only persistent runtime, while eligible projected pages use
 the bounded first-display owner and atomic post-paint takeover. APS rendering moves
 to a Trusted Server-owned top-page mount with independent bootstrap and renderer
@@ -31,7 +32,7 @@ checked-in shell/Node CI scripts.
 
 The sole design authority is
 `docs/superpowers/specs/2026-08-04-aps-render-fix-and-tsjs-resilience-design.md`
-revision 42. This is the sole implementation plan for that design.
+revision 43. This is the sole implementation plan for that design.
 
 The implementation branch is `feature/aps-tsjs-resilience-rc202608`. Its first
 parent is the fetched `origin/rc/202608` commit
@@ -41,14 +42,14 @@ commit `95b562ea820268d6f16da08863dfa9f71076e4d2`. That integrated history alrea
 implements the descriptor/projection contract, proxy route, core runtime, first-
 display split, integration catalog, hard cutover, package upgrade, and most
 verification surfaces. Those commits are implementation history, not evidence that
-revision 42 is complete.
+revision 43 is complete.
 
 The final Task 17 refresh fetched and integrated `origin/rc/202608` at
-`d4cd2cc823718d64ae73bcb068e5eab03ecd901a` on 2026-08-20. Its rc-owned package and
+`d4cd2cc823718d64ae73bcb068e5eab03ecd901a` on 2026-08-21. Its rc-owned package and
 operator-document changes are retained. Its raw-global GAM-attribution transport is
 superseded by the typed immutable GPT configuration carrier and sole parser-time GPT
 owner, and its mutable publisher-native APS experiment is superseded by the single
-Trusted Server renderer owner required by revision 42.
+Trusted Server renderer owner required by revision 43.
 
 `origin/rc/202608` is the behavior, API, dependency, CI, and performance baseline.
 Do not merge `main` separately. Before final verification, fetch the release branch;
@@ -328,14 +329,16 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 - Test: `crates/trusted-server-js/lib/test/first_display/{agent,handoff,slices}.test.ts`
 - Test: integration module tests under `crates/trusted-server-js/lib/test/integrations/`
 
-- [ ] **Step 1: Add failing exact-shape and hostile-object tests.** Cover all caps
-      from Task 2 plus accessors, symbols, sparse arrays, custom prototypes, cycles,
-      repeated aliases, non-finite numbers, UTF-8 boundaries, throwing traps, and
-      copy/freeze failure. Require validation before effects and `abi_mismatch` on
-      failure.
+- [ ] **Step 1: Add failing exact-shape and hostile-object tests.** At the complete
+      runtime/public object-form boundaries, cover all caps from Task 2 plus
+      accessors, symbols, sparse arrays, custom prototypes, cycles, repeated aliases,
+      non-finite numbers, UTF-8 boundaries, throwing traps, and copy/freeze failure.
+      Require validation before effects and `abi_mismatch` on failure. Task 15A
+      separately hard-cuts the production inline wire to canonical JSON text.
 
-- [ ] **Step 2: Add failing immutable-snapshot tests.** Mutate/replace the original
-      server literal and public preload object after bootstrap capture. Agent,
+- [ ] **Step 2: Add failing immutable-snapshot tests.** Mutate/replace the public boot
+      target after bootstrap capture and prove the parsed lexical payload is never
+      reread. Agent,
       prepared runtime, deferred modules, and final `tsjs.boot` must all observe the
       same recursively frozen copy and canonical config digest. Handoff carries the
       digest, never a recopy of config.
@@ -351,11 +354,13 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
   npm --prefix crates/trusted-server-js/lib test -- --run test/core/bootstrap.test.ts test/kernel/integration_registry.test.ts test/kernel/runtime.test.ts test/kernel/release_catalog.test.ts test/first_display/agent.test.ts test/first_display/handoff.test.ts test/first_display/slices.test.ts
   ```
 
-- [ ] **Step 5: Implement admission and catalog binding.** Use own property
-      descriptors only, copy into ordinary objects/arrays, recursively freeze, retain
-      the closure snapshot, calculate the canonical digest, and pass only the
-      catalog-declared value to first-display slices and integration preparation.
-      Delete raw per-integration bootstrap globals and activation attributes.
+- [ ] **Step 5: Implement admission and catalog binding.** At object-form boundaries,
+      use own property descriptors only, copy into ordinary objects/arrays,
+      recursively freeze, retain the closure snapshot, calculate the canonical
+      digest, and pass only the catalog-declared value to first-display slices and
+      integration preparation. Delete raw per-integration bootstrap globals and
+      activation attributes. Task 15A later removes this full validator graph from
+      the trusted production lexical transport without weakening these boundaries.
 
 - [ ] **Step 6: Add exact typed validators in each product module.** Unknown or
       missing fields and manifest/config inclusion mismatches are `abi_mismatch`;
@@ -781,7 +786,8 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 - Modify: `crates/trusted-server-core/src/auction/endpoints.rs`
 - Modify: `trusted-server.example.toml`
 - Modify: `docs/guide/configuration.md`
-- Modify: checked-in configuration fixtures containing `[creative_opportunities]`
+- Modify: inline configuration fixtures in the Rust owners above containing
+  `[creative_opportunities]`; this worktree has no separate fixture file
 - Test: colocated Rust tests
 
 - [ ] **Step 1: Add failing config tests.** A present table requires an explicit
@@ -1032,7 +1038,9 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
       hex characters and reachable from fetched `origin/rc/202608`. Never derive a
       fallback from candidate HEAD or a moving branch name.
       Add a required `base_sha` input to manual/called workflow entrypoints and bind
-      PR runs directly to `pull_request.base.sha` as `TSJS_PERF_BASE_SHA`.
+      PR runs directly to `pull_request.base.sha` as `TSJS_PERF_BASE_SHA`. Bind
+      `TSJS_PERF_HEAD_SHA` to `pull_request.head.sha`; neither writer nor validator
+      may read `GITHUB_SHA`, which names the synthetic PR merge commit.
 
 - [ ] **Step 2: Add failing legacy/phase-aware baseline-loader tests.** A detached
       worktree builds the real artifact model at the exact base: legacy core+
@@ -1041,11 +1049,27 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
       candidate-only metadata from a legacy base.
 
 - [ ] **Step 3: Enforce all absolute and relative gates.** Keep immutable historical
-      and remediation captures report-only. Enforce bootstrap, every admitted
-      first-display mask, persistent runtime, maximal total, semantic no-growth,
-      paired GPT/APS <=1.10 timing/transfer, APS action/completion/paint/heap ceilings,
-      and the common 4 MiB retained-heap ceiling. Require real User Timing marks and
-      no persistent/deferred request, preload, prepare, or execution before paint.
+      and remediation captures report-only. Pin these independent raw/gzip/Brotli
+      ceilings exactly: bootstrap `48,000/16,000/14,000`; every permitted
+      first-display mask `90,000/30,000/26,000`; persistent reference
+      `524,288/163,840/131,072`; maximal non-bootstrap total
+      `1,048,576/327,680/262,144`. Require and name the minimal
+      `[first_display]`, GPT reference
+      `[first_display,creative_initial,gpt_initial,prebid_initial,datadome_initial]`,
+      and APS
+      `[first_display,render_owner_initial,aps_initial,creative_initial,gpt_initial]`
+      masks, plus the largest admitted mask per encoding. Enforce GPT reference
+      semantic transfer no-growth in every encoding. Separately require both GPT and
+      APS candidate first-action p90 and pre-action raw/gzip/Brotli transfer to be at
+      most the exact rc base × 1.10.
+
+      Pin the APS absolute table: bids-script→first GPT action p90 ≤900 ms; first
+      action→accepted completion p90 ≤1,500 ms; accepted completion→paint p90 ≤250
+      ms; bids-script→paint p90 ≤2,500 ms; forced-GC post-paint used size ≤3,145,728
+      bytes; post-takeover/queue-drain used size ≤3,932,160 bytes. Both variants in
+      the paired GPT case remain below 4,194,304 bytes at boot, first render, refresh,
+      and SPA navigation. Require real User Timing marks and no persistent/deferred request,
+      preload, prepare, or execution before paint.
       The production source graph must prove that neither first-display nor
       persistent artifacts reach `shared/aps_documents.ts` or the document-form ES5
       validator; those authorities exist only in the generator and contract tests.
@@ -1071,7 +1095,22 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
       remote-HEAD mismatch, artifact naming, and validator invocation with an
       injected fake command runner.
 
-- [ ] **Step 5: Run local self-tests and budget gates.**
+      The performance job is fixed to Chromium `145.0.7632.6`, the
+      `github-hosted:ubuntu-24.04` runner class,
+      `tsjs-baseline-paired-network-v3` (150 ms, 200,000 bytes/s down, 93,750 bytes/s
+      up, zero loss), five warmups and 50 measured samples per variant, alternating
+      baseline/candidate order, a 40-minute browser budget, a 50-minute job budget,
+      exactly one post-sample candidate lifecycle observation, and separate paired
+      heap contexts. Add focused validator tests for every literal and reject an
+      environment override.
+
+- [ ] **Step 5: Run local self-tests and prove the intentional pre-remediation
+      RED.** Validator/schema/dispatch unit tests and the build must be GREEN. The
+      exact semantic-transfer and APS admission checks against the untouched
+      candidate are expected RED for the recorded revision-43 bytes/timing; preserve
+      that failure as the gate contract. Do not weaken membership, a threshold, or a
+      fixture to make Task 15 green. Tasks 15A/15B are the remediation, and Task 15B
+      Step 7 is the first required full acceptance GREEN.
 
   ```bash
   node scripts/validate-tsjs-performance-evidence.mjs --self-test
@@ -1087,6 +1126,237 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
   ```bash
   git add crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs crates/trusted-server-js/lib/test/build/release-v1.test.mjs crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json scripts/validate-tsjs-performance-evidence.mjs scripts/ci/tsjs-performance.sh scripts/ci/aps-tsjs-evidence.mjs scripts/ci/dispatch-aps-tsjs-gate.mjs scripts/ci/dispatch-aps-tsjs-gate.test.mjs crates/trusted-server-integration-tests/browser/tests/shared/tsjs-performance.spec.ts crates/trusted-server-integration-tests/browser/playwright.performance.config.ts .github/workflows/tsjs-performance-gate.yml .github/workflows/test.yml
   git commit -m "Compare TSJS performance with the exact rc base"
+  ```
+
+### Task 15A: Replace the production boot object graph with a sealed JSON transport
+
+**Files:**
+
+- Create: `crates/trusted-server-js/lib/src/core/contracts/server_boot_transport.ts`
+- Modify: `crates/trusted-server-core/src/tsjs.rs`
+- Modify: `crates/trusted-server-js/lib/src/core/bootstrap.ts`
+- Modify: `crates/trusted-server-js/lib/src/core/contracts/boot.ts`
+- Modify: `crates/trusted-server-js/lib/src/kernel/runtime.ts`
+- Modify: `crates/trusted-server-js/lib/src/kernel/release_catalog.ts`
+- Modify: `crates/trusted-server-js/lib/src/shared/first_display_handoff.ts`
+- Modify: `crates/trusted-server-js/lib/src/shared/takeover.ts`
+- Modify: `crates/trusted-server-js/lib/build-all.mjs`
+- Modify: `crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs`
+- Test: `crates/trusted-server-js/lib/test/core/bootstrap.test.ts`
+- Test: `crates/trusted-server-js/lib/test/kernel/runtime.test.ts`
+- Test: `crates/trusted-server-js/lib/test/first_display/handoff.test.ts`
+- Test: `crates/trusted-server-js/lib/test/first_display/takeover.test.ts`
+- Test: `crates/trusted-server-js/lib/test/build/generated-fallback.test.mjs`
+- Test: `crates/trusted-server-js/lib/test/build/release-v1.test.mjs`
+- Test: colocated `crates/trusted-server-core/src/tsjs.rs` tests
+
+- [ ] **Step 1: Add the RED production-transport tests.** Require Rust to emit one
+      inline lexical JSON string containing exact
+      `{version:1,boot,integrity,outline}` and no
+      object-form `__TSJS_SERVER_BOOT_INPUT_V1__`, raw boot global, compatibility
+      alias, or executable source value. Parse the emitted fragment in the test and
+      prove exact release, manifest, projection, carrier, creative, diagnostics,
+      always-present boot-integrity digests, the exact
+      `outline:null | TakeoverOutlineV1` union and non-null equality, escaping, and 10
+      MiB decoded-size behavior.
+
+- [ ] **Step 2: Add the RED compact-parser and graph tests.** Define the wished-for
+      `snapshotServerBootTransportV1(payload, releaseId)` contract. A canonical valid
+      string returns one recursively frozen fresh snapshot; malformed JSON, wrong or
+      extra root keys, release mismatch, bad first-display URL/mask/slices, bad
+      runtime URL, missing/malformed boot integrity, outline parity/count/digest form
+      or integrity mismatch, invalid dedicated booleans, or an oversized string
+      returns `undefined` before effects. A direct-runtime snapshot has
+      `outline:null` but retains the integrity value. Add RED runtime/handoff tests
+      proving direct boot recomputes both digests, and takeover requires recomputed
+      boot = integrity = outline = handoff. Projection and integration-config
+      mismatches independently produce `abi_mismatch` before preparation,
+      activation, or publication; a valid carrier succeeds on both paths. The release metafile
+      must prove `bootstrap` no longer reaches `core/contracts/boot.ts`,
+      `core/contracts/auction_projection.ts`, or
+      `core/contracts/integration_configs.ts`.
+
+      The generated fallback tests require the exact safe manifest, empty
+      `integrations:{version:1,entries:[]}`, empty fallback auction projection,
+      disabled creative/diagnostics defaults, omitted `requestAds()` → `{slots:[]}`,
+      explicit valid id → `slot_unresolved`, already-aborted explicit id →
+      `caller_aborted`, same frozen reason on `addAdUnits` refusal/internal state,
+      both `initialDisplayCommitted` values, exact FIFO queue drain, accepted-DOM
+      preservation, no pending call, no artifact retry, and both
+      `abi_mismatch`/`bundle_partial` classifications. Fallback never needs the full
+      projection validator.
+
+- [ ] **Step 3: Run RED and inspect the expected failures.**
+
+  ```bash
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" tsjs::tests
+  npm --prefix crates/trusted-server-js/lib test -- --run test/core/bootstrap.test.ts test/kernel/runtime.test.ts test/first_display/handoff.test.ts test/first_display/takeover.test.ts
+  node --test crates/trusted-server-js/lib/test/build/generated-fallback.test.mjs
+  npm --prefix crates/trusted-server-js/lib run test:release
+  ```
+
+  Expected: the Rust shape still emits the object graph, the compact parser is
+  absent, and the bootstrap metafile still reaches the full validators.
+
+- [ ] **Step 4: Implement the minimal sealed transport.** Canonicalize and validate
+      in Rust exactly as today, serialize the payload once, escape it as a JS string,
+      and keep `window.tsjs` target acquisition outside the JSON. In the compact
+      parser, use the parsed fresh tree, perform only revision-43 critical
+      release/manifest/integrity/outline checks, recursively freeze, and return one
+      snapshot.
+      Do not accept object form or move executable code into the payload.
+
+- [ ] **Step 5: Rewire only the production bootstrap.** Import the compact parser,
+      replace the generic config lookup with an exact scan over the already-frozen
+      ordered entries, and retain the full `snapshotTsjsBootV1` validators for core,
+      public, and test boundaries. First-display batch and slice validators remain
+      authoritative before their effects. Persistent core recomputes the canonical
+      projection and integration-config SHA-256 digests before direct use or handoff
+      adoption and compares them with the always-present integrity value; the
+      controller validates only exact digest form and outline/integrity relations.
+
+- [ ] **Step 6: Run GREEN and adjacent hard-cutover checks.**
+
+  ```bash
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" tsjs::tests
+  npm --prefix crates/trusted-server-js/lib test -- --run test/core/bootstrap.test.ts test/kernel/runtime.test.ts test/first_display
+  npm --prefix crates/trusted-server-js/lib run typecheck
+  npm --prefix crates/trusted-server-js/lib run lint
+  npm --prefix crates/trusted-server-js/lib run build
+  npm --prefix crates/trusted-server-js/lib run test:release
+  npm --prefix crates/trusted-server-js/lib run check:hard-cutover-absence
+  ```
+
+- [ ] **Step 7: Measure rather than infer transfer improvement.** Read the generated
+      bootstrap raw/gzip/Brotli values and its complete source-owner list. If the
+      graph exclusions pass but the served GPT semantic interval cannot fit beneath
+      the exact rc baseline after including its real inline payload, stop and revisit
+      the architecture instead of adding mangling or changing membership.
+
+- [ ] **Step 8: Commit.**
+
+  ```bash
+  git add crates/trusted-server-core/src/tsjs.rs crates/trusted-server-js/lib/src/core/bootstrap.ts crates/trusted-server-js/lib/src/core/contracts/server_boot_transport.ts crates/trusted-server-js/lib/src/core/contracts/boot.ts crates/trusted-server-js/lib/src/kernel/runtime.ts crates/trusted-server-js/lib/src/kernel/release_catalog.ts crates/trusted-server-js/lib/src/shared/first_display_handoff.ts crates/trusted-server-js/lib/src/shared/takeover.ts crates/trusted-server-js/lib/build-all.mjs crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs crates/trusted-server-js/lib/test/core/bootstrap.test.ts crates/trusted-server-js/lib/test/kernel/runtime.test.ts crates/trusted-server-js/lib/test/first_display/handoff.test.ts crates/trusted-server-js/lib/test/first_display/takeover.test.ts crates/trusted-server-js/lib/test/build/generated-fallback.test.mjs crates/trusted-server-js/lib/test/build/release-v1.test.mjs
+  git commit -m "Seal the production TSJS boot transport"
+  ```
+
+### Task 15B: Add the shared render-owner slice and thin the APS slice
+
+**Files:**
+
+- Create: `crates/trusted-server-js/lib/src/first_display/render_journal.ts`
+- Create: `crates/trusted-server-js/lib/src/first_display/slices/render_owner.ts`
+- Modify: `crates/trusted-server-core/src/tsjs.rs`
+- Modify: `crates/trusted-server-js/lib/src/first_display/agent.ts`
+- Modify: `crates/trusted-server-js/lib/src/first_display/adm_render_bridge.ts`
+- Modify: `crates/trusted-server-js/lib/src/first_display/render_bridge.ts`
+- Modify: `crates/trusted-server-js/lib/src/first_display/leaf/aps_protocol.ts`
+- Modify: `crates/trusted-server-js/lib/src/first_display/slices/aps.ts`
+- Modify: `crates/trusted-server-js/lib/src/core/contracts/server_boot_transport.ts`
+- Modify: `crates/trusted-server-js/lib/src/kernel/contracts/puc_dynamic_owner.ts`
+- Modify: `crates/trusted-server-js/lib/src/kernel/release_catalog.ts`
+- Modify: `crates/trusted-server-js/lib/src/shared/first_display_transaction.ts`
+- Modify: `crates/trusted-server-js/lib/src/shared/first_display_registration.ts`
+- Modify: `crates/trusted-server-js/lib/src/shared/first_display_contracts.ts`
+- Modify: `crates/trusted-server-js/lib/build-all.mjs`
+- Modify: `crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs`
+- Test: `crates/trusted-server-js/lib/test/first_display/{agent,adm_render_bridge,render_bridge,slices}.test.ts`
+- Test: `crates/trusted-server-js/lib/test/first_display/transaction.test.ts`
+- Test: `crates/trusted-server-js/lib/test/first_display/contracts.test.ts`
+- Test: `crates/trusted-server-js/lib/test/kernel/release_catalog.test.ts`
+- Test: `crates/trusted-server-js/lib/test/services/puc_bridge.test.ts`
+- Test: `crates/trusted-server-js/lib/test/build/release-v1.test.mjs`
+- Test: `crates/trusted-server-integration-tests/browser/tests/shared/{aps-renderer,aps-puc-lifecycle,tsjs-runtime}.spec.ts`
+
+- [ ] **Step 1: Add RED catalog, selection, and source-ownership tests.** Add
+      `render_owner_initial` as catalog order 2 and shift the remaining optional
+      slices by one. Enumerate exactly 3,584 reachable 14-bit masks. Select the slice
+      exactly for an ADM or APS reservation; require it for `aps_initial`; omit it
+      from no-bid/nonrendering masks. It owns one frozen source-neutral render-journal
+      interface for attempt collection, terminal latching, reservation/ticket state,
+      v4 PUC owner control, committed-artifact identity, handoff capture, detachment,
+      and exact-once retirement. `aps_initial` composes that interface and has no
+      second full journal/bridge implementation. The only APS-specific branch admitted
+      to the shared owner is the exact authority-free informational
+      `TS APS Top Mount Started` control message after APS kernel/top-mount start;
+      non-APS masks cannot reach APS descriptors, URLs, nonce registries,
+      renderer-document parsing, mount code, or top-mount policy. ADM-only masks still
+      receive the self-contained v4 owner. Assert exact catalog order 1–14 and the
+      implications APS ⇒ render owner ⇒ GPT, ADM ⇒ render owner without APS, and
+      no-bid/nonrendering ⇒ no render owner.
+
+- [ ] **Step 2: Add RED parity tests before extracting code.** Run the same journal
+      corpus against ADM-only, APS-only, and mixed APS/ADM batches. Cover accepted,
+      failed, cancelled, empty-GAM fallback, replacement success/failure, moved or
+      mutated nodes, navigation, handoff, post-detach reentrancy, overlay-lease
+      transfer, targeting restoration, and final retirement. The new tests must fail
+      only because a shared base journal is not yet exposed.
+
+- [ ] **Step 3: Add RED compact-owner tests.** Keep the exact successful/refused v4
+      outer shapes and the complete current adversarial corpus, while requiring the
+      checked-in dynamic owner to remain self-contained and contain no `fetch`,
+      dynamic import, script insertion, blob/worker loader, URL, descriptor, or APS
+      DOM authority. Exercise registration timeout/refusal/replay, port errors,
+      nested publisher callbacks, ADM insertion, APS informational start, settlement,
+      and Promise behavior through the actual serialized program. The release/static-
+      route test must also prove `render_owner_initial` is concatenated into the one
+      served mask body, has no independently routable/requested production asset, and
+      can create no script, preload, fetch, dynamic-import, worker, or blob request
+      before paint.
+
+- [ ] **Step 4: Run RED.**
+
+  ```bash
+  npm --prefix crates/trusted-server-js/lib test -- --run test/first_display/agent.test.ts test/first_display/adm_render_bridge.test.ts test/first_display/render_bridge.test.ts test/first_display/slices.test.ts test/first_display/transaction.test.ts test/first_display/contracts.test.ts test/kernel/release_catalog.test.ts test/services/puc_bridge.test.ts test/build/release-v1.test.mjs
+  ```
+
+- [ ] **Step 5: Extract one render-owner slice and journal.** Replace—not wrap—the
+      common ADM/APS maps, reservation/ticket state, v4 PUC dispatcher/owner control,
+      terminal latch, committed artifact journal, mutation notification, handoff/
+      detach state, timers, and retirement bookkeeping. Expose only the exact frozen
+      operations the APS protocol needs through the release-private slice host. Keep
+      APS descriptor parsing, nonce registries, document parser, mount policy, and
+      overlay behavior in `aps_initial`.
+
+- [ ] **Step 6: Compact the dynamic owner in place.** Deduplicate its exact record,
+      event/port, timer, and terminal helpers without removing checks or changing a
+      message. Preserve the single self-contained `renderer` string and the existing
+      64 KiB/72 KiB caps; do not load another asset and do not rely on cross-artifact
+      property mangling.
+
+- [ ] **Step 7: Run GREEN, build, and inspect the actual APS mask.**
+
+  ```bash
+  npm --prefix crates/trusted-server-js/lib test -- --run test/first_display test/services/puc_bridge.test.ts test/integrations/aps test/services/render.test.ts test/build/release-v1.test.mjs
+  npm --prefix crates/trusted-server-js/lib run typecheck
+  npm --prefix crates/trusted-server-js/lib run lint
+  npm --prefix crates/trusted-server-js/lib run build
+  npm --prefix crates/trusted-server-js/lib run check:bundle
+  node scripts/validate-tsjs-performance-evidence.mjs --self-test
+  node --test scripts/ci/dispatch-aps-tsjs-gate.test.mjs
+  npm --prefix crates/trusted-server-js/lib run test:release
+  npm --prefix crates/trusted-server-js/lib run check:architecture
+  ```
+
+  Expected: every focused behavior is unchanged, the production graph has one
+  render journal, and the exact mandatory APS mask remains admitted. If the combined
+  inline-plus-mask semantic bytes still exceed the rc × 1.10 allowance, stop and
+  revisit the approved split rather than weakening a gate.
+
+- [ ] **Step 8: Run the three-browser focused lifecycle proof.** In
+      `tsjs-runtime.spec.ts`, assert exactly one parser-blocking first-display TSJS
+      request before paint, no separately routed render-owner asset, and no script,
+      preload, fetch, dynamic-import, worker, or blob request from that owner.
+
+  ```bash
+  npm --prefix crates/trusted-server-integration-tests/browser test -- tests/shared/aps-renderer.spec.ts tests/shared/aps-puc-lifecycle.spec.ts tests/shared/tsjs-runtime.spec.ts --project=chromium --project=firefox --project=webkit
+  ```
+
+- [ ] **Step 9: Commit.**
+
+  ```bash
+  git add crates/trusted-server-core/src/tsjs.rs crates/trusted-server-js/lib/src/first_display crates/trusted-server-js/lib/src/core/contracts/server_boot_transport.ts crates/trusted-server-js/lib/src/kernel/contracts/puc_dynamic_owner.ts crates/trusted-server-js/lib/src/kernel/release_catalog.ts crates/trusted-server-js/lib/src/shared/first_display_transaction.ts crates/trusted-server-js/lib/src/shared/first_display_registration.ts crates/trusted-server-js/lib/src/shared/first_display_contracts.ts crates/trusted-server-js/lib/build-all.mjs crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs crates/trusted-server-js/lib/test/first_display crates/trusted-server-js/lib/test/kernel/release_catalog.test.ts crates/trusted-server-js/lib/test/services/puc_bridge.test.ts crates/trusted-server-js/lib/test/build/release-v1.test.mjs crates/trusted-server-integration-tests/browser/tests/shared/aps-renderer.spec.ts crates/trusted-server-integration-tests/browser/tests/shared/aps-puc-lifecycle.spec.ts crates/trusted-server-integration-tests/browser/tests/shared/tsjs-runtime.spec.ts
+  git commit -m "Thin the APS first-display owner"
   ```
 
 ### Task 16: Enforce hard-cutover absence and supply-chain boundaries
@@ -1154,7 +1424,7 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
   ```
 
   If already an ancestor, abort the empty merge and record the no-op. If advanced,
-  resolve conflicts in favor of revision 42 where it explicitly supersedes rc and
+  resolve conflicts in favor of revision 43 where it explicitly supersedes rc and
   otherwise in favor of rc. Do not merge `main` separately.
 
 - [ ] **Step 2: Produce an overlap inventory before committing.** For every
@@ -1166,7 +1436,7 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 
   | Rc overlap                                                   | Final disposition and owner                                                                                                                                                                                                                              | Focused proof                                                                                                        |
   | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-  | APS provider, renderer, browser types, and guide             | Revision 42 supersedes the publisher-native experiment. `integrations/aps.rs`, `integrations/aps/render.ts`, and the shared render services retain one TS-owned renderer and the no-second-auction invariant.                                            | APS Rust tests, `test/integrations/aps/render.test.ts`, GPT/PUC ownership tests, hard-cutover scan                   |
+  | APS provider, renderer, browser types, and guide             | Revision 43 supersedes the publisher-native experiment. `integrations/aps.rs`, `integrations/aps/render.ts`, and the shared render services retain one TS-owned renderer and the no-second-auction invariant.                                            | APS Rust tests, `test/integrations/aps/render.test.ts`, GPT/PUC ownership tests, hard-cutover scan                   |
   | APS creative-frame scrollbar fix                             | Preserve the concept in the stronger proxy-owned documents: both document roots suppress overflow and the inner creative iframe is borderless, block-level, and full-size. No publisher-origin runner path is retained.                                  | APS document corpus, renderer unit suite, three-engine browser matrix                                                |
   | Initial GPT scheduling one-shot and handoff latch            | Supersede both mutable `scheduleInitialAdInit` implementations. The authenticated first-display registration transaction accepts one exact ordered batch, deletes registration ingress before activation, and transfers one frozen handoff exactly once. | first-display transaction, bootstrap, agent, takeover, and handoff suites                                            |
   | GPT diagnostics presentation review fixes                    | Preserve target-window scheduling, cancellable ownership, bounded badge size lists, shared size formatting, rounded observed boxes, destroyed-state guards, and record-currentness checks inside the data-only diagnostics owner.                        | GPT diagnostics binding, badge, overlay, slot-size, store, and public-type suites                                    |
@@ -1174,10 +1444,10 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
   | Structural ad-template slot generation                       | Preserve rc's structural TOML update, contiguous provider tables, line-ending safeguards, and unmanaged-field check; add the required `enabled = true` only when the generator creates a hard-cutover section.                                           | focused `slot_toml` and CLI configuration suites                                                                     |
   | GAM cohort attribution                                       | Preserve the configuration and reporting concept; supersede rc raw globals and the activation attribute with the frozen GPT config carrier and sole parser-time GPT owner.                                                                               | GPT Rust config tests, `tsjs.rs` selection tests, first-display GPT adapter/slice tests, persistent GPT module tests |
   | GPT diagnostics correlation guide                            | Preserve the rc correlation evidence, rewritten to the immutable initial projection and navigation-internal page-bids projection.                                                                                                                        | GPT diagnostics store/API/data/overlay suites and docs format/build                                                  |
-  | Retired GPT bootstrap, request runtime, and legacy GPT tests | Keep the revision-42 deletions; no second runtime or compatibility file returns.                                                                                                                                                                         | hard-cutover scan, architecture test, release graph test                                                             |
+  | Retired GPT bootstrap, request runtime, and legacy GPT tests | Keep the revision-43 deletions; no second runtime or compatibility file returns.                                                                                                                                                                         | hard-cutover scan, architecture test, release graph test                                                             |
   | Docs TypeScript-ESLint update                                | Preserve rc package and lockfile ownership.                                                                                                                                                                                                              | docs install, lint, format, and build                                                                                |
   | GPT operator wording and example config                      | Preserve rc's provider-neutral environment-overlay wording; do not add EdgeZero feature work.                                                                                                                                                            | docs format/build and config tests                                                                                   |
-  | Rc GAM review plan/spec artifacts                            | Preserve as release-branch documentation; they do not override revision 42's TSJS architecture.                                                                                                                                                          | docs format/build and plan-integrity scan                                                                            |
+  | Rc GAM review plan/spec artifacts                            | Preserve as release-branch documentation; they do not override revision 43's TSJS architecture.                                                                                                                                                          | docs format/build and plan-integrity scan                                                                            |
 
 - [ ] **Step 3: Update every rc-baseline row and rerun its exact proof.** No stale
       SHA or prior pass satisfies the gate.
@@ -1327,7 +1597,7 @@ validate-inputs` and `run`; it tests PUC 1.17.2 in Chromium, Firefox, and WebKit
 **Files:** no new implementation files.
 
 - [ ] **Step 1: Use `superpowers:requesting-code-review`.** Review the complete diff
-      against the exact PR base, design revision 42, this plan, the rc adoption
+      against the exact PR base, design revision 43, this plan, the rc adoption
       ledger, security protocol, lifecycle ownership, no-vendoring boundary, and
       verification evidence. Resolve every blocking finding test-first and rerun the
       affected task plus Task 18.
@@ -1341,8 +1611,8 @@ validate-inputs` and `run`; it tests PUC 1.17.2 in Chromium, Firefox, and WebKit
       analytics expansion, named rc behaviors preserved, test matrix, performance
       evidence, and any external real-GAM prerequisite.
 
-- [ ] **Step 4: Confirm GitHub checks.** If a check fails, use
-      `github:gh-fix-ci`, inspect the actual job/log, reproduce locally where
+- [ ] **Step 4: Confirm GitHub checks.** If a check fails, inspect the actual GitHub
+      job/log with the available repository GitHub workflow, reproduce locally where
       practical, fix the owner test-first, push, and wait for the replacement run.
 
 - [ ] **Step 5: Use `superpowers:finishing-a-development-branch`.** Present the
@@ -1352,7 +1622,7 @@ validate-inputs` and `run`; it tests PUC 1.17.2 in Chromium, Firefox, and WebKit
 
 ## Completion checklist
 
-- [ ] Design revision 42 and this one plan agree on `rc/202608` authority.
+- [ ] Design revision 43 and this one plan agree on `rc/202608` authority.
 - [ ] All 23 concept rows have fresh final rc-baseline classifications.
 - [ ] No backward-compatibility path or second runtime remains.
 - [ ] No APS runner, GPT, or PUC bytes are vendored, pinned, cached, or stored.
@@ -1360,7 +1630,15 @@ validate-inputs` and `run`; it tests PUC 1.17.2 in Chromium, Firefox, and WebKit
       equivalent across all four adapters.
 - [ ] `TsjsBootV1` contains one exact frozen ordered integration-config carrier;
       modules receive attenuated values only.
+- [ ] Production boot uses one server-sealed canonical JSON lexical transport;
+      bootstrap does not bundle the full object-form projection/config validators.
+- [ ] `ServerBootIntegrityV1` is always present; direct runtime and takeover both
+      recompute projection/config digests before effects, and takeover requires exact
+      integrity/outline/handoff equality.
 - [ ] No-agent preparation/activation/commit is synchronous and parser-blocking.
+- [ ] ADM and APS reservations select one `render_owner_initial` slice with the
+      source-neutral journal and compact self-contained PUC owner; `aps_initial`
+      owns only APS-specific descriptor/nonce/mount behavior.
 - [ ] APS uses top mount -> bootstrap -> outer data -> inner data -> creative with
       independent `b1_`/`n1_` nonces and exact conditional CSP.
 - [ ] PUC protocol v4 owns registration/Promise settlement only, not APS DOM.
