@@ -1561,19 +1561,25 @@ configuration and direct `POST /auction` endpoint.
 #### Publisher document cache policy
 
 For a successful GET publisher document, Trusted Server applies the
-browser-facing `Cache-Control: max-age=60` policy from
+browser-only `Cache-Control: private, max-age=60` policy from
 [#1007](https://github.com/IABTechLab/trusted-server/issues/1007) when the
-server-side ad stack is structurally inactive. This includes an absent
+server-side ad stack is structurally inactive. Trusted Server also applies this
+policy to a subsequent `304 Not Modified` response so revalidation cannot
+restore the origin freshness policy. This includes an absent
 `[creative_opportunities]` section, `enabled = false`, no slot matching the
-path, or a disabled auction. The policy replaces the origin browser cache
-policy except when the origin sends `private` or `no-store`, which are
-preserved. Bot, prefetch, and consent-denied requests also retain the origin
-policy because they can produce a request-specific representation for the same
-URL. Error responses and non-document requests retain the origin policy.
+path, or a disabled auction. The `private` directive prevents shared caches
+that use `Cache-Control` from storing the document. The policy replaces the
+origin browser cache policy except when the origin sends `private` or
+`no-store`, which are preserved. Bot, prefetch, and consent-denied requests
+also retain the origin policy because they can produce a request-specific
+representation for the same URL. Error responses and non-document requests
+retain the origin policy.
 
-Any response that carries `Set-Cookie` is finalized as
-`Cache-Control: private, max-age=0`; this privacy rule takes precedence over
-the short inactive-stack policy.
+Trusted Server leaves origin validators and CDN-specific cache headers
+unchanged. Those headers continue to control supporting CDNs independently of
+the browser-only policy. If a response using the generated inactive-stack
+policy later carries `Set-Cookie`, cookie privacy finalization replaces it with
+`Cache-Control: private, max-age=0` and removes the CDN-specific cache headers.
 
 ```toml
 [creative_opportunities]
