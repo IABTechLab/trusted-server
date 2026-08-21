@@ -1,5 +1,5 @@
 import type { DisposeCallback } from '../kernel/disposable';
-import { MAX_MANIFEST_MODULES } from '../kernel/release_catalog';
+import { EMBEDDED_MAX_MANIFEST_MODULES } from '../kernel/contracts/release_capacity';
 
 const INTEGRATION_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 // Context shares the existing /auction request-body ceiling. The structural
@@ -120,7 +120,7 @@ interface TraversalFrame {
 }
 
 function snapshotManifest(candidate: readonly string[]): readonly string[] {
-  if (!Object.isFrozen(candidate) || candidate.length > MAX_MANIFEST_MODULES) {
+  if (!Object.isFrozen(candidate) || candidate.length > EMBEDDED_MAX_MANIFEST_MODULES) {
     throw new TypeError('Auction context manifest must be frozen and bounded');
   }
   const seen = new Set<string>();

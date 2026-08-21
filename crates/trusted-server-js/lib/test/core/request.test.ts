@@ -1,10 +1,23 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { snapshotTsjsBootV1 } from '../../src/core/contracts/boot';
+import {
+  canonicalIntegrationConfigDigestV1,
+  sha256HexUtf8V1,
+} from '../../src/core/contracts/integration_configs';
 import type { TsjsApi, TsjsBootV1 } from '../../src/core/types';
+import stringifyCorpus from '../fixtures/contracts/ecmascript-json-stringify-v1.json';
 
 const RELEASE = 'a'.repeat(64);
 const RUNTIME_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+
+describe('server JSON.stringify canonicalization corpus', () => {
+  it.each(stringifyCorpus)('$name', ({ input, expected }) => {
+    const canonical = JSON.stringify(JSON.parse(input));
+    expect(canonical).toBe(expected);
+    expect(sha256HexUtf8V1(canonical)).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
 
 function boot() {
   return snapshotTsjsBootV1(
@@ -52,7 +65,15 @@ function installBootClaim(target: object, acceptedBoot: Readonly<TsjsBootV1>): v
     value: (source: unknown) => {
       if (source !== document.currentScript) return undefined;
       Reflect.deleteProperty(target, '_claimBootSnapshot');
-      return acceptedBoot;
+      return Object.freeze({
+        boot: acceptedBoot,
+        complete: () => undefined,
+        integrity: Object.freeze({
+          version: 1,
+          projectionDigest: sha256HexUtf8V1(JSON.stringify(acceptedBoot.auctionProjection)),
+          integrationConfigDigest: canonicalIntegrationConfigDigestV1(acceptedBoot.integrations),
+        }),
+      });
     },
     writable: false,
   });

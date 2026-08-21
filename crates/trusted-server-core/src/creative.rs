@@ -1049,6 +1049,7 @@ mod tests {
         process_auction_creative, rewrite_creative_html, rewrite_inline_creative_html,
         rewrite_srcset, rewrite_style_urls, sanitize_creative_html, to_abs,
     };
+    use crate::test_support::tests::bootstrap_transport;
 
     fn rewrite_srcset_attr(attr_name: &str, attr_value: &str) -> String {
         let settings = crate::test_support::tests::create_test_settings();
@@ -1120,20 +1121,20 @@ mod tests {
             out.contains("/static/tsjs=tsjs-unified.min.js"),
             "expected unified tsjs injection: {out}"
         );
-        assert!(
-            out.contains("__TSJS_SERVER_BOOT_INPUT_V1__"),
-            "expected creative boot transport: {out}"
+        assert!(out.contains("__TSJS_SERVER_BOOT_TRANSPORT_V1__"));
+        let transport = bootstrap_transport(&out);
+        assert_eq!(
+            transport["boot"]["manifest"]["integrations"],
+            serde_json::json!([
+                {"id":"render_runtime","phase":"takeover"},
+                {"id":"creative","phase":"takeover"}
+            ]),
+            "expected exact creative runtime membership: {out}"
         );
         assert!(
-            out.contains(r#"{"id":"render_runtime","phase":"takeover"}"#),
-            "expected render runtime membership: {out}"
-        );
-        assert!(
-            out.contains(r#"{"id":"creative","phase":"takeover"}"#),
-            "expected creative membership: {out}"
-        );
-        assert!(
-            !out.contains(r#""id":"gpt""#),
+            transport["boot"]["manifest"]["integrations"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().all(|entry| entry["id"] != "gpt")),
             "must not ship GPT into a creative: {out}"
         );
         // The source appears in both the authenticated manifest and the tag;

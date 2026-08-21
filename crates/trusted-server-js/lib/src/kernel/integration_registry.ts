@@ -6,12 +6,13 @@ import {
 import { snapshotPersistentFirstDisplayAdoptionV1 } from '../shared/takeover';
 
 import type { ReleaseConfigSourceV1 } from './release_catalog';
+import { EMBEDDED_MAX_MANIFEST_MODULES } from './contracts/release_capacity';
 import { DisposableStack, type DisposeCallback } from './disposable';
 import { trustedArtifactOrigin, type BootFailureReason } from './fallback';
 
 const INTEGRATION_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const RELEASE_ID = /^[0-9a-f]{64}$/;
-const MAX_INTEGRATIONS = 20;
+const MAX_INTEGRATIONS = EMBEDDED_MAX_MANIFEST_MODULES;
 const MAX_KNOWN_INTEGRATIONS = 256;
 const BOOT_DEADLINE_MS = 10_000;
 const EMPTY_BINDING = Object.freeze({});
@@ -420,7 +421,7 @@ function validateCatalog(
   return Object.freeze(catalog);
 }
 
-function validateManifest(
+export function validateRuntimeManifestV1(
   candidate: unknown,
   embeddedReleaseId: string,
   catalog: readonly IntegrationCatalogEntry[],
@@ -687,7 +688,7 @@ class IntegrationRegistryOwner {
       : undefined;
     this.catalog = catalog ?? Object.freeze([]);
     this.manifestValue = catalog
-      ? validateManifest(
+      ? validateRuntimeManifestV1(
           options.manifest,
           options.releaseId,
           catalog,

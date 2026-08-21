@@ -8,6 +8,7 @@ import {
   snapshotIntegrationConfigsV1,
 } from '../../src/core/contracts/integration_configs';
 import { snapshotBootstrapInputV1 } from '../../src/core/contracts/boot';
+import { snapshotServerBootTransportV1 } from '../../src/core/contracts/server_boot_transport';
 
 const RELEASE = 'a'.repeat(64);
 
@@ -89,6 +90,105 @@ function firstDisplayInput(): Record<string, unknown> {
   };
   return input;
 }
+
+function transportInput(firstDisplay = false): Record<string, unknown> {
+  const input = firstDisplay ? firstDisplayInput() : bootInput();
+  const boot = input.boot as Record<string, unknown>;
+  const integrationConfigDigest = createHash('sha256')
+    .update(JSON.stringify(boot.integrations))
+    .digest('hex');
+  const projectionDigest = createHash('sha256')
+    .update(JSON.stringify(boot.auctionProjection))
+    .digest('hex');
+  const outline = input.outline as Record<string, unknown> | null;
+  if (outline) {
+    outline.projectionDigest = projectionDigest;
+    outline.integrationConfigDigest = integrationConfigDigest;
+  }
+  return {
+    version: 1,
+    boot,
+    integrity: { version: 1, projectionDigest, integrationConfigDigest },
+    outline,
+  };
+}
+
+describe('sealed production boot transport', () => {
+  it.each([false, true])('parses and recursively freezes a fresh %s transport', (firstDisplay) => {
+    const original = transportInput(firstDisplay);
+    const accepted = snapshotServerBootTransportV1(JSON.stringify(original), RELEASE);
+
+    expect(accepted).toBeDefined();
+    expect(accepted).not.toBe(original);
+    expect(Object.isFrozen(accepted)).toBe(true);
+    expect(Object.isFrozen(accepted?.boot)).toBe(true);
+    expect(Object.isFrozen(accepted?.boot.auctionProjection)).toBe(true);
+    expect(Object.isFrozen(accepted?.integrity)).toBe(true);
+    expect(accepted?.outline === null || Object.isFrozen(accepted?.outline)).toBe(true);
+  });
+
+  it('accepts strings only and requires the exact root and always-present integrity', () => {
+    const valid = transportInput();
+    expect(snapshotServerBootTransportV1(valid, RELEASE)).toBeUndefined();
+    expect(
+      snapshotServerBootTransportV1(JSON.stringify({ ...valid, extra: true }), RELEASE)
+    ).toBeUndefined();
+    const { integrity: _integrity, ...missingIntegrity } = valid;
+    expect(
+      snapshotServerBootTransportV1(JSON.stringify(missingIntegrity), RELEASE)
+    ).toBeUndefined();
+  });
+
+  it('binds a non-null outline to the always-present integrity value', () => {
+    const value = transportInput(true);
+    (value.outline as Record<string, unknown>).projectionDigest = 'f'.repeat(64);
+
+    expect(snapshotServerBootTransportV1(JSON.stringify(value), RELEASE)).toBeUndefined();
+  });
+
+  it('rejects a decoded transport above 10 MiB before parsing it', () => {
+    const encoded = `${JSON.stringify(transportInput())}${' '.repeat(10 * 1024 * 1024)}`;
+    expect(snapshotServerBootTransportV1(encoded, RELEASE)).toBeUndefined();
+  });
+
+  it('rejects more than fourteen takeover manifest entries', () => {
+    const value = transportInput();
+    const boot = value.boot as Record<string, unknown>;
+    const manifest = boot.manifest as Record<string, unknown>;
+    const integrations = Array.from({ length: 14 }, (_, index) => ({
+      id: `takeover_${index}`,
+      phase: 'takeover',
+    }));
+    manifest.integrations = integrations;
+
+    expect(snapshotServerBootTransportV1(JSON.stringify(value), RELEASE)).toBeDefined();
+
+    integrations.push({ id: 'takeover_14', phase: 'takeover' });
+
+    expect(snapshotServerBootTransportV1(JSON.stringify(value), RELEASE)).toBeUndefined();
+  });
+
+  it('binds each deferred manifest source to its declared id', () => {
+    const value = transportInput();
+    const boot = value.boot as Record<string, unknown>;
+    const manifest = boot.manifest as Record<string, unknown>;
+    manifest.integrations = [
+      { id: 'render_runtime', phase: 'takeover' },
+      {
+        id: 'gpt_later',
+        phase: 'deferred',
+        trigger: 'first_display_or_idle',
+        src: `/static/tsjs=tsjs-gpt_later.min.js?v=${'e'.repeat(64)}`,
+      },
+    ];
+
+    expect(snapshotServerBootTransportV1(JSON.stringify(value), RELEASE)).toBeDefined();
+
+    const deferred = (manifest.integrations as Array<Record<string, unknown>>)[1]!;
+    deferred.src = `/static/tsjs=tsjs-evil.min.js?v=${'e'.repeat(64)}`;
+    expect(snapshotServerBootTransportV1(JSON.stringify(value), RELEASE)).toBeUndefined();
+  });
+});
 
 describe('bootstrap integration configuration admission', () => {
   it('captures one complete immutable boot copy without retaining the server literal', () => {

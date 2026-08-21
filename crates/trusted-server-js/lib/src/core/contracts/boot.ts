@@ -318,21 +318,31 @@ export function snapshotTsjsBootV1(candidate: unknown, releaseId: string): TsjsB
   }
 }
 
-/** Revalidate a bootstrap snapshot while retaining its exact object identity. */
-export function retainTsjsBootSnapshotV1(
+/** Revalidate one recursively frozen boot and return the independent accepted snapshot. */
+export function snapshotFrozenTsjsBootV1(
   candidate: unknown,
   releaseId: string
-): Readonly<TsjsBootV1> | undefined {
+): TsjsBootV1 | undefined {
   try {
     const accepted = snapshotTsjsBootV1(candidate, releaseId);
     return accepted &&
       recursivelyFrozenPlainData(candidate) &&
       JSON.stringify(candidate) === JSON.stringify(accepted)
-      ? (candidate as Readonly<TsjsBootV1>)
+      ? accepted
       : undefined;
   } catch {
     return undefined;
   }
+}
+
+/** Revalidate a bootstrap snapshot while retaining its exact object identity. */
+export function retainTsjsBootSnapshotV1(
+  candidate: unknown,
+  releaseId: string
+): Readonly<TsjsBootV1> | undefined {
+  return snapshotFrozenTsjsBootV1(candidate, releaseId)
+    ? (candidate as Readonly<TsjsBootV1>)
+    : undefined;
 }
 
 /** Capture the exact server lexical, including the one retained immutable boot copy. */

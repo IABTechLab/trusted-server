@@ -553,6 +553,7 @@ export interface TsjsFallbackApi extends TsjsApiBase {
     state: 'fallback';
     releaseId: string;
     reason: 'abi_mismatch' | 'bundle_partial';
+    initialDisplayCommitted: boolean;
   }>;
 }
 

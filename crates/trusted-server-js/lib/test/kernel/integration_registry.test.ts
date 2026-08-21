@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { BootManifestV1 } from '../../src/core/types';
+import { EMBEDDED_MAX_MANIFEST_MODULES } from '../../src/kernel/contracts/release_capacity';
 import {
   createIntegrationRegistry as createIntegrationRegistryOwner,
   snapshotIntegrationRegistration,
@@ -535,7 +536,12 @@ describe('integration manifest and registration admission', () => {
         ],
       },
     ],
-    ['over capacity', manifest(Array.from({ length: 21 }, (_, index) => `module_${index}`))],
+    [
+      'over generated capacity',
+      manifest(
+        Array.from({ length: EMBEDDED_MAX_MANIFEST_MODULES + 1 }, (_, index) => `module_${index}`)
+      ),
+    ],
   ])('rejects a malformed manifest: %s', async (_name, candidate) => {
     const registry = createIntegrationRegistry({
       manifest: candidate,

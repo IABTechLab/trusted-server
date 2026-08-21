@@ -5485,7 +5485,9 @@ mod tests {
         build_services_with_secret_http_client_and_client_ip, noop_services,
         noop_services_with_telemetry_sink,
     };
-    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+    use crate::test_support::tests::{
+        bootstrap_transport, crate_test_settings_str, create_test_settings,
+    };
     use edgezero_core::body::Body as EdgeBody;
     use http::{Method, Request as HttpRequest, StatusCode, header};
     use std::sync::Arc;
@@ -6973,19 +6975,23 @@ mod tests {
 
         let seam = seam_script_for(&params, &settings, &registry);
         let boot = seam
-            .find("const __TSJS_SERVER_BOOT_INPUT_V1__=")
-            .expect("should emit one immutable boot input");
+            .find("const __TSJS_SERVER_BOOT_TRANSPORT_V1__=")
+            .expect("should emit one immutable sealed boot transport");
         let runtime = seam
             .find("id=\"trustedserver-js\"")
             .expect("should emit the selected parser-time runtime");
 
         assert!(boot < runtime, "boot input must precede runtime execution");
         assert_eq!(
-            seam.matches("const __TSJS_SERVER_BOOT_INPUT_V1__=").count(),
+            seam.matches("const __TSJS_SERVER_BOOT_TRANSPORT_V1__=")
+                .count(),
             1,
             "reader seam must carry exactly one complete boot"
         );
-        assert!(seam.contains(r#""auctionId":"auction-c2-reader""#));
+        assert_eq!(
+            bootstrap_transport(&seam)["boot"]["auctionProjection"]["auction"]["auctionId"],
+            "auction-c2-reader"
+        );
         assert!(seam.contains(r#"performance.mark("tsjs:bids-script")"#));
         assert!(!seam.contains(AD_ASSEMBLY_SEAM));
         assert!(!seam.contains(".adSlots"));

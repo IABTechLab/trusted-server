@@ -1,7 +1,9 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::sync::OnceLock;
 
 use error_stack::Report;
+use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use trusted_server_js::{
@@ -9,7 +11,10 @@ use trusted_server_js::{
 };
 use validator::Validate;
 
-use crate::auction::types::{BidRenderSourceV1, BrowserAuctionProjectionV1, SlotAuctionDecisionV1};
+use crate::auction::types::{
+    BidRenderSourceV1, BrowserAuctionProjectionV1, MAX_BROWSER_AUCTION_PROJECTION_BYTES,
+    SlotAuctionDecisionV1,
+};
 use crate::error::TrustedServerError;
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -35,6 +40,236 @@ pub(crate) const INTEGRATION_CONFIG_MAX_VALUES_V1: usize = 4_096;
 pub(crate) const INTEGRATION_CONFIG_MAX_STRING_BYTES_V1: usize = 4_096;
 pub(crate) const INTEGRATION_CONFIG_MAX_ENTRY_BYTES_V1: usize = 65_536;
 const INTEGRATION_CONFIG_MAX_CARRIER_BYTES_V1: usize = 524_288;
+const SERVER_BOOT_TRANSPORT_MAX_BYTES_V1: usize = 10 * 1024 * 1024;
+
+#[derive(Debug)]
+enum EcmascriptJsonValue {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Array(Vec<Self>),
+    Object(Vec<(String, Self)>),
+}
+
+struct EcmascriptJsonVisitor;
+
+impl<'de> Visitor<'de> for EcmascriptJsonVisitor {
+    type Value = EcmascriptJsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a finite JSON value")
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(EcmascriptJsonValue::Null)
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(EcmascriptJsonValue::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(EcmascriptJsonValue::Number(value as f64))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(EcmascriptJsonValue::Number(value as f64))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        if !value.is_finite() {
+            return Err(E::custom("JSON number must be finite"));
+        }
+        Ok(EcmascriptJsonValue::Number(value))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(EcmascriptJsonValue::String(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(EcmascriptJsonValue::String(value))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+        while let Some(value) = sequence.next_element()? {
+            values.push(value);
+        }
+        Ok(EcmascriptJsonValue::Array(values))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(map.size_hint().unwrap_or(0));
+        let mut keys = HashSet::new();
+        while let Some((key, value)) = map.next_entry::<String, EcmascriptJsonValue>()? {
+            if !keys.insert(key.clone()) {
+                return Err(serde::de::Error::custom("duplicate JSON object key"));
+            }
+            values.push((key, value));
+        }
+        Ok(EcmascriptJsonValue::Object(values))
+    }
+}
+
+impl<'de> Deserialize<'de> for EcmascriptJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(EcmascriptJsonVisitor)
+    }
+}
+
+fn ecmascript_number_string(value: f64) -> Option<String> {
+    if !value.is_finite() {
+        return None;
+    }
+    if value == 0.0 {
+        return Some("0".to_owned());
+    }
+    let negative = value.is_sign_negative();
+    let raw = serde_json::to_string(&value.abs()).ok()?;
+    let (mantissa, exponent) = raw
+        .split_once(['e', 'E'])
+        .map_or((raw.as_str(), 0), |(mantissa, exponent)| {
+            (mantissa, exponent.parse::<i32>().ok().unwrap_or(i32::MAX))
+        });
+    if exponent == i32::MAX {
+        return None;
+    }
+    let point = mantissa.find('.').unwrap_or(mantissa.len());
+    let mut digits = mantissa
+        .bytes()
+        .filter(|byte| *byte != b'.')
+        .map(char::from)
+        .collect::<String>();
+    let mut decimal_position = i32::try_from(point).ok()?.checked_add(exponent)?;
+    while digits.len() > 1 && digits.starts_with('0') {
+        digits.remove(0);
+        decimal_position = decimal_position.checked_sub(1)?;
+    }
+    while digits.len() > 1 && digits.ends_with('0') {
+        digits.pop();
+    }
+    let digit_count = i32::try_from(digits.len()).ok()?;
+    let mut output = String::new();
+    if negative {
+        output.push('-');
+    }
+    if digit_count <= decimal_position && decimal_position <= 21 {
+        output.push_str(&digits);
+        output.extend(std::iter::repeat_n(
+            '0',
+            usize::try_from(decimal_position - digit_count).ok()?,
+        ));
+    } else if decimal_position > 0 && decimal_position <= 21 {
+        let split = usize::try_from(decimal_position).ok()?;
+        output.push_str(&digits[..split]);
+        output.push('.');
+        output.push_str(&digits[split..]);
+    } else if decimal_position > -6 && decimal_position <= 0 {
+        output.push_str("0.");
+        output.extend(std::iter::repeat_n(
+            '0',
+            usize::try_from(-decimal_position).ok()?,
+        ));
+        output.push_str(&digits);
+    } else {
+        output.push_str(&digits[..1]);
+        if digits.len() > 1 {
+            output.push('.');
+            output.push_str(&digits[1..]);
+        }
+        output.push('e');
+        let scientific_exponent = decimal_position.checked_sub(1)?;
+        if scientific_exponent >= 0 {
+            output.push('+');
+        }
+        output.push_str(&scientific_exponent.to_string());
+    }
+    Some(output)
+}
+
+fn ecmascript_array_index(key: &str) -> Option<u32> {
+    if key.is_empty() || (key.len() > 1 && key.starts_with('0')) {
+        return None;
+    }
+    let value = key.parse::<u32>().ok()?;
+    (value < u32::MAX && value.to_string() == key).then_some(value)
+}
+
+fn write_ecmascript_json(value: &EcmascriptJsonValue, output: &mut String) -> Option<()> {
+    match value {
+        EcmascriptJsonValue::Null => output.push_str("null"),
+        EcmascriptJsonValue::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        EcmascriptJsonValue::Number(value) => output.push_str(&ecmascript_number_string(*value)?),
+        EcmascriptJsonValue::String(value) => {
+            output.push_str(&serde_json::to_string(value).ok()?);
+        }
+        EcmascriptJsonValue::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                write_ecmascript_json(value, output)?;
+            }
+            output.push(']');
+        }
+        EcmascriptJsonValue::Object(values) => {
+            let mut indexed = values
+                .iter()
+                .filter_map(|(key, value)| {
+                    ecmascript_array_index(key).map(|index| (index, key, value))
+                })
+                .collect::<Vec<_>>();
+            indexed.sort_unstable_by_key(|(index, _, _)| *index);
+            output.push('{');
+            let mut first = true;
+            for (_, key, value) in indexed {
+                if !first {
+                    output.push(',');
+                }
+                first = false;
+                output.push_str(&serde_json::to_string(key).ok()?);
+                output.push(':');
+                write_ecmascript_json(value, output)?;
+            }
+            for (key, value) in values {
+                if ecmascript_array_index(key).is_some() {
+                    continue;
+                }
+                if !first {
+                    output.push(',');
+                }
+                first = false;
+                output.push_str(&serde_json::to_string(key).ok()?);
+                output.push(':');
+                write_ecmascript_json(value, output)?;
+            }
+            output.push('}');
+        }
+    }
+    Some(())
+}
+
+fn ecmascript_json_stringify_v1(json: &str) -> Option<String> {
+    let value = serde_json::from_str::<EcmascriptJsonValue>(json).ok()?;
+    let mut output = String::with_capacity(json.len());
+    write_ecmascript_json(&value, &mut output)?;
+    Some(output)
+}
 
 /// One admitted browser-safe product configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -79,15 +314,6 @@ impl IntegrationConfigsV1 {
             }
             validate_integration_config_value_v1(&config, 0, &mut value_count)?;
             let entry = IntegrationConfigEntryV1 { id, config };
-            if serde_json::to_vec(&entry)
-                .map_err(|_| integration_config_error("product entry serialization failed"))?
-                .len()
-                > INTEGRATION_CONFIG_MAX_ENTRY_BYTES_V1
-            {
-                return Err(integration_config_error(
-                    "product entry exceeds 65,536 UTF-8 JSON bytes",
-                ));
-            }
             admitted.push(entry);
             previous_index = Some(index);
         }
@@ -96,16 +322,33 @@ impl IntegrationConfigsV1 {
             version: 1,
             entries: admitted,
         };
-        if serde_json::to_vec(&carrier)
-            .map_err(|_| integration_config_error("carrier serialization failed"))?
-            .len()
-            > INTEGRATION_CONFIG_MAX_CARRIER_BYTES_V1
-        {
+        carrier.canonical_json_v1()?;
+        Ok(carrier)
+    }
+
+    fn canonical_json_v1(&self) -> Result<String, Report<TrustedServerError>> {
+        for entry in &self.entries {
+            let serialized = serde_json::to_string(entry)
+                .map_err(|_| integration_config_error("product entry serialization failed"))?;
+            let canonical = ecmascript_json_stringify_v1(&serialized).ok_or_else(|| {
+                integration_config_error("product entry ECMAScript serialization failed")
+            })?;
+            if canonical.len() > INTEGRATION_CONFIG_MAX_ENTRY_BYTES_V1 {
+                return Err(integration_config_error(
+                    "product entry exceeds 65,536 UTF-8 JSON bytes",
+                ));
+            }
+        }
+        let serialized = serde_json::to_string(self)
+            .map_err(|_| integration_config_error("carrier serialization failed"))?;
+        let canonical = ecmascript_json_stringify_v1(&serialized)
+            .ok_or_else(|| integration_config_error("carrier ECMAScript serialization failed"))?;
+        if canonical.len() > INTEGRATION_CONFIG_MAX_CARRIER_BYTES_V1 {
             return Err(integration_config_error(
                 "carrier exceeds 524,288 UTF-8 JSON bytes",
             ));
         }
-        Ok(carrier)
+        Ok(canonical)
     }
 
     /// Construct the exact empty carrier used by documents with no product modules.
@@ -296,6 +539,13 @@ pub fn tsjs_bootstrap_fragment_v1(
         publisher_origin,
     )
     .map_err(|_| boot_manifest_error("auction projection violates the version-1 contract"))?;
+    let projection = ecmascript_json_stringify_v1(&projection)
+        .ok_or_else(|| boot_manifest_error("auction projection ECMAScript serialization failed"))?;
+    if projection.len() > MAX_BROWSER_AUCTION_PROJECTION_BYTES {
+        return Err(boot_manifest_error(
+            "auction projection exceeds 8 MiB after ECMAScript serialization",
+        ));
+    }
     let projection_value = serde_json::from_str::<BrowserAuctionProjectionV1>(&projection)
         .map_err(|_| boot_manifest_error("canonical auction projection is unavailable"))?;
     let projection_digest = hex::encode(Sha256::digest(projection.as_bytes()));
@@ -402,10 +652,13 @@ pub fn tsjs_bootstrap_fragment_v1(
         runtime_src,
         integrations.join(",")
     );
-    let integration_configs_json = serde_json::to_string(config.integration_configs)
-        .map_err(|_| integration_config_error("carrier serialization failed"))?;
+    let integration_configs_json = config.integration_configs.canonical_json_v1()?;
     let integration_config_digest =
         hex::encode(Sha256::digest(integration_configs_json.as_bytes()));
+    let integrity = format!(
+        r#"{{"version":1,"projectionDigest":"{}","integrationConfigDigest":"{}"}}"#,
+        projection_digest, integration_config_digest
+    );
     let outline = first_display.as_ref().map_or_else(
         || "null".to_owned(),
         |_| {
@@ -425,10 +678,28 @@ pub fn tsjs_bootstrap_fragment_v1(
             )
         },
     );
-    let manifest = escape_json_for_inline_script(&manifest);
-    let projection = escape_json_for_inline_script(&projection);
-    let integration_configs = escape_json_for_inline_script(&integration_configs_json);
-    let outline = escape_json_for_inline_script(&outline);
+    let transport = format!(
+        r#"{{"version":1,"boot":{{"abi":1,"releaseId":"{}","manifest":{},"auctionProjection":{},"integrations":{},"creative":{{"version":1,"enabled":{},"clickGuard":{},"renderGuard":{}}},"diagnostics":{{"version":1,"renderTraceOverlay":{},"gpt":{{"active":{}}}}}}},"integrity":{},"outline":{}}}"#,
+        release_id(),
+        manifest,
+        projection,
+        integration_configs_json,
+        config.creative.enabled,
+        config.creative.click_guard,
+        config.creative.render_guard,
+        config.render_trace_overlay,
+        config.gpt_diagnostics_active,
+        integrity,
+        outline,
+    );
+    if transport.len() > SERVER_BOOT_TRANSPORT_MAX_BYTES_V1 {
+        return Err(boot_manifest_error(
+            "server boot transport exceeds 10 MiB UTF-8",
+        ));
+    }
+    let transport_literal = serde_json::to_string(&transport)
+        .map_err(|_| boot_manifest_error("server boot transport serialization failed"))?;
+    let transport_literal = escape_json_for_inline_script(&transport_literal);
     let bootstrap = trusted_server_js::bootstrap_bundle();
     if bootstrap.to_ascii_lowercase().contains("</script") {
         return Err(boot_manifest_error(
@@ -436,18 +707,7 @@ pub fn tsjs_bootstrap_fragment_v1(
         ));
     }
     let controller = format!(
-        "<script>const __TSJS_SERVER_BOOT_INPUT_V1__={{\"target\":(window.tsjs=window.tsjs||{{}}),\"boot\":{{\"abi\":1,\"releaseId\":\"{}\",\"manifest\":{},\"auctionProjection\":{},\"integrations\":{},\"creative\":{{\"version\":1,\"enabled\":{},\"clickGuard\":{},\"renderGuard\":{}}},\"diagnostics\":{{\"version\":1,\"renderTraceOverlay\":{},\"gpt\":{{\"active\":{}}}}}}},\"outline\":{}}};{}</script>",
-        release_id(),
-        manifest,
-        projection,
-        integration_configs,
-        config.creative.enabled,
-        config.creative.click_guard,
-        config.creative.render_guard,
-        config.render_trace_overlay,
-        config.gpt_diagnostics_active,
-        outline,
-        bootstrap,
+        "<script>const __TSJS_SERVER_BOOT_TRANSPORT_V1__={transport_literal};{bootstrap}</script>"
     );
     let selected_src = agent
         .as_ref()
@@ -989,9 +1249,33 @@ pub fn tsjs_deferred_script_tags(module_ids: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::tests::bootstrap_transport;
 
     const VALID_BROWSER_AUCTION_PROJECTION_JSON: &str = r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[]}"#;
     const PERFORMANCE_ORIGIN: &str = "https://performance.example";
+
+    #[test]
+    fn ecmascript_json_corpus_matches_the_browser_stringify_contract() {
+        let corpus: serde_json::Value = serde_json::from_str(include_str!(
+            "../../trusted-server-js/lib/test/fixtures/contracts/ecmascript-json-stringify-v1.json"
+        ))
+        .expect("shared ECMAScript JSON corpus should parse");
+        for case in corpus
+            .as_array()
+            .expect("shared ECMAScript JSON corpus should be an array")
+        {
+            let name = case["name"].as_str().expect("case should have a name");
+            let input = case["input"].as_str().expect("case should have input");
+            let expected = case["expected"]
+                .as_str()
+                .expect("case should have expected bytes");
+            assert_eq!(
+                ecmascript_json_stringify_v1(input).as_deref(),
+                Some(expected),
+                "shared case should match: {name}"
+            );
+        }
+    }
 
     #[test]
     fn integration_configs_serialize_once_in_canonical_product_order() {
@@ -1161,8 +1445,27 @@ mod tests {
             PERFORMANCE_ORIGIN,
         )
         .expect("matching carrier and manifest should serialize");
+        let transport = bootstrap_transport(&script);
+        assert_eq!(
+            transport
+                .as_object()
+                .map(|record| record.keys().cloned().collect::<Vec<_>>()),
+            Some(vec![
+                "boot".to_owned(),
+                "integrity".to_owned(),
+                "outline".to_owned(),
+                "version".to_owned(),
+            ]),
+            "production transport must have one exact four-key root"
+        );
+        assert!(transport["integrity"]["projectionDigest"].is_string());
+        assert!(transport["integrity"]["integrationConfigDigest"].is_string());
+        assert!(transport["outline"].is_null());
+        assert!(!script.contains("__TSJS_SERVER_BOOT_INPUT_V1__"));
+        assert!(!script.contains(r#""target""#));
         assert!(
-            script.contains(r#""integrations":{"version":1,"entries":[{"id":"aps","config":{}}]}"#),
+            transport["boot"]["integrations"]
+                == serde_json::json!({"version":1,"entries":[{"id":"aps","config":{}}]}),
             "boot must contain the sole typed integration carrier: {script}"
         );
 
@@ -1293,8 +1596,14 @@ mod tests {
         .expect("first-display bootstrap should serialize");
 
         assert!(
-            script.contains(&format!(r#""integrationConfigDigest":"{expected_digest}""#)),
+            bootstrap_transport(&script)["integrity"]["integrationConfigDigest"].as_str()
+                == Some(expected_digest.as_str()),
             "outline must bind the exact canonical carrier: {script}"
+        );
+        assert_eq!(
+            bootstrap_transport(&script)["outline"]["integrationConfigDigest"],
+            expected_digest,
+            "outline must copy the always-present integrity value"
         );
     }
 
@@ -1329,7 +1638,8 @@ mod tests {
         .expect("attribution-only first-display bootstrap should serialize");
 
         assert!(
-            script.contains(r#""slices":["first_display","gpt_initial"]"#),
+            bootstrap_transport(&script)["boot"]["manifest"]["firstDisplay"]["slices"]
+                == serde_json::json!(["first_display", "gpt_initial"]),
             "typed GAM attribution must select the GPT parser-time owner: {script}"
         );
         assert!(
@@ -1404,11 +1714,12 @@ mod tests {
         )
         .expect("should serialize the production bootstrap");
 
-        assert!(
-            controller.contains(&format!(
-                r#""runtimeSrc":"/static/tsjs=tsjs-unified.min.js?v={}""#,
+        assert_eq!(
+            bootstrap_transport(&controller)["boot"]["manifest"]["runtimeSrc"],
+            format!(
+                "/static/tsjs=tsjs-unified.min.js?v={}",
                 concatenated_hash(&["render_runtime", "gpt"])
-            )),
+            ),
             "should carry the exact runtime artifact source in BootManifestV1"
         );
         assert!(
@@ -1592,16 +1903,15 @@ mod tests {
             .expect("the default creative integration should be enabled");
         let expected_src = tsjs_script_src(&["render_runtime", "creative"]);
 
-        assert!(
-            bootstrap.contains("__TSJS_SERVER_BOOT_INPUT_V1__"),
-            "{bootstrap}"
-        );
-        assert!(
-            bootstrap.contains(r#"{"id":"render_runtime","phase":"takeover"}"#),
-            "{bootstrap}"
-        );
-        assert!(
-            bootstrap.contains(r#"{"id":"creative","phase":"takeover"}"#),
+        assert!(bootstrap.contains("__TSJS_SERVER_BOOT_TRANSPORT_V1__"));
+        assert!(!bootstrap.contains("__TSJS_SERVER_BOOT_INPUT_V1__"));
+        let transport = bootstrap_transport(&bootstrap);
+        assert_eq!(
+            transport["boot"]["manifest"]["integrations"],
+            serde_json::json!([
+                {"id":"render_runtime","phase":"takeover"},
+                {"id":"creative","phase":"takeover"}
+            ]),
             "{bootstrap}"
         );
         assert!(
@@ -1609,8 +1919,16 @@ mod tests {
             "{bootstrap}"
         );
         assert_eq!(bootstrap.matches("id=\"trustedserver-js\"").count(), 1);
-        assert!(!bootstrap.contains(r#""id":"gpt""#), "{bootstrap}");
-        assert!(!bootstrap.contains(r#""phase":"deferred""#), "{bootstrap}");
+        assert!(
+            transport["boot"]["manifest"]["integrations"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().all(|entry| entry["id"] != "gpt"))
+        );
+        assert!(
+            transport["boot"]["manifest"]["integrations"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().all(|entry| entry["phase"] != "deferred"))
+        );
     }
 
     #[test]

@@ -157,44 +157,10 @@ describe('kernel boot creative ABI', () => {
 });
 
 describe('terminal fallback boot manifest', () => {
-  it('uses the independently trusted takeover source when the manifest field is missing', () => {
-    const fallback = buildFallbackBoot(
-      RELEASE_ID,
-      {
-        ...boot({ version: 1, enabled: false, clickGuard: false, renderGuard: false }),
-        manifest: {
-          version: 1,
-          releaseId: RELEASE_ID,
-          integrations: [],
-        },
-      },
-      TRUSTED_RUNTIME_SRC
-    ) as { readonly manifest: unknown };
-
-    expect(fallback.manifest).toEqual({
-      version: 1,
-      releaseId: RELEASE_ID,
-      firstDisplay: null,
-      runtimeSrc: TRUSTED_RUNTIME_SRC,
-      integrations: [],
-    });
-  });
-
-  it('uses the independently trusted takeover source when the manifest field is malformed', () => {
-    const fallback = buildFallbackBoot(
-      RELEASE_ID,
-      {
-        ...boot({ version: 1, enabled: false, clickGuard: false, renderGuard: false }),
-        manifest: {
-          version: 1,
-          releaseId: RELEASE_ID,
-          firstDisplay: null,
-          runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${'e'.repeat(64)}&publisher=1`,
-          integrations: [],
-        },
-      },
-      TRUSTED_RUNTIME_SRC
-    ) as { readonly manifest: unknown };
+  it('constructs the exact safe manifest from the independently trusted takeover source', () => {
+    const fallback = buildFallbackBoot(RELEASE_ID, TRUSTED_RUNTIME_SRC) as {
+      readonly manifest: unknown;
+    };
 
     expect(fallback.manifest).toEqual({
       version: 1,
@@ -206,22 +172,14 @@ describe('terminal fallback boot manifest', () => {
   });
 
   it('refuses to construct a fallback boot without an independently trusted takeover source', () => {
-    expect(
-      buildFallbackBoot(
-        RELEASE_ID,
-        boot({ version: 1, enabled: false, clickGuard: false, renderGuard: false }),
-        undefined as never
-      )
-    ).toBeUndefined();
+    expect(buildFallbackBoot(RELEASE_ID, undefined as never)).toBeUndefined();
   });
 
   it('publishes the exact phase-aware fallback manifest with the accepted takeover source', () => {
     const acceptedManifest = manifest(['render_runtime', 'diagnostics_presentation']);
-    const fallback = buildFallbackBoot(
-      RELEASE_ID,
-      boot({ version: 1, enabled: false, clickGuard: false, renderGuard: false }),
-      acceptedManifest.runtimeSrc
-    ) as { readonly manifest: unknown };
+    const fallback = buildFallbackBoot(RELEASE_ID, acceptedManifest.runtimeSrc) as {
+      readonly manifest: unknown;
+    };
 
     expect(fallback.manifest).toEqual({
       version: 1,

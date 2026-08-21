@@ -2,6 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 import {
   loadRuntimeTsjsFixture,
   runtimeTsjsFixture,
+  serverBootTransportLiteralV1,
   type RuntimeTsjsFixture,
 } from "../../helpers/tsjs-fixture.js";
 
@@ -82,7 +83,7 @@ test.describe("TSJS hard-cutover runtime", () => {
       route.fulfill({
         status: 200,
         contentType: "text/html; charset=utf-8",
-        body: `<!doctype html><head><script>window.__runtimeOrder=[];window.tsjs={que:[()=>window.__runtimeOrder.push("kernel-commit")]};const __TSJS_SERVER_BOOT_INPUT_V1__={target:window.tsjs,boot:${JSON.stringify(boot(KERNEL_FIXTURE))},outline:null};${KERNEL_FIXTURE.bootstrapBody}</script><script src="${KERNEL_FIXTURE.runtimeSrc}" id="trustedserver-js"></script><script>window.__runtimeOrder.push("publisher-parser:"+window.tsjs?._internal?.state)</script></head><body></body>`,
+        body: `<!doctype html><head><script>window.__runtimeOrder=[];window.tsjs={que:[()=>window.__runtimeOrder.push("kernel-commit")]};const __TSJS_SERVER_BOOT_TRANSPORT_V1__=${serverBootTransportLiteralV1(boot(KERNEL_FIXTURE))};${KERNEL_FIXTURE.bootstrapBody}</script><script src="${KERNEL_FIXTURE.runtimeSrc}" id="trustedserver-js"></script><script>window.__runtimeOrder.push("publisher-parser:"+window.tsjs?._internal?.state)</script></head><body></body>`,
       }),
     );
 
@@ -205,37 +206,31 @@ test.describe("TSJS hard-cutover runtime", () => {
     page,
   }) => {
     await openRuntimePage(page);
-    await page.evaluate(
-      ({ initialBoot, releaseId }) => {
-        const browserWindow = window as unknown as {
-          tsjs: Record<string, unknown>;
-          fallbackEffects: { messageListeners: number; timeouts: number };
-        };
-        browserWindow.fallbackEffects = { messageListeners: 0, timeouts: 0 };
-        const nativeAddEventListener = window.addEventListener.bind(window);
-        window.addEventListener = ((
-          type: string,
-          listener: EventListenerOrEventListenerObject,
-        ) => {
-          if (type === "message")
-            browserWindow.fallbackEffects.messageListeners += 1;
-          nativeAddEventListener(type, listener);
-        }) as typeof window.addEventListener;
-        const nativeSetTimeout = window.setTimeout.bind(window);
-        window.setTimeout = ((handler: TimerHandler, timeout?: number) => {
-          browserWindow.fallbackEffects.timeouts += 1;
-          return nativeSetTimeout(handler, timeout);
-        }) as typeof window.setTimeout;
-        browserWindow.tsjs = {
-          boot: { ...initialBoot, manifest: { version: 2, releaseId } },
-          que: [],
-        };
-      },
-      {
-        initialBoot: boot(FALLBACK_FIXTURE),
-        releaseId: FALLBACK_FIXTURE.releaseId,
-      },
-    );
+    await page.evaluate((initialBoot) => {
+      const browserWindow = window as unknown as {
+        tsjs: Record<string, unknown>;
+        fallbackEffects: { messageListeners: number; timeouts: number };
+      };
+      browserWindow.fallbackEffects = { messageListeners: 0, timeouts: 0 };
+      const nativeAddEventListener = window.addEventListener.bind(window);
+      window.addEventListener = ((
+        type: string,
+        listener: EventListenerOrEventListenerObject,
+      ) => {
+        if (type === "message")
+          browserWindow.fallbackEffects.messageListeners += 1;
+        nativeAddEventListener(type, listener);
+      }) as typeof window.addEventListener;
+      const nativeSetTimeout = window.setTimeout.bind(window);
+      window.setTimeout = ((handler: TimerHandler, timeout?: number) => {
+        browserWindow.fallbackEffects.timeouts += 1;
+        return nativeSetTimeout(handler, timeout);
+      }) as typeof window.setTimeout;
+      browserWindow.tsjs = {
+        boot: initialBoot,
+        que: [],
+      };
+    }, boot(FALLBACK_FIXTURE));
 
     await loadRuntimeTsjsFixture(page, FALLBACK_FIXTURE);
     await waitForRuntime(page, "fallback");
@@ -302,7 +297,7 @@ test.describe("TSJS hard-cutover runtime", () => {
     );
     expect(after.effects.timeouts).toBe(before.effects.timeouts);
     expect(after.frames).toBe(0);
-    expect(after.scripts).toBe(2);
+    expect(after.scripts).toBe(3);
     expect(after.hasGoogletag).toBe(false);
   });
 });

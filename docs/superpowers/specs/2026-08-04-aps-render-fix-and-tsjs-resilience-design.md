@@ -2659,8 +2659,13 @@ canonicalizer and embedded as `boot.auctionProjection`. It computes
 `integrity.integrationConfigDigest` as lowercase SHA-256 over the exact UTF-8
 `JSON.stringify`-equivalent serialization of the ordered `IntegrationConfigsV1`
 embedded as `boot.integrations`; object insertion order is the wire order and no
-insignificant whitespace is present. On an agent page Rust copies those exact values
-into the outline rather than hashing again. The compact controller checks integrity
+insignificant whitespace is present. Rust must normalize both admitted trees to
+ECMAScript `JSON.stringify` spellings and enumeration order before hashing and
+embedding; hashing `serde_json` output directly is invalid because negative zero,
+fixed/exponent thresholds, IEEE-754 rounding, and integer-index object keys differ.
+A shared Rust/JavaScript corpus pins those edge cases and nested combinations. On an
+agent page Rust copies those exact values into the outline rather than hashing again.
+The compact controller checks integrity
 and outline digest form and, when the outline is non-null, their exact equality, but
 does not bundle SHA-256 or the full domain validators. The first-display owner
 completely validates the batch, retains the always-present sealed integrity values,
@@ -3006,7 +3011,8 @@ properties and therefore cannot preserve a source accessor, Proxy, symbol, custo
 prototype, sparse hole, or repeated object identity. Before any DOM, timer, queue,
 GPT, attribution, or registration effect, the parser requires the exact root keys
 and version, embedded release equality, exact critical boot keys, manifest release
-and URL/mask/slice relationships, the always-present exact integrity shape and digest
+and URL/mask/slice relationships, at most 14 takeover entries, every deferred source
+bound to its declared module id, the always-present exact integrity shape and digest
 forms, null/non-null first-display and outline parity, outline
 release/slice/count/digest forms and digest equality with integrity, dedicated
 creative/diagnostics booleans, and the configured decoded-size bound. It recursively freezes the parsed tree,
@@ -3019,6 +3025,16 @@ first-display base validates its complete immutable projection/batch before
 activation; every selected slice validates its attenuated product value before its
 effect; and persistent core performs the complete manifest, projection, carrier,
 creative, and diagnostics validation before a direct boot or takeover uses them.
+If that post-claim validation fails, persistent core returns `abi_mismatch` through
+the one-use completion capability returned by the one-use,
+exact-source-authenticated closure claim during the current runtime script task; the
+controller commits fallback immediately instead of allowing the load watchdog to
+relabel the failure `bundle_partial`. Takeover preparation or activation failure is
+reported through that same capability. In takeover mode only the bootstrap owner may
+publish terminal fallback: it preserves accepted DOM, snapshots the agent's
+`initialDisplayCommitted` state, disposes the provisional agent, and commits once.
+The persistent runtime never publishes a competing takeover fallback. On a direct
+page, the persistent runtime remains the terminal-fallback owner after a valid claim.
 The full object-form validators retain their existing hostile-object contract for
 runtime/public/test boundaries: exact `version`/`entries`, unique ordered ids,
 plain configs, finite JSON values, dense Arrays, own enumerable data properties, no
@@ -3026,6 +3042,19 @@ accessors/symbols/custom prototypes/cycles/aliases, depth 16, 4,096 values, 4,09
 keys/strings, 65,536-byte entries, and the 524,288-byte carrier. The inline
 bootstrap artifact must not import those full validators or the complete auction-
 projection parser merely to revalidate the trusted lexical producer.
+The closure claim atomically reserves a private `claiming` state before it touches
+any mutable DOM or realm authentication surface and rolls back only after a failed
+authentication. Its completion capability admits outcomes through primitive string
+comparisons, consumes its one-use guard before invoking the selected handler, and
+therefore remains one-shot under reentrant claim and completion attempts.
+The compact fallback's `addAdUnits` surface still runs the exact public registration
+validator before it refuses a valid call. That validator imports its bounded-string
+primitive from an effect-free bootstrap-safe leaf; it does not make bootstrap reach
+the auction-projection parser.
+The persistent core receives the manifest-entry capacity as a generated numeric
+build constant; it does not import the build-time release catalog merely to learn
+that bound. Substitution may tree-shake the declaration module completely, and the
+release metafile must prove that the persistent core graph excludes the catalog.
 
 The release catalog binds every module id to exactly one config source: its product
 entry, `creative`, `diagnostics`, or none. The integration's generated exact typed

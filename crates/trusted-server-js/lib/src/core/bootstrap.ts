@@ -1,4 +1,4 @@
-declare const __TSJS_SERVER_BOOT_INPUT_V1__: unknown;
+declare const __TSJS_SERVER_BOOT_TRANSPORT_V1__: unknown;
 
 import type {
   FirstDisplayAgent,
@@ -10,8 +10,12 @@ import type { FirstDisplaySliceId } from '../kernel/release_catalog';
 import type { FirstDisplaySliceActivationContext } from '../shared/first_display_transaction';
 
 import { enqueueFirstDisplayGamAttribution } from './adapters/gam_attribution';
-import { snapshotBootstrapInputV1, type BootstrapInputSnapshotV1 } from './contracts/boot';
-import { integrationConfigValueV1 } from './contracts/integration_configs';
+import { validateRequestAdsOptions } from './contracts/request_ads';
+import {
+  snapshotServerBootTransportV1,
+  type ServerBootTransportSnapshotV1,
+} from './contracts/server_boot_transport';
+import { validateProgrammaticAdUnits } from './registry';
 import { EMBEDDED_RELEASE_ID } from './release_id';
 
 const RELEASE = EMBEDDED_RELEASE_ID;
@@ -21,7 +25,14 @@ interface ComponentRegistration {
   readonly prepare: (host: unknown) => unknown;
 }
 
+type BootstrapTarget = object & { boot?: unknown; que?: unknown };
+
+interface BootstrapInputSnapshotV1 extends ServerBootTransportSnapshotV1 {
+  readonly target: BootstrapTarget;
+}
+
 type BootFailureReason = 'abi_mismatch' | 'bundle_partial';
+type BootClaimOutcome = 'kernel' | BootFailureReason;
 
 class RuntimeUnavailableError extends Error {
   public readonly code = 'runtime_unavailable';
@@ -44,7 +55,7 @@ function deepFreeze(value: unknown): void {
   Object.freeze(value);
 }
 
-function prepareIngress(target: BootstrapInputSnapshotV1['target']): unknown[] {
+function prepareIngress(target: BootstrapTarget): unknown[] {
   const descriptor = Object.getOwnPropertyDescriptor(target, 'que');
   const previous =
     descriptor && 'value' in descriptor && Array.isArray(descriptor.value) ? descriptor.value : [];
@@ -78,12 +89,18 @@ function fallbackFields(
       runtimeSrc: boot.manifest.runtimeSrc,
       integrations: [],
     },
-    auctionProjection: boot.auctionProjection,
+    auctionProjection: {
+      version: 1,
+      auction: { version: 1, auctionId: 'fallback', results: [] },
+      slots: [],
+      bids: [],
+    },
     integrations: { version: 1, entries: [] },
     creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
     diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
   };
   deepFreeze(safeBoot);
+  const knownSlots = new Set<string>();
   let level = 'warn';
   const levels = ['silent', 'error', 'warn', 'info', 'debug'];
   const observe = (..._values: readonly unknown[]): void => undefined;
@@ -103,11 +120,22 @@ function fallbackFields(
       debug: observe,
     }),
     _registerIntegration: () => false,
-    addAdUnits: (_units: unknown): never => {
+    addAdUnits: (units: unknown): never => {
+      validateProgrammaticAdUnits(units, knownSlots);
       throw new RuntimeUnavailableError(RELEASE, reason);
     },
-    requestAds: async (): Promise<never> => {
-      throw new RuntimeUnavailableError(RELEASE, reason);
+    requestAds: async (options?: unknown): Promise<unknown> => {
+      const validated = validateRequestAdsOptions(options);
+      const selected = validated.slots ?? [];
+      const result = {
+        slots: selected.map((slot) =>
+          validated.aborted
+            ? { slot, path: 'primary', outcome: 'cancelled', reason: 'caller_aborted' }
+            : { slot, path: 'primary', outcome: 'failed', reason: 'slot_unresolved' }
+        ),
+      };
+      deepFreeze(result);
+      return result;
     },
   };
   Object.defineProperty(fields, '_internal', {
@@ -170,7 +198,7 @@ function publishFallback(
   }
 }
 
-function installBootstrap({ target, boot, outline }: BootstrapInputSnapshotV1): void {
+function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSnapshotV1): void {
   const ingress = prepareIngress(target);
   const firstDisplay = boot.manifest.firstDisplay;
   const trustedOrigin = (): string | undefined => {
@@ -219,7 +247,9 @@ function installBootstrap({ target, boot, outline }: BootstrapInputSnapshotV1): 
       return false;
     }
   };
-  let bootClaimed = false;
+  let bootClaimState: 'available' | 'claiming' | 'claimed' = 'available';
+  let bootClaimCompleted = false;
+  let completeClaimedBoot: ((outcome: BootClaimOutcome) => void) | undefined;
   const removeBootClaim = (): void => {
     try {
       const descriptor = Object.getOwnPropertyDescriptor(target, '_claimBootSnapshot');
@@ -230,19 +260,43 @@ function installBootstrap({ target, boot, outline }: BootstrapInputSnapshotV1): 
       // The closure-retained snapshot remains authoritative after hostile replacement.
     }
   };
-  const claimBoot = (source: unknown): Readonly<typeof boot> | undefined => {
-    const expectedId = firstDisplay === null ? 'trustedserver-js' : 'trustedserver-js-runtime';
+  const completeBootClaim = (outcome: BootClaimOutcome): void => {
+    const acceptedOutcome =
+      outcome === 'kernel' || outcome === 'abi_mismatch' || outcome === 'bundle_partial';
     if (
-      bootClaimed ||
-      !(source instanceof HTMLScriptElement) ||
-      document.currentScript !== source ||
-      !authentic(source, boot.manifest.runtimeSrc, expectedId)
+      bootClaimState !== 'claimed' ||
+      bootClaimCompleted ||
+      !completeClaimedBoot ||
+      !acceptedOutcome
     ) {
+      return;
+    }
+    bootClaimCompleted = true;
+    const complete = completeClaimedBoot;
+    completeClaimedBoot = undefined;
+    complete(outcome);
+  };
+  const claimedBoot = Object.freeze({ boot, integrity, complete: completeBootClaim });
+  const claimBoot = (source: unknown): Readonly<typeof claimedBoot> | undefined => {
+    if (bootClaimState !== 'available') return undefined;
+    bootClaimState = 'claiming';
+    let accepted = false;
+    try {
+      const expectedId = firstDisplay === null ? 'trustedserver-js' : 'trustedserver-js-runtime';
+      accepted =
+        source instanceof HTMLScriptElement &&
+        document.currentScript === source &&
+        authentic(source, boot.manifest.runtimeSrc, expectedId);
+    } catch {
+      // The claim stays reserved only until this authentication attempt fails.
+    }
+    if (!accepted) {
+      bootClaimState = 'available';
       return undefined;
     }
-    bootClaimed = true;
+    bootClaimState = 'claimed';
     removeBootClaim();
-    return boot;
+    return claimedBoot;
   };
   const installBootClaim = (): void => {
     Object.defineProperty(target, '_claimBootSnapshot', {
@@ -264,7 +318,7 @@ function installBootstrap({ target, boot, outline }: BootstrapInputSnapshotV1): 
         // A hostile replacement cannot make the captured claim callable again.
       }
     };
-    const fallback = (): void => {
+    const fallback = (reason: BootFailureReason = 'bundle_partial'): void => {
       if (terminal) return;
       terminal = true;
       if (timer !== undefined) window.clearTimeout(timer);
@@ -275,7 +329,10 @@ function installBootstrap({ target, boot, outline }: BootstrapInputSnapshotV1): 
       }
       removeClaim();
       removeBootClaim();
-      publishFallback(target, ingress, fallbackFields(boot, 'bundle_partial', false));
+      publishFallback(target, ingress, fallbackFields(boot, reason, false));
+    };
+    completeClaimedBoot = (outcome) => {
+      if (outcome === 'abi_mismatch') fallback(outcome);
     };
     const claim = (
       source: unknown,
@@ -382,6 +439,9 @@ function installBootstrap({ target, boot, outline }: BootstrapInputSnapshotV1): 
     }
     disposeAgent();
     publishFallback(target, ingress, fallbackFields(boot, reason, initialDisplayCommitted));
+  };
+  completeClaimedBoot = (outcome) => {
+    if (outcome !== 'kernel') commitFallback(outcome);
   };
   const now = (): number => performance.now();
   const startedAtMs = now();
@@ -529,27 +589,15 @@ function installBootstrap({ target, boot, outline }: BootstrapInputSnapshotV1): 
   };
   const binding = (id: string): unknown => {
     const product = id.endsWith('_initial') ? id.slice(0, -'_initial'.length) : '';
-    const config =
-      id === 'creative_initial'
-        ? boot.creative
-        : [
-              'aps',
-              'datadome',
-              'didomi',
-              'google_tag_manager',
-              'gpt',
-              'lockr',
-              'osano',
-              'permutive',
-              'prebid',
-              'sourcepoint',
-              'testlight',
-            ].includes(product)
-          ? integrationConfigValueV1(
-              boot.integrations,
-              product as Parameters<typeof integrationConfigValueV1>[1]
-            )
-          : undefined;
+    let config: unknown = id === 'creative_initial' ? boot.creative : undefined;
+    if (config === undefined && product !== '') {
+      for (const entry of boot.integrations.entries) {
+        if (entry.id === product) {
+          config = entry.config;
+          break;
+        }
+      }
+    }
     return Object.freeze({ bindings: rawBinding(id), config });
   };
   const host: FirstDisplayAgentRegistrationHostV1 = Object.freeze({
@@ -689,8 +737,27 @@ function installBootstrap({ target, boot, outline }: BootstrapInputSnapshotV1): 
   }
 }
 
-const input = snapshotBootstrapInputV1(
-  typeof __TSJS_SERVER_BOOT_INPUT_V1__ === 'undefined' ? undefined : __TSJS_SERVER_BOOT_INPUT_V1__,
+function bootstrapTarget(): BootstrapTarget | undefined {
+  try {
+    const namespace = window as unknown as { tsjs?: unknown };
+    const current = namespace.tsjs;
+    if ((typeof current === 'object' || typeof current === 'function') && current !== null) {
+      return current as BootstrapTarget;
+    }
+    if (current) return undefined;
+    const target: BootstrapTarget = {};
+    namespace.tsjs = target;
+    return target;
+  } catch {
+    return undefined;
+  }
+}
+
+const transport = snapshotServerBootTransportV1(
+  typeof __TSJS_SERVER_BOOT_TRANSPORT_V1__ === 'undefined'
+    ? undefined
+    : __TSJS_SERVER_BOOT_TRANSPORT_V1__,
   RELEASE
 );
-if (input) installBootstrap(input);
+const target = transport && bootstrapTarget();
+if (transport && target) installBootstrap(Object.freeze({ ...transport, target }));
