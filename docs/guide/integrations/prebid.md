@@ -504,10 +504,14 @@ before rollout. The storage name is fixed to `idl_env`; operators choose only
 the storage type, expiry, and refresh interval.
 
 When enabled, Trusted Server owns one deterministic `identityLink` entry in
-`userSync.userIds`. Other publisher-configured User ID entries are preserved,
-but publisher attempts to add, remove, or replace `identityLink` are normalized
-back to the operator-managed values. Including `identityLinkIdSystem` in a
-bundle is inert until this configuration is enabled.
+`userSync.userIds` for publisher configuration applied through the public
+`pbjs.setConfig` and `pbjs.mergeConfig` APIs. Other publisher-configured User ID
+entries are preserved, but calls through those APIs that add, remove, or replace
+`identityLink` are normalized back to the operator-managed values. This is a
+configuration-ownership convention, not a security boundary against same-origin
+code that retained a pre-wrapper function reference or directly mutates Prebid's
+internal configuration. Including `identityLinkIdSystem` in a bundle is inert
+until this configuration is enabled.
 
 ### Resolution timing and data flow
 

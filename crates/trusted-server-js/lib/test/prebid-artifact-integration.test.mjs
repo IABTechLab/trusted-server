@@ -176,6 +176,29 @@ describe('external bundle + served shim evaluated together', () => {
       ])
     );
 
+    // Exercise the real Prebid mergeConfig implementation. It closes over
+    // Prebid's internal setConfig, so the shim must guard mergeConfig itself
+    // to prevent a publisher-owned duplicate from bypassing the setConfig guard.
+    pageWindow.pbjs.mergeConfig({
+      userSync: {
+        userIds: [
+          { name: 'sharedId' },
+          { name: 'identityLink', params: { pid: 'publisher-value' } },
+        ],
+      },
+    });
+
+    const mergedUserIds = pageWindow.pbjs.getConfig('userSync.userIds');
+    expect(mergedUserIds.filter(({ name }) => name === 'identityLink')).toEqual([
+      expect.objectContaining({
+        name: 'identityLink',
+        params: { pid: '999', notUse3P: false },
+      }),
+    ]);
+    expect(mergedUserIds).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'sharedId' })])
+    );
+
     // A second evaluation (double script inclusion, or a legacy bundle that
     // still carries a baked-in shim running after this one) must be a no-op.
     pageWindow.eval(shimCode);
