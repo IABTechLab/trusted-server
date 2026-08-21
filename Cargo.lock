@@ -1721,8 +1721,9 @@ dependencies = [
 
 [[package]]
 name = "esi"
-version = "0.7.1"
-source = "git+https://github.com/stackpop/esi.git?rev=4c53feab4d22ad9a84641b4c46f3f63bc6d197e2#4c53feab4d22ad9a84641b4c46f3f63bc6d197e2"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "026264c3022569f7bc5052f9452362537e923b34ecc9248b803437c2b89cdd81"
 dependencies = [
  "atoi",
  "base64",

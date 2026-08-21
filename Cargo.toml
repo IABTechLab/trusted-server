@@ -62,7 +62,7 @@ edgezero-cli = { git = "https://github.com/stackpop/edgezero", rev = "5f3d648c3c
 edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "5f3d648c3c6c38fc6e6b22b5c65c66177363aad8", default-features = false }
 env_logger = "0.11"
 error-stack = "0.6"
-esi = { git = "https://github.com/stackpop/esi.git", rev = "4c53feab4d22ad9a84641b4c46f3f63bc6d197e2" }
+esi = "0.7.2"
 fastly = "0.12"
 fern = "0.7.1"
 flate2 = "1.1"
