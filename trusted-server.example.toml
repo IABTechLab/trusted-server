@@ -12,11 +12,20 @@ origin_url = "https://origin.example.com"
 proxy_secret = "change-me-proxy-secret"
 
 [ec]
-passphrase = "trusted-server-placeholder-secret"
+# Edge Cookie identity is OFF by default: with no provider selected, Trusted
+# Server runs statelessly and generates no Edge Cookie. Activate one by
+# uncommenting the selector AND its [ec.providers.<key>] block together (a
+# block with no selector is rejected at startup), or set the selector with the
+# TRUSTED_SERVER__ec__provider environment variable. The built-in hmac provider
+# is host-neutral; a vendor provider needs its own cargo feature.
+# provider = "hmac"
 ec_store = "ec_identity_store"
 pull_sync_concurrency = 3
 # cluster_trust_threshold = 10
 # cluster_recheck_secs = 3600
+
+# [ec.providers.hmac]
+# passphrase = "replace-with-32-plus-byte-random-secret"
 
 # Example partner configuration. Replace the token before validating/pushing.
 # [[ec.partners]]

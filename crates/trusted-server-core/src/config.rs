@@ -338,6 +338,9 @@ origin_url = "https://origin.example.com"
 proxy_secret = "change-me-proxy-secret"
 
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "production-secret-key-32-bytes-min"
 
 [[handlers]]
