@@ -2723,12 +2723,9 @@ pub async fn handle_publisher_request(
     let ad_templates_enabled = creative_opportunities.is_some_and(|co_config| co_config.enabled);
     let ad_templates_disabled = creative_opportunities.is_some_and(|co_config| !co_config.enabled);
     let matched_slots = if is_get && ad_templates_enabled {
-        settings
-            .creative_opportunities
-            .as_ref()
-            .map_or_else(Vec::new, |co_config| {
-                match_renderable_slots(auction.slots, co_config, &request_path)
-            })
+        creative_opportunities.map_or_else(Vec::new, |co_config| {
+            match_renderable_slots(auction.slots, co_config, &request_path)
+        })
     } else {
         Vec::new()
     };
@@ -3042,7 +3039,8 @@ pub async fn handle_publisher_request(
         .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or_default();
-    if is_html_content_type(origin_content_type) {
+    let is_not_modified = response.status() == StatusCode::NOT_MODIFIED;
+    if is_html_content_type(origin_content_type) || is_not_modified {
         if should_run_ad_stack {
             enforce_synthesized_html_cache_privacy(&mut response);
         } else if is_server_side_ad_eligible_navigation(
@@ -3051,11 +3049,13 @@ pub async fn handle_publisher_request(
             is_prefetch,
             is_bot,
             consent_allows_auction,
-        ) && response.status() == StatusCode::OK
+        ) && (response.status() == StatusCode::OK || is_not_modified)
         {
             // Issue #1007 caps browser caching for structurally inactive
-            // server-side ad templates. Request-scoped skips retain the origin
-            // policy because the same URL can otherwise render templates.
+            // server-side ad templates. The cap also applies to 304 responses
+            // so revalidation cannot restore the origin freshness policy.
+            // Request-scoped skips retain the origin policy because the same URL
+            // can otherwise render templates.
             if !cache_control_forbids_shared_storage(response.headers()) {
                 apply_inactive_ad_stack_browser_cache_policy(&mut response);
             }
@@ -5790,7 +5790,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn noneligible_origin_304_preserves_conditional_response_metadata() {
+        async fn inactive_ad_stack_304_uses_short_browser_cache_policy() {
             // Arrange
             let settings = settings_with_enabled_auction_and_creative_opportunities();
             let stub = Arc::new(StubHttpClient::new());
@@ -5823,10 +5823,17 @@ mod tests {
             assert_eq!(
                 response.status(),
                 StatusCode::NOT_MODIFIED,
-                "noneligible origin 304 should preserve its status"
+                "inactive server-side ad templates should preserve the 304 status"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("private, max-age=60"),
+                "inactive server-side ad templates should apply the browser policy on revalidation"
             );
             for (header_name, expected) in [
-                (header::CACHE_CONTROL, "public, max-age=300"),
                 (header::ETAG, ORIGIN_ETAG),
                 (header::LAST_MODIFIED, ORIGIN_LAST_MODIFIED),
                 (
@@ -5844,7 +5851,7 @@ mod tests {
                         .get(&header_name)
                         .and_then(|value| value.to_str().ok()),
                     Some(expected),
-                    "noneligible origin 304 should preserve {header_name}"
+                    "inactive server-side ad templates should preserve {header_name} on revalidation"
                 );
             }
             assert_eq!(
@@ -5866,6 +5873,40 @@ mod tests {
                 Some(ORIGIN_LAST_MODIFIED),
                 "noneligible publisher request should preserve If-Modified-Since"
             );
+        }
+
+        #[tokio::test]
+        async fn inactive_ad_stack_304_preserves_private_origin_cache_policy() {
+            let settings = settings_with_enabled_auction_and_creative_opportunities();
+
+            for cache_control in ["private, max-age=0", "No-Store"] {
+                // Arrange
+                let stub = Arc::new(StubHttpClient::new());
+                stub.push_response_with_headers(
+                    304,
+                    Vec::new(),
+                    vec![("cache-control", cache_control), ("etag", ORIGIN_ETAG)],
+                );
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+
+                // Act
+                let response =
+                    run_with_slots(&settings, &services, &[], conditional_navigation_request())
+                        .await;
+                let response_head = response_head(response);
+
+                // Assert
+                assert_eq!(
+                    response_head
+                        .headers
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(cache_control),
+                    "inactive server-side ad templates should preserve origin {cache_control} policy on revalidation"
+                );
+            }
         }
     }
 
