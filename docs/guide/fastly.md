@@ -82,21 +82,33 @@ authentication headers on every backend request. Preserving values supplied by
 the browser is unsafe because a caller could choose the IP used for geolocation
 and other request processing.
 
-For a VCL-to-Compute [service chain](https://www.fastly.com/documentation/guides/getting-started/services/service-chaining/),
-overwrite [`Fastly-Client-IP`](https://www.fastly.com/documentation/reference/http/http-headers/Fastly-Client-IP/)
+For a dedicated VCL-to-Compute [service chain](https://www.fastly.com/documentation/guides/getting-started/services/service-chaining/),
+where every request from the VCL service goes to Trusted Server, overwrite
+[`Fastly-Client-IP`](https://www.fastly.com/documentation/reference/http/http-headers/Fastly-Client-IP/)
 from the initial [`client.ip`](https://www.fastly.com/documentation/reference/vcl/variables/client-connection/client-ip/)
-and set a dedicated authentication header in the fronting service. For example:
+and set a dedicated authentication header in the fronting service. Read the
+secret from a private (write-only) edge dictionary instead of placing it in the
+VCL source. For example:
 
 ```vcl
 sub vcl_recv {
   if (fastly.ff.visits_this_service == 0 && req.restarts == 0) {
     unset req.http.Fastly-Client-IP;
+    unset req.http.X-TS-Client-IP-Auth;
+
     set req.http.Fastly-Client-IP = client.ip;
+    set req.http.X-TS-Client-IP-Auth =
+      table.lookup(ts_private_config, "trusted_client_ip_secret");
   }
-  unset req.http.X-TS-Client-IP-Auth;
-  set req.http.X-TS-Client-IP-Auth = "replace-with-a-random-shared-secret";
 }
 ```
+
+In this example, attach an edge dictionary named `ts_private_config` to the
+fronting VCL service and store the shared secret under the key
+`trusted_client_ip_secret`. If the service also routes to other backends, wrap
+the Trusted Server header setup in the same host or path condition that selects
+Trusted Server. Strip any client-supplied authentication header on the other
+routes, and do not send the dictionary value to unrelated backends.
 
 The `unset` before each `set` matters. Trusted Server ignores a forwarded
 address whenever either trust header carries more than one value, so a client
@@ -104,11 +116,10 @@ that sends its own copy of either header could otherwise force the fallback and
 keep its real address out of geolocation and bot protection.
 
 Use a cryptographically random secret of at least 32 ASCII graphic bytes in
-production, encoded as hex or base64url with no whitespace. The value above is
-a placeholder that Trusted Server rejects at startup. Keep it in a private edge
-dictionary rather than inlining it in VCL, where it is readable by anyone with
-service-configuration access and preserved in every version diff. Configure the
-identical header names and secret in Trusted Server:
+production, encoded as hex or base64url with no whitespace. Keep the fronting
+copy in a private edge dictionary rather than inlining it in VCL, where it is
+readable by anyone with service-configuration access and preserved in every
+version diff. Configure the identical header names and secret in Trusted Server:
 
 ```toml
 [trusted_client_ip]
@@ -117,11 +128,20 @@ auth_header = "x-ts-client-ip-auth"
 shared_secret = "replace-with-a-random-shared-secret"
 ```
 
+The `shared_secret` value above is an intentionally invalid placeholder. Replace
+it with the exact value stored in the fronting service's edge dictionary.
+
 `Fastly-Client-IP` is not protected from modification when it first enters
 Fastly, which is why overwriting it and authenticating the handoff are both
 required. Trusted Server removes both trust headers before routing. Direct
 requests and requests with missing, invalid, or duplicated trust headers remain
 available and use the immediate peer address instead.
+
+The VCL example assumes that the reader connects directly to the fronting
+Fastly service. If another CDN is in front, `client.ip` identifies that CDN's
+node instead. In that topology, restrict direct access to the Fastly front door,
+derive the IP header from the upstream CDN's protected reader-IP value, and
+still overwrite both trust headers before the request enters Trusted Server.
 
 ::: warning No-code request routing limitation
 Fastly no-code request routing does not provide a point to inject these headers.
