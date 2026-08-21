@@ -1252,11 +1252,12 @@ impl IntegrationHeadInjector for ApsRendererIntegration {
     }
 
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
         (self.rendering_mode == ApsRenderingMode::PublisherNative)
-            .then(|| {
-                "<meta name=\"trusted-server-aps-rendering-mode\" content=\"publisher_native\">"
-                    .to_string()
-            })
+            .then_some(("data-ts-aps-rendering-mode", "publisher_native"))
             .into_iter()
             .collect()
     }
@@ -1302,6 +1303,11 @@ pub fn register_providers(
     if config.debug {
         log::warn!(
             "APS debug mode is ON — raw request and response data, including creative markup, will be included in client-visible /auction responses"
+        );
+    }
+    if config.rendering_mode == ApsRenderingMode::PublisherNative && config.allow_script_creatives {
+        log::warn!(
+            "APS publisher-native rendering with script creatives is ON; selected bidder scripts execute with publisher-origin privileges"
         );
     }
     Ok(vec![Arc::new(ApsAuctionProvider::new(config))])
@@ -2430,6 +2436,25 @@ mod tests {
         assert_eq!(registration.integration_id, APS_INTEGRATION_ID);
         assert_eq!(registration.proxies.len(), 1);
         assert_eq!(registration.head_injectors.len(), 1);
+        let document_state = IntegrationDocumentState::default();
+        let context = IntegrationHtmlContext {
+            request_host: "publisher.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+        assert!(
+            registration.head_injectors[0]
+                .head_inserts(&context)
+                .is_empty(),
+            "should not inject a native-mode head marker by default"
+        );
+        assert!(
+            registration.head_injectors[0]
+                .tsjs_script_tag_attributes()
+                .is_empty(),
+            "should not authorize native rendering by default"
+        );
         assert!(registration.js_disabled);
     }
 
@@ -2471,10 +2496,39 @@ mod tests {
             origin_host: "origin.example",
             document_state: &document_state,
         };
+        assert!(
+            integration.head_inserts(&context).is_empty(),
+            "should not inject a forgeable native-mode marker"
+        );
         assert_eq!(
-            integration.head_inserts(&context),
-            vec!["<meta name=\"trusted-server-aps-rendering-mode\" content=\"publisher_native\">"],
-            "should inject only the native-mode marker"
+            integration.tsjs_script_tag_attributes(),
+            vec![("data-ts-aps-rendering-mode", "publisher_native")],
+            "should authorize native mode on the publisher bundle tag"
+        );
+    }
+
+    #[test]
+    fn publisher_native_script_creatives_remain_available_for_controlled_validation() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                APS_INTEGRATION_ID,
+                &json!({
+                    "enabled": true,
+                    "account_id": "example-account",
+                    "allow_script_creatives": true,
+                    "rendering_mode": "publisher_native"
+                }),
+            )
+            .expect("should insert native APS script config");
+
+        let providers = register_providers(&settings).expect("should register APS provider");
+
+        assert_eq!(
+            providers.len(),
+            1,
+            "should retain the controlled experiment"
         );
     }
 

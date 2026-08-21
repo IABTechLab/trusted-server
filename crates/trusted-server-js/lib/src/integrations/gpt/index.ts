@@ -1712,6 +1712,7 @@ export function installTsRenderBridge(): void {
       const dispatched = dispatchApsRendering({
         slotId: prebidRendererEntry.adUnitCode,
         renderer,
+        source: e.source,
         trustedServer: (validatedRenderer) => {
           const rendererUrl = apsRendererUrl();
           if (!rendererUrl) return false;
@@ -1775,6 +1776,7 @@ export function installTsRenderBridge(): void {
         dispatchApsRendering({
           slotId,
           renderer,
+          source: e.source,
           trustedServer: (validatedRenderer) => {
             const rendererUrl = apsRendererUrl();
             if (!rendererUrl) return false;

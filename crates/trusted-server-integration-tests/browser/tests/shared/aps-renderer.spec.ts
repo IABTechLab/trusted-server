@@ -4,6 +4,8 @@ import { expect, test, type Page } from "@playwright/test";
 import { runtimeUrl } from "../../helpers/state.js";
 
 const RUNNER_URL = "https://client.aps.amazon-adsystem.com/prebid-creative.js";
+const PUBLISHER_CORE_URL =
+    "https://client.aps.amazon-adsystem.com/trusted-server-core.js";
 const IFRAME_CREATIVE_URL = "https://creative.example/iframe";
 const SCRIPT_CREATIVE_URL = "https://creative.example/script.js";
 const SANDBOX =
@@ -967,8 +969,16 @@ parent.postMessage(JSON.stringify({
         const auctionUrl = `${publisherOrigin}/auction`;
         const testUrl = `${publisherOrigin}/aps-publisher-native-test`;
         const renderer = descriptor("iframe");
+        const coreBundle = readFileSync(clientAuctionBundlePaths().core, "utf8");
         let runnerRequests = 0;
 
+        await page.route(PUBLISHER_CORE_URL, async (route) => {
+            await route.fulfill({
+                status: 200,
+                contentType: "application/javascript",
+                body: coreBundle,
+            });
+        });
         await page.route(RUNNER_URL, async (route) => {
             runnerRequests += 1;
             await route.fulfill({
@@ -1015,16 +1025,33 @@ parent.postMessage(JSON.stringify({
                 contentType: "text/html",
                 headers: {
                     "Content-Security-Policy":
-                        "default-src 'none'; script-src 'unsafe-inline' https://client.aps.amazon-adsystem.com https://creative.example; connect-src 'self'; frame-src https://creative.example",
+                        "default-src 'none'; script-src https://client.aps.amazon-adsystem.com https://creative.example; connect-src 'self'; frame-src https://creative.example",
                 },
                 body: `<!doctype html>
-<meta name="trusted-server-aps-rendering-mode" content="publisher_native">
 <div id="publisher-native-slot"><span class="existing">existing publisher content</span></div>`,
             });
         });
 
         await page.goto(testUrl);
-        await page.addScriptTag({ path: clientAuctionBundlePaths().core });
+        await page.evaluate(async (scriptUrl) => {
+            await new Promise<void>((resolveScript, rejectScript) => {
+                const script = document.createElement("script");
+                script.setAttribute(
+                    "data-ts-aps-rendering-mode",
+                    "publisher_native",
+                );
+                script.src = scriptUrl;
+                script.addEventListener("load", () => resolveScript(), {
+                    once: true,
+                });
+                script.addEventListener(
+                    "error",
+                    () => rejectScript(new Error("TSJS core failed to load")),
+                    { once: true },
+                );
+                document.head.appendChild(script);
+            });
+        }, PUBLISHER_CORE_URL);
         await page.evaluate(() => {
             const tsjs = (
                 window as unknown as {

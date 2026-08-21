@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AdUnit } from '../../src/core/types';
 import {
   APS_PREBID_CREATIVE_RUNNER_URL,
-  APS_RENDERING_MODE_META_NAME,
+  APS_RENDERING_MODE_ATTRIBUTE_NAME,
 } from '../../src/integrations/aps/render';
 import envelope from '../fixtures/aps-renderer-v1.json';
 
@@ -154,10 +154,11 @@ describe('request.requestAds', () => {
       width: apsBid.w,
       height: apsBid.h,
     };
-    const marker = document.createElement('meta');
-    marker.name = APS_RENDERING_MODE_META_NAME;
-    marker.content = 'publisher_native';
-    document.head.appendChild(marker);
+    const publisherScript = document.createElement('script');
+    publisherScript.setAttribute(APS_RENDERING_MODE_ATTRIBUTE_NAME, 'publisher_native');
+    const currentScriptSpy = vi
+      .spyOn(document, 'currentScript', 'get')
+      .mockReturnValue(publisherScript);
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -175,6 +176,7 @@ describe('request.requestAds', () => {
     try {
       const { addAdUnits } = await import('../../src/core/registry');
       const { requestAds } = await import('../../src/core/request');
+      currentScriptSpy.mockRestore();
       document.body.innerHTML = '<div id="slot1"><span>existing</span></div>';
       addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } });
 
@@ -202,7 +204,7 @@ describe('request.requestAds', () => {
       expect(document.querySelector('#slot1 span')).toBeNull();
       expect(frame.style.display).toBe('');
     } finally {
-      marker.remove();
+      currentScriptSpy.mockRestore();
     }
   });
 

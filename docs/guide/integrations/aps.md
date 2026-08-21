@@ -51,7 +51,7 @@ timeout_ms = 2000
 
 `allow_script_creatives` defaults to `false`. While disabled, APS script bids are rejected before per-impression reduction, floors, mediation, and winner selection. Enable it only for a controlled cohort after the browser-security checks in [Rollout](#rollout) pass.
 
-`rendering_mode` is a strict enum: `trusted_server` (the default) retains the opaque static renderer route, and `publisher_native` disables that route and emits the inert `<meta name="trusted-server-aps-rendering-mode" content="publisher_native">` head marker selecting the injected friendly-frame runner below. The marker works under a publisher CSP that blocks inline scripts. Unknown values fail configuration deserialization.
+`rendering_mode` is a strict enum: `trusted_server` (the default) retains the opaque static renderer route, and `publisher_native` disables that route and adds `data-ts-aps-rendering-mode="publisher_native"` to the server-generated TSJS bundle tag. TSJS captures this server-owned attribute when the bundle executes, so markup added later cannot change the mode. The attribute works under a publisher CSP that blocks inline scripts. Unknown values fail configuration deserialization.
 
 ### Publisher-native runner experiment
 
@@ -195,7 +195,9 @@ In `trusted_server` mode, the TSJS auction client validates the typed renderer d
 
 ### GAM and Universal Creative
 
-For initial navigation and page-bids, Trusted Server publishes the same descriptor in `window.tsjs.bids`. In `publisher_native` mode the ownership-checked bridge resolves the publisher div and starts the friendly-frame runner without sending a Universal Creative renderer response; in `trusted_server` mode it uses the static dynamic renderer described below. The source-checked Prebid Universal Creative bridge accepts requests only from the iframe that owns the matching `hb_adid`, validates the complete envelope, and returns a static dynamic-renderer program that creates the same opaque renderer iframe.
+For initial navigation and page-bids, Trusted Server publishes the same descriptor in `window.tsjs.bids`. The source-checked Prebid Universal Creative bridge accepts requests only from the iframe that owns the matching `hb_adid` and validates the complete envelope. In `trusted_server` mode it returns a static dynamic-renderer program that creates the same opaque renderer iframe. In `publisher_native` mode it instead resolves the publisher div and starts the friendly-frame runner without sending a Universal Creative renderer response.
+
+After the native runner loads, Trusted Server replaces the existing children of the resolved publisher div with the friendly frame. This removes the GAM or Universal Creative iframe when it is inside that div. If the runner fails, the existing iframe remains, but its Universal Creative request receives no response because Trusted Server has already claimed the selected bid. This one-owner behavior avoids a second render path, but GAM impression and viewability reporting must be validated with the APS account team for the controlled cohort.
 
 For client-side `trustedServer` adapter auctions, Prebid generates its own `hb_adid`. Trusted Server binds that generated ID to the validated APS descriptor in a bounded, expiring browser registry before GAM refresh. The bridge verifies that the requesting Universal Creative iframe belongs to the same ad unit, consumes the capability once, and passes the APS bid ID separately to the Amazon runner.
 
@@ -233,6 +235,8 @@ This release is a direct protocol cutover:
 
 There is no legacy runtime switch. Roll back by disabling `[integrations.aps]`, restoring native APS for the cohort, or deploying the prior binary.
 
+Changing `rendering_mode` does not update pages that are already loaded or stored in an HTML cache. A cached `trusted_server` page can continue requesting `/integrations/aps/renderer` after a native-mode deployment removes that route. A cached `publisher_native` page continues using its captured native mode after rollback. Coordinate the mode change with HTML cache expiry or purge and reload active test sessions before judging the result.
+
 ## Rollout
 
 Use fictional values in source-controlled configuration and fixtures. Supply controlled account details out of band.
@@ -242,7 +246,7 @@ Use fictional values in source-controlled configuration and fixtures. Supply con
 3. Keep the default `trusted_server` mode and `allow_script_creatives = false`; observe iframe bids through direct and GAM paths.
 4. Confirm outbound privacy fields, aggregate diagnostics, decoded-price competition, line-item targeting, dimensions, click-throughs, and opaque-origin isolation.
 5. In a still-smaller cohort, set `rendering_mode = "publisher_native"` and confirm the fixed runner request, friendly-frame dimensions, iframe creatives, impression reporting, and click-throughs without a request to `/integrations/aps/renderer`.
-6. Confirm the publisher CSP permits the runner but does not need to permit inline Trusted Server scripts.
+6. Purge or expire cached HTML and reload active test sessions when changing modes. Confirm the publisher CSP permits the runner but does not need to permit inline Trusted Server scripts.
 7. Only after reviewing the friendly-frame security tradeoff, enable script creatives for the isolated native cohort and validate them in a real browser.
 8. Expand traffic only after APS confirmation and successful controlled validation.
 
