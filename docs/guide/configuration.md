@@ -66,17 +66,18 @@ fail and the service will return its startup-error response.
 
 ## Key Sections
 
-| Section             | Purpose                                      |
-| ------------------- | -------------------------------------------- |
-| `[publisher]`       | Domain, origin, proxy settings               |
-| `[ec]`              | Edge Cookie (EC) ID generation               |
-| `[tester_cookie]`   | Optional tester-cookie endpoint              |
-| `[proxy]`           | Proxy SSRF allowlist and asset routes        |
-| `[cache]`           | Static/rehosted asset cache policy rules     |
-| `[image_optimizer]` | Reusable Image Optimizer profile sets        |
-| `[request_signing]` | Ed25519 request signing                      |
-| `[auction]`         | Auction orchestration                        |
-| `[integrations.*]`  | Partner integrations (Prebid, Next.js, etc.) |
+| Section               | Purpose                                      |
+| --------------------- | -------------------------------------------- |
+| `[publisher]`         | Domain, origin, proxy settings               |
+| `[trusted_client_ip]` | Authenticated client-IP forwarding           |
+| `[ec]`                | Edge Cookie (EC) ID generation               |
+| `[tester_cookie]`     | Optional tester-cookie endpoint              |
+| `[proxy]`             | Proxy SSRF allowlist and asset routes        |
+| `[cache]`             | Static/rehosted asset cache policy rules     |
+| `[image_optimizer]`   | Reusable Image Optimizer profile sets        |
+| `[request_signing]`   | Ed25519 request signing                      |
+| `[auction]`           | Auction orchestration                        |
+| `[integrations.*]`    | Partner integrations (Prebid, Next.js, etc.) |
 
 ## Example: Production Setup
 
@@ -352,6 +353,74 @@ a zero-byte cap fails every non-empty publisher response.
 ```bash
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 ```
+
+## Trusted Client IP Configuration
+
+Use this optional section when a trusted CDN service forwards requests to the
+Fastly service running Trusted Server. It lets Trusted Server use the reader's
+address instead of the immediate fronting edge node's address. Only the Fastly
+adapter honours this section; the Cloudflare, Spin, and Axum adapters validate
+it but keep using their own runtime client address.
+
+### `[trusted_client_ip]`
+
+| Field           | Type   | Required | Description                                                                       |
+| --------------- | ------ | -------- | --------------------------------------------------------------------------------- |
+| `ip_header`     | String | Yes      | Header containing exactly one reader IP address                                   |
+| `auth_header`   | String | Yes      | Header containing exactly one shared-secret value                                 |
+| `shared_secret` | String | Yes      | Secret shared with the trusted front door, 32+ ASCII graphic bytes, no whitespace |
+
+All three fields are required when the section exists. When the section is
+absent, Trusted Server continues to use the immediate peer address.
+
+```toml
+[trusted_client_ip]
+ip_header = "fastly-client-ip"
+auth_header = "x-ts-client-ip-auth"
+shared_secret = "replace-with-a-random-shared-secret"
+```
+
+The front door must overwrite both headers on every request. Trusted Server
+accepts the forwarded address only when the request has exactly one
+`auth_header` value that matches `shared_secret` byte-for-byte and exactly one
+`ip_header` value that parses directly as IPv4 or IPv6. Values are not trimmed
+or normalized. Missing, empty, duplicate, non-UTF-8, mismatched, or malformed
+values do not reject the request; Trusted Server safely falls back to the
+immediate peer address. Both configured headers are removed before routing.
+
+Header names are validated case-insensitively. `ip_header` must be
+`fastly-client-ip` or start with `x-`, while `auth_header` must start with `x-`.
+The names must differ. Neither field may use the reserved
+`x-ts-tls-protocol` or `x-ts-tls-cipher` header. These restrictions exclude
+standard sensitive headers such as `Host`, `Content-Length`, `Cookie`, and
+`Authorization`, as well as Trusted Server's TLS bridge headers. Choose
+dedicated `x-` names that no other application or routing logic uses, because
+Trusted Server removes the configured headers before routing.
+
+Generate `shared_secret` with a cryptographically secure random generator,
+encode it as hex or base64url, store the same value only in the front door and
+Trusted Server configuration, and never commit it. The value is redacted from
+configuration debug output. Configuration requires at least 32 ASCII graphic
+bytes (`!` through `~`) with no whitespace, controls, DEL, or non-ASCII bytes,
+and startup fails when the value is still the documented placeholder.
+
+Redaction protects debug output and validation errors; it does not move the
+value into a platform secret store. `ts config push` serializes the value in the
+Trusted Server application-config blob, so restrict access to that configuration
+store. Every adapter removes the configured IP and authentication headers before
+routing, although only Fastly uses them for client-IP resolution.
+
+**Environment Overrides**:
+
+```bash
+TRUSTED_SERVER__TRUSTED_CLIENT_IP__IP_HEADER=fastly-client-ip
+TRUSTED_SERVER__TRUSTED_CLIENT_IP__AUTH_HEADER=x-ts-client-ip-auth
+TRUSTED_SERVER__TRUSTED_CLIENT_IP__SHARED_SECRET=replace-with-a-random-shared-secret
+```
+
+Because the typed environment overlay cannot create a missing section, add
+`[trusted_client_ip]` and all three fields to the TOML before using these
+overrides.
 
 ## Tester Cookie Configuration
 

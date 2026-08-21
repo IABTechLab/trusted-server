@@ -26,7 +26,7 @@ use serde_json::Value as JsonValue;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt as _};
 
-use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EC, COOKIE_TS_EIDS};
+use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use crate::cookies::extract_cookie_value;
 use crate::error::TrustedServerError;
 use crate::openrtb::Eid;
@@ -64,6 +64,12 @@ const ADMIN_NAMESPACE_PREFIX: &str = "/_ts/admin";
 /// (trailing, descendant, and encoded-separator forms) is reserved here.
 const RETIRED_ADMIN_KEYS_PREFIX: &str = "/admin/keys";
 
+/// Maximum percent-decoding rounds applied when testing reserved namespaces.
+///
+/// Bounds the work a `%25`-chained path can force while still reaching the
+/// fixed point of any separator encoding a proxy chain would plausibly decode.
+const MAX_PERCENT_DECODE_ROUNDS: usize = 4;
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum AdminDiagnosticShape {
     ValidResource,
@@ -86,10 +92,46 @@ fn admin_diagnostic_shape(path: &str) -> Option<AdminDiagnosticShape> {
     // Reserve the complete admin namespace at the publisher-fallback boundary.
     // A successfully authenticated malformed or future admin path must never
     // forward its Authorization header or body to the publisher origin.
-    let reserved = is_reserved_admin_path(path)
-        || percent_decoded_path(path).is_some_and(|decoded| is_reserved_admin_path(&decoded));
+    reserves_admin_namespace(path).then_some(AdminDiagnosticShape::Malformed)
+}
 
-    reserved.then_some(AdminDiagnosticShape::Malformed)
+/// Returns whether `path` reaches a reserved admin namespace either as sent or
+/// after any bounded number of percent-decoding rounds.
+///
+/// Multi-encoded separators such as `/admin%252Fkeys/rotate` survive a single
+/// decode as `/admin%2Fkeys/rotate`, so the check is repeated to a fixed point
+/// rather than applied once.
+fn reserves_admin_namespace(path: &str) -> bool {
+    if is_reserved_admin_path(path) {
+        return true;
+    }
+
+    // Normal publisher paths carry no escape sequence, so the decode loop —
+    // and its allocation — is skipped entirely for them.
+    if !path.contains('%') {
+        return false;
+    }
+
+    let mut current = path.to_owned();
+    for _ in 0..MAX_PERCENT_DECODE_ROUNDS {
+        let Some(decoded) = percent_decoded_path(&current) else {
+            return false;
+        };
+
+        // A path whose remaining `%` sequences are not decodable escapes is a
+        // fixed point; further rounds would repeat the same comparison.
+        if decoded == current {
+            return false;
+        }
+
+        if is_reserved_admin_path(&decoded) {
+            return true;
+        }
+
+        current = decoded;
+    }
+
+    false
 }
 
 /// Returns whether `path` sits in a namespace that must never reach publisher
@@ -113,9 +155,8 @@ fn is_reserved_admin_path(path: &str) -> bool {
 ///
 /// Routers and the basic-auth matcher both operate on the raw path, so an
 /// encoded separator can shift a request out of the literal admin namespace
-/// while still matching the admin auth handler. Checking the decoded form as
-/// well keeps the reservation closed for `%2F`, `%2f`, and their
-/// double-encoded variants.
+/// while still matching the admin auth handler. See [`reserves_admin_namespace`]
+/// for how the decoded forms are checked.
 fn percent_decoded_path(path: &str) -> Option<String> {
     if !path.contains('%') {
         return None;
@@ -132,8 +173,8 @@ fn percent_decoded_path(path: &str) -> Option<String> {
 /// unexpectedly reaches fallback return `404 Not Found`. The reservation
 /// spans the whole `/_ts/admin` prefix — including percent-encoded separators
 /// such as `/_ts/admin%2Fec` — plus the retired `/admin/keys` alias namespace,
-/// evaluated on both the raw and the percent-decoded path. Paths outside those
-/// namespaces return `None`, preserving normal fallback.
+/// evaluated on the raw path and on each of its bounded percent-decodings.
+/// Paths outside those namespaces return `None`, preserving normal fallback.
 #[must_use]
 pub fn deny_admin_diagnostic_fallback(req: &Request<EdgeBody>) -> Option<Response<EdgeBody>> {
     let shape = admin_diagnostic_shape(req.uri().path())?;
@@ -273,6 +314,32 @@ pub fn admin_ec_lookup_not_supported() -> Response<EdgeBody> {
     )
 }
 
+/// Reads the request's `ts-ec` cookie through the same [`cookie::CookieJar`]
+/// path the live EC lifecycle uses.
+///
+/// The jar keeps the last of any duplicate `ts-ec` pairs; a first-match header
+/// scan would let this diagnostic report a different EC record than the request
+/// lifecycle — and the auction — actually read.
+///
+/// Returns the (boxed) error response to send directly when no usable cookie
+/// value is available.
+fn cookie_ec_id(req: &Request<EdgeBody>) -> Result<String, Box<Response<EdgeBody>>> {
+    let parsed = super::parse_ec_from_request(req).map_err(|_| {
+        Box::new(json_error(
+            StatusCode::BAD_REQUEST,
+            "request Cookie header is not valid UTF-8",
+        ))
+    })?;
+
+    parsed.cookie_ec.ok_or_else(|| {
+        Box::new(json_error(
+            StatusCode::NOT_FOUND,
+            "no EC ID in path and no ts-ec cookie on the request — pass \
+             an explicit id: /_ts/admin/ec/{id}",
+        ))
+    })
+}
+
 /// Resolves the EC ID to look up from the path or the `ts-ec` cookie.
 ///
 /// Returns the (boxed) error response to send directly when no valid ID is
@@ -286,16 +353,7 @@ fn requested_ec_id(req: &Request<EdgeBody>) -> Result<String, Box<Response<EdgeB
         .trim_matches('/');
 
     let ec_id = if remainder.is_empty() {
-        match extract_cookie_value(req, COOKIE_TS_EC) {
-            Some(cookie_ec_id) => cookie_ec_id,
-            None => {
-                return Err(Box::new(json_error(
-                    StatusCode::NOT_FOUND,
-                    "no EC ID in path and no ts-ec cookie on the request — pass \
-                     an explicit id: /_ts/admin/ec/{id}",
-                )));
-            }
-        }
+        cookie_ec_id(req)?
     } else {
         remainder.to_owned()
     };
@@ -861,6 +919,34 @@ mod tests {
     }
 
     #[test]
+    fn admin_diagnostic_fallback_reserves_multi_encoded_separators() {
+        // A single decode leaves `/admin%252Fkeys/rotate` as
+        // `/admin%2Fkeys/rotate`, which no literal check matches. Decoding to a
+        // fixed point keeps the reservation closed against a proxy or origin
+        // that decodes the path more than once.
+        let paths = [
+            "/admin%252Fkeys/rotate",
+            "/admin/keys%252Frotate",
+            "/admin%25252Fkeys/rotate",
+            "/_ts%252Fadmin/ec",
+        ];
+
+        for path in paths {
+            for method in [http::Method::GET, http::Method::POST] {
+                let request = request_with_method(method.clone(), path);
+                let response = deny_admin_diagnostic_fallback(&request)
+                    .unwrap_or_else(|| panic!("should deny {method} {path} locally"));
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "should deny {path} before publisher fallback"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn admin_diagnostic_fallback_ignores_unrelated_publisher_paths() {
         for path in [
             "/articles/example",
@@ -868,6 +954,8 @@ mod tests {
             "/admin/login",
             "/admin/keyboards",
             "/admin/keystore",
+            "/admin/keys%25store",
+            "/articles/100%25-organic",
             "/_ts/api/v1/batch-sync",
         ] {
             let request = request_with_method(http::Method::POST, path);
@@ -1149,6 +1237,31 @@ mod tests {
             json["ec_id"],
             ec_id.as_str(),
             "should resolve the EC ID from the ts-ec cookie"
+        );
+    }
+
+    #[test]
+    fn bare_route_uses_last_duplicate_ts_ec_cookie() {
+        // `CookieJar` — the parser the live EC lifecycle uses — keeps the last
+        // duplicate pair. The diagnostic must inspect that same record, not the
+        // first one a header scan would find.
+        let stale_ec_id = format!("{}.stale1", "b".repeat(64));
+        let live_ec_id = test_ec_id();
+        let kv = kv_with_entry(&live_ec_id, &sample_entry());
+        let req = get_request_with_cookie(
+            "/_ts/admin/ec",
+            &format!("ts-ec={stale_ec_id}; ts-ec={live_ec_id}"),
+        );
+
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+            .expect("should handle lookup");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response);
+        assert_eq!(
+            json["ec_id"],
+            live_ec_id.as_str(),
+            "should resolve the same duplicate ts-ec cookie the EC lifecycle reads"
         );
     }
 
