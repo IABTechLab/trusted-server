@@ -805,7 +805,7 @@ mod tests {
         IntegrationHeadInjector, IntegrationHtmlContext,
     };
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{bootstrap_transport, create_test_settings};
     use serde_json::json;
     use std::io::Cursor;
     use std::sync::Arc;
@@ -1003,7 +1003,6 @@ mod tests {
             .expect("should process HTML");
         let processed = String::from_utf8(output).expect("should produce valid UTF-8");
         let bundle_marker = "id=\"trustedserver-js\"";
-        let diagnostics_manifest_marker = r#""id":"gpt_diagnostics","phase":"takeover""#;
         let diagnostics_script_marker = "tsjs-gpt_diagnostics.min.js";
         let cleanup_asset_marker = "tsjs-gpt_diagnostics-bootstrap.min.js";
         let cleanup_program_marker = "history.replaceState";
@@ -1018,8 +1017,14 @@ mod tests {
             1,
             "should inject the immediate TSJS bundle once"
         );
+        let transport = bootstrap_transport(&processed);
         assert_eq!(
-            processed.matches(diagnostics_marker).count(),
+            transport["boot"]["manifest"]["integrations"]
+                .as_array()
+                .expect("manifest integrations should be an array")
+                .iter()
+                .filter(|entry| entry["id"] == "gpt_diagnostics")
+                .count(),
             1,
             "should select diagnostics once in immutable boot data"
         );
@@ -1044,7 +1049,7 @@ mod tests {
             !processed.contains("history.replaceState"),
             "URL cleanup behavior must remain in its external request-scoped asset"
         );
-        assert!(processed.contains(r#""gpt":{"active":true}"#));
+        assert_eq!(transport["boot"]["diagnostics"]["gpt"]["active"], true);
     }
 
     #[test]
@@ -1804,9 +1809,10 @@ mod tests {
             )
             .expect("should process");
         let html = std::str::from_utf8(&output).expect("should be utf8");
-        assert!(
-            html.contains("window.tsjs=window.tsjs||{}"),
-            "should inject the hard-cutover boot namespace at head-open"
+        assert_eq!(
+            bootstrap_transport(html)["boot"]["abi"],
+            1,
+            "should inject the sealed hard-cutover boot at head-open"
         );
         assert!(
             !html.contains(".adSlots"),
@@ -1880,20 +1886,26 @@ mod tests {
             .expect("should process HTML");
         let html = std::str::from_utf8(&output).expect("should produce UTF-8");
         let boot = html
-            .find("const __TSJS_SERVER_BOOT_INPUT_V1__=")
-            .expect("should emit exact server boot input transport");
+            .find("const __TSJS_SERVER_BOOT_TRANSPORT_V1__=")
+            .expect("should emit exact sealed server boot transport");
         let core = html
             .find("id=\"trustedserver-js\"")
             .expect("should emit core bundle");
 
         assert!(boot < core, "boot transport must precede core execution");
-        assert!(html.contains(r#""auctionId":"auction-1""#));
-        assert!(html.contains(
-            r#""creative":{"version":1,"enabled":true,"clickGuard":true,"renderGuard":false}"#
-        ));
+        let transport = bootstrap_transport(html);
+        assert_eq!(
+            transport["boot"]["auctionProjection"]["auction"]["auctionId"],
+            "auction-1"
+        );
+        assert_eq!(
+            transport["boot"]["creative"],
+            json!({"version":1,"enabled":true,"clickGuard":true,"renderGuard":false})
+        );
         assert!(html.contains(r#"performance.mark("tsjs:bids-script")"#));
         assert_eq!(
-            html.matches("const __TSJS_SERVER_BOOT_INPUT_V1__=").count(),
+            html.matches("const __TSJS_SERVER_BOOT_TRANSPORT_V1__=")
+                .count(),
             1
         );
         assert!(!html.contains(".adSlots"));
@@ -1923,13 +1935,14 @@ mod tests {
             .process_chunk(b"<html><head></head><body>content</body></html>", true)
             .expect("should process");
         let html = std::str::from_utf8(&output).expect("should be utf8");
-        assert!(
-            html.contains(r#""auctionId":"auction-body""#),
+        assert_eq!(
+            bootstrap_transport(html)["boot"]["auctionProjection"]["auction"]["auctionId"],
+            "auction-body",
             "should inject the exact projection into immutable boot"
         );
         let boot_pos = html
-            .find("const __TSJS_SERVER_BOOT_INPUT_V1__=")
-            .expect("server boot input should be in output");
+            .find("const __TSJS_SERVER_BOOT_TRANSPORT_V1__=")
+            .expect("sealed server boot transport should be in output");
         let core_pos = html
             .find("id=\"trustedserver-js\"")
             .expect("core should be in output");
@@ -1965,7 +1978,8 @@ mod tests {
             .expect("should process");
         let html = std::str::from_utf8(&output).expect("should be utf8");
         assert_eq!(
-            html.matches("const __TSJS_SERVER_BOOT_INPUT_V1__=").count(),
+            html.matches("const __TSJS_SERVER_BOOT_TRANSPORT_V1__=")
+                .count(),
             1,
             "should inject immutable boot exactly once even with multiple body elements"
         );
@@ -2055,8 +2069,14 @@ mod tests {
             .process_chunk(b"<html><head></head><body>content</body></html>", true)
             .expect("should process");
         let html = std::str::from_utf8(&output).expect("should be utf8");
-        assert!(
-            html.contains(r#""auctionId":"initial","results":[]},"slots":[],"bids":[]"#),
+        assert_eq!(
+            bootstrap_transport(html)["boot"]["auctionProjection"],
+            json!({
+                "version": 1,
+                "auction": {"version": 1, "auctionId": "initial", "results": []},
+                "slots": [],
+                "bids": []
+            }),
             "should inject the exact safe empty initial projection"
         );
         assert!(!html.contains(".bids="));
@@ -2084,7 +2104,8 @@ mod tests {
             .expect("should process");
         let html = std::str::from_utf8(&output).expect("should be utf8");
         assert_eq!(
-            html.matches("const __TSJS_SERVER_BOOT_INPUT_V1__=").count(),
+            html.matches("const __TSJS_SERVER_BOOT_TRANSPORT_V1__=")
+                .count(),
             1,
             "every document should receive one complete server boot input"
         );

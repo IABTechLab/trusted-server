@@ -1,6 +1,6 @@
 // Programmatic ad-unit validation for the hard-cutover runtime.
 import type { AddAdUnitsResult, ProgrammaticAdUnit } from './types';
-import { validBoundedString } from './contracts/auction_projection';
+import { validBoundedString } from './contracts/bounded_string';
 
 const MAX_AUCTION_BODY_BYTES = 256 * 1024;
 const MAX_PROGRAMMATIC_UNITS = 256;

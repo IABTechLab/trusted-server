@@ -107,9 +107,11 @@ const CURRENT_PROVIDER_SOURCE_OWNERS = Object.freeze({
 const CURRENT_EXACT_SOURCE_OWNERS = Object.freeze({
   'src/core/adapters/gam_attribution.ts': 'bootstrap',
   'src/core/bootstrap.ts': 'bootstrap',
-  'src/core/contracts/boot.ts': 'bootstrap',
-  'src/core/contracts/integration_configs.ts': 'bootstrap',
-  'src/core/types.ts': 'bootstrap',
+  'src/core/contracts/server_boot_transport.ts': 'bootstrap',
+  'src/core/contracts/boot.ts': 'core',
+  'src/core/contracts/integration_configs.ts': 'core',
+  'src/core/contracts/sha256.ts': 'core',
+  'src/core/types.ts': 'core',
   'src/adapters/googletag.ts': 'gpt',
   'src/adapters/messaging.ts': 'core',
   'src/composition/runtime_transport.ts': 'core',
@@ -180,12 +182,13 @@ const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
   'src/core/auction.ts': Object.freeze(['core']),
   'src/core/config.ts': Object.freeze(['bootstrap', 'core']),
   'src/core/contracts/aps_renderer.ts': Object.freeze(['bootstrap', 'core', 'aps']),
-  'src/core/contracts/auction_projection.ts': Object.freeze([
+  'src/core/contracts/bounded_string.ts': Object.freeze([
     'bootstrap',
     'core',
     'prebid',
     'prebid_later',
   ]),
+  'src/core/contracts/auction_projection.ts': Object.freeze(['core', 'prebid', 'prebid_later']),
   'src/core/contracts/generated/renderer_validator_v1.ts': Object.freeze([
     'bootstrap',
     'core',
@@ -263,6 +266,7 @@ const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
   'src/core/templates/iframe.html?raw': Object.freeze(['core']),
   'src/core/trace.ts': Object.freeze(['core', 'gpt_diagnostics']),
   'src/kernel/contracts/message_protocol.ts': Object.freeze(['core', 'gpt']),
+  'src/kernel/contracts/release_capacity.ts': Object.freeze(['core']),
   'src/kernel/contracts/puc_dynamic_owner.ts': Object.freeze(['aps_initial', 'gpt']),
   'src/kernel/diagnostics.ts': Object.freeze(['core']),
   'src/kernel/disposable.ts': Object.freeze(['core', 'gpt']),

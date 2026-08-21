@@ -1133,21 +1133,41 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 **Files:**
 
 - Create: `crates/trusted-server-js/lib/src/core/contracts/server_boot_transport.ts`
+- Create: `crates/trusted-server-js/lib/src/core/contracts/sha256.ts`
+- Create: `crates/trusted-server-js/lib/src/core/contracts/bounded_string.ts`
+- Create: `crates/trusted-server-js/lib/test/fixtures/contracts/ecmascript-json-stringify-v1.json`
+- Move: `crates/trusted-server-js/lib/src/core/release_capacity.ts` to
+  `crates/trusted-server-js/lib/src/kernel/contracts/release_capacity.ts`
+- Modify: `crates/trusted-server-core/src/creative.rs`
+- Modify: `crates/trusted-server-core/src/html_processor.rs`
+- Modify: `crates/trusted-server-core/src/publisher.rs`
+- Modify: `crates/trusted-server-core/src/test_support.rs`
 - Modify: `crates/trusted-server-core/src/tsjs.rs`
 - Modify: `crates/trusted-server-js/lib/src/core/bootstrap.ts`
+- Modify: `crates/trusted-server-js/lib/src/core/contracts/auction_projection.ts`
 - Modify: `crates/trusted-server-js/lib/src/core/contracts/boot.ts`
+- Modify: `crates/trusted-server-js/lib/src/core/contracts/integration_configs.ts`
+- Modify: `crates/trusted-server-js/lib/src/core/index.ts`
+- Modify: `crates/trusted-server-js/lib/src/core/registry.ts`
+- Modify: `crates/trusted-server-js/lib/src/core/types.ts`
+- Modify: `crates/trusted-server-js/lib/src/kernel/fallback.ts`
+- Modify: `crates/trusted-server-js/lib/src/kernel/integration_registry.ts`
 - Modify: `crates/trusted-server-js/lib/src/kernel/runtime.ts`
-- Modify: `crates/trusted-server-js/lib/src/kernel/release_catalog.ts`
-- Modify: `crates/trusted-server-js/lib/src/shared/first_display_handoff.ts`
-- Modify: `crates/trusted-server-js/lib/src/shared/takeover.ts`
-- Modify: `crates/trusted-server-js/lib/build-all.mjs`
+- Modify: `crates/trusted-server-js/lib/src/services/context.ts`
+- Modify: `crates/trusted-server-js/lib/vite.config.ts`
 - Modify: `crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs`
+- Modify: `crates/trusted-server-integration-tests/browser/helpers/tsjs-fixture.ts`
+- Test: `crates/trusted-server-integration-tests/browser/tests/shared/creative-sandbox.spec.ts`
+- Test: `crates/trusted-server-integration-tests/browser/tests/shared/tsjs-runtime.spec.ts`
 - Test: `crates/trusted-server-js/lib/test/core/bootstrap.test.ts`
+- Test: `crates/trusted-server-js/lib/test/core/index.test.ts`
+- Test: `crates/trusted-server-js/lib/test/core/request.test.ts`
+- Test: `crates/trusted-server-js/lib/test/kernel/fallback.test.ts`
+- Test: `crates/trusted-server-js/lib/test/kernel/integration_registry.test.ts`
 - Test: `crates/trusted-server-js/lib/test/kernel/runtime.test.ts`
-- Test: `crates/trusted-server-js/lib/test/first_display/handoff.test.ts`
-- Test: `crates/trusted-server-js/lib/test/first_display/takeover.test.ts`
 - Test: `crates/trusted-server-js/lib/test/build/generated-fallback.test.mjs`
 - Test: `crates/trusted-server-js/lib/test/build/release-v1.test.mjs`
+- Test: `crates/trusted-server-js/lib/test/contract/retired-concept-audit.test.mjs`
 - Test: colocated `crates/trusted-server-core/src/tsjs.rs` tests
 
 - [ ] **Step 1: Add the RED production-transport tests.** Require Rust to emit one
@@ -1158,21 +1178,29 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
       prove exact release, manifest, projection, carrier, creative, diagnostics,
       always-present boot-integrity digests, the exact
       `outline:null | TakeoverOutlineV1` union and non-null equality, escaping, and 10
-      MiB decoded-size behavior.
+      MiB decoded-size behavior. Pin a shared Rust/JavaScript ECMAScript
+      `JSON.stringify` corpus covering negative zero, fixed/exponent thresholds,
+      IEEE-754 rounding, integer-index key ordering, and nested combinations so the
+      producer and verifier hash identical admitted bytes.
 
 - [ ] **Step 2: Add the RED compact-parser and graph tests.** Define the wished-for
       `snapshotServerBootTransportV1(payload, releaseId)` contract. A canonical valid
       string returns one recursively frozen fresh snapshot; malformed JSON, wrong or
       extra root keys, release mismatch, bad first-display URL/mask/slices, bad
-      runtime URL, missing/malformed boot integrity, outline parity/count/digest form
-      or integrity mismatch, invalid dedicated booleans, or an oversized string
-      returns `undefined` before effects. A direct-runtime snapshot has
+      runtime URL, more than 14 takeover entries, a deferred source not bound to its
+      declared id, missing/malformed boot integrity, outline parity/count/digest
+      form or integrity mismatch, invalid dedicated booleans, or an oversized string
+      returns `undefined` before effects. Boundary-valid takeover counts and exact
+      deferred id/source pairs remain accepted. A direct-runtime snapshot has
       `outline:null` but retains the integrity value. Add RED runtime/handoff tests
       proving direct boot recomputes both digests, and takeover requires recomputed
       boot = integrity = outline = handoff. Projection and integration-config
       mismatches independently produce `abi_mismatch` before preparation,
-      activation, or publication; a valid carrier succeeds on both paths. The release metafile
-      must prove `bootstrap` no longer reaches `core/contracts/boot.ts`,
+      activation, or publication; a valid carrier succeeds on both paths. At both
+      direct and takeover runtime boundaries, accessors are never invoked and custom
+      prototypes, symbols, sparse arrays, repeated aliases, or any mutable nested
+      manifest/projection/carrier/diagnostics value fail immediately. The release
+      metafile must prove `bootstrap` no longer reaches `core/contracts/boot.ts`,
       `core/contracts/auction_projection.ts`, or
       `core/contracts/integration_configs.ts`.
 
@@ -1184,7 +1212,11 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
       both `initialDisplayCommitted` values, exact FIFO queue drain, accepted-DOM
       preservation, no pending call, no artifact retry, and both
       `abi_mismatch`/`bundle_partial` classifications. Fallback never needs the full
-      projection validator.
+      projection validator, but `addAdUnits` still validates before refusing. The
+      registration validator obtains its bounded-string primitive from an
+      effect-free bootstrap-safe leaf rather than importing the auction-projection
+      graph. The persistent-core graph must consume a generated numeric manifest
+      capacity and exclude the build-time release catalog.
 
 - [ ] **Step 3: Run RED and inspect the expected failures.**
 
@@ -1199,11 +1231,14 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
   absent, and the bootstrap metafile still reaches the full validators.
 
 - [ ] **Step 4: Implement the minimal sealed transport.** Canonicalize and validate
-      in Rust exactly as today, serialize the payload once, escape it as a JS string,
-      and keep `window.tsjs` target acquisition outside the JSON. In the compact
-      parser, use the parsed fresh tree, perform only revision-43 critical
-      release/manifest/integrity/outline checks, recursively freeze, and return one
-      snapshot.
+      in Rust, normalize the admitted projection and every generic configuration to
+      ECMAScript `JSON.stringify`-equivalent bytes, hash and embed those exact bytes,
+      serialize the payload once, escape it as a JS string, and keep `window.tsjs`
+      target acquisition outside the JSON. Do not hash raw `serde_json` spellings:
+      negative zero, exponent formatting, and integer-index key enumeration are
+      observably different in JavaScript. In the compact parser, use the parsed fresh
+      tree, perform only revision-43 critical release/manifest/integrity/outline
+      checks, recursively freeze, and return one snapshot.
       Do not accept object form or move executable code into the payload.
 
 - [ ] **Step 5: Rewire only the production bootstrap.** Import the compact parser,
@@ -1214,29 +1249,52 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
       projection and integration-config SHA-256 digests before direct use or handoff
       adoption and compares them with the always-present integrity value; the
       controller validates only exact digest form and outline/integrity relations.
+      Reuse the existing pure manifest validator and full auction-projection parser
+      in persistent core, validate the generic carrier there without importing its
+      bootstrap-hostile object graph, and split the synchronous SHA-256 primitive
+      into an effect-free leaf shared by the two boundaries. On rejection after the
+      one-use exact-source-authenticated claim, invoke its one-use completion
+      capability with `abi_mismatch` during the current runtime-script task; do not
+      let the watchdog later relabel a validation failure as `bundle_partial`. The
+      claim reserves a closure-private `claiming` state before any mutable DOM or
+      realm authentication boundary, and completion validates with primitive string
+      comparisons and consumes its guard before invoking a handler; reentrant claim
+      or completion cannot obtain or consume the capability twice. In
+      takeover mode, the persistent runtime never publishes fallback itself: it
+      reports preparation/activation failure through the same completion capability,
+      and the bootstrap owner alone preserves accepted DOM, snapshots
+      `initialDisplayCommitted`, disposes the agent, and commits fallback. Direct mode
+      retains the persistent runtime's existing terminal-fallback ownership.
 
 - [ ] **Step 6: Run GREEN and adjacent hard-cutover checks.**
 
   ```bash
   cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" tsjs::tests
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" html_processor::tests
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" injects_tsjs_creative_when_body_present
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" c2_reader_seam_inserts_one_complete_hard_cutover_boot
   npm --prefix crates/trusted-server-js/lib test -- --run test/core/bootstrap.test.ts test/kernel/runtime.test.ts test/first_display
   npm --prefix crates/trusted-server-js/lib run typecheck
   npm --prefix crates/trusted-server-js/lib run lint
   npm --prefix crates/trusted-server-js/lib run build
   npm --prefix crates/trusted-server-js/lib run test:release
   npm --prefix crates/trusted-server-js/lib run check:hard-cutover-absence
+  npx --prefix crates/trusted-server-integration-tests/browser playwright test --list tests/shared/tsjs-runtime.spec.ts tests/shared/creative-sandbox.spec.ts
   ```
 
 - [ ] **Step 7: Measure rather than infer transfer improvement.** Read the generated
       bootstrap raw/gzip/Brotli values and its complete source-owner list. If the
       graph exclusions pass but the served GPT semantic interval cannot fit beneath
       the exact rc baseline after including its real inline payload, stop and revisit
-      the architecture instead of adding mangling or changing membership.
+      the architecture instead of adding mangling or changing membership. Generate
+      the manifest-entry capacity as a build constant so persistent core does not
+      import the release catalog for one number; assert both catalog exclusion and
+      intentional tree-shaking of the declaration module in the release metafile.
 
 - [ ] **Step 8: Commit.**
 
   ```bash
-  git add crates/trusted-server-core/src/tsjs.rs crates/trusted-server-js/lib/src/core/bootstrap.ts crates/trusted-server-js/lib/src/core/contracts/server_boot_transport.ts crates/trusted-server-js/lib/src/core/contracts/boot.ts crates/trusted-server-js/lib/src/kernel/runtime.ts crates/trusted-server-js/lib/src/kernel/release_catalog.ts crates/trusted-server-js/lib/src/shared/first_display_handoff.ts crates/trusted-server-js/lib/src/shared/takeover.ts crates/trusted-server-js/lib/build-all.mjs crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs crates/trusted-server-js/lib/test/core/bootstrap.test.ts crates/trusted-server-js/lib/test/kernel/runtime.test.ts crates/trusted-server-js/lib/test/first_display/handoff.test.ts crates/trusted-server-js/lib/test/first_display/takeover.test.ts crates/trusted-server-js/lib/test/build/generated-fallback.test.mjs crates/trusted-server-js/lib/test/build/release-v1.test.mjs
+  git add -A docs/superpowers/specs/2026-08-04-aps-render-fix-and-tsjs-resilience-design.md docs/superpowers/plans/2026-08-04-aps-tsjs-resilience-implementation.md crates/trusted-server-core/src/creative.rs crates/trusted-server-core/src/html_processor.rs crates/trusted-server-core/src/publisher.rs crates/trusted-server-core/src/test_support.rs crates/trusted-server-core/src/tsjs.rs crates/trusted-server-integration-tests/browser/helpers/tsjs-fixture.ts crates/trusted-server-integration-tests/browser/tests/shared/creative-sandbox.spec.ts crates/trusted-server-integration-tests/browser/tests/shared/tsjs-runtime.spec.ts crates/trusted-server-js/lib/src/core crates/trusted-server-js/lib/src/kernel/contracts/release_capacity.ts crates/trusted-server-js/lib/src/kernel/fallback.ts crates/trusted-server-js/lib/src/kernel/integration_registry.ts crates/trusted-server-js/lib/src/kernel/runtime.ts crates/trusted-server-js/lib/src/services/context.ts crates/trusted-server-js/lib/vite.config.ts crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs crates/trusted-server-js/lib/test/fixtures/contracts/ecmascript-json-stringify-v1.json crates/trusted-server-js/lib/test/core/bootstrap.test.ts crates/trusted-server-js/lib/test/core/index.test.ts crates/trusted-server-js/lib/test/core/request.test.ts crates/trusted-server-js/lib/test/kernel/fallback.test.ts crates/trusted-server-js/lib/test/kernel/integration_registry.test.ts crates/trusted-server-js/lib/test/kernel/runtime.test.ts crates/trusted-server-js/lib/test/build/generated-fallback.test.mjs crates/trusted-server-js/lib/test/build/release-v1.test.mjs crates/trusted-server-js/lib/test/contract/retired-concept-audit.test.mjs
   git commit -m "Seal the production TSJS boot transport"
   ```
 

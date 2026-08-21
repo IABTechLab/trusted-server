@@ -1331,6 +1331,64 @@ describe('Runtime bootstrap owner', () => {
     ]);
   });
 
+  it.each(['prepare', 'activate'] as const)(
+    'returns a takeover %s failure to bootstrap without publishing a second fallback owner',
+    async (checkpoint) => {
+      const target = { que: [] as unknown[] };
+      const onInstallComplete = vi.fn();
+      const coordinateTakeover = vi.fn((prepared) => {
+        const candidate = takeoverHandoff();
+        const handoff = prepared.validateHandoff(candidate.handoff, candidate.outline);
+        expect(handoff).toBeDefined();
+        prepared.activate(
+          Object.freeze({
+            version: 1 as const,
+            adoptInitialDisplay: true as const,
+            handoff: handoff!,
+            identities: Object.freeze([]),
+          })
+        );
+        prepared.commit();
+      });
+      const fail = () => {
+        throw new Error(checkpoint);
+      };
+      const runtime = createRuntime({
+        target,
+        releaseId: RELEASE,
+        manifest: manifest([]),
+        knownIntegrationIds: Object.freeze([]),
+        boot: boot(),
+        ...(checkpoint === 'prepare' ? { prepareOwner: fail } : { activateOwner: fail }),
+        coordinateTakeover,
+        onInstallComplete,
+        kernel: {
+          addAdUnits: vi.fn(),
+          diagnostics: Object.freeze({}),
+          requestAds: vi.fn(),
+        },
+      });
+
+      expect(runtime.start()).toBe(true);
+      await expect(runtime.install()).resolves.toEqual({
+        state: 'fallback',
+        reason: 'bundle_partial',
+      });
+
+      expect(runtime.state).toBe('failed');
+      expect(onInstallComplete).toHaveBeenCalledOnce();
+      expect(onInstallComplete).toHaveBeenCalledWith({
+        state: 'fallback',
+        reason: 'bundle_partial',
+      });
+      expect(target).not.toHaveProperty('version');
+      expect(target).not.toHaveProperty('_internal');
+      expect(target).not.toHaveProperty('requestAds');
+      if (checkpoint === 'prepare') expect(coordinateTakeover).not.toHaveBeenCalled();
+      else expect(coordinateTakeover).toHaveBeenCalledOnce();
+    }
+  );
+
   it('stops activation when owner activation disposes the installing runtime', async () => {
     const activateCore = vi.fn();
     const activateModule = vi.fn();
@@ -1494,6 +1552,7 @@ describe('Runtime bootstrap owner', () => {
       state: 'fallback',
       releaseId: RELEASE,
       reason,
+      initialDisplayCommitted: false,
     });
     await expect(
       (target as unknown as { requestAds(options?: unknown): Promise<unknown> }).requestAds()
@@ -1756,6 +1815,7 @@ describe('Runtime bootstrap owner', () => {
       state: 'fallback',
       releaseId: RELEASE,
       reason: 'bundle_partial',
+      initialDisplayCommitted: false,
     });
   });
 
@@ -2071,7 +2131,7 @@ describe('Runtime bootstrap owner', () => {
     expect(runtime.state).toBe('kernel');
   });
 
-  it('validates fallback calls and settles known, unknown, and aborted slots', async () => {
+  it('validates fallback calls against the exact empty safe projection', async () => {
     const target = {};
     const runtime = createRuntime({
       target,
@@ -2089,9 +2149,10 @@ describe('Runtime bootstrap owner', () => {
       boot: unknown;
     };
 
+    await expect(api.requestAds()).resolves.toEqual({ slots: [] });
     await expect(api.requestAds({ slots: ['known', 'unknown'] })).resolves.toEqual({
       slots: [
-        { slot: 'known', path: 'primary', outcome: 'failed', reason: 'abi_mismatch' },
+        { slot: 'known', path: 'primary', outcome: 'failed', reason: 'slot_unresolved' },
         { slot: 'unknown', path: 'primary', outcome: 'failed', reason: 'slot_unresolved' },
       ],
     });
@@ -2138,7 +2199,7 @@ describe('Runtime bootstrap owner', () => {
     });
   });
 
-  it('snapshots fallback boot before publisher mutation during installation', async () => {
+  it('never retains projected slot membership in fallback boot', async () => {
     const target = { boot: boot([{ slot: 'initial', outcome: 'no_bid' }]) };
     const runtime = createRuntime({
       target,
@@ -2156,12 +2217,10 @@ describe('Runtime bootstrap owner', () => {
       boot: { auctionProjection: { auction: { results: readonly { slot: string }[] } } };
       requestAds(options: unknown): Promise<unknown>;
     };
-    expect(api.boot.auctionProjection.auction.results).toEqual([
-      { slot: 'initial', outcome: 'no_bid' },
-    ]);
+    expect(api.boot.auctionProjection.auction.results).toEqual([]);
     await expect(api.requestAds({ slots: ['initial', 'mutated'] })).resolves.toEqual({
       slots: [
-        { slot: 'initial', path: 'primary', outcome: 'failed', reason: 'abi_mismatch' },
+        { slot: 'initial', path: 'primary', outcome: 'failed', reason: 'slot_unresolved' },
         { slot: 'mutated', path: 'primary', outcome: 'failed', reason: 'slot_unresolved' },
       ],
     });
@@ -2446,7 +2505,7 @@ describe('Runtime bootstrap owner', () => {
     }
   );
 
-  it('applies fallback slot collision and combined registry capacity validation', async () => {
+  it('does not retain server slot collisions or capacity in fallback validation', async () => {
     const makeFallback = async (slots: readonly string[]) => {
       const target = {};
       const runtime = createRuntime({
@@ -2464,14 +2523,12 @@ describe('Runtime bootstrap owner', () => {
     const collision = await makeFallback(['server']);
     expect(() =>
       collision({ code: 'server', mediaTypes: { banner: { sizes: [[300, 250]] } } })
-    ).toThrow(expect.objectContaining({ code: 'slot_collision', unitIndex: 0 }));
+    ).toThrow(TsjsUnavailableError);
 
     const full = await makeFallback(Array.from({ length: 256 }, (_, index) => `slot-${index}`));
-    const capacityError = thrownBy(() =>
+    expect(() =>
       full({ code: 'overflow', mediaTypes: { banner: { sizes: [[300, 250]] } } })
-    );
-    expect(capacityError).toMatchObject({ code: 'registry_capacity' });
-    expect(Object.prototype.hasOwnProperty.call(capacityError, 'unitIndex')).toBe(false);
+    ).toThrow(TsjsUnavailableError);
   });
 
   it('reports aggregate request overflow before combined registry capacity', async () => {

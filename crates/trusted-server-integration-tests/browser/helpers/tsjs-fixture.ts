@@ -33,6 +33,39 @@ export interface RuntimeTsjsFixture {
   };
 }
 
+interface ServerBootDigestInputV1 {
+  readonly auctionProjection: unknown;
+  readonly integrations: unknown;
+  readonly [key: string]: unknown;
+}
+
+/** Serialize the exact string-only server boot carrier consumed by bootstrap. */
+export function serverBootTransportLiteralV1(
+  boot: ServerBootDigestInputV1,
+  outline: unknown = null,
+): string {
+  const projection = JSON.stringify(boot.auctionProjection);
+  const integrationConfigs = JSON.stringify(boot.integrations);
+  if (projection === undefined || integrationConfigs === undefined) {
+    throw new Error("TSJS server boot digest input is not JSON");
+  }
+  const transport = JSON.stringify({
+    version: 1,
+    boot,
+    integrity: {
+      version: 1,
+      projectionDigest: createHash("sha256")
+        .update(projection, "utf8")
+        .digest("hex"),
+      integrationConfigDigest: createHash("sha256")
+        .update(integrationConfigs, "utf8")
+        .digest("hex"),
+    },
+    outline,
+  });
+  return JSON.stringify(transport);
+}
+
 function exactArtifact(release: Release, id: string): ReleaseArtifact {
   const matches = release.artifacts.filter((artifact) => artifact.id === id);
   if (matches.length !== 1)
@@ -102,37 +135,18 @@ export async function loadRuntimeTsjsFixture(
   fixture: RuntimeTsjsFixture,
 ): Promise<void> {
   await routeRuntimeTsjsFixture(page, fixture);
+  const boot = await page.evaluate(
+    () => (window as unknown as { tsjs: Record<string, unknown> }).tsjs.boot,
+  );
+  if (typeof boot !== "object" || boot === null || Array.isArray(boot)) {
+    throw new Error("TSJS runtime fixture boot is unavailable");
+  }
+  await page.addScriptTag({
+    content: `const __TSJS_SERVER_BOOT_TRANSPORT_V1__=${serverBootTransportLiteralV1(boot as ServerBootDigestInputV1)};${fixture.bootstrapBody}`,
+  });
   await page.evaluate(
     (src) =>
       new Promise<void>((resolveLoad, rejectLoad) => {
-        const target = (window as unknown as { tsjs: Record<string, unknown> })
-          .tsjs;
-        const freeze = (value: unknown): void => {
-          if (
-            typeof value !== "object" ||
-            value === null ||
-            Object.isFrozen(value)
-          )
-            return;
-          for (const key of Reflect.ownKeys(value)) {
-            const descriptor = Object.getOwnPropertyDescriptor(value, key);
-            if (descriptor && "value" in descriptor) freeze(descriptor.value);
-          }
-          Object.freeze(value);
-        };
-        const retainedBoot = target.boot;
-        freeze(retainedBoot);
-        const claim = (source: unknown): unknown => {
-          if (source !== document.currentScript) return undefined;
-          Reflect.deleteProperty(target, "_claimBootSnapshot");
-          return retainedBoot;
-        };
-        Object.defineProperty(target, "_claimBootSnapshot", {
-          configurable: true,
-          enumerable: false,
-          value: claim,
-          writable: false,
-        });
         const script = document.createElement("script");
         script.id = "trustedserver-js";
         script.src = src;

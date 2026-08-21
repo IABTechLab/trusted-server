@@ -430,11 +430,7 @@ class RuntimeOwner implements Runtime {
           if (this.options.autoInstall && !this.installPromise) void this.install();
         },
       });
-      this.fallbackBoot = buildFallbackBoot(
-        EMBEDDED_RELEASE_ID,
-        bootCandidate,
-        this.trustedRuntimeSrc
-      );
+      this.fallbackBoot = buildFallbackBoot(EMBEDDED_RELEASE_ID, this.trustedRuntimeSrc);
       if (!this.fallbackBoot) throw new Error('Trusted runtime artifact source is unavailable');
       if (this.registry.manifest) {
         this.kernelBoot = buildKernelBoot(
@@ -498,11 +494,19 @@ class RuntimeOwner implements Runtime {
     if (!this.registry || !this.ingress || this.runtimeState !== 'installing') {
       return Promise.resolve(Object.freeze({ state: 'fallback', reason: 'bundle_partial' }));
     }
+    const notifyInstallComplete = (result: IntegrationInstallResult): void => {
+      try {
+        this.options.onInstallComplete?.(result);
+      } catch {
+        // Completion observation cannot change the already committed terminal state.
+      }
+    };
     if (!this.kernelBoot) {
       this.registry.dispose();
       const result = Object.freeze({ state: 'fallback' as const, reason: 'abi_mismatch' as const });
       this.runtimeState = 'failed';
-      this.commitFallback(result.reason);
+      if (!this.options.coordinateTakeover) this.commitFallback(result.reason);
+      notifyInstallComplete(result);
       this.installPromise = Promise.resolve(result);
       return this.installPromise;
     }
@@ -567,13 +571,9 @@ class RuntimeOwner implements Runtime {
         this.runtimeState = 'kernel';
       } else {
         this.runtimeState = 'failed';
-        this.commitFallback(result.reason);
+        if (!this.options.coordinateTakeover) this.commitFallback(result.reason);
       }
-      try {
-        this.options.onInstallComplete?.(result);
-      } catch {
-        // Completion observation cannot change the already committed terminal state.
-      }
+      notifyInstallComplete(result);
       resolveInstall?.(result);
     };
     if (!this.options.coordinateTakeover) {
@@ -668,7 +668,6 @@ class RuntimeOwner implements Runtime {
     const fields = createFallbackFields({
       releaseId: EMBEDDED_RELEASE_ID,
       reason,
-      boot: this.fallbackBoot,
       trustedRuntimeSrc: this.trustedRuntimeSrc,
     });
     if (!fields) return;

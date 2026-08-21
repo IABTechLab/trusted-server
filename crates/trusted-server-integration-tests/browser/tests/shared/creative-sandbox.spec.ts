@@ -3,6 +3,7 @@ import { runtimeUrl } from "../../helpers/state.js";
 import {
   routeRuntimeTsjsFixture,
   runtimeTsjsFixture,
+  serverBootTransportLiteralV1,
   type RuntimeTsjsFixture,
 } from "../../helpers/tsjs-fixture.js";
 
@@ -32,9 +33,7 @@ function creativeDocument(
   fixture: RuntimeTsjsFixture,
   signedClick: string,
 ): string {
-  const signedClick =
-    "/first-party/click?tsurl=https%3A%2F%2Fadvertiser.example%2Flanding&foo=1&tstoken=browser-test-token";
-  const boot = JSON.stringify({
+  const transport = serverBootTransportLiteralV1({
     abi: 1,
     releaseId: fixture.releaseId,
     manifest: fixture.manifest,
@@ -68,11 +67,7 @@ function creativeDocument(
         enumerable: false,
       });
       window.tsjs = { que: [] };
-      const __TSJS_SERVER_BOOT_INPUT_V1__ = {
-        target: window.tsjs,
-        boot: ${boot},
-        outline: null,
-      };
+      const __TSJS_SERVER_BOOT_TRANSPORT_V1__ = ${transport};
       ${fixture.bootstrapBody}
     </script>
     <script>

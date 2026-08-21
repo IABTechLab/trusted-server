@@ -606,6 +606,50 @@ test('generated takeover transport owns branded render operations without GPT du
   }
 });
 
+test('generated bootstrap uses only the compact sealed transport parser', () => {
+  const metrics = JSON.parse(
+    fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-build-metrics-v1.json'), 'utf8')
+  );
+  const sources = new Set(metrics.bootstrap.sources.map(({ file }) => file));
+
+  assert.equal(sources.has('src/core/contracts/server_boot_transport.ts'), true);
+  for (const forbidden of [
+    'src/core/contracts/boot.ts',
+    'src/core/contracts/auction_projection.ts',
+    'src/core/contracts/integration_configs.ts',
+  ]) {
+    assert.equal(sources.has(forbidden), false, `bootstrap must not reach ${forbidden}`);
+  }
+});
+
+test('persistent core consumes generated capacity without bundling the build catalog', () => {
+  const metrics = JSON.parse(
+    fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-build-metrics-v1.json'), 'utf8')
+  );
+  const core = metrics.modules.find(({ file }) => file === 'tsjs-core.js');
+  const sources = new Set(core.sources.map(({ file }) => file));
+  const buildSource = fs.readFileSync(path.resolve(libDirectory, 'build-all.mjs'), 'utf8');
+  const registrySource = fs.readFileSync(
+    path.resolve(libDirectory, 'src/kernel/integration_registry.ts'),
+    'utf8'
+  );
+
+  assert.match(
+    buildSource,
+    /__TSJS_EMBEDDED_MAX_MANIFEST_MODULES_V1__:\s*JSON\.stringify\(releaseCatalog\.length\)/u
+  );
+  assert.match(
+    registrySource,
+    /import \{ EMBEDDED_MAX_MANIFEST_MODULES \} from '\.\/contracts\/release_capacity';/u
+  );
+  assert.match(registrySource, /const MAX_INTEGRATIONS = EMBEDDED_MAX_MANIFEST_MODULES;/u);
+  assert.doesNotMatch(registrySource, /const MAX_INTEGRATIONS = 20;/u);
+  // The generated scalar is substituted before bundling, so its declaration is
+  // intentionally tree-shaken along with the build-only catalog.
+  assert.equal(sources.has('src/kernel/contracts/release_capacity.ts'), false);
+  assert.equal(sources.has('src/kernel/release_catalog.ts'), false);
+});
+
 test('messaging protocol binding is declared before schema initialization', () => {
   const source = fs.readFileSync(path.resolve(libDirectory, 'src/adapters/messaging.ts'), 'utf8');
   const binding =
@@ -717,6 +761,16 @@ test('co-bundled render_runtime and independent GPT start one branded display fl
       return freeze({
         abi: 1,
         releaseId: '${release.releaseId}',
+        manifest: freeze({
+          version: 1,
+          releaseId: '${release.releaseId}',
+          firstDisplay: null,
+          runtimeSrc: '/static/tsjs=tsjs-unified.min.js?v=${runtimeHash}',
+          integrations: freeze([
+            freeze({ id: 'render_runtime', phase: 'takeover' }),
+            freeze({ id: 'gpt', phase: 'takeover' })
+          ])
+        }),
         auctionProjection: freeze({
           version: 1,
           auction: freeze({
@@ -748,16 +802,6 @@ test('co-bundled render_runtime and independent GPT start one branded display fl
           version: 1,
           renderTraceOverlay: false,
           gpt: freeze({ active: false })
-        }),
-        manifest: freeze({
-          version: 1,
-          releaseId: '${release.releaseId}',
-          firstDisplay: null,
-          runtimeSrc: '/static/tsjs=tsjs-unified.min.js?v=${runtimeHash}',
-          integrations: freeze([
-            freeze({ id: 'render_runtime', phase: 'takeover' }),
-            freeze({ id: 'gpt', phase: 'takeover' })
-          ])
         })
       });
     })()`);
@@ -765,6 +809,20 @@ test('co-bundled render_runtime and independent GPT start one branded display fl
     runtimeScript.id = 'trustedserver-js';
     runtimeScript.src = `/static/tsjs=tsjs-unified.min.js?v=${runtimeHash}`;
     dom.window.document.head.append(runtimeScript);
+    const integrity = dom.window.Object.create(dom.window.Object.prototype);
+    dom.window.Object.assign(integrity, {
+      version: 1,
+      projectionDigest: createHash('sha256')
+        .update(JSON.stringify(boot.auctionProjection))
+        .digest('hex'),
+      integrationConfigDigest: createHash('sha256')
+        .update(JSON.stringify(boot.integrations))
+        .digest('hex'),
+    });
+    dom.window.Object.freeze(integrity);
+    const claimedBoot = dom.window.Object.create(dom.window.Object.prototype);
+    dom.window.Object.assign(claimedBoot, { boot, integrity, complete: () => undefined });
+    dom.window.Object.freeze(claimedBoot);
     Object.defineProperty(dom.window, 'tsjs', { configurable: true, value: {} });
     Object.defineProperties(dom.window.tsjs, {
       boot: { configurable: true, enumerable: true, value: boot, writable: true },
@@ -775,7 +833,7 @@ test('co-bundled render_runtime and independent GPT start one branded display fl
         value: (source) => {
           if (source !== runtimeScript) return undefined;
           Reflect.deleteProperty(dom.window.tsjs, '_claimBootSnapshot');
-          return boot;
+          return claimedBoot;
         },
         writable: false,
       },
