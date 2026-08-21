@@ -1473,33 +1473,56 @@ The Fastly service opens the logical config store selected by
 its default key. A Fastly resource link maps that logical store name to the
 physical config store for the service at runtime.
 
-For a service-specific physical store, create the store, link it with the
-logical name, then push to that physical store:
+Fastly store names are account-level. For a first deployment, the default setup
+is safe only when no other service in the account uses the
+`trusted_server_config` physical store:
 
 ```bash
-fastly config-store create --name <physical-store-name>
-fastly resource-link create --service-id <service-id> --version <version> \
-  --resource-id <config-store-id> --name trusted_server_config
+ts provision --adapter fastly
+ts config push --adapter fastly --dry-run
+ts config push --adapter fastly
+```
+
+For the first deployment of a service in a shared account, select a
+service-specific physical store during both provisioning and config push. The
+first deployment applies the generated setup entry and links the physical store
+under the logical name:
+
+```bash
+EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<physical-store-name> \
+  ts provision --adapter fastly
+EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<physical-store-name> \
+  ts config push --adapter fastly --dry-run
 EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<physical-store-name> \
   ts config push --adapter fastly
 ```
 
-The resource-link name must match the logical store ID, and the pushed store
-must contain a valid Trusted Server app-config blob envelope at its default key.
-An absent or empty entry makes application startup fail closed. Use the Trusted
-Server CLI to provision the store and publish the validated config.
+For an already-deployed service, Fastly does not reapply setup entries. Create
+and link the service-specific physical store explicitly, seed it, then activate
+the cloned service version:
+
+```bash
+fastly config-store create --name <physical-store-name>
+fastly resource-link create --service-id <service-id> --version latest --autoclone \
+  --resource-id <config-store-id> --name trusted_server_config
+EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<physical-store-name> \
+  ts config push --adapter fastly --dry-run
+EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<physical-store-name> \
+  ts config push --adapter fastly
+fastly service-version activate --service-id <service-id> --version latest
+```
+
+Confirm that each dry run names the intended physical store before writing. In
+a shared account, it must be the service-specific store rather than the
+account-level default. The resource-link name must match the logical store ID,
+and the physical store must contain a valid Trusted Server app-config blob
+envelope at its default key. An absent or empty entry makes application startup
+fail closed.
 
 **Local development** (writes the entry used by Viceroy in `fastly.toml`):
 
 ```bash
 ts config push --adapter fastly --local
-```
-
-**Production setup**:
-
-```bash
-ts provision --adapter fastly
-ts config push --adapter fastly
 ```
 
 Rollback to the legacy entry point is no longer controlled by runtime config
