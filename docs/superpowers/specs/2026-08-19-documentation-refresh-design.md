@@ -1,7 +1,7 @@
 # Documentation Refresh (Full Surface)
 
 **Date:** 2026-08-19
-**Revised:** 2026-08-20 (round 2; addresses both pre-implementation reviews)
+**Revised:** 2026-08-20 (round 3; addresses all three pre-implementation reviews)
 **Status:** Draft, pending review
 **Scope:** Documentation and doc tooling. No runtime behavior changes.
 Baseline audited at `main` commit `2e85a1cdc` (2026-08-18); realigned and
@@ -92,7 +92,7 @@ drift in every surface. The failures fall into six categories:
    the image optimizer, and Tinybird auction telemetry exist only in the
    Fastly adapter today; the other adapters construct no telemetry sink and
    silently use the no-op default.
-5. **Publishing and policy hygiene.** All 75 internal spec/plan files under
+5. **Publishing and policy hygiene.** All 120 internal spec/plan markdown files under
    `docs/superpowers/` are built and published to the public GitHub Pages site
    (no `srcExclude` in `docs/.vitepress/config.mts`), along with
    `docs/guide/onboarding.md` (internal contacts, meetings, access guidance),
@@ -101,7 +101,11 @@ drift in every surface. The failures fall into six categories:
    personal email (`authors`, line 4) and a real Fastly service id (line 10)
    against the repo's own sensitive-data policy, and unlabeled base64 key
    fixtures that read as credentials. `docs/package.json` is not `private`
-   and declares an ISC license in an Apache-2.0 repository. Active examples
+   and declares an ISC license in an Apache-2.0 repository. The maintained
+   agent instructions under `.claude/agents/` are badly stale: they still
+   describe a three-crate Fastly-only workspace, cite the nonexistent
+   `RequestWrapper` trait, list outdated verification gates, and assume all
+   PRs target `main`. Active examples
    violate the fictional-data policy beyond that: `ec-setup-guide.md:15`
    names a real deployment domain, and `.env.example` uses non-reserved
    `publisher.com` values instead of `.example` domains.
@@ -159,8 +163,9 @@ under `docs/superpowers/`, legitimately contain every retired term):
   pages nor historical artifacts but are still maintained and must pass the
   truth standard: `docs/README.md`, `docs/internal/**` (including the moved
   onboarding page), `scripts/README.md` and `tinybird/README.md` once
-  created, and `.claude/skills/**` (operator-facing skills such as the
-  Fastly deployment skill).
+  created, `.claude/skills/**` (operator-facing skills such as the
+  Fastly deployment skill), `.claude/agents/**` (maintained agent
+  instructions), and `.github/pull_request_template.md`.
 - **Historical set:** `docs/superpowers/**` (specs, plans, implementation
   notes, archive) and shipped `CHANGELOG.md` release entries. Exempt from
   retired-term greps; a changelog entry describing a rename may name the
@@ -206,10 +211,14 @@ under `docs/superpowers/`, legitimately contain every retired term):
 - No new documentation toolchains. VitePress, rustdoc, and clap help remain
   the three delivery mechanisms. No TypeDoc, no docs.rs publishing.
 - No rewrite of `docs/business-use-cases.md` marketing copy. Default
-  handling changed after review: the page leaves primary navigation until
-  every quantitative claim carries dated evidence and unshipped features
-  are visibly labeled (open question 4 records the alternative of keeping
-  it with evidence added). `docs/roadmap.md` gets a
+  handling hardened after review: the page is excluded from the built site
+  (`srcExclude`) until every quantitative claim carries dated evidence and
+  unshipped features are visibly labeled - nav-only removal would leave a
+  known-false page published and locally searchable, and would violate
+  WP5's no-orphan acceptance (the page presents planned headless-browser
+  malvertising detection as shipped while the roadmap calls it planned).
+  Open question 4 records the alternative of an evidence-based rewrite in
+  this pass. `docs/roadmap.md` gets a
   factual status pass (shipped/active/deferred labels, correct crate names),
   not a strategy rewrite.
 - No release-management policy changes. The CHANGELOG's 10-month untagged
@@ -245,9 +254,10 @@ the live site until rc merges to main. Therefore:
   The rc PR carries the same changes; the rc→main merge reconciles to an
   identical state.
 - Everything else lands only in the single rc PR.
-- If release-branch PRs are expected to get CodeQL analysis, `rc/*` must be
-  added to `codeql.yml`'s branch triggers (WP8 records this alongside the
-  other workflow changes).
+- CodeQL today analyzes only PRs targeting `main`, so the rc PR carrying
+  new workflows, generators, and scripts would go unanalyzed. Decision:
+  WP8 adds `rc/*` to `codeql.yml`'s PR branch triggers, and CodeQL joins
+  the final gate list in Verification.
 
 Open question 7 asks the owner to confirm this shape.
 
@@ -269,6 +279,9 @@ Smallest package, highest urgency. The containment subset also ships to
   the repository is public, so source-sensitive details are scrubbed even
   from excluded files. Verify with a local `vitepress build` that the dist
   no longer contains those paths.
+- The containment pieces are independent of the CNAME decision and must
+  not wait for it: `srcExclude` and the onboarding move/scrub ship
+  immediately; the CNAME change follows its own resolution (open question 2) in a separate commit.
 - Resolve `docs/public/CNAME`: it currently ships the placeholder
   `your-custom-domain.com` into every Pages deploy while `base` is set to
   `/trusted-server` (the two are mutually inconsistent). Default action:
@@ -295,11 +308,17 @@ real key` labels to the `[local_server]` secret/JWKS entries; add one-line
   `cargo test -p`, the exact pattern `AGENTS.md` warns will fail). Add the
   missing Spin/cloudflare-wasm gates to `AGENTS.md`'s fallback list.
 
-Acceptance: `vitepress build` output contains no `superpowers/`, `internal/`,
-`epics/`, or onboarding pages; the containment PR to `main` is merged and
-the live site no longer serves those URLs; no real personal emails in
-tracked config; no internal contacts or access instructions anywhere in the
-repo; every command file lists the same gates as `CLAUDE.md`.
+Acceptance: `vitepress build` output contains no `superpowers/`,
+`internal/`, `epics/`, onboarding, or business-use-cases pages; the
+containment PR to `main` is merged, the live site no longer serves those
+URLs, and a positive post-deploy smoke passes (site root, the Guide
+landing page, and one reference page return 200 with expected content);
+the rollback procedure is documented in the containment PR (owner: the
+maintainer driving this refresh; procedure: revert the containment commit
+on `main` and re-run the Pages deploy via `workflow_dispatch`); no real
+personal emails in tracked config; no internal contacts or access
+instructions anywhere in the repo; every command file lists the same gates
+as `CLAUDE.md`.
 
 ### WP2: Truth pass over existing content
 
@@ -307,13 +326,19 @@ Nothing new is written here beyond minimal replacement prose; the goal is
 that nothing in the active sets is false. The pass starts from a complete
 page inventory: every page in the active public and active maintained
 internal sets gets an explicit disposition, verified, rewrite, or retire.
-The inventory is checked into the repository (under
-`docs/superpowers/implementation-notes/`) with per-page source anchors, not
-left in a PR description. Token greps establish that retired names are
+The inventory is checked into the repository under
+`docs/internal/audits/` (inside the active maintained internal set, not
+the exempt historical tree), stamped with the audited merge-base SHA, with
+per-page source anchors, not left in a PR description. The inventory is an
+audit record of this pass; the WP8 parity gates, not the inventory, are
+the continuing control. Token greps establish that retired names are
 gone; they cannot validate commands, APIs, auth, or behavior, so each
 "verified" disposition means the page's commands and examples were actually
-checked against code, and marked Rust/shell/TOML/JSON snippets are compiled
-or parsed wherever feasible (the WP8 harness runs them).
+checked against code, and executable fences are governed by the WP8
+snippet manifest: every Rust/shell/TOML/JSON fence in the active public
+set gets a checked-in disposition (rust-compile, toml/json-parse, bash -n,
+safe smoke test, or manual with a reason and source anchor), and CI fails
+on new executable fences with no classification.
 
 - `docs/guide/api-reference.md`: delete `GET /first-party/ad` and
   `POST /third-party/ad` sections (endpoints do not exist). The full
@@ -343,7 +368,10 @@ or parsed wherever feasible (the WP8 harness runs them).
   values; sweep both sets for other real domains, customer names, or
   credential-shaped strings. Reviewed canonical vendor endpoints (e.g. real
   GPT/DataDome CDN hosts an integration genuinely proxies) stay, everything
-  else becomes fictional.
+  else becomes fictional. Legitimate vendor endpoints are recorded in a
+  checked-in allowlist (category, rationale, owner) that the WP8 scanner
+  reads; `CLAUDE.md`'s example-domains-only policy gains a sentence
+  describing this vendor-endpoint exception (WP6 makes that edit).
 - Re-verify the pages touched by the final six rc commits:
   `docs/guide/integrations/datadome.md` (the staging requirement was
   removed from protection behavior in the same commit that rewrote the
@@ -458,9 +486,14 @@ integrations can skip typed deserialization entirely.
   `[cache]` section, promote the commented `[[cache.asset_rules]]` examples
   to a complete worked block covered by the WP8 example harness.
 - Field-path inventories: for every nested `Settings` type and all 14 typed
-  integration config structs, enumerate the full field paths from the
-  source, then reconcile `docs/guide/configuration.md`'s field tables
-  against that inventory. This audits the five existing integration
+  integration config structs, the inventory is derived from the serde
+  surface itself (a schema-derive or serializer-walk in a test, with an
+  explicit grammar for dynamic map keys, enum variants, aliases, flattened
+  fields, and skipped fields), so a newly added field breaks CI until the
+  inventory, template, and reference are updated - the chain is
+  Rust serde surface to machine inventory to template to generated
+  markdown, checked in both directions. Reconcile
+  `docs/guide/configuration.md`'s field tables against that inventory. This audits the five existing integration
   sections (Prebid's reference is already missing valid keys) as well as
   adding the nine absent ones (`aps`, `datadome`, `didomi`, `sourcepoint`,
   `lockr`, `gpt`, `gpt_diagnostics`, `google_tag_manager`, `adserver_mock`).
@@ -492,8 +525,10 @@ with per-endpoint contracts, not just paths, and with per-adapter accuracy.
 - Document every named route: health, discovery/signing endpoints, admin key
   rotation (and the deliberately 404-denied legacy `/admin/keys/*` aliases),
   the rc admin diagnostics (`GET /_ts/admin/ec` and `/_ts/admin/ec/{id}`,
-  Fastly-only because they need the EC KV store; `GET /_ts/admin/eids`,
-  which is a request-inspection handler registered on all four adapters),
+  registered on all four adapters but functional only on Fastly, which has
+  the EC identity KV store - the others return not-supported, matching the
+  key-rotation pattern; `GET /_ts/admin/eids`, a request-inspection
+  handler that works on all four adapters),
   EC partner API (`/_ts/api/v1/batch-sync`, `/_ts/api/v1/identify`), tester
   cookie endpoints, `POST /auction`, `GET /_ts/page-bids` plus the legacy
   `/__ts/page-bids` alias, the four `/first-party/*` proxy endpoints,
@@ -621,11 +656,20 @@ path) agree with the published tables.
 - Site usability: enable VitePress `lastUpdated` (the deploy workflow
   already fetches full history for it) and local search
   (`themeConfig.search`), so the 1,600-line configuration reference is
-  navigable; give mermaid diagrams a one-paragraph prose equivalent nearby.
+  navigable.
+- Release identity: add a global banner stating the site documents the
+  unreleased `main` line, plus a short compatibility statement
+  (server/config/CLI move together via the blob-envelope contract), and
+  the rule that versioned documentation is published when a release is
+  actually tagged.
+- Diagram accessibility: inventory the active public mermaid diagrams and
+  give each a nearby one-paragraph prose equivalent; the inventory with a
+  per-diagram checkbox is part of WP5's recorded acceptance.
 - Navigation: add sidebar entries for the three orphaned real integrations
-  (`gpt`, `google_tag_manager`, `sourcepoint`) and the new pages; remove
-  `business-use-cases` from primary navigation per the Non-goals default
-  (open question 4).
+  (`gpt`, `google_tag_manager`, `sourcepoint`) and the new pages;
+  `business-use-cases` is excluded from the build per the Non-goals
+  default (open question 4), so it neither sits in navigation nor counts
+  against the no-orphan acceptance.
 - `docs/guide/architecture.md`: describe all 10 workspace crates and the
   platform trait boundary; add the missing Cloudflare adapter section.
 
@@ -666,6 +710,13 @@ serve`; link the deployment guides; refresh the doc-site link table.
 - `.claude/skills/**`: audit the operator-facing skills (including the
   Fastly deployment skill) against current commands and config, same truth
   standard as the command files.
+- `.claude/agents/**`: audit every agent instruction file; they currently
+  describe a three-crate Fastly-only workspace, cite the nonexistent
+  `RequestWrapper` trait (`code-architect.md:11`, `repo-explorer.md:12`),
+  omit Cloudflare/Spin/parity gates (`verify-app.md:19`), and assume PRs
+  target `main` (`pr-creator.md:177`).
+- `CLAUDE.md` policy edits owned here: the vendor-endpoint exception
+  sentence (WP2) and the `# Examples` standard reconciliation (WP7).
 - `ProjectGovernance.md`: the two claims contradicted by repo state
   (meeting minutes "maintained within the repository" - none exist;
   "continuous releases" - none tagged since v1.1.0) become accurate
@@ -712,10 +763,13 @@ Targeted, not exhaustive. The worklist below is the acceptance scope.
    documented), which is the public tsjs type surface. Add a header block to
    `build-prebid-external.mjs` (401 lines, no header).
 
-Style follows `CLAUDE.md` documentation standards. `# Examples` sections are
-added only where an example compiles as a doctest and earns its keep
-(`redacted.rs` is the model); this spec does not attempt examples on all ~589
-public functions.
+Style follows `CLAUDE.md` documentation standards with one deliberate
+divergence that WP6 reconciles: `CLAUDE.md` currently mandates
+`# Examples` on every public API function, which no part of the codebase
+satisfies; the standard is updated to require examples where they compile
+as doctests and earn their keep (`redacted.rs` is the model), so the two
+documents state the same rule. This spec does not attempt examples on all
+~589 public functions.
 
 Rustdoc verification commands (the exact matrix WP8 puts in CI; the CI job
 needs pinned Node/npm setup because documenting `trusted-server-js` runs its
@@ -731,8 +785,8 @@ npm-based build script):
 Acceptance: every item on the worklist above is complete; the rustdoc
 command matrix builds warning-free with `RUSTDOCFLAGS="-D warnings"`; the
 listed TypeScript files each have a file-header JSDoc block and every
-`core/types.ts` export is documented (checked by the WP8 jsdoc lint scoped
-to those files, or a grep count recorded in the PR description).
+`core/types.ts` export is documented, enforced by the mandatory WP8 jsdoc
+lint scoped to those files.
 
 ### WP8: Enforcement
 
@@ -750,10 +804,11 @@ Build gates:
 
 - Docs site: add `npm run build` to the `format-docs` job in
   `.github/workflows/format.yml` so dead internal links fail PRs instead of
-  the post-merge deploy. External links are out of the PR gate; add an
-  allowlisted scheduled link check (or a documented manual audit cadence)
-  instead. Align the two workflows' npm cache keys (one keys on
-  `package.json`, the other on `package-lock.json`). Add `.tool-versions`
+  the post-merge deploy. External links are out of the PR gate; the decided policy is an
+  allowlisted scheduled link-check workflow (weekly), failing into an
+  issue rather than blocking PRs. Normalize every `setup-node` cache key across all workflows to the
+  relevant `package-lock.json` (today one keys on `package.json`, another
+  on the lockfile). Add `.tool-versions`
   to `deploy-docs.yml` trigger paths (the site renders versions from it, so
   version-only bumps must republish). If release-branch PRs are expected to
   get CodeQL analysis, add `rc/*` to `codeql.yml` branch triggers.
@@ -765,7 +820,9 @@ Build gates:
   `-D warnings` stays the item-level gate.
 - Doctests: add a native-host `cargo test --doc -p trusted-server-core` step
   (doctests are silently skipped today because core is only tested
-  cross-compiled).
+  cross-compiled). This job needs the same pinned Node/npm setup as the
+  rustdoc job: core depends on `trusted-server-js`, whose build script
+  invokes npm.
 - Add `[lints] workspace = true` to `trusted-server-openrtb-codegen`, the
   one crate not inheriting the doc lints.
 - Dependency governance: Dependabot gains the `github-actions` ecosystem,
@@ -780,22 +837,36 @@ Semantic parity checks (each catches a class of drift this audit found):
 - Example-config harness (replaces the naive parse test, which cannot pass:
   `Settings` finalization deliberately rejects the template's placeholder
   admin password, and TOML parsing ignores commented blocks). The harness
-  (a) applies a deterministic substitution of the known placeholders with
-  synthetic valid values and asserts the substituted template fully parses
-  and finalizes; (b) extracts every commented example block via explicit
-  begin/end markers and parses each one (typed integration blocks are
-  deserialized directly into their config structs, bypassing the
-  disabled-integration short-circuit); and (c) separately asserts the
-  distributed template still contains the placeholder markers, so a
-  template that would deploy without customization fails CI.
+  (a) applies a deterministic substitution of the known placeholders and
+  deliberately invalid disabled-block values (e.g. empty IDs) with
+  synthetic valid values, and asserts the substituted template fully
+  parses and finalizes; (b) extracts every commented example block via
+  explicit begin/end markers and, for typed integration blocks,
+  deserializes each directly into its config struct with ignored-key
+  detection (several structs, including Permutive's, do not reject
+  unknown fields), runs its `Validate::validate`, and exercises the
+  integration-specific deploy/startup checks from `core/src/config.rs`;
+  and (c) separately asserts the distributed template still contains the
+  placeholder markers, so a template that would deploy without
+  customization fails CI.
 - Route parity: a test per adapter asserting its registered route set,
   methods, and response semantics/status for guarded routes match the
   machine-readable inventory that feeds the api-reference generated
-  regions.
-- CLI parity: a golden file of the built `ts` binary's recursive `--help`
-  tree (commands and flags, including the dependency-owned `edgezero-cli`
-  lifecycle flags at the locked version) that feeds the cli.md generated
-  region.
+  regions. Route definitions expose only path, methods, and handler, so
+  the generated regions cover the route/availability tables; the
+  per-endpoint contract prose (auth, schemas, headers, cache/CORS, config
+  gates, rate limits) is explicitly manually owned, marked as such in the
+  page, and backed by targeted tests where they exist
+  (`Settings::ADMIN_ENDPOINTS` coverage, config-gate behavior tests)
+  rather than falsely claimed as generated. The adapter capability matrix
+  rows are likewise either tied to a per-adapter test or marked manually
+  owned.
+- CLI parity: golden files of the built `ts` binary's recursive `--help`
+  tree on both Linux and macOS (the `ts dev` subtree is compile-time
+  gated to macOS, and CI already runs the CLI suite on both hosts),
+  merged into a platform-annotated union (including the dependency-owned
+  `edgezero-cli` lifecycle flags at the locked version) that feeds the
+  cli.md generated region.
 - Integration parity: tests over the three inventories (registry
   `builders()`, auction `provider_builders()`, JS module registry including
   `JS_ALWAYS`) that together feed the integrations-overview generated
@@ -804,6 +875,13 @@ Semantic parity checks (each catches a class of drift this audit found):
   them.
 - Config parity: the field-path inventories from WP3 feed the
   configuration.md field tables' generated regions.
+- Snippet manifest: a checked-in manifest classifying every executable
+  fence in the active public set (rust-compile, toml/json-parse,
+  `bash -n`, safe smoke test, or manual with reason and source anchor);
+  CI runs the classified checks and fails on unclassified new fences.
+- Domain scanner: a deterministic scan of all active sets for
+  non-`.example` domains and credential-shaped strings, allowlist-aware
+  (the WP2 vendor allowlist).
 - Repo inventory: a CI script checking workspace members each have a
   README, every active public page is reachable from the sidebar or an
   explicit orphan allowlist, and the CI gate list in `CLAUDE.md` names the
@@ -812,9 +890,9 @@ Semantic parity checks (each catches a class of drift this audit found):
   ESLint, the CLI/codegen clippy jobs, the bench compile check, the release
   WASM builds, and the entire integration-tests workflow) so agents and the
   slash commands stay aligned with reality.
-- Optional, decide at review: enable a minimal `jsdoc/*` ESLint rule set
-  scoped to the WP7 TypeScript files; skipped by default to keep WP8
-  low-noise.
+- A scoped `jsdoc/*` ESLint rule set over the WP7 TypeScript files is
+  mandatory (a PR-description grep count provides no recurrence
+  protection); the plugin is already installed with zero rules enabled.
 
 Acceptance: a PR introducing a dead internal docs link, a broken intra-doc
 link, a failing doctest, an invalid example-config block, or a
@@ -824,17 +902,17 @@ the final PR HEAD produces no diff.
 
 ## Sequencing and estimate
 
-| Order | Package                                     | Size | Depends on                                                   |
-| ----- | ------------------------------------------- | ---- | ------------------------------------------------------------ |
-| 0     | WP1 containment subset → separate `main` PR | XS   | -                                                            |
-| 1     | WP1 hygiene (full, in rc PR)                | S    | -                                                            |
-| 2     | WP2 truth pass                              | M    | -                                                            |
-| 3     | WP3 config reference                        | M    | -                                                            |
-| 4     | WP4 API reference                           | M    | WP2                                                          |
-| 5     | WP5 new pages + nav                         | L    | WP2 (nav), WP3 (links)                                       |
-| 6     | WP6 root + crate READMEs                    | M    | -                                                            |
-| 7     | WP7 in-code docs                            | M    | -                                                            |
-| 8     | WP8 enforcement                             | L    | WP3, WP4, WP7 (generated regions and gates must start green) |
+| Order | Package                                     | Size | Depends on                                                       |
+| ----- | ------------------------------------------- | ---- | ---------------------------------------------------------------- |
+| 0     | WP1 containment subset → separate `main` PR | XS   | -                                                                |
+| 1     | WP1 hygiene (full, in rc PR)                | S    | -                                                                |
+| 2     | WP2 truth pass                              | M    | -                                                                |
+| 3     | WP3 config reference                        | M    | -                                                                |
+| 4     | WP4 API reference                           | M    | WP2                                                              |
+| 5     | WP5 new pages + nav                         | L    | WP2 (nav), WP3 (links)                                           |
+| 6     | WP6 root + crate READMEs                    | M    | -                                                                |
+| 7     | WP7 in-code docs                            | M    | -                                                                |
+| 8     | WP8 enforcement                             | L    | WP3-WP7 (generated regions, goldens, and gates must start green) |
 
 Commits land in this order within the single rc PR, after the spec commit;
 WP8 comes last so the new CI gates turn green on the same PR.
@@ -843,7 +921,8 @@ WP8 comes last so the new CI gates turn green on the same PR.
 
 Before the rc PR is marked ready, at its final HEAD:
 
-- All applicable GitHub checks green, explicitly including: format
+- All applicable GitHub checks green, explicitly including: CodeQL (with
+  `rc/*` added to its PR triggers), format
   (fmt/clippy matrix, ESLint, Prettier for js and docs), the seven `test.yml`
   jobs (rust/axum/cloudflare/spin/parity/cli/typescript), the four
   integration-test workflow jobs (including browser), the release WASM
@@ -881,13 +960,16 @@ where stated.
 3. `FAQ_POC.md` and the `gam.md`/`kargo.md` pages (blocks their WP2
    deletions): this spec recommends deletion with an inbound-link inventory
    and redirect stubs where referenced; confirm.
-4. `docs/business-use-cases.md` (blocks the WP5 nav change): default is now
-   removal from primary navigation until quantitative claims carry dated
-   evidence; the alternative is keeping it with evidence added in this
-   pass. Confirm the default.
+4. `docs/business-use-cases.md` (blocks the WP1/WP5 exclusion): default is
+   exclusion from the built site until quantitative claims carry dated
+   evidence and unshipped features are labeled; the alternative is an
+   evidence-based rewrite in this pass. Confirm the default.
 5. CHANGELOG release cut (blocks nothing; mechanical repairs are in WP2
-   either way): should a release be cut to drain the six breaking entries
-   in `[Unreleased]`?
+   either way): should a release be cut to drain the seven breaking
+   entries in `[Unreleased]`? If no release is cut, the deterministic WP2
+   edit is: keep the `[1.2.0]` section with an explicit "(tag v1.2.0 was
+   never published)" annotation, repoint the link references to
+   resolvable compares, and leave entries untouched.
 6. Governance ownership (blocks the WP6 governance edit only): who owns
    naming maintainers/CODEOWNERS and the meeting-minutes commitment?
 7. Delivery shape (blocks starting implementation): confirm the shape in
@@ -925,27 +1007,27 @@ files, not from this table alone. WP8's route snapshots also record response
 semantics/status for guarded and unsupported routes, not only method and
 path.
 
-| Route                                                                                         | Methods                                                                              | Availability                                                                            | Handler                                                                                                                                         |
-| --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/health`                                                                                     | GET                                                                                  | all except Cloudflare                                                                   | adapter entry points                                                                                                                            |
-| `/_ts/debug/ja4`                                                                              | GET                                                                                  | Fastly only, gated by `debug.ja4_endpoint_enabled`                                      | `adapter-fastly/src/main.rs`                                                                                                                    |
-| `/.well-known/trusted-server.json`                                                            | GET                                                                                  | all                                                                                     | `core/src/request_signing/endpoints.rs`                                                                                                         |
-| `/verify-signature`                                                                           | POST                                                                                 | all                                                                                     | `core/src/request_signing/endpoints.rs`                                                                                                         |
-| `/_ts/admin/keys/rotate`, `/_ts/admin/keys/deactivate`                                        | POST                                                                                 | Fastly working; Axum, Cloudflare, and Spin register the routes and return not-supported | `core/src/request_signing/endpoints.rs`, `adapter-fastly/src/management_api.rs`                                                                 |
-| `/_ts/admin/ec`, `/_ts/admin/ec/{id}`                                                         | GET                                                                                  | Fastly only (requires the EC identity KV store); Basic-auth gated                       | `core/src/ec/admin.rs`                                                                                                                          |
-| `/_ts/admin/eids`                                                                             | GET                                                                                  | all four adapters (request-inspection handler); Basic-auth gated                        | `core/src/ec/admin.rs`; registrations in `adapter-axum/src/app.rs:342`, `adapter-cloudflare/src/app.rs:506`, `adapter-spin/src/app.rs:533` (rc) |
-| `/admin/keys/*`                                                                               | the seven fallback methods                                                           | all: deliberately 404-denied legacy aliases                                             | adapter apps                                                                                                                                    |
-| `/_ts/api/v1/batch-sync`                                                                      | POST                                                                                 | Fastly only; Bearer auth + rate limit                                                   | `core/src/ec/batch_sync.rs`                                                                                                                     |
-| `/_ts/api/v1/identify`                                                                        | GET, OPTIONS                                                                         | Fastly only                                                                             | `core/src/ec/identify.rs`                                                                                                                       |
-| `/_ts/set-tester`, `/_ts/clear-tester`                                                        | GET                                                                                  | Fastly only, gated by `tester_cookie.enabled`                                           | `core/src/tester_cookie.rs`                                                                                                                     |
-| `/auction`                                                                                    | POST                                                                                 | all                                                                                     | `core/src/auction/endpoints.rs`                                                                                                                 |
-| `/_ts/page-bids`                                                                              | GET; OPTIONS registered and denied in-handler (CORS preflight guard)                 | all; gated by `X-TSJS-Page-Bids` header                                                 | `core/src/publisher.rs`                                                                                                                         |
-| `/__ts/page-bids`                                                                             | GET; OPTIONS registered and denied                                                   | legacy alias of `/_ts/page-bids`                                                        | `core/src/publisher.rs`                                                                                                                         |
-| `/first-party/proxy`, `/first-party/click`, `/first-party/sign`, `/first-party/proxy-rebuild` | GET (sign/rebuild also POST)                                                         | all                                                                                     | `core/src/proxy.rs`                                                                                                                             |
-| `/static/tsjs=<file>`                                                                         | GET                                                                                  | all (fallback chain)                                                                    | `core/src/publisher.rs` `handle_tsjs_dynamic`                                                                                                   |
-| `/integrations/<id>/...`                                                                      | varies                                                                               | per enabled integration (Appendix C)                                                    | integration proxies                                                                                                                             |
-| asset route prefixes                                                                          | GET, HEAD                                                                            | Fastly only today; operator-configured `[[proxy.asset_routes]]`                         | `core/src/proxy.rs` `handle_asset_proxy_request`, dispatched from `adapter-fastly/src/app.rs`                                                   |
-| everything else                                                                               | the seven registered fallback methods (GET, POST, HEAD, OPTIONS, PUT, PATCH, DELETE) | publisher origin proxy + HTML rewriting                                                 | `core/src/publisher.rs` `handle_publisher_request`                                                                                              |
+| Route                                                                                         | Methods                                                                              | Availability                                                                                                                                                                                                           | Handler                                                                                                                                         |
+| --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/health`                                                                                     | GET                                                                                  | all except Cloudflare                                                                                                                                                                                                  | adapter entry points                                                                                                                            |
+| `/_ts/debug/ja4`                                                                              | GET                                                                                  | Fastly only, gated by `debug.ja4_endpoint_enabled`                                                                                                                                                                     | `adapter-fastly/src/main.rs`                                                                                                                    |
+| `/.well-known/trusted-server.json`                                                            | GET                                                                                  | all                                                                                                                                                                                                                    | `core/src/request_signing/endpoints.rs`                                                                                                         |
+| `/verify-signature`                                                                           | POST                                                                                 | all                                                                                                                                                                                                                    | `core/src/request_signing/endpoints.rs`                                                                                                         |
+| `/_ts/admin/keys/rotate`, `/_ts/admin/keys/deactivate`                                        | POST                                                                                 | Fastly working; Axum, Cloudflare, and Spin register the routes and return not-supported                                                                                                                                | `core/src/request_signing/endpoints.rs`, `adapter-fastly/src/management_api.rs`                                                                 |
+| `/_ts/admin/ec`, `/_ts/admin/ec/{id}`                                                         | GET                                                                                  | registered on all four adapters; functional only on Fastly (EC identity KV store), others return not-supported (`adapter-axum/src/app.rs:330`, `adapter-cloudflare/src/app.rs:500`, `adapter-spin/src/app.rs:800`, rc) | `core/src/ec/admin.rs`                                                                                                                          |
+| `/_ts/admin/eids`                                                                             | GET                                                                                  | all four adapters (request-inspection handler); Basic-auth gated                                                                                                                                                       | `core/src/ec/admin.rs`; registrations in `adapter-axum/src/app.rs:342`, `adapter-cloudflare/src/app.rs:506`, `adapter-spin/src/app.rs:533` (rc) |
+| `/admin/keys/*`                                                                               | the seven fallback methods                                                           | all: deliberately 404-denied legacy aliases                                                                                                                                                                            | adapter apps                                                                                                                                    |
+| `/_ts/api/v1/batch-sync`                                                                      | POST                                                                                 | Fastly only; Bearer auth + rate limit                                                                                                                                                                                  | `core/src/ec/batch_sync.rs`                                                                                                                     |
+| `/_ts/api/v1/identify`                                                                        | GET, OPTIONS                                                                         | Fastly only                                                                                                                                                                                                            | `core/src/ec/identify.rs`                                                                                                                       |
+| `/_ts/set-tester`, `/_ts/clear-tester`                                                        | GET                                                                                  | Fastly only, gated by `tester_cookie.enabled`                                                                                                                                                                          | `core/src/tester_cookie.rs`                                                                                                                     |
+| `/auction`                                                                                    | POST                                                                                 | all                                                                                                                                                                                                                    | `core/src/auction/endpoints.rs`                                                                                                                 |
+| `/_ts/page-bids`                                                                              | GET; OPTIONS registered and denied in-handler (CORS preflight guard)                 | all; gated by `X-TSJS-Page-Bids` header                                                                                                                                                                                | `core/src/publisher.rs`                                                                                                                         |
+| `/__ts/page-bids`                                                                             | GET; OPTIONS registered and denied                                                   | legacy alias of `/_ts/page-bids`                                                                                                                                                                                       | `core/src/publisher.rs`                                                                                                                         |
+| `/first-party/proxy`, `/first-party/click`, `/first-party/sign`, `/first-party/proxy-rebuild` | GET (sign/rebuild also POST)                                                         | all                                                                                                                                                                                                                    | `core/src/proxy.rs`                                                                                                                             |
+| `/static/tsjs=<file>`                                                                         | GET                                                                                  | all (fallback chain)                                                                                                                                                                                                   | `core/src/publisher.rs` `handle_tsjs_dynamic`                                                                                                   |
+| `/integrations/<id>/...`                                                                      | varies                                                                               | per enabled integration (Appendix C)                                                                                                                                                                                   | integration proxies                                                                                                                             |
+| asset route prefixes                                                                          | GET, HEAD                                                                            | Fastly only today; operator-configured `[[proxy.asset_routes]]`                                                                                                                                                        | `core/src/proxy.rs` `handle_asset_proxy_request`, dispatched from `adapter-fastly/src/app.rs`                                                   |
+| everything else                                                                               | the seven registered fallback methods (GET, POST, HEAD, OPTIONS, PUT, PATCH, DELETE) | publisher origin proxy + HTML rewriting                                                                                                                                                                                | `core/src/publisher.rs` `handle_publisher_request`                                                                                              |
 
 Per-adapter pipelines: Fastly runs pre-route integration request filters
 (DataDome), then dispatches tsjs, integration proxy routes, asset routes,
@@ -1101,7 +1183,7 @@ baseline and re-verified on rc/202608 where marked.
 - fastly.toml: personal email (`:4`), service id (`:10`, ops-owned
   follow-up), orphaned script reference (`:38`), unlabeled key fixtures
   (`:48-74`).
-- Publishing: 75 `docs/superpowers/**` files built into the public site (no
+- Publishing: 120 `docs/superpowers/**` markdown files built into the public site (no
   `srcExclude`); `docs/guide/onboarding.md` published with internal
   contacts; `docs/public/CNAME` placeholder; empty `docs/guide/index.md`;
   nav Guide link bypasses the landing page (`config.mts:61`);
