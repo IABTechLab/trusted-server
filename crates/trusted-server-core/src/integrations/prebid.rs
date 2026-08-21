@@ -2715,7 +2715,7 @@ mod tests {
     };
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{bootstrap_transport, create_test_settings};
     use base64::engine::general_purpose::STANDARD as TEST_BASE64_STANDARD;
     use bytes::Bytes;
     use http::Method;
@@ -3284,7 +3284,15 @@ excluded_gam_ad_unit_path_suffixes = ["{suffix}"]
         let shim_index = processed
             .find("id=\"trustedserver-js\"")
             .expect("should inject one TSJS runtime tag");
-        assert!(processed.contains(r#""id":"prebid","phase":"takeover""#));
+        let transport = bootstrap_transport(&processed);
+        let manifest_integrations = transport["boot"]["manifest"]["integrations"]
+            .as_array()
+            .expect("manifest integrations should be an array");
+        assert!(
+            manifest_integrations
+                .iter()
+                .any(|entry| { entry["id"] == "prebid" && entry["phase"] == "takeover" })
+        );
         assert!(!processed.contains("tsjs-prebid.min.js"));
         assert!(
             bundle_index < shim_index,

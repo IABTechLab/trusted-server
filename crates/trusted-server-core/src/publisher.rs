@@ -5518,6 +5518,19 @@ mod tests {
         }
     }
 
+    fn boot_auction_id(html: &str) -> String {
+        bootstrap_transport(html)["boot"]["auctionProjection"]["auction"]["auctionId"]
+            .as_str()
+            .expect("sealed auction projection should carry an auction id")
+            .to_owned()
+    }
+
+    fn boot_gpt_diagnostics_active(html: &str) -> bool {
+        bootstrap_transport(html)["boot"]["diagnostics"]["gpt"]["active"]
+            .as_bool()
+            .expect("sealed diagnostics should carry the GPT activation state")
+    }
+
     mod coordinated_cutover_projection_tests {
         use std::collections::{HashMap, VecDeque};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7077,7 +7090,7 @@ mod tests {
             "should not inject the removed activation flag"
         );
         assert!(
-            html.contains(r#""gpt":{"active":true}"#),
+            boot_gpt_diagnostics_active(&html),
             "should activate diagnostics through immutable boot data"
         );
         assert!(html.contains("tsjs-unified.min.js?v="));
@@ -9697,7 +9710,7 @@ mod tests {
                 "https://origin.test-publisher.com/article?keep=a%2Fb"
             );
             assert_eq!(result.outbound_cookie.as_deref(), Some("publisher=value"));
-            assert!(body.contains(r#""gpt":{"active":false}"#));
+            assert!(!boot_gpt_diagnostics_active(&body));
             assert!(!body.contains("tsjs-gpt_diagnostics.min.js"));
             assert!(!body.contains("tsjs-gpt_diagnostics-bootstrap.min.js"));
             assert_eq!(body.matches("history.replaceState").count(), 1);
@@ -9715,7 +9728,7 @@ mod tests {
         .await;
         let active_body = response_body_string(active.response);
         assert_eq!(active.outbound_cookie.as_deref(), Some("publisher=value"));
-        assert!(active_body.contains(r#""gpt":{"active":true}"#));
+        assert!(boot_gpt_diagnostics_active(&active_body));
         assert!(active_body.contains("tsjs-unified.min.js?v="));
         assert!(!active_body.contains("tsjs-gpt_diagnostics.min.js"));
         assert!(!active_body.contains("tsjs-gpt_diagnostics-bootstrap.min.js"));
@@ -9737,7 +9750,7 @@ mod tests {
             "https://origin.test-publisher.com/article?keep=%2F"
         );
         let disabled_body = response_body_string(disabled.response);
-        assert!(disabled_body.contains(r#""gpt":{"active":false}"#));
+        assert!(!boot_gpt_diagnostics_active(&disabled_body));
         assert!(!disabled_body.contains("tsjs-gpt_diagnostics.min.js"));
         assert!(!disabled_body.contains("tsjs-gpt_diagnostics-bootstrap.min.js"));
         assert_eq!(disabled_body.matches("history.replaceState").count(), 1);
@@ -9753,13 +9766,15 @@ mod tests {
         )
         .await;
         let body = response_body_string(result.response);
+        let transport = bootstrap_transport(&body);
+        let diagnostics = &transport["boot"]["diagnostics"];
 
         assert!(
-            body.contains(r#""renderTraceOverlay":true"#),
+            diagnostics["renderTraceOverlay"] == true,
             "the exact server-owned trace cookie must populate DiagnosticsBootV1: {body}"
         );
         assert_eq!(
-            body.matches(r#""diagnostics":{"version":1,"renderTraceOverlay":true"#)
+            body.matches("const __TSJS_SERVER_BOOT_TRANSPORT_V1__=")
                 .count(),
             1,
             "the immutable server boot must carry one active diagnostics object"
@@ -9783,7 +9798,7 @@ mod tests {
             assert_eq!(result.outbound_cookie.as_deref(), Some("publisher=value"));
             assert!(!result.response.headers().contains_key(header::SET_COOKIE));
             let body = response_body_string(result.response);
-            assert!(body.contains(r#""gpt":{"active":false}"#));
+            assert!(!boot_gpt_diagnostics_active(&body));
             assert!(!body.contains("tsjs-gpt_diagnostics.min.js"));
             assert!(!body.contains("tsjs-gpt_diagnostics-bootstrap.min.js"));
             assert!(!body.contains("history.replaceState"));
@@ -12129,20 +12144,21 @@ mod tests {
             .expect("stream body with auction should process on async path");
 
             let html = String::from_utf8(output).expect("should be valid UTF-8");
+            let auction_id = boot_auction_id(&html);
             assert!(
                 html.contains("hello"),
                 "should preserve streamed HTML content. Got: {html}"
             );
             assert!(
-                html.contains(r#""auctionId":"a1_"#),
+                auction_id.starts_with("a1_"),
                 "the immutable pre-core boot must contain the collected auction projection with a browser-only auction id. Got: {html}"
             );
             assert!(
-                !html.contains(&format!(r#""auctionId":"{}""#, auction_request.id)),
+                auction_id != auction_request.id,
                 "the immutable pre-core boot must not expose the upstream auction id. Got: {html}"
             );
             assert!(
-                !html.contains(r#""auctionId":"initial""#),
+                auction_id != "initial",
                 "the safe empty projection must not replace a dispatched auction. Got: {html}"
             );
             assert!(!html.contains(".adSlots"));
@@ -12207,6 +12223,7 @@ mod tests {
             .expect("buffered multi-member gzip auction body should process");
 
             let html = String::from_utf8(gzip_decode(&output)).expect("should be valid UTF-8");
+            let auction_id = boot_auction_id(&html);
             assert!(
                 html.contains("hello"),
                 "should decode the first gzip member. Got: {html}"
@@ -12216,11 +12233,11 @@ mod tests {
                 "should decode the second gzip member that a single-member decoder drops. Got: {html}"
             );
             assert!(
-                html.contains(r#""auctionId":"a1_"#),
+                auction_id.starts_with("a1_"),
                 "should emit the collected projection with a browser-only auction id before the head bundle. Got: {html}"
             );
             assert!(
-                !html.contains(r#""auctionId":"test-auction""#),
+                auction_id != "test-auction",
                 "should not expose the upstream auction id to the browser. Got: {html}"
             );
             assert!(!html.contains(".bids="));
@@ -12569,20 +12586,21 @@ mod tests {
 
         let first = first_lazy_body_chunk(body);
         let html = String::from_utf8(first.to_vec()).expect("should be valid UTF-8");
+        let auction_id = boot_auction_id(&html);
         assert!(
             html.contains("hello"),
             "the origin body should remain lazy after the pre-head collect. Got: {html}"
         );
         assert!(
-            html.contains(r#""auctionId":"a1_"#),
+            auction_id.starts_with("a1_"),
             "the first head chunk must contain the exact collected projection with a browser-only auction id. Got: {html}"
         );
         assert!(
-            !html.contains(r#""auctionId":"test-auction""#),
+            auction_id != "test-auction",
             "the first head chunk must not expose the upstream auction id. Got: {html}"
         );
         assert!(
-            !html.contains(r#""auctionId":"initial""#),
+            auction_id != "initial",
             "a dispatched auction must not boot with the safe empty projection. Got: {html}"
         );
         assert!(!html.contains(".adSlots"));
@@ -13077,13 +13095,14 @@ mod tests {
         .to_vec();
 
         let html = String::from_utf8(gzip_decode(&output)).expect("should be valid UTF-8");
+        let auction_id = boot_auction_id(&html);
         assert!(
-            html.contains(r#""auctionId":"a1_"#),
+            auction_id.starts_with("a1_"),
             "should collect the exact projection with a browser-only auction id before the compressed head. Got head: {}",
             &html[..html.len().min(500)]
         );
         assert!(
-            !html.contains(r#""auctionId":"test-auction""#),
+            auction_id != "test-auction",
             "should not expose the upstream auction id in the compressed head. Got head: {}",
             &html[..html.len().min(500)]
         );
@@ -13144,7 +13163,7 @@ mod tests {
 
         let html = String::from_utf8(output).expect("should be valid UTF-8");
         assert!(
-            html.contains(r#""auctionId":"initial","results":[]},"slots":[],"bids":[]"#),
+            boot_auction_id(&html) == "initial",
             "mixed-case HTML must use the HTML processor and inject the canonical boot projection. Got: {html}"
         );
         assert!(
