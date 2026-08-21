@@ -585,7 +585,13 @@ pub(crate) fn run_update_slots(
                     Ok(page) => {
                         let final_url = page.final_url().unwrap_or_else(|_| url.clone());
                         if let Err(error) =
-                            fold_collected(&mut table, &final_url, &page, &mut notes)
+                            fold_collected(
+                                &mut table,
+                                &final_url,
+                                &page,
+                                first_label,
+                                &mut notes,
+                            )
                         {
                             fold_error = Some(error);
                             return Ok(collector::ControlFlow::Stop);
@@ -617,8 +623,10 @@ pub(crate) fn run_update_slots(
     // counts as a redirect worth reporting.
     if without_fragment(&root_url) != without_fragment(&target_url) {
         notes.push(format!(
-            "followed a root redirect from `{}` to `{}`; slots and page patterns are derived from the final URL",
+            "followed a root redirect from `{}{}` to `{}{}`; slots and page patterns are derived from the final URL",
+            target_url.origin().ascii_serialization(),
             target_url.path(),
+            root_url.origin().ascii_serialization(),
             root_url.path()
         ));
     }
@@ -944,6 +952,7 @@ fn fold_collected(
     table: &mut evidence::EvidenceTable,
     url: &Url,
     collected: &collector::CollectedPage,
+    profile_label: &str,
     notes: &mut Vec<String>,
 ) -> CliResult<()> {
     // `analyze_collected_page` already carries the collector's warnings forward,
@@ -956,14 +965,14 @@ fn fold_collected(
         let note = if warning == collector::CONSENT_STUB_WARNING {
             warning.clone()
         } else {
-            format!("`{}`: {warning}", url.path())
+            format!("`{}` on {profile_label}: {warning}", url.path())
         };
         if !notes.contains(&note) {
             notes.push(note);
         }
     }
     if let Some(reason) = looks_like_an_interstitial(&artifact) {
-        notes.push(format!("`{}`: {reason}", url.path()));
+        notes.push(format!("`{}` on {profile_label}: {reason}", url.path()));
     }
     let page_has_prebid = artifact
         .detected_integrations
@@ -1027,7 +1036,9 @@ fn crawl_sections(
                     Ok(page) => {
                         successful_pages += 1;
                         let final_url = page.final_url().unwrap_or_else(|_| url.clone());
-                        if let Err(error) = fold_collected(table, &final_url, &page, notes) {
+                        if let Err(error) =
+                            fold_collected(table, &final_url, &page, profile_label, notes)
+                        {
                             fold_error = Some(error);
                             return Ok(collector::ControlFlow::Stop);
                         }
@@ -1649,6 +1660,7 @@ mod tests {
                 &mut table,
                 &Url::parse(url).expect("should parse fixture URL"),
                 &collected_page_with_ambiguous_slots(url),
+                "desktop",
                 &mut notes,
             )
             .expect("should fold ambiguous page evidence");
@@ -1700,6 +1712,7 @@ mod tests {
                 &mut table,
                 &Url::parse(url).expect("should parse fixture URL"),
                 &page,
+                "desktop",
                 &mut notes,
             )
             .expect("should fold page evidence");
@@ -1710,6 +1723,30 @@ mod tests {
             [collector::CONSENT_STUB_WARNING.to_string()],
             "a run-wide fact should appear once, without a page path"
         );
+    }
+
+    #[test]
+    fn page_warnings_remain_distinct_across_profiles() {
+        let mut table = evidence::EvidenceTable::default();
+        let mut notes = Vec::new();
+        let mut page = collected_page();
+        page.requested_url = "https://publisher.example/news".to_string();
+        page.final_url = page.requested_url.clone();
+        page.warnings.push("navigation did not settle".to_string());
+        let url = Url::parse(&page.final_url).expect("should parse fixture URL");
+
+        fold_collected(&mut table, &url, &page, "desktop", &mut notes)
+            .expect("should fold desktop evidence");
+        fold_collected(&mut table, &url, &page, "mobile", &mut notes)
+            .expect("should fold mobile evidence");
+
+        assert_eq!(
+            notes.len(),
+            2,
+            "profile-specific warnings must not collapse"
+        );
+        assert!(notes.iter().any(|note| note.contains("on desktop")));
+        assert!(notes.iter().any(|note| note.contains("on mobile")));
     }
 
     #[test]
@@ -2246,7 +2283,10 @@ mod tests {
         );
         let notes = String::from_utf8(notes).expect("notes should be UTF-8");
         assert!(
-            notes.contains("followed a root redirect"),
+            notes.contains(
+                "followed a root redirect from `http://publisher.example/` to \
+                 `https://publisher.example/`"
+            ),
             "an accepted redirect should say the run switched URLs, got {notes:?}"
         );
     }

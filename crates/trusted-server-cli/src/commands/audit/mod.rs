@@ -16,7 +16,7 @@ use clap::{Args, Subcommand};
 use crate::app_config::AppConfigArgs;
 use crate::commands::audit::collector::{BrowserOpts, GenerateBrowserOpts};
 use crate::commands::audit::page::PageAuditArgs;
-use crate::error::{CliResult, cli_error};
+use crate::error::{CliResult, cli_error, report_error};
 use crate::run::RunOutcome;
 
 /// Parses and validates an `http`/`https` URL, rejecting all other schemes.
@@ -405,15 +405,18 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
 ///
 /// # Errors
 ///
-/// Returns a user-facing error when the section is present but cannot be
-/// deserialized.
+/// Returns a user-facing error when the document is malformed or the section is
+/// present but cannot be deserialized.
 fn creative_config(
     document: &str,
 ) -> CliResult<Option<trusted_server_core::creative_opportunities::CreativeOpportunitiesConfig>> {
-    let Some(section) = toml::from_str::<toml::Value>(document)
-        .ok()
-        .and_then(|value| value.get("creative_opportunities").cloned())
-    else {
+    let value = toml::from_str::<toml::Value>(document).map_err(|error| {
+        report_error(format!(
+            "failed to parse the existing config before generating slots: {error}. Fix the \
+             TOML syntax and re-run"
+        ))
+    })?;
+    let Some(section) = value.get("creative_opportunities").cloned() else {
         return Ok(None);
     };
     match section.try_into() {
@@ -480,6 +483,17 @@ mod tests {
         assert!(
             creative.is_none(),
             "a document with no `[creative_opportunities]` has no configured slots"
+        );
+    }
+
+    #[test]
+    fn malformed_document_is_rejected_before_creative_config_extraction() {
+        let error = creative_config("[creative_opportunities\ngam_network_id = \"123\"\n")
+            .expect_err("should reject malformed TOML");
+
+        assert!(
+            format!("{error:?}").contains("failed to parse the existing config"),
+            "error should identify the document parse failure, got {error:?}"
         );
     }
 
