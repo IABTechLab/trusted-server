@@ -930,6 +930,17 @@ mod tests {
         AdTemplateCollectorConfig, build_ad_template_init_script,
     };
 
+    const AD_TEMPLATE_COLLECTOR_JS: &str = include_str!("ad_template_collector.js");
+
+    #[test]
+    fn rust_and_javascript_evidence_entry_caps_match() {
+        assert!(
+            AD_TEMPLATE_COLLECTOR_JS
+                .contains(&format!("const __ts_max_entries = {MAX_EVIDENCE_ENTRIES}")),
+            "should keep the JS cap equal to MAX_EVIDENCE_ENTRIES"
+        );
+    }
+
     #[test]
     fn well_known_chrome_paths_are_known_for_this_os() {
         // macOS/Linux/Windows each have candidate paths; guards the cfg branches.

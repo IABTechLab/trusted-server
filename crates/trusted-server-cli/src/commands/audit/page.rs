@@ -128,7 +128,8 @@ mod tests {
 
     #[test]
     fn page_controlled_text_is_escaped_before_it_reaches_the_terminal() {
-        // Title, warning text, and the post-redirect URL are all page-controlled.
+        // Title and warning text are page-controlled and can contain raw
+        // terminal controls. URL percent-encoding is asserted separately.
         let page = collected(
             "https://publisher.example/a%1B%5B2Jb",
             "Example\u{1b}[2J",
@@ -143,6 +144,10 @@ mod tests {
         assert!(
             !out.contains('\u{1b}'),
             "no escape sequence may reach the terminal, got {out:?}"
+        );
+        assert!(
+            out.contains("final url: https://publisher.example/a%1B%5B2Jb\n"),
+            "the final URL should retain URL's percent encoding, got {out:?}"
         );
         assert!(
             out.contains("warning [page_"),
