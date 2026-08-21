@@ -220,7 +220,7 @@ describe('GptDiagnosticsApiController', () => {
               requestedSlotSizes: [
                 [300, 250],
                 [728, 90],
-              ],
+              ] as const,
               adManager: {
                 yieldGroupIds: [10],
                 companyIds: [20],

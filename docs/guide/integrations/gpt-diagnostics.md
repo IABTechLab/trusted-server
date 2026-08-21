@@ -339,22 +339,26 @@ element using the same exact ID is rebound automatically.
 
 When Trusted Server associates a GPT slot with its next request, diagnostics retains
 `requestedSlotSizes`: the configured `AuctionSlot.formats` list Trusted Server supplied
-to GPT for that request. It is a bounded validated copy of the complete configured
-list, not an inferred responsive size or a claim about the final selected size. It is
-omitted for publisher and otherwise unknown request paths where Trusted Server did not
-supply formats.
+to GPT when it defined the slot. A reused slot keeps those definition-time formats even
+if a later SPA auction has different configured formats, because GPT still holds the
+original sizes. The retained value is a bounded validated copy of the complete
+configured list, not an inferred responsive size or a claim about the final selected
+size. It is omitted for publisher and otherwise unknown request paths where Trusted
+Server did not supply formats.
 
 For an explicitly filled render, diagnostics can also retain `observedSlotSize`: the
-current outer CSS box of the uniquely bound, connected slot element. This is measured
-after `slotRenderEnded`. When `ResizeObserver` is available, it remains current
-while that same request cycle is latest for the GPT slot; otherwise it is the most
-recently sampled box. It is displayed separately from `size`, which remains the exact
-GPT-reported `slotRenderEnded.size` fill-size fact. The panel and badge label the three
-separate facts as requested slot sizes, GPT-reported fill size, and observed outer slot
-box. The observed box may differ from GPT's reported size (for example, a flexible APS
-creative can report `1×1` while its allocated outer slot box is larger). It is a
-publisher-page layout measurement, not a claim about universal internal creative-pixel
-dimensions. A collapsed or hidden bound element can report `0×0`, which records the
+most recently sampled outer CSS box of the uniquely bound, connected slot element.
+This is measured after `slotRenderEnded`. When `ResizeObserver` is available, it is
+updated while that same request cycle is latest for the GPT slot. If the element later
+becomes unbound or ambiguous, the last successful sample remains as request-cycle
+evidence while the binding status reports the current DOM state. It is displayed
+separately from `size`, which remains the exact GPT-reported `slotRenderEnded.size`
+fill-size fact. The panel labels the three separate facts as requested slot sizes,
+GPT-reported fill size, and observed outer slot box; the badge abbreviates them as
+`Req`, `Fill`, and `Box`. The observed box may differ from GPT's reported size (for
+example, a flexible APS creative can report `1×1` while its allocated outer slot box
+is larger). The measurement describes publisher-page layout, not universal internal
+creative-pixel dimensions. A collapsed or hidden bound element can report `0×0`, which records the
 page layout state rather than an invalid measurement. Empty, unbound, missing, or
 ambiguous slots do not report an observed box; delayed measurements from an older cycle
 are rejected after a refresh.

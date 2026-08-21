@@ -113,14 +113,12 @@ function badgeText(cycle: GptDiagnosticsRequestCycle): string {
     const displayedSizes = cycle.requestedSlotSizes.slice(0, MAX_BADGE_REQUESTED_SLOT_SIZES);
     const remainingSizeCount = cycle.requestedSlotSizes.length - displayedSizes.length;
     firstLine.push(
-      `Requested ${formatSizes(displayedSizes)}${
-        remainingSizeCount > 0 ? ` +${remainingSizeCount}` : ''
-      }`
+      `Req ${formatSizes(displayedSizes)}${remainingSizeCount > 0 ? ` +${remainingSizeCount}` : ''}`
     );
   }
-  if (cycle.size) firstLine.push(`GPT fill ${cycle.size[0]}×${cycle.size[1]}`);
+  if (cycle.size) firstLine.push(`Fill ${cycle.size[0]}×${cycle.size[1]}`);
   if (cycle.observedSlotSize) {
-    firstLine.push(`Outer box ${cycle.observedSlotSize[0]}×${cycle.observedSlotSize[1]}`);
+    firstLine.push(`Box ${cycle.observedSlotSize[0]}×${cycle.observedSlotSize[1]}`);
   }
 
   const timingLine: string[] = [];
