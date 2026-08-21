@@ -455,29 +455,6 @@ function prepareApsRunnerDocument(
   }).observe(frameDocument.body, { childList: true });
 }
 
-function prepareApsRunnerDocument(
-  frameWindow: Window & typeof globalThis,
-  frameDocument: Document
-): void {
-  for (const element of [frameDocument.documentElement, frameDocument.body]) {
-    element.style.margin = '0px';
-    element.style.padding = '0px';
-  }
-
-  const normalizeFrame = (node: Node): void => {
-    if (
-      node instanceof frameWindow.HTMLIFrameElement &&
-      node.parentElement === frameDocument.body
-    ) {
-      node.style.display = 'block';
-    }
-  };
-  Array.from(frameDocument.body.children).forEach(normalizeFrame);
-  new frameWindow.MutationObserver((records) => {
-    for (const record of records) record.addedNodes.forEach(normalizeFrame);
-  }).observe(frameDocument.body, { childList: true });
-}
-
 /** Render the exact selected response through APS's fixed runner in a friendly iframe. */
 function renderApsPublisherNative({
   slotId,
