@@ -551,6 +551,10 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         true
     }
 
+    fn supports_pending_streaming_responses(&self) -> bool {
+        true
+    }
+
     async fn send(
         &self,
         request: PlatformHttpRequest,
@@ -580,17 +584,17 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("Image Optimizer is not supported with Fastly send_async"));
         }
-        if request.stream_response {
-            return Err(Report::new(PlatformError::HttpClient)
-                .attach("streaming responses are not supported with Fastly send_async"));
-        }
+        let stream_response = request.stream_response;
+        let request_method = request.request.method().clone();
         let bypass_cache = request.bypass_cache;
         let mut fastly_req = edge_request_to_fastly(request.request)?;
         apply_fastly_cache_bypass(&mut fastly_req, bypass_cache);
         let pending = fastly_req
             .send_async(&backend_name)
             .change_context(PlatformError::HttpClient)?;
-        Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
+        Ok(PlatformPendingRequest::new(pending)
+            .with_backend_name(backend_name)
+            .with_response_handling(stream_response, request_method))
     }
 
     async fn select(
@@ -602,6 +606,14 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         if pending_requests.is_empty() {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("select called with an empty pending_requests list"));
+        }
+
+        if pending_requests
+            .iter()
+            .any(PlatformPendingRequest::stream_response)
+        {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("stream-marked pending request requires direct wait"));
         }
 
         let mut fastly_pending: Vec<PendingRequest> = Vec::with_capacity(pending_requests.len());
@@ -659,6 +671,33 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
             remaining,
             failed_backend_name,
         })
+    }
+
+    async fn wait(
+        &self,
+        pending: PlatformPendingRequest,
+    ) -> Result<PlatformResponse, Report<PlatformError>> {
+        use fastly::http::request::PendingRequest;
+
+        let backend_hint = pending.backend_name().map(str::to_owned);
+        let stream_response = pending.stream_response();
+        let request_is_head = pending.request_method() == Some(&edgezero_core::http::Method::HEAD);
+        let pending = pending.downcast::<PendingRequest>().map_err(|pending| {
+            let backend_name = pending.backend_name().unwrap_or("<unknown>");
+            Report::new(PlatformError::HttpClient).attach(format!(
+                "PlatformPendingRequest inner type is not fastly::PendingRequest for backend '{backend_name}'"
+            ))
+        })?;
+        let response = pending.wait().change_context(PlatformError::HttpClient)?;
+        let backend_name = response
+            .get_backend_name()
+            .map(str::to_owned)
+            .or(backend_hint)
+            .ok_or_else(|| {
+                Report::new(PlatformError::HttpClient)
+                    .attach("wait: response has no backend name; correlation impossible")
+            })?;
+        fastly_response_to_platform(response, backend_name, stream_response, request_is_head)
     }
 }
 
@@ -1082,6 +1121,21 @@ mod tests {
     }
 
     #[test]
+    fn fastly_platform_http_client_rejects_stream_marked_pending_from_select() {
+        let client = FastlyPlatformHttpClient;
+        let pending = PlatformPendingRequest::new(42_u32)
+            .with_backend_name("origin-a")
+            .with_response_handling(true, edgezero_core::http::Method::GET);
+        let err = futures::executor::block_on(client.select(vec![pending]))
+            .expect_err("should reject stream-marked pending handles from select");
+
+        assert!(
+            format!("{err:?}").contains("stream-marked pending request"),
+            "should explain that streaming pendings require direct wait: {err:?}"
+        );
+    }
+
+    #[test]
     fn fastly_platform_http_client_send_returns_error_for_streaming_body() {
         let client = FastlyPlatformHttpClient;
         let request = request_builder()
@@ -1132,8 +1186,13 @@ mod tests {
     }
 
     #[test]
-    fn fastly_platform_http_client_send_async_rejects_stream_response() {
+    fn fastly_platform_http_client_supports_pending_streaming_responses() {
         let client = FastlyPlatformHttpClient;
+        assert!(
+            client.supports_pending_streaming_responses(),
+            "should advertise direct pending-response streaming"
+        );
+
         let request = request_builder()
             .method("GET")
             .uri("https://example.com/image.jpg")
@@ -1143,11 +1202,11 @@ mod tests {
             PlatformHttpRequest::new(request, "nonexistent-backend").with_stream_response();
 
         let err = futures::executor::block_on(client.send_async(platform_request))
-            .expect_err("should reject async streaming-response requests");
+            .expect_err("should fail only because the backend is unregistered");
 
         assert!(
-            format!("{err:?}").contains("streaming responses"),
-            "should explain unsupported async streaming-response path: {err:?}"
+            !format!("{err:?}").contains("streaming responses are not supported"),
+            "should accept streaming on the async path before backend dispatch: {err:?}"
         );
     }
 

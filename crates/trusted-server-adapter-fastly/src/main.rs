@@ -205,9 +205,9 @@ fn edgezero_main(mut req: FastlyRequest) {
         policy.apply_after_route_finalization(&mut response);
     }
 
-    if let Some(ec_state) = ec_state {
+    if let Some(mut ec_state) = ec_state {
         if let Some(settings) = settings_snapshot.as_deref() {
-            match apply_edgezero_ec_finalize(settings, &ec_state, &mut response) {
+            match apply_edgezero_ec_finalize(settings, &mut ec_state, &mut response) {
                 Ok(partner_registry) => {
                     send_edgezero_response(response, request_filter_effects.as_ref());
                     run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
@@ -222,7 +222,7 @@ fn edgezero_main(mut req: FastlyRequest) {
         } else {
             match load_settings_from_config_store() {
                 Ok(settings) => {
-                    match apply_edgezero_ec_finalize(&settings, &ec_state, &mut response) {
+                    match apply_edgezero_ec_finalize(&settings, &mut ec_state, &mut response) {
                         Ok(partner_registry) => {
                             send_edgezero_response(response, request_filter_effects.as_ref());
                             run_edgezero_pull_sync_after_send(
@@ -286,7 +286,7 @@ fn apply_entry_point_finalize_headers(
 
 fn apply_edgezero_ec_finalize(
     settings: &Settings,
-    ec_state: &EcFinalizeState,
+    ec_state: &mut EcFinalizeState,
     response: &mut HttpResponse,
 ) -> Result<PartnerRegistry, Report<TrustedServerError>> {
     let partner_registry = PartnerRegistry::from_config(&settings.ec.partners)?;
@@ -297,7 +297,7 @@ fn apply_edgezero_ec_finalize(
     };
     ec_finalize_response(
         settings,
-        &ec_state.ec_context,
+        &mut ec_state.ec_context,
         finalize_kv_graph.as_ref(),
         &partner_registry,
         ec_state.eids_cookie.as_deref(),

@@ -201,6 +201,26 @@ mod tests {
     }
 
     #[test]
+    fn platform_pending_request_preserves_response_handling_metadata() {
+        let pending = PlatformPendingRequest::new(7_u8)
+            .with_backend_name("origin")
+            .with_response_handling(true, edgezero_core::http::Method::HEAD);
+        let pending = pending
+            .downcast::<String>()
+            .expect_err("should reject downcast to the wrong pending type");
+
+        assert!(
+            pending.stream_response(),
+            "should preserve the streaming response flag"
+        );
+        assert_eq!(
+            pending.request_method(),
+            Some(&edgezero_core::http::Method::HEAD),
+            "should preserve the originating request method"
+        );
+    }
+
+    #[test]
     fn geo_info_coordinates_string_formats_correctly() {
         let geo = GeoInfo {
             city: "New York".to_owned(),
