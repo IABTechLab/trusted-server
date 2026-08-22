@@ -203,5 +203,5 @@ One lever at a time, Fastly pilot only, each independently config-reversible for
 
 1. Land binary (including the telemetry field and Tinybird schema, deployed schema-first); all flags default off.
 2. Lever A Phase 0 trace on the pilot property (including callback-discipline capture). If predicates and net-benefit hold: enable `request_bids_coalesce_ms = 50` alone; hold ≥7 days against the guardrail table; on failure return to `0` and confirm drain per the definition above.
-3. With A retained-and-stable or fully drained: enable `gam_preconnect` alone under its governance artifact; **hold ≥7 days** with the weekly synthetic reuse/setup and consent-network checks; retain only if the live checks continue to meet the acceptance gates, roll back on any conformance failure immediately.
+3. With A retained-and-stable or fully drained: enable `gam_preconnect` alone under its governance artifact; **hold ≥7 days** with the daily synthetic reuse/setup and consent-network checks; retain only if the live checks continue to meet the acceptance gates, roll back on any conformance failure immediately.
 4. Lever C follows its own spec revision after discovery.
