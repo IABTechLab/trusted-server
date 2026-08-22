@@ -25,7 +25,7 @@ use trusted_server_core::constants::{
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
 use trusted_server_core::geo::GeoInfo;
-use trusted_server_core::platform::PlatformGeo;
+use trusted_server_core::platform::{ClientInfo, PlatformGeo};
 use trusted_server_core::settings::Settings;
 
 pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
@@ -67,7 +67,10 @@ impl FinalizeResponseMiddleware {
 #[async_trait(?Send)]
 impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        let client_ip = FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip);
+        let client_ip = ctx.request().extensions().get::<ClientInfo>().map_or_else(
+            || FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip),
+            |info| info.client_ip,
+        );
 
         let mut response = match next.run(ctx).await {
             Ok(r) => r,
@@ -249,7 +252,7 @@ mod tests {
 
     use std::collections::HashMap;
     use std::net::IpAddr;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
@@ -259,7 +262,7 @@ mod tests {
     use edgezero_core::params::PathParams;
     use error_stack::Report;
     use futures::executor::block_on;
-    use trusted_server_core::platform::{PlatformError, PlatformGeo};
+    use trusted_server_core::platform::{ClientInfo, PlatformError, PlatformGeo};
 
     fn empty_response() -> Response {
         response_builder()
@@ -281,6 +284,23 @@ mod tests {
     impl PlatformGeo for FixedGeo {
         fn lookup(&self, _: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
             Ok(self.0.clone())
+        }
+    }
+
+    struct RecordingGeo {
+        lookups: Arc<Mutex<Vec<Option<IpAddr>>>>,
+    }
+
+    impl PlatformGeo for RecordingGeo {
+        fn lookup(
+            &self,
+            client_ip: Option<IpAddr>,
+        ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+            self.lookups
+                .lock()
+                .expect("should lock recorded geo lookups")
+                .push(client_ip);
+            Ok(None)
         }
     }
 
@@ -524,6 +544,110 @@ mod tests {
     // ---------------------------------------------------------------------------
     // FinalizeResponseMiddleware::handle tests
     // ---------------------------------------------------------------------------
+
+    #[test]
+    fn finalize_handle_uses_client_info_ip_for_geo_lookup() {
+        let reader_ip = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7));
+        let peer_ip = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9));
+        let settings = settings_with_response_headers(vec![]);
+        let lookups = Arc::new(Mutex::new(Vec::new()));
+        let middleware = FinalizeResponseMiddleware::new(
+            Arc::new(settings),
+            Arc::new(RecordingGeo {
+                lookups: Arc::clone(&lookups),
+            }),
+        );
+        let mut ctx = empty_ctx();
+        ctx.request_mut().extensions_mut().insert(ClientInfo {
+            client_ip: Some(reader_ip),
+            ..ClientInfo::default()
+        });
+        FastlyRequestContext::insert(
+            ctx.request_mut(),
+            FastlyRequestContext {
+                client_ip: Some(peer_ip),
+            },
+        );
+        let handler =
+            Arc::new(
+                |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
+            );
+
+        block_on(middleware.handle(ctx, Next::new(&[], &*handler))).expect("should succeed");
+
+        assert_eq!(
+            *lookups.lock().expect("should lock recorded geo lookups"),
+            vec![Some(reader_ip)],
+            "should look up geo using the resolved ClientInfo IP"
+        );
+    }
+
+    #[test]
+    fn finalize_handle_preserves_none_from_present_client_info() {
+        let peer_ip = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9));
+        let settings = settings_with_response_headers(vec![]);
+        let lookups = Arc::new(Mutex::new(Vec::new()));
+        let middleware = FinalizeResponseMiddleware::new(
+            Arc::new(settings),
+            Arc::new(RecordingGeo {
+                lookups: Arc::clone(&lookups),
+            }),
+        );
+        let mut ctx = empty_ctx();
+        ctx.request_mut()
+            .extensions_mut()
+            .insert(ClientInfo::default());
+        FastlyRequestContext::insert(
+            ctx.request_mut(),
+            FastlyRequestContext {
+                client_ip: Some(peer_ip),
+            },
+        );
+        let handler =
+            Arc::new(
+                |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
+            );
+
+        block_on(middleware.handle(ctx, Next::new(&[], &*handler))).expect("should succeed");
+
+        assert_eq!(
+            *lookups.lock().expect("should lock recorded geo lookups"),
+            vec![None],
+            "should preserve no IP from the authoritative ClientInfo"
+        );
+    }
+
+    #[test]
+    fn finalize_handle_uses_fastly_context_ip_when_client_info_is_absent() {
+        let peer_ip = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9));
+        let settings = settings_with_response_headers(vec![]);
+        let lookups = Arc::new(Mutex::new(Vec::new()));
+        let middleware = FinalizeResponseMiddleware::new(
+            Arc::new(settings),
+            Arc::new(RecordingGeo {
+                lookups: Arc::clone(&lookups),
+            }),
+        );
+        let mut ctx = empty_ctx();
+        FastlyRequestContext::insert(
+            ctx.request_mut(),
+            FastlyRequestContext {
+                client_ip: Some(peer_ip),
+            },
+        );
+        let handler =
+            Arc::new(
+                |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
+            );
+
+        block_on(middleware.handle(ctx, Next::new(&[], &*handler))).expect("should succeed");
+
+        assert_eq!(
+            *lookups.lock().expect("should lock recorded geo lookups"),
+            vec![Some(peer_ip)],
+            "should fall back to the Fastly request context IP"
+        );
+    }
 
     #[test]
     fn finalize_handle_injects_geo_unavailable_on_ok_response() {
