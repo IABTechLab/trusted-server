@@ -242,7 +242,8 @@ describe('installTsAdInit', () => {
 
   function configureOpportunityDiagnostics(
     bid: AuctionBidData | undefined,
-    recordTrustedServerOpportunity: ReturnType<typeof vi.fn>
+    recordTrustedServerOpportunity: ReturnType<typeof vi.fn>,
+    formats: Array<[number, number]> = [[300, 250]]
   ) {
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
@@ -268,7 +269,7 @@ describe('installTsAdInit', () => {
           id: 'atf_sidebar_ad',
           gam_unit_path: '/123/atf',
           div_id: 'div-atf-sidebar',
-          formats: [[300, 250]],
+          formats,
           targeting: {},
         },
       ],
@@ -329,7 +330,9 @@ describe('installTsAdInit', () => {
       expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
         mockSlot,
         'atf_sidebar_ad',
-        expectedOpportunity
+        expectedOpportunity,
+        undefined,
+        undefined
       );
     }
   );
@@ -354,8 +357,94 @@ describe('installTsAdInit', () => {
       mockSlot,
       'atf_sidebar_ad',
       'unrenderable_candidate',
-      'auction-123'
+      'auction-123',
+      undefined
     );
+  });
+
+  it('retains handoff formats when reusing a Trusted Server-defined GPT slot', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const formats: Array<[number, number]> = [
+      [300, 250],
+      [728, 90],
+      [320, 50],
+    ];
+    const { mockSlot } = configureOpportunityDiagnostics(
+      undefined,
+      recordTrustedServerOpportunity,
+      formats
+    );
+    (window as TestWindow).tsjs!.gptSlotHandoffs = {
+      'div-atf-sidebar': {
+        gamUnitPath: '/123/atf',
+        formats,
+        divIdPrefix: 'div-atf-sidebar',
+        slotElementId: 'div-atf-sidebar',
+        publisherClaimed: true,
+        suppressPublisherDisplay: false,
+        suppressPublisherRefresh: false,
+      },
+    };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'no_candidate',
+      undefined,
+      formats
+    );
+  });
+
+  it('forwards configured formats when defining a Trusted Server GPT slot', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const formats: Array<[number, number]> = [
+      [300, 250],
+      [728, 90],
+    ];
+    const { mockPubads, mockSlot } = configureOpportunityDiagnostics(
+      undefined,
+      recordTrustedServerOpportunity,
+      formats
+    );
+    mockPubads.getSlots.mockReturnValue([]);
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'no_candidate',
+      undefined,
+      formats
+    );
+  });
+
+  it('keeps slot delivery running when requested-size diagnostics access throws', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const { mockPubads, mockSlot } = configureOpportunityDiagnostics(
+      undefined,
+      recordTrustedServerOpportunity
+    );
+    Object.defineProperty((window as TestWindow).tsjs!, 'gptSlotHandoffs', {
+      configurable: true,
+      get: () => {
+        throw new Error('diagnostics handoff unavailable');
+      },
+    });
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+
+    expect(() => (window as TestWindow).tsjs!.adInit!()).not.toThrow();
+    expect(recordTrustedServerOpportunity).not.toHaveBeenCalled();
+    expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
+    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
   });
 
   it('records no_candidate when the resolved slot has no bid', async () => {
@@ -370,7 +459,9 @@ describe('installTsAdInit', () => {
     expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
       mockSlot,
       'atf_sidebar_ad',
-      'no_candidate'
+      'no_candidate',
+      undefined,
+      undefined
     );
   });
 
