@@ -328,7 +328,7 @@ check_hit_is_private() {
     -H "sec-fetch-dest: document" -H "sec-fetch-mode: navigate" \
     "http://127.0.0.1:$TS_PORT/article")
   check "cache hit is not shared-cacheable" \
-    "$(echo "$hdrs" | grep -ci 'cache-control: private, no-store' || true)" "1"
+    "$(echo "$hdrs" | grep -ci 'cache-control: no-store, private' || true)" "1"
 }
 
 check_post_reaches_origin() {
