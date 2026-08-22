@@ -44,7 +44,7 @@ fn migrated_legacy_project() -> MigratedProject {
     let mut document = LEGACY_CONFIG
         .parse::<DocumentMut>()
         .expect("should parse legacy integration config");
-    // EdgeZero v0.0.4 environment overlays cannot create missing TOML leaves,
+    // EdgeZero environment overlays cannot create missing TOML leaves,
     // so a migrated config must carry both creative-processing leaves for the
     // corresponding environment variables to take effect.
     document["auction"]["rewrite_creatives"] = value(true);

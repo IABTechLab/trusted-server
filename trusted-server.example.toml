@@ -147,7 +147,7 @@ enabled = false
 
 [auction]
 enabled = false
-# Defaults to true. Keep this leaf present when using the EdgeZero v0.0.4
+# Defaults to true. Keep this leaf present when using the EdgeZero
 # environment override. Set false to return unre-written winning-bid adm,
 # skipping proxy/click URL conversion and creative TSJS injection.
 # Sanitization is controlled separately by `sanitize_creatives` below.
