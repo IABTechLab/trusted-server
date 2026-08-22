@@ -110,8 +110,9 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
     // Phase 1 intentionally preserves the existing inline-settings model:
     // `ts config push` publishes the validated Trusted Server config as one
     // app-config blob. Migrating app-level secrets to `EdgeZero` secret-store
-    // references needs nested/array extraction support and operator migration
-    // work tracked separately.
+    // references needs the secret-field paths spelled out here (this
+    // hand-written impl does not inherit the derive's nested/array paths)
+    // plus operator migration work tracked separately.
     fn secret_fields() -> Vec<edgezero_core::app_config::SecretField> {
         Vec::new()
     }
