@@ -4,6 +4,8 @@ import { expect, test, type Page } from "@playwright/test";
 import { runtimeUrl } from "../../helpers/state.js";
 
 const RUNNER_URL = "https://client.aps.amazon-adsystem.com/prebid-creative.js";
+const PUBLISHER_CORE_URL =
+    "https://client.aps.amazon-adsystem.com/trusted-server-core.js";
 const IFRAME_CREATIVE_URL = "https://creative.example/iframe";
 const SCRIPT_CREATIVE_URL = "https://creative.example/script.js";
 const SANDBOX =
@@ -155,6 +157,9 @@ const FAKE_RUNNER = `(function(){
       if (bid.ext.tagtype === 'iframe') {
         var frame = document.createElement('iframe');
         frame.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+        frame.width = String(bid.w);
+        frame.height = String(bid.h);
+        frame.style.border = '0';
         frame.src = bid.ext.creativeurl;
         document.body.appendChild(frame);
       } else {
@@ -192,7 +197,7 @@ const SCRIPT_CREATIVE = `(function(){
   }, '*');
 })();`;
 
-test.describe("APS opaque renderer", () => {
+test.describe("APS rendering", () => {
     test("renders a trustedServer adapter bid using Prebid's generated GAM ad ID", async ({
         page,
     }) => {
@@ -955,5 +960,162 @@ parent.postMessage(JSON.stringify({
         await expect(page.locator("#same-origin-slot .existing")).toHaveCount(
             1,
         );
+    });
+
+    test("renders publisher-native mode through the injected friendly-frame runner", async ({
+        page,
+    }) => {
+        const publisherOrigin = "https://publisher.example";
+        const auctionUrl = `${publisherOrigin}/auction`;
+        const testUrl = `${publisherOrigin}/aps-publisher-native-test`;
+        const renderer = descriptor("iframe");
+        const coreBundle = readFileSync(clientAuctionBundlePaths().core, "utf8");
+        let runnerRequests = 0;
+
+        await page.route(PUBLISHER_CORE_URL, async (route) => {
+            await route.fulfill({
+                status: 200,
+                contentType: "application/javascript",
+                body: coreBundle,
+            });
+        });
+        await page.route(RUNNER_URL, async (route) => {
+            runnerRequests += 1;
+            await route.fulfill({
+                status: 200,
+                contentType: "application/javascript",
+                body: FAKE_RUNNER,
+            });
+        });
+        await page.route(IFRAME_CREATIVE_URL, async (route) => {
+            await route.fulfill({
+                status: 200,
+                contentType: "text/html",
+                body: IFRAME_CREATIVE,
+            });
+        });
+        await page.route(auctionUrl, async (route) => {
+            await route.fulfill({
+                status: 200,
+                contentType: "application/json",
+                body: JSON.stringify({
+                    id: "fictional-native-auction",
+                    seatbid: [
+                        {
+                            seat: "aps",
+                            bid: [
+                                {
+                                    id: renderer.bidId,
+                                    impid: "publisher-native-slot",
+                                    price: 1.23,
+                                    w: renderer.width,
+                                    h: renderer.height,
+                                    ext: { trusted_server: { renderer } },
+                                },
+                            ],
+                        },
+                    ],
+                    ext: {},
+                }),
+            });
+        });
+        await page.route(testUrl, async (route) => {
+            await route.fulfill({
+                status: 200,
+                contentType: "text/html",
+                headers: {
+                    "Content-Security-Policy":
+                        "default-src 'none'; script-src https://client.aps.amazon-adsystem.com https://creative.example; connect-src 'self'; frame-src https://creative.example",
+                },
+                body: `<!doctype html>
+<div id="publisher-native-slot"><span class="existing">existing publisher content</span></div>`,
+            });
+        });
+
+        await page.goto(testUrl);
+        await page.evaluate(async (scriptUrl) => {
+            await new Promise<void>((resolveScript, rejectScript) => {
+                const script = document.createElement("script");
+                script.setAttribute(
+                    "data-ts-aps-rendering-mode",
+                    "publisher_native",
+                );
+                script.src = scriptUrl;
+                script.addEventListener("load", () => resolveScript(), {
+                    once: true,
+                });
+                script.addEventListener(
+                    "error",
+                    () => rejectScript(new Error("TSJS core failed to load")),
+                    { once: true },
+                );
+                document.head.appendChild(script);
+            });
+        }, PUBLISHER_CORE_URL);
+        await page.evaluate(() => {
+            const tsjs = (
+                window as unknown as {
+                    tsjs: {
+                        addAdUnits(units: Array<Record<string, unknown>>): void;
+                        requestAds(): void;
+                    };
+                }
+            ).tsjs;
+            tsjs.addAdUnits([
+                {
+                    code: "publisher-native-slot",
+                    mediaTypes: { banner: { sizes: [[300, 250]] } },
+                    bids: [],
+                },
+            ]);
+            tsjs.requestAds();
+        });
+
+        await expect.poll(() => runnerRequests).toBe(1);
+        const frame = page.locator("#publisher-native-slot > iframe");
+        await expect(frame).toHaveCount(1);
+        await expect(frame).toBeVisible();
+        expect(await frame.getAttribute("sandbox")).toBeNull();
+        await expect(
+            frame
+                .contentFrame()
+                .locator(`iframe[src="${IFRAME_CREATIVE_URL}"]`),
+        ).toHaveCount(1);
+        await expect(
+            page.locator("#publisher-native-slot .existing"),
+        ).toHaveCount(0);
+        expect(
+            await frame.evaluate((element: HTMLIFrameElement) => {
+                const document = element.contentDocument!;
+                const creative = document.body.querySelector("iframe")!;
+                return {
+                    bodyMargin: getComputedStyle(document.body).margin,
+                    bodyPadding: getComputedStyle(document.body).padding,
+                    creativeDisplay: getComputedStyle(creative).display,
+                    clientWidth: document.documentElement.clientWidth,
+                    clientHeight: document.documentElement.clientHeight,
+                    scrollWidth: document.documentElement.scrollWidth,
+                    scrollHeight: document.documentElement.scrollHeight,
+                };
+            }),
+        ).toEqual({
+            bodyMargin: "0px",
+            bodyPadding: "0px",
+            creativeDisplay: "block",
+            clientWidth: 300,
+            clientHeight: 250,
+            scrollWidth: 300,
+            scrollHeight: 250,
+        });
+        expect(
+            await page
+                .locator("#publisher-native-slot")
+                .evaluate(
+                    (slot) =>
+                        slot.querySelectorAll(
+                            'iframe[src*="/integrations/aps/renderer"]',
+                        ).length,
+                ),
+        ).toBe(0);
     });
 });
