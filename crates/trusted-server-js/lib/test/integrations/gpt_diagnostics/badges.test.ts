@@ -278,7 +278,7 @@ describe('GptDiagnosticsBadgeManager', () => {
         },
       })
     ).toBe(
-      'Filled · Requested 728×90, 970×250 · GPT fill 728×90 · Outer box 980×270\nResponse 276 ms · Render 42 ms\nViewable after 1 s'
+      'Filled · Req 728×90, 970×250 · Fill 728×90 · Box 980×270\nResponse 276 ms · Render 42 ms\nViewable after 1 s'
     );
     expect(
       formatGptDiagnosticsBadgeText({
@@ -293,7 +293,7 @@ describe('GptDiagnosticsBadgeManager', () => {
         incompleteSequence: false,
         durations: {},
       })
-    ).toBe('Filled · Requested 300×250, 320×50, 728×90 +1');
+    ).toBe('Filled · Req 300×250, 320×50, 728×90 +1');
     expect(
       gptDiagnosticsBadgeTextForTest({
         requestNumber: 1,

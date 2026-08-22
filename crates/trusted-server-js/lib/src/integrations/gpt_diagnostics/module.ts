@@ -1,4 +1,3 @@
-import type { GoogletagDiagnosticsFact } from '../../adapters/googletag';
 import type {
   IntegrationActivationContext,
   IntegrationPrepareContext,
@@ -10,13 +9,13 @@ import {
   GptDiagnosticsDataApiController,
   type GptDiagnosticsPresentationFactory,
 } from './data_api';
-import { GptDiagnosticsObserver } from './observer';
+import { GptDiagnosticsObserver, type GptDiagnosticsFact } from './observer';
 import { GptDiagnosticsStore } from './store';
 
 export const GPT_DIAGNOSTICS_INTEGRATION_ID = 'gpt_diagnostics' as const;
 
 interface GptEventsCapability {
-  readonly subscribe: (listener: (fact: Readonly<Record<string, unknown>>) => void) => () => void;
+  readonly subscribe: (listener: (fact: Readonly<GptDiagnosticsFact>) => void) => () => void;
 }
 
 function activeConfiguration(candidate: unknown): boolean {
@@ -107,7 +106,7 @@ export function createGptDiagnosticsIntegrationRegistration(
         });
         active = true;
         const release = events.subscribe((fact) => {
-          if (active) observer.consume(fact as unknown as Readonly<GoogletagDiagnosticsFact>);
+          if (active) observer.consume(fact);
         });
         if (typeof release !== 'function') {
           throw new TypeError('GPT diagnostics event disposer is unavailable');

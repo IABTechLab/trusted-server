@@ -281,7 +281,7 @@ fn volatile_prefix_before_placement(div_id: &str) -> Option<String> {
 /// other structure than a generated id.
 fn is_per_render_token(segment: &str) -> bool {
     let leading_digits = segment.bytes().take_while(u8::is_ascii_digit).count();
-    leading_digits >= 8
+    leading_digits >= 10
         && segment.len() > leading_digits
         && segment.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
@@ -1214,7 +1214,7 @@ mod tests {
         let discovered = discover_gpt_slots(
             &[registry_slot(
                 "/123456789/site_in-article_desktop_1",
-                "vendor-tag_12345678AbCdEfGh_slot_inarticle_1",
+                "vendor-tag_1724112345678AbCdEfGh_slot_inarticle_1",
                 &[(300, 250)],
             )],
             &[],
@@ -1236,7 +1236,7 @@ mod tests {
     #[test]
     fn single_volatile_family_request_slot_is_refused() {
         let discovered = from_requests(&[request(
-            "https://securepubads.g.doubleclick.net/gampad/ads?iu_parts=123456789%2Csite_in-article_desktop_1&dids=vendor-tag_12345678AbCdEfGh_slot_inarticle_1&prev_iu_szs=300x250",
+            "https://securepubads.g.doubleclick.net/gampad/ads?iu_parts=123456789%2Csite_in-article_desktop_1&dids=vendor-tag_1724112345678AbCdEfGh_slot_inarticle_1&prev_iu_szs=300x250",
         )]);
 
         assert!(
@@ -1262,11 +1262,11 @@ mod tests {
         // that follows it is irrelevant: every one of these leaves `vendor-tag`
         // as the only stable prefix, and that prefix reaches all of them.
         for volatile in [
-            "vendor-tag_12345678AbCdEfGh_slot_inarticle_1",
-            "vendor-tag_12345678AbCdEfGh_slot_overlay_1-container",
-            "vendor-tag_12345678AbCdEfGh_slot_sidebar_1",
-            "vendor-tag_12345678AbCdEfGh_slot_overlay_stable",
-            "vendor-tag_12345678AbCdEfGh_slot_overlay_1_extra",
+            "vendor-tag_1724112345678AbCdEfGh_slot_inarticle_1",
+            "vendor-tag_1724112345678AbCdEfGh_slot_overlay_1-container",
+            "vendor-tag_1724112345678AbCdEfGh_slot_sidebar_1",
+            "vendor-tag_1724112345678AbCdEfGh_slot_overlay_stable",
+            "vendor-tag_1724112345678AbCdEfGh_slot_overlay_1_extra",
         ] {
             assert_eq!(
                 volatile_prefix_before_placement(volatile).as_deref(),
@@ -1284,9 +1284,12 @@ mod tests {
             // A bare digit run is how stable placement indices are written.
             "vendor-tag_12345678_slot_inarticle_1",
             "ad-slot-1234567890123456-tail",
+            // An eight-digit calendar date plus a stable suffix is not a
+            // timestamp-like per-render token.
+            "promo-20260820a-sidebar",
             // The token is trailing, so the prefix before it still identifies
             // this element and normalization/collision handling own the case.
-            "vendor-tag_slot_inarticle_12345678AbCdEfGh",
+            "vendor-tag_slot_inarticle_1724112345678AbCdEfGh",
             "vendor-tag-header",
         ] {
             assert_eq!(

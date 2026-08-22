@@ -21,6 +21,7 @@ import type {
   GptDiagnosticsPresentationSource,
 } from './data_api';
 import { GptDiagnosticsOverlay } from './overlay';
+import { GptDiagnosticsSlotSizeObserver } from './slot_size_observer';
 
 type GptDiagnosticsWindow = Window & typeof globalThis;
 
@@ -483,15 +484,20 @@ function createPresentationControls(
   });
   let badges: GptDiagnosticsBadgeManager | undefined;
   let overlay: GptDiagnosticsOverlay | undefined;
+  let slotSizeObserver: GptDiagnosticsSlotSizeObserver | undefined;
   const cleanup = (): void => {
     isolate(() => overlay?.destroy());
     isolate(() => badges?.destroy());
+    isolate(() => slotSizeObserver?.destroy());
     isolate(() => bindings.destroy());
   };
   try {
     badges = new GptDiagnosticsBadgeManager(source, bindings, {
       window: targetWindow,
       document: targetDocument,
+    });
+    slotSizeObserver = new GptDiagnosticsSlotSizeObserver(source, bindings, {
+      window: targetWindow,
     });
     overlay = new GptDiagnosticsOverlay(source, bindings, {
       window: targetWindow,

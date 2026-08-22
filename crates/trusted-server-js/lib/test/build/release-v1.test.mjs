@@ -473,9 +473,21 @@ test('generated first-display components self-register through one authenticated
     const activatedRenderOwner = registrations
       .find(({ id }) => id === 'render_owner_initial')
       .prepare(activatedBase.sliceHost);
+    const apsBase = registrations[0].prepare(dom.window.__firstDisplayBaseHost);
+    const activatedAps = registrations
+      .find(({ id }) => id === 'aps_initial')
+      .prepare(apsBase.sliceHost);
     const activatedGpt = registrations
       .find(({ id }) => id === 'gpt_initial')
       .prepare(activatedBase.sliceHost);
+    activatedAps.activate(dom.window.__firstDisplaySliceActivation);
+    assert.deepEqual(
+      [...dom.window.__firstDisplayEvents],
+      ['aps:aps'],
+      'the independently minified APS slice must consume the authored cross-artifact binding'
+    );
+    dom.window.__firstDisplayDisposers.pop()();
+    dom.window.__firstDisplayEvents.length = 0;
     activatedBase.activate(dom.window.__firstDisplayActivation);
     activatedRenderOwner.activate(dom.window.__firstDisplaySliceActivation);
     activatedGpt.activate(dom.window.__firstDisplaySliceActivation);
@@ -693,6 +705,11 @@ test('generated APS bootstrap configuration preserves its public wire keys', () 
     source,
     /TS APS Bootstrap Configure",version:2,bootstrapNonce:[^,}]+,["']?rendererNonce["']?:/u,
     'the independently minified APS slice must serialize rendererNonce with its authored name'
+  );
+  assert.match(
+    source,
+    /version:1,nonce:[^,}]+,["']?publisherOrigin["']?:/u,
+    'the independently minified APS slice must serialize publisherOrigin with its authored name'
   );
 });
 

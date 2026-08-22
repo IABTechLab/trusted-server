@@ -116,7 +116,7 @@ base TOML configuration by `ts config validate`, `ts config diff`, and
 stored in the app-config blob. Changing an environment variable requires
 rerunning validation and pushing the resolved config, not rebuilding the binary.
 
-EdgeZero v0.0.4 only overrides leaves that already exist in the parsed TOML; it
+EdgeZero's env overlay only overrides leaves that already exist in the parsed TOML; it
 does not create missing fields. Add newly introduced defaulted fields to an
 existing config before relying on their environment overrides. Pass `--no-env`
 to use file values without the overlay.
@@ -1502,7 +1502,7 @@ remove that field's non-default value (and any environment override), run
 `ts config validate`, push the resulting default-compatible blob, and only then
 roll back the binary.
 
-**Environment overlays:** EdgeZero v0.0.4 overlays cannot create missing TOML
+**Environment overlays:** EdgeZero's env overlays cannot create missing TOML
 leaves. Existing configs must add **both** leaves under `[auction]`
 (`rewrite_creatives` and `sanitize_creatives`) before
 `TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES` /
@@ -1566,19 +1566,25 @@ template delivery while retaining the slot configuration and direct
 #### Publisher document cache policy
 
 For a successful GET publisher document, Trusted Server applies the
-browser-facing `Cache-Control: max-age=60` policy from
+browser-only `Cache-Control: private, max-age=60` policy from
 [#1007](https://github.com/IABTechLab/trusted-server/issues/1007) when the
-server-side ad stack is structurally inactive. This includes an absent
+server-side ad stack is structurally inactive. Trusted Server also applies this
+policy to a subsequent `304 Not Modified` response so revalidation cannot
+restore the origin freshness policy. This includes an absent
 `[creative_opportunities]` section, `enabled = false`, no slot matching the
-path, or a disabled auction. The policy replaces the origin browser cache
-policy except when the origin sends `private` or `no-store`, which are
-preserved. Bot, prefetch, and consent-denied requests also retain the origin
-policy because they can produce a request-specific representation for the same
-URL. Error responses and non-document requests retain the origin policy.
+path, or a disabled auction. The `private` directive prevents shared caches
+that use `Cache-Control` from storing the document. The policy replaces the
+origin browser cache policy except when the origin sends `private` or
+`no-store`, which are preserved. Bot, prefetch, and consent-denied requests
+also retain the origin policy because they can produce a request-specific
+representation for the same URL. Error responses and non-document requests
+retain the origin policy.
 
-Any response that carries `Set-Cookie` is finalized as
-`Cache-Control: private, max-age=0`; this privacy rule takes precedence over
-the short inactive-stack policy.
+Trusted Server leaves origin validators and CDN-specific cache headers
+unchanged. Those headers continue to control supporting CDNs independently of
+the browser-only policy. If a response using the generated inactive-stack
+policy later carries `Set-Cookie`, cookie privacy finalization replaces it with
+`Cache-Control: private, max-age=0` and removes the CDN-specific cache headers.
 
 ```toml
 [creative_opportunities]
@@ -2020,7 +2026,7 @@ trusted-server.dev.toml      # Development overrides
 **Environment Variables Not Applied**:
 
 - Run the override through `ts config validate`, `ts config diff`, or `ts config push`
-- Verify the target leaf already exists in `trusted-server.toml`; EdgeZero v0.0.4 does not create missing fields
+- Verify the target leaf already exists in `trusted-server.toml`; the env overlay does not create missing fields
 - Verify prefix: `TRUSTED_SERVER__`
 - Check separator: `__` (double underscore)
 - Confirm the variable is exported: `echo $VARIABLE_NAME`

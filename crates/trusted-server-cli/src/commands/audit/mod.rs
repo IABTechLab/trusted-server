@@ -16,7 +16,7 @@ use clap::{Args, Subcommand};
 use crate::app_config::AppConfigArgs;
 use crate::commands::audit::collector::{BrowserOpts, GenerateBrowserOpts};
 use crate::commands::audit::page::PageAuditArgs;
-use crate::error::{CliResult, cli_error};
+use crate::error::{CliResult, cli_error, report_error};
 use crate::run::RunOutcome;
 
 /// Parses and validates an `http`/`https` URL, rejecting all other schemes.
@@ -93,7 +93,71 @@ pub(crate) struct LegacyGenerateArgs {
     )]
     pub(crate) cookies: Vec<(String, String)>,
     #[command(flatten)]
-    pub(crate) browser: GenerateBrowserOpts,
+    pub(crate) browser: LegacyBrowserOpts,
+}
+
+/// Hidden browser flags retained for the legacy `ts audit <url>` form.
+#[derive(Debug, Args)]
+pub(crate) struct LegacyBrowserOpts {
+    /// Path to the Chrome/Chromium executable.
+    #[arg(long, hide = true, requires = "legacy_url")]
+    pub(crate) chrome: Option<std::path::PathBuf>,
+    /// Run a visible browser instead of Chrome's new headless mode.
+    #[arg(long, hide = true, requires = "legacy_url")]
+    pub(crate) headful: bool,
+    /// Do not answer the standard IAB consent APIs for the fresh audit profile.
+    #[arg(long, hide = true, requires = "legacy_url")]
+    pub(crate) no_assume_consent: bool,
+    /// Route the browser through this proxy.
+    #[arg(long, value_name = "HOST:PORT", hide = true, requires = "legacy_url")]
+    pub(crate) browser_proxy: Option<String>,
+    /// Quiet window in milliseconds that marks the page settled.
+    #[arg(
+        long,
+        default_value_t = crate::commands::audit::collector::GENERATE_SETTLE_QUIET_MS,
+        hide = true,
+        requires = "legacy_url"
+    )]
+    pub(crate) settle_quiet_ms: u64,
+    /// Hard cap in milliseconds on waiting for the page to settle.
+    #[arg(
+        long,
+        default_value_t = crate::commands::audit::collector::GENERATE_SETTLE_MAX_MS,
+        hide = true,
+        requires = "legacy_url"
+    )]
+    pub(crate) settle_max_ms: u64,
+    /// Navigate to origins whose TLS certificate does not validate.
+    #[arg(long, hide = true, requires = "legacy_url")]
+    pub(crate) danger_accept_invalid_certs: bool,
+}
+
+impl Default for LegacyBrowserOpts {
+    fn default() -> Self {
+        Self {
+            chrome: None,
+            headful: false,
+            no_assume_consent: false,
+            browser_proxy: None,
+            settle_quiet_ms: crate::commands::audit::collector::GENERATE_SETTLE_QUIET_MS,
+            settle_max_ms: crate::commands::audit::collector::GENERATE_SETTLE_MAX_MS,
+            danger_accept_invalid_certs: false,
+        }
+    }
+}
+
+impl From<&LegacyBrowserOpts> for GenerateBrowserOpts {
+    fn from(options: &LegacyBrowserOpts) -> Self {
+        Self {
+            chrome: options.chrome.clone(),
+            headful: options.headful,
+            no_assume_consent: options.no_assume_consent,
+            browser_proxy: options.browser_proxy.clone(),
+            settle_quiet_ms: options.settle_quiet_ms,
+            settle_max_ms: options.settle_max_ms,
+            danger_accept_invalid_certs: options.danger_accept_invalid_certs,
+        }
+    }
 }
 
 /// `ts audit` subcommands.
@@ -311,8 +375,8 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
         }
         None => match args.legacy_url.as_ref() {
             Some(url) => {
-                args.legacy_generate.browser.validate()?;
                 let generate_args = legacy_generate_args(args, url);
+                generate_args.browser.validate()?;
                 let stdout = std::io::stdout();
                 let mut out = stdout.lock();
                 let collector = generate::browser_collector::BrowserAuditCollector::default()
@@ -341,15 +405,18 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
 ///
 /// # Errors
 ///
-/// Returns a user-facing error when the section is present but cannot be
-/// deserialized.
+/// Returns a user-facing error when the document is malformed or the section is
+/// present but cannot be deserialized.
 fn creative_config(
     document: &str,
 ) -> CliResult<Option<trusted_server_core::creative_opportunities::CreativeOpportunitiesConfig>> {
-    let Some(section) = toml::from_str::<toml::Value>(document)
-        .ok()
-        .and_then(|value| value.get("creative_opportunities").cloned())
-    else {
+    let value = toml::from_str::<toml::Value>(document).map_err(|error| {
+        report_error(format!(
+            "failed to parse the existing config before generating slots: {error}. Fix the \
+             TOML syntax and re-run"
+        ))
+    })?;
+    let Some(section) = value.get("creative_opportunities").cloned() else {
         return Ok(None);
     };
     match section.try_into() {
@@ -371,7 +438,7 @@ fn legacy_generate_args(args: &AuditArgs, url: &url::Url) -> generate::GenerateA
         no_config: args.legacy_generate.no_config,
         force: args.legacy_generate.force,
         cookies: args.legacy_generate.cookies.clone(),
-        browser: args.legacy_generate.browser.clone(),
+        browser: GenerateBrowserOpts::from(&args.legacy_generate.browser),
     }
 }
 
@@ -416,6 +483,17 @@ mod tests {
         assert!(
             creative.is_none(),
             "a document with no `[creative_opportunities]` has no configured slots"
+        );
+    }
+
+    #[test]
+    fn malformed_document_is_rejected_before_creative_config_extraction() {
+        let error = creative_config("[creative_opportunities\ngam_network_id = \"123\"\n")
+            .expect_err("should reject malformed TOML");
+
+        assert!(
+            format!("{error:?}").contains("failed to parse the existing config"),
+            "error should identify the document parse failure, got {error:?}"
         );
     }
 
@@ -470,9 +548,9 @@ mod tests {
                 no_config: false,
                 force: true,
                 cookies: vec![("session".to_string(), "example".to_string())],
-                browser: GenerateBrowserOpts {
+                browser: LegacyBrowserOpts {
                     headful: true,
-                    ..GenerateBrowserOpts::default()
+                    ..LegacyBrowserOpts::default()
                 },
             },
         };

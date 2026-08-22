@@ -108,22 +108,23 @@ function bindings(candidate: unknown): ApsInitialBindings | undefined {
       return undefined;
     }
     const fields = exactRecord(candidate, ['observe', 'publisherOrigin', 'register']);
+    const publisherOrigin = fields?.['publisherOrigin'];
     if (
       !fields ||
       typeof fields.observe !== 'function' ||
-      typeof fields.publisherOrigin !== 'string' ||
+      typeof publisherOrigin !== 'string' ||
       typeof fields.register !== 'function'
     ) {
       return undefined;
     }
-    const origin = new URL(fields.publisherOrigin);
+    const origin = new URL(publisherOrigin);
     const loopbackHttp =
       origin.protocol === 'http:' &&
       (origin.hostname === 'localhost' ||
         origin.hostname === '[::1]' ||
         LOOPBACK_IPV4.test(origin.hostname));
     if (
-      origin.origin !== fields.publisherOrigin ||
+      origin.origin !== publisherOrigin ||
       (origin.protocol !== 'https:' && !loopbackHttp) ||
       origin.username !== '' ||
       origin.password !== ''
@@ -282,11 +283,12 @@ export function installApsInitial(
 ): Readonly<{ version: 1; id: 'aps' }> {
   const value = bindings(candidate);
   if (!value || typeof own !== 'function') throw new TypeError('tsjs');
-  const rendererUrl = new URL('/integrations/aps/renderer/v2', value.publisherOrigin).href;
+  const publisherOrigin = value['publisherOrigin'];
+  const rendererUrl = new URL('/integrations/aps/renderer/v2', publisherOrigin).href;
   const protocol: FirstDisplayApsProtocolV1 = Object.freeze({
     version: 1,
     id: 'aps',
-    publisherOrigin: value.publisherOrigin,
+    publisherOrigin,
     rendererUrl,
     sandbox: SANDBOX,
     permanentSandbox: PERMANENT_SANDBOX,
@@ -296,7 +298,7 @@ export function installApsInitial(
     }),
     isBootstrapNonce: (input: unknown): input is string => exactOpaqueId(input, 'b1_'),
     isRendererNonce: (input: unknown): input is string => exactOpaqueId(input, 'n1_'),
-    bootstrapPolicy: (renderer: unknown) => bootstrapPolicy(renderer, value.publisherOrigin),
+    bootstrapPolicy: (renderer: unknown) => bootstrapPolicy(renderer, publisherOrigin),
     parseDocumentMessage,
     parseWindowMessage,
     createRenderStrategy: (options: FirstDisplayRenderOwnerOptionsV1) =>

@@ -63,6 +63,8 @@ import { createTargetingService } from '../../services/targeting';
 import {
   activateGptDiagnosticsEventListeners,
   createGptDiagnosticsFactBuffer,
+  createTrustedServerOpportunityFact,
+  type GptDiagnosticsFact,
   projectGptTraceFact,
 } from './diagnostics_facts';
 import { installGptGuard, resetGuardState } from './script_guard';
@@ -235,14 +237,35 @@ export function adoptInitialGptFactsFromHandoff(
   }
   const cycles = frozenArray(dataField(adoption.handoff, 'cycles'));
   const artifacts = frozenArray(dataField(adoption.handoff, 'artifacts'));
-  if (!cycles || !artifacts || adoption.identities.length !== cycles.length + artifacts.length) {
+  const slots = frozenArray(dataField(adoption.handoff, 'slots'));
+  if (
+    !cycles ||
+    !artifacts ||
+    !slots ||
+    adoption.identities.length !== cycles.length + artifacts.length
+  ) {
     return undefined;
   }
   const identities = new Map<string, ReturnType<GoogletagAdapter['diagnosticsIdentity']>>();
+  const opportunityFacts = new Map<
+    string,
+    NonNullable<ReturnType<typeof createTrustedServerOpportunityFact>>
+  >();
+  const slotById = new Map<string, unknown>();
+  for (let index = 0; index < slots.length; index += 1) {
+    const slotId = dataField(slots[index], 'id');
+    if (typeof slotId !== 'string' || slotById.has(slotId)) return undefined;
+    slotById.set(slotId, slots[index]);
+  }
   for (let index = 0; index < cycles.length; index += 1) {
     const token = dataField(cycles[index], 'token');
+    const slotId = dataField(cycles[index], 'slotId');
+    const placement = typeof slotId === 'string' ? slotById.get(slotId) : undefined;
+    const formats = frozenArray(dataField(placement, 'formats'));
     const physicalSlot = adoption.identities[index];
-    if (typeof token !== 'string' || !physicalSlot) return undefined;
+    if (typeof token !== 'string' || typeof slotId !== 'string' || !formats || !physicalSlot) {
+      return undefined;
+    }
     let identity: ReturnType<GoogletagAdapter['diagnosticsIdentity']>;
     try {
       identity = adapter.diagnosticsIdentity(physicalSlot);
@@ -250,12 +273,24 @@ export function adoptInitialGptFactsFromHandoff(
       return undefined;
     }
     if (!identity || identity.traceToken !== token || identities.has(token)) return undefined;
+    const opportunity = createTrustedServerOpportunityFact({
+      auctionSlotId: slotId,
+      opportunity: 'renderable_candidate',
+      requestedSlotSizes: formats as readonly Readonly<[number, number]>[],
+      slot: identity,
+    });
+    if (!opportunity) return undefined;
     identities.set(token, identity);
+    opportunityFacts.set(token, opportunity);
   }
   try {
     return buffer.adoptFirstDisplay(
       diagnostics as Readonly<FirstDisplayGptDiagnosticsV1>,
-      (traceToken) => identities.get(traceToken)
+      (traceToken) => identities.get(traceToken),
+      (traceToken, slot) => {
+        const opportunity = opportunityFacts.get(traceToken);
+        return opportunity?.slot === slot ? opportunity : undefined;
+      }
     )
       ? adoption
       : undefined;
@@ -545,6 +580,12 @@ interface InitialProjectionServices {
   readonly slots: SlotService;
   readonly targeting: TargetingService;
   readonly requestClass?: string;
+  readonly recordDiagnosticsOpportunity?: (
+    slot: object,
+    auctionSlotId: string,
+    trustedServerAuctionId: string,
+    requestedSlotSizes: readonly Readonly<[number, number]>[]
+  ) => void;
 }
 
 export interface GptSlotOperationInput extends Omit<PucGamAttemptInput, 'attempt'> {
@@ -585,6 +626,7 @@ export interface GptWinnerPublicationInput extends Omit<
   readonly slot: object;
   readonly slots: Pick<SlotService, 'isBoundGptSlot' | 'request'>;
   readonly targeting: Pick<TargetingService, 'observePublisherMutations' | 'own'>;
+  readonly beforeRequest?: (() => void) | undefined;
 }
 
 function currentProjectedWinner(input: GptWinnerPublicationInput): boolean {
@@ -924,6 +966,11 @@ export async function publishGptWinner(
       reservationId: input.bid.rendererReservationId,
       slots: {
         request: (requestInput) => {
+          try {
+            input.beforeRequest?.();
+          } catch {
+            // Diagnostics cannot change GPT request ownership.
+          }
           const handle = input.slots.request({ ...requestInput, expectedSlot: input.slot });
           requestStarted = true;
           return handle;
@@ -950,6 +997,7 @@ interface PbsCacheGptPublicationInput {
   readonly requestClass: string;
   readonly slots: Pick<SlotService, 'isBoundGptSlot' | 'request'>;
   readonly targeting: Pick<TargetingService, 'observePublisherMutations' | 'own'>;
+  readonly beforeRequest?: (() => void) | undefined;
 }
 
 async function publishPbsCacheGptWinner(input: PbsCacheGptPublicationInput): Promise<void> {
@@ -1020,6 +1068,11 @@ async function publishPbsCacheGptWinner(input: PbsCacheGptPublicationInput): Pro
       owners.push(ownership);
     }
     if (!current()) return;
+    try {
+      input.beforeRequest?.();
+    } catch {
+      // Diagnostics cannot change GPT request ownership.
+    }
     handle = input.slots.request({
       expectedSlot: input.binding.slot,
       intentId: ownerId,
@@ -1557,6 +1610,13 @@ export async function publishInitialGptProjection(
       if (binding) {
         cachePublications.push(
           publishPbsCacheGptWinner({
+            beforeRequest: () =>
+              input.recordDiagnosticsOpportunity?.(
+                binding.slot,
+                placement.slot,
+                projection.auction.auctionId,
+                placement.formats
+              ),
             bid,
             binding,
             googletag,
@@ -1607,6 +1667,13 @@ export async function publishInitialGptProjection(
         artifact,
         attempt,
         bid,
+        beforeRequest: () =>
+          input.recordDiagnosticsOpportunity?.(
+            binding.slot,
+            placement.slot,
+            projection.auction.auctionId,
+            placement.formats
+          ),
         createSlotOperation: render.createSlotOperation,
         googletag,
         navigation,
@@ -1730,6 +1797,28 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
       })
     : undefined;
   if (diagnosticsFacts) scope.onDispose(diagnosticsFacts.dispose);
+  const recordDiagnosticsOpportunity = (
+    slot: object,
+    auctionSlotId: string,
+    trustedServerAuctionId: string,
+    requestedSlotSizes: readonly Readonly<[number, number]>[]
+  ): void => {
+    if (!diagnosticsFacts) return;
+    try {
+      const identity = googletag.diagnosticsIdentity(slot);
+      if (!identity) return;
+      const fact = createTrustedServerOpportunityFact({
+        auctionSlotId,
+        opportunity: 'renderable_candidate',
+        requestedSlotSizes,
+        slot: identity,
+        trustedServerAuctionId,
+      });
+      if (fact) diagnosticsFacts.publish(fact);
+    } catch {
+      // Diagnostics cannot change GPT request ownership.
+    }
+  };
   let pucBridge: PucBridge | undefined;
   let takeoverReconciliationRelease: (() => void) | undefined;
   let laterLifecycleActive = false;
@@ -1816,6 +1905,7 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
               projection,
               protect: () => true,
               pucBridge: currentBridge,
+              recordDiagnosticsOpportunity,
               render,
               requestClass: 'page-bids',
               slots,
@@ -1864,7 +1954,7 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
     slots,
   });
   const eventsCapability = Object.freeze({
-    subscribe: (listener: (fact: Readonly<Record<string, unknown>>) => void): (() => void) => {
+    subscribe: (listener: (fact: Readonly<GptDiagnosticsFact>) => void): (() => void) => {
       const release =
         active && diagnosticsFacts
           ? diagnosticsFacts.activate(listener as Parameters<typeof diagnosticsFacts.activate>[0])
@@ -2014,6 +2104,7 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
           projection: auction.projection,
           protect: runtime.protectFirstDisplayAttemptBatch,
           pucBridge: currentBridge,
+          recordDiagnosticsOpportunity,
           render,
           slots,
           targeting,

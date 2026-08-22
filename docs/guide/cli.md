@@ -76,6 +76,29 @@ Trusted Server settings JSON. This blob model is intentional because full
 Trusted Server configs can exceed Fastly limits when split into one config-store
 entry per setting.
 
+Reclaim orphaned chunk entries leaked from prior oversized pushes:
+
+```bash
+ts config gc --adapter fastly
+```
+
+Without `--yes`, `config gc` only previews: it reports what it would delete and
+deletes nothing. `--dry-run` states that intent explicitly and conflicts with
+`--yes`. To actually delete, pass `--yes` together with `--older-than <window>`
+(`s`/`m`/`h`/`d` suffixes, e.g. `7d`; a bare number means seconds):
+
+```bash
+ts config gc --adapter fastly --yes --older-than 7d
+```
+
+`config gc` sweeps every root in the selected physical store, so `--older-than`
+is a safety assertion about the whole store: nothing in it changed within the
+window and no writer is targeting it. Unlike the other `config` subcommands,
+`gc` never loads the typed app config; its `--no-env` flag instead ignores
+`EDGEZERO__STORES__CONFIG__<ID>__NAME` when resolving which physical store to
+sweep. On a destructive run, check the store id `gc` reports before passing
+`--yes`.
+
 ### Diagnose ad-template configuration
 
 The static `ts config ad-templates` commands evaluate local configuration
@@ -263,7 +286,8 @@ ts audit ad-templates generate https://publisher.example/ --max-sections 20 --ma
 # Audit exactly one page, as earlier releases did.
 ts audit ad-templates generate https://publisher.example/ --max-pages 1
 
-# Set the patterns yourself; this disables pattern inference entirely.
+# Set the patterns yourself; this disables pattern inference entirely unless a
+# slot's template had to borrow section_root from another slot.
 ts audit ad-templates generate https://publisher.example/ \
   --page-pattern '/' --page-pattern '/news' --page-pattern '/news/*'
 
@@ -276,13 +300,19 @@ hand-tuned fields and gains this run's patterns and newly observed formats, and 
 `gam_unit_path` template is preserved. `--replace` discards existing slots
 instead, which also discards any template you wrote by hand.
 
+A slot that never appeared without a section segment can borrow a
+`section_root` witnessed by another slot only while its patterns are derived
+from the paths where it was observed. If `--page-pattern` would override those
+patterns, generation fails and names the affected slots; remove the explicit
+patterns so the safe per-slot patterns can be derived.
+
 A merge refuses to change the section policy that preserved `{section}` slots
-were written against: if the config already sets `section_root` (or
-`section_segment`) and this run infers different values, the run fails and asks
-for `--replace` as an explicit migration. A config whose `{section}` slots have
-no `section_root` at all is a different case — the runtime rejects such a file
-outright — so the first merge adopts the inferred policy and makes it loadable
-instead of demanding `--replace`.
+were written against. If the config has a non-empty `section_root`, an inferred
+root or segment mismatch fails and asks for `--replace` as an explicit
+migration. An explicitly configured `section_segment` is preserved even when
+`section_root` is unset. When the root is unset and the segment is either unset
+or agrees with inference, the first merge adopts the inferred root and makes
+the otherwise unloadable `{section}` config valid.
 
 Locale-prefixed sites are inferred at their observed section depth. Only real
 ISO 639-1 language codes are read as a locale prefix, so a two-letter _section_

@@ -222,10 +222,12 @@ function normalizedRequestedSlotSizes(value: unknown): ReadonlyArray<Size> | und
       candidate.length !== 2 ||
       typeof candidate[0] !== 'number' ||
       typeof candidate[1] !== 'number' ||
-      !Number.isFinite(candidate[0]) ||
-      !Number.isFinite(candidate[1]) ||
-      candidate[0] <= 0 ||
-      candidate[1] <= 0
+      !Number.isInteger(candidate[0]) ||
+      !Number.isInteger(candidate[1]) ||
+      candidate[0] < 1 ||
+      candidate[0] > 4_096 ||
+      candidate[1] < 1 ||
+      candidate[1] > 4_096
     ) {
       continue;
     }
@@ -354,6 +356,7 @@ export class GptDiagnosticsStore {
       return;
     }
 
+    const identity = slot.token ?? slot;
     this.trustedServerSlots.delete(auctionSlotId);
     this.trustedServerSlots.set(auctionSlotId, slot);
     while (this.trustedServerSlots.size > MAX_TRUSTED_SERVER_ASSOCIATIONS) {
@@ -362,7 +365,7 @@ export class GptDiagnosticsStore {
       this.trustedServerSlots.delete(oldest);
     }
 
-    this.recordRequestIntentSource(slot, 'trusted_server_direct', {
+    this.recordRequestIntentSource(identity, 'trusted_server_direct', {
       trustedServerOpportunity: opportunity,
       trustedServerAuctionId: normalizedAuctionId(trustedServerAuctionId),
       requestedSlotSizes: normalizedRequestedSlotSizes(requestedSlotSizes),
@@ -405,7 +408,7 @@ export class GptDiagnosticsStore {
     }
 
     const identity = this.attributionIdentity(slot);
-    const runtimeSlotNumber = this.slotNumbers.get(slot);
+    const runtimeSlotNumber = this.slotNumbers.get(slot.token ?? slot);
     const record = runtimeSlotNumber === undefined ? undefined : this.slots.get(runtimeSlotNumber);
     if (!record || record.requests.length === 0) {
       this.reportAttributionIssue('creative_request_without_cycle', timestampMs, identity);

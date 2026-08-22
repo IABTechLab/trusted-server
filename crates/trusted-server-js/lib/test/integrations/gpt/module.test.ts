@@ -17,7 +17,12 @@ import { createLegacyGptRegistrationForTest as createGptIntegrationRegistration 
 import { createGptIntegrationRegistration as createProductionGptRegistration } from '../../../src/integrations/gpt/module';
 import { createRenderRuntimeIntegrationRegistration } from '../../../src/integrations/render_runtime/module';
 import type { RuntimeCapabilityV1 } from '../../../src/kernel/runtime';
-import { createNoopGoogletagAdapter, type GoogletagFacade } from '../../../src/adapters/googletag';
+import {
+  createNoopGoogletagAdapter,
+  type GoogletagDiagnosticsSlotSnapshot,
+  type GoogletagFacade,
+} from '../../../src/adapters/googletag';
+import type { GptDiagnosticsOpportunityFact } from '../../../src/shared/gpt_diagnostics';
 import { isGuardInstalled, resetGuardState } from '../../../src/integrations/gpt/script_guard';
 import { createTestNavigationIdentityIssuer } from '../../../src/kernel/identity';
 import {
@@ -96,7 +101,14 @@ describe('GPT first-display diagnostics adoption', () => {
 
   it('restores diagnostics facts only when the diagnostics owner is selected', () => {
     const adoptFirstDisplay = vi.fn(
-      (_diagnostics: unknown, _resolve?: (token: string) => unknown) => true
+      (
+        _diagnostics: unknown,
+        _resolve?: (token: string) => Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined,
+        _resolveOpportunity?: (
+          token: string,
+          slot: Readonly<GoogletagDiagnosticsSlotSnapshot>
+        ) => Readonly<GptDiagnosticsOpportunityFact> | undefined
+      ) => true
     );
     const physicalSlot = {};
     const diagnosticsToken = Object.freeze(Object.create(null) as object);
@@ -138,8 +150,11 @@ describe('GPT first-display diagnostics adoption', () => {
       adoptInitialDisplay: true as const,
       handoff: Object.freeze({
         artifacts: Object.freeze([]),
-        cycles: Object.freeze([Object.freeze({ token: 'gt1_1' })]),
+        cycles: Object.freeze([Object.freeze({ slotId: 'slot-1', token: 'gt1_1' })]),
         gptDiagnostics: diagnostics,
+        slots: Object.freeze([
+          Object.freeze({ id: 'slot-1', formats: Object.freeze([Object.freeze([300, 250])]) }),
+        ]),
       }),
       identities: Object.freeze([physicalSlot]),
     });
@@ -147,9 +162,23 @@ describe('GPT first-display diagnostics adoption', () => {
     expect(adoptInitialGptFactsFromHandoff(adoption, { adoptFirstDisplay }, adapter)).toBe(
       adoption
     );
-    expect(adoptFirstDisplay).toHaveBeenCalledWith(diagnostics, expect.any(Function));
+    expect(adoptFirstDisplay).toHaveBeenCalledWith(
+      diagnostics,
+      expect.any(Function),
+      expect.any(Function)
+    );
     const resolve = adoptFirstDisplay.mock.calls[0]?.[1] as (token: string) => unknown;
     expect(resolve('gt1_1')).toMatchObject({ token: diagnosticsToken, runtimeSlotNumber: 1 });
+    const resolveOpportunity = adoptFirstDisplay.mock.calls[0]?.[2] as (
+      token: string,
+      slot: unknown
+    ) => unknown;
+    expect(resolveOpportunity('gt1_1', resolve('gt1_1'))).toMatchObject({
+      kind: 'trustedServerOpportunity',
+      auctionSlotId: 'slot-1',
+      opportunity: 'renderable_candidate',
+      requestedSlotSizes: [[300, 250]],
+    });
     expect(adoptInitialGptFactsFromHandoff(adoption, undefined, adapter)).toBeUndefined();
   });
 
@@ -1569,6 +1598,9 @@ describe('transactional GPT integration module', () => {
         dispose: vi.fn(),
       })
     );
+    const recordDiagnosticsOpportunity = vi.fn(() => {
+      throw new Error('fictional diagnostics failure');
+    });
     const slots = Object.freeze({
       adoptGptSlot: (
         _generation: object,
@@ -1627,6 +1659,7 @@ describe('transactional GPT integration module', () => {
       navigation,
       projection: projection as never,
       protect,
+      recordDiagnosticsOpportunity,
       pucBridge: Object.freeze({
         registerGamAttempt: vi.fn(() => true),
         recordNonemptyGam: vi.fn(() => true),
@@ -1652,6 +1685,15 @@ describe('transactional GPT integration module', () => {
     });
 
     expect(protect).toHaveBeenCalledOnce();
+    expect(recordDiagnosticsOpportunity).toHaveBeenCalledTimes(2);
+    expect(recordDiagnosticsOpportunity.mock.calls).toEqual(
+      projection.slots.map((placement) => [
+        physical.get(placement.slot),
+        placement.slot,
+        projection.auction.auctionId,
+        placement.formats,
+      ])
+    );
     expect(request).toHaveBeenCalledTimes(2);
     await Promise.allSettled([...(protectedLatches ?? [])]);
     artifacts.dispose();

@@ -664,7 +664,7 @@ export function createFirstDisplayApsRenderStrategy(
       !post(port, {
         version: 1,
         nonce: rendererNonce,
-        publisherOrigin: aps.publisherOrigin,
+        ['publisherOrigin']: aps.publisherOrigin,
         renderer: attempt.cycle.bid.renderSource,
       }) ||
       !attempt.active ||

@@ -8,10 +8,11 @@ retaining the browser-facing cache policy from issue #1007:
 
 - Server-side ad templates active: `Cache-Control: private, no-store`.
 - Structurally inactive server-side ad templates: successful request-eligible GET
-  document HTML uses exactly `Cache-Control: max-age=60`, except origin
-  `private`/`no-store` policies remain unchanged.
-- Non-200, non-GET, non-document, bot, prefetch, and consent-denied responses
-  keep the origin browser cache policy.
+  document HTML and its `304 Not Modified` revalidations use exactly
+  `Cache-Control: private, max-age=60`, except origin `private`/`no-store`
+  policies remain unchanged.
+- Responses other than `200 OK` and `304 Not Modified`, non-GET, non-document,
+  bot, prefetch, and consent-denied responses keep the origin browser cache policy.
 - CDN-specific cache headers must not change when templates are inactive.
 
 **Issue context:** The current cache-policy change uses the runtime
@@ -56,13 +57,16 @@ consistent with the current issue #952 behavior:
    - Remove `ETag` and `Last-Modified`.
    - Remove `Surrogate-Control`, `Fastly-Surrogate-Control`, `CDN-Cache-Control`,
      and `Cloudflare-CDN-Cache-Control`.
-2. For a request-eligible `200 OK` GET document HTML response where the
-   server-side ad stack is structurally inactive, including an explicit template
-   disable:
-   - Set exactly `Cache-Control: max-age=60`, replacing origin browser policies
-     as specified by issue #1007 unless the origin sends `private` or `no-store`.
+2. For a request-eligible GET document response where the server-side ad stack
+   is structurally inactive, including an explicit template disable:
+   - On `200 OK` HTML and `304 Not Modified`, set exactly
+     `Cache-Control: private, max-age=60`, replacing origin browser policies as
+     specified by issue #1007 unless the origin sends `private` or `no-store`.
+     The `private` directive prohibits storage by shared caches that use
+     `Cache-Control`. Applying the policy to `304` prevents revalidation from
+     restoring the origin freshness policy on the stored document.
    - Leave validators and all CDN-specific cache headers untouched.
-3. For non-200, non-GET, non-document, bot, prefetch, and consent-denied
+3. For other statuses, non-GET, non-document, bot, prefetch, and consent-denied
    responses, preserve the origin browser cache policy.
 4. Apply request-scoped privacy finalization after this policy so GPT diagnostics
    and cookie-bearing responses can still require `private, no-store`; a
@@ -177,13 +181,13 @@ semantics:
 
 - [ ] Keep the active-SSAT `private, no-store` behavior and validator/CDN header
       removal unchanged.
-- [ ] Keep the inactive-HTML `max-age=60` behavior from issue #1007.
+- [ ] Keep the inactive-HTML `private, max-age=60` behavior from issue #1007.
 - [ ] Verify that structurally inactive request-eligible responses replace the
-      browser-facing `Cache-Control` for `200 OK` GET document HTML, including
-      origin `no-cache` and zero-age policies, while preserving `private` and
-      `no-store`.
+      browser-facing `Cache-Control` for `200 OK` GET document HTML and
+      `304 Not Modified` revalidations, including origin `no-cache` and zero-age
+      policies, while preserving `private` and `no-store`.
 - [ ] Preserve `ETag`, `Last-Modified`, and every CDN-specific header.
-- [ ] Verify that non-200, non-GET, non-document, bot, prefetch, and
+- [ ] Verify that other statuses, non-GET, non-document, bot, prefetch, and
       consent-denied responses retain the origin browser cache policy.
 - [ ] Verify that request-scoped GPT diagnostics and cookie privacy override this
       policy.

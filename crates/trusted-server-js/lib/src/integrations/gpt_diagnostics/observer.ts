@@ -1,8 +1,11 @@
 import type { GoogletagDiagnosticsFact } from '../../adapters/googletag';
 import { log } from '../../core/log';
 import type { Size } from '../../core/types';
+import type { GptDiagnosticsOpportunityFact } from '../../shared/gpt_diagnostics';
 
 import type { GptDiagnosticsSlotLike, GptRenderFacts } from './store';
+
+export type GptDiagnosticsFact = GoogletagDiagnosticsFact | GptDiagnosticsOpportunityFact;
 
 function renderFacts(fact: Readonly<GoogletagDiagnosticsFact>): GptRenderFacts {
   const adManager = fact.adManager;
@@ -23,6 +26,13 @@ function renderFacts(fact: Readonly<GoogletagDiagnosticsFact>): GptRenderFacts {
 
 export interface GptDiagnosticsObserverStore {
   markGptObserved(): void;
+  recordTrustedServerOpportunity(
+    slot: GptDiagnosticsSlotLike,
+    auctionSlotId: string,
+    opportunity: 'renderable_candidate' | 'unrenderable_candidate' | 'no_candidate',
+    trustedServerAuctionId?: string,
+    requestedSlotSizes?: ReadonlyArray<Size>
+  ): void;
   recordSlotRequested(slot: GptDiagnosticsSlotLike, timestampMs?: number): void;
   recordSlotResponseReceived(slot: GptDiagnosticsSlotLike, timestampMs?: number): void;
   recordSlotRenderEnded(
@@ -64,8 +74,20 @@ export class GptDiagnosticsObserver {
     this.started = true;
   }
 
-  consume(fact: Readonly<GoogletagDiagnosticsFact>): void {
+  consume(fact: Readonly<GptDiagnosticsFact>): void {
     this.start();
+    if (fact.kind === 'trustedServerOpportunity') {
+      this.handle(fact.kind, () =>
+        this.store.recordTrustedServerOpportunity(
+          fact.slot,
+          fact.auctionSlotId,
+          fact.opportunity,
+          fact.trustedServerAuctionId,
+          fact.requestedSlotSizes
+        )
+      );
+      return;
+    }
     if (!this.observed) {
       this.observed = true;
       this.handle('observation', () => this.store.markGptObserved());
@@ -127,10 +149,7 @@ export class GptDiagnosticsObserver {
     }
   }
 
-  private handle(
-    kind: GoogletagDiagnosticsFact['kind'] | 'observation',
-    callback: () => void
-  ): void {
+  private handle(kind: GptDiagnosticsFact['kind'] | 'observation', callback: () => void): void {
     try {
       callback();
     } catch (error) {

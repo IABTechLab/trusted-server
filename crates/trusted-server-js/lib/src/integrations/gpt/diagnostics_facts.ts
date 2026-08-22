@@ -3,10 +3,16 @@ import type {
   GptTraceCycleOrdinalV1,
   GoogletagAdapter,
   GoogletagDiagnosticsFact,
-  GoogletagDiagnosticsObserver,
   GoogletagDiagnosticsSlotSnapshot,
 } from '../../adapters/googletag';
+import {
+  createTrustedServerOpportunityFact,
+  isTrustedServerOpportunityFact,
+  type GptDiagnosticsOpportunityFact,
+} from '../../shared/gpt_diagnostics';
 import type { FirstDisplayGptDiagnosticsV1, FirstDisplayGptFactV1 } from '../../shared/takeover';
+
+export { createTrustedServerOpportunityFact, type GptDiagnosticsOpportunityFact };
 
 const MAX_BUFFERED_FACTS = 512;
 const DIAGNOSTICS_ONLY_EVENTS = Object.freeze([
@@ -28,13 +34,20 @@ export interface GptDiagnosticsFactBufferOptions {
   readonly onOverflow?: (droppedFacts: number) => void;
 }
 
+export type GptDiagnosticsFact = GoogletagDiagnosticsFact | GptDiagnosticsOpportunityFact;
+export type GptDiagnosticsFactObserver = (fact: Readonly<GptDiagnosticsFact>) => void;
+
 export interface GptDiagnosticsFactBuffer {
   readonly adoptFirstDisplay: (
     diagnostics: Readonly<FirstDisplayGptDiagnosticsV1>,
-    resolveSlot?: (traceToken: string) => Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined
+    resolveSlot?: (traceToken: string) => Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined,
+    resolveOpportunity?: (
+      traceToken: string,
+      slot: Readonly<GoogletagDiagnosticsSlotSnapshot>
+    ) => Readonly<GptDiagnosticsOpportunityFact> | undefined
   ) => boolean;
-  readonly publish: (fact: Readonly<GoogletagDiagnosticsFact>) => boolean;
-  readonly activate: (consumer: GoogletagDiagnosticsObserver) => (() => void) | undefined;
+  readonly publish: (fact: Readonly<GptDiagnosticsFact>) => boolean;
+  readonly activate: (consumer: GptDiagnosticsFactObserver) => (() => void) | undefined;
   readonly dispose: () => void;
 }
 
@@ -80,9 +93,12 @@ export function projectGptTraceFact(
   }
 }
 
-function validFact(fact: unknown): fact is Readonly<GoogletagDiagnosticsFact> {
+function validFact(fact: unknown): fact is Readonly<GptDiagnosticsFact> {
   if (typeof fact !== 'object' || fact === null || !Object.isFrozen(fact)) return false;
   const kind = Object.getOwnPropertyDescriptor(fact, 'kind');
+  if (kind && 'value' in kind && kind.value === 'trustedServerOpportunity') {
+    return isTrustedServerOpportunityFact(fact);
+  }
   const slot = Object.getOwnPropertyDescriptor(fact, 'slot');
   return (
     ((kind !== undefined &&
@@ -197,8 +213,12 @@ function validTransferredFact(candidate: unknown): candidate is Readonly<FirstDi
 
 function rawFirstDisplayFacts(
   diagnostics: Readonly<FirstDisplayGptDiagnosticsV1>,
-  resolveSlot?: (traceToken: string) => Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined
-): readonly Readonly<GoogletagDiagnosticsFact>[] | undefined {
+  resolveSlot?: (traceToken: string) => Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined,
+  resolveOpportunity?: (
+    traceToken: string,
+    slot: Readonly<GoogletagDiagnosticsSlotSnapshot>
+  ) => Readonly<GptDiagnosticsOpportunityFact> | undefined
+): readonly Readonly<GptDiagnosticsFact>[] | undefined {
   const fields = exactFrozenRecord(diagnostics, ['facts', 'overflowCount', 'dropCount']);
   if (
     !fields ||
@@ -215,7 +235,7 @@ function rawFirstDisplayFacts(
     return undefined;
   }
   const slotByTraceToken = new Map<string, Readonly<GoogletagDiagnosticsSlotSnapshot>>();
-  const facts: Array<Readonly<GoogletagDiagnosticsFact>> = [];
+  const facts: Array<Readonly<GptDiagnosticsFact>> = [];
   for (const candidate of fields.facts) {
     if (!validTransferredFact(candidate)) return undefined;
     let slot = slotByTraceToken.get(candidate.token);
@@ -247,6 +267,15 @@ function rawFirstDisplayFacts(
       });
       slotByTraceToken.set(candidate.token, slot);
     }
+    if (candidate.event === 'slotRequested' && resolveOpportunity) {
+      let opportunity: Readonly<GptDiagnosticsOpportunityFact> | undefined;
+      try {
+        opportunity = resolveOpportunity(candidate.token, slot);
+      } catch {
+        opportunity = undefined;
+      }
+      if (opportunity && validFact(opportunity)) facts.push(opportunity);
+    }
     facts.push(
       Object.freeze({
         kind: candidate.event,
@@ -271,8 +300,8 @@ function rawFirstDisplayFacts(
 export function createGptDiagnosticsFactBuffer(
   options: GptDiagnosticsFactBufferOptions = {}
 ): GptDiagnosticsFactBuffer {
-  const pending: Readonly<GoogletagDiagnosticsFact>[] = [];
-  let consumer: GoogletagDiagnosticsObserver | undefined;
+  const pending: Readonly<GptDiagnosticsFact>[] = [];
+  let consumer: GptDiagnosticsFactObserver | undefined;
   let consumerGeneration = 0;
   let replaying = false;
   let disposed = false;
@@ -294,14 +323,14 @@ export function createGptDiagnosticsFactBuffer(
       // Overflow reporting is diagnostics-only.
     }
   };
-  const enqueue = (fact: Readonly<GoogletagDiagnosticsFact>): void => {
+  const enqueue = (fact: Readonly<GptDiagnosticsFact>): void => {
     if (pending.length >= MAX_BUFFERED_FACTS) {
       pending.shift();
       reportOverflow();
     }
     pending.push(fact);
   };
-  const deliver = (fact: Readonly<GoogletagDiagnosticsFact>): void => {
+  const deliver = (fact: Readonly<GptDiagnosticsFact>): void => {
     const current = consumer;
     if (!current) return;
     try {
@@ -314,9 +343,13 @@ export function createGptDiagnosticsFactBuffer(
   return Object.freeze({
     adoptFirstDisplay: (
       diagnostics: Readonly<FirstDisplayGptDiagnosticsV1>,
-      resolveSlot?: (traceToken: string) => Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined
+      resolveSlot?: (traceToken: string) => Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined,
+      resolveOpportunity?: (
+        traceToken: string,
+        slot: Readonly<GoogletagDiagnosticsSlotSnapshot>
+      ) => Readonly<GptDiagnosticsOpportunityFact> | undefined
     ): boolean => {
-      const facts = rawFirstDisplayFacts(diagnostics, resolveSlot);
+      const facts = rawFirstDisplayFacts(diagnostics, resolveSlot, resolveOpportunity);
       if (disposed || !adoptionOpen || pending.length !== 0 || consumer !== undefined || !facts) {
         return false;
       }
@@ -325,14 +358,14 @@ export function createGptDiagnosticsFactBuffer(
       adoptionOpen = false;
       return true;
     },
-    publish: (fact: Readonly<GoogletagDiagnosticsFact>): boolean => {
+    publish: (fact: Readonly<GptDiagnosticsFact>): boolean => {
       adoptionOpen = false;
       if (disposed || !validFact(fact)) return false;
       if (replaying || !consumer) enqueue(fact);
       else deliver(fact);
       return true;
     },
-    activate: (nextConsumer: GoogletagDiagnosticsObserver): (() => void) | undefined => {
+    activate: (nextConsumer: GptDiagnosticsFactObserver): (() => void) | undefined => {
       adoptionOpen = false;
       if (disposed || consumer || typeof nextConsumer !== 'function') return undefined;
       consumer = nextConsumer;
@@ -445,7 +478,7 @@ export function activateGptDiagnosticsEventListeners(
 /** Connect the sole GPT adapter stream and only the four diagnostics-only listeners. */
 export function activateGptDiagnosticsFactCapture(
   adapter: Pick<GoogletagAdapter, 'observeDiagnostics' | 'run'>,
-  buffer: Pick<GptDiagnosticsFactBuffer, 'publish'>
+  buffer: Readonly<{ publish: (fact: Readonly<GoogletagDiagnosticsFact>) => boolean }>
 ): (() => void) | undefined {
   let disposed = false;
   const observerRelease = adapter.observeDiagnostics((fact) => {

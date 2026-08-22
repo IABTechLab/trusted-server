@@ -14,7 +14,7 @@
   `2e85a1cdcfe3d23814bab5b2215dd6b096f871eb` and is already an ancestor of the
   rc baseline; it is not a competing implementation authority.
 - **Final release-branch refresh:** fetched `origin/rc/202608` at
-  `d4cd2cc823718d64ae73bcb068e5eab03ecd901a` on 2026-08-21. The final overlap
+  `58532d7c42d2a59f8e87f0d643f8d0b109a680cb` on 2026-08-21. The final overlap
   audit and performance comparison use that exact tip. It already contains the
   `main` ancestry selected by the release branch, so `main` is not merged
   separately.

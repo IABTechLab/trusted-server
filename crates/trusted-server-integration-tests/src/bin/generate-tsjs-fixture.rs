@@ -111,6 +111,7 @@ fn error_box(message: impl Into<String>) -> DynError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tempfile::NamedTempFile;
 
     const CANONICAL_PROJECTION: &str = r#"{
@@ -150,6 +151,19 @@ mod tests {
   }]
 }"#;
 
+    fn bootstrap_transport(html: &str) -> serde_json::Value {
+        let encoded = html
+            .split_once("const __TSJS_SERVER_BOOT_TRANSPORT_V1__=")
+            .expect("fixture should contain the sealed transport")
+            .1;
+        let decoded = serde_json::Deserializer::from_str(encoded)
+            .into_iter::<String>()
+            .next()
+            .expect("transport should contain one JSON string")
+            .expect("transport should be a JSON string literal");
+        serde_json::from_str(&decoded).expect("decoded transport should be exact JSON")
+    }
+
     #[test]
     fn fixture_uses_the_size_admitted_agent_before_the_post_paint_runtime() {
         let mut projection = NamedTempFile::new().expect("should create canonical projection");
@@ -167,24 +181,45 @@ mod tests {
             projection: projection.path().to_path_buf(),
         };
         let html = run(&args).expect("should serialize an production TSJS fixture");
+        let transport = bootstrap_transport(&html);
 
         assert!(html.contains(r#"id="perf-slot""#));
-        assert!(html.contains(
-            r#""creative":{"version":1,"enabled":true,"clickGuard":true,"renderGuard":false}"#
-        ));
-        assert!(html.contains(r#""renderTraceOverlay":true"#));
-        assert!(html.contains(
-            r#"{"id":"gpt","config":{"gamAttributionEnabled":false,"pageBidsEnabled":true}}"#
-        ));
-        assert!(html.contains(r#""id":"diagnostics_presentation","phase":"deferred""#));
-        assert!(html.contains(r#""id":"gpt_later","phase":"deferred""#));
-        assert!(html.contains(
-            r#""firstDisplay":{"src":"/static/tsjs=tsjs-first-display.min.js?m=0045\u0026v="#
-        ));
-        assert!(html.contains(r#""slices":["first_display","creative_initial","gpt_initial"]"#));
-        assert!(html.contains(r#""runtimeSrc":"/static/tsjs=tsjs-unified.min.js?v="#));
+        assert_eq!(
+            transport["boot"]["creative"],
+            json!({"version":1,"enabled":true,"clickGuard":true,"renderGuard":false})
+        );
+        assert_eq!(transport["boot"]["diagnostics"]["renderTraceOverlay"], true);
+        assert_eq!(
+            transport["boot"]["integrations"]["entries"][0],
+            json!({"id":"gpt","config":{"gamAttributionEnabled":false,"pageBidsEnabled":true}})
+        );
+        assert_eq!(
+            transport["boot"]["manifest"]["firstDisplay"]["slices"],
+            json!([
+                "first_display",
+                "render_owner_initial",
+                "creative_initial",
+                "gpt_initial"
+            ])
+        );
+        let first_display_src = transport["boot"]["manifest"]["firstDisplay"]["src"]
+            .as_str()
+            .expect("first-display source should be a string");
+        assert!(first_display_src.starts_with("/static/tsjs=tsjs-first-display.min.js?m=008b&v="));
+        let runtime_src = transport["boot"]["manifest"]["runtimeSrc"]
+            .as_str()
+            .expect("runtime source should be a string");
+        assert!(runtime_src.starts_with("/static/tsjs=tsjs-unified.min.js?v="));
+        assert_eq!(
+            transport["boot"]["manifest"]["integrations"][3]["id"],
+            "diagnostics_presentation"
+        );
+        assert_eq!(
+            transport["boot"]["manifest"]["integrations"][4]["id"],
+            "gpt_later"
+        );
         assert_eq!(html.matches("<script").count(), 2);
-        assert!(html.contains(r#"<script src="/static/tsjs=tsjs-first-display.min.js?m=0045&v="#));
+        assert!(html.contains(r#"<script src="/static/tsjs=tsjs-first-display.min.js?m=008b&v="#));
         assert!(!html.contains(r#"<script src="/static/tsjs=tsjs-unified.min.js"#));
         assert!(!html.contains(r#"<script src="/static/tsjs=tsjs-gpt_later"#));
     }

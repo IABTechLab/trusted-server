@@ -170,6 +170,11 @@ describe('deferred GPT diagnostics presentation integration', () => {
       drainFrames();
       expect(controller.api.snapshot().slots[0]?.binding).toEqual({ status: 'bound' });
     });
+    store.recordSlotRenderEnded(slotToken, { isEmpty: false, size: [300, 250] }, 2);
+    await vi.waitFor(() => {
+      drainFrames();
+      expect(controller.api.snapshot().slots[0]?.requests[0]?.observedSlotSize).toEqual([300, 250]);
+    });
     const badgeRenderCount = (): number =>
       replaceChildren.mock.calls.filter((nodes) =>
         nodes.some(

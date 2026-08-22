@@ -2,6 +2,7 @@ import type {
   GptDiagnosticsApi,
   GptDiagnosticsBinding,
   GptDiagnosticsExportV1,
+  Size,
 } from '../../core/types';
 import { DiagnosticsSubscriberLimitError } from '../../core/trace';
 
@@ -9,6 +10,11 @@ import type { GptDiagnosticsBindingInput, GptDiagnosticsStoreSnapshot } from './
 
 interface DiagnosticsDataStore {
   readonly bindingInputs: () => GptDiagnosticsBindingInput[];
+  readonly recordObservedSlotSize: (
+    runtimeSlotNumber: number,
+    requestNumber: number,
+    size: Size
+  ) => void;
   readonly snapshot: () => GptDiagnosticsStoreSnapshot;
   readonly subscribe: (listener: () => void) => () => void;
   readonly subscribeCommits: (listener: () => void) => () => void;
@@ -25,6 +31,11 @@ export interface GptDiagnosticsPresentationControls {
 
 export interface GptDiagnosticsPresentationSource {
   readonly bindingInputs: () => GptDiagnosticsBindingInput[];
+  readonly recordObservedSlotSize: (
+    runtimeSlotNumber: number,
+    requestNumber: number,
+    size: Size
+  ) => void;
   readonly snapshot: () => GptDiagnosticsStoreSnapshot;
   readonly subscribe: (listener: () => void) => () => void;
 }
@@ -128,6 +139,8 @@ export class GptDiagnosticsDataApiController {
     this.unsubscribeStore = store.subscribeCommits(() => this.scheduleNotification());
     this.presentationSource = Object.freeze({
       bindingInputs: () => store.bindingInputs(),
+      recordObservedSlotSize: (runtimeSlotNumber: number, requestNumber: number, size: Size) =>
+        store.recordObservedSlotSize(runtimeSlotNumber, requestNumber, size),
       snapshot: () => store.snapshot(),
       subscribe: (listener: () => void) => store.subscribe(listener),
     });

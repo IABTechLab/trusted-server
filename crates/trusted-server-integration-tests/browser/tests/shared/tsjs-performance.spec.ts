@@ -1980,6 +1980,13 @@ test("drives the generated APS agent through fictional PUC, terminal, paint, and
         observation = await observeFixture(run, resources);
       } catch (error) {
         const diagnostics = await run.page.evaluate(() => ({
+          runtimeState: window.tsjs?._internal?.state,
+          runtimeReason: (
+            window.tsjs?._internal as { reason?: string } | undefined
+          )?.reason,
+          runtimeNames: window.tsjs
+            ? Object.getOwnPropertyNames(window.tsjs)
+            : [],
           marks: performance
             .getEntriesByType("mark")
             .map((entry) => ({ name: entry.name, startTime: entry.startTime })),
@@ -1994,8 +2001,9 @@ test("drives the generated APS agent through fictional PUC, terminal, paint, and
             .getEntriesByType("resource")
             .map((entry) => entry.name),
         }));
+        const frameUrls = run.page.frames().map((frame) => frame.url());
         throw new Error(
-          `APS performance smoke failed: ${JSON.stringify({ diagnostics, pageErrors: run.pageErrors, consoleMessages: run.consoleMessages })}; ${String(error)}`,
+          `APS performance smoke failed: ${JSON.stringify({ diagnostics, frameUrls, pageErrors: run.pageErrors, consoleMessages: run.consoleMessages })}; ${String(error)}`,
         );
       }
       expect(observation.releaseId).toBe(resources.release?.releaseId);

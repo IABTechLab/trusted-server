@@ -35,6 +35,87 @@ pub const CDN_CACHE_HEADERS: &[&str] = &[
     "cloudflare-cdn-cache-control",
 ];
 
+const INACTIVE_AD_STACK_BROWSER_CACHE_CONTROL: &str = "private, max-age=60";
+
+#[derive(Debug, Clone, Copy)]
+struct GeneratedInactiveAdStackBrowserCachePolicy;
+
+fn cache_control_segment_has_directive(segment: &[u8], target: &[u8]) -> bool {
+    let name_end = segment
+        .iter()
+        .position(|byte| *byte == b'=')
+        .unwrap_or(segment.len());
+    segment[..name_end]
+        .trim_ascii()
+        .eq_ignore_ascii_case(target)
+}
+
+fn cache_control_value_has_directive(value: &[u8], target: &[u8]) -> bool {
+    let mut segment_start = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for (index, byte) in value.iter().copied().enumerate() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_quotes = false;
+            }
+        } else if byte == b'"' {
+            in_quotes = true;
+        } else if byte == b',' {
+            if cache_control_segment_has_directive(&value[segment_start..index], target) {
+                return true;
+            }
+            segment_start = index + 1;
+        }
+    }
+
+    cache_control_segment_has_directive(&value[segment_start..], target)
+}
+
+fn cache_control_has_directive(headers: &HeaderMap, target: &str) -> bool {
+    headers
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .any(|value| cache_control_value_has_directive(value.as_bytes(), target.as_bytes()))
+}
+
+/// Returns whether `Cache-Control` prohibits storage by shared caches.
+pub(crate) fn cache_control_forbids_shared_storage(headers: &HeaderMap) -> bool {
+    cache_control_has_directive(headers, "private")
+        || cache_control_has_directive(headers, "no-store")
+}
+
+fn has_generated_inactive_ad_stack_browser_cache_policy(response: &Response) -> bool {
+    response
+        .extensions()
+        .get::<GeneratedInactiveAdStackBrowserCachePolicy>()
+        .is_some()
+        && response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .is_some_and(|value| {
+                value
+                    .as_bytes()
+                    .eq_ignore_ascii_case(INACTIVE_AD_STACK_BROWSER_CACHE_CONTROL.as_bytes())
+            })
+}
+
+/// Applies the browser-only cache policy for structurally inactive ad templates.
+pub fn apply_inactive_ad_stack_browser_cache_policy(response: &mut Response) {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(INACTIVE_AD_STACK_BROWSER_CACHE_CONTROL),
+    );
+    response
+        .extensions_mut()
+        .insert(GeneratedInactiveAdStackBrowserCachePolicy);
+}
+
 fn strip_cdn_cache_headers(response: &mut Response) {
     for name in CDN_CACHE_HEADERS {
         response.headers_mut().remove(*name);
@@ -113,9 +194,10 @@ pub fn enforce_uncacheable_cache_privacy(response: &mut Response) {
 /// must never be shared-cached, or a shared cache could replay one user's
 /// `Set-Cookie` to others.
 ///
-/// Idempotent: a response already marked `private`/`no-store` keeps its stricter
-/// `Cache-Control`, but the surrogate cache headers are stripped regardless so a
-/// `no-store` cookie response can never retain shared cacheability.
+/// Origin `private`/`no-store` policies remain unchanged, but the generated
+/// inactive-stack browser policy is downgraded to `private, max-age=0`. CDN
+/// cache headers are always stripped so a cookie response cannot retain shared
+/// cacheability.
 pub fn enforce_set_cookie_cache_privacy(response: &mut Response) {
     if !response.headers().contains_key(header::SET_COOKIE) {
         return;
@@ -125,13 +207,20 @@ pub fn enforce_set_cookie_cache_privacy(response: &mut Response) {
     // independent of Cache-Control and would otherwise let a shared cache store
     // and replay one visitor's Set-Cookie.
     strip_cdn_cache_headers(response);
-    let already_uncacheable = is_private_or_no_store(response.headers());
-    if !already_uncacheable {
+    // Cookie privacy takes precedence over the generated inactive-stack browser
+    // policy, while unrelated origin private/no-store policies remain unchanged.
+    let already_forbids_shared_storage = cache_control_forbids_shared_storage(response.headers());
+    let has_generated_inactive_browser_policy =
+        has_generated_inactive_ad_stack_browser_cache_policy(response);
+    if !already_forbids_shared_storage || has_generated_inactive_browser_policy {
         response.headers_mut().insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("private, max-age=0"),
         );
     }
+    response
+        .extensions_mut()
+        .remove::<GeneratedInactiveAdStackBrowserCachePolicy>();
 }
 
 /// Applies operator-configured `settings.response_headers` with cookie-privacy
@@ -151,7 +240,7 @@ pub fn enforce_set_cookie_cache_privacy(response: &mut Response) {
 pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: &mut Response) {
     enforce_set_cookie_cache_privacy(response);
 
-    let response_is_uncacheable = is_private_or_no_store(response.headers());
+    let response_is_uncacheable = cache_control_forbids_shared_storage(response.headers());
     enforce_uncacheable_cache_privacy(response);
 
     for (key, value) in &settings.response_headers {
@@ -258,6 +347,83 @@ mod tests {
     }
 
     #[test]
+    fn identifies_cache_control_that_forbids_shared_storage() {
+        for (cache_control, expected) in [
+            ("public, max-age=60", false),
+            ("no-cache", false),
+            ("public, x=notprivate", false),
+            ("public, x=\"private, no-store\"", false),
+            (r#"public, x="private\", no-store", max-age=60"#, false),
+            (r#"public, x="private\\", no-store"#, true),
+            ("Private=\"set-cookie\", max-age=60", true),
+            ("No-Store", true),
+        ] {
+            let response = response_builder()
+                .header(header::CACHE_CONTROL, cache_control)
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build response");
+
+            assert_eq!(
+                cache_control_forbids_shared_storage(response.headers()),
+                expected,
+                "should classify {cache_control} shared-storage policy"
+            );
+        }
+    }
+
+    #[test]
+    fn downgrades_inactive_browser_cache_policy_on_cookie_response() {
+        let mut response = response_builder()
+            .header("surrogate-control", "max-age=600")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+        apply_inactive_ad_stack_browser_cache_policy(&mut response);
+        response
+            .headers_mut()
+            .insert(header::SET_COOKIE, HeaderValue::from_static("id=abc"));
+
+        enforce_set_cookie_cache_privacy(&mut response);
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, max-age=0"),
+            "inactive browser cache policy should yield to cookie privacy"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "cookie privacy should strip CDN cache headers"
+        );
+    }
+
+    #[test]
+    fn preserves_identical_origin_private_policy_on_cookie_response() {
+        let mut response = response_builder()
+            .header(header::SET_COOKIE, "id=abc")
+            .header(header::CACHE_CONTROL, "private, max-age=60")
+            .header("surrogate-control", "max-age=600")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+
+        enforce_set_cookie_cache_privacy(&mut response);
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, max-age=60"),
+            "origin private policy should remain unchanged"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "cookie privacy should still strip CDN cache headers"
+        );
+    }
+
+    #[test]
     fn downgrades_public_cache_control_on_cookie_response() {
         let settings = settings_with_response_headers(&[("cache-control", "public, max-age=600")]);
         let mut response = response_builder()
@@ -322,6 +488,64 @@ mod tests {
         assert!(
             response.headers().contains_key(header::SET_COOKIE),
             "the operator Set-Cookie itself should still be applied"
+        );
+    }
+
+    #[test]
+    fn cookie_privacy_does_not_treat_pseudo_directives_as_uncacheable() {
+        let settings = settings_with_response_headers(&[]);
+        let mut response = response_builder()
+            .header(header::SET_COOKIE, "id=abc")
+            .header(
+                header::CACHE_CONTROL,
+                "public, max-age=600, no-storey, not-private",
+            )
+            .header("surrogate-control", "max-age=600")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+
+        apply_response_headers_with_cache_privacy(&settings, &mut response);
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, max-age=0"),
+            "pseudo-directives must not prevent the cookie privacy downgrade"
+        );
+        assert!(
+            !response.headers().contains_key("surrogate-control"),
+            "cookie privacy downgrade should still strip edge-cache headers"
+        );
+    }
+
+    #[test]
+    fn cookie_privacy_ignores_quoted_extension_directives() {
+        let settings = settings_with_response_headers(&[]);
+        let mut response = response_builder()
+            .header(header::SET_COOKIE, "id=abc")
+            .header(
+                header::CACHE_CONTROL,
+                "public, max-age=600, ext=\"a,no-store,b\"",
+            )
+            .header("surrogate-control", "max-age=600")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+
+        apply_response_headers_with_cache_privacy(&settings, &mut response);
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, max-age=0"),
+            "quoted extension text must not prevent the cookie privacy downgrade"
+        );
+        assert!(
+            !response.headers().contains_key("surrogate-control"),
+            "cookie privacy downgrade should strip edge-cache headers"
         );
     }
 

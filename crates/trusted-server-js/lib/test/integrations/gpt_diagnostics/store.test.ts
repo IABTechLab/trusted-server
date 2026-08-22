@@ -656,6 +656,36 @@ describe('GptDiagnosticsStore', () => {
     expect(cycles[1]?.requestedSlotSizes).toBeUndefined();
   });
 
+  it('correlates release-private snapshots through their shared opaque slot token', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+    const token = Object.freeze(Object.create(null) as object);
+    const opportunitySlot = Object.freeze({
+      token,
+      elementId: 'token-correlated-slot',
+      adUnitPath: '/example/token-correlated-slot',
+    });
+    const callbackSlot = Object.freeze({
+      token,
+      elementId: 'token-correlated-slot',
+      adUnitPath: '/example/token-correlated-slot',
+    });
+
+    store.recordTrustedServerOpportunity(
+      opportunitySlot,
+      'auction-slot',
+      'renderable_candidate',
+      'fictional-auction',
+      [[300, 250]]
+    );
+    store.recordSlotRequested(callbackSlot, 11);
+
+    expect(store.snapshot().slots[0]?.requests[0]).toMatchObject({
+      requestedSlotSizes: [[300, 250]],
+      trustedServerAuctionId: 'fictional-auction',
+      trustedServerOpportunity: 'renderable_candidate',
+    });
+  });
+
   it('bounds and validates requested sizes before retaining them', () => {
     const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
     const slot = fakeSlot('validated-requested-sizes');
@@ -665,6 +695,8 @@ describe('GptDiagnosticsStore', () => {
     );
     formats[0] = [0, 250];
     formats[1] = [300, Number.NaN];
+    formats[2] = [1.5, 250];
+    formats[3] = [4_097, 250];
 
     store.recordTrustedServerOpportunity(
       slot,
@@ -676,9 +708,11 @@ describe('GptDiagnosticsStore', () => {
     store.recordSlotRequested(slot);
 
     const requested = store.snapshot().slots[0]!.requests[0]!.requestedSlotSizes;
-    expect(requested).toHaveLength(MAX_REQUESTED_SLOT_SIZES - 2);
+    expect(requested).toHaveLength(MAX_REQUESTED_SLOT_SIZES - 4);
     expect(requested).not.toContainEqual([0, 250]);
     expect(requested).not.toContainEqual([300, Number.NaN]);
+    expect(requested).not.toContainEqual([1.5, 250]);
+    expect(requested).not.toContainEqual([4_097, 250]);
     expect(requested).not.toContainEqual([MAX_REQUESTED_SLOT_SIZES + 1, 250]);
   });
 });
