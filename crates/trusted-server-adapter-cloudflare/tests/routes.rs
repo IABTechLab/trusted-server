@@ -21,13 +21,18 @@ const LEGACY_ADMIN_DENY_METHODS: &[&str] =
 /// The handler regex is the production-shaped `^/_ts/admin`, matching
 /// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
 /// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
-fn test_router() -> RouterService {
-    let settings = Settings::from_toml(
+fn test_settings() -> Settings {
+    Settings::from_toml(
         r#"
             [[handlers]]
             path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass"
+
+            [[handlers]]
+            path = "^/integrations/aps"
+            username = "aps-user"
+            password = "aps-pass"
 
             [publisher]
             domain = "test-publisher.example.com"
@@ -37,11 +42,18 @@ fn test_router() -> RouterService {
 
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [integrations.aps]
+            enabled = true
+            account_id = "route-test-aps-account"
+            allow_script_creatives = true
         "#,
     )
-    .expect("should parse route test settings");
+    .expect("should parse route test settings")
+}
 
-    TrustedServerApp::routes_with_settings(settings)
+fn test_router() -> RouterService {
+    TrustedServerApp::routes_with_settings(test_settings())
         .expect("should build router from test settings")
 }
 
@@ -56,6 +68,13 @@ fn registered_routes() -> Vec<(String, String)> {
 
 async fn route(router: RouterService, req: Request) -> Response {
     router.oneshot(req).await.expect("should route request")
+}
+
+async fn route_reserved(req: Request) -> Response {
+    trusted_server_adapter_cloudflare::app::dispatch_reserved_with_settings(test_settings(), req)
+        .await
+        .expect("should build APS dispatcher")
+        .expect("APS family should be reserved")
 }
 
 fn assert_route_registered(method: &str, path: &str) {
@@ -99,6 +118,77 @@ fn routes_build_without_panic() {
     // build_state() may fail (no real settings in CI) — startup_error_router
     // is the fallback. Either way, routes() must not panic.
     let _router = TrustedServerApp::routes();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aps_cutover_renderer_and_family_failures_are_local() {
+    let renderer = request_builder()
+        .method("GET")
+        .uri("/integrations/aps/renderer/v2")
+        .header("authorization", "Bearer must-not-reach-publisher")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build APS renderer request");
+    let response = route_reserved(renderer).await;
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/html; charset=utf-8"
+    );
+    assert_eq!(
+        response.headers()["cache-control"],
+        "public, max-age=31536000, immutable"
+    );
+    assert!(!response.headers().contains_key("x-frame-options"));
+    let body = response.into_body().into_bytes().unwrap_or_default();
+    let body = std::str::from_utf8(&body).expect("renderer should be UTF-8");
+    assert!(body.contains("TS APS Bootstrap Ready"));
+    assert!(body.contains("TS APS Bootstrap Configure"));
+    assert!(body.contains("/integrations/aps/runner.js"));
+    assert!(body.contains("data:text/html;charset=utf-8,"));
+    assert!(!body.contains("client.aps.amazon-adsystem.com"));
+
+    for (method, path, expected) in [
+        ("POST", "/integrations/aps/runner.js", 405),
+        ("TRACE", "/integrations/aps/renderer/v2", 405),
+        ("CONNECT", "/integrations/aps/renderer/v2", 405),
+        ("PROPFIND", "/integrations/aps/renderer/v2", 405),
+        ("GET", "/integrations/aps/renderer", 404),
+        ("GET", "/integrations/aps/renderer/v1", 404),
+        ("GET", "/integrations/aps/runner/v1.js", 404),
+        ("GET", "/integrations/aps", 404),
+    ] {
+        let request = request_builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", "Bearer must-not-reach-publisher")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build APS family request");
+        let response = route_reserved(request).await;
+        assert_eq!(response.status().as_u16(), expected, "{method} {path}");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(!response.headers().contains_key("x-geo-info-available"));
+        if expected == 405 {
+            assert_eq!(response.headers()["allow"], "GET");
+            assert_eq!(response.headers().len(), 2, "{method} {path}");
+        } else {
+            assert_eq!(response.headers().len(), 1, "{method} {path}");
+        }
+        assert!(
+            response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_default()
+                .is_empty()
+        );
+    }
+
+    let protected_control = request_builder()
+        .method("GET")
+        .uri("/integrations/apsx")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build protected non-APS boundary request");
+    let response = route(test_router(), protected_control).await;
+    assert_eq!(response.status().as_u16(), 401);
 }
 
 // ---------------------------------------------------------------------------
@@ -204,40 +294,32 @@ async fn tsjs_route_is_routed_not_5xx() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tsjs_route_emits_cloudflare_cache_header_for_matching_hash() {
-    let router = test_router();
-    let src = trusted_server_core::tsjs::tsjs_script_src(&["creative"]);
-    let req = request_builder()
-        .method("GET")
-        .uri(src)
-        .body(edgezero_core::body::Body::empty())
-        .expect("should build request");
+async fn tsjs_wrong_methods_are_local_no_store_404s() {
+    for method in ["HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"] {
+        let req = request_builder()
+            .method(method)
+            .uri(format!(
+                "/static/tsjs=tsjs-unified.min.js?v={}",
+                "0".repeat(64)
+            ))
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build wrong-method TSJS request");
+        let response = route(test_router(), req).await;
 
-    let resp = route(router, req).await;
-
-    assert_eq!(
-        resp.status().as_u16(),
-        200,
-        "matching TSJS hash should serve OK"
-    );
-    assert_eq!(
-        resp.headers()
-            .get("cache-control")
-            .and_then(|value| value.to_str().ok()),
-        Some("public, max-age=31536000, immutable"),
-        "browser cache policy should be immutable for matching TSJS hash"
-    );
-    assert_eq!(
-        resp.headers()
-            .get("cloudflare-cdn-cache-control")
-            .and_then(|value| value.to_str().ok()),
-        Some("max-age=31536000"),
-        "Cloudflare adapter should emit the Cloudflare-specific edge header"
-    );
-    assert!(
-        resp.headers().get("surrogate-control").is_none(),
-        "Cloudflare adapter must not emit Fastly Surrogate-Control"
-    );
+        assert_eq!(response.status().as_u16(), 404, "method {method}");
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "method {method}"
+        );
+        assert!(
+            !response.headers().contains_key("location"),
+            "method {method}"
+        );
+    }
 }
 
 /// Verify that every expected explicit route is registered in the route table.
@@ -256,16 +338,9 @@ fn all_explicit_routes_are_registered() {
         ("GET", "/_ts/admin/ec/{id}"),
         ("GET", "/_ts/admin/eids"),
         ("POST", "/auction"),
-        // SPA re-auction endpoint, plus its deprecated `/__ts/` alias. Both
-        // paths are spelled out as literals rather than referencing
-        // `PAGE_BIDS_PATH` / `PAGE_BIDS_LEGACY_PATH` so this test pins the
-        // actual URL the tsjs client fetches — asserting a const against itself
-        // would still pass if the const's value changed out from under the
-        // client.
+        // Pin the canonical literal fetched by the hard-cutover client.
         ("GET", "/_ts/page-bids"),
         ("OPTIONS", "/_ts/page-bids"),
-        ("GET", "/__ts/page-bids"),
-        ("OPTIONS", "/__ts/page-bids"),
         ("GET", "/first-party/proxy"),
         ("GET", "/first-party/click"),
         ("GET", "/first-party/sign"),
@@ -276,6 +351,9 @@ fn all_explicit_routes_are_registered() {
 
     for (method, path) in expected {
         assert_route_registered(method, path);
+    }
+    for method in LEGACY_ADMIN_DENY_METHODS {
+        assert_route_registered(method, "/__ts/page-bids");
     }
 
     for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {

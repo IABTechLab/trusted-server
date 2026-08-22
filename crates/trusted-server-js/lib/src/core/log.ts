@@ -37,8 +37,9 @@ function styleFor(method: 'log' | 'info' | 'warn' | 'error'): string {
 
 function print(method: 'log' | 'info' | 'warn' | 'error', ...args: unknown[]) {
   const c:
-    | Partial<Record<'log' | 'info' | 'warn' | 'error', (...a: unknown[]) => void>>
-    | undefined = (globalThis as unknown as { console?: Console }).console;
+    Partial<Record<'log' | 'info' | 'warn' | 'error', (...a: unknown[]) => void>> | undefined = (
+    globalThis as unknown as { console?: Console }
+  ).console;
   if (!c || typeof c[method] !== 'function') return;
   if (supportsCss()) {
     c[method]('%c[tsjs]%c ' + ts() + ':', styleFor(method), 'color:inherit', ...args);

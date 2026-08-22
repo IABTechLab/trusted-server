@@ -1,22 +1,21 @@
 // Origin helpers shared by creative runtime modules.
 
+const nativeUrl = typeof URL === 'undefined' ? undefined : URL;
+
 // Normalize a candidate first-party origin, returning '' when it is unusable.
-//
-// Parsing with `URL` rather than matching origin grammar by hand keeps valid
-// but less common forms working — notably IPv6 literals such as
-// `http://[::1]:7676`, which a DNS-shaped pattern rejects. `URL.origin`
-// serializes back to `scheme://host[:port]`, so the result is also what gets
-// embedded in the srcdoc stamp.
-//
-// The final character check is defence in depth for that embedding: an http(s)
-// origin cannot contain quotes, backslashes, angle brackets, or whitespace, so
-// anything that does is not the value we think it is and is discarded rather
-// than written into the document.
+// URL parsing keeps valid IPv6 literals working while the credential and
+// character checks make the result safe to embed in the srcdoc stamp.
 export function normalizeTrustedOrigin(candidate: unknown): string {
-  if (typeof candidate !== 'string' || !candidate) return '';
+  if (typeof candidate !== 'string' || !candidate || !nativeUrl) return '';
   try {
-    const parsed = new URL(candidate);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+    const parsed = new nativeUrl(candidate);
+    if (
+      (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') ||
+      parsed.username !== '' ||
+      parsed.password !== ''
+    ) {
+      return '';
+    }
     const origin = parsed.origin;
     if (!origin || origin === 'null' || /['"<>\\\s]/.test(origin)) return '';
     return origin;
@@ -78,3 +77,18 @@ export const TRUSTED_BASE_URL: string = (() => {
   }
   return '';
 })();
+
+// Exact first-party origin for protocol messages and root-owned endpoints.
+// `TRUSTED_BASE_URL` may be a full inherited base URI in the final fallback,
+// so normalize it to its origin while retaining the same HTTP(S)-only and
+// credential-free trust boundary.
+export function trustedHttpOrigin(baseUrl: string = TRUSTED_BASE_URL): string {
+  return normalizeTrustedOrigin(baseUrl);
+}
+
+export function trustedDocumentHttpOrigin(
+  documentOrigin: string,
+  trustedBaseUrl: string = TRUSTED_BASE_URL
+): string {
+  return trustedHttpOrigin(documentOrigin === 'null' ? trustedBaseUrl : documentOrigin);
+}

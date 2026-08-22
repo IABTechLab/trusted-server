@@ -143,7 +143,7 @@ sequenceDiagram
     Note over Client,Mock: Response Assembly
     activate TS
     activate Client
-    Orch->>Orch: Transform to OpenRTB response<br/>Preserve typed render source<br/>Optionally sanitize creative HTML<br/>Optionally rewrite creative URLs<br/>Add orchestrator metadata
+    Orch->>Orch: Transform to OpenRTB response<br/>Preserve typed render source<br/>Optionally sanitize and rewrite ordinary creatives<br/>Add orchestrator metadata
 
     Orch-->>TS: OpenRTB BidResponse
     Note right of Orch: APS winner carries ext.trusted_server.renderer<br/>with no adm; ordinary winners retain sanitized adm/cache data
@@ -156,13 +156,8 @@ sequenceDiagram
   %% === Creative Rendering ===
   rect rgb(239,246,255)
     Note over Client,Mock: Creative Rendering
-    alt APS winner
-      Client->>Client: Validate renderer descriptor<br/>Create opaque sandbox iframe<br/>Load /integrations/aps/renderer
-      Note right of Client: Fragment-bound nonce and one-time acknowledgement<br/>No allow-same-origin on the outer frame
-    else Ordinary creative
-      Client->>Client: Inject winning creative<br/>Render iframe<br/>Load creative resources
-      Note right of Client: Default: first-party proxy/click URLs<br/>rewrite_creatives=false: accepted external URLs remain direct
-    end
+    Client->>Client: Validate renderer descriptor<br/>Create opaque sandbox iframe<br/>Load /integrations/aps/renderer/v2
+    Note right of Client: Fragment-bound nonce and one-time acknowledgement<br/>No allow-same-origin on the outer frame
     deactivate Client
   end
 ```
@@ -331,7 +326,7 @@ Transforms auction requests into OpenRTB 2.x format and sends them to a Prebid S
 
 - Bids include decoded `price` (clear decimal CPM)
 - Creative HTML provided in `adm` field
-- Winning creative URLs rewritten to first-party proxy format by default when the `/auction` response is assembled
+- Winning creative URLs rewritten to first-party proxy format when `[auction].rewrite_creatives` is enabled
 - Per-bidder timing (`responsetimemillis`), errors, and warnings always attached as response metadata
 - When `debug` is enabled, PBS debug payload and per-bid status (`bidstatus`) also included
 
@@ -594,8 +589,7 @@ markup with its inner content. `rewrite_creatives` (default `true`) runs an
 HTML rewriter (`lol_html`) that converts eligible external resource and click
 URLs to signed first-party paths, adds `data-tsclick`, rewrites inline CSS
 `url(...)` values, removes bidder-supplied `<base>` elements, and injects the
-unified creative TSJS runtime exactly once, whether or not the bidder supplied a
-`<body>` element. In every mode, a creative
+unified creative TSJS runtime exactly once, including for body-less fragments. In every mode, a creative
 larger than the 1 MiB per-creative cap is rejected and its `adm` is dropped.
 
 ```toml
@@ -719,7 +713,7 @@ environment overrides to apply; see
 | Field                    | Type   | Default                       | Description                                                       |
 | ------------------------ | ------ | ----------------------------- | ----------------------------------------------------------------- |
 | `enabled`                | bool   | `false`                       | Enable APS provider                                               |
-| `account_id`             | string | —                             | APS account ID (required; `pub_id` is an alias)                   |
+| `account_id`             | string | —                             | APS account ID (required; integers are rejected)                  |
 | `endpoint`               | string | Built-in APS OpenRTB endpoint | Optional APS OpenRTB endpoint override                            |
 | `timeout_ms`             | u32    | `800`                         | Request timeout                                                   |
 | `debug`                  | bool   | `false`                       | Include the raw APS HTTP exchange in `/auction` provider metadata |
@@ -805,11 +799,11 @@ The orchestrator is designed to be resilient:
 
 The auction system logs at multiple levels throughout execution:
 
-| Level   | Examples                                                                                |
-| ------- | --------------------------------------------------------------------------------------- |
-| `info`  | Auction request received, provider launch, bid counts, winner selection, total timing   |
-| `debug` | Bid-drop reasons, mediation restoration notes, creative processing mode and byte counts |
-| `warn`  | Provider launch failures, parse failures, mediator bids without decoded prices          |
+| Level   | Examples                                                                              |
+| ------- | ------------------------------------------------------------------------------------- |
+| `info`  | Auction request received, provider launch, bid counts, winner selection, total timing |
+| `debug` | Bid-drop reasons, mediation restoration notes, creative rewrite sizes                 |
+| `warn`  | Provider launch failures, parse failures, mediator bids without decoded prices        |
 
 ### Response Metadata
 

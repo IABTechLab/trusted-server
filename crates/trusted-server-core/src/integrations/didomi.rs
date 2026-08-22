@@ -11,9 +11,8 @@ use validator::{Validate, ValidationError};
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    INTEGRATION_MAX_BODY_BYTES, IntegrationEndpoint, IntegrationHeadInjector,
-    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, collect_body_bounded,
-    ensure_integration_backend,
+    INTEGRATION_MAX_BODY_BYTES, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    collect_body_bounded, ensure_integration_backend,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -253,10 +252,19 @@ pub fn register(
         return Ok(None);
     };
 
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct DidomiBrowserConfigV1 {
+        proxy_path: String,
+    }
+    let browser_config = DidomiBrowserConfigV1 {
+        proxy_path: format!("{}/", integration.resolved_prefix()),
+    };
+
     Ok(Some(
         IntegrationRegistration::builder(DIDOMI_INTEGRATION_ID)
             .with_proxy(integration.clone())
-            .with_head_injector(integration)
+            .with_browser_config_v1(&browser_config)?
             .build(),
     ))
 }
@@ -332,42 +340,12 @@ impl IntegrationProxy for DidomiIntegration {
     }
 }
 
-impl IntegrationHeadInjector for DidomiIntegration {
-    fn integration_id(&self) -> &'static str {
-        DIDOMI_INTEGRATION_ID
-    }
-
-    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct InjectedDidomiClientConfig {
-            proxy_path: String,
-        }
-
-        let payload = InjectedDidomiClientConfig {
-            proxy_path: format!("{}/", self.resolved_prefix()),
-        };
-
-        // Escape `</` to prevent breaking out of the script tag.
-        let config_json = serde_json::to_string(&payload)
-            .unwrap_or_else(|e| {
-                log::warn!("Didomi: failed to serialize client config: {e}");
-                "{}".to_string()
-            })
-            .replace("</", "<\\/");
-
-        vec![format!(
-            r#"<script>window.__tsjs_didomi={config_json};</script>"#
-        )]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
+    use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::test_support::tests::create_test_settings;
     use http::Method;
@@ -554,26 +532,26 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_emits_proxy_path() {
-        let custom_config = DidomiIntegrationConfig {
-            enabled: true,
-            proxy_path: Some("my-consent".to_string()),
-            sdk_origin: default_sdk_origin(),
-            api_origin: default_api_origin(),
-        };
-        let integration = DidomiIntegration::new(Arc::new(custom_config));
-        let doc_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "example.com",
-            request_scheme: "https",
-            origin_host: "example.com",
-            document_state: &doc_state,
-        };
-        let inserts = integration.head_inserts(&ctx);
-        assert_eq!(inserts.len(), 1);
+    fn registration_projects_custom_proxy_path_without_a_config_script() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                DIDOMI_INTEGRATION_ID,
+                &serde_json::json!({
+                    "enabled": true,
+                    "proxy_path": "my-consent",
+                }),
+            )
+            .expect("should insert Didomi config");
+        let registration = register(&settings)
+            .expect("config should parse")
+            .expect("Didomi should register");
+
+        assert!(registration.head_injectors.is_empty());
         assert_eq!(
-            inserts[0],
-            r#"<script>window.__tsjs_didomi={"proxyPath":"/my-consent/"};</script>"#
+            registration.browser_config_v1,
+            Some(serde_json::json!({ "proxyPath": "/my-consent/" }))
         );
     }
 
@@ -636,19 +614,24 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_default_path() {
-        let integration = DidomiIntegration::new(Arc::new(config(true)));
-        let doc_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "example.com",
-            request_scheme: "https",
-            origin_host: "example.com",
-            document_state: &doc_state,
-        };
-        let inserts = integration.head_inserts(&ctx);
+    fn registration_projects_default_proxy_path() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                DIDOMI_INTEGRATION_ID,
+                &serde_json::json!({ "enabled": true }),
+            )
+            .expect("should insert Didomi config");
+        let registration = register(&settings)
+            .expect("config should parse")
+            .expect("Didomi should register");
+
         assert_eq!(
-            inserts[0],
-            r#"<script>window.__tsjs_didomi={"proxyPath":"/integrations/didomi/consent/"};</script>"#
+            registration.browser_config_v1,
+            Some(serde_json::json!({
+                "proxyPath": "/integrations/didomi/consent/"
+            }))
         );
     }
 }

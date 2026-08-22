@@ -300,9 +300,8 @@ mod tests {
     /// handler covers is the operator's decision, and silently carving holes in
     /// it would be worse than a documented constraint. Operators must scope
     /// handler patterns to the paths they mean (`^/_ts/admin`) — see the
-    /// configuration guide. The tsjs client's `/__ts/page-bids` fallback keeps
-    /// affected deployments serving SPA ads until they do, but it disappears
-    /// with the alias in IABTechLab/trusted-server#970.
+    /// configuration guide. A broad pattern will block the canonical page-bids
+    /// endpoint; the hard-cutover client does not retry a compatibility alias.
     #[test]
     fn broad_handler_regex_also_covers_browser_facing_endpoints() {
         let config = crate_test_settings_str().replace(r#"path = "^/secure""#, r#"path = "^/_ts""#);

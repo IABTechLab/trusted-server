@@ -82,6 +82,11 @@ describe('DOM insertion dispatcher', () => {
     container.appendChild(permutiveScript);
     expect(permutiveScript.src).toContain('/integrations/permutive/sdk');
 
+    const permutiveLookalike = document.createElement('script');
+    permutiveLookalike.src = 'https://cdn.permutive.com.attacker.example/abc123-web.js';
+    container.appendChild(permutiveLookalike);
+    expect(permutiveLookalike.src).toBe('https://cdn.permutive.com.attacker.example/abc123-web.js');
+
     const dataDomeScript = document.createElement('script');
     dataDomeScript.src = 'https://js.datadome.co/tags.js';
     container.appendChild(dataDomeScript);

@@ -1,6 +1,6 @@
 # GPT Refresh Source and Replacement Diagnostics
 
-**Date:** 2026-08-05  
+**Date:** 2026-08-05
 **Status:** Implemented
 **Scope:** Opt-in GPT diagnostics only; zero publisher-code changes
 

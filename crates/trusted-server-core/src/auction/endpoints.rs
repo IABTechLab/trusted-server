@@ -1,6 +1,6 @@
 //! HTTP endpoint handlers for auction requests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
@@ -20,20 +20,21 @@ use crate::ec::log_id;
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
+use crate::http_util::RequestInfo;
 use crate::openrtb::{Eid, Uid};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 use super::AuctionOrchestrator;
-use super::formats::{
-    convert_to_openrtb_response, convert_to_openrtb_response_with_report,
-    convert_tsjs_to_auction_request,
-};
+use super::formats::{attach_auction_response_headers, convert_tsjs_to_auction_request};
 use super::telemetry::{
     AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
     emit_auction_events_best_effort_lazy,
 };
-use super::types::AuctionContext;
+use super::types::{
+    AuctionContext, AuctionDecisionSetV1, AuctionRequest, AuctionSlotFailureReason,
+    SlotAuctionDecisionV1, SystemAuctionIdentityGenerator,
+};
 
 const MAX_CLIENT_EID_SOURCES: usize = 64;
 const MAX_CLIENT_UIDS_PER_SOURCE: usize = 32;
@@ -44,6 +45,66 @@ const MAX_CLIENT_EID_SOURCE_BYTES: usize = 255;
 /// with EID arrays) while preventing an authenticated client from consuming
 /// arbitrary WASM linear memory.
 const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
+
+struct ExactAuctionResponseV1 {
+    response: Response<EdgeBody>,
+    delivered_winner_slots: HashSet<String>,
+    dropped_winner_count: usize,
+}
+
+fn exact_auction_response_v1(
+    result: &OrchestrationResult,
+    settings: &Settings,
+    auction_request: &AuctionRequest,
+    request_origin: &str,
+    ec_allowed: bool,
+) -> Result<ExactAuctionResponseV1, Report<TrustedServerError>> {
+    let price_granularity = settings
+        .creative_opportunities
+        .as_ref()
+        .map(|config| config.price_granularity)
+        .unwrap_or_default();
+    let canonical = crate::publisher::coordinated_cutover_v1::build_browser_auction_projection_v1(
+        result,
+        price_granularity,
+        settings,
+        request_origin,
+        None,
+        &SystemAuctionIdentityGenerator,
+    )?;
+    let body = crate::auction::formats::coordinated_cutover_v1::serialize_trusted_server_auction_response_v1(
+        &canonical,
+    )?;
+    let delivered_winner_slots: HashSet<String> = canonical
+        .projection
+        .auction
+        .results
+        .iter()
+        .filter_map(|decision| match decision {
+            SlotAuctionDecisionV1::Winner { slot, .. } => Some(slot.clone()),
+            _ => None,
+        })
+        .collect();
+    let projected_winner_count = result
+        .decision_set
+        .results
+        .iter()
+        .filter(|decision| matches!(decision, SlotAuctionDecisionV1::Winner { .. }))
+        .count();
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(EdgeBody::from(body))
+        .change_context(TrustedServerError::Auction {
+            message: "Failed to build exact auction response".to_string(),
+        })?;
+    attach_auction_response_headers(&mut response, auction_request, ec_allowed)?;
+    Ok(ExactAuctionResponseV1 {
+        response,
+        dropped_winner_count: projected_winner_count.saturating_sub(delivered_winner_slots.len()),
+        delivered_winner_slots,
+    })
+}
 
 /// Handle auction request from `POST /auction`.
 ///
@@ -168,6 +229,22 @@ pub async fn handle_auction(
     );
 
     let http_req = Request::from_parts(parts, EdgeBody::empty());
+    let request_info = RequestInfo::from_request(&http_req, services.client_info());
+    let request_scheme = if request_info.scheme.is_empty() {
+        http_req.uri().scheme_str().unwrap_or("https")
+    } else {
+        &request_info.scheme
+    };
+    let request_host = if request_info.host.is_empty() {
+        http_req
+            .uri()
+            .authority()
+            .map(http::uri::Authority::as_str)
+            .unwrap_or(&settings.publisher.domain)
+    } else {
+        &request_info.host
+    };
+    let request_origin = format!("{request_scheme}://{request_host}");
 
     // Story 5 middleware contract: auction is a read-only EC route.
     // It must not generate EC IDs; it only consumes pre-routed context.
@@ -221,15 +298,21 @@ pub async fn handle_auction(
             provider_responses: Vec::new(),
             mediator_response: None,
             winning_bids: HashMap::new(),
+            decision_set: AuctionDecisionSetV1::failed(
+                &auction_request,
+                AuctionSlotFailureReason::ConsentDenied,
+            ),
             total_time_ms: 0,
             metadata: HashMap::new(),
         };
-        return convert_to_openrtb_response(
+        return Ok(exact_auction_response_v1(
             &empty_result,
             settings,
             &auction_request,
+            &request_origin,
             ec_context.ec_allowed(),
-        );
+        )?
+        .response);
     }
 
     // Parse client-provided EIDs from the current request body. When the
@@ -326,10 +409,11 @@ pub async fn handle_auction(
         }
     };
 
-    let conversion = match convert_to_openrtb_response_with_report(
+    let conversion = match exact_auction_response_v1(
         &result,
         settings,
         &auction_request,
+        &request_origin,
         ec_context.ec_allowed(),
     ) {
         Ok(conversion) => conversion,
@@ -357,7 +441,7 @@ pub async fn handle_auction(
             AuctionTerminalOutcome::Completed {
                 request: &auction_request,
                 result: &result,
-                delivered_winner_slots: Some(&conversion.delivery.delivered_winner_slots),
+                delivered_winner_slots: Some(&conversion.delivered_winner_slots),
             },
         )
     })
@@ -366,8 +450,8 @@ pub async fn handle_auction(
     log::info!(
         "Auction completed: {} providers, {} delivered winning bids, {} dropped winners, {}ms total",
         result.provider_responses.len(),
-        conversion.delivery.delivered_winner_slots.len(),
-        conversion.delivery.dropped_winner_count,
+        conversion.delivered_winner_slots.len(),
+        conversion.dropped_winner_count,
         result.total_time_ms
     );
 
@@ -572,11 +656,10 @@ mod tests {
     use crate::consent::types::ConsentContext;
     use crate::openrtb::Uid;
     use crate::platform::test_support::{
-        NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, StubHttpClient,
-        noop_services,
+        NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, noop_services,
     };
-    use crate::platform::{ClientInfo, PlatformHttpClient, PlatformHttpRequest, PlatformResponse};
-    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+    use crate::platform::{ClientInfo, PlatformResponse};
+    use crate::test_support::tests::create_test_settings;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use serde_json::json;
@@ -661,41 +744,25 @@ mod tests {
         }
     }
 
-    /// Provider used to prove that direct `/auction` remains available when
-    /// publisher server-side ad templates are disabled.
-    struct TemplateSwitchProbeProvider {
-        calls: Arc<Mutex<usize>>,
+    struct CallRecordingProvider {
+        called: Arc<Mutex<bool>>,
     }
 
     #[async_trait::async_trait(?Send)]
-    impl AuctionProvider for TemplateSwitchProbeProvider {
+    impl AuctionProvider for CallRecordingProvider {
         fn provider_name(&self) -> &'static str {
-            "template_switch_probe"
+            "call_recording_provider"
         }
 
         async fn request_bids(
             &self,
             _request: &AuctionRequest,
-            context: &AuctionContext<'_>,
+            _context: &AuctionContext<'_>,
         ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-            *self.calls.lock().expect("should lock provider call count") += 1;
-            let request = Request::builder()
-                .method("POST")
-                .uri("https://bidder.example/auction")
-                .body(EdgeBody::empty())
-                .expect("should build probe provider request");
-            context
-                .services
-                .http_client()
-                .send_async(PlatformHttpRequest::new(
-                    request,
-                    "template-switch-probe-backend",
-                ))
-                .await
-                .change_context(TrustedServerError::Auction {
-                    message: "probe provider launch failed".to_string(),
-                })
-                .map(ProviderRequestOutcome::pending)
+            *self.called.lock().expect("should lock provider call flag") = true;
+            Err(Report::new(TrustedServerError::Auction {
+                message: "call recorded".to_string(),
+            }))
         }
 
         async fn parse_response(
@@ -703,11 +770,7 @@ mod tests {
             _response: PlatformResponse,
             _response_time_ms: u64,
         ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            Ok(AuctionResponse::success(
-                self.provider_name(),
-                Vec::new(),
-                0,
-            ))
+            panic!("parse_response must not run when the launch returns an error");
         }
 
         fn timeout_ms(&self) -> u32 {
@@ -715,35 +778,30 @@ mod tests {
         }
 
         fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
-            Some("template-switch-probe-backend".to_string())
+            Some("call-recording-backend".to_string())
         }
     }
 
     #[tokio::test]
-    async fn direct_auction_remains_available_when_templates_are_disabled() {
-        let settings_toml = format!(
-            "{}\n[auction]\nenabled = true\nproviders = [\"template_switch_probe\"]\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
-            crate_test_settings_str()
+    async fn disabled_creative_opportunities_do_not_disable_direct_auction() {
+        let mut settings = create_test_settings();
+        settings.creative_opportunities = Some(
+            toml::from_str("enabled = false\ngam_network_id = \"12345\"\n")
+                .expect("should build disabled creative opportunity config"),
         );
-        let settings = Settings::from_toml(&settings_toml)
-            .expect("should parse settings with disabled templates");
-        let calls = Arc::new(Mutex::new(0));
-        let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-        orchestrator.register_provider(Arc::new(TemplateSwitchProbeProvider {
-            calls: Arc::clone(&calls),
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["call_recording_provider".to_string()],
+            timeout_ms: 2_000,
+            mediator: None,
+            ..Default::default()
+        };
+        let called = Arc::new(Mutex::new(false));
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(CallRecordingProvider {
+            called: Arc::clone(&called),
         }));
-
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, b"probe response".to_vec());
-        let services = RuntimeServices::builder()
-            .config_store(Arc::new(NoopConfigStore))
-            .secret_store(Arc::new(NoopSecretStore))
-            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-            .backend(Arc::new(NoopBackend))
-            .http_client(Arc::clone(&stub) as Arc<dyn PlatformHttpClient>)
-            .geo(Arc::new(NoopGeo))
-            .client_info(ClientInfo::default())
-            .build();
+        let services = noop_services();
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
         let body = json!({
             "adUnits": [{
@@ -759,7 +817,7 @@ mod tests {
             ))
             .expect("should build auction request");
 
-        let response = handle_auction(
+        let _ = handle_auction(
             &settings,
             &orchestrator,
             None,
@@ -768,15 +826,12 @@ mod tests {
             &services,
             req,
         )
-        .await
-        .expect("direct auction should remain available");
+        .await;
 
-        assert_eq!(
-            *calls.lock().expect("should lock provider call count"),
-            1,
-            "disabling publisher templates must not disable direct /auction"
+        assert!(
+            *called.lock().expect("should lock provider call flag"),
+            "direct /auction must remain live when publisher template delivery is disabled"
         );
-        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -843,6 +898,20 @@ mod tests {
         assert!(
             seatbid_empty,
             "gated auction must return no bids, got: {parsed}"
+        );
+        assert_eq!(parsed["cur"], "USD");
+        assert_eq!(
+            parsed["ext"]["trusted_server"]["slot_results"]["results"][0],
+            json!({
+                "slot": "div-gpt-ad-1",
+                "outcome": "failed",
+                "reason": "consent_denied"
+            }),
+            "the production endpoint must emit the exact decision-set extension"
+        );
+        assert!(
+            parsed["ext"].get("orchestrator").is_none(),
+            "the removed legacy response extension must not survive the hard cutover"
         );
 
         let batches = telemetry_sink

@@ -1,7 +1,7 @@
 # GPT Delivery Evidence and Auction Competition
 
-**Date:** 2026-08-04  
-**Status:** Implemented  
+**Date:** 2026-08-04
+**Status:** Implemented
 **Scope:** Opt-in GPT diagnostics only; no publisher-code changes
 
 ## Relationship to the Existing Diagnostics Design

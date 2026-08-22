@@ -1,4 +1,5 @@
 import type { GptDiagnosticsBinding, GptDiagnosticsSlotExport } from '../../core/types';
+import { realmOwnedElement, realmOwnedHtmlElement } from '../../shared/realm';
 
 import { scheduleFrame } from './presentation_helpers';
 import type { GptDiagnosticsBindingInput } from './store';
@@ -9,20 +10,20 @@ interface BindingStore {
 }
 
 type BindingWindow = Window & {
-  CSS?: typeof CSS;
+  CSS?: typeof CSS | undefined;
   HTMLElement: typeof HTMLElement;
-  MutationObserver?: typeof MutationObserver;
+  MutationObserver?: typeof MutationObserver | undefined;
 };
 
 interface BindingOptions {
-  document?: Document;
-  window?: BindingWindow;
-  scheduleFrame?: (callback: () => void) => void;
+  document?: Document | undefined;
+  window?: BindingWindow | undefined;
+  scheduleFrame?: ((callback: () => void) => () => void) | undefined;
 }
 
 export interface GptDiagnosticsBindingView {
   binding: GptDiagnosticsBinding;
-  element?: HTMLElement;
+  element?: HTMLElement | undefined;
   visible: boolean;
 }
 
@@ -40,23 +41,33 @@ function isVisibleInViewport(element: HTMLElement, window: BindingWindow): boole
   );
 }
 
-function nodeIntersectsSlotIds(node: Node, slotElementIds: Set<string>): boolean {
-  if (!(node instanceof Element)) return false;
-  if (slotElementIds.has(node.id)) return true;
-  return Array.from(node.querySelectorAll('[id]')).some((element) =>
-    slotElementIds.has(element.id)
+function nodeIntersectsSlotIds(
+  node: Node,
+  slotElementIds: Set<string>,
+  targetWindow: BindingWindow
+): boolean {
+  const element = realmOwnedElement(node, targetWindow);
+  if (!element) return false;
+  if (slotElementIds.has(element.id)) return true;
+  return Array.from(element.querySelectorAll('[id]')).some((descendant) =>
+    slotElementIds.has(descendant.id)
   );
 }
 
-function mutationIntersectsSlotIds(record: MutationRecord, slotElementIds: Set<string>): boolean {
+function mutationIntersectsSlotIds(
+  record: MutationRecord,
+  slotElementIds: Set<string>,
+  targetWindow: BindingWindow
+): boolean {
+  const target = realmOwnedElement(record.target, targetWindow);
   if (record.type === 'attributes') {
-    if (!(record.target instanceof Element)) return false;
-    return slotElementIds.has(record.target.id) || slotElementIds.has(record.oldValue ?? '');
+    if (!target) return false;
+    return slotElementIds.has(target.id) || slotElementIds.has(record.oldValue ?? '');
   }
 
-  if (record.target instanceof Element && slotElementIds.has(record.target.id)) return true;
+  if (target && slotElementIds.has(target.id)) return true;
   return [...record.addedNodes, ...record.removedNodes].some((node) =>
-    nodeIntersectsSlotIds(node, slotElementIds)
+    nodeIntersectsSlotIds(node, slotElementIds, targetWindow)
   );
 }
 
@@ -77,19 +88,23 @@ export class GptDiagnosticsBindingManager {
   private readonly store: BindingStore;
   private readonly document: Document;
   private readonly window: BindingWindow;
-  private readonly scheduleFrame: (callback: () => void) => void;
+  private readonly scheduleFrame: (callback: () => void) => () => void;
   private readonly bindings = new Map<number, GptDiagnosticsBindingView>();
   private readonly listeners = new Set<BindingListener>();
   private readonly slotElementIds = new Set<string>();
   private readonly unsubscribeStore: () => void;
   private mutationObserver?: MutationObserver;
+  private cancelScheduledRefresh: (() => void) | undefined;
   private refreshScheduled = false;
   private destroyed = false;
 
   constructor(store: BindingStore, options: BindingOptions = {}) {
     this.store = store;
     this.document = options.document ?? document;
-    this.window = options.window ?? (window as unknown as BindingWindow);
+    this.window =
+      options.window ??
+      (this.document.defaultView as unknown as BindingWindow | null) ??
+      (window as unknown as BindingWindow);
     this.scheduleFrame =
       options.scheduleFrame ?? ((callback) => scheduleFrame(this.window, callback));
     this.unsubscribeStore = this.store.subscribe(() => this.scheduleRefresh());
@@ -149,6 +164,14 @@ export class GptDiagnosticsBindingManager {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    const cancelRefresh = this.cancelScheduledRefresh;
+    this.cancelScheduledRefresh = undefined;
+    this.refreshScheduled = false;
+    try {
+      cancelRefresh?.();
+    } catch {
+      // Continue releasing every independently owned binding resource.
+    }
     this.unsubscribeStore();
     this.mutationObserver?.disconnect();
     this.window.removeEventListener('scroll', this.scheduleRefresh);
@@ -160,10 +183,40 @@ export class GptDiagnosticsBindingManager {
   private readonly scheduleRefresh = (): void => {
     if (this.destroyed || this.refreshScheduled) return;
     this.refreshScheduled = true;
-    this.scheduleFrame(() => {
+    let active = true;
+    let cancelFrame: (() => void) | undefined;
+    const run = (): void => {
+      if (!active) return;
+      active = false;
+      this.cancelScheduledRefresh = undefined;
+      try {
+        cancelFrame?.();
+      } catch {
+        // A completed frame remains authoritative when scheduler cleanup fails.
+      }
       this.refreshScheduled = false;
       this.refresh();
-    });
+    };
+    try {
+      cancelFrame = this.scheduleFrame(run);
+      if (typeof cancelFrame !== 'function') {
+        throw new TypeError('Invalid binding frame scheduler');
+      }
+      if (active) {
+        this.cancelScheduledRefresh = (): void => {
+          if (!active) return;
+          active = false;
+          this.refreshScheduled = false;
+          cancelFrame?.();
+        };
+      } else {
+        cancelFrame();
+      }
+    } catch {
+      active = false;
+      this.cancelScheduledRefresh = undefined;
+      this.refreshScheduled = false;
+    }
   };
 
   private resolveBinding(
@@ -184,15 +237,14 @@ export class GptDiagnosticsBindingManager {
       };
     }
 
-    const candidate = this.document.getElementById(slotElementId);
-    if (!candidate || !(candidate instanceof this.window.HTMLElement) || !candidate.isConnected) {
+    const element = realmOwnedHtmlElement(this.document.getElementById(slotElementId), this.window);
+    if (!element || !element.isConnected) {
       return {
         binding: { status: 'unbound', reason: 'missing_element' },
         visible: false,
       };
     }
 
-    const element = candidate as HTMLElement;
     const escape = this.window.CSS?.escape;
     if (typeof escape !== 'function') {
       return {
@@ -230,7 +282,9 @@ export class GptDiagnosticsBindingManager {
     const observer = new Observer((records) => {
       if (
         this.slotElementIds.size > 0 &&
-        records.some((record) => mutationIntersectsSlotIds(record, this.slotElementIds))
+        records.some((record) =>
+          mutationIntersectsSlotIds(record, this.slotElementIds, this.window)
+        )
       ) {
         this.scheduleRefresh();
       }

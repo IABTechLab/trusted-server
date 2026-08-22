@@ -1,9 +1,15 @@
 //! Core types for auction requests and responses.
 
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
+};
 use edgezero_core::body::Body as EdgeBody;
 use http::Request;
+use rand::{RngCore as _, rngs::OsRng};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use url::Url;
 
 use crate::auction::context::ContextValue;
 use crate::geo::GeoInfo;
@@ -12,6 +18,42 @@ use crate::settings::Settings;
 
 fn is_zero(value: &usize) -> bool {
     *value == 0
+}
+
+/// Injectable CSPRNG boundary for server-minted response-local identities.
+pub(crate) trait AuctionIdentityGenerator: Send + Sync {
+    /// Fill the complete destination or report that secure randomness is unavailable.
+    fn fill(&self, destination: &mut [u8]) -> Result<(), ()>;
+}
+
+/// Production CSPRNG for server-minted auction identities.
+pub(crate) struct SystemAuctionIdentityGenerator;
+
+impl AuctionIdentityGenerator for SystemAuctionIdentityGenerator {
+    fn fill(&self, destination: &mut [u8]) -> Result<(), ()> {
+        OsRng.try_fill_bytes(destination).map_err(|_| ())
+    }
+}
+
+/// Mint one response-unique unpadded base64url identity.
+pub(crate) fn mint_response_unique_base64url_identity(
+    generator: &dyn AuctionIdentityGenerator,
+    issued: &mut HashSet<String>,
+    prefix: &str,
+    random_byte_count: usize,
+    collision_retries: usize,
+) -> Option<String> {
+    for _ in 0..=collision_retries {
+        let mut bytes = vec![0_u8; random_byte_count];
+        if generator.fill(&mut bytes).is_err() {
+            return None;
+        }
+        let identity = format!("{prefix}{}", URL_SAFE_NO_PAD.encode(bytes));
+        if issued.insert(identity.clone()) {
+            return Some(identity);
+        }
+    }
+    None
 }
 
 /// Represents a unified auction request across all providers.
@@ -154,6 +196,353 @@ pub struct AuctionContext<'a> {
     pub services: &'a RuntimeServices,
 }
 
+/// Closed, local reason set for rejecting provider bids or undeliverable winners.
+///
+/// These values are serialized only into existing auction debug/diagnostic
+/// surfaces. They are not a persistence or external-event taxonomy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuctionDropReason {
+    /// Configured processing rejected an ordinary creative's only render source.
+    CreativeProcessingRejected,
+    /// Optional creative ID is present with an invalid type or value.
+    InvalidCreativeId,
+    /// Optional creative ID exceeds its UTF-8 byte bound.
+    CreativeIdTooLarge,
+    /// A positive integral dimension exceeds the supported range.
+    DimensionsOutOfRange,
+    /// An otherwise valid upstream bid ID is repeated in one provider response.
+    DuplicateUpstreamBidId,
+    /// A response contains no seat bids.
+    #[serde(rename = "empty_seatbid")]
+    EmptySeatBid,
+    /// A seat bid contains no usable bid array.
+    #[serde(rename = "empty_seatbid_bids")]
+    EmptySeatBidBids,
+    /// A creative URL is malformed, unsafe, or self-origin.
+    InvalidCreativeUrl,
+    /// A dimension is missing, malformed, nonpositive, or not requested.
+    InvalidDimensions,
+    /// A price is missing, malformed, nonfinite, or negative.
+    InvalidPrice,
+    /// The provider response violates the response-level contract.
+    InvalidProviderResponse,
+    /// The APS tag type is missing or unsupported.
+    InvalidTagType,
+    /// An upstream bid ID contains a forbidden control value or has the wrong type.
+    InvalidUpstreamBidId,
+    /// A valid sibling was preferred by deterministic per-slot reduction.
+    LostToHigherBid,
+    /// A provider bid is not an object.
+    MalformedBid,
+    /// APS creative metadata does not contain `creativeurl`.
+    MissingCreativeUrl,
+    /// Provider parsing was invoked without its request-local context.
+    MissingRequestContext,
+    /// A required upstream bid ID is absent or empty.
+    MissingUpstreamBidId,
+    /// A winner carries more than one render source.
+    MultipleRenderSources,
+    /// A winner has no render source.
+    NoRenderSource,
+    /// A typed renderer extension could not be serialized.
+    RendererExtensionSerializationFailed,
+    /// A validated renderer projection exceeds its bound.
+    RenderPayloadTooLarge,
+    /// APS script rendering is disabled by configuration.
+    ScriptRenderingDisabled,
+    /// A provider bid references an impression that was not dispatched.
+    UnknownImpression,
+    /// A provider bid declares a non-banner media type.
+    UnsupportedMediaType,
+    /// An upstream bid ID exceeds 64 UTF-8 bytes.
+    UpstreamBidIdTooLarge,
+}
+
+impl AuctionDropReason {
+    /// Return the exact existing debug/projection literal.
+    ///
+    /// This hand-written mapping also drives [`Ord`] so serialized-map output stays
+    /// alphabetically stable even when declaration order changes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CreativeProcessingRejected => "creative_processing_rejected",
+            Self::InvalidCreativeId => "invalid_creative_id",
+            Self::CreativeIdTooLarge => "creative_id_too_large",
+            Self::DimensionsOutOfRange => "dimensions_out_of_range",
+            Self::DuplicateUpstreamBidId => "duplicate_upstream_bid_id",
+            Self::EmptySeatBid => "empty_seatbid",
+            Self::EmptySeatBidBids => "empty_seatbid_bids",
+            Self::InvalidCreativeUrl => "invalid_creative_url",
+            Self::InvalidDimensions => "invalid_dimensions",
+            Self::InvalidPrice => "invalid_price",
+            Self::InvalidProviderResponse => "invalid_provider_response",
+            Self::InvalidTagType => "invalid_tag_type",
+            Self::InvalidUpstreamBidId => "invalid_upstream_bid_id",
+            Self::LostToHigherBid => "lost_to_higher_bid",
+            Self::MalformedBid => "malformed_bid",
+            Self::MissingCreativeUrl => "missing_creative_url",
+            Self::MissingRequestContext => "missing_request_context",
+            Self::MissingUpstreamBidId => "missing_upstream_bid_id",
+            Self::MultipleRenderSources => "multiple_render_sources",
+            Self::NoRenderSource => "no_render_source",
+            Self::RendererExtensionSerializationFailed => "renderer_extension_serialization_failed",
+            Self::RenderPayloadTooLarge => "render_payload_too_large",
+            Self::ScriptRenderingDisabled => "script_rendering_disabled",
+            Self::UnknownImpression => "unknown_impression",
+            Self::UnsupportedMediaType => "unsupported_media_type",
+            Self::UpstreamBidIdTooLarge => "upstream_bid_id_too_large",
+        }
+    }
+}
+
+impl Ord for AuctionDropReason {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl PartialOrd for AuctionDropReason {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Typed counts projected into the existing `drop_reasons` debug object.
+pub type AuctionDropReasons = BTreeMap<AuctionDropReason, u64>;
+
+/// Increment one typed local drop reason.
+pub(crate) fn record_auction_drop(reasons: &mut AuctionDropReasons, reason: AuctionDropReason) {
+    *reasons.entry(reason).or_default() += 1;
+}
+
+/// Closed failure set for one requested slot's server-auction decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuctionSlotFailureReason {
+    /// The auction orchestrator is disabled.
+    AuctionDisabled,
+    /// Request consent does not permit a server-side auction.
+    ConsentDenied,
+    /// No enabled configured provider can bid on the slot.
+    SlotNotEligible,
+    /// A dispatched provider exceeded its deadline.
+    ProviderTimeout,
+    /// A provider could not launch or complete its transport/HTTP exchange.
+    ProviderError,
+    /// A provider response failed structural, currency, identity, or bid validation.
+    InvalidProviderResponse,
+    /// The configured mediator failed or returned invalid provenance.
+    MediationFailed,
+    /// A selected candidate cannot be represented by the exact browser contract.
+    WinnerNotRenderable,
+    /// A unique renderer reservation could not be minted.
+    IdentityGenerationFailed,
+    /// An internal invariant or candidate-identity operation failed.
+    InternalError,
+}
+
+impl AuctionSlotFailureReason {
+    /// Return the exact wire literal.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AuctionDisabled => "auction_disabled",
+            Self::ConsentDenied => "consent_denied",
+            Self::SlotNotEligible => "slot_not_eligible",
+            Self::ProviderTimeout => "provider_timeout",
+            Self::ProviderError => "provider_error",
+            Self::InvalidProviderResponse => "invalid_provider_response",
+            Self::MediationFailed => "mediation_failed",
+            Self::WinnerNotRenderable => "winner_not_renderable",
+            Self::IdentityGenerationFailed => "identity_generation_failed",
+            Self::InternalError => "internal_error",
+        }
+    }
+
+    /// Closed multi-provider aggregation priority; lower values win.
+    #[must_use]
+    pub const fn priority(self) -> u8 {
+        match self {
+            Self::InternalError => 0,
+            Self::MediationFailed => 1,
+            Self::InvalidProviderResponse => 2,
+            Self::ProviderError => 3,
+            Self::ProviderTimeout => 4,
+            Self::ConsentDenied => 5,
+            Self::AuctionDisabled => 6,
+            Self::SlotNotEligible => 7,
+            Self::WinnerNotRenderable | Self::IdentityGenerationFailed => u8::MAX,
+        }
+    }
+}
+
+/// Exactly one final server-auction decision for a requested slot.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(
+    tag = "outcome",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum SlotAuctionDecisionV1 {
+    /// A candidate won and joins exactly one projected bid.
+    Winner {
+        /// Exact request slot identifier.
+        slot: String,
+        /// Opaque response-local candidate identifier.
+        candidate_id: String,
+    },
+    /// Every dispatched provider completed successfully without a candidate.
+    NoBid {
+        /// Exact request slot identifier.
+        slot: String,
+    },
+    /// The slot failed with one closed reason.
+    Failed {
+        /// Exact request slot identifier.
+        slot: String,
+        /// Exact failure reason.
+        reason: AuctionSlotFailureReason,
+    },
+}
+
+impl SlotAuctionDecisionV1 {
+    /// Return the exact slot identifier shared by every variant.
+    #[must_use]
+    pub fn slot(&self) -> &str {
+        match self {
+            Self::Winner { slot, .. } | Self::NoBid { slot } | Self::Failed { slot, .. } => slot,
+        }
+    }
+}
+
+impl Serialize for SlotAuctionDecisionV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        match self {
+            Self::Winner { slot, candidate_id } => {
+                let mut state = serializer.serialize_struct("SlotAuctionDecisionV1", 3)?;
+                state.serialize_field("slot", slot)?;
+                state.serialize_field("outcome", "winner")?;
+                state.serialize_field("candidateId", candidate_id)?;
+                state.end()
+            }
+            Self::NoBid { slot } => {
+                let mut state = serializer.serialize_struct("SlotAuctionDecisionV1", 2)?;
+                state.serialize_field("slot", slot)?;
+                state.serialize_field("outcome", "no_bid")?;
+                state.end()
+            }
+            Self::Failed { slot, reason } => {
+                let mut state = serializer.serialize_struct("SlotAuctionDecisionV1", 3)?;
+                state.serialize_field("slot", slot)?;
+                state.serialize_field("outcome", "failed")?;
+                state.serialize_field("reason", reason)?;
+                state.end()
+            }
+        }
+    }
+}
+
+/// Ordered version-1 decision set for one server auction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuctionDecisionSetV1 {
+    /// Contract version.
+    pub version: u8,
+    /// Exact auction identifier.
+    pub auction_id: String,
+    /// Exactly one decision per requested slot, in request order.
+    pub results: Vec<SlotAuctionDecisionV1>,
+}
+
+impl AuctionDecisionSetV1 {
+    /// Construct an ordered decision set for a request-wide gate.
+    #[must_use]
+    pub fn failed(request: &AuctionRequest, reason: AuctionSlotFailureReason) -> Self {
+        Self {
+            version: 1,
+            auction_id: request.id.clone(),
+            results: request
+                .slots
+                .iter()
+                .map(|slot| SlotAuctionDecisionV1::Failed {
+                    slot: slot.id.clone(),
+                    reason,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Maximum canonical UTF-8 size of the browser auction projection.
+pub const MAX_BROWSER_AUCTION_PROJECTION_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum number of requested results or projected winner bids.
+pub const MAX_BROWSER_AUCTION_RESULTS: usize = 256;
+/// Maximum number of publisher targeting entries on one projected bid.
+pub const MAX_BROWSER_AUCTION_TARGETING_ENTRIES: usize = 32;
+
+/// One exact browser-facing winner projection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserAuctionBidV1 {
+    /// Response-local mediator candidate identity.
+    pub candidate_id: String,
+    /// Exact requested server slot identity.
+    pub slot: String,
+    /// Canonical provider integration name.
+    pub provider: String,
+    /// Exact provider-native upstream bid identity.
+    pub upstream_bid_id: String,
+    /// Selected finite, nonnegative CPM.
+    pub cpm: f64,
+    /// Exact auction currency; version 1 admits only `USD`.
+    pub currency: String,
+    /// Lexically ordered publisher targeting, excluding runtime-owned `hb_adid`.
+    pub targeting: BTreeMap<String, String>,
+    /// Server-minted renderer capability identity for APS/ADM only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renderer_reservation_id: Option<String>,
+    /// Sole tagged render authority for the winner.
+    pub render_source: BidRenderSourceV1,
+}
+
+/// Exact GAM placement metadata required to publish one server-projected slot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserAuctionSlotV1 {
+    /// Exact server slot identity joined to one auction decision.
+    pub slot: String,
+    /// Fully rendered GAM ad-unit path for this navigation.
+    pub gam_unit_path: String,
+    /// Stable configured DOM id/prefix for responsive resolution.
+    pub div_id: String,
+    /// Accepted banner dimensions in configured order.
+    pub formats: Vec<[u32; 2]>,
+    /// Static publisher targeting applied before winner targeting.
+    pub targeting: BTreeMap<String, String>,
+}
+
+/// Complete browser-facing version-1 auction projection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserAuctionProjectionV1 {
+    /// Contract version.
+    pub version: u8,
+    /// Ordered decision set for every requested slot.
+    pub auction: AuctionDecisionSetV1,
+    /// Ordered GAM placement definitions; empty only for direct `/auction` serialization.
+    pub slots: Vec<BrowserAuctionSlotV1>,
+    /// Winner bids in matching decision order.
+    pub bids: Vec<BrowserAuctionBidV1>,
+}
+
 /// URL used by the orchestrator when invoking a mediator from the collect
 /// path. Providers can `debug_assert` against this value to catch a mediator
 /// that has accidentally started depending on `context.request` carrying real
@@ -187,7 +576,7 @@ pub enum ApsTagType {
 
 /// Version 1 APS renderer descriptor shared with browser clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApsRendererV1 {
     /// Renderer contract version.
     pub version: u8,
@@ -210,22 +599,308 @@ pub struct ApsRendererV1 {
     pub height: u32,
 }
 
-/// Typed browser renderer capability carried by a bid.
+/// Version 1 inline ADM render source shared with browser clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum BidRenderer {
-    /// APS renderer version 1.
-    Aps(ApsRendererV1),
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdmRenderSourceV1 {
+    /// Render-source contract version.
+    pub version: u8,
+    /// Exact creative markup.
+    pub adm: String,
+    /// Creative width.
+    pub width: u32,
+    /// Creative height.
+    pub height: u32,
 }
 
-impl BidRenderer {
+/// Thin version 1 carrier for the current GPT-owned PBS Cache behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BaselinePbsCacheSourceV1 {
+    /// Render-source contract version.
+    pub version: u8,
+    /// Exact native PBS Cache identity.
+    pub cache_id: String,
+    /// Exact current-main `hb_cache_host` value.
+    pub cache_host: String,
+    /// Exact current-main `hb_cache_path` value.
+    pub cache_path: String,
+    /// Winning width transported without cache-specific validation.
+    pub width: u32,
+    /// Winning height transported without cache-specific validation.
+    pub height: u32,
+}
+
+/// Typed browser render source carried by a bid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BidRenderSourceV1 {
+    /// APS renderer version 1.
+    Aps(ApsRendererV1),
+    /// Inline ADM version 1.
+    Adm(AdmRenderSourceV1),
+    /// Current-main GPT-owned PBS Cache carrier.
+    PbsCache(BaselinePbsCacheSourceV1),
+}
+
+impl BidRenderSourceV1 {
     /// Return the APS renderer descriptor when this is an APS renderer.
     #[must_use]
     pub fn as_aps(&self) -> Option<&ApsRendererV1> {
         match self {
             Self::Aps(renderer) => Some(renderer),
+            Self::Adm(_) | Self::PbsCache(_) => None,
         }
     }
+}
+
+/// Smallest accepted renderer dimension in CSS pixels.
+pub const RENDER_DIMENSION_MIN: u64 = 1;
+/// Largest accepted renderer dimension in CSS pixels.
+pub const RENDER_DIMENSION_MAX: u64 = 4096;
+
+const MAX_APS_ACCOUNT_ID_BYTES: usize = 1024;
+const MAX_APS_BID_ID_BYTES: usize = 64;
+const MAX_APS_CREATIVE_ID_BYTES: usize = 1024;
+const MAX_APS_CREATIVE_URL_BYTES: usize = 4096;
+const MAX_APS_RENDER_ENVELOPE_BYTES: usize = 256 * 1024;
+const MAX_APS_RENDER_ENVELOPE_BASE64_BYTES: usize = 4 * MAX_APS_RENDER_ENVELOPE_BYTES.div_ceil(3);
+
+/// Cross-language APS descriptor validation result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApsRendererValidationResult {
+    /// Descriptor and decoded envelope are valid and agree.
+    Accepted,
+    /// Descriptor or decoded envelope is malformed.
+    DescriptorInvalid,
+    /// A dimension has the wrong type or is nonfinite, fractional, zero, or negative.
+    InvalidDimensions,
+    /// An otherwise integral positive dimension is outside the supported range.
+    DimensionsOutOfRange,
+}
+
+impl ApsRendererValidationResult {
+    /// Return the exact browser failure/result literal.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::DescriptorInvalid => "descriptor_invalid",
+            Self::InvalidDimensions => "invalid_dimensions",
+            Self::DimensionsOutOfRange => "dimensions_out_of_range",
+        }
+    }
+}
+
+fn has_exact_json_keys(value: &serde_json::Value, expected: &[&str]) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+    })
+}
+
+fn classify_render_dimension(value: &serde_json::Value) -> ApsRendererValidationResult {
+    let Some(number) = value.as_f64() else {
+        return ApsRendererValidationResult::InvalidDimensions;
+    };
+    if !number.is_finite() || number.fract() != 0.0 || number <= 0.0 {
+        return ApsRendererValidationResult::InvalidDimensions;
+    }
+    if number < RENDER_DIMENSION_MIN as f64 || number > RENDER_DIMENSION_MAX as f64 {
+        return ApsRendererValidationResult::DimensionsOutOfRange;
+    }
+    ApsRendererValidationResult::Accepted
+}
+
+fn valid_aps_creative_url(value: &str, publisher_origin: &str) -> bool {
+    if value.len() > MAX_APS_CREATIVE_URL_BYTES {
+        return false;
+    }
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.origin().ascii_serialization() != publisher_origin
+}
+
+/// Classify a raw APS renderer descriptor using the cross-language version-1 contract.
+#[must_use]
+pub fn classify_aps_renderer_v1(
+    value: &serde_json::Value,
+    publisher_origin: &str,
+) -> ApsRendererValidationResult {
+    const REQUIRED_KEYS: &[&str] = &[
+        "aaxResponse",
+        "accountId",
+        "bidId",
+        "creativeUrl",
+        "height",
+        "tagType",
+        "type",
+        "version",
+        "width",
+    ];
+    const KEYS_WITH_CREATIVE_ID: &[&str] = &[
+        "aaxResponse",
+        "accountId",
+        "bidId",
+        "creativeId",
+        "creativeUrl",
+        "height",
+        "tagType",
+        "type",
+        "version",
+        "width",
+    ];
+
+    if !has_exact_json_keys(value, REQUIRED_KEYS)
+        && !has_exact_json_keys(value, KEYS_WITH_CREATIVE_ID)
+    {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+
+    let Some(descriptor) = value.as_object() else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    if descriptor.get("type").and_then(serde_json::Value::as_str) != Some("aps")
+        || descriptor
+            .get("version")
+            .and_then(serde_json::Value::as_f64)
+            .is_none_or(|version| version != 1.0)
+    {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+
+    let Some(account_id) = descriptor
+        .get("accountId")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    let Some(bid_id) = descriptor.get("bidId").and_then(serde_json::Value::as_str) else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    if account_id.is_empty()
+        || account_id.len() > MAX_APS_ACCOUNT_ID_BYTES
+        || bid_id.is_empty()
+        || bid_id.len() > MAX_APS_BID_ID_BYTES
+        || bid_id.bytes().any(|byte| byte <= 0x1f || byte == 0x7f)
+    {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+    if let Some(creative_id) = descriptor.get("creativeId") {
+        let Some(creative_id) = creative_id.as_str() else {
+            return ApsRendererValidationResult::DescriptorInvalid;
+        };
+        if creative_id.is_empty() || creative_id.len() > MAX_APS_CREATIVE_ID_BYTES {
+            return ApsRendererValidationResult::DescriptorInvalid;
+        }
+    }
+    let Some(tag_type) = descriptor
+        .get("tagType")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    if tag_type != "iframe" && tag_type != "script" {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+
+    let width_result =
+        classify_render_dimension(descriptor.get("width").unwrap_or(&serde_json::Value::Null));
+    if width_result != ApsRendererValidationResult::Accepted {
+        return width_result;
+    }
+    let height_result =
+        classify_render_dimension(descriptor.get("height").unwrap_or(&serde_json::Value::Null));
+    if height_result != ApsRendererValidationResult::Accepted {
+        return height_result;
+    }
+
+    let Some(creative_url) = descriptor
+        .get("creativeUrl")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    let Some(aax_response) = descriptor
+        .get("aaxResponse")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    if !valid_aps_creative_url(creative_url, publisher_origin)
+        || aax_response.is_empty()
+        || aax_response.len() > MAX_APS_RENDER_ENVELOPE_BASE64_BYTES
+    {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+    let Ok(decoded_bytes) = BASE64_STANDARD.decode(aax_response) else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    if decoded_bytes.len() > MAX_APS_RENDER_ENVELOPE_BYTES
+        || BASE64_STANDARD.encode(&decoded_bytes) != aax_response
+    {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+    let Ok(decoded_utf8) = core::str::from_utf8(&decoded_bytes) else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    let Ok(decoded) = serde_json::from_str::<serde_json::Value>(decoded_utf8) else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    if !has_exact_json_keys(&decoded, &["seatbid"]) {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+    let Some(seats) = decoded.get("seatbid").and_then(serde_json::Value::as_array) else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    if seats.len() != 1 || !has_exact_json_keys(&seats[0], &["bid"]) {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+    let Some(bids) = seats[0].get("bid").and_then(serde_json::Value::as_array) else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    if bids.len() != 1 || !has_exact_json_keys(&bids[0], &["ext", "h", "id", "price", "w"]) {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+    let bid = &bids[0];
+    let Some(ext) = bid.get("ext") else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    if !has_exact_json_keys(ext, &["creativeurl", "tagtype"]) {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+
+    let bid_width_result =
+        classify_render_dimension(bid.get("w").unwrap_or(&serde_json::Value::Null));
+    if bid_width_result != ApsRendererValidationResult::Accepted {
+        return bid_width_result;
+    }
+    let bid_height_result =
+        classify_render_dimension(bid.get("h").unwrap_or(&serde_json::Value::Null));
+    if bid_height_result != ApsRendererValidationResult::Accepted {
+        return bid_height_result;
+    }
+    let price_is_valid = bid
+        .get("price")
+        .and_then(serde_json::Value::as_f64)
+        .is_some_and(|price| price.is_finite() && price >= 0.0);
+    if bid.get("id").and_then(serde_json::Value::as_str) != Some(bid_id)
+        || bid.get("w").and_then(serde_json::Value::as_f64)
+            != descriptor.get("width").and_then(serde_json::Value::as_f64)
+        || bid.get("h").and_then(serde_json::Value::as_f64)
+            != descriptor.get("height").and_then(serde_json::Value::as_f64)
+        || ext.get("creativeurl").and_then(serde_json::Value::as_str) != Some(creative_url)
+        || ext.get("tagtype").and_then(serde_json::Value::as_str) != Some(tag_type)
+        || !price_is_valid
+    {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+
+    ApsRendererValidationResult::Accepted
 }
 
 /// Individual bid from a provider.
@@ -233,13 +908,22 @@ impl BidRenderer {
 pub struct Bid {
     /// Slot this bid is for
     pub slot_id: String,
+    /// Server-minted opaque identifier used only for this auction response.
+    #[serde(skip)]
+    pub candidate_id: Option<String>,
+    /// Provider integration name paired with the upstream bid ID for provenance.
+    #[serde(skip)]
+    pub candidate_provider: Option<String>,
+    /// Server-minted renderer capability identifier (populated during projection).
+    #[serde(skip)]
+    pub renderer_reservation_id: Option<String>,
     /// Bid price in CPM.
     pub price: Option<f64>,
     /// Currency code (e.g., "USD")
     pub currency: String,
     /// Creative markup (HTML/VAST).
     ///
-    /// `None` when the bid uses a typed [`BidRenderer`] instead.
+    /// `None` when the bid uses a typed [`BidRenderSourceV1`] instead.
     pub creative: Option<String>,
     /// Advertiser domain
     pub adomain: Option<Vec<String>>,
@@ -267,11 +951,11 @@ pub struct Bid {
     pub creative_id: Option<String>,
     /// Typed browser renderer capability.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub renderer: Option<BidRenderer>,
+    pub renderer: Option<BidRenderSourceV1>,
     /// Prebid Cache UUID for this bid.
     ///
     /// Populated from `ext.prebid.cache.bids.cacheId` in the PBS response.
-    /// Used as `hb_adid` targeting value in `window.tsjs.bids`. `None` for
+    /// Used as the `hb_adid` value in the initial browser auction projection. `None` for
     /// non-PBS providers (e.g., APS) and PBS bids without Prebid Cache enabled.
     pub cache_id: Option<String>,
     /// Prebid Cache host (e.g., `"openads.adsrvr.org"`).
@@ -286,6 +970,28 @@ pub struct Bid {
     pub cache_path: Option<String>,
     /// Provider-specific bid metadata.
     pub metadata: HashMap<String, serde_json::Value>,
+}
+
+/// Length of the hex-encoded creative trace hash.
+const ADM_TRACE_HASH_LEN: usize = 16;
+
+/// Compute the trace hash for delivered creative markup.
+#[must_use]
+pub fn adm_trace_hash(adm: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let digest = Sha256::digest(adm.as_bytes());
+    let mut hex = hex::encode(digest);
+    hex.truncate(ADM_TRACE_HASH_LEN);
+    hex
+}
+
+impl Bid {
+    /// Trace hash of this bid's creative markup, when present.
+    #[must_use]
+    pub fn creative_trace_hash(&self) -> Option<String> {
+        self.creative.as_deref().map(adm_trace_hash)
+    }
 }
 
 /// Per-provider summary included in the auction response.
@@ -338,7 +1044,7 @@ pub struct OrchestratorExt {
     pub dropped_winner_count: usize,
     /// Machine-readable reasons for omitted winners.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub dropped_winner_reasons: BTreeMap<String, usize>,
+    pub dropped_winner_reasons: AuctionDropReasons,
 }
 
 /// Status of bid response.
@@ -394,6 +1100,30 @@ impl AuctionResponse {
         self.metadata.insert(key.into(), value);
         self
     }
+
+    /// Project typed local drop reasons into the existing provider metadata surface.
+    #[must_use]
+    pub fn with_drop_reasons(mut self, reasons: &AuctionDropReasons) -> Self {
+        if !reasons.is_empty() {
+            let values = reasons
+                .iter()
+                .map(|(reason, count)| {
+                    (reason.as_str().to_string(), serde_json::Value::from(*count))
+                })
+                .collect();
+            self.metadata.insert(
+                "drop_reasons".to_string(),
+                serde_json::Value::Object(values),
+            );
+        }
+        self
+    }
+
+    /// Project one typed local drop reason into provider metadata.
+    #[must_use]
+    pub fn with_drop_reason(self, reason: AuctionDropReason) -> Self {
+        self.with_drop_reasons(&BTreeMap::from([(reason, 1)]))
+    }
 }
 
 #[cfg(test)]
@@ -401,9 +1131,59 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn typed_drop_reasons_use_exact_literals_in_provider_summary_metadata() {
+        let reasons = [
+            AuctionDropReason::CreativeProcessingRejected,
+            AuctionDropReason::InvalidCreativeId,
+            AuctionDropReason::CreativeIdTooLarge,
+            AuctionDropReason::DimensionsOutOfRange,
+            AuctionDropReason::DuplicateUpstreamBidId,
+            AuctionDropReason::EmptySeatBid,
+            AuctionDropReason::EmptySeatBidBids,
+            AuctionDropReason::InvalidCreativeUrl,
+            AuctionDropReason::InvalidDimensions,
+            AuctionDropReason::InvalidPrice,
+            AuctionDropReason::InvalidProviderResponse,
+            AuctionDropReason::InvalidTagType,
+            AuctionDropReason::InvalidUpstreamBidId,
+            AuctionDropReason::LostToHigherBid,
+            AuctionDropReason::MalformedBid,
+            AuctionDropReason::MissingCreativeUrl,
+            AuctionDropReason::MissingRequestContext,
+            AuctionDropReason::MissingUpstreamBidId,
+            AuctionDropReason::MultipleRenderSources,
+            AuctionDropReason::NoRenderSource,
+            AuctionDropReason::RendererExtensionSerializationFailed,
+            AuctionDropReason::RenderPayloadTooLarge,
+            AuctionDropReason::ScriptRenderingDisabled,
+            AuctionDropReason::UnknownImpression,
+            AuctionDropReason::UnsupportedMediaType,
+            AuctionDropReason::UpstreamBidIdTooLarge,
+        ];
+        for reason in reasons {
+            assert_eq!(
+                serde_json::to_value(reason).expect("drop reason should serialize"),
+                json!(reason.as_str()),
+                "serde and diagnostic literal should agree for {reason:?}"
+            );
+        }
+
+        let response = AuctionResponse::no_bid("aps", 12)
+            .with_drop_reason(AuctionDropReason::InvalidProviderResponse);
+        let summary = ProviderSummary::from(&response);
+        assert_eq!(
+            summary.metadata["drop_reasons"]["invalid_provider_response"], 1,
+            "publisher provider-summary projection should retain the typed reason"
+        );
+    }
+
     fn make_bid(bidder: &str) -> Bid {
         Bid {
             slot_id: "slot-1".to_owned(),
+            candidate_id: None,
+            candidate_provider: None,
+            renderer_reservation_id: None,
             price: Some(1.0),
             currency: "USD".to_owned(),
             creative: None,
@@ -536,6 +1316,9 @@ mod tests {
     fn bid_with_cache_fields_round_trips_through_json() {
         let bid = Bid {
             slot_id: "atf".to_string(),
+            candidate_id: None,
+            candidate_provider: None,
+            renderer_reservation_id: None,
             price: Some(1.50),
             currency: "USD".to_string(),
             creative: None,
@@ -575,7 +1358,7 @@ mod tests {
 
     #[test]
     fn aps_renderer_serializes_to_versioned_camel_case_contract() {
-        let renderer = BidRenderer::Aps(ApsRendererV1 {
+        let renderer = BidRenderSourceV1::Aps(ApsRendererV1 {
             version: 1,
             account_id: "example-account-id".to_string(),
             bid_id: "fictional-bid-id".to_string(),
@@ -609,7 +1392,7 @@ mod tests {
 
     #[test]
     fn aps_renderer_omits_absent_creative_id() {
-        let renderer = BidRenderer::Aps(ApsRendererV1 {
+        let renderer = BidRenderSourceV1::Aps(ApsRendererV1 {
             version: 1,
             account_id: "example-account-id".to_string(),
             bid_id: "fictional-bid-id".to_string(),
@@ -639,9 +1422,39 @@ mod tests {
     }
 
     #[test]
+    fn slot_failure_priority_matches_the_closed_contract() {
+        let ordered = [
+            AuctionSlotFailureReason::InternalError,
+            AuctionSlotFailureReason::MediationFailed,
+            AuctionSlotFailureReason::InvalidProviderResponse,
+            AuctionSlotFailureReason::ProviderError,
+            AuctionSlotFailureReason::ProviderTimeout,
+            AuctionSlotFailureReason::ConsentDenied,
+            AuctionSlotFailureReason::AuctionDisabled,
+            AuctionSlotFailureReason::SlotNotEligible,
+        ];
+
+        assert_eq!(
+            ordered.map(AuctionSlotFailureReason::priority),
+            [0, 1, 2, 3, 4, 5, 6, 7]
+        );
+        assert_eq!(
+            AuctionSlotFailureReason::WinnerNotRenderable.priority(),
+            u8::MAX
+        );
+        assert_eq!(
+            AuctionSlotFailureReason::IdentityGenerationFailed.priority(),
+            u8::MAX
+        );
+    }
+
+    #[test]
     fn bid_has_ad_id_field() {
         let bid = Bid {
             slot_id: "s".to_string(),
+            candidate_id: None,
+            candidate_provider: None,
+            renderer_reservation_id: None,
             price: Some(1.0),
             currency: "USD".to_string(),
             creative: None,

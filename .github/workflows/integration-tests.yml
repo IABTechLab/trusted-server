@@ -1,4 +1,6 @@
 name: "Integration Tests"
+run-name: >-
+  Integration Tests / ${{ inputs.evidence_id || format('PR {0}', github.event.pull_request.number) }}
 
 permissions:
   contents: read
@@ -9,6 +11,23 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   workflow_dispatch:
+    inputs:
+      base_sha:
+        description: Exact rc/202608 base commit for performance comparison
+        required: true
+        type: string
+      evidence_id:
+        description: Unique identifier used to bind this run to an evidence artifact
+        required: true
+        type: string
+      release_id:
+        description: Exact generated TSJS release id
+        required: true
+        type: string
+      previous_artifact_id:
+        description: Immutable artifact identifier used for rollback
+        required: true
+        type: string
 
 env:
   ORIGIN_PORT: 8888
@@ -19,8 +38,32 @@ env:
   CF_BUILD_ARTIFACT_PATH: /tmp/integration-test-artifacts/cloudflare/build
 
 jobs:
+  tsjs-performance-gate:
+    name: TSJS first-display performance evidence
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (startsWith(inputs.evidence_id, 'aps-tsjs-preswitch-') ||
+       startsWith(inputs.evidence_id, 'aps-tsjs-postswitch-'))
+    uses: ./.github/workflows/tsjs-performance-gate.yml
+    with:
+      base_sha: ${{ inputs.base_sha }}
+      evidence_id: ${{ inputs.evidence_id }}
+      mode: ${{ startsWith(inputs.evidence_id, 'aps-tsjs-postswitch-') && 'postswitch' || 'preswitch' }}
+
+  real-gam-attestation:
+    name: protected real-GAM attestation
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      startsWith(inputs.evidence_id, 'aps-tsjs-cutover-')
+    uses: ./.github/workflows/aps-real-gam.yml
+    with:
+      evidence_id: ${{ inputs.evidence_id }}
+      release_id: ${{ inputs.release_id }}
+      previous_artifact_id: ${{ inputs.previous_artifact_id }}
+
   prepare-artifacts:
     name: prepare integration artifacts
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -57,6 +100,7 @@ jobs:
 
   integration-tests:
     name: integration tests
+    if: github.event_name == 'pull_request'
     needs: prepare-artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -116,6 +160,7 @@ jobs:
 
   integration-tests-fastly-ec:
     name: integration tests (Fastly EC lifecycle)
+    if: github.event_name == 'pull_request'
     needs: prepare-artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -152,10 +197,60 @@ jobs:
           VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
           RUST_LOG: info
 
+  aps-runner-proxy:
+    name: APS runner proxy (${{ matrix.runtime }})
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [axum, fastly, cloudflare, spin]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up APS proxy test environment
+        id: shared-setup
+        uses: ./.github/actions/setup-integration-test-env
+        with:
+          origin-port: ${{ env.ORIGIN_PORT }}
+          install-viceroy: ${{ matrix.runtime == 'fastly' && 'true' || 'false' }}
+          build-wasm: "false"
+          build-axum: "false"
+          build-test-images: "false"
+          build-cloudflare: "false"
+
+      - name: Add Cloudflare wasm target
+        if: matrix.runtime == 'cloudflare'
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Set up Node.js for Wrangler
+        if: matrix.runtime == 'cloudflare'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.shared-setup.outputs.node-version }}
+
+      - name: Install Wrangler
+        if: matrix.runtime == 'cloudflare'
+        run: npm install -g wrangler@4.64.0
+
+      - name: Install Spin
+        if: matrix.runtime == 'spin'
+        uses: fermyon/actions/spin/setup@v1
+        with:
+          version: "v4.0.2"
+
+      - name: Run actual-adapter APS runner-proxy corpus
+        run: ./scripts/integration-tests-aps-runner-proxy.sh --runtime ${{ matrix.runtime }}
+        env:
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          RUST_LOG: info
+
   browser-tests:
     name: browser integration tests
+    if: github.event_name == 'pull_request'
     needs: prepare-artifacts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -244,3 +339,143 @@ jobs:
           name: playwright-traces
           path: crates/trusted-server-integration-tests/browser/test-results/
           retention-days: 7
+
+  browser-tests-aps-tsjs-conformance:
+    name: browser integration tests (APS/TSJS conformance)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up APS/TSJS browser test runtime
+        id: shared-setup
+        uses: ./.github/actions/setup-integration-test-env
+        with:
+          origin-port: ${{ env.ORIGIN_PORT }}
+          install-viceroy: "true"
+          build-wasm: "false"
+          build-axum: "false"
+          build-test-images: "false"
+          build-cloudflare: "false"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.shared-setup.outputs.node-version }}
+          cache: npm
+          cache-dependency-path: |
+            crates/trusted-server-integration-tests/browser/package-lock.json
+            crates/trusted-server-js/lib/package-lock.json
+
+      - name: Run focused APS/TSJS three-browser conformance matrix
+        env:
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          TS_BROWSER_FRAMEWORKS: nextjs
+          TS_BROWSER_PROJECTS: chromium,firefox,webkit
+        run: ./scripts/integration-tests-browser.sh tests/shared/aps-renderer.spec.ts tests/shared/aps-puc-lifecycle.spec.ts tests/shared/tsjs-runtime.spec.ts tests/shared/creative-sandbox.spec.ts tests/nextjs/gpt-diagnostics.spec.ts tests/nextjs/navigation.spec.ts --project=chromium --project=firefox --project=webkit
+
+      - name: Upload APS/TSJS Playwright report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-aps-tsjs-conformance
+          path: crates/trusted-server-integration-tests/browser/playwright-report/
+          retention-days: 7
+
+  cutover-suite:
+    name: exact APS/TSJS integration evidence
+    if: github.event_name == 'workflow_dispatch' && startsWith(inputs.evidence_id, 'aps-tsjs-cutover-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up the complete integration environment
+        id: shared-setup
+        uses: ./.github/actions/setup-integration-test-env
+        with:
+          origin-port: ${{ env.ORIGIN_PORT }}
+          install-viceroy: "true"
+          build-cloudflare: "true"
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.shared-setup.outputs.node-version }}
+          cache: npm
+          cache-dependency-path: |
+            crates/trusted-server-js/lib/package-lock.json
+            crates/trusted-server-integration-tests/browser/package-lock.json
+
+      - name: Install exact integration runtimes
+        run: npm install -g wrangler@4.64.0
+
+      - name: Install pinned Spin
+        uses: fermyon/actions/spin/setup@v1
+        with:
+          version: "v4.0.2"
+
+      - name: Generate integration Viceroy configs
+        run: ./scripts/generate-integration-viceroy-configs.sh
+        env:
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+
+      - name: Build and validate the exact TSJS release
+        env:
+          EXPECTED_RELEASE_ID: ${{ inputs.release_id }}
+        shell: bash
+        run: bash scripts/ci/aps-tsjs-cutover.sh build-release
+
+      - name: Run route parity and the full adapter integration suite
+        env:
+          WASM_BINARY_PATH: ${{ github.workspace }}/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm
+          AXUM_BINARY_PATH: ${{ github.workspace }}/target/debug/trusted-server-axum
+          CLOUDFLARE_WRANGLER_DIR: ${{ github.workspace }}/crates/trusted-server-adapter-cloudflare
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
+          RUST_LOG: info
+        shell: bash
+        run: bash scripts/ci/aps-tsjs-cutover.sh run-adapters
+
+      - name: Install Chromium, Firefox, and WebKit
+        run: bash scripts/ci/aps-tsjs-cutover.sh install-browsers
+
+      - name: Run the focused three-browser APS/TSJS matrix
+        env:
+          WASM_BINARY_PATH: ${{ github.workspace }}/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
+          TEST_FRAMEWORK: nextjs
+          TS_BROWSER_PROJECTS: chromium,firefox,webkit
+        shell: bash
+        run: bash scripts/ci/aps-tsjs-cutover.sh run-browser
+
+      - name: Run the APS runner-proxy corpus on every adapter
+        shell: bash
+        run: bash scripts/ci/aps-tsjs-cutover.sh run-proxies
+        env:
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          RUST_LOG: info
+
+      - name: Write exact integration evidence manifest
+        env:
+          EVIDENCE_ID: ${{ inputs.evidence_id }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          PREVIOUS_ARTIFACT_ID: ${{ inputs.previous_artifact_id }}
+        run: node scripts/ci/aps-tsjs-evidence.mjs write-integration
+
+      - name: Scrub all integration evidence before upload
+        env:
+          INTEGRATION_AUTHORIZATION: integration-test-proxy-secret
+        run: node scripts/ci/aps-tsjs-evidence.mjs scrub-integration
+
+      - name: Upload exact integration evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: aps-tsjs-cutover-${{ github.sha }}
+          path: target/aps-tsjs-cutover-evidence/
+          if-no-files-found: error
+          retention-days: 30

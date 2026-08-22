@@ -1,0 +1,581 @@
+{
+  "version": 2,
+  "historicalMain": {
+    "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+    "rows": [
+      {
+        "id": "RCJ-CORE-01",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "main-owned",
+        "ownerPaths": [
+          "crates/trusted-server-js/lib/src/core/auction.ts",
+          "crates/trusted-server-js/lib/src/core/render.ts",
+          "crates/trusted-server-js/lib/src/core/request.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/core/auction.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/core/auction.test.ts test/core/request.test.ts test/core/render.test.ts",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-CORE-02",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "main-owned",
+        "ownerPaths": [
+          "crates/trusted-server-js/lib/src/core/config.ts",
+          "crates/trusted-server-js/lib/src/core/index.ts",
+          "crates/trusted-server-js/lib/src/core/log.ts",
+          "crates/trusted-server-js/lib/src/core/registry.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/core/index.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/core/index.test.ts test/core/config.test.ts test/core/registry.test.ts",
+        "result": "pass",
+        "disposition": "supersede"
+      },
+      {
+        "id": "RCJ-BOOT-01",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "main-owned",
+        "ownerPaths": [
+          "crates/trusted-server-core/src/html_processor.rs",
+          "crates/trusted-server-js/lib/src/integrations/gpt/index.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/gpt/gpt_bootstrap.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/gpt/gpt_bootstrap.test.ts test/integrations/gpt/schedule_initial_ad_init.test.ts",
+        "result": "pass",
+        "disposition": "supersede"
+      },
+      {
+        "id": "RCJ-TRACE-01",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "implementation-gap",
+        "ownerPaths": ["crates/trusted-server-js/lib/src/core/index.ts"],
+        "testPath": "crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "command": "node --test --test-name-pattern='RCJ-TRACE-01' crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "result": "fail",
+        "disposition": "supersede"
+      },
+      {
+        "id": "RCJ-GPT-01",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "main-owned",
+        "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/gpt/index.ts"],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/gpt/ad_init.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/gpt/ad_init.test.ts",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-GPT-02",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "main-owned",
+        "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/gpt/index.ts"],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/gpt/ad_init.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/gpt/ad_init.test.ts",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-GPT-03",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "main-owned",
+        "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/gpt/index.ts"],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/gpt/index.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/gpt/index.test.ts",
+        "result": "pass",
+        "disposition": "preserve"
+      },
+      {
+        "id": "RCJ-GPT-04",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "implementation-gap",
+        "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/gpt/index.ts"],
+        "testPath": "crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "command": "node --test --test-name-pattern='RCJ-GPT-04' crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "result": "fail",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-PREBID-01",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "main-owned",
+        "ownerPaths": [
+          "crates/trusted-server-js/lib/build-prebid-external.mjs",
+          "crates/trusted-server-js/lib/src/integrations/prebid/index.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/prebid-artifact-integration.test.mjs",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/build-prebid-external.test.mjs test/prebid-artifact-integration.test.mjs",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-PREBID-02",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "main-owned",
+        "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/prebid/index.ts"],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/prebid/index.test.ts",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-PREBID-03",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "main-owned",
+        "ownerPaths": [
+          "crates/trusted-server-js/lib/build-prebid-external.mjs",
+          "crates/trusted-server-js/lib/src/integrations/prebid/user_id_modules.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/prebid/user_id_modules.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/prebid/user_id_modules.test.ts",
+        "result": "pass",
+        "disposition": "preserve"
+      },
+      {
+        "id": "RCJ-PREBID-04",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "main-owned",
+        "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/prebid/index.ts"],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/prebid/index.test.ts",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-APS-01",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "main-owned",
+        "ownerPaths": [
+          "crates/trusted-server-core/src/integrations/aps.rs",
+          "crates/trusted-server-js/lib/src/integrations/aps/render.ts"
+        ],
+        "testPath": "crates/trusted-server-core/src/integrations/aps.rs",
+        "command": "cargo test-fastly integrations::aps::tests",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-APS-02",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "main-owned",
+        "ownerPaths": [
+          "crates/trusted-server-js/lib/src/integrations/aps/render.ts",
+          "crates/trusted-server-js/lib/src/integrations/gpt/index.ts",
+          "crates/trusted-server-js/lib/src/integrations/prebid/index.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/gpt/ad_init.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/gpt/ad_init.test.ts",
+        "result": "pass",
+        "disposition": "supersede"
+      },
+      {
+        "id": "RCJ-APS-03",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "implementation-gap",
+        "ownerPaths": [
+          "crates/trusted-server-core/src/integrations/aps.rs",
+          "crates/trusted-server-js/lib/src/integrations/aps/render.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "command": "node --test --test-name-pattern='RCJ-APS-03' crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "result": "fail",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-APS-04",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "implementation-gap",
+        "ownerPaths": [
+          "crates/trusted-server-core/src/integrations/aps.rs",
+          "crates/trusted-server-js/lib/src/integrations/aps/render.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "command": "node --test --test-name-pattern='RCJ-APS-04' crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "result": "fail",
+        "disposition": "preserve"
+      },
+      {
+        "id": "RCJ-CREATIVE-01",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "main-owned",
+        "ownerPaths": ["crates/trusted-server-core/src/publisher.rs"],
+        "testPath": "crates/trusted-server-core/src/publisher.rs",
+        "command": "cargo test-fastly build_bid_map_",
+        "result": "pass",
+        "disposition": "preserve"
+      },
+      {
+        "id": "RCJ-CREATIVE-02",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "main-owned",
+        "ownerPaths": [
+          "crates/trusted-server-js/lib/src/integrations/creative/click.ts",
+          "crates/trusted-server-js/lib/src/shared/origin.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/creative/click.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/creative/click.test.ts test/integrations/creative/image.test.ts test/integrations/creative/iframe.test.ts",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-CREATIVE-03",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "main-owned",
+        "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/creative/index.ts"],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/creative/image.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/creative/click.test.ts test/integrations/creative/image.test.ts test/integrations/creative/iframe.test.ts",
+        "result": "pass",
+        "disposition": "supersede"
+      },
+      {
+        "id": "RCJ-DIAG-01",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "main-owned",
+        "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/index.ts"],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/index.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/gpt_diagnostics",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-INT-01",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "main-owned",
+        "ownerPaths": [
+          "crates/trusted-server-core/src/integrations/testlight.rs",
+          "crates/trusted-server-js/lib/src/integrations/datadome/script_guard.ts",
+          "crates/trusted-server-js/lib/src/integrations/didomi/index.ts",
+          "crates/trusted-server-js/lib/src/integrations/google_tag_manager/script_guard.ts",
+          "crates/trusted-server-js/lib/src/integrations/lockr/script_guard.ts",
+          "crates/trusted-server-js/lib/src/integrations/osano/index.ts",
+          "crates/trusted-server-js/lib/src/integrations/permutive/segments.ts",
+          "crates/trusted-server-js/lib/src/integrations/sourcepoint/index.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/datadome/script_guard.test.ts",
+        "command": "cargo test-fastly integrations::testlight && npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/datadome/script_guard.test.ts test/integrations/didomi/index.test.ts test/integrations/google_tag_manager/script_guard.test.ts test/integrations/lockr/script_guard.test.ts test/integrations/osano/index.test.ts test/integrations/permutive/segments.test.ts test/integrations/sourcepoint/index.test.ts",
+        "result": "pass",
+        "disposition": "preserve"
+      },
+      {
+        "id": "RCJ-INT-02",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "main-owned",
+        "ownerPaths": [
+          "crates/trusted-server-js/lib/src/shared/async.ts",
+          "crates/trusted-server-js/lib/src/shared/beacon_guard.ts",
+          "crates/trusted-server-js/lib/src/shared/dom_insertion_dispatcher.ts",
+          "crates/trusted-server-js/lib/src/shared/origin.ts",
+          "crates/trusted-server-js/lib/src/shared/scheduler.ts",
+          "crates/trusted-server-js/lib/src/shared/script_guard.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/shared/dom_insertion_dispatcher.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/shared",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-QUAL-01",
+        "mainSha": "f6a2fb85ce623bf8a574e3941e1ee349acc3412d",
+        "classification": "implementation-gap",
+        "ownerPaths": [
+          "crates/trusted-server-js/lib/eslint.config.js",
+          "crates/trusted-server-js/lib/package.json",
+          "crates/trusted-server-js/lib/vitest.config.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "command": "node --test --test-name-pattern='RCJ-QUAL-01' crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "result": "fail",
+        "disposition": "preserve"
+      }
+    ]
+  },
+  "rcBaseline": {
+    "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+    "rows": [
+      {
+        "id": "RCJ-CORE-01",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "baseline-owned",
+        "ownerPaths": [
+          "crates/trusted-server-js/lib/src/core/auction.ts",
+          "crates/trusted-server-js/lib/src/core/render.ts",
+          "crates/trusted-server-js/lib/src/core/request.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/core/auction.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/core/auction.test.ts test/core/request.test.ts test/core/render.test.ts",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-CORE-02",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "baseline-owned",
+        "ownerPaths": [
+          "crates/trusted-server-js/lib/src/core/config.ts",
+          "crates/trusted-server-js/lib/src/core/index.ts",
+          "crates/trusted-server-js/lib/src/core/log.ts",
+          "crates/trusted-server-js/lib/src/core/registry.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/core/index.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/core/index.test.ts test/core/config.test.ts test/core/registry.test.ts",
+        "result": "pass",
+        "disposition": "supersede"
+      },
+      {
+        "id": "RCJ-BOOT-01",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "baseline-owned",
+        "ownerPaths": [
+          "crates/trusted-server-core/src/html_processor.rs",
+          "crates/trusted-server-js/lib/src/integrations/gpt/index.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/gpt/gpt_bootstrap.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/gpt/gpt_bootstrap.test.ts test/integrations/gpt/schedule_initial_ad_init.test.ts",
+        "result": "pass",
+        "disposition": "supersede"
+      },
+      {
+        "id": "RCJ-TRACE-01",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "implementation-gap",
+        "ownerPaths": ["crates/trusted-server-js/lib/src/core/index.ts"],
+        "testPath": "crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "command": "TSJS_CONCEPT_PROOF_LIB_ROOT=\"$TSJS_RC_BASELINE_ROOT/crates/trusted-server-js/lib\" node --test --test-name-pattern='RCJ-TRACE-01' crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "result": "fail",
+        "disposition": "supersede"
+      },
+      {
+        "id": "RCJ-GPT-01",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "baseline-owned",
+        "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/gpt/index.ts"],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/gpt/ad_init.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/gpt/ad_init.test.ts",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-GPT-02",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "baseline-owned",
+        "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/gpt/index.ts"],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/gpt/ad_init.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/gpt/ad_init.test.ts",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-GPT-03",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "baseline-owned",
+        "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/gpt/index.ts"],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/gpt/index.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/gpt/index.test.ts",
+        "result": "pass",
+        "disposition": "preserve"
+      },
+      {
+        "id": "RCJ-GPT-04",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "implementation-gap",
+        "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/gpt/index.ts"],
+        "testPath": "crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "command": "TSJS_CONCEPT_PROOF_LIB_ROOT=\"$TSJS_RC_BASELINE_ROOT/crates/trusted-server-js/lib\" node --test --test-name-pattern='RCJ-GPT-04' crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "result": "fail",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-PREBID-01",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "baseline-owned",
+        "ownerPaths": [
+          "crates/trusted-server-js/lib/build-prebid-external.mjs",
+          "crates/trusted-server-js/lib/src/integrations/prebid/index.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/prebid-artifact-integration.test.mjs",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/build-prebid-external.test.mjs test/prebid-artifact-integration.test.mjs",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-PREBID-02",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "baseline-owned",
+        "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/prebid/index.ts"],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/prebid/index.test.ts",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-PREBID-03",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "baseline-owned",
+        "ownerPaths": [
+          "crates/trusted-server-js/lib/build-prebid-external.mjs",
+          "crates/trusted-server-js/lib/src/integrations/prebid/user_id_modules.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/prebid/user_id_modules.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/prebid/user_id_modules.test.ts",
+        "result": "pass",
+        "disposition": "preserve"
+      },
+      {
+        "id": "RCJ-PREBID-04",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "baseline-owned",
+        "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/prebid/index.ts"],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/prebid/index.test.ts",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-APS-01",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "baseline-owned",
+        "ownerPaths": [
+          "crates/trusted-server-core/src/integrations/aps.rs",
+          "crates/trusted-server-js/lib/src/integrations/aps/render.ts"
+        ],
+        "testPath": "crates/trusted-server-core/src/integrations/aps.rs",
+        "command": "cargo test --package trusted-server-core --target \"$(rustc -vV | sed -n 's/^host: //p')\" integrations::aps::tests",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-APS-02",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "baseline-owned",
+        "ownerPaths": [
+          "crates/trusted-server-js/lib/src/integrations/aps/render.ts",
+          "crates/trusted-server-js/lib/src/integrations/gpt/index.ts",
+          "crates/trusted-server-js/lib/src/integrations/prebid/index.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/gpt/ad_init.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/gpt/ad_init.test.ts",
+        "result": "pass",
+        "disposition": "supersede"
+      },
+      {
+        "id": "RCJ-APS-03",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "implementation-gap",
+        "ownerPaths": [
+          "crates/trusted-server-core/src/integrations/aps.rs",
+          "crates/trusted-server-js/lib/src/integrations/aps/render.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "command": "TSJS_CONCEPT_PROOF_LIB_ROOT=\"$TSJS_RC_BASELINE_ROOT/crates/trusted-server-js/lib\" node --test --test-name-pattern='RCJ-APS-03' crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "result": "fail",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-APS-04",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "implementation-gap",
+        "ownerPaths": [
+          "crates/trusted-server-core/src/integrations/aps.rs",
+          "crates/trusted-server-js/lib/src/integrations/aps/render.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "command": "TSJS_CONCEPT_PROOF_LIB_ROOT=\"$TSJS_RC_BASELINE_ROOT/crates/trusted-server-js/lib\" node --test --test-name-pattern='RCJ-APS-04' crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "result": "fail",
+        "disposition": "preserve"
+      },
+      {
+        "id": "RCJ-CREATIVE-01",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "baseline-owned",
+        "ownerPaths": ["crates/trusted-server-core/src/publisher.rs"],
+        "testPath": "crates/trusted-server-core/src/publisher.rs",
+        "command": "cargo test --package trusted-server-core --target \"$(rustc -vV | sed -n 's/^host: //p')\" build_bid_map_",
+        "result": "pass",
+        "disposition": "preserve"
+      },
+      {
+        "id": "RCJ-CREATIVE-02",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "baseline-owned",
+        "ownerPaths": [
+          "crates/trusted-server-js/lib/src/integrations/creative/click.ts",
+          "crates/trusted-server-js/lib/src/shared/origin.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/creative/click.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/creative/click.test.ts test/integrations/creative/image.test.ts test/integrations/creative/iframe.test.ts",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-CREATIVE-03",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "baseline-owned",
+        "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/creative/index.ts"],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/creative/image.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/creative/click.test.ts test/integrations/creative/image.test.ts test/integrations/creative/iframe.test.ts",
+        "result": "pass",
+        "disposition": "supersede"
+      },
+      {
+        "id": "RCJ-DIAG-01",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "baseline-owned",
+        "ownerPaths": ["crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/index.ts"],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/index.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/gpt_diagnostics",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-INT-01",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "baseline-owned",
+        "ownerPaths": [
+          "crates/trusted-server-core/src/integrations/testlight.rs",
+          "crates/trusted-server-js/lib/src/integrations/datadome/script_guard.ts",
+          "crates/trusted-server-js/lib/src/integrations/didomi/index.ts",
+          "crates/trusted-server-js/lib/src/integrations/google_tag_manager/script_guard.ts",
+          "crates/trusted-server-js/lib/src/integrations/lockr/script_guard.ts",
+          "crates/trusted-server-js/lib/src/integrations/osano/index.ts",
+          "crates/trusted-server-js/lib/src/integrations/permutive/segments.ts",
+          "crates/trusted-server-js/lib/src/integrations/sourcepoint/index.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/integrations/datadome/script_guard.test.ts",
+        "command": "cargo test --package trusted-server-core --target \"$(rustc -vV | sed -n 's/^host: //p')\" integrations::testlight && npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/datadome/script_guard.test.ts test/integrations/didomi/index.test.ts test/integrations/google_tag_manager/script_guard.test.ts test/integrations/lockr/script_guard.test.ts test/integrations/osano/index.test.ts test/integrations/permutive/segments.test.ts test/integrations/sourcepoint/index.test.ts",
+        "result": "pass",
+        "disposition": "preserve"
+      },
+      {
+        "id": "RCJ-INT-02",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "baseline-owned",
+        "ownerPaths": [
+          "crates/trusted-server-js/lib/src/shared/async.ts",
+          "crates/trusted-server-js/lib/src/shared/beacon_guard.ts",
+          "crates/trusted-server-js/lib/src/shared/dom_insertion_dispatcher.ts",
+          "crates/trusted-server-js/lib/src/shared/origin.ts",
+          "crates/trusted-server-js/lib/src/shared/scheduler.ts",
+          "crates/trusted-server-js/lib/src/shared/script_guard.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/shared/dom_insertion_dispatcher.test.ts",
+        "command": "npm --prefix crates/trusted-server-js/lib test -- --run test/shared",
+        "result": "pass",
+        "disposition": "rebuild"
+      },
+      {
+        "id": "RCJ-QUAL-01",
+        "baselineSha": "d4cd2cc823718d64ae73bcb068e5eab03ecd901a",
+        "classification": "implementation-gap",
+        "ownerPaths": [
+          "crates/trusted-server-js/lib/eslint.config.js",
+          "crates/trusted-server-js/lib/package.json",
+          "crates/trusted-server-js/lib/vitest.config.ts"
+        ],
+        "testPath": "crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "command": "TSJS_CONCEPT_PROOF_LIB_ROOT=\"$TSJS_RC_BASELINE_ROOT/crates/trusted-server-js/lib\" node --test --test-name-pattern='RCJ-QUAL-01' crates/trusted-server-js/lib/test/contract/current-main-concept-gaps.proof.mjs",
+        "result": "fail",
+        "disposition": "preserve"
+      }
+    ]
+  }
+}

@@ -189,41 +189,14 @@ pub fn derive_section(path: &str, section_root: &str, section_segment: usize) ->
     }
 }
 
-const fn default_enabled() -> bool {
-    true
-}
-
-const fn is_default_enabled(value: &bool) -> bool {
-    *value == default_enabled()
-}
-
-/// How per-user ad state reaches the page.
-///
-/// `Inline` is the shipped behaviour: the auction result is injected before
-/// `</body>` and the root document is therefore uncacheable. `Esi` stores a
-/// request-neutral shared template and fills its per-request byte seam at the edge.
-///
-/// Spike-only, for the #1009 ESI validation. Remove with the spike.
-///
-/// # Why the template must be request-neutral
-///
-/// Under `Esi` the template is shared across visitors, so
-/// nothing whose *presence* depends on the request may appear in it — not merely
-/// nothing whose *value* does. `tsjs.adSlots` is the trap: its content is derived
-/// from config and path, but whether it is emitted at all is gated on consent,
-/// bot classification, prefetch status and the auction kill switch. A template
-/// filled by the first request would freeze that request's decision for every
-/// later reader.
+/// How per-request ad state is assembled into publisher HTML.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AssemblyMode {
-    /// Inject bids inline before `</body>`. Root uncacheable. Shipped behaviour.
+    /// Inject the request projection into the transformed response directly.
     #[default]
     Inline,
-    /// Serve a shared template; assemble its inert marker with an exact byte split.
-    ///
-    /// The operator-facing spelling remains `esi` for continuity, but no general
-    /// purpose ESI parser executes on this path.
+    /// Store a reader-neutral template and fill its single inert byte seam.
     Esi,
 }
 
@@ -231,14 +204,10 @@ pub enum AssemblyMode {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreativeOpportunitiesConfig {
-    /// Enables server-side ad template delivery on publisher HTML and page-bids requests.
+    /// Enables template delivery on publisher HTML and page-bids requests.
     ///
-    /// This does not disable the direct `POST /auction` endpoint. The default is
-    /// `true` so existing creative-opportunity configurations retain their behavior.
-    #[serde(
-        default = "default_enabled",
-        skip_serializing_if = "is_default_enabled"
-    )]
+    /// This switch does not disable direct `POST /auction`. It is required in
+    /// the hard-cutover schema so an operator must choose the delivery state.
     pub enabled: bool,
     /// GAM network ID used to build default unit paths.
     pub gam_network_id: String,
@@ -297,62 +266,25 @@ pub struct CreativeOpportunitiesConfig {
     /// [`section_root`](Self::section_root) are omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section_segment: Option<usize>,
-    /// How per-user ad state reaches the page. Absent means
-    /// [`AssemblyMode::Inline`], the shipped behaviour.
-    ///
-    /// `Option` rather than a bare enum, and `skip_serializing_if`, deliberately:
-    /// these structs use `deny_unknown_fields`, so a pushed key makes an older
-    /// binary fail configuration load. Keeping it absent when unset means a
-    /// deployment that never sets it stays rollback-compatible.
-    ///
-    /// Spike-only. See [`AssemblyMode`].
+    /// How per-request state is delivered. Absent resolves to inline assembly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assembly_mode: Option<AssemblyMode>,
-    /// Request headers the origin varies on, which the shared-template cache key must
-    /// cover.
-    ///
-    /// Operator-stated because a cache **lookup happens before the fetch**, so on a cold
-    /// key the origin's `Vary` is not yet known. See `VarySpec` for why the alternatives
-    /// (two-phase lookup, or storing the list and re-keying) were not taken.
-    ///
-    /// **Unset or empty means no operator-stated header is covered, so any origin
-    /// `Vary` other than structurally covered `Accept-Encoding` disqualifies the
-    /// response.** `Cookie` may never be configured: a per-cookie object violates the
-    /// reader-neutral template contract. This fail-closed default prevents a deployment
-    /// that has not stated what its origin varies on from gaining a shared cache by
-    /// omission.
-    ///
-    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    /// Origin request headers covered by the shared-template key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_cache_vary: Option<Vec<String>>,
-    /// Maximum time a reader-neutral transformed template may remain in the shared template cache.
+    /// Maximum time a reader-neutral transformed template may remain in the
+    /// shared template cache.
     ///
-    /// This is a safety ceiling, not freshness authorization. The origin must still
-    /// provide positive shared freshness, and the stored lifetime is the smaller of
-    /// the origin's remaining edge freshness and this value. Defaults to 60 seconds
-    /// and may be configured from 1 second through 1 day.
-    ///
-    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    /// This is a safety ceiling, not freshness authorization. The origin must
+    /// still provide positive shared freshness, and the stored lifetime is the
+    /// smaller of the origin's remaining edge freshness and this value.
+    /// Defaults to 60 seconds and may be configured from 1 second through 1 day.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_cache_max_age_seconds: Option<u32>,
-    /// Operator assertion that the origin's HTML does not depend on request cookies.
-    ///
-    /// Unset or `false` disqualifies **every cookie-bearing request** from the shared
-    /// template cache, in both directions. That is safe and it is also very nearly a
-    /// disable switch: Trusted Server sets its own identity cookie, so essentially every
-    /// repeat visitor carries one. Left at the default, the cache can only ever serve
-    /// first-ever page views and cookie-less clients.
-    ///
-    /// Setting `true` asserts the origin serves the same HTML with or without cookies.
-    /// It is not taken on trust alone — if the origin ever declares `Vary: Cookie`, the
-    /// response is refused regardless of this flag or the configured key. So a wrong
-    /// assertion is caught whenever the origin is honest about it, and this only widens
-    /// the window where the origin personalizes *silently*.
-    ///
-    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    /// Whether cookie-bearing requests may use a reader-neutral template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_is_cookie_independent: Option<bool>,
-    /// Slot templates. Empty vec = feature disabled (no auction fired, no globals injected).
+    /// Slot templates. An empty vector disables template work.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub slot: Vec<CreativeOpportunitySlot>,
 }
@@ -1595,32 +1527,6 @@ mod tests {
         assert_eq!(derive_section("/%%%/x", "home", 0), "_");
     }
 
-    #[test]
-    fn enabled_defaults_true_and_is_omitted_from_serialized_config() {
-        let config = make_config_with_section_template(None);
-        assert!(
-            config.enabled,
-            "template delivery should default to enabled"
-        );
-        let value = serde_json::to_value(&config).expect("should serialize config");
-        assert!(
-            value.get("enabled").is_none(),
-            "default enabled value should be omitted for rollback compatibility"
-        );
-    }
-
-    #[test]
-    fn disabled_template_switch_is_serialized() {
-        let mut config = make_config_with_section_template(None);
-        config.enabled = false;
-        let value = serde_json::to_value(&config).expect("should serialize config");
-        assert_eq!(
-            value.get("enabled"),
-            Some(&serde_json::Value::Bool(false)),
-            "explicitly disabled template delivery must remain in config blobs"
-        );
-    }
-
     fn make_config_with_section_template(
         section_root: Option<&str>,
     ) -> CreativeOpportunitiesConfig {
@@ -2014,14 +1920,13 @@ mod tests {
 
     #[test]
     fn validate_runtime_allows_blank_network_id_when_no_slots_configured() {
-        // An empty slot list disables the feature, so the id is never rendered.
-        // Failing startup there would break a deploy over an unused value.
+        // With no slot definitions, the network id is not consumed.
         let mut config = make_config_with_section_template(Some("home"));
         config.gam_network_id = String::new();
         config.slot.clear();
         config
             .validate_runtime()
-            .expect("a disabled creative_opportunities stack should not fail on a blank id");
+            .expect("an unused creative_opportunities network id should not fail validation");
     }
 
     #[test]
@@ -2285,13 +2190,21 @@ mod tests {
     fn config_rejects_unknown_top_level_key() {
         // A typo such as `slots` instead of `slot` must surface as a config
         // error rather than silently deserializing to an empty (disabled) stack.
-        let typo = serde_json::json!({ "gam_network_id": "12345", "slots": [] });
+        let typo = serde_json::json!({
+            "enabled": true,
+            "gam_network_id": "12345",
+            "slots": []
+        });
         assert!(
             serde_json::from_value::<CreativeOpportunitiesConfig>(typo).is_err(),
             "unknown top-level key should be rejected by deny_unknown_fields"
         );
 
-        let correct = serde_json::json!({ "gam_network_id": "12345", "slot": [] });
+        let correct = serde_json::json!({
+            "enabled": true,
+            "gam_network_id": "12345",
+            "slot": []
+        });
         assert!(
             serde_json::from_value::<CreativeOpportunitiesConfig>(correct).is_ok(),
             "the correct `slot` key should still deserialize"
@@ -2324,8 +2237,9 @@ mod tests {
 
     #[test]
     fn assembly_mode_defaults_to_inline_when_absent() {
-        // Arrange: the minimal config an existing deployment would have.
+        // Arrange: the minimal hard-cutover config without an assembly mode.
         let toml = r#"
+            enabled = true
             gam_network_id = "99999"
         "#;
 
@@ -2346,10 +2260,78 @@ mod tests {
     }
 
     #[test]
+    fn creative_opportunities_enabled_is_required() {
+        let missing = r#"
+            gam_network_id = "99999"
+        "#;
+        assert!(
+            toml::from_str::<CreativeOpportunitiesConfig>(missing).is_err(),
+            "hard-cutover configuration must reject a present table without `enabled`"
+        );
+
+        for enabled in [true, false] {
+            let config: CreativeOpportunitiesConfig = toml::from_str(&format!(
+                r#"
+                    enabled = {enabled}
+                    gam_network_id = "99999"
+                "#
+            ))
+            .unwrap_or_else(|error| panic!("explicit enabled={enabled} should parse: {error}"));
+            assert_eq!(config.enabled, enabled);
+        }
+    }
+
+    #[test]
+    fn disabled_creative_opportunities_still_validate_every_field() {
+        let invalid_slot: CreativeOpportunitiesConfig = toml::from_str(
+            r#"
+                enabled = false
+                gam_network_id = "99999"
+
+                [[slot]]
+                id = "invalid-pattern"
+                page_patterns = ["["]
+                formats = [{ width = 300, height = 250 }]
+            "#,
+        )
+        .expect("disabled slot shape should deserialize before runtime validation");
+        assert!(
+            invalid_slot.validate_runtime().is_err(),
+            "disabled delivery must not bypass slot validation"
+        );
+
+        let invalid_cache: CreativeOpportunitiesConfig = toml::from_str(
+            r#"
+                enabled = false
+                gam_network_id = "99999"
+                template_cache_vary = ["not a header"]
+            "#,
+        )
+        .expect("disabled cache shape should deserialize before runtime validation");
+        assert!(
+            invalid_cache.validate_runtime().is_err(),
+            "disabled delivery must not bypass cache-field validation"
+        );
+
+        assert!(
+            toml::from_str::<CreativeOpportunitiesConfig>(
+                r#"
+                    enabled = false
+                    gam_network_id = "99999"
+                    assembly_mode = "client_fill"
+                "#,
+            )
+            .is_err(),
+            "disabled delivery must not bypass assembly-mode parsing"
+        );
+    }
+
+    #[test]
     fn assembly_mode_deserializes_each_variant() {
         for (raw, expected) in [("inline", AssemblyMode::Inline), ("esi", AssemblyMode::Esi)] {
             let toml = format!(
                 r#"
+                    enabled = true
                     gam_network_id = "99999"
                     assembly_mode = "{raw}"
                 "#
@@ -2364,6 +2346,7 @@ mod tests {
         }
 
         let removed_mode = r#"
+            enabled = true
             gam_network_id = "99999"
             assembly_mode = "client_fill"
         "#;
@@ -2377,6 +2360,7 @@ mod tests {
     fn template_cache_vary_rejects_invalid_header_names() {
         let config: CreativeOpportunitiesConfig = toml::from_str(
             r#"
+                enabled = true
                 gam_network_id = "99999"
                 template_cache_vary = ["rsc", "not a header"]
             "#,
@@ -2389,6 +2373,7 @@ mod tests {
 
         let cookie_key: CreativeOpportunitiesConfig = toml::from_str(
             r#"
+                enabled = true
                 gam_network_id = "99999"
                 template_cache_vary = ["Cookie"]
             "#,
@@ -2405,6 +2390,7 @@ mod tests {
         for seconds in [1_u32, 1_200, 86_400] {
             let config: CreativeOpportunitiesConfig = toml::from_str(&format!(
                 r#"
+                    enabled = true
                     gam_network_id = "99999"
                     template_cache_max_age_seconds = {seconds}
                 "#
@@ -2430,6 +2416,7 @@ mod tests {
         for seconds in [0_u32, 86_401] {
             let config: CreativeOpportunitiesConfig = toml::from_str(&format!(
                 r#"
+                    enabled = true
                     gam_network_id = "99999"
                     template_cache_max_age_seconds = {seconds}
                 "#
@@ -2447,9 +2434,10 @@ mod tests {
     }
 
     #[test]
-    fn unset_template_cache_max_age_is_omitted_for_rollback_compatibility() {
+    fn unset_template_cache_max_age_is_omitted_from_serialized_config() {
         let config: CreativeOpportunitiesConfig =
-            toml::from_str("gam_network_id = \"99999\"").expect("should deserialize");
+            toml::from_str("enabled = true\ngam_network_id = \"99999\"")
+                .expect("should deserialize");
 
         assert_eq!(
             config.template_cache_max_age(),
@@ -2460,17 +2448,16 @@ mod tests {
 
         assert!(
             !serialized.contains("template_cache_max_age_seconds"),
-            "an unset new key must not break rollback to an older binary: {serialized}"
+            "an unset cache ceiling should remain absent: {serialized}"
         );
     }
 
     #[test]
     fn unset_assembly_mode_is_omitted_from_serialized_config() {
-        // `deny_unknown_fields` means a pushed key breaks config load on an older
-        // binary. A deployment that never sets this must not gain the key just by
-        // round-tripping through a newer one.
+        // A deployment that never sets this should not gain it by round-tripping.
         let config: CreativeOpportunitiesConfig =
-            toml::from_str("gam_network_id = \"99999\"").expect("should deserialize");
+            toml::from_str("enabled = true\ngam_network_id = \"99999\"")
+                .expect("should deserialize");
 
         let serialized = toml::to_string(&config).expect("should serialize");
 

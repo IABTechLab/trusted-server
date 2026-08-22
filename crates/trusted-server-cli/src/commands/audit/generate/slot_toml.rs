@@ -526,6 +526,11 @@ pub(super) fn splice_creative_slots(
     // retain positions from their source document, so anchor the whole subtree
     // here to keep the parent, slots, and provider tables together.
     creative.set_position(section_position);
+    if !had_section {
+        // The hard-cutover schema requires an explicit switch. A generated
+        // section is active by definition because the operator requested it.
+        creative["enabled"] = toml_edit::value(true);
+    }
     if let Some(network_id) = keys.network_id {
         creative["gam_network_id"] = toml_edit::value(network_id);
     }
@@ -555,7 +560,13 @@ fn ensure_only_managed_fields_changed(before: &str, after: &str) -> CliResult<()
                 .get_mut("creative_opportunities")
                 .and_then(toml::Value::as_table_mut)
             {
-                for key in ["slot", "gam_network_id", "section_root", "section_segment"] {
+                for key in [
+                    "slot",
+                    "enabled",
+                    "gam_network_id",
+                    "section_root",
+                    "section_segment",
+                ] {
                     creative.remove(key);
                 }
                 creative.is_empty()
@@ -808,13 +819,14 @@ slot_id = "sidebar"
     }
 
     fn existing_config(toml_str: &str) -> CreativeOpportunitiesConfig {
-        toml::from_str::<CreativeOpportunitiesConfig>(toml_str).expect("valid creative config")
+        toml::from_str::<CreativeOpportunitiesConfig>(&format!("enabled = true\n{toml_str}"))
+            .expect("valid creative config")
     }
 
     #[test]
     fn splice_replaces_slots_and_preserves_other_sections() {
         let existing = "[publisher]\ndomain = \"x\"\n\n\
-             [creative_opportunities]\ngam_network_id = \"111\"\nprice_granularity = \"dense\"\n\n\
+             [creative_opportunities]\nenabled = true\ngam_network_id = \"111\"\nprice_granularity = \"dense\"\n\n\
              [[creative_opportunities.slot]]\nid = \"old\"\ndiv_id = \"old\"\n\
              gam_unit_path = \"/111/old\"\npage_patterns = [\"/\"]\n\
              formats = [{ width = 300, height = 250 }]\n\n\
@@ -826,6 +838,10 @@ slot_id = "sidebar"
         assert!(
             out.contains("gam_network_id = \"222\""),
             "network id updated"
+        );
+        assert!(
+            out.contains("enabled = true"),
+            "hard-cutover enablement should be preserved"
         );
         assert!(!out.contains("id = \"old\""), "old slot removed");
         assert!(
@@ -947,7 +963,7 @@ slot_id = "sidebar"
 
     #[test]
     fn splice_rejects_top_level_inline_creative_opportunities_table() {
-        let existing = "creative_opportunities = { gam_network_id = \"111\" }\n";
+        let existing = "creative_opportunities = { enabled = true, gam_network_id = \"111\" }\n";
 
         let error = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
             .expect_err("should refuse a top-level inline table");
@@ -975,7 +991,7 @@ slot_id = "sidebar"
     fn splice_inserts_section_policy_keys_a_config_does_not_have_yet() {
         // The whole point of `upsert`: every config predating templating lacks
         // these keys, so a replace-only writer could never add them.
-        let existing = "[creative_opportunities]\ngam_network_id = \"111\"\n\n\
+        let existing = "[creative_opportunities]\nenabled = true\ngam_network_id = \"111\"\n\n\
              [auction]\nenabled = true\n";
 
         let out = splice_creative_slots(
@@ -999,7 +1015,7 @@ slot_id = "sidebar"
 
     #[test]
     fn splice_replaces_section_policy_keys_that_are_already_present() {
-        let existing = "[creative_opportunities]\ngam_network_id = \"111\"\n\
+        let existing = "[creative_opportunities]\nenabled = true\ngam_network_id = \"111\"\n\
              section_root = \"old\"\nsection_segment = 2\n";
 
         let out = splice_creative_slots(
@@ -1025,7 +1041,7 @@ slot_id = "sidebar"
         // `section_root`/`section_segment` are `deny_unknown_fields` additions:
         // writing them into a config that does not need them would make it
         // unloadable by an older binary for no benefit.
-        let existing = "[creative_opportunities]\ngam_network_id = \"111\"\n";
+        let existing = "[creative_opportunities]\nenabled = true\ngam_network_id = \"111\"\n";
 
         let out = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
             .expect("should splice");
@@ -1087,6 +1103,11 @@ slot_id = "sidebar"
             value["creative_opportunities"]["gam_network_id"].as_str(),
             Some("222")
         );
+        assert_eq!(
+            value["creative_opportunities"]["enabled"].as_bool(),
+            Some(true),
+            "a newly generated hard-cutover section must be loadable"
+        );
     }
 
     #[test]
@@ -1094,6 +1115,7 @@ slot_id = "sidebar"
         // Mirrors the templated operator shape: section policy scalars in the
         // head block and a per-slot prebid provider subtable.
         let existing = "[creative_opportunities]\n\
+             enabled = true\n\
              gam_network_id = \"111\"\n\
              auction_timeout_ms = 2000\n\
              section_root = \"homepage\"\n\n\
@@ -1109,6 +1131,7 @@ slot_id = "sidebar"
         let existing_config = existing_config(
             &existing
                 .replace("[creative_opportunities]\n", "")
+                .replacen("enabled = true\n", "", 1)
                 .replace("[[creative_opportunities.slot]]", "[[slot]]")
                 .replace("[creative_opportunities.slot.", "[slot.")
                 .replace("\n[auction]\nenabled = true\n", ""),
@@ -1150,7 +1173,7 @@ slot_id = "sidebar"
 
     #[test]
     fn splice_preserves_crlf_line_endings() {
-        let existing = "[creative_opportunities]\r\ngam_network_id = \"111\"\r\n\r\n\
+        let existing = "[creative_opportunities]\r\nenabled = true\r\ngam_network_id = \"111\"\r\n\r\n\
              [auction]\r\nenabled = true\r\n";
 
         let out = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
@@ -1340,7 +1363,7 @@ slot_id = "sidebar"
     fn splice_recognizes_inline_commented_section_header() {
         // `[creative_opportunities] # comment` is valid TOML; the splice must
         // update it in place instead of appending a duplicate section.
-        let existing = "[creative_opportunities] # ad templates\ngam_network_id = \"111\"\n\n\
+        let existing = "[creative_opportunities] # ad templates\nenabled = true\ngam_network_id = \"111\"\n\n\
              [auction] # flags\nenabled = true\n";
 
         let out = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
@@ -1372,8 +1395,7 @@ slot_id = "sidebar"
 
     #[test]
     fn splice_inserts_when_no_existing_slots() {
-        let existing =
-            "[creative_opportunities]\ngam_network_id = \"111\"\n\n[auction]\nenabled = true\n";
+        let existing = "[creative_opportunities]\nenabled = true\ngam_network_id = \"111\"\n\n[auction]\nenabled = true\n";
 
         let out = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
             .expect("should splice");
@@ -1398,6 +1420,7 @@ slot_id = "sidebar"
     #[test]
     fn splice_replaces_inline_slot_array() {
         let existing = "[creative_opportunities]\n\
+             enabled = true\n\
              gam_network_id = \"111\"\n\
              slot = [{ id = \"old\", div_id = \"old\", gam_unit_path = \"/111/old\", page_patterns = [\"/\"], formats = [{ width = 300, height = 250 }] }]\n\n\
              [auction]\nenabled = true\n";
@@ -1421,6 +1444,7 @@ slot_id = "sidebar"
     #[test]
     fn splice_replaces_inline_slot_map() {
         let existing = "[creative_opportunities]\n\
+             enabled = true\n\
              gam_network_id = \"111\"\n\
              slot = { \"0\" = { id = \"old\", div_id = \"old\", gam_unit_path = \"/111/old\", page_patterns = [\"/\"], formats = [{ width = 300, height = 250 }] } }\n";
 
@@ -1721,7 +1745,7 @@ slot_id = "sidebar"
 
     #[test]
     fn replace_key_handles_inline_commented_headers() {
-        let document = "[creative_opportunities] # managed\ngam_network_id = \"111\"\n\n\
+        let document = "[creative_opportunities] # managed\nenabled = true\ngam_network_id = \"111\"\n\n\
              [auction] # flags\nenabled = true\n";
 
         let updated = replace_key_in_section(
@@ -1758,7 +1782,7 @@ slot_id = "sidebar"
             false,
         );
         let doc = format!(
-            "[creative_opportunities]\ngam_network_id = \"1\"\n{}",
+            "[creative_opportunities]\nenabled = true\ngam_network_id = \"1\"\n{}",
             render_slots(&merged)
         );
 

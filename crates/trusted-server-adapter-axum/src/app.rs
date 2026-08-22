@@ -24,8 +24,8 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, buffer_publisher_response_async,
-    handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
+    AuctionDispatch, PAGE_BIDS_PATH, buffer_publisher_response_async, handle_page_bids,
+    handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
@@ -34,6 +34,7 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::{
     default_config_key, default_config_store_name, get_settings_from_config_store,
 };
+use trusted_server_core::trace_cookie::handle_trace_mode;
 
 use trusted_server_core::platform::RuntimeServices;
 
@@ -82,6 +83,91 @@ fn build_state_with_settings(
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
     }))
+}
+
+async fn dispatch_reserved_for_state(state: &Arc<AppState>, req: Request) -> Option<Response> {
+    if !state.registry.has_reserved_path(req.uri().path()) {
+        return None;
+    }
+    let ctx = RequestContext::new(req, edgezero_core::params::PathParams::default());
+    let services = build_runtime_services(&ctx);
+    Some(
+        state
+            .registry
+            .handle_reserved_proxy(&state.settings, &services, ctx.into_request())
+            .await
+            .expect("reserved path should have a hard-cutover handler")
+            .unwrap_or_else(|report| http_error(&report)),
+    )
+}
+
+#[derive(Clone)]
+/// Dispatcher that owns one startup-built registry for hard-cutover route families.
+pub struct ReservedApsDispatcher {
+    state: Arc<AppState>,
+}
+
+impl ReservedApsDispatcher {
+    /// Build the dispatcher from the adapter's startup settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when settings, the orchestrator, or the integration
+    /// registry cannot be initialized.
+    pub fn from_startup_settings() -> Result<Self, Report<TrustedServerError>> {
+        // The outer Axum router cannot share EdgeZero's private application
+        // state, so the dev adapter builds one additional immutable startup
+        // snapshot for only the two reserved APS browser resources. Production
+        // adapters do not take this native development path.
+        Ok(Self {
+            state: build_state()?,
+        })
+    }
+
+    /// Build the dispatcher from explicit settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the orchestrator or integration registry cannot be
+    /// initialized from `settings`.
+    pub fn from_settings(settings: Settings) -> Result<Self, Report<TrustedServerError>> {
+        Ok(Self {
+            state: build_state_with_settings(settings)?,
+        })
+    }
+
+    /// Dispatch a request when it belongs to the reserved APS family.
+    pub async fn dispatch(&self, req: Request) -> Option<Response> {
+        dispatch_reserved_for_state(&self.state, req).await
+    }
+}
+
+/// Dispatch a reserved APS request using explicit settings.
+///
+/// # Errors
+///
+/// Returns an error when the dispatcher cannot be initialized.
+pub async fn dispatch_reserved_with_settings(
+    settings: Settings,
+    req: Request,
+) -> Result<Option<Response>, Report<TrustedServerError>> {
+    Ok(ReservedApsDispatcher::from_settings(settings)?
+        .dispatch(req)
+        .await)
+}
+
+/// Dispatch a reserved APS request using startup settings.
+///
+/// # Errors
+///
+/// Returns an error when startup settings or the dispatcher
+/// cannot be initialized.
+pub async fn dispatch_reserved(
+    req: Request,
+) -> Result<Option<Response>, Report<TrustedServerError>> {
+    Ok(ReservedApsDispatcher::from_startup_settings()?
+        .dispatch(req)
+        .await)
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +277,7 @@ async fn dispatch_fallback(
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
-    if method == Method::GET && path.starts_with("/static/tsjs=") {
+    if path.starts_with("/static/tsjs=") {
         return handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback);
     }
 
@@ -274,6 +360,7 @@ enum NamedRouteHandler {
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
+    TraceMode,
     Auction,
     PageBids,
     FirstPartyProxy,
@@ -298,7 +385,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 16] {
+fn named_routes() -> [NamedRoute; 17] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -360,6 +447,11 @@ fn named_routes() -> [NamedRoute; 16] {
             handler: NamedRouteHandler::LegacyAdminDenied,
         },
         NamedRoute {
+            path: "/_ts/trace",
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::TraceMode,
+        },
+        NamedRoute {
             path: "/auction",
             primary_methods: &[Method::POST],
             handler: NamedRouteHandler::Auction,
@@ -371,13 +463,12 @@ fn named_routes() -> [NamedRoute; 16] {
             primary_methods: &[Method::GET, Method::OPTIONS],
             handler: NamedRouteHandler::PageBids,
         },
-        // Deprecated double-underscore alias, kept so tsjs bundles served before
-        // the `/_ts/page-bids` rename keep getting ads on SPA navigations until
-        // they age out of browser caches. See `PAGE_BIDS_LEGACY_PATH`.
+        // This removed route must never reach the publisher fallback, which
+        // would make the hard cutover depend on the origin response.
         NamedRoute {
-            path: PAGE_BIDS_LEGACY_PATH,
-            primary_methods: &[Method::GET, Method::OPTIONS],
-            handler: NamedRouteHandler::PageBids,
+            path: "/__ts/page-bids",
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
+            handler: NamedRouteHandler::LegacyAdminDenied,
         },
         NamedRoute {
             path: "/first-party/proxy",
@@ -450,6 +541,9 @@ fn named_route_handler(
                         handle_admin_eids_lookup(&partner_registry, &req)
                     }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
+                    NamedRouteHandler::TraceMode => {
+                        handle_trace_mode(&state.settings, req.uri().query())
+                    }
                     NamedRouteHandler::Auction => {
                         // Build the geo-aware EC context so the auction consent
                         // gate sees the caller's jurisdiction — `EcContext::default()`

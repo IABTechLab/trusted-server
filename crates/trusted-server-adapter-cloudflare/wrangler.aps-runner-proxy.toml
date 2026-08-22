@@ -1,0 +1,16 @@
+name = "trusted-server-aps-runner-proxy-integration"
+main = "build/index.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat", "cache_option_enabled"]
+
+[[kv_namespaces]]
+binding = "TRUSTED_SERVER_KV"
+id = "aps-runner-proxy-local-kv"
+
+[[services]]
+binding = "APS_RUNNER_PROXY_FIXTURE"
+service = "aps-runner-proxy-fixture"
+
+[vars]
+# Replaced in a temporary copy by the integration-test controller.
+TRUSTED_SERVER_CONFIG = "{}"

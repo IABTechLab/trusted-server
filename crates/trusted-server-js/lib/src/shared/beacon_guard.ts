@@ -50,13 +50,53 @@ function extractUrl(input: RequestInfo | URL): string | null {
   return null;
 }
 
+function sameDescriptor(
+  left: PropertyDescriptor | undefined,
+  right: PropertyDescriptor | undefined
+): boolean {
+  if (!left || !right) return left === right;
+  if (left.configurable !== right.configurable || left.enumerable !== right.enumerable) {
+    return false;
+  }
+  if ('value' in left || 'value' in right) {
+    return (
+      'value' in left &&
+      'value' in right &&
+      left.value === right.value &&
+      left.writable === right.writable
+    );
+  }
+  return left.get === right.get && left.set === right.set;
+}
+
+function restoreOwnedDescriptor(
+  target: object,
+  property: PropertyKey,
+  installed: PropertyDescriptor | undefined,
+  original: PropertyDescriptor | undefined
+): void {
+  try {
+    if (!sameDescriptor(Object.getOwnPropertyDescriptor(target, property), installed)) return;
+    if (original) Object.defineProperty(target, property, original);
+    else Reflect.deleteProperty(target, property);
+  } catch {
+    // Publisher replacement or a hostile descriptor cannot block independent cleanup.
+  }
+}
+
 /**
  * Create an independent beacon guard for a specific integration.
  */
 export function createBeaconGuard(config: BeaconGuardConfig): BeaconGuard {
   let installed = false;
-  let originalSendBeacon: typeof navigator.sendBeacon | null = null;
-  let originalFetch: typeof window.fetch | null = null;
+  let originalSendBeacon: typeof navigator.sendBeacon | undefined;
+  let originalSendBeaconDescriptor: PropertyDescriptor | undefined;
+  let installedSendBeaconDescriptor: PropertyDescriptor | undefined;
+  let originalFetch: typeof window.fetch | undefined;
+  let originalFetchDescriptor: PropertyDescriptor | undefined;
+  let installedFetchDescriptor: PropertyDescriptor | undefined;
+  let sendBeaconPatched = false;
+  let fetchPatched = false;
   const prefix = `${config.name} beacon guard`;
 
   function install(): void {
@@ -74,23 +114,37 @@ export function createBeaconGuard(config: BeaconGuardConfig): BeaconGuard {
 
     // --- Patch navigator.sendBeacon ---
     if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
-      originalSendBeacon = navigator.sendBeacon.bind(navigator);
+      originalSendBeacon = navigator.sendBeacon;
+      originalSendBeaconDescriptor = Object.getOwnPropertyDescriptor(navigator, 'sendBeacon');
+      sendBeaconPatched = true;
 
-      navigator.sendBeacon = function (url: string, data?: BodyInit | null): boolean {
+      const wrapper = function (url: string, data?: BodyInit | null): boolean {
+        const sendBeacon = originalSendBeacon;
+        if (!sendBeacon) return false;
         if (config.isTargetUrl(url)) {
           const rewritten = config.rewriteUrl(url);
           log.info(`${prefix}: rewriting sendBeacon`, { original: url, rewritten });
-          return originalSendBeacon!(rewritten, data);
+          return Reflect.apply(sendBeacon, navigator, [rewritten, data]);
         }
-        return originalSendBeacon!(url, data);
+        return Reflect.apply(sendBeacon, navigator, [url, data]);
       };
+      navigator.sendBeacon = wrapper;
+      installedSendBeaconDescriptor = Object.getOwnPropertyDescriptor(navigator, 'sendBeacon');
+      sendBeaconPatched = sameDescriptor(installedSendBeaconDescriptor, {
+        ...installedSendBeaconDescriptor,
+        value: wrapper,
+      });
     }
 
     // --- Patch window.fetch ---
     if (typeof window.fetch === 'function') {
-      originalFetch = window.fetch.bind(window);
+      originalFetch = window.fetch;
+      originalFetchDescriptor = Object.getOwnPropertyDescriptor(window, 'fetch');
+      fetchPatched = true;
 
-      window.fetch = function (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+      const wrapper = function (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+        const fetch = originalFetch;
+        if (!fetch) return Promise.reject(new TypeError('fetch is unavailable'));
         const url = extractUrl(input);
 
         if (url && config.isTargetUrl(url)) {
@@ -100,13 +154,19 @@ export function createBeaconGuard(config: BeaconGuardConfig): BeaconGuard {
           // If the input was a Request, create a new one with the rewritten URL
           if (input instanceof Request) {
             const newRequest = new Request(rewritten, input);
-            return originalFetch!(newRequest, init);
+            return Reflect.apply(fetch, window, [newRequest, init]);
           }
-          return originalFetch!(rewritten, init);
+          return Reflect.apply(fetch, window, [rewritten, init]);
         }
 
-        return originalFetch!(input, init);
+        return Reflect.apply(fetch, window, [input, init]);
       };
+      window.fetch = wrapper;
+      installedFetchDescriptor = Object.getOwnPropertyDescriptor(window, 'fetch');
+      fetchPatched = sameDescriptor(installedFetchDescriptor, {
+        ...installedFetchDescriptor,
+        value: wrapper,
+      });
     }
 
     installed = true;
@@ -118,14 +178,25 @@ export function createBeaconGuard(config: BeaconGuardConfig): BeaconGuard {
   }
 
   function reset(): void {
-    if (originalSendBeacon && typeof navigator !== 'undefined') {
-      navigator.sendBeacon = originalSendBeacon;
-      originalSendBeacon = null;
+    if (sendBeaconPatched && typeof navigator !== 'undefined') {
+      restoreOwnedDescriptor(
+        navigator,
+        'sendBeacon',
+        installedSendBeaconDescriptor,
+        originalSendBeaconDescriptor
+      );
     }
-    if (originalFetch && typeof window !== 'undefined') {
-      window.fetch = originalFetch;
-      originalFetch = null;
+    if (fetchPatched && typeof window !== 'undefined') {
+      restoreOwnedDescriptor(window, 'fetch', installedFetchDescriptor, originalFetchDescriptor);
     }
+    originalSendBeacon = undefined;
+    originalSendBeaconDescriptor = undefined;
+    installedSendBeaconDescriptor = undefined;
+    originalFetch = undefined;
+    originalFetchDescriptor = undefined;
+    installedFetchDescriptor = undefined;
+    sendBeaconPatched = false;
+    fetchPatched = false;
     installed = false;
     log.debug(`${prefix}: reset and uninstalled`);
   }

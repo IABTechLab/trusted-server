@@ -152,7 +152,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join(", ");
         let toml = format!(
-            "gam_network_id = \"123\"\n\
+            "enabled = true\n\
+             gam_network_id = \"123\"\n\
              \n\
              [[slot]]\n\
              id = \"atf\"\n\
@@ -202,7 +203,8 @@ mod tests {
 
     #[test]
     fn expected_slots_default_resolution_without_overrides() {
-        let toml = "gam_network_id = \"42\"\n\
+        let toml = "enabled = true\n\
+             gam_network_id = \"42\"\n\
              \n\
              [[slot]]\n\
              id = \"footer\"\n\
@@ -223,7 +225,8 @@ mod tests {
 
     #[test]
     fn expected_slots_render_section_templates_per_path() {
-        let toml = "gam_network_id = \"99999\"\n\
+        let toml = "enabled = true\n\
+             gam_network_id = \"99999\"\n\
              section_root = \"homepage\"\n\
              \n\
              [[slot]]\n\
@@ -258,7 +261,8 @@ mod tests {
         // A `{section}` template that renders past GAM's 100-byte unit-path
         // limit. The runtime omits this slot for the request path, so diagnostics
         // must not match it against a truncated or otherwise different path.
-        let toml = "gam_network_id = \"99999\"\n\
+        let toml = "enabled = true\n\
+             gam_network_id = \"99999\"\n\
              section_root = \"homepage\"\n\
              \n\
              [[slot]]\n\

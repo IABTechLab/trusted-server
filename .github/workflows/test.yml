@@ -1,4 +1,6 @@
 name: "Run Tests"
+run-name: >-
+  Run Tests / ${{ inputs.evidence_id || format('PR {0}', github.event.pull_request.number) }}
 
 permissions:
   contents: read
@@ -7,6 +9,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      evidence_id:
+        description: Unique cutover evidence identifier
+        required: true
+        type: string
+      release_id:
+        description: Exact generated TSJS release id
+        required: true
+        type: string
 
 jobs:
   test-rust:
@@ -247,6 +259,8 @@ jobs:
         working-directory: crates/trusted-server-js/lib
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Retrieve Node.js version
         id: node-version
@@ -267,5 +281,98 @@ jobs:
       - name: Build bundle
         run: npm run build
 
+      - name: Build pure external Prebid artifact
+        run: npm run build:prebid-external
+
+      - name: Verify release inventory
+        run: npm run test:release
+
+      - name: Enforce bundle budgets
+        run: npm run check:bundle
+
+      - name: Typecheck full TSJS package
+        run: npm run typecheck
+
+      - name: Lint full TSJS package
+        run: npm run lint
+
+      - name: Verify generated APS renderer contract
+        run: npm run check:aps-contract
+
+      - name: Verify APS/TSJS gate scripts
+        working-directory: ${{ github.workspace }}
+        run: bash scripts/ci/aps-tsjs-quality.sh contracts
+
+      - name: Enforce hard-cutover absence
+        run: npm run check:hard-cutover-absence
+
+      - name: Run embedded APS renderer contract
+        run: node --test test/contract/aps-renderer-es5.test.mjs
+
+      - name: Verify retired concept audit
+        run: npm run check:concept-audit
+
       - name: Run unit tests
         run: npm test -- --run
+
+  cutover-quality-evidence:
+    name: APS/TSJS cutover quality evidence
+    if: github.event_name == 'workflow_dispatch'
+    needs:
+      - test-rust
+      - test-axum
+      - test-cloudflare
+      - test-spin
+      - test-parity
+      - test-cli
+      - test-typescript
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read repository toolchain pins
+        id: toolchains
+        shell: bash
+        run: bash scripts/ci/read-toolchains.sh
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.toolchains.outputs.node }}
+          cache: npm
+          cache-dependency-path: |
+            crates/trusted-server-js/lib/package-lock.json
+            docs/package-lock.json
+
+      - name: Set up pinned Rust quality targets
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.toolchains.outputs.rust }}
+          components: clippy, rustfmt
+          target: wasm32-wasip1,wasm32-unknown-unknown
+          cache-shared-key: cargo-${{ runner.os }}-aps-tsjs-quality
+
+      - name: Install exact JavaScript dependencies
+        run: bash scripts/ci/aps-tsjs-quality.sh install
+
+      - name: Validate release id and run final quality gates
+        env:
+          EXPECTED_RELEASE_ID: ${{ inputs.release_id }}
+        shell: bash
+        run: bash scripts/ci/aps-tsjs-quality.sh run
+
+      - name: Write exact quality evidence manifest
+        env:
+          EVIDENCE_ID: ${{ inputs.evidence_id }}
+          RELEASE_ID: ${{ inputs.release_id }}
+        run: node scripts/ci/aps-tsjs-evidence.mjs write-quality
+
+      - name: Upload exact quality evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: aps-tsjs-quality-${{ github.run_id }}
+          path: target/aps-tsjs-quality-evidence/
+          if-no-files-found: error
+          retention-days: 30

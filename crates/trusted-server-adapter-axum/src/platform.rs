@@ -11,7 +11,8 @@ use error_stack::{Report, ResultExt as _};
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
     PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+    PlatformSecretStore, PlatformSelectResult, ProxyHeaderEvidenceV1, ProxyResponseEvidenceV1,
+    RawProxyPolicyV1, RawProxyResponseV1, RuntimeServices, StoreId, StoreName,
 };
 
 // ---------------------------------------------------------------------------
@@ -285,6 +286,9 @@ pub struct AxumPlatformHttpClient {
     client: reqwest::Client,
 }
 
+#[cfg(feature = "aps-runner-proxy-integration-test")]
+const APS_RUNNER_PROXY_TEST_ENDPOINT_ENV: &str = "TS_APS_RUNNER_PROXY_TEST_ENDPOINT";
+
 impl AxumPlatformHttpClient {
     /// Create a new client with sensible dev-server timeouts.
     ///
@@ -305,6 +309,38 @@ impl AxumPlatformHttpClient {
                 .build()
                 .expect("should build reqwest client"),
         }
+    }
+
+    #[cfg(feature = "aps-runner-proxy-integration-test")]
+    fn aps_runner_proxy_test_transport_uri(
+        logical_uri: &str,
+    ) -> Result<Option<String>, Report<PlatformError>> {
+        use trusted_server_core::integrations::aps::APS_RUNNER_UPSTREAM_URL;
+
+        if logical_uri != APS_RUNNER_UPSTREAM_URL {
+            return Ok(None);
+        }
+        let endpoint = std::env::var(APS_RUNNER_PROXY_TEST_ENDPOINT_ENV).map_err(|_| {
+            Report::new(PlatformError::HttpClient).attach(
+                "APS runner proxy integration artifact requires its loopback fixture endpoint",
+            )
+        })?;
+        let parsed = reqwest::Url::parse(&endpoint)
+            .change_context(PlatformError::HttpClient)
+            .attach("invalid APS runner proxy integration fixture endpoint")?;
+        if parsed.scheme() != "http"
+            || !matches!(parsed.host_str(), Some("127.0.0.1" | "::1"))
+            || parsed.port().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(Report::new(PlatformError::HttpClient).attach(
+                "APS runner proxy integration fixture endpoint must be an explicit loopback HTTP URL",
+            ));
+        }
+        Ok(Some(parsed.into()))
     }
 
     /// Drain `body` to a `Vec<u8>`.
@@ -380,6 +416,127 @@ impl AxumPlatformHttpClient {
 
         Ok(PlatformResponse::new(edge_resp).with_backend_name(request.backend_name))
     }
+
+    fn raw_header_evidence(
+        headers: &reqwest::header::HeaderMap,
+        name: reqwest::header::HeaderName,
+    ) -> ProxyHeaderEvidenceV1 {
+        ProxyHeaderEvidenceV1::Occurrences(
+            headers
+                .get_all(name)
+                .iter()
+                .map(|value| value.as_bytes().to_vec())
+                .collect(),
+        )
+    }
+
+    fn canonical_declared_length(evidence: &ProxyHeaderEvidenceV1) -> Option<usize> {
+        let ProxyHeaderEvidenceV1::Occurrences(values) = evidence else {
+            return None;
+        };
+        let [value] = values.as_slice() else {
+            return None;
+        };
+        if value.is_empty()
+            || !value.iter().all(u8::is_ascii_digit)
+            || (value.len() > 1 && value[0] == b'0')
+        {
+            return None;
+        }
+        std::str::from_utf8(value).ok()?.parse().ok()
+    }
+
+    async fn execute_raw_proxy_v1(
+        &self,
+        request: PlatformHttpRequest,
+        policy: RawProxyPolicyV1,
+    ) -> Result<RawProxyResponseV1, Report<PlatformError>> {
+        if request.image_optimizer.is_some() || request.stream_response {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("unsupported option on Axum raw proxy request"));
+        }
+
+        let logical_uri = request.request.uri().to_string();
+        #[cfg(feature = "aps-runner-proxy-integration-test")]
+        let transport_uri = Self::aps_runner_proxy_test_transport_uri(&logical_uri)?;
+        #[cfg(feature = "aps-runner-proxy-integration-test")]
+        let uri = transport_uri.as_deref().unwrap_or(&logical_uri);
+        #[cfg(not(feature = "aps-runner-proxy-integration-test"))]
+        let uri = logical_uri.as_str();
+        let method = reqwest::Method::from_bytes(request.request.method().as_str().as_bytes())
+            .change_context(PlatformError::HttpClient)?;
+        let mut builder = self.client.request(method, uri);
+        for (name, value) in request.request.headers() {
+            builder = builder.header(name.as_str(), value.as_bytes());
+        }
+        #[cfg(feature = "aps-runner-proxy-integration-test")]
+        if transport_uri.is_some() {
+            builder = builder
+                .header(reqwest::header::HOST, "client.aps.amazon-adsystem.com")
+                .header("x-ts-aps-logical-url", logical_uri.as_str());
+        }
+        let (_, request_body) = request.request.into_parts();
+        let request_body = Self::buffer_body(request_body).await?;
+        if !request_body.is_empty() {
+            builder = builder.body(request_body);
+        }
+
+        tokio::time::timeout(policy.total_timeout, async move {
+            let mut response = tokio::time::timeout(policy.first_byte_timeout, builder.send())
+                .await
+                .map_err(|_| {
+                    Report::new(PlatformError::HttpClient)
+                        .attach("raw proxy first-byte deadline exceeded")
+                })?
+                .change_context(PlatformError::HttpClient)?;
+            let evidence = ProxyResponseEvidenceV1 {
+                status: response.status().as_u16(),
+                content_type: Self::raw_header_evidence(
+                    response.headers(),
+                    reqwest::header::CONTENT_TYPE,
+                ),
+                content_encoding: Self::raw_header_evidence(
+                    response.headers(),
+                    reqwest::header::CONTENT_ENCODING,
+                ),
+                content_length: Self::raw_header_evidence(
+                    response.headers(),
+                    reqwest::header::CONTENT_LENGTH,
+                ),
+            };
+            if Self::canonical_declared_length(&evidence.content_length)
+                .is_some_and(|length| length > policy.max_response_bytes)
+            {
+                return Err(Report::new(PlatformError::HttpClient)
+                    .attach("raw proxy declared body exceeds configured cap"));
+            }
+
+            let mut body = Vec::new();
+            loop {
+                let chunk = tokio::time::timeout(policy.blocking_read_timeout, response.chunk())
+                    .await
+                    .map_err(|_| {
+                        Report::new(PlatformError::HttpClient)
+                            .attach("raw proxy blocking-read deadline exceeded")
+                    })?
+                    .change_context(PlatformError::HttpClient)?;
+                let Some(chunk) = chunk else { break };
+                let next_len = body.len().checked_add(chunk.len()).ok_or_else(|| {
+                    Report::new(PlatformError::HttpClient).attach("raw proxy body length overflow")
+                })?;
+                if next_len > policy.max_response_bytes {
+                    return Err(Report::new(PlatformError::HttpClient)
+                        .attach("raw proxy body exceeds configured cap"));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(RawProxyResponseV1 { evidence, body })
+        })
+        .await
+        .map_err(|_| {
+            Report::new(PlatformError::HttpClient).attach("raw proxy total deadline exceeded")
+        })?
+    }
 }
 
 impl Default for AxumPlatformHttpClient {
@@ -395,6 +552,14 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         self.execute(request).await
+    }
+
+    async fn send_raw_proxy_v1(
+        &self,
+        request: PlatformHttpRequest,
+        policy: RawProxyPolicyV1,
+    ) -> Result<RawProxyResponseV1, Report<PlatformError>> {
+        self.execute_raw_proxy_v1(request, policy).await
     }
 
     async fn send_async(
@@ -753,6 +918,223 @@ mod tests {
                 .as_ref(),
             b"ok",
             "should preserve decoded response body"
+        );
+    }
+
+    fn raw_proxy_request(url: &str) -> PlatformHttpRequest {
+        PlatformHttpRequest::new(
+            edgezero_core::http::request_builder()
+                .uri(url)
+                .header(header::ACCEPT_ENCODING, "identity")
+                .body(EdgeBody::empty())
+                .expect("should build raw proxy request"),
+            "test_backend",
+        )
+    }
+
+    fn raw_proxy_policy(timeout: Duration, max_response_bytes: usize) -> RawProxyPolicyV1 {
+        RawProxyPolicyV1 {
+            total_timeout: timeout,
+            first_byte_timeout: timeout,
+            blocking_read_timeout: timeout,
+            max_response_bytes,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_proxy_preserves_header_occurrences_and_exact_bytes() {
+        let url = serve_raw_response(
+            b"HTTP/1.1 200 OK\r\n\
+              Content-Type: application/javascript\r\n\
+              Content-Encoding: identity\r\n\
+              Content-Length: 2\r\n\
+              Set-Cookie: must-not-enter-core=1\r\n\
+              \r\n\
+              ok",
+        )
+        .await;
+
+        let response = AxumPlatformHttpClient::new()
+            .send_raw_proxy_v1(
+                raw_proxy_request(&url),
+                raw_proxy_policy(Duration::from_secs(1), 2),
+            )
+            .await
+            .expect("valid raw response should be collected");
+
+        assert_eq!(response.evidence.status, 200);
+        assert_eq!(
+            response.evidence.content_type,
+            ProxyHeaderEvidenceV1::one("application/javascript")
+        );
+        assert_eq!(
+            response.evidence.content_encoding,
+            ProxyHeaderEvidenceV1::one("identity")
+        );
+        assert_eq!(
+            response.evidence.content_length,
+            ProxyHeaderEvidenceV1::one("2")
+        );
+        assert_eq!(response.body, b"ok");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_proxy_preserves_duplicate_security_headers_for_core_rejection() {
+        let url = serve_raw_response(
+            b"HTTP/1.1 200 OK\r\n\
+              Content-Type: application/javascript\r\n\
+              Content-Type: text/javascript\r\n\
+              Content-Length: 2\r\n\
+              \r\n\
+              ok",
+        )
+        .await;
+
+        let response = AxumPlatformHttpClient::new()
+            .send_raw_proxy_v1(
+                raw_proxy_request(&url),
+                raw_proxy_policy(Duration::from_secs(1), 2),
+            )
+            .await
+            .expect("transport should preserve duplicate evidence");
+
+        assert_eq!(
+            response.evidence.content_type,
+            ProxyHeaderEvidenceV1::Occurrences(vec![
+                b"application/javascript".to_vec(),
+                b"text/javascript".to_vec(),
+            ])
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_proxy_cancels_on_body_overflow_and_total_deadline() {
+        let overflow_url = serve_raw_response(
+            b"HTTP/1.1 200 OK\r\n\
+              Content-Type: application/javascript\r\n\
+              Transfer-Encoding: chunked\r\n\
+              \r\n\
+              2\r\n\
+              ok\r\n\
+              0\r\n\
+              \r\n",
+        )
+        .await;
+        let overflow = AxumPlatformHttpClient::new()
+            .send_raw_proxy_v1(
+                raw_proxy_request(&overflow_url),
+                raw_proxy_policy(Duration::from_secs(1), 1),
+            )
+            .await;
+        assert!(overflow.is_err(), "one byte over the cap must fail");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind deadline test server");
+        let addr = listener.local_addr().expect("should read local address");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("should accept request");
+            let mut request = [0; 1024];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("should read request");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: 2\r\n\r\nok",
+                )
+                .await;
+        });
+        let deadline = AxumPlatformHttpClient::new()
+            .send_raw_proxy_v1(
+                raw_proxy_request(&format!("http://{addr}/")),
+                raw_proxy_policy(Duration::from_millis(20), 2),
+            )
+            .await;
+        assert!(deadline.is_err(), "total deadline must cover first byte");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_proxy_enforces_first_byte_and_blocking_read_deadlines() {
+        let first_byte_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind first-byte deadline server");
+        let first_byte_addr = first_byte_listener
+            .local_addr()
+            .expect("should read first-byte server address");
+        tokio::spawn(async move {
+            let (mut stream, _) = first_byte_listener
+                .accept()
+                .await
+                .expect("should accept first-byte request");
+            let mut request = [0; 1024];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("should read first-byte request");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: 2\r\n\r\nok",
+                )
+                .await;
+        });
+        let first_byte = AxumPlatformHttpClient::new()
+            .send_raw_proxy_v1(
+                raw_proxy_request(&format!("http://{first_byte_addr}/")),
+                RawProxyPolicyV1 {
+                    total_timeout: Duration::from_secs(1),
+                    first_byte_timeout: Duration::from_millis(20),
+                    blocking_read_timeout: Duration::from_secs(1),
+                    max_response_bytes: 2,
+                },
+            )
+            .await;
+        assert!(
+            first_byte.is_err(),
+            "response headers after the first-byte deadline must fail"
+        );
+
+        let body_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind blocking-read deadline server");
+        let body_addr = body_listener
+            .local_addr()
+            .expect("should read blocking-read server address");
+        tokio::spawn(async move {
+            let (mut stream, _) = body_listener
+                .accept()
+                .await
+                .expect("should accept blocking-read request");
+            let mut request = [0; 1024];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("should read blocking-read request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nTransfer-Encoding: chunked\r\n\r\n1\r\no\r\n",
+                )
+                .await
+                .expect("should write first body chunk");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = stream.write_all(b"1\r\nk\r\n0\r\n\r\n").await;
+        });
+        let blocking_read = AxumPlatformHttpClient::new()
+            .send_raw_proxy_v1(
+                raw_proxy_request(&format!("http://{body_addr}/")),
+                RawProxyPolicyV1 {
+                    total_timeout: Duration::from_secs(1),
+                    first_byte_timeout: Duration::from_secs(1),
+                    blocking_read_timeout: Duration::from_millis(20),
+                    max_response_bytes: 2,
+                },
+            )
+            .await;
+        assert!(
+            blocking_read.is_err(),
+            "a body read blocked past its deadline must fail"
         );
     }
 

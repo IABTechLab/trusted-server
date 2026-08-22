@@ -11,6 +11,8 @@ use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+#[cfg(all(feature = "aps-runner-proxy-integration-test", target_arch = "wasm32"))]
+use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
@@ -26,14 +28,14 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherResponse,
-    buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
-    handle_tsjs_dynamic, page_bids_preflight_denied,
+    AuctionDispatch, PAGE_BIDS_PATH, PublisherResponse, buffer_publisher_response_async,
+    handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
+use trusted_server_core::trace_cookie::handle_trace_mode;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware};
 use crate::platform::build_runtime_services;
@@ -55,8 +57,23 @@ pub struct AppState {
 ///
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
+#[cfg(not(all(feature = "aps-runner-proxy-integration-test", target_arch = "wasm32")))]
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let settings = Settings::from_toml(include_str!("../../../trusted-server.example.toml"))?;
+    build_state_with_settings(settings)
+}
+
+#[cfg(all(feature = "aps-runner-proxy-integration-test", target_arch = "wasm32"))]
+fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    let envelope =
+        futures::executor::block_on(spin_sdk::variables::get("v_trusted_x5fserver_x5fconfig"))
+            .map_err(|error| {
+                Report::new(TrustedServerError::Configuration {
+                    message: "failed to read the Spin APS proxy test app config".to_string(),
+                })
+                .attach(error.to_string())
+            })?;
+    let settings = settings_from_config_blob(&envelope)?;
     build_state_with_settings(settings)
 }
 
@@ -77,6 +94,49 @@ fn build_state_with_settings(
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
     }))
+}
+
+async fn dispatch_reserved_for_state(state: &Arc<AppState>, req: Request) -> Option<Response> {
+    if !state.registry.has_reserved_path(req.uri().path()) {
+        return None;
+    }
+    let ctx = RequestContext::new(req, edgezero_core::params::PathParams::default());
+    let services = build_runtime_services(&ctx);
+    Some(
+        state
+            .registry
+            .handle_reserved_proxy(&state.settings, &services, ctx.into_request())
+            .await
+            .expect("reserved path should have a hard-cutover handler")
+            .unwrap_or_else(|report| http_error(&report)),
+    )
+}
+
+/// Dispatch a reserved APS request using explicit settings.
+///
+/// # Errors
+///
+/// Returns an error when the application state cannot be
+/// initialized from `settings`.
+pub async fn dispatch_reserved_with_settings(
+    settings: Settings,
+    req: Request,
+) -> Result<Option<Response>, Report<TrustedServerError>> {
+    let state = build_state_with_settings(settings)?;
+    Ok(dispatch_reserved_for_state(&state, req).await)
+}
+
+/// Dispatch a reserved APS request using startup settings.
+///
+/// # Errors
+///
+/// Returns an error when startup settings or the application
+/// state cannot be initialized.
+pub async fn dispatch_reserved(
+    req: Request,
+) -> Result<Option<Response>, Report<TrustedServerError>> {
+    let state = build_state()?;
+    Ok(dispatch_reserved_for_state(&state, req).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +208,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 16] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -159,9 +219,10 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 16] {
         ("/_ts/admin/eids", &[Method::GET]),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
+        ("/_ts/trace", &[Method::GET]),
         ("/auction", &[Method::POST]),
         (PAGE_BIDS_PATH, &[Method::GET, Method::OPTIONS]),
-        (PAGE_BIDS_LEGACY_PATH, &[Method::GET, Method::OPTIONS]),
+        ("/__ts/page-bids", LEGACY_ADMIN_DENY_METHODS),
         ("/first-party/proxy", &[Method::GET]),
         ("/first-party/click", &[Method::GET]),
         ("/first-party/sign", &[Method::GET, Method::POST]),
@@ -581,6 +642,21 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
         };
 
+        // GET /_ts/trace — render-trace toggle: arms/disarms the ts-trace
+        // cookie and redirects to `/`. Gated by [debug] trace_route_enabled
+        // (404 when off).
+        let s = Arc::clone(&state);
+        let trace_mode_handler = move |ctx: RequestContext| {
+            let s = Arc::clone(&s);
+            async move {
+                let req = ctx.into_request();
+                Ok::<Response, EdgeError>(
+                    handle_trace_mode(&s.settings, req.uri().query())
+                        .unwrap_or_else(|e| http_error(&e)),
+                )
+            }
+        };
+
         // GET /_ts/page-bids — SPA re-auction endpoint.
         let s = Arc::clone(&state);
         let page_bids_handler = move |ctx: RequestContext| {
@@ -695,9 +771,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let path = req.uri().path().to_owned();
             let method = req.method().clone();
 
-            // Dynamic tsjs serving is GET-only; other methods fall through to the
-            // integration/publisher fallback.
-            let result = if method == Method::GET && path.starts_with("/static/tsjs=") {
+            let result = if path.starts_with("/static/tsjs=") {
                 handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback)
             } else if state.registry.has_route(&method, &path) {
                 let mut ec_context = EcContext::default();
@@ -792,27 +866,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // credentials and key-management payloads to the origin.
             .post("/_ts/admin/keys/rotate", admin_not_supported_handler)
             .post("/_ts/admin/keys/deactivate", admin_not_supported_handler)
-            // Admin EC lookup routes. Registered explicitly (like the key
-            // routes above) so they never fall through to the publisher
-            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
-            // coverage. The EC identity graph is Fastly KV backed, so this
-            // adapter has no store to read.
             .get("/_ts/admin/ec", admin_ec_not_supported_handler)
             .get("/_ts/admin/ec/{id}", admin_ec_not_supported_handler)
             .get("/_ts/admin/eids", admin_eids_handler)
+            .get("/_ts/trace", trace_mode_handler)
             .post("/auction", auction_handler)
-            .get(PAGE_BIDS_PATH, page_bids_handler.clone())
+            .get(PAGE_BIDS_PATH, page_bids_handler)
             .route(PAGE_BIDS_PATH, Method::OPTIONS, page_bids_options_handler)
-            // Deprecated double-underscore alias, kept so tsjs bundles served
-            // before the `/_ts/page-bids` rename keep getting ads on SPA
-            // navigations until they age out of browser caches. See
-            // `PAGE_BIDS_LEGACY_PATH`.
-            .get(PAGE_BIDS_LEGACY_PATH, page_bids_handler)
-            .route(
-                PAGE_BIDS_LEGACY_PATH,
-                Method::OPTIONS,
-                page_bids_options_handler,
-            )
             .get("/first-party/proxy", fp_proxy_handler)
             .get("/first-party/click", fp_click_handler)
             .get("/first-party/sign", fp_sign_handler)
@@ -823,6 +883,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         for method in LEGACY_ADMIN_DENY_METHODS {
             builder = builder.route("/admin/keys/rotate", method.clone(), legacy_admin_deny);
             builder = builder.route("/admin/keys/deactivate", method.clone(), legacy_admin_deny);
+            builder = builder.route("/__ts/page-bids", method.clone(), legacy_admin_deny);
         }
 
         // Mirror the Fastly/Axum publisher fallback: every supported method that is

@@ -3,12 +3,9 @@
   <head>
     <meta charset="utf-8" />
     <script>
-      // Runs before any creative markup, so this is the only opportunity to fix
-      // the trusted origin. Define it non-writable and non-configurable:
-      // creative markup can carry its own <head> script, whose content executes
-      // ahead of the runtime injected at the top of <body>, and a plain
-      // assignment would let it redirect click and rebuild resolution to an
-      // attacker origin.
+      // Creative markup can execute before the body-injected runtime. Keep the
+      // first-party resolution stamp immutable so bidder code cannot redirect
+      // click recovery or signed resource resolution to another origin.
       Object.defineProperty(window, '__tsCreativeOrigin', {
         value: '%TRUSTED_ORIGIN%',
         writable: false,

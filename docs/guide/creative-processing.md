@@ -71,12 +71,12 @@ rewrite_creatives = true
 Regardless of mode, a creative larger than the 1 MiB per-creative cap is
 rejected and its `adm` is dropped.
 
-| `sanitize_creatives` | `rewrite_creatives` | Auction winning-bid `adm` behavior                                                                                                                                                                                                                                         |
-| -------------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `false` (default)    | `false`             | Deliver the creative exactly as the bidder returned it (subject to the size cap).                                                                                                                                                                                          |
-| `true`               | `false`             | Strip executable markup (`script`/`object`/`embed`/`form`, event handlers) with its inner content, then deliver without rewriting. Sanitizer-accepted external resource, click, and inline CSS URLs remain direct.                                                         |
-| `false`              | `true` (default)    | Rewrite eligible resource/CSS and click URLs in the raw bidder markup to signed first-party endpoints, removing any bidder `<base>` element. Executable markup is preserved.                                                                                               |
-| `true`               | `true`              | Sanitize first, then rewrite. `POST /auction` emits root-relative endpoints and injects creative TSJS exactly once, whether or not the bidder supplied a `<body>`; SSAT/page-bids emits absolute endpoints for its foreign-origin renderer and does not inject the bundle. |
+| `sanitize_creatives` | `rewrite_creatives` | Auction winning-bid `adm` behavior                                                                                                                                                                                                                             |
+| -------------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `false` (default)    | `false`             | Deliver the creative exactly as the bidder returned it (subject to the size cap).                                                                                                                                                                              |
+| `true`               | `false`             | Strip executable markup (`script`/`object`/`embed`/`form`, event handlers) with its inner content, then deliver without rewriting. Sanitizer-accepted external resource, click, and inline CSS URLs remain direct.                                             |
+| `false`              | `true` (default)    | Rewrite eligible resource/CSS and click URLs in the raw bidder markup to signed first-party endpoints, removing any bidder `<base>` element. Executable markup is preserved.                                                                                   |
+| `true`               | `true`              | Sanitize first, then rewrite. `POST /auction` emits root-relative endpoints and injects creative TSJS exactly once, including for body-less fragments; SSAT/page-bids emits absolute endpoints for its foreign-origin renderer and does not inject the bundle. |
 
 ::: warning Sanitization blanks script-based creatives
 Sanitization removes `script`/`object`/`embed`/`form` and similar elements
@@ -94,22 +94,22 @@ directly.
 Creatives rendered by Trusted Server's own path run in a sandboxed iframe
 **without** `allow-same-origin`, i.e. an opaque origin. The injected creative
 runtime's click guard recovers mutated clicks there via a GET
-`/first-party/proxy-rebuild` navigation (302 chain).
+`/first-party/proxy-rebuild` navigation (302 chain), or a form POST when nesting
+the signed click would exceed the platform request-URL bound.
 
-Two capabilities are unavailable in that context. **CORS-mode subresources** —
-ES modules, `crossorigin` fonts, `fetch`/XHR — cannot load through
-`/first-party/proxy`, because that endpoint deliberately sends no
-`Access-Control-Allow-Origin`: it is a generic signed fetcher that forwards the
-EC ID and client-derived headers, so letting an opaque creative frame read its
-responses would turn it into a readable bidder-controlled proxy. Ordinary
-subresources (`<img>`, `<script src>`, stylesheets, media) are unaffected. A
-separately constrained asset capability is tracked in
+The generic `/first-party/proxy` deliberately emits no CORS grant and strips
+one supplied upstream. Otherwise an opaque bidder frame could read bodies
+fetched with Trusted Server's forwarded identity and client-derived headers.
+Ordinary subresources (`<img>`, `<script src>`, stylesheets, media) are
+unaffected; CORS-mode subresources (ES modules, `crossorigin` fonts, fetch/XHR)
+need the constrained asset capability tracked in
 [#982](https://github.com/IABTechLab/trusted-server/issues/982).
 
-The second is **dynamic** resource signing,
+Another unavailable capability in that context is **dynamic** resource signing,
 which rewrites URLs on elements a creative inserts at runtime. It is installed
-only when `renderGuard` is enabled in `tsCreativeConfig`, and that is `false`
-by default — deployments using the default configuration are unaffected. Where
+only when `renderGuard` is enabled in the immutable
+`window.tsjs.boot.creative` configuration, and that is `false` by default —
+deployments using the default configuration are unaffected. Where
 it is enabled, runtime-inserted `<img>`/`<iframe>` URLs cannot be signed from an
 opaque origin (the signing request is blocked by CORS), so they load directly
 from third parties; the sandbox still isolates them from the publisher origin,
@@ -753,29 +753,33 @@ impl IntegrationScriptRewriter for NextJsIntegration {
 
 ### Head Injectors
 
-Integrations can inject HTML snippets at the start of `<head>`, immediately after the unified TSJS bundle:
+Integrations can inject HTML snippets at the start of `<head>`, before the unified TSJS bundle:
 
-**Example**: An integration injects configuration that runs after the TSJS API is available
+**Example**: An integration emits release-bound configuration through the one transient pre-core transport
 
 ```rust
 impl IntegrationHeadInjector for MyIntegration {
     fn integration_id(&self) -> &'static str { "my_integration" }
 
     fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        vec![format!(
-            r#"<script>tsjs.setConfig({{ host: "{}" }});</script>"#,
-            ctx.request_host
-        )]
+        let config_json = serde_json::to_string(&serde_json::json!({
+            "host": ctx.request_host,
+        }))
+        .expect("should serialize integration config")
+        .replace("</", "<\\/");
+        vec![super::integration_config_script("my_integration", &config_json)]
     }
 }
 ```
 
 **Behavior**:
 
-- Snippets are prepended into `<head>` after the TSJS bundle tag
+- Snippets are prepended into `<head>` before the TSJS bundle tags
 - Called once per HTML response
 - Multiple integrations can each contribute snippets
 - If no snippets are returned, no extra markup is added
+
+The core snapshots and freezes each manifest integration's configuration, deletes the transient transport, and exposes only the final immutable `window.tsjs.boot` and `TsjsApi` surfaces.
 
 See [Integration Guide](/guide/integration-guide) for creating custom rewriters.
 

@@ -1,0 +1,39 @@
+[
+  { "name": "negative zero", "input": "{\"n\":-0.0}", "expected": "{\"n\":0}" },
+  { "name": "integral float", "input": "{\"n\":1.0}", "expected": "{\"n\":1}" },
+  {
+    "name": "upper decimal threshold",
+    "input": "{\"n\":1e20}",
+    "expected": "{\"n\":100000000000000000000}"
+  },
+  {
+    "name": "upper exponent threshold",
+    "input": "{\"n\":1e21}",
+    "expected": "{\"n\":1e+21}"
+  },
+  {
+    "name": "lower decimal threshold",
+    "input": "{\"n\":1e-6}",
+    "expected": "{\"n\":0.000001}"
+  },
+  {
+    "name": "lower exponent threshold",
+    "input": "{\"n\":1e-7}",
+    "expected": "{\"n\":1e-7}"
+  },
+  {
+    "name": "binary64 integer rounding",
+    "input": "{\"n\":9007199254740993}",
+    "expected": "{\"n\":9007199254740992}"
+  },
+  {
+    "name": "integer index enumeration",
+    "input": "{\"a\":1,\"10\":10,\"2\":2,\"01\":1}",
+    "expected": "{\"2\":2,\"10\":10,\"a\":1,\"01\":1}"
+  },
+  {
+    "name": "nested number and key ordering",
+    "input": "{\"values\":[-0.0,1e20,1e-7],\"3\":{\"20\":20,\"4\":4}}",
+    "expected": "{\"3\":{\"4\":4,\"20\":20},\"values\":[0,100000000000000000000,1e-7]}"
+  }
+]

@@ -39,6 +39,131 @@ describe('render', () => {
     expect(sandbox).not.toContain('allow-same-origin');
   });
 
+  it('prepares and appends one exact ADM iframe with srcdoc already assigned', async () => {
+    const { ADM_IFRAME_SANDBOX, prepareAdmIframe } = await import('../../src/core/render');
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const loaded = vi.fn();
+    const failed = vi.fn();
+    const observer = new MutationObserver(() => undefined);
+    observer.observe(container, { childList: true });
+    const handle = prepareAdmIframe({
+      adm: '<div>fictional ADM creative</div>',
+      container,
+      height: 250,
+      onError: failed,
+      onLoad: loaded,
+      width: 300,
+    });
+
+    expect(handle).toBeDefined();
+    if (!handle) throw new Error('should prepare an ADM iframe');
+    expect(handle.frame.parentNode).toBeNull();
+    expect(handle.frame.srcdoc).toContain('fictional ADM creative');
+    expect(handle.frame.hasAttribute('src')).toBe(false);
+    expect(handle.frame.getAttribute('sandbox')).toBe(ADM_IFRAME_SANDBOX);
+    expect(handle.frame.referrerPolicy).toBe('no-referrer');
+    expect(handle.frame.width).toBe('300');
+    expect(handle.frame.height).toBe('250');
+    expect(handle.frame.style.width).toBe('300px');
+    expect(handle.frame.style.height).toBe('250px');
+    expect(handle.append()).toBe(true);
+    expect(handle.append()).toBe(false);
+    const mutations = observer.takeRecords();
+    expect(mutations).toHaveLength(1);
+    const inserted = mutations[0]?.addedNodes.item(0) as HTMLIFrameElement | null;
+    expect(inserted).toBe(handle.frame);
+    expect(inserted?.srcdoc).toBe(handle.frame.srcdoc);
+    expect(inserted?.srcdoc.length).toBeGreaterThan(0);
+    expect(handle.activate()).toBe(true);
+    handle.frame.dispatchEvent(new Event('load'));
+    handle.frame.dispatchEvent(new Event('load'));
+    expect(loaded).toHaveBeenCalledOnce();
+    expect(failed).not.toHaveBeenCalled();
+    expect(handle.current()).toBe(true);
+    handle.dispose();
+    expect(handle.frame.isConnected).toBe(false);
+    observer.disconnect();
+  });
+
+  it('ignores a poisoned detached factory frame and rejects a pre-append load', async () => {
+    const { prepareAdmIframe } = await import('../../src/core/render');
+    const poisoned = document.createElement('iframe');
+    poisoned.title = 'publisher frame';
+    const unrelated = document.createElement('div');
+    document.body.appendChild(unrelated);
+    poisoned.remove = vi.fn(() => unrelated.remove());
+    Object.defineProperty(poisoned, 'srcdoc', {
+      configurable: true,
+      get: () => '<div>lie</div>',
+      set: vi.fn(),
+    });
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const createElement = vi.spyOn(document, 'createElement').mockReturnValueOnce(poisoned);
+    const loaded = vi.fn();
+    const failed = vi.fn();
+
+    try {
+      const handle = prepareAdmIframe({
+        adm: '<div>exact creative</div>',
+        container,
+        height: 250,
+        onError: failed,
+        onLoad: loaded,
+        width: 300,
+      });
+      expect(handle).toBeDefined();
+      if (!handle) throw new Error('should prepare a native ADM iframe');
+      expect(createElement).not.toHaveBeenCalled();
+      expect(handle.frame).not.toBe(poisoned);
+      handle.frame.dispatchEvent(new Event('load'));
+      expect(handle.append()).toBe(true);
+      expect(handle.activate()).toBe(true);
+      expect(loaded).not.toHaveBeenCalled();
+      expect(failed).not.toHaveBeenCalled();
+      handle.dispose();
+      expect(poisoned.remove).not.toHaveBeenCalled();
+      expect(poisoned.title).toBe('publisher frame');
+      expect(unrelated.isConnected).toBe(true);
+    } finally {
+      createElement.mockRestore();
+    }
+  });
+
+  it('commits only predecessors and keeps the accepted frame exactly disposable', async () => {
+    const { prepareAdmIframe } = await import('../../src/core/render');
+    const container = document.createElement('div');
+    const predecessor = document.createElement('div');
+    const laterSibling = document.createElement('div');
+    container.appendChild(predecessor);
+    document.body.appendChild(container);
+    const handle = prepareAdmIframe({
+      adm: '<div>accepted creative</div>',
+      container,
+      height: 250,
+      onError: vi.fn(),
+      onLoad: vi.fn(),
+      width: 300,
+    });
+
+    expect(handle).toBeDefined();
+    if (!handle) throw new Error('should prepare an ADM iframe');
+    expect(handle.append()).toBe(true);
+    container.appendChild(laterSibling);
+    expect(handle.activate()).toBe(true);
+    handle.frame.dispatchEvent(new Event('load'));
+    expect(handle.commit()).toBe(true);
+    expect(predecessor.isConnected).toBe(false);
+    expect(laterSibling.isConnected).toBe(true);
+    expect(handle.frame.isConnected).toBe(true);
+
+    handle.dispose();
+    handle.dispose();
+    expect(handle.frame.isConnected).toBe(false);
+    expect(laterSibling.isConnected).toBe(true);
+  });
+
   it('preserves dollar sequences when building the creative document', async () => {
     const { buildCreativeDocument } = await import('../../src/core/render');
     const creativeHtml = "<div>$& $$ $1 $` $'</div>";
@@ -63,9 +188,6 @@ describe('render', () => {
   });
 
   it('defines the stamped origin so creative script cannot overwrite it', async () => {
-    // Creative markup can carry its own <head> script, whose content executes
-    // before the runtime injected at the top of <body>. A plain assignment
-    // would let it point click and rebuild resolution at an attacker origin.
     const { buildCreativeDocument } = await import('../../src/core/render');
     const documentHtml = buildCreativeDocument('<div>creative</div>');
 
@@ -73,9 +195,6 @@ describe('render', () => {
     expect(documentHtml).toContain('writable: false');
     expect(documentHtml).toContain('configurable: false');
 
-    // Execute the stamp exactly as the browser would, then try to overwrite it.
-    // Parse rather than regex out the script: tag-matching patterns miss case
-    // and attribute variations, and the DOM is what the browser actually uses.
     const parsed = new DOMParser().parseFromString(documentHtml, 'text/html');
     const stamp = parsed.querySelector('head script')?.textContent;
     expect(stamp, 'document should carry the stamping script').toBeTruthy();
@@ -85,7 +204,7 @@ describe('render', () => {
     try {
       host.__tsCreativeOrigin = 'https://attacker.example';
     } catch {
-      // strict-mode assignment throws; either way the value must not change
+      // Strict-mode assignment may throw; the immutable value must survive either way.
     }
     expect(host.__tsCreativeOrigin).toBe(location.origin);
   });

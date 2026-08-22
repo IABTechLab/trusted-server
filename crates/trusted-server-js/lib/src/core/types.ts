@@ -1,55 +1,6 @@
 // Shared TypeScript types for the tsjs core API and extensions.
 export type Size = readonly [number, number];
 
-export interface Banner {
-  sizes: ReadonlyArray<Size>;
-}
-
-export interface MediaTypes {
-  banner?: Banner;
-}
-
-export interface Bid {
-  bidder: string;
-  params?: Record<string, unknown>;
-}
-
-export interface AdUnit {
-  code: string;
-  mediaTypes?: MediaTypes;
-  bids?: Bid[];
-}
-
-/** Minimal shape of a server-side auction slot injected into `window.tsjs.adSlots`. */
-export interface AuctionSlot {
-  id: string;
-  gam_unit_path: string;
-  div_id: string;
-  formats: Array<[number, number]>;
-  targeting?: Record<string, string>;
-}
-
-/** Debug-only copy of server-side bid fields exposed for pipeline inspection. */
-export interface AuctionDebugBidData {
-  slot_id?: string;
-  price?: number | null;
-  currency?: string;
-  creative?: string | null;
-  adomain?: string[] | null;
-  bidder?: string;
-  width?: number;
-  height?: number;
-  nurl?: string | null;
-  burl?: string | null;
-  bid_id?: string | null;
-  ad_id?: string | null;
-  creative_id?: string | null;
-  cache_id?: string | null;
-  cache_host?: string | null;
-  cache_path?: string | null;
-  metadata?: Record<string, unknown>;
-}
-
 export type ApsTagType = 'iframe' | 'script';
 
 /** Version 1 Trusted Server APS renderer descriptor. */
@@ -58,7 +9,7 @@ export interface ApsRendererV1 {
   version: 1;
   accountId: string;
   bidId: string;
-  creativeId?: string;
+  creativeId?: string | undefined;
   tagType: ApsTagType;
   creativeUrl: string;
   aaxResponse: string;
@@ -66,46 +17,82 @@ export interface ApsRendererV1 {
   height: number;
 }
 
-export type AuctionBidRenderer = ApsRendererV1;
-
-/** A client-side Prebid bid's generated ad ID bound to its APS render capability. */
-export interface ApsPrebidRendererEntry {
-  adUnitCode: string;
-  renderer: ApsRendererV1;
-  registeredAt: number;
-  expiresAt: number;
-  /** Mark the bid as won and rendered after replying to Universal Creative. */
-  markUsed(): void;
+export interface AdmRenderSourceV1 {
+  type: 'adm';
+  version: 1;
+  adm: string;
+  width: number;
+  height: number;
 }
 
-/** Bid targeting data from the server-side auction, injected into `window.tsjs.bids`. */
-export interface AuctionBidData {
-  hb_pb?: string;
-  hb_bidder?: string;
-  hb_adid?: string;
-  hb_cache_host?: string;
-  hb_cache_path?: string;
-  /** Opaque server-auction correlation ID used only by GPT diagnostics. */
-  hb_auction_id?: string;
-  /** Winning creative width; the bridge sizes the inline render from this. */
-  w?: number;
-  /** Winning creative height; the bridge sizes the inline render from this. */
-  h?: number;
-  nurl?: string;
-  burl?: string;
-  /** Typed winning-bid renderer capability. */
-  renderer?: AuctionBidRenderer;
-  /** Winning creative width used by the inline render bridge. */
-  w?: number;
-  /** Winning creative height used by the inline render bridge. */
-  h?: number;
-  /**
-   * Sanitized winning creative markup for the inline render bridge. Present
-   * when the server retained a non-empty creative; not gated by debug mode.
-   */
-  adm?: string;
-  /** Debug-only bid field mirror. Only present when `[debug] inject_adm_for_testing = true`. */
-  debug_bid?: AuctionDebugBidData;
+export interface BaselinePbsCacheSourceV1 {
+  type: 'pbs_cache';
+  version: 1;
+  cacheId: string;
+  cacheHost: string;
+  cachePath: string;
+  width: number;
+  height: number;
+}
+
+export type BidRenderSourceV1 = ApsRendererV1 | AdmRenderSourceV1 | BaselinePbsCacheSourceV1;
+
+export type AuctionSlotFailureReason =
+  | 'auction_disabled'
+  | 'consent_denied'
+  | 'slot_not_eligible'
+  | 'provider_timeout'
+  | 'provider_error'
+  | 'invalid_provider_response'
+  | 'mediation_failed'
+  | 'winner_not_renderable'
+  | 'identity_generation_failed'
+  | 'internal_error';
+
+export type SlotAuctionDecisionV1 =
+  | { slot: string; outcome: 'winner'; candidateId: string }
+  | { slot: string; outcome: 'no_bid' }
+  | { slot: string; outcome: 'failed'; reason: AuctionSlotFailureReason };
+
+export interface AuctionDecisionSetV1 {
+  version: 1;
+  auctionId: string;
+  results: SlotAuctionDecisionV1[];
+}
+
+interface BrowserAuctionBidBaseV1 {
+  candidateId: string;
+  slot: string;
+  provider: string;
+  upstreamBidId: string;
+  cpm: number;
+  currency: 'USD';
+  targeting: Record<string, string>;
+}
+
+export type BrowserAuctionBidV1 =
+  | (BrowserAuctionBidBaseV1 & {
+      rendererReservationId: string;
+      renderSource: ApsRendererV1 | AdmRenderSourceV1;
+    })
+  | (BrowserAuctionBidBaseV1 & {
+      renderSource: BaselinePbsCacheSourceV1;
+    });
+
+/** Exact GAM placement metadata required to publish one server-projected slot. */
+export interface BrowserAuctionSlotV1 {
+  slot: string;
+  gamUnitPath: string;
+  divId: string;
+  formats: ReadonlyArray<Size>;
+  targeting: Record<string, string>;
+}
+
+export interface BrowserAuctionProjectionV1 {
+  version: 1;
+  auction: AuctionDecisionSetV1;
+  slots: BrowserAuctionSlotV1[];
+  bids: BrowserAuctionBidV1[];
 }
 
 export type GptDiagnosticsCallbackKind =
@@ -127,15 +114,15 @@ export type GptDiagnosticsBindingReason =
 
 export interface GptDiagnosticsBinding {
   status: 'bound' | 'unbound' | 'ambiguous';
-  reason?: GptDiagnosticsBindingReason;
+  reason?: GptDiagnosticsBindingReason | undefined;
 }
 
 export interface GptDiagnosticsDurations {
-  requestToResponseMs?: number;
-  responseToRenderMs?: number;
-  requestToRenderMs?: number;
-  renderToLoadMs?: number;
-  renderToViewableMs?: number;
+  requestToResponseMs?: number | undefined;
+  responseToRenderMs?: number | undefined;
+  requestToRenderMs?: number | undefined;
+  renderToLoadMs?: number | undefined;
+  renderToViewableMs?: number | undefined;
 }
 
 /**
@@ -147,14 +134,14 @@ export interface GptDiagnosticsDurations {
  * Manager delivered; they claim nothing about which demand source supplied it.
  */
 export interface GptDiagnosticsAdManagerIdentity {
-  lineItemId?: number;
-  creativeId?: number;
-  campaignId?: number;
-  advertiserId?: number;
-  sourceAgnosticLineItemId?: number;
-  sourceAgnosticCreativeId?: number;
-  yieldGroupIds?: number[];
-  companyIds?: number[];
+  lineItemId?: number | undefined;
+  creativeId?: number | undefined;
+  campaignId?: number | undefined;
+  advertiserId?: number | undefined;
+  sourceAgnosticLineItemId?: number | undefined;
+  sourceAgnosticCreativeId?: number | undefined;
+  yieldGroupIds?: number[] | undefined;
+  companyIds?: number[] | undefined;
 }
 
 /**
@@ -162,31 +149,19 @@ export interface GptDiagnosticsAdManagerIdentity {
  * facts GPT reported.
  */
 export type GptDiagnosticsResponseClass =
-  | 'empty'
-  | 'backfill'
-  | 'reservation'
-  | 'unclassified_non_empty';
+  'empty' | 'backfill' | 'reservation' | 'unclassified_non_empty';
 
 /** The request path observed for a GPT request cycle. */
 export type GptDiagnosticsRequestPath =
-  | 'trusted_server_direct'
-  | 'prebid_refresh'
-  | 'publisher_refresh'
-  | 'competing'
-  | 'unattributed';
+  'trusted_server_direct' | 'prebid_refresh' | 'publisher_refresh' | 'competing' | 'unattributed';
 
 /** The Trusted Server creative opportunity observed for a request. */
 export type GptDiagnosticsTrustedServerOpportunity =
-  | 'renderable_candidate'
-  | 'unrenderable_candidate'
-  | 'no_candidate';
+  'renderable_candidate' | 'unrenderable_candidate' | 'no_candidate';
 
 /** A safe failure category observed while obtaining or posting creative markup. */
 export type GptDiagnosticsCreativeFailure =
-  | 'missing_render_source'
-  | 'cache_fetch_failed'
-  | 'invalid_cache_payload'
-  | 'response_post_failed';
+  'missing_render_source' | 'cache_fetch_failed' | 'invalid_cache_payload' | 'response_post_failed';
 
 /** Delivery evidence derived for a GPT request cycle. */
 export type GptDiagnosticsDelivery =
@@ -200,58 +175,58 @@ export type GptDiagnosticsDelivery =
 
 export interface GptDiagnosticsRequestCycle {
   requestNumber: number;
-  requestedAtMs?: number;
-  responseAtMs?: number;
-  renderAtMs?: number;
-  loadAtMs?: number;
-  viewableAtMs?: number;
+  requestedAtMs?: number | undefined;
+  responseAtMs?: number | undefined;
+  renderAtMs?: number | undefined;
+  loadAtMs?: number | undefined;
+  viewableAtMs?: number | undefined;
   durations: GptDiagnosticsDurations;
-  isEmpty?: boolean;
+  isEmpty?: boolean | undefined;
   /** Configured sizes Trusted Server supplied to GPT for this request. */
-  requestedSlotSizes?: ReadonlyArray<Size>;
-  /** Exact fill size fact GPT reported in its `slotRenderEnded` callback. */
-  size?: Size;
+  requestedSlotSizes?: ReadonlyArray<Size> | undefined;
+  /** Exact fill size fact GPT reported in `slotRenderEnded`. */
+  size?: Size | undefined;
   /**
    * Outer CSS box observed on the uniquely bound, connected slot element after
-   * a filled GPT render. This is not an assertion about internal creative pixels.
+   * a filled GPT render. This does not assert the internal creative pixel size.
    */
-  observedSlotSize?: Size;
-  isBackfill?: boolean;
-  slotContentChanged?: boolean;
+  observedSlotSize?: Size | undefined;
+  isBackfill?: boolean | undefined;
+  slotContentChanged?: boolean | undefined;
   incompleteSequence: boolean;
-  adManager?: GptDiagnosticsAdManagerIdentity;
-  responseClass?: GptDiagnosticsResponseClass;
-  requestPath?: GptDiagnosticsRequestPath;
-  requestIntentId?: number;
-  trustedServerAuctionId?: string;
-  opportunityToRequestMs?: number;
-  replacedRequestNumber?: number;
-  previousRenderToRequestMs?: number;
-  creativeChanged?: boolean;
-  previousCreativeId?: GptDiagnosticsAdManagerIdentity['creativeId'];
-  loadObservedBeforeRender?: boolean;
-  trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity;
-  trustedServerCreativeRequestAtMs?: number;
-  trustedServerCreativeResponseAtMs?: number;
-  trustedServerCreativeFailures?: GptDiagnosticsCreativeFailure[];
+  adManager?: GptDiagnosticsAdManagerIdentity | undefined;
+  responseClass?: GptDiagnosticsResponseClass | undefined;
+  requestPath?: GptDiagnosticsRequestPath | undefined;
+  requestIntentId?: number | undefined;
+  trustedServerAuctionId?: string | undefined;
+  opportunityToRequestMs?: number | undefined;
+  replacedRequestNumber?: number | undefined;
+  previousRenderToRequestMs?: number | undefined;
+  creativeChanged?: boolean | undefined;
+  previousCreativeId?: GptDiagnosticsAdManagerIdentity['creativeId'] | undefined;
+  loadObservedBeforeRender?: boolean | undefined;
+  trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity | undefined;
+  trustedServerCreativeRequestAtMs?: number | undefined;
+  trustedServerCreativeResponseAtMs?: number | undefined;
+  trustedServerCreativeFailures?: GptDiagnosticsCreativeFailure[] | undefined;
   /** Derived on every snapshot; absent only on a cycle read before derivation. */
-  delivery?: GptDiagnosticsDelivery;
+  delivery?: GptDiagnosticsDelivery | undefined;
 }
 
 export interface GptDiagnosticsSlotExport {
   runtimeSlotNumber: number;
-  slotElementId?: string;
-  adUnitPath?: string;
+  slotElementId?: string | undefined;
+  adUnitPath?: string | undefined;
   binding: GptDiagnosticsBinding;
-  currentVisibilityPercentage?: number;
-  maximumVisibilityPercentage?: number;
-  requests: GptDiagnosticsRequestCycle[];
+  currentVisibilityPercentage?: number | undefined;
+  maximumVisibilityPercentage?: number | undefined;
+  requests: readonly Readonly<GptDiagnosticsRequestCycle>[];
 }
 
 export interface GptDiagnosticsCallbackIssue {
   kind: GptDiagnosticsCallbackKind;
   runtimeSlotNumber: number;
-  slotElementId?: string;
+  slotElementId?: string | undefined;
   timestampMs: number;
   disposition: GptDiagnosticsCallbackDisposition;
   reason: string;
@@ -284,22 +259,24 @@ export interface GptDiagnosticsCoverageCounters {
 }
 
 export interface GptDiagnosticsExportV1 {
-  version: 1;
-  capturedAt: string;
-  page: {
+  readonly version: 1;
+  readonly capturedAt: string;
+  readonly page: Readonly<{
     origin: string;
     pathname: string;
-  };
-  slots: GptDiagnosticsSlotExport[];
-  callbackIssues: GptDiagnosticsCallbackIssue[];
-  attributionIssues?: GptDiagnosticsAttributionIssue[];
-  coverage: Record<GptDiagnosticsCallbackKind, GptDiagnosticsCoverageCounters>;
-  metadata: {
+  }>;
+  readonly slots: readonly Readonly<GptDiagnosticsSlotExport>[];
+  readonly callbackIssues: readonly Readonly<GptDiagnosticsCallbackIssue>[];
+  readonly attributionIssues: readonly Readonly<GptDiagnosticsAttributionIssue>[];
+  readonly coverage: Readonly<
+    Record<GptDiagnosticsCallbackKind, Readonly<GptDiagnosticsCoverageCounters>>
+  >;
+  readonly metadata: Readonly<{
     droppedCallbacks: number;
-    droppedAttributionIssues?: number;
+    droppedAttributionIssues: number;
     evictedSlots: number;
     evictedRequestCycles: number;
-  };
+  }>;
 }
 
 /** GPT slot object identity, the only key diagnostics correlates slots by. */
@@ -310,23 +287,15 @@ export interface GptDiagnosticsSlotHandle {
 
 /** The documented, read-only operator API. It records no evidence. */
 export interface GptDiagnosticsApi {
-  snapshot(): GptDiagnosticsExportV1;
+  snapshot(): Readonly<GptDiagnosticsExportV1>;
   export(): void;
-  subscribe(listener: (snapshot: GptDiagnosticsExportV1) => void): () => void;
+  subscribe(listener: (snapshot: Readonly<GptDiagnosticsExportV1>) => void): () => void;
   show(): void;
   hide(): void;
 }
 
-/**
- * Evidence writers used by Trusted Server's own integration modules.
- *
- * Separate bundles can only reach each other through `window.tsjs`, so this
- * channel is reachable from the page like anything else there. Keeping it off
- * [`GptDiagnosticsApi`] is what makes the documented operator surface read-only
- * and stops the writers from becoming part of the public contract.
- */
+/** Closure-private evidence channel shared only by release-bound TSJS modules. */
 export interface GptDiagnosticsRecorder {
-  /** Record Trusted Server's creative opportunity and configured sizes for an associated GPT slot. */
   recordTrustedServerOpportunity(
     slot: GptDiagnosticsSlotHandle,
     auctionSlotId: string,
@@ -334,152 +303,258 @@ export interface GptDiagnosticsRecorder {
     trustedServerAuctionId?: string,
     requestedSlotSizes?: ReadonlyArray<Size>
   ): void;
-  /** Mark slots whose next observed GPT request follows the Prebid refresh path. */
   recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
-  /** Record a creative markup request and return its opaque attempt ID. */
   recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;
-  /** Record that a creative attempt successfully posted markup. */
   recordTrustedServerCreativeResponse(attemptId: number): void;
-  /** Record a safe failure category for a creative attempt. */
   recordTrustedServerCreativeFailure(
     attemptId: number,
     reason: GptDiagnosticsCreativeFailure
   ): void;
 }
 
-/**
- * Lifecycle state for a GPT slot TS created before its publisher declares it.
- *
- * Stored on `window.tsjs` so the head bootstrap and the full TSJS bundle share
- * one handoff protocol.
- */
-export interface GptSlotHandoff {
-  gamUnitPath: string;
-  formats: Array<[number, number]>;
-  /** Stable configured prefix used to safely bridge framework-generated IDs. */
-  divIdPrefix: string;
-  /** Element ID GPT received when TS created the fallback slot. */
-  slotElementId: string;
-  publisherClaimed: boolean;
-  suppressPublisherDisplay: boolean;
-  suppressPublisherRefresh: boolean;
+/** Release-internal takeover module emitted inside the persistent artifact. */
+export interface BootManifestTakeoverIntegrationV1 {
+  readonly id: string;
+  readonly phase: 'takeover';
 }
 
-export interface TsjsApi {
-  version: string;
-  que: Array<() => void>;
-  addAdUnits(units: AdUnit | AdUnit[]): void;
-  renderAdUnit(codeOrUnit: string | AdUnit): void;
-  renderAllAdUnits(): void;
-  setConfig?(cfg: Record<string, unknown>): void;
-  getConfig?(): Record<string, unknown>;
-  requestAds?(opts?: { bidsBackHandler?: () => void; timeout?: number }): void;
-  requestAds?(
-    callback: () => void,
-    opts?: { bidsBackHandler?: () => void; timeout?: number }
-  ): void;
-  log?: {
-    setLevel(l: 'silent' | 'error' | 'warn' | 'info' | 'debug'): void;
-    getLevel(): 'silent' | 'error' | 'warn' | 'info' | 'debug';
-    info(...args: unknown[]): void;
-    warn(...args: unknown[]): void;
-    error(...args: unknown[]): void;
-    debug(...args: unknown[]): void;
-  };
-
-  // ── Server-side auction runtime (populated by TS edge injection) ──────────
-  /** Ad slot definitions injected at <head> open. */
-  adSlots?: AuctionSlot[];
-  /** Winning bid targeting data injected before </body>. */
-  bids?: Record<string, AuctionBidData>;
-  /**
-   * Bounded client-side Prebid APS renderer capabilities keyed by Prebid's generated
-   * `hb_adid`. The Universal Creative bridge consumes each entry at most once.
-   */
-  apsPrebidRenderers?: Record<string, ApsPrebidRendererEntry>;
-  /** Initialises GPT slots with server-side bid targeting and calls refresh(). */
-  adInit?: () => void;
-  /** GPT slot objects TS defined — used to destroy stale slots on SPA navigation. */
-  prevGptSlots?: unknown[];
-  /** Guards one-time-per-page enableSingleRequest/enableServices calls. */
-  servicesEnabled?: boolean;
-  /** Maps actualDivId → slotId for slotRenderEnded billing lookup. */
-  divToSlotId?: Record<string, string>;
-  /**
-   * Win/billing beacons already fired, keyed by `slotId|bidIdentity|kind|url`.
-   * Used by the GPT render bridge so a bid's nurl/burl fire at most once even
-   * across repeated Prebid Universal Creative requests for the same adId.
-   */
-  firedBeacons?: Record<string, boolean>;
-  /** Slot-level GPT targeting keys TS applied on the previous route. */
-  prevSlotTargetingKeys?: Record<string, string[]>;
-  /**
-   * One-shot bypass for the slim-Prebid refresh wrapper: true only while
-   * adInit() runs its internal refresh of server-side-targeted slots, so the
-   * wrapper passes that refresh straight to GPT instead of starting a
-   * client-side auction that would clear the just-applied TS targeting.
-   */
-  adInitRefreshInProgress?: boolean;
-  /** Scoped context marking an active Prebid-controlled GPT refresh delegation. */
-  prebidRefreshDispatchInProgress?: boolean;
-  /**
-   * Whether the publisher disabled GPT initial load through
-   * `googletag.setConfig()` or `googletag.pubads().disableInitialLoad()`.
-   * TS synchronizes this from GPT's getter and wraps both configuration APIs as
-   * a fallback when the getter is unavailable.
-   * When set, `display()` only registers a slot and the ad request must come
-   * from a `refresh()`; adInit() uses this to refresh its own freshly defined
-   * slots so they are not left blank.
-   */
-  gptInitialLoadDisabled?: boolean;
-  /** Late publisher claims for TS-created GPT slots, keyed by actual div ID. */
-  gptSlotHandoffs?: Record<string, GptSlotHandoff>;
-  /** True only while TS calls a GPT function that the handoff wrappers observe. */
-  gptSlotHandoffInternal?: boolean;
-  /** Guards SPA pushState hook installation. */
-  spaHookInstalled?: boolean;
-  /** Internal one-shot state shared by bootstrap and bundle scheduler installs. */
-  initialAdInitScheduled?: boolean;
-  /**
-   * Monotonic count of committed SPA navigations, incremented synchronously by
-   * the SPA auction hook the moment it accepts a route change. The deferred
-   * initial-adInit bootstrap ([`scheduleInitialAdInit`]) is pinned to
-   * generation 0 (the SSR document) and no-ops when a navigation has
-   * committed — before it was called, or while it was pending. A counter is
-   * used instead of a URL comparison so the guard cannot diverge from the
-   * auction path: a query-only history change (which the hook deliberately
-   * ignores) leaves the counter unchanged, and an `/a → /b → /a` round trip
-   * (where the URL compares equal again) advances it.
-   */
-  navGeneration?: number;
-  /**
-   * Defers the initial `adInit()` until after React hydration: window `load`,
-   * then a double `requestAnimationFrame`. Called by the server-injected
-   * `</body>` bids script with the SSR bids payload. The whole initial pass
-   * is pinned to navigation generation 0 (the SSR document): if an SPA
-   * navigation has already committed — or commits while the deferred callback
-   * is pending — the payload is dropped and `adInit()` is not run, so a stale
-   * SSR bootstrap can neither clobber the live route's bids nor re-run it.
-   * Lives in the bundle so the lifecycle is executable under test and shares
-   * [`navGeneration`] with the SPA auction hook; `gpt_bootstrap.js` installs
-   * a minimal fallback for pages where the bundle fails to load.
-   *
-   * `initialSlots` exists for the shared-template `</body>` seam, which is the
-   * only place slot definitions arrive with the bids rather than from the head
-   * script. Passing them here rather than assigning `tsjs.adSlots` before the
-   * call puts them behind the same generation guard: an assignment made ahead
-   * of the guard would clobber a committed SPA navigation's slots with the SSR
-   * document's, and then be read by that route's `adInit()`.
-   */
-  scheduleInitialAdInit?: (
-    initialBids?: Record<string, AuctionBidData>,
-    initialSlots?: AuctionSlot[]
-  ) => void;
-  /** Read-only GPT lifecycle diagnostics API, present only in an activated tab. */
-  gptDiagnostics?: GptDiagnosticsApi;
-  /**
-   * Internal evidence channel for Trusted Server integration modules. Not part
-   * of the operator API; present only in an activated tab.
-   */
-  gptDiagnosticsRecorder?: GptDiagnosticsRecorder;
+/** Release-internal later module authenticated and loaded by core. */
+export interface BootManifestDeferredIntegrationV1 {
+  readonly id: string;
+  readonly phase: 'deferred';
+  readonly trigger: 'first_display_or_idle';
+  readonly src: string;
 }
+
+export type BootManifestIntegrationV1 =
+  BootManifestTakeoverIntegrationV1 | BootManifestDeferredIntegrationV1;
+
+export interface BootManifestFirstDisplayV1 {
+  readonly src: string;
+  readonly slices: readonly string[];
+}
+
+/** Exact phase-aware bundle set and injection order required by one TSJS release. */
+export interface BootManifestV1 {
+  readonly version: 1;
+  readonly releaseId: string;
+  readonly firstDisplay: Readonly<BootManifestFirstDisplayV1> | null;
+  readonly runtimeSrc: string;
+  readonly integrations: readonly BootManifestIntegrationV1[];
+}
+
+/** One direct-auction ad unit admitted into the current navigation. */
+export interface ProgrammaticAdUnit {
+  readonly code: string;
+  readonly mediaTypes: Readonly<{
+    banner: Readonly<{ sizes: readonly (readonly [number, number])[] }>;
+  }>;
+  readonly bids?: readonly Readonly<{
+    bidder: string;
+    params?: Readonly<Record<string, unknown>>;
+  }>[];
+}
+
+export interface AddAdUnitsResult {
+  readonly registered: readonly string[];
+}
+
+export interface RequestAdsOptions {
+  readonly slots?: readonly string[];
+  readonly timeoutMs?: number;
+  readonly signal?: AbortSignal;
+}
+
+export type RenderFailureReason =
+  | 'auction_timeout'
+  | AuctionSlotFailureReason
+  | 'network_error'
+  | 'http_error'
+  | 'invalid_response'
+  | 'slot_unresolved'
+  | 'descriptor_invalid'
+  | 'invalid_dimensions'
+  | 'dimensions_out_of_range'
+  | 'no_render_source'
+  | 'registry_full'
+  | 'capability_registry_full'
+  | 'external_queue_full'
+  | 'external_ready_timeout'
+  | 'external_artifact_incompatible'
+  | 'prebid_admission_failed'
+  | 'prebid_contract_violation'
+  | 'prebid_selection_timeout'
+  | 'reservation_collision'
+  | 'identity_generation_failed'
+  | 'cycle_unattributable'
+  | 'slot_quarantined'
+  | 'gpt_request_failed'
+  | 'gpt_request_timeout'
+  | 'gpt_completion_timeout'
+  | 'reconciliation_capacity'
+  | 'gam_empty'
+  | 'bridge_claim_timeout'
+  | 'bridge_id_mismatch'
+  | 'owner_registration_timeout'
+  | 'owner_insertion_timeout'
+  | 'renderer_document_no_load'
+  | 'runner_no_load'
+  | 'runner_failed'
+  | 'cache_fetch_failed'
+  | 'invalid_cache_payload'
+  | 'response_post_failed'
+  | 'adm_document_no_load'
+  | 'abi_mismatch'
+  | 'bundle_partial';
+
+export type RequestAdsSlotResult =
+  | Readonly<{ slot: string; path: 'primary' | 'fallback'; outcome: 'accepted' }>
+  | Readonly<{ slot: string; path: 'primary' | 'fallback'; outcome: 'no_bid' }>
+  | Readonly<{
+      slot: string;
+      path: 'primary' | 'fallback';
+      outcome: 'failed';
+      reason: RenderFailureReason;
+    }>
+  | Readonly<{
+      slot: string;
+      path: 'primary' | 'fallback';
+      outcome: 'cancelled';
+      reason: 'caller_aborted' | 'superseded' | 'navigation_disposed';
+    }>;
+
+export interface RequestAdsResult {
+  readonly slots: readonly RequestAdsSlotResult[];
+}
+
+export type TsjsLogLevel = 'silent' | 'error' | 'warn' | 'info' | 'debug';
+
+export interface TsjsLog {
+  setLevel(level: TsjsLogLevel): void;
+  getLevel(): TsjsLogLevel;
+  error(...values: readonly unknown[]): void;
+  warn(...values: readonly unknown[]): void;
+  info(...values: readonly unknown[]): void;
+  debug(...values: readonly unknown[]): void;
+}
+
+export interface TsjsCommandQueue {
+  readonly length: 0;
+  push(callback: unknown): 0;
+}
+
+export interface CreativeBootV1 {
+  readonly version: 1;
+  readonly enabled: boolean;
+  readonly clickGuard: boolean;
+  readonly renderGuard: boolean;
+}
+
+export interface DiagnosticsBootV1 {
+  readonly version: 1;
+  readonly renderTraceOverlay: boolean;
+  readonly gpt: Readonly<{ readonly active: boolean }>;
+}
+
+export const INTEGRATION_CONFIG_IDS_V1 = Object.freeze([
+  'aps',
+  'datadome',
+  'didomi',
+  'google_tag_manager',
+  'gpt',
+  'lockr',
+  'osano',
+  'permutive',
+  'prebid',
+  'sourcepoint',
+  'testlight',
+] as const);
+
+export type IntegrationConfigIdV1 = (typeof INTEGRATION_CONFIG_IDS_V1)[number];
+export type BootJsonPrimitiveV1 = null | boolean | number | string;
+export type BootJsonValueV1 =
+  | BootJsonPrimitiveV1
+  | readonly BootJsonValueV1[]
+  | Readonly<{ readonly [key: string]: BootJsonValueV1 }>;
+
+export interface IntegrationConfigEntryV1 {
+  readonly id: IntegrationConfigIdV1;
+  readonly config: Readonly<{ readonly [key: string]: BootJsonValueV1 }>;
+}
+
+export interface IntegrationConfigsV1 {
+  readonly version: 1;
+  readonly entries: readonly Readonly<IntegrationConfigEntryV1>[];
+}
+
+export interface TsjsBootV1 {
+  readonly abi: 1;
+  readonly releaseId: string;
+  readonly manifest: Readonly<BootManifestV1>;
+  readonly auctionProjection: Readonly<BrowserAuctionProjectionV1>;
+  readonly integrations: Readonly<IntegrationConfigsV1>;
+  readonly creative: Readonly<CreativeBootV1>;
+  readonly diagnostics: Readonly<DiagnosticsBootV1>;
+}
+
+export type RenderTracePathV1 = 'auction' | 'ssat' | 'gam-refresh';
+export type RenderTraceServedFromV1 = 'inline' | 'gam' | 'debug-adm' | 'pbs-cache' | 'prebid';
+
+export interface RenderTraceRecord {
+  readonly slotId: string;
+  readonly path: RenderTracePathV1;
+  readonly rendered: boolean;
+  readonly elementId?: string;
+  readonly auctionId?: string;
+  readonly bidder?: string;
+  readonly adId?: string;
+  readonly bidId?: string;
+  readonly creativeId?: string;
+  readonly admHash?: string;
+  readonly servedFrom?: RenderTraceServedFromV1;
+  readonly gamEmpty?: boolean;
+  readonly injected?: boolean;
+  readonly visible?: boolean;
+  readonly count: number;
+  readonly seq: number;
+  readonly at: number;
+}
+
+export interface RenderTraceDiagnostics {
+  current(): Readonly<Record<string, Readonly<RenderTraceRecord>>>;
+  history(): readonly Readonly<RenderTraceRecord>[];
+  subscribe(listener: (record: Readonly<RenderTraceRecord>) => void): () => void;
+}
+
+export interface TsjsDiagnostics {
+  readonly renderTrace: RenderTraceDiagnostics;
+  readonly gpt?: GptDiagnosticsApi;
+}
+
+export interface TsjsApiBase {
+  readonly version: '1.0.0';
+  readonly releaseId: string;
+  readonly boot: Readonly<TsjsBootV1>;
+  readonly que: TsjsCommandQueue;
+  readonly log: TsjsLog;
+  readonly _registerIntegration: (registration: unknown) => false;
+  addAdUnits(units: ProgrammaticAdUnit | readonly ProgrammaticAdUnit[]): AddAdUnitsResult;
+  requestAds(options?: RequestAdsOptions): Promise<RequestAdsResult>;
+}
+
+export interface TsjsKernelApi extends TsjsApiBase {
+  readonly diagnostics: Readonly<TsjsDiagnostics>;
+  readonly _internal: Readonly<{ state: 'kernel'; releaseId: string }>;
+}
+
+export interface TsjsFallbackApi extends TsjsApiBase {
+  readonly diagnostics?: never;
+  readonly _internal: Readonly<{
+    state: 'fallback';
+    releaseId: string;
+    reason: 'abi_mismatch' | 'bundle_partial';
+    initialDisplayCommitted: boolean;
+  }>;
+}
+
+export type TsjsApi = TsjsKernelApi | TsjsFallbackApi;

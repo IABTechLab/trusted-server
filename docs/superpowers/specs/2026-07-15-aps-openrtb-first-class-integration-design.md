@@ -6,6 +6,12 @@
 
 ---
 
+> **Superseded configuration guidance:** The August 4 APS render-fix and TSJS
+> resilience design is the controlling hard-cutover contract. It removes the
+> `pub_id` alias and integer coercion described in this July record. The shipped
+> APS configuration accepts only a non-empty string `account_id`; references
+> below to alias or integer migration are retained only as superseded history.
+
 ## 1. Goal
 
 Replace Trusted Server's legacy Amazon Publisher Services (APS/TAM) wire contract
@@ -36,7 +42,7 @@ confirmation is a rollout gate, not an implementation blocker.
 | Sandbox compatibility     | APS confirmed `allow-same-origin` compatibility, but Trusted Server must not grant it on the outer security boundary. The outer renderer iframe has an opaque origin; descendant APS frames cannot relax an ancestor sandbox restriction. `script` remains disabled until browser proof. |
 | APS notifications         | Do not expose or fire APS `nurl`/`burl` in this issue. The fixed APS runner owns creative tracking until APS approves a separate notification contract.                                                                                                                                  |
 | APS user sync             | Out of scope. Do not expose or execute `ext.userSyncs`.                                                                                                                                                                                                                                  |
-| Migration                 | Cut over directly. Keep `pub_id` only as a configuration alias; do not retain a legacy/OpenRTB protocol switch.                                                                                                                                                                          |
+| Migration                 | Cut over directly. The controlling August design accepts only string `account_id`; it removes the superseded `pub_id` alias, integer coercion, and any legacy/OpenRTB protocol switch.                                                                                                   |
 | Native APS coexistence    | When a Trusted Server APS renderer descriptor is present, Trusted Server must not call `apstag.setDisplayBids()`. The test cohort must disable native APS demand to avoid duplicate participation.                                                                                       |
 
 ---
@@ -130,14 +136,14 @@ timeout_ms = 800
 allow_script_creatives = false
 ```
 
-### 6.1 Compatibility
+### 6.1 Hard cutover
 
 - Rename `pub_id` to `account_id` in the Rust type, example configuration, and docs.
-- Accept `pub_id` as a serde alias for `account_id` for existing operator configs.
-- Continue accepting a string or integer value during migration. Trim strings, reject
-  empty-after-trim values, and normalize integers to strings.
-- If both names are supplied, deserialization must fail as a duplicate field rather
-  than silently selecting one.
+- Accept only a string `account_id`; trim it and reject empty-after-trim or oversized
+  values.
+- Reject `pub_id`, integer account IDs, and mixed old/new field shapes as invalid
+  configuration. The alias and integer-coercion migration proposed by this July
+  record is superseded by the controlling August design.
 - Keep `endpoint` as an operator-owned test/override setting, but require HTTPS with a
   non-empty host and no URL credentials. Its configured endpoint must implement this
   OpenRTB contract; it is not a legacy-protocol switch. There is no plaintext test

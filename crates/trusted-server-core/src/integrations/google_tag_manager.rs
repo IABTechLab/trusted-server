@@ -422,6 +422,7 @@ pub fn register(
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration.clone())
             .with_script_rewriter(integration)
+            .with_empty_browser_config_v1()?
             .build(),
     ))
 }

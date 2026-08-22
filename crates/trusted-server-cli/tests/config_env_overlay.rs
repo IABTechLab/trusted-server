@@ -50,6 +50,7 @@ fn migrated_legacy_project() -> MigratedProject {
     // expected to take effect.
     document["auction"]["rewrite_creatives"] = value(true);
     document["auction"]["sanitize_creatives"] = value(false);
+    document["integrations"]["gpt"]["gam_attribution_enabled"] = value(false);
     document["creative_opportunities"]["enabled"] = value(true);
     document["creative_opportunities"]["gam_network_id"] = value("123456789");
     fs::write(&config_path, document.to_string()).expect("should write migrated config");
@@ -156,7 +157,7 @@ fn migrated_legacy_config_applies_boolean_environment_overrides() {
     assert_eq!(
         envelope["data"]["integrations"]["gpt"]["gam_attribution_enabled"],
         serde_json::Value::Bool(true),
-        "pushed config should contain the GAM attribution environment override"
+        "pushed config should contain the GAM attribution environment override: {envelope}"
     );
     assert_eq!(
         envelope["data"]["creative_opportunities"]["enabled"],

@@ -1,0 +1,1993 @@
+#!/usr/bin/env node
+
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const EXPECTED = Object.freeze({
+  schemaVersion: 6,
+  chromium: "145.0.7632.6",
+  machineClass: "github-hosted:ubuntu-24.04",
+  runnerImage: "ubuntu-24.04",
+  fixture: "tsjs-baseline-paired-network-v3",
+  controller: "generated-server-v1+production-rc-v1",
+  node: "v24.12.0",
+  npm: "11.6.2",
+  typescript: "6.0.3",
+  warmupsPerVariant: 5,
+  samplesPerVariant: 50,
+  percentile: 90,
+  interleaving: "alternating-baseline-candidate",
+  networkProfile: Object.freeze({
+    mechanism: "cdp-Network.emulateNetworkConditions",
+    appliedBeforeNavigation: true,
+    latencyMs: 150,
+    downloadThroughputBytesPerSecond: 200_000,
+    uploadThroughputBytesPerSecond: 93_750,
+    packetLossPercent: 0,
+  }),
+  maximumRatio: 1.1,
+  heapCheckpoints: Object.freeze([
+    "afterBoot",
+    "afterFirstRender",
+    "afterRefresh",
+    "afterSpaNavigation",
+  ]),
+  heapHardCeilingBytes: 4 * 1024 * 1024,
+  aps: Object.freeze({
+    actionCeilingMs: 900,
+    actionToCompletionCeilingMs: 1_500,
+    completionToPaintCeilingMs: 250,
+    totalToPaintCeilingMs: 2_500,
+    afterProtectedPaintHeapCeilingBytes: 3 * 1024 * 1024,
+    afterTakeoverQueueDrainHeapCeilingBytes: 3_932_160,
+  }),
+  workflowName: "TSJS Performance Gate",
+  workflowFile: ".github/workflows/tsjs-performance-gate.yml",
+});
+
+function fail(message) {
+  throw new Error(`invalid TSJS performance evidence: ${message}`);
+}
+
+function record(value, path) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    fail(`${path} must be an object`);
+  }
+  return value;
+}
+
+function exactKeys(value, keys, path) {
+  const actual = Object.keys(record(value, path)).sort();
+  const expected = [...keys].sort();
+  if (
+    actual.length !== expected.length ||
+    actual.some((key, index) => key !== expected[index])
+  ) {
+    fail(`${path} has an unexpected schema`);
+  }
+}
+
+function exactString(value, expected, path) {
+  if (typeof value !== "string" || value !== expected)
+    fail(`${path} must equal ${expected}`);
+}
+
+function boolean(value, expected, path) {
+  if (typeof value !== "boolean" || value !== expected)
+    fail(`${path} must equal ${expected}`);
+}
+
+function finiteNumber(value, path, { integer = false, minimum = 0 } = {}) {
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value) ||
+    value < minimum ||
+    (integer && !Number.isSafeInteger(value))
+  ) {
+    fail(`${path} must be a finite${integer ? " safe integer" : " number"}`);
+  }
+  return value;
+}
+
+function nearestRank(values, percentile) {
+  const ordered = [...values].sort((left, right) => left - right);
+  return ordered[Math.ceil((percentile / 100) * ordered.length) - 1];
+}
+
+function validateReferenceTransfer(
+  value,
+  expectedSha,
+  expectedModel,
+  path,
+  firstDisplayMask = "008b",
+) {
+  exactKeys(
+    value,
+    ["sha", "artifactModel", "sources", "rawBytes", "gzipBytes", "brotliBytes"],
+    path,
+  );
+  exactString(value.sha, expectedSha, `${path}.sha`);
+  exactString(value.artifactModel, expectedModel, `${path}.artifactModel`);
+  if (!Array.isArray(value.sources)) fail(`${path}.sources must be an array`);
+  const expectedInlineEndpoints =
+    expectedModel === "legacy-rc-v1"
+      ? ["inline:legacy-boot", "inline:legacy-ad-init"]
+      : ["inline:boot-controller"];
+  if (value.sources.length !== expectedInlineEndpoints.length + 1) {
+    fail(`${path}.sources has an unexpected semantic count`);
+  }
+  const endpoints = new Set();
+  const sums = { rawBytes: 0, gzipBytes: 0, brotliBytes: 0 };
+  let externalRawBytes;
+  for (const [index, source] of value.sources.entries()) {
+    const sourcePath = `${path}.sources[${index}]`;
+    exactKeys(
+      source,
+      [
+        "semanticEndpoint",
+        "delivery",
+        "rawBytes",
+        "gzipBytes",
+        "brotliBytes",
+        "sha256",
+      ],
+      sourcePath,
+    );
+    if (
+      typeof source.semanticEndpoint !== "string" ||
+      source.semanticEndpoint.length === 0 ||
+      endpoints.has(source.semanticEndpoint)
+    ) {
+      fail(`${sourcePath}.semanticEndpoint must be unique`);
+    }
+    endpoints.add(source.semanticEndpoint);
+    if (!/^[0-9a-f]{64}$/.test(source.sha256)) {
+      fail(`${sourcePath}.sha256 is invalid`);
+    }
+    if (source.delivery === "inline") {
+      if (!source.semanticEndpoint.startsWith("inline:")) {
+        fail(`${sourcePath} has a mismatched inline endpoint`);
+      }
+    } else if (source.delivery === "external") {
+      const expectedExternalEndpoint =
+        expectedModel === "release-v1"
+          ? `external:/static/tsjs=tsjs-first-display.min.js?m=${firstDisplayMask}&v=${source.sha256}`
+          : `external:/static/tsjs=tsjs-unified.min.js?v=${source.sha256}`;
+      if (source.semanticEndpoint !== expectedExternalEndpoint) {
+        fail(`${sourcePath} has a mismatched external endpoint`);
+      }
+      if (externalRawBytes !== undefined) {
+        fail(`${path} contains duplicate external transfer`);
+      }
+      externalRawBytes = source.rawBytes;
+    } else {
+      fail(`${sourcePath}.delivery is invalid`);
+    }
+    for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
+      sums[metric] += finiteNumber(source[metric], `${sourcePath}.${metric}`, {
+        integer: true,
+        minimum: 1,
+      });
+    }
+  }
+  const inlineEndpoints = [...endpoints]
+    .filter((endpoint) => endpoint.startsWith("inline:"))
+    .sort();
+  if (
+    inlineEndpoints.length !== expectedInlineEndpoints.length ||
+    inlineEndpoints.some(
+      (endpoint, index) =>
+        endpoint !== [...expectedInlineEndpoints].sort()[index],
+    )
+  ) {
+    fail(`${path} omits or mislabels an inline semantic source`);
+  }
+  if (externalRawBytes === undefined)
+    fail(`${path} omits the external transfer`);
+  for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
+    const total = finiteNumber(value[metric], `${path}.${metric}`, {
+      integer: true,
+      minimum: 1,
+    });
+    if (total !== sums[metric]) fail(`${path}.${metric} total is inconsistent`);
+  }
+  return { externalRawBytes };
+}
+
+export function validateEvidence(evidence, expected) {
+  const expectedMode = expected.mode;
+  if (
+    expectedMode !== "preswitch" &&
+    expectedMode !== "postswitch" &&
+    expectedMode !== "pull-request"
+  ) {
+    fail("expected mode must be preswitch, postswitch, or pull-request");
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(expected.evidenceId ?? "")) {
+    fail("expected evidence id is invalid");
+  }
+  if (!/^[0-9a-f]{40}$/.test(expected.headSha ?? ""))
+    fail("expected head SHA is invalid");
+  if (!/^[0-9a-f]{40}$/.test(expected.baseSha ?? ""))
+    fail("expected base SHA is invalid");
+
+  exactKeys(
+    evidence,
+    [
+      "schemaVersion",
+      "evidenceId",
+      "mode",
+      "headSha",
+      "environment",
+      "sampling",
+      "networkProfile",
+      "marks",
+      "performance",
+      "transfer",
+      "heap",
+      "requests",
+      "aps",
+      "assertions",
+      "provenance",
+      "result",
+    ],
+    "evidence",
+  );
+  if (evidence.schemaVersion !== EXPECTED.schemaVersion)
+    fail("schemaVersion drifted");
+  exactString(evidence.evidenceId, expected.evidenceId, "evidenceId");
+  exactString(evidence.mode, expectedMode, "mode");
+  exactString(evidence.headSha, expected.headSha, "headSha");
+  exactString(evidence.result, "complete", "result");
+
+  exactKeys(
+    evidence.environment,
+    [
+      "chromium",
+      "controller",
+      "machineClass",
+      "runnerImage",
+      "fixture",
+      "node",
+      "npm",
+      "typescript",
+    ],
+    "environment",
+  );
+  exactString(
+    evidence.environment.chromium,
+    EXPECTED.chromium,
+    "environment.chromium",
+  );
+  exactString(
+    evidence.environment.controller,
+    EXPECTED.controller,
+    "environment.controller",
+  );
+  exactString(
+    evidence.environment.machineClass,
+    EXPECTED.machineClass,
+    "environment.machineClass",
+  );
+  exactString(
+    evidence.environment.runnerImage,
+    EXPECTED.runnerImage,
+    "environment.runnerImage",
+  );
+  exactString(
+    evidence.environment.fixture,
+    EXPECTED.fixture,
+    "environment.fixture",
+  );
+  for (const name of ["node", "npm", "typescript"])
+    exactString(
+      evidence.environment[name],
+      EXPECTED[name],
+      `environment.${name}`,
+    );
+
+  exactKeys(
+    evidence.sampling,
+    ["warmupsPerVariant", "samplesPerVariant", "percentile", "interleaving"],
+    "sampling",
+  );
+  if (
+    evidence.sampling.warmupsPerVariant !== EXPECTED.warmupsPerVariant ||
+    evidence.sampling.samplesPerVariant !== EXPECTED.samplesPerVariant ||
+    evidence.sampling.percentile !== EXPECTED.percentile ||
+    evidence.sampling.interleaving !== EXPECTED.interleaving
+  ) {
+    fail("sampling contract drifted");
+  }
+
+  exactKeys(
+    evidence.networkProfile,
+    [
+      "mechanism",
+      "appliedBeforeNavigation",
+      "latencyMs",
+      "downloadThroughputBytesPerSecond",
+      "uploadThroughputBytesPerSecond",
+      "packetLossPercent",
+    ],
+    "networkProfile",
+  );
+  for (const [name, expectedValue] of Object.entries(EXPECTED.networkProfile)) {
+    if (evidence.networkProfile[name] !== expectedValue)
+      fail(`networkProfile.${name} drifted`);
+  }
+
+  exactKeys(
+    evidence.marks,
+    [
+      "source",
+      "comparisonStart",
+      "firstObservableAction",
+      "candidateBidsScript",
+      "candidateFirstDisplay",
+      "candidateFirstDisplayPaint",
+    ],
+    "marks",
+  );
+  exactString(
+    evidence.marks.source,
+    "fixture-first-observable-action",
+    "marks.source",
+  );
+  for (const name of [
+    "comparisonStart",
+    "firstObservableAction",
+    "candidateBidsScript",
+    "candidateFirstDisplay",
+    "candidateFirstDisplayPaint",
+  ]) {
+    boolean(evidence.marks[name], true, `marks.${name}`);
+  }
+
+  exactKeys(evidence.performance, ["requestToFirstActionMs"], "performance");
+  const timing = evidence.performance.requestToFirstActionMs;
+  exactKeys(
+    timing,
+    ["baseline", "candidate", "percentile", "maximumRatio", "observedRatio"],
+    "performance timing",
+  );
+  if (timing.percentile !== EXPECTED.percentile)
+    fail("performance percentile drifted");
+  if (timing.maximumRatio !== EXPECTED.maximumRatio)
+    fail("performance ratio limit drifted");
+  exactKeys(
+    timing.baseline,
+    ["sha", "artifactModel", "selectedTransferBytes", "samples", "p90"],
+    "baseline performance timing",
+  );
+  exactString(timing.baseline.sha, expected.baseSha, "performance base SHA");
+  if (
+    timing.baseline.artifactModel !== "legacy-rc-v1" &&
+    timing.baseline.artifactModel !== "release-v1"
+  ) {
+    fail("performance baseline artifact model is invalid");
+  }
+  finiteNumber(
+    timing.baseline.selectedTransferBytes,
+    "baseline selected transfer bytes",
+    { integer: true, minimum: 1 },
+  );
+  exactKeys(
+    timing.candidate,
+    ["artifactModel", "selectedTransferBytes", "samples", "p90"],
+    "candidate performance timing",
+  );
+  exactString(
+    timing.candidate.artifactModel,
+    "release-v1",
+    "performance candidate artifact model",
+  );
+  finiteNumber(
+    timing.candidate.selectedTransferBytes,
+    "candidate selected transfer bytes",
+    { integer: true, minimum: 1 },
+  );
+  const validateVariant = (variant, path) => {
+    if (
+      !Array.isArray(variant.samples) ||
+      variant.samples.length !== EXPECTED.samplesPerVariant
+    ) {
+      fail(`${path} samples must contain exactly 50 values`);
+    }
+    const samples = variant.samples.map((value, index) =>
+      finiteNumber(value, `${path} performance sample ${index}`),
+    );
+    const variantP90 = finiteNumber(variant.p90, `${path} performance p90`);
+    if (!Object.is(variantP90, nearestRank(samples, EXPECTED.percentile))) {
+      fail(`${path} performance p90 is inconsistent with the samples`);
+    }
+    return variantP90;
+  };
+  const baselineP90 = validateVariant(timing.baseline, "baseline");
+  const candidateP90 = validateVariant(timing.candidate, "candidate");
+  if (baselineP90 <= 0) fail("baseline performance p90 must be positive");
+  const observedRatio = finiteNumber(
+    timing.observedRatio,
+    "performance observed ratio",
+  );
+  if (Math.abs(observedRatio - candidateP90 / baselineP90) > Number.EPSILON) {
+    fail("performance observed ratio is inconsistent with the p90 values");
+  }
+  if (candidateP90 > baselineP90 * EXPECTED.maximumRatio)
+    fail("candidate performance p90 exceeds the paired 10% limit");
+
+  exactKeys(
+    evidence.transfer,
+    ["algorithm", "baselineReferenceTransfer", "candidateReferenceTransfer"],
+    "transfer",
+  );
+  exactString(
+    evidence.transfer.algorithm,
+    "semantic-tsjs-transfer-v1",
+    "transfer.algorithm",
+  );
+  const baselineTransfer = validateReferenceTransfer(
+    evidence.transfer.baselineReferenceTransfer,
+    expected.baseSha,
+    timing.baseline.artifactModel,
+    "transfer.baselineReferenceTransfer",
+  );
+  const candidateTransfer = validateReferenceTransfer(
+    evidence.transfer.candidateReferenceTransfer,
+    expected.headSha,
+    timing.candidate.artifactModel,
+    "transfer.candidateReferenceTransfer",
+  );
+  if (
+    timing.baseline.selectedTransferBytes !== baselineTransfer.externalRawBytes
+  ) {
+    fail("baseline selected transfer bytes disagree with semantic transfer");
+  }
+  if (
+    timing.candidate.selectedTransferBytes !==
+    candidateTransfer.externalRawBytes
+  ) {
+    fail("candidate selected transfer bytes disagree with semantic transfer");
+  }
+  for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
+    if (
+      evidence.transfer.candidateReferenceTransfer[metric] >
+      evidence.transfer.baselineReferenceTransfer[metric]
+    ) {
+      fail(`candidate reference ${metric} exceeds the rc baseline`);
+    }
+  }
+
+  exactKeys(
+    evidence.heap,
+    ["collection", "hardCeilingBytes", "baseline", "candidate"],
+    "heap",
+  );
+  exactString(
+    evidence.heap.collection,
+    "playwright-requestGC-then-immediate-cdp-getHeapUsage",
+    "heap.collection",
+  );
+  if (evidence.heap.hardCeilingBytes !== EXPECTED.heapHardCeilingBytes)
+    fail("heap hard ceiling drifted");
+  exactKeys(evidence.heap.baseline, ["sha", "checkpoints"], "heap.baseline");
+  exactString(evidence.heap.baseline.sha, expected.baseSha, "heap base SHA");
+  exactKeys(evidence.heap.candidate, ["checkpoints"], "heap.candidate");
+  exactKeys(
+    evidence.heap.baseline.checkpoints,
+    EXPECTED.heapCheckpoints,
+    "heap.baseline.checkpoints",
+  );
+  exactKeys(
+    evidence.heap.candidate.checkpoints,
+    EXPECTED.heapCheckpoints,
+    "heap.candidate.checkpoints",
+  );
+  for (const name of EXPECTED.heapCheckpoints) {
+    const baselineUsedSize = finiteNumber(
+      evidence.heap.baseline.checkpoints[name],
+      `heap.baseline.checkpoints.${name}`,
+      { integer: true, minimum: 1 },
+    );
+    const candidateUsedSize = finiteNumber(
+      evidence.heap.candidate.checkpoints[name],
+      `heap.candidate.checkpoints.${name}`,
+      { integer: true, minimum: 1 },
+    );
+    if (
+      baselineUsedSize > EXPECTED.heapHardCeilingBytes ||
+      candidateUsedSize > EXPECTED.heapHardCeilingBytes
+    ) {
+      fail(`${name} retained heap exceeds the hard ceiling`);
+    }
+  }
+
+  exactKeys(evidence.requests, ["selected", "deferred"], "requests");
+  exactKeys(evidence.requests.selected, ["count"], "requests.selected");
+  if (evidence.requests.selected.count !== 1)
+    fail("selected request count must be exactly one");
+  exactKeys(
+    evidence.requests.deferred,
+    [
+      "count",
+      "requestBeforePaintCount",
+      "preloadBeforePaintCount",
+      "preparationBeforePaintCount",
+      "executionBeforePaintCount",
+      "independentlyTriggered",
+      "headOfLineBlocking",
+    ],
+    "requests.deferred",
+  );
+  finiteNumber(evidence.requests.deferred.count, "deferred count", {
+    integer: true,
+  });
+  if (evidence.requests.deferred.count !== 2)
+    fail("deferred module count must be exactly two");
+  for (const name of [
+    "requestBeforePaintCount",
+    "preloadBeforePaintCount",
+    "preparationBeforePaintCount",
+    "executionBeforePaintCount",
+  ]) {
+    if (evidence.requests.deferred[name] !== 0)
+      fail(`deferred ${name} must be zero`);
+  }
+  boolean(
+    evidence.requests.deferred.independentlyTriggered,
+    true,
+    "deferred independentlyTriggered",
+  );
+  boolean(
+    evidence.requests.deferred.headOfLineBlocking,
+    false,
+    "deferred headOfLineBlocking",
+  );
+
+  exactKeys(
+    evidence.aps,
+    ["marks", "performance", "transfer", "heap", "requests", "assertions"],
+    "aps",
+  );
+  exactKeys(
+    evidence.aps.marks,
+    [
+      "source",
+      "candidateBidsScript",
+      "candidateFirstDisplay",
+      "candidateFirstDisplayTerminal",
+      "candidateFirstDisplayPaint",
+    ],
+    "aps.marks",
+  );
+  exactString(
+    evidence.aps.marks.source,
+    "performance-entry",
+    "aps.marks.source",
+  );
+  for (const name of [
+    "candidateBidsScript",
+    "candidateFirstDisplay",
+    "candidateFirstDisplayTerminal",
+    "candidateFirstDisplayPaint",
+  ]) {
+    boolean(evidence.aps.marks[name], true, `aps.marks.${name}`);
+  }
+
+  exactKeys(
+    evidence.aps.performance,
+    ["firstAction", "actionToCompletion", "completionToPaint", "totalToPaint"],
+    "aps.performance",
+  );
+  const apsFirstAction = evidence.aps.performance.firstAction;
+  exactKeys(
+    apsFirstAction,
+    [
+      "baseline",
+      "candidate",
+      "percentile",
+      "maximumRatio",
+      "absoluteCeilingMs",
+      "observedRatio",
+    ],
+    "aps.performance.firstAction",
+  );
+  if (
+    apsFirstAction.percentile !== EXPECTED.percentile ||
+    apsFirstAction.maximumRatio !== EXPECTED.maximumRatio ||
+    apsFirstAction.absoluteCeilingMs !== EXPECTED.aps.actionCeilingMs
+  ) {
+    fail("APS first-action policy drifted");
+  }
+  exactKeys(
+    apsFirstAction.baseline,
+    ["sha", "artifactModel", "selectedTransferBytes", "samples", "p90"],
+    "aps.performance.firstAction.baseline",
+  );
+  exactString(
+    apsFirstAction.baseline.sha,
+    expected.baseSha,
+    "APS first-action base SHA",
+  );
+  if (
+    apsFirstAction.baseline.artifactModel !== "legacy-rc-v1" &&
+    apsFirstAction.baseline.artifactModel !== "release-v1"
+  ) {
+    fail("APS baseline artifact model is invalid");
+  }
+  finiteNumber(
+    apsFirstAction.baseline.selectedTransferBytes,
+    "APS baseline selected transfer bytes",
+    { integer: true, minimum: 1 },
+  );
+  exactKeys(
+    apsFirstAction.candidate,
+    ["artifactModel", "selectedTransferBytes", "samples", "p90"],
+    "aps.performance.firstAction.candidate",
+  );
+  exactString(
+    apsFirstAction.candidate.artifactModel,
+    "release-v1",
+    "APS candidate artifact model",
+  );
+  finiteNumber(
+    apsFirstAction.candidate.selectedTransferBytes,
+    "APS candidate selected transfer bytes",
+    { integer: true, minimum: 1 },
+  );
+  const apsBaselineActionP90 = validateVariant(
+    apsFirstAction.baseline,
+    "APS baseline first action",
+  );
+  const apsCandidateActionP90 = validateVariant(
+    apsFirstAction.candidate,
+    "APS candidate first action",
+  );
+  if (apsBaselineActionP90 <= 0)
+    fail("APS baseline first-action p90 must be positive");
+  const apsObservedRatio = finiteNumber(
+    apsFirstAction.observedRatio,
+    "APS first-action observed ratio",
+  );
+  if (
+    Math.abs(apsObservedRatio - apsCandidateActionP90 / apsBaselineActionP90) >
+    Number.EPSILON
+  ) {
+    fail("APS first-action ratio is inconsistent");
+  }
+  if (apsCandidateActionP90 > apsBaselineActionP90 * EXPECTED.maximumRatio) {
+    fail("APS candidate first-action p90 exceeds the paired 10% limit");
+  }
+  if (apsCandidateActionP90 > EXPECTED.aps.actionCeilingMs) {
+    fail("APS candidate first-action p90 exceeds its absolute ceiling");
+  }
+
+  const validateApsInterval = (name, ceiling) => {
+    const interval = evidence.aps.performance[name];
+    exactKeys(
+      interval,
+      ["samples", "p90", "ceilingMs"],
+      `aps.performance.${name}`,
+    );
+    if (interval.ceilingMs !== ceiling) fail(`APS ${name} ceiling drifted`);
+    const intervalP90 = validateVariant(interval, `APS ${name}`);
+    if (intervalP90 > ceiling) fail(`APS ${name} p90 exceeds its ceiling`);
+  };
+  validateApsInterval(
+    "actionToCompletion",
+    EXPECTED.aps.actionToCompletionCeilingMs,
+  );
+  validateApsInterval(
+    "completionToPaint",
+    EXPECTED.aps.completionToPaintCeilingMs,
+  );
+  validateApsInterval("totalToPaint", EXPECTED.aps.totalToPaintCeilingMs);
+
+  exactKeys(
+    evidence.aps.transfer,
+    [
+      "algorithm",
+      "maximumRatio",
+      "baselineReferenceTransfer",
+      "candidateReferenceTransfer",
+    ],
+    "aps.transfer",
+  );
+  exactString(
+    evidence.aps.transfer.algorithm,
+    "semantic-tsjs-transfer-v1",
+    "aps.transfer.algorithm",
+  );
+  if (evidence.aps.transfer.maximumRatio !== EXPECTED.maximumRatio) {
+    fail("APS transfer ratio limit drifted");
+  }
+  const apsBaselineTransfer = validateReferenceTransfer(
+    evidence.aps.transfer.baselineReferenceTransfer,
+    expected.baseSha,
+    apsFirstAction.baseline.artifactModel,
+    "aps.transfer.baselineReferenceTransfer",
+    "008f",
+  );
+  const apsCandidateTransfer = validateReferenceTransfer(
+    evidence.aps.transfer.candidateReferenceTransfer,
+    expected.headSha,
+    apsFirstAction.candidate.artifactModel,
+    "aps.transfer.candidateReferenceTransfer",
+    "008f",
+  );
+  if (
+    apsFirstAction.baseline.selectedTransferBytes !==
+      apsBaselineTransfer.externalRawBytes ||
+    apsFirstAction.candidate.selectedTransferBytes !==
+      apsCandidateTransfer.externalRawBytes
+  ) {
+    fail("APS selected transfer bytes disagree with semantic transfer");
+  }
+  for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
+    if (
+      evidence.aps.transfer.candidateReferenceTransfer[metric] >
+      evidence.aps.transfer.baselineReferenceTransfer[metric] *
+        EXPECTED.maximumRatio
+    ) {
+      fail(`APS candidate ${metric} transfer exceeds the paired 10% limit`);
+    }
+  }
+
+  exactKeys(
+    evidence.aps.heap,
+    ["collection", "afterProtectedPaint", "afterTakeoverQueueDrain"],
+    "aps.heap",
+  );
+  exactString(
+    evidence.aps.heap.collection,
+    "playwright-requestGC-then-immediate-cdp-getHeapUsage",
+    "aps.heap.collection",
+  );
+  for (const [name, ceiling] of [
+    ["afterProtectedPaint", EXPECTED.aps.afterProtectedPaintHeapCeilingBytes],
+    [
+      "afterTakeoverQueueDrain",
+      EXPECTED.aps.afterTakeoverQueueDrainHeapCeilingBytes,
+    ],
+  ]) {
+    const checkpoint = evidence.aps.heap[name];
+    exactKeys(checkpoint, ["usedSize", "ceilingBytes"], `aps.heap.${name}`);
+    if (checkpoint.ceilingBytes !== ceiling)
+      fail(`APS ${name} heap ceiling drifted`);
+    if (
+      finiteNumber(checkpoint.usedSize, `aps.heap.${name}.usedSize`, {
+        integer: true,
+        minimum: 1,
+      }) > ceiling
+    ) {
+      fail(`APS ${name} retained heap exceeds its ceiling`);
+    }
+  }
+
+  exactKeys(evidence.aps.requests, ["selected", "deferred"], "aps.requests");
+  exactKeys(evidence.aps.requests.selected, ["count"], "aps.requests.selected");
+  if (evidence.aps.requests.selected.count !== 1)
+    fail("APS selected request count must be one");
+  exactKeys(
+    evidence.aps.requests.deferred,
+    [
+      "count",
+      "requestBeforePaintCount",
+      "preloadBeforePaintCount",
+      "preparationBeforePaintCount",
+      "executionBeforePaintCount",
+    ],
+    "aps.requests.deferred",
+  );
+  if (evidence.aps.requests.deferred.count !== 2)
+    fail("APS deferred module count must be two");
+  for (const name of [
+    "requestBeforePaintCount",
+    "preloadBeforePaintCount",
+    "preparationBeforePaintCount",
+    "executionBeforePaintCount",
+  ]) {
+    if (evidence.aps.requests.deferred[name] !== 0) {
+      fail(`APS deferred ${name} must be zero`);
+    }
+  }
+  exactKeys(
+    evidence.aps.assertions,
+    ["correctness", "loadOrder"],
+    "aps.assertions",
+  );
+  boolean(
+    evidence.aps.assertions.correctness,
+    true,
+    "aps.assertions.correctness",
+  );
+  boolean(evidence.aps.assertions.loadOrder, true, "aps.assertions.loadOrder");
+
+  exactKeys(evidence.assertions, ["correctness", "loadOrder"], "assertions");
+  boolean(evidence.assertions.correctness, true, "assertions.correctness");
+  boolean(evidence.assertions.loadOrder, true, "assertions.loadOrder");
+
+  exactKeys(
+    evidence.provenance,
+    [
+      "workflowName",
+      "workflowFile",
+      "runId",
+      "runAttempt",
+      "artifactName",
+      "headSha",
+    ],
+    "provenance",
+  );
+  exactString(
+    evidence.provenance.workflowName,
+    EXPECTED.workflowName,
+    "provenance.workflowName",
+  );
+  exactString(
+    evidence.provenance.workflowFile,
+    EXPECTED.workflowFile,
+    "provenance.workflowFile",
+  );
+  finiteNumber(evidence.provenance.runId, "provenance.runId", {
+    integer: true,
+    minimum: 1,
+  });
+  finiteNumber(evidence.provenance.runAttempt, "provenance.runAttempt", {
+    integer: true,
+    minimum: 1,
+  });
+  exactString(
+    evidence.provenance.artifactName,
+    `tsjs-performance-${expected.evidenceId}`,
+    "provenance.artifactName",
+  );
+  exactString(
+    evidence.provenance.headSha,
+    expected.headSha,
+    "provenance.headSha",
+  );
+  return evidence;
+}
+
+function validFixture() {
+  const evidenceId = "aps-tsjs-preswitch-12345678";
+  const headSha = "a".repeat(40);
+  const baseSha = "c".repeat(40);
+  const baselineSamples = Array.from({ length: 50 }, () => 200);
+  const candidateSamples = Array.from({ length: 50 }, () => 210);
+  return {
+    expected: { evidenceId, headSha, baseSha, mode: "preswitch" },
+    evidence: {
+      schemaVersion: 6,
+      evidenceId,
+      mode: "preswitch",
+      headSha,
+      environment: {
+        chromium: "145.0.7632.6",
+        controller: "generated-server-v1+production-rc-v1",
+        machineClass: "github-hosted:ubuntu-24.04",
+        runnerImage: "ubuntu-24.04",
+        fixture: "tsjs-baseline-paired-network-v3",
+        node: "v24.12.0",
+        npm: "11.6.2",
+        typescript: "6.0.3",
+      },
+      sampling: {
+        warmupsPerVariant: 5,
+        samplesPerVariant: 50,
+        percentile: 90,
+        interleaving: "alternating-baseline-candidate",
+      },
+      networkProfile: {
+        mechanism: "cdp-Network.emulateNetworkConditions",
+        appliedBeforeNavigation: true,
+        latencyMs: 150,
+        downloadThroughputBytesPerSecond: 200_000,
+        uploadThroughputBytesPerSecond: 93_750,
+        packetLossPercent: 0,
+      },
+      marks: {
+        source: "fixture-first-observable-action",
+        comparisonStart: true,
+        firstObservableAction: true,
+        candidateBidsScript: true,
+        candidateFirstDisplay: true,
+        candidateFirstDisplayPaint: true,
+      },
+      performance: {
+        requestToFirstActionMs: {
+          baseline: {
+            sha: baseSha,
+            artifactModel: "legacy-rc-v1",
+            selectedTransferBytes: 80_000,
+            samples: baselineSamples,
+            p90: 200,
+          },
+          candidate: {
+            artifactModel: "release-v1",
+            selectedTransferBytes: 79_000,
+            samples: candidateSamples,
+            p90: 210,
+          },
+          percentile: 90,
+          maximumRatio: 1.1,
+          observedRatio: 210 / 200,
+        },
+      },
+      transfer: {
+        algorithm: "semantic-tsjs-transfer-v1",
+        baselineReferenceTransfer: {
+          sha: baseSha,
+          artifactModel: "legacy-rc-v1",
+          sources: [
+            {
+              semanticEndpoint: "inline:legacy-boot",
+              delivery: "inline",
+              rawBytes: 1_000,
+              gzipBytes: 400,
+              brotliBytes: 300,
+              sha256: "1".repeat(64),
+            },
+            {
+              semanticEndpoint: "inline:legacy-ad-init",
+              delivery: "inline",
+              rawBytes: 200,
+              gzipBytes: 100,
+              brotliBytes: 80,
+              sha256: "2".repeat(64),
+            },
+            {
+              semanticEndpoint: `external:/static/tsjs=tsjs-unified.min.js?v=${"3".repeat(64)}`,
+              delivery: "external",
+              rawBytes: 80_000,
+              gzipBytes: 20_000,
+              brotliBytes: 15_000,
+              sha256: "3".repeat(64),
+            },
+          ],
+          rawBytes: 81_200,
+          gzipBytes: 20_500,
+          brotliBytes: 15_380,
+        },
+        candidateReferenceTransfer: {
+          sha: headSha,
+          artifactModel: "release-v1",
+          sources: [
+            {
+              semanticEndpoint: "inline:boot-controller",
+              delivery: "inline",
+              rawBytes: 1_000,
+              gzipBytes: 400,
+              brotliBytes: 300,
+              sha256: "4".repeat(64),
+            },
+            {
+              semanticEndpoint: `external:/static/tsjs=tsjs-first-display.min.js?m=008b&v=${"5".repeat(64)}`,
+              delivery: "external",
+              rawBytes: 79_000,
+              gzipBytes: 19_000,
+              brotliBytes: 14_000,
+              sha256: "5".repeat(64),
+            },
+          ],
+          rawBytes: 80_000,
+          gzipBytes: 19_400,
+          brotliBytes: 14_300,
+        },
+      },
+      heap: {
+        collection: "playwright-requestGC-then-immediate-cdp-getHeapUsage",
+        hardCeilingBytes: 4 * 1024 * 1024,
+        baseline: {
+          sha: baseSha,
+          checkpoints: Object.fromEntries(
+            EXPECTED.heapCheckpoints.map((name) => [name, 1_600_000]),
+          ),
+        },
+        candidate: {
+          checkpoints: Object.fromEntries(
+            EXPECTED.heapCheckpoints.map((name) => [name, 1_650_000]),
+          ),
+        },
+      },
+      requests: {
+        selected: { count: 1 },
+        deferred: {
+          count: 2,
+          requestBeforePaintCount: 0,
+          preloadBeforePaintCount: 0,
+          preparationBeforePaintCount: 0,
+          executionBeforePaintCount: 0,
+          independentlyTriggered: true,
+          headOfLineBlocking: false,
+        },
+      },
+      aps: {
+        marks: {
+          source: "performance-entry",
+          candidateBidsScript: true,
+          candidateFirstDisplay: true,
+          candidateFirstDisplayTerminal: true,
+          candidateFirstDisplayPaint: true,
+        },
+        performance: {
+          firstAction: {
+            baseline: {
+              sha: baseSha,
+              artifactModel: "legacy-rc-v1",
+              selectedTransferBytes: 80_000,
+              samples: Array.from({ length: 50 }, () => 300),
+              p90: 300,
+            },
+            candidate: {
+              artifactModel: "release-v1",
+              selectedTransferBytes: 79_500,
+              samples: Array.from({ length: 50 }, () => 310),
+              p90: 310,
+            },
+            percentile: 90,
+            maximumRatio: 1.1,
+            absoluteCeilingMs: 900,
+            observedRatio: 310 / 300,
+          },
+          actionToCompletion: {
+            samples: Array.from({ length: 50 }, () => 60),
+            p90: 60,
+            ceilingMs: 1_500,
+          },
+          completionToPaint: {
+            samples: Array.from({ length: 50 }, () => 20),
+            p90: 20,
+            ceilingMs: 250,
+          },
+          totalToPaint: {
+            samples: Array.from({ length: 50 }, () => 400),
+            p90: 400,
+            ceilingMs: 2_500,
+          },
+        },
+        transfer: {
+          algorithm: "semantic-tsjs-transfer-v1",
+          maximumRatio: 1.1,
+          baselineReferenceTransfer: {
+            sha: baseSha,
+            artifactModel: "legacy-rc-v1",
+            sources: [
+              {
+                semanticEndpoint: "inline:legacy-boot",
+                delivery: "inline",
+                rawBytes: 1_000,
+                gzipBytes: 400,
+                brotliBytes: 300,
+                sha256: "6".repeat(64),
+              },
+              {
+                semanticEndpoint: "inline:legacy-ad-init",
+                delivery: "inline",
+                rawBytes: 200,
+                gzipBytes: 100,
+                brotliBytes: 80,
+                sha256: "7".repeat(64),
+              },
+              {
+                semanticEndpoint: `external:/static/tsjs=tsjs-unified.min.js?v=${"8".repeat(64)}`,
+                delivery: "external",
+                rawBytes: 80_000,
+                gzipBytes: 20_000,
+                brotliBytes: 15_000,
+                sha256: "8".repeat(64),
+              },
+            ],
+            rawBytes: 81_200,
+            gzipBytes: 20_500,
+            brotliBytes: 15_380,
+          },
+          candidateReferenceTransfer: {
+            sha: headSha,
+            artifactModel: "release-v1",
+            sources: [
+              {
+                semanticEndpoint: "inline:boot-controller",
+                delivery: "inline",
+                rawBytes: 1_000,
+                gzipBytes: 400,
+                brotliBytes: 300,
+                sha256: "9".repeat(64),
+              },
+              {
+                semanticEndpoint: `external:/static/tsjs=tsjs-first-display.min.js?m=008f&v=${"a".repeat(64)}`,
+                delivery: "external",
+                rawBytes: 79_500,
+                gzipBytes: 19_500,
+                brotliBytes: 14_500,
+                sha256: "a".repeat(64),
+              },
+            ],
+            rawBytes: 80_500,
+            gzipBytes: 19_900,
+            brotliBytes: 14_800,
+          },
+        },
+        heap: {
+          collection: "playwright-requestGC-then-immediate-cdp-getHeapUsage",
+          afterProtectedPaint: {
+            usedSize: 2_000_000,
+            ceilingBytes: 3 * 1024 * 1024,
+          },
+          afterTakeoverQueueDrain: {
+            usedSize: 2_500_000,
+            ceilingBytes: 3_932_160,
+          },
+        },
+        requests: {
+          selected: { count: 1 },
+          deferred: {
+            count: 2,
+            requestBeforePaintCount: 0,
+            preloadBeforePaintCount: 0,
+            preparationBeforePaintCount: 0,
+            executionBeforePaintCount: 0,
+          },
+        },
+        assertions: { correctness: true, loadOrder: true },
+      },
+      assertions: { correctness: true, loadOrder: true },
+      provenance: {
+        workflowName: "TSJS Performance Gate",
+        workflowFile: ".github/workflows/tsjs-performance-gate.yml",
+        runId: 123,
+        runAttempt: 1,
+        artifactName: `tsjs-performance-${evidenceId}`,
+        headSha,
+      },
+      result: "complete",
+    },
+  };
+}
+
+function runSelfTest() {
+  const fixture = validFixture();
+  validateEvidence(fixture.evidence, fixture.expected);
+  const releaseBaselineFixture = structuredClone(fixture.evidence);
+  releaseBaselineFixture.performance.requestToFirstActionMs.baseline.artifactModel =
+    "release-v1";
+  releaseBaselineFixture.transfer.baselineReferenceTransfer.artifactModel =
+    "release-v1";
+  const removedLegacyInit =
+    releaseBaselineFixture.transfer.baselineReferenceTransfer.sources.splice(
+      1,
+      1,
+    )[0];
+  releaseBaselineFixture.transfer.baselineReferenceTransfer.sources[0].semanticEndpoint =
+    "inline:boot-controller";
+  releaseBaselineFixture.transfer.baselineReferenceTransfer.sources[1].semanticEndpoint = `external:/static/tsjs=tsjs-first-display.min.js?m=008b&v=${"3".repeat(64)}`;
+  for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
+    releaseBaselineFixture.transfer.baselineReferenceTransfer[metric] -=
+      removedLegacyInit[metric];
+  }
+  validateEvidence(releaseBaselineFixture, fixture.expected);
+  const mutations = [
+    ["evidence id", (value) => (value.evidenceId = "wrong-evidence")],
+    ["head SHA", (value) => (value.headSha = "b".repeat(40))],
+    ["mode", (value) => (value.mode = "postswitch")],
+    ["environment", (value) => (value.environment.chromium = "145.0.0.0")],
+    ["controller", (value) => (value.environment.controller = "handwritten")],
+    ["fixture", (value) => (value.environment.fixture = "drifted")],
+    ["node", (value) => (value.environment.node = "v24.11.0")],
+    ["npm", (value) => (value.environment.npm = "11.6.1")],
+    ["typescript", (value) => (value.environment.typescript = "6.0.2")],
+    ["warmups", (value) => (value.sampling.warmupsPerVariant = 4)],
+    ["interleaving", (value) => (value.sampling.interleaving = "sequential")],
+    ["network latency", (value) => (value.networkProfile.latencyMs = 0)],
+    [
+      "network ordering",
+      (value) => (value.networkProfile.appliedBeforeNavigation = false),
+    ],
+    [
+      "candidate sample count",
+      (value) =>
+        value.performance.requestToFirstActionMs.candidate.samples.pop(),
+    ],
+    [
+      "candidate transfer bytes",
+      (value) =>
+        (value.performance.requestToFirstActionMs.candidate.selectedTransferBytes = 0),
+    ],
+    [
+      "baseline sample count",
+      (value) =>
+        value.performance.requestToFirstActionMs.baseline.samples.pop(),
+    ],
+    [
+      "baseline transfer bytes",
+      (value) =>
+        (value.performance.requestToFirstActionMs.baseline.selectedTransferBytes = 0),
+    ],
+    [
+      "stale transfer base SHA",
+      (value) =>
+        (value.transfer.baselineReferenceTransfer.sha = "b".repeat(40)),
+    ],
+    [
+      "stale transfer candidate SHA",
+      (value) =>
+        (value.transfer.candidateReferenceTransfer.sha = "b".repeat(40)),
+    ],
+    [
+      "omitted inline source",
+      (value) => {
+        const removed =
+          value.transfer.candidateReferenceTransfer.sources.shift();
+        for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
+          value.transfer.candidateReferenceTransfer[metric] -= removed[metric];
+        }
+      },
+    ],
+    [
+      "duplicate transfer source",
+      (value) => {
+        const duplicate = structuredClone(
+          value.transfer.candidateReferenceTransfer.sources[0],
+        );
+        value.transfer.candidateReferenceTransfer.sources.push(duplicate);
+        for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
+          value.transfer.candidateReferenceTransfer[metric] +=
+            duplicate[metric];
+        }
+      },
+    ],
+    [
+      "mismatched semantic endpoint",
+      (value) => {
+        value.transfer.candidateReferenceTransfer.sources[1].semanticEndpoint = `external:/wrong?v=${"5".repeat(64)}`;
+      },
+    ],
+    [
+      "mismatched first-display mask",
+      (value) => {
+        value.transfer.candidateReferenceTransfer.sources[1].semanticEndpoint = `external:/static/tsjs=tsjs-first-display.min.js?m=008f&v=${"5".repeat(64)}`;
+      },
+    ],
+    [
+      "inconsistent transfer total",
+      (value) => (value.transfer.candidateReferenceTransfer.rawBytes += 1),
+    ],
+    [
+      "one-byte raw regression",
+      (value) => {
+        const transfer = value.transfer.candidateReferenceTransfer;
+        const increase =
+          value.transfer.baselineReferenceTransfer.rawBytes -
+          transfer.rawBytes +
+          1;
+        transfer.sources[1].rawBytes += increase;
+        transfer.rawBytes += increase;
+        value.performance.requestToFirstActionMs.candidate.selectedTransferBytes +=
+          increase;
+      },
+    ],
+    [
+      "one-byte gzip regression",
+      (value) => {
+        const transfer = value.transfer.candidateReferenceTransfer;
+        const increase =
+          value.transfer.baselineReferenceTransfer.gzipBytes -
+          transfer.gzipBytes +
+          1;
+        transfer.sources[1].gzipBytes += increase;
+        transfer.gzipBytes += increase;
+      },
+    ],
+    [
+      "one-byte Brotli regression",
+      (value) => {
+        const transfer = value.transfer.candidateReferenceTransfer;
+        const increase =
+          value.transfer.baselineReferenceTransfer.brotliBytes -
+          transfer.brotliBytes +
+          1;
+        transfer.sources[1].brotliBytes += increase;
+        transfer.brotliBytes += increase;
+      },
+    ],
+    ["percentile", (value) => (value.sampling.percentile = 95)],
+    ["real marks", (value) => (value.marks.source = "synthetic")],
+    ["missing mark", (value) => (value.marks.firstObservableAction = false)],
+    [
+      "paired p90 limit",
+      (value) => {
+        value.performance.requestToFirstActionMs.candidate.samples.fill(221);
+        value.performance.requestToFirstActionMs.candidate.p90 = 221;
+        value.performance.requestToFirstActionMs.observedRatio = 221 / 200;
+      },
+    ],
+    [
+      "p90 consistency",
+      (value) => (value.performance.requestToFirstActionMs.candidate.p90 = 19),
+    ],
+    [
+      "finite sample",
+      (value) =>
+        (value.performance.requestToFirstActionMs.candidate.samples[0] = null),
+    ],
+    [
+      "base SHA",
+      (value) =>
+        (value.performance.requestToFirstActionMs.baseline.sha = "b".repeat(
+          40,
+        )),
+    ],
+    [
+      "baseline artifact model",
+      (value) =>
+        (value.performance.requestToFirstActionMs.baseline.artifactModel =
+          "unknown-v1"),
+    ],
+    [
+      "candidate artifact model",
+      (value) =>
+        (value.performance.requestToFirstActionMs.candidate.artifactModel =
+          "legacy-rc-v1"),
+    ],
+    [
+      "observed ratio",
+      (value) => (value.performance.requestToFirstActionMs.observedRatio = 1),
+    ],
+    [
+      "heap hard ceiling",
+      (value) => {
+        value.heap.baseline.checkpoints.afterBoot = 4 * 1024 * 1024 + 1;
+        value.heap.candidate.checkpoints.afterBoot = 4 * 1024 * 1024 + 1;
+      },
+    ],
+    [
+      "heap collection",
+      (value) => (value.heap.collection = "direct-cdp-collection"),
+    ],
+    ["retired heap ratio policy", (value) => (value.heap.maximumRatio = 1.1)],
+    ["heap base SHA", (value) => (value.heap.baseline.sha = "b".repeat(40))],
+    ["selected count", (value) => (value.requests.selected.count = 2)],
+    ["deferred count", (value) => (value.requests.deferred.count = 1)],
+    ["excess deferred count", (value) => (value.requests.deferred.count = 3)],
+    [
+      "deferred request",
+      (value) => (value.requests.deferred.requestBeforePaintCount = 1),
+    ],
+    [
+      "deferred preload",
+      (value) => (value.requests.deferred.preloadBeforePaintCount = 1),
+    ],
+    [
+      "deferred prepare",
+      (value) => (value.requests.deferred.preparationBeforePaintCount = 1),
+    ],
+    [
+      "deferred execute",
+      (value) => (value.requests.deferred.executionBeforePaintCount = 1),
+    ],
+    ["HOL", (value) => (value.requests.deferred.headOfLineBlocking = true)],
+    [
+      "independent",
+      (value) => (value.requests.deferred.independentlyTriggered = false),
+    ],
+    ["correctness", (value) => (value.assertions.correctness = false)],
+    [
+      "APS real terminal mark",
+      (value) => (value.aps.marks.candidateFirstDisplayTerminal = false),
+    ],
+    [
+      "APS paired action ratio",
+      (value) => {
+        value.aps.performance.firstAction.candidate.samples.fill(331);
+        value.aps.performance.firstAction.candidate.p90 = 331;
+        value.aps.performance.firstAction.observedRatio = 331 / 300;
+      },
+    ],
+    [
+      "APS action absolute ceiling",
+      (value) => {
+        value.aps.performance.firstAction.candidate.samples.fill(901);
+        value.aps.performance.firstAction.candidate.p90 = 901;
+        value.aps.performance.firstAction.observedRatio = 901 / 300;
+      },
+    ],
+    [
+      "APS completion ceiling",
+      (value) => {
+        value.aps.performance.actionToCompletion.samples.fill(1_501);
+        value.aps.performance.actionToCompletion.p90 = 1_501;
+      },
+    ],
+    [
+      "APS paint ceiling",
+      (value) => {
+        value.aps.performance.completionToPaint.samples.fill(251);
+        value.aps.performance.completionToPaint.p90 = 251;
+      },
+    ],
+    [
+      "APS total ceiling",
+      (value) => {
+        value.aps.performance.totalToPaint.samples.fill(2_501);
+        value.aps.performance.totalToPaint.p90 = 2_501;
+      },
+    ],
+    [
+      "APS transfer ratio",
+      (value) => {
+        const transfer = value.aps.transfer.candidateReferenceTransfer;
+        const limit = Math.floor(
+          value.aps.transfer.baselineReferenceTransfer.rawBytes * 1.1,
+        );
+        const increase = limit - transfer.rawBytes + 1;
+        transfer.sources[1].rawBytes += increase;
+        transfer.rawBytes += increase;
+        value.aps.performance.firstAction.candidate.selectedTransferBytes +=
+          increase;
+      },
+    ],
+    [
+      "APS protected-paint heap",
+      (value) =>
+        (value.aps.heap.afterProtectedPaint.usedSize = 3 * 1024 * 1024 + 1),
+    ],
+    [
+      "APS takeover heap",
+      (value) => (value.aps.heap.afterTakeoverQueueDrain.usedSize = 3_932_161),
+    ],
+    [
+      "APS deferred execution before paint",
+      (value) => (value.aps.requests.deferred.executionBeforePaintCount = 1),
+    ],
+    ["load order", (value) => (value.assertions.loadOrder = false)],
+    ["incomplete", (value) => (value.result = "failed")],
+    [
+      "workflow",
+      (value) => (value.provenance.workflowFile = ".github/workflows/test.yml"),
+    ],
+    ["artifact", (value) => (value.provenance.artifactName = "wrong")],
+    ["schema", (value) => (value.extra = true)],
+  ];
+  for (const [name, mutate] of mutations) {
+    const candidate = structuredClone(fixture.evidence);
+    mutate(candidate);
+    assert.throws(
+      () => validateEvidence(candidate, fixture.expected),
+      /invalid TSJS performance evidence/u,
+      `${name} mutation should be rejected`,
+    );
+  }
+  assert.throws(
+    () =>
+      parseArguments([
+        "--file",
+        "evidence.json",
+        "--evidence-id",
+        fixture.expected.evidenceId,
+        "--head-sha",
+        fixture.expected.headSha,
+        "--mode",
+        "preswitch",
+        "--mode",
+        "postswitch",
+      ]),
+    /invalid TSJS performance evidence/u,
+    "duplicate CLI bindings must be rejected rather than overwritten",
+  );
+  assert.throws(
+    () =>
+      validateEvidence(fixture.evidence, {
+        ...fixture.expected,
+        baseSha: undefined,
+      }),
+    /invalid TSJS performance evidence/u,
+    "missing exact-rc identity must make the relative comparison unavailable",
+  );
+  const repositoryRoot = new URL("../", import.meta.url);
+  const performanceTest = readFileSync(
+    new URL(
+      "crates/trusted-server-integration-tests/browser/tests/shared/tsjs-performance.spec.ts",
+      repositoryRoot,
+    ),
+    "utf8",
+  );
+  const performanceWorkflow = readFileSync(
+    new URL(".github/workflows/tsjs-performance-gate.yml", repositoryRoot),
+    "utf8",
+  );
+  const performanceWorkflowScript = readFileSync(
+    new URL("scripts/ci/tsjs-performance.sh", repositoryRoot),
+    "utf8",
+  );
+  const toolchainScript = readFileSync(
+    new URL("scripts/ci/read-toolchains.sh", repositoryRoot),
+    "utf8",
+  );
+  const generatorSource = readFileSync(
+    new URL(
+      "crates/trusted-server-integration-tests/src/bin/generate-tsjs-fixture.rs",
+      repositoryRoot,
+    ),
+    "utf8",
+  );
+  const integrationWorkflow = readFileSync(
+    new URL(".github/workflows/integration-tests.yml", repositoryRoot),
+    "utf8",
+  );
+  const browserTestScript = readFileSync(
+    new URL("scripts/integration-tests-browser.sh", repositoryRoot),
+    "utf8",
+  );
+  const apsProxyScript = readFileSync(
+    new URL("scripts/integration-tests-aps-runner-proxy.sh", repositoryRoot),
+    "utf8",
+  );
+  const generalTestWorkflow = readFileSync(
+    new URL(".github/workflows/test.yml", repositoryRoot),
+    "utf8",
+  );
+  assert.match(
+    performanceTest,
+    /generate-tsjs-fixture/u,
+    "the browser gate must consume the generated production server controller",
+  );
+  assert.match(
+    performanceTest,
+    /performanceCase === "aps" \? "008f" : "008b"/u,
+    "the release-v1 semantic transfer must measure the exact admitted GPT and APS agents",
+  );
+  assert.match(
+    generatorSource,
+    /tsjs_bootstrap_fixture_fragment_v1/u,
+    "the production server fixture must emit the admitted first-display transport",
+  );
+  assert.match(
+    performanceTest,
+    /TSJS_SKIP_BUILD/u,
+    "the controller generator must consume the workflow's one canonical artifact build",
+  );
+  assert.doesNotMatch(
+    performanceTest,
+    /__tsjsPerf/u,
+    "the browser gate must read real performance entries, never the placeholder API",
+  );
+  assert.match(
+    performanceTest,
+    /from "node:http"/u,
+    "the browser gate must serve the fixture through node:http",
+  );
+  assert.match(
+    performanceTest,
+    /\.listen\(0, "127\.0\.0\.1"/u,
+    "the browser gate must listen on an ephemeral IPv4 loopback port",
+  );
+  assert.match(
+    performanceTest,
+    /FIXTURE_ID = "tsjs-baseline-paired-network-v3"/u,
+    "the browser gate must identify the paired network-shaped fixture",
+  );
+  assert.doesNotMatch(
+    performanceTest,
+    /62421ee44c62f24534ea8782a46dfa5bfbcea950/u,
+    "the browser gate must not retain the obsolete frozen reference SHA",
+  );
+  assert.match(
+    performanceTest,
+    /Network\.emulateNetworkConditions[\s\S]*latency: 150[\s\S]*downloadThroughput: 200_000[\s\S]*uploadThroughput: 93_750/u,
+    "the browser gate must apply the fixed CDP network profile before navigation",
+  );
+  assert.ok(
+    performanceTest.indexOf(
+      'networkSession.send("Network.emulateNetworkConditions"',
+    ) < performanceTest.indexOf("await page.goto(fixtureUrl"),
+    "the browser gate must install network shaping before either variant navigates",
+  );
+  assert.match(
+    performanceTest,
+    /loadLegacyBaselineFixtureResources[\s\S]*tsjs-core\.js[\s\S]*tsjs-creative\.js[\s\S]*tsjs-gpt\.js/u,
+    "the browser gate must consume the rc base's actual legacy core, creative, and GPT artifact shape",
+  );
+  assert.match(
+    performanceTest,
+    /SELECTED_IDS = \["render_runtime", "creative", "gpt"\]/u,
+    "the release-v1 comparison must use the same core, render, creative, and GPT shape",
+  );
+  assert.match(
+    generatorSource,
+    /CreativeBootConfigV1 \{[\s\S]*enabled: true/u,
+    "the generated candidate controller must enable the rc baseline's default creative policy",
+  );
+  assert.match(
+    performanceTest,
+    /loadBaselineFixtureResources[\s\S]*tsjs-release-v1\.json[\s\S]*loadReleaseFixtureResources[\s\S]*loadLegacyBaselineFixtureResources/u,
+    "the browser gate must detect the rc base's actual legacy or release-v1 artifact shape",
+  );
+  assert.match(
+    performanceTest,
+    /performance\.mark\("tsjs:first-observable-action"\)[\s\S]*display\(target:[\s\S]*markFirstObservableAction\(\)/u,
+    "the cross-version endpoint must be the first observable GPT display or refresh action",
+  );
+  assert.match(
+    performanceTest,
+    /baselineReferenceTransfer:[\s\S]*baselineResources\.referenceTransfer[\s\S]*candidateReferenceTransfer:[\s\S]*candidateResources\.referenceTransfer/u,
+    "the evidence must record both exact semantic reference transfers",
+  );
+  assert.match(
+    performanceTest,
+    /import \{ measureBytes \} from "\.\.\/\.\.\/\.\.\/\.\.\/trusted-server-js\/lib\/scripts\/bundle-metrics\.mjs"/u,
+    "the browser gate must share the bundle gate's frozen compression implementation",
+  );
+  for (const endpoint of [
+    "inline:legacy-boot",
+    "inline:legacy-ad-init",
+    "inline:boot-controller",
+    "external:${selectedSrc}",
+  ]) {
+    assert.ok(
+      performanceTest.includes(endpoint),
+      `the browser gate must count semantic endpoint ${endpoint}`,
+    );
+  }
+  assert.match(
+    performanceTest,
+    /candidateResources\.referenceTransfer\[metric\][\s\S]*baselineResources\.referenceTransfer\[metric\]/u,
+    "the browser gate must softly collect all evidence while enforcing every transfer encoding",
+  );
+  assert.match(
+    performanceWorkflowScript,
+    /git fetch origin refs\/heads\/rc\/202608:refs\/remotes\/origin\/rc\/202608[\s\S]*merge-base --is-ancestor "\$base_sha" origin\/rc\/202608[\s\S]*TSJS_PERF_BASE_SHA/u,
+    "the performance workflow script must validate and export the exact rc base SHA",
+  );
+  assert.match(
+    performanceWorkflow,
+    /base_sha:[\s\S]*required: true/u,
+    "manual and called performance runs must require an exact base SHA",
+  );
+  assert.match(
+    performanceWorkflow,
+    /TSJS_PERF_BASE_SHA: \$\{\{ github\.event_name == 'pull_request' && github\.event\.pull_request\.base\.sha \|\| inputs\.base_sha \}\}/u,
+    "PR performance runs must bind the exact pull-request base SHA",
+  );
+  assert.doesNotMatch(
+    performanceWorkflowScript,
+    /origin\/main|TSJS_PERF_MAIN/u,
+    "the performance scripts must not use a moving main baseline",
+  );
+  assert.match(
+    performanceWorkflow,
+    /pull_request:[\s\S]*paths:/u,
+    "the performance workflow must run automatically for relevant PR changes",
+  );
+  for (const path of [
+    "crates/trusted-server-core/src/auction/**",
+    "crates/trusted-server-core/src/html_processor.rs",
+    "crates/trusted-server-core/src/publisher.rs",
+    "crates/trusted-server-core/src/tsjs.rs",
+    "crates/trusted-server-integration-tests/src/bin/generate-tsjs-fixture.rs",
+  ]) {
+    assert.ok(
+      performanceWorkflow.includes(`- \"${path}\"`),
+      `the performance workflow must run when ${path} changes`,
+    );
+  }
+  assert.match(
+    performanceWorkflowScript,
+    /validate-tsjs-performance-evidence\.mjs"? --self-test/u,
+    "the performance workflow script must execute transfer/schema negative fixtures before measurement",
+  );
+  assert.match(
+    performanceWorkflow,
+    /TSJS_PERF_HEAD_SHA: \$\{\{ github\.event_name == 'pull_request' && github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/u,
+    "the performance workflow must bind PR evidence to the head commit rather than the synthetic merge commit",
+  );
+  assert.match(
+    performanceTest,
+    /const headSha = process\.env\.TSJS_PERF_HEAD_SHA/u,
+    "the browser evidence writer must consume the dedicated immutable head SHA binding",
+  );
+  assert.doesNotMatch(
+    performanceTest,
+    /process\.env\.GITHUB_SHA/u,
+    "the browser evidence writer must not read GitHub's reserved synthetic merge SHA",
+  );
+  assert.doesNotMatch(
+    performanceWorkflow,
+    /^\s+GITHUB_SHA:/mu,
+    "the performance workflow must not pretend to override GitHub's reserved SHA variable",
+  );
+  assert.doesNotMatch(
+    performanceWorkflow,
+    /GITHUB_SHA: \$\{\{ github\.sha \}\}|--head-sha "\$\{\{ github\.sha \}\}"/u,
+    "the performance workflow must not attest a pull-request merge SHA as the source commit",
+  );
+  assert.doesNotMatch(
+    `${performanceWorkflow}\n${performanceWorkflowScript}`,
+    /62421ee44c62f24534ea8782a46dfa5bfbcea950/u,
+    "the performance workflow must never build a frozen reference instead of the exact rc base",
+  );
+  assert.doesNotMatch(
+    performanceTest,
+    /\.route(?:FromHAR)?\(|\.fulfill\(/u,
+    "the browser gate must not intercept or fulfill measured requests through Playwright",
+  );
+  assert.match(
+    performanceTest,
+    /server\.closeAllConnections\(\)/u,
+    "the browser gate must force-close Chromium keepalive connections during cleanup",
+  );
+  assert.match(
+    performanceTest,
+    /test\.setTimeout\(2_400_000\)/u,
+    "the browser gate must leave enough time to collect both paired heap contexts and write evidence after the complete shaped sample",
+  );
+  assert.match(
+    performanceWorkflow,
+    /timeout-minutes: 50/u,
+    "the performance job must leave setup and finalization headroom around the 40-minute browser-test budget",
+  );
+  const timingVariantSource = performanceTest.match(
+    /const observeTimingVariant[\s\S]*?^    \};/mu,
+  )?.[0];
+  assert.ok(
+    timingVariantSource,
+    "the browser gate must define one bounded paired timing observer",
+  );
+  assert.match(
+    timingVariantSource,
+    /observeComparisonFixture\(run, resources\)[\s\S]*return comparison/u,
+    "paired warmup and measured navigations must stop at the common first-action timing endpoint",
+  );
+  assert.match(
+    timingVariantSource,
+    /openFixture\([\s\S]*\{\s*waitUntil: "commit",?\s*\}\s*\)/u,
+    "paired timing navigation must not wait for the page load event and its deferred lifecycle",
+  );
+  assert.doesNotMatch(
+    timingVariantSource,
+    /releaseId/u,
+    "the timing observer must not wait for or assert release identity that belongs to persistent takeover",
+  );
+  assert.match(
+    performanceTest,
+    /const representativeRun = await openFixture\([\s\S]*candidateServer,[\s\S]*candidateResources,[\s\S]*\{\s*waitUntil: "load"\s*\}[\s\S]*const representative = await observeFixture\([\s\S]*representativeRun,[\s\S]*candidateResources[\s\S]*expect\(representative\.releaseId\)\.toBe\(\s*candidateResources\.release\?\.releaseId,?\s*\)/u,
+    "the same run must retain one separate full candidate lifecycle observation for release identity, paint, takeover, and deferred-order evidence",
+  );
+  assert.match(
+    performanceTest,
+    /preparationBeforePaintCount/u,
+    "the browser gate must record deferred preparation timing",
+  );
+  assert.match(
+    performanceTest,
+    /executionBeforePaintCount/u,
+    "the browser gate must record deferred activation timing",
+  );
+  assert.match(
+    performanceTest,
+    /preloadTimes/u,
+    "the browser gate must retain transient deferred preload observations",
+  );
+  assert.match(
+    performanceTest,
+    /publisherRefresh/u,
+    "the retained-heap refresh checkpoint must use the publisher GPT refresh path",
+  );
+  assert.doesNotMatch(
+    performanceTest,
+    /MAXIMUM_HEAP_RATIO|paired retained heap/u,
+    "hard-cutover retained heap must use the absolute ceiling rather than a legacy-shape ratio",
+  );
+  assert.match(
+    performanceTest,
+    /page\.requestGC\(\)/u,
+    "retained-heap checkpoints must use Playwright's supported garbage-collection operation",
+  );
+  assert.doesNotMatch(
+    performanceTest,
+    /HeapProfiler\.collectGarbage/u,
+    "retained-heap checkpoints must not issue the raw unbounded CDP garbage-collection command",
+  );
+  assert.match(
+    performanceTest,
+    /HEAP_OPERATION_TIMEOUT_MS = 30_000/u,
+    "retained-heap collection must fail locally instead of consuming the whole performance budget",
+  );
+  for (const phase of [
+    "open",
+    "runtime-ready",
+    "release",
+    "first-render",
+    "publisher-refresh",
+    "spa-dispatch",
+    "spa-response",
+    "spa-reconciliation",
+    "close",
+  ]) {
+    assert.ok(
+      performanceTest.includes(`\${label}:${phase}`),
+      `retained-heap lifecycle phase ${phase} must use the bounded phase runner`,
+    );
+  }
+  assert.match(
+    performanceTest,
+    /const heapBrowser = await chromium\.launch\([\s\S]*collectHeapCheckpoints\([\s\S]*heapBrowser,[\s\S]*baselineServer[\s\S]*collectHeapCheckpoints\([\s\S]*heapBrowser,[\s\S]*candidateServer/u,
+    "paired retained-heap checkpoints must run in one fresh, explicitly closed Chromium process",
+  );
+  assert.match(
+    performanceTest,
+    /await withHeapOperationTimeout\("heap browser close", heapBrowser\.close\(\)\)/u,
+    "the isolated retained-heap browser must close within its local failure boundary",
+  );
+  assert.match(
+    performanceTest,
+    /auctionId: "performance-navigation"[\s\S]*results: \[\{ slot: "perf-slot", outcome: "no_bid" \}\]/u,
+    "the SPA heap checkpoint must use a projection with real GPT reconciliation",
+  );
+  assert.match(
+    performanceTest,
+    /history\.pushState\(\{\}, "", "\/fixture\/navigation"\)/u,
+    "the paired SPA heap checkpoint must change pathname so the rc base and candidate both observe the same navigation",
+  );
+  assert.doesNotMatch(
+    performanceTest,
+    /history\.pushState\(\{\}, "", "\/fixture\?navigation=/u,
+    "the paired SPA heap checkpoint must not use a query-only transition ignored by the rc base",
+  );
+  assert.match(
+    performanceTest,
+    /expect\(await response\.finished\(\)\)\.toBeNull\(\)[\s\S]*getSlots\(\)[\s\S]*afterSpaNavigation/u,
+    "the SPA heap checkpoint must await the response body and reconciled GPT slot",
+  );
+  assert.doesNotMatch(
+    `${performanceWorkflow}\n${performanceWorkflowScript}`,
+    /setup-integration-test-env|VICEROY|WASM_ARTIFACT|build-test-images/u,
+    "the hermetic performance fixture must not build unused runtime infrastructure",
+  );
+  assert.match(
+    toolchainScript,
+    /node_version="\$\(awk '\$1 == "nodejs" \{ print \$2 \}' "\$tool_versions"\)"/u,
+    "the toolchain script must extract the pinned Node.js version with valid awk quoting",
+  );
+  assert.match(
+    toolchainScript,
+    /rust_version="\$\(awk '\$1 == "rust" \{ print \$2 \}' "\$tool_versions"\)"/u,
+    "the toolchain script must extract the pinned Rust version with valid awk quoting",
+  );
+  assert.match(
+    toolchainScript,
+    /test -n "\$node_version"[\s\S]*test -n "\$rust_version"/u,
+    "the toolchain script must reject empty toolchain pins",
+  );
+  assert.match(
+    performanceWorkflowScript,
+    /test "\$\(node --version\)" = "v\$node_version"[\s\S]*test "\$\(npm --version\)" = "11\.6\.2"[\s\S]*test "\$\(rustc --version \| awk '\{ print \$2 \}'\)" = "\$rust_version"/u,
+    "the performance workflow script must verify the installed Node.js, npm, and Rust versions",
+  );
+  assert.match(
+    integrationWorkflow,
+    /uses: fermyon\/actions\/spin\/setup@v1[\s\S]{0,100}version: "v4\.0\.2"/u,
+    "the integration workflow must retain Spin's required v-prefixed version",
+  );
+  for (const job of [
+    "prepare-artifacts",
+    "integration-tests",
+    "integration-tests-fastly-ec",
+    "aps-runner-proxy",
+    "browser-tests",
+    "browser-tests-aps-tsjs-conformance",
+  ]) {
+    assert.match(
+      integrationWorkflow,
+      new RegExp(
+        `^  ${job}:\\n(?:    .+\\n)*?    if: github\\.event_name == 'pull_request'$`,
+        "mu",
+      ),
+      `${job} must stay PR-only so manual evidence dispatches run the immutable performance job once`,
+    );
+  }
+  assert.deepEqual(
+    browserTestScript.match(/^cd .+$/gmu),
+    ['cd "$REPO_ROOT"'],
+    "the browser test launcher must remain at the repository root",
+  );
+  assert.equal(
+    browserTestScript.match(/Building TSJS browser fixtures/gu)?.length,
+    1,
+    "the browser test launcher must build TSJS fixtures exactly once",
+  );
+  assert.match(
+    browserTestScript,
+    /npm --prefix "\$BROWSER_DIR" exec --[\s\S]*--config "\$REPO_ROOT\/\$BROWSER_DIR\/playwright\.config\.ts"/u,
+    "the browser test launcher must pass Playwright an absolute config path",
+  );
+  assert.match(
+    browserTestScript,
+    /export ARTIFACTS_DIR="\$\{ARTIFACTS_DIR:-\$REPO_ROOT\/target\/integration-test-artifacts\}"/u,
+    "the browser test launcher must establish one effective artifacts directory",
+  );
+  assert.match(
+    browserTestScript,
+    /GENERATED_VICEROY_CONFIG_PATH="\$ARTIFACTS_DIR\/configs\/viceroy\.toml"/u,
+    "the browser test launcher must consume the config generated in the effective artifacts directory",
+  );
+  assert.match(
+    apsProxyScript,
+    /ARTIFACTS_DIR="\$\{ARTIFACTS_DIR:-\$REPO_ROOT\/target\/integration-test-artifacts\}"/u,
+    "the APS proxy launcher must establish one effective artifacts directory",
+  );
+  assert.match(
+    apsProxyScript,
+    /VICEROY_CONFIG_PATH="\$ARTIFACTS_DIR\/configs\/viceroy\.toml"/u,
+    "the APS proxy launcher must use the generator's effective artifacts directory",
+  );
+  assert.doesNotMatch(
+    generalTestWorkflow,
+    /tsjs-performance-gate\.yml/u,
+    "general CI must not redefine or automatically rerun immutable performance evidence",
+  );
+  assert.match(
+    generalTestWorkflow,
+    /test-typescript:[\s\S]*?uses: actions\/checkout@v4\n        with:\n          fetch-depth: 0/u,
+    "the exact-rc concept audit must receive the pinned baseline commit",
+  );
+  console.log(
+    `TSJS performance evidence self-test passed (${mutations.length} mutations)`,
+  );
+}
+
+function parseArguments(arguments_) {
+  const values = new Map();
+  for (let index = 0; index < arguments_.length; index += 2) {
+    const name = arguments_[index];
+    const value = arguments_[index + 1];
+    if (!name?.startsWith("--") || value === undefined)
+      fail("invalid CLI arguments");
+    if (values.has(name)) fail(`duplicate ${name}`);
+    values.set(name, value);
+  }
+  for (const name of [
+    "--file",
+    "--evidence-id",
+    "--head-sha",
+    "--base-sha",
+    "--mode",
+  ]) {
+    if (!values.has(name)) fail(`missing ${name}`);
+  }
+  if (values.size !== 5) fail("unknown or duplicate CLI arguments");
+  return values;
+}
+
+function main() {
+  if (process.argv.length === 3 && process.argv[2] === "--self-test") {
+    runSelfTest();
+    return;
+  }
+  const arguments_ = parseArguments(process.argv.slice(2));
+  let evidence;
+  try {
+    evidence = JSON.parse(readFileSync(arguments_.get("--file"), "utf8"));
+  } catch (error) {
+    fail(
+      `cannot read JSON evidence: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  validateEvidence(evidence, {
+    evidenceId: arguments_.get("--evidence-id"),
+    headSha: arguments_.get("--head-sha"),
+    baseSha: arguments_.get("--base-sha"),
+    mode: arguments_.get("--mode"),
+  });
+  console.log("TSJS performance evidence is valid");
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    main();
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  }
+}

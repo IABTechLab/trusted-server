@@ -1,10 +1,77 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use hex::encode;
 use sha2::{Digest as _, Sha256};
 
 include!(concat!(env!("OUT_DIR"), "/tsjs_modules.rs"));
+
+/// Release artifact role recorded in the generated inventory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TsjsArtifactRole {
+    /// Inline minimal bootstrap controller and fallback artifact.
+    Bootstrap,
+    /// Base of the parser-blocking provisional first-display artifact.
+    FirstDisplayBase,
+    /// One closed, server-selected provisional first-display slice.
+    FirstDisplaySlice,
+    /// Sole TSJS kernel artifact.
+    Core,
+    /// Catalogued takeover or deferred integration module.
+    Integration,
+}
+
+/// Fixed catalog phase for one integration module.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TsjsModulePhase {
+    /// Parser-blocking provisional phase, disposed or adopted after protected paint.
+    FirstDisplay,
+    /// Persistent module prepared for the atomic runtime takeover.
+    Takeover,
+    /// Authenticated module loaded only after the protected phase gate.
+    Deferred,
+}
+
+/// Immutable generated artifact metadata shared with the server.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TsjsArtifactMetadata {
+    /// Canonical artifact identifier.
+    pub id: &'static str,
+    /// Artifact release role.
+    pub role: TsjsArtifactRole,
+    /// Catalog phase for integration artifacts.
+    pub phase: Option<TsjsModulePhase>,
+    /// Fixed deferred trigger, when applicable.
+    pub trigger: Option<&'static str>,
+    /// Declared consumed capability edges.
+    pub inputs: &'static [&'static str],
+    /// Server-owned inclusion predicate from the canonical catalog.
+    pub include: Option<&'static str>,
+    /// Declared provided capability keys.
+    pub outputs: &'static [&'static str],
+    /// Generated artifact filename.
+    pub file: &'static str,
+    /// SHA-256 over exact uncompressed response bytes.
+    pub hash: &'static str,
+}
+
+/// Maximum catalogued takeover modules.
+pub const MAX_TAKEOVER_MODULES: usize = GENERATED_MAX_TAKEOVER_MODULES;
+/// Maximum integrations in one boot manifest.
+pub const MAX_MANIFEST_MODULES: usize = GENERATED_MAX_MANIFEST_MODULES;
+/// Return the sentinel-normalized release identifier shared by every bundle.
+#[must_use]
+#[inline]
+pub const fn release_id() -> &'static str {
+    TSJS_RELEASE_ID
+}
+
+/// Return the generated, executable TSJS bootstrap controller.
+#[must_use]
+#[inline]
+pub const fn bootstrap_bundle() -> &'static str {
+    TSJS_BOOTSTRAP
+}
 
 /// Return the JS bundle content for a given module ID (e.g., "core", "prebid").
 #[must_use]
@@ -17,7 +84,125 @@ pub fn module_bundle(id: &str) -> Option<&'static str> {
 #[must_use]
 #[inline]
 pub fn all_module_ids() -> Vec<&'static str> {
-    TSJS_MODULES.iter().map(|module| module.id).collect()
+    TSJS_ARTIFACTS
+        .iter()
+        .filter(|artifact| artifact.role == "core" || artifact.role == "integration")
+        .map(|artifact| artifact.id)
+        .collect()
+}
+
+/// Return all closed first-display component IDs in canonical mask order.
+#[must_use]
+pub fn all_first_display_ids() -> Vec<&'static str> {
+    TSJS_ARTIFACTS
+        .iter()
+        .filter(|artifact| {
+            artifact.role == "first_display_base" || artifact.role == "first_display_slice"
+        })
+        .map(|artifact| artifact.id)
+        .collect()
+}
+
+/// Return whether the generated release admits this exact mask under every size ceiling.
+#[must_use]
+pub fn first_display_mask_is_permitted(mask: u16) -> bool {
+    PERMITTED_FIRST_DISPLAY_MASKS.binary_search(&mask).is_ok()
+}
+
+/// Return all catalogued integration IDs in canonical phase/injection order.
+#[must_use]
+pub fn all_integration_ids() -> Vec<&'static str> {
+    TSJS_ARTIFACTS
+        .iter()
+        .filter(|artifact| artifact.role == "integration")
+        .map(|artifact| artifact.id)
+        .collect()
+}
+
+/// Return generated metadata for bootstrap, core, and every catalog module.
+#[must_use]
+pub fn all_artifact_metadata() -> Vec<TsjsArtifactMetadata> {
+    TSJS_ARTIFACTS.iter().map(public_metadata).collect()
+}
+
+/// Return generated metadata for the twenty integration modules.
+#[must_use]
+pub fn all_integration_metadata() -> Vec<TsjsArtifactMetadata> {
+    TSJS_ARTIFACTS
+        .iter()
+        .filter(|artifact| artifact.role == "integration")
+        .map(public_metadata)
+        .collect()
+}
+
+/// Return generated metadata for the base and thirteen first-display slices.
+#[must_use]
+pub fn all_first_display_metadata() -> Vec<TsjsArtifactMetadata> {
+    TSJS_ARTIFACTS
+        .iter()
+        .filter(|artifact| {
+            artifact.role == "first_display_base" || artifact.role == "first_display_slice"
+        })
+        .map(public_metadata)
+        .collect()
+}
+
+/// Return the exact generated bytes for one closed first-display component.
+#[must_use]
+pub fn first_display_component_bundle(id: &str) -> Option<&'static str> {
+    TSJS_ARTIFACTS
+        .iter()
+        .find(|artifact| {
+            (artifact.role == "first_display_base" || artifact.role == "first_display_slice")
+                && artifact.id == id
+        })
+        .map(|artifact| artifact.bundle)
+}
+
+/// Compose the base plus selected optional first-display slices in canonical order.
+///
+/// Unknown, duplicate, or explicitly supplied base IDs fail closed.
+#[must_use]
+pub fn concatenate_first_display_slices(ids: &[&str]) -> Option<String> {
+    let selected = ids.iter().copied().collect::<HashSet<_>>();
+    if selected.len() != ids.len() || selected.contains("first_display") {
+        return None;
+    }
+    if selected.iter().any(|id| {
+        !TSJS_ARTIFACTS
+            .iter()
+            .any(|artifact| artifact.role == "first_display_slice" && artifact.id == *id)
+    }) {
+        return None;
+    }
+    let parts = TSJS_ARTIFACTS
+        .iter()
+        .filter(|artifact| {
+            artifact.role == "first_display_base"
+                || (artifact.role == "first_display_slice" && selected.contains(artifact.id))
+        })
+        .map(|artifact| artifact.bundle)
+        .collect::<Vec<_>>();
+    Some(parts.join(";\n"))
+}
+
+/// SHA-256 of one validated, canonically ordered first-display composition.
+#[must_use]
+pub fn concatenated_first_display_hash(ids: &[&str]) -> Option<String> {
+    concatenate_first_display_slices(ids).map(|body| {
+        let mut hasher = Sha256::new();
+        hasher.update(body.as_bytes());
+        encode(hasher.finalize())
+    })
+}
+
+/// Return generated metadata for a catalogued integration module.
+#[must_use]
+pub fn integration_metadata(id: &str) -> Option<TsjsArtifactMetadata> {
+    TSJS_ARTIFACTS
+        .iter()
+        .find(|artifact| artifact.role == "integration" && artifact.id == id)
+        .map(public_metadata)
 }
 
 /// Concatenate core + the requested integration modules into a single JS string.
@@ -58,8 +243,11 @@ pub fn concatenated_hash(ids: &[&str]) -> String {
 /// Used for cache-busting URLs of deferred modules served individually.
 #[must_use]
 #[inline]
-pub fn single_module_hash(id: &str) -> Option<&'static str> {
-    module_meta_map().get(id).map(|module| module.sha256)
+pub fn single_module_hash(id: &str) -> Option<String> {
+    TSJS_ARTIFACTS
+        .iter()
+        .find(|artifact| artifact.role == "integration" && artifact.id == id)
+        .map(|artifact| artifact.hash.to_owned())
 }
 
 fn concatenated_module_ids(ids: &[&str]) -> Vec<&'static str> {
@@ -108,12 +296,14 @@ where
     }
 }
 
-fn module_meta_map() -> &'static HashMap<&'static str, &'static TsjsModuleMeta> {
-    static MAP: OnceLock<HashMap<&'static str, &'static TsjsModuleMeta>> = OnceLock::new();
+fn module_meta_map() -> &'static HashMap<&'static str, &'static TsjsGeneratedArtifactMeta> {
+    static MAP: OnceLock<HashMap<&'static str, &'static TsjsGeneratedArtifactMeta>> =
+        OnceLock::new();
     MAP.get_or_init(|| {
-        TSJS_MODULES
+        TSJS_ARTIFACTS
             .iter()
-            .map(|module| (module.id, module))
+            .filter(|artifact| artifact.role == "core" || artifact.role == "integration")
+            .map(|artifact| (artifact.id, artifact))
             .collect()
     })
 }
@@ -130,57 +320,140 @@ fn concatenated_hash_cache() -> &'static Mutex<HashMap<Vec<&'static str>, String
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn public_metadata(artifact: &TsjsGeneratedArtifactMeta) -> TsjsArtifactMetadata {
+    TsjsArtifactMetadata {
+        id: artifact.id,
+        role: match artifact.role {
+            "bootstrap" => TsjsArtifactRole::Bootstrap,
+            "first_display_base" => TsjsArtifactRole::FirstDisplayBase,
+            "first_display_slice" => TsjsArtifactRole::FirstDisplaySlice,
+            "core" => TsjsArtifactRole::Core,
+            "integration" => TsjsArtifactRole::Integration,
+            _ => unreachable!("generated artifact role should be validated"),
+        },
+        phase: artifact.phase.map(|phase| match phase {
+            "first_display" => TsjsModulePhase::FirstDisplay,
+            "takeover" => TsjsModulePhase::Takeover,
+            "deferred" => TsjsModulePhase::Deferred,
+            _ => unreachable!("generated artifact phase should be validated"),
+        }),
+        trigger: artifact.trigger,
+        include: artifact.include,
+        inputs: artifact.inputs,
+        outputs: artifact.outputs,
+        file: artifact.file,
+        hash: artifact.hash,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sha256_hex(bytes: &[u8]) -> String {
-        encode(Sha256::digest(bytes))
+    #[test]
+    fn generated_catalog_metadata_has_exact_phase_order_and_derived_capacities() {
+        let metadata = all_integration_metadata();
+        let generated = include_str!(concat!(env!("OUT_DIR"), "/tsjs_modules.rs"));
+
+        assert_eq!(metadata.len(), 20, "should embed all catalog modules");
+        assert_eq!(MAX_TAKEOVER_MODULES, 14);
+        assert_eq!(MAX_MANIFEST_MODULES, 20);
+        assert!(
+            !generated.contains("INTERNAL_DIAGNOSTICS_SUBSCRIPTIONS"),
+            "the synchronous diagnostics ingress must not generate subscription capacity"
+        );
+        assert_eq!(metadata[0].id, "render_runtime");
+        assert_eq!(metadata[0].phase, Some(TsjsModulePhase::Takeover));
+        assert_eq!(metadata[13].id, "testlight");
+        assert_eq!(metadata[13].phase, Some(TsjsModulePhase::Takeover));
+        assert_eq!(metadata[14].id, "diagnostics_presentation");
+        assert_eq!(metadata[14].phase, Some(TsjsModulePhase::Deferred));
+        assert_eq!(metadata[19].id, "sourcepoint_lifecycle");
+        assert_eq!(metadata[19].trigger, Some("first_display_or_idle"));
+        assert_eq!(
+            metadata[0].outputs,
+            &[
+                "slots.v1",
+                "auction.v1",
+                "render.v1",
+                "messages.v1",
+                "trace.v1",
+                "trace.presentation.v1",
+                "direct.v1"
+            ]
+        );
     }
 
     #[test]
-    fn generated_single_module_hashes_match_bundle_contents() {
-        for id in all_module_ids() {
-            let bundle = module_bundle(id).expect("should have module bundle");
-            let generated_hash = single_module_hash(id).expect("should have generated hash");
+    fn generated_artifact_inventory_includes_bootstrap_core_and_catalog_once() {
+        let artifacts = all_artifact_metadata();
 
-            assert_eq!(
-                generated_hash,
-                sha256_hex(bundle.as_bytes()),
-                "generated hash for module {id} should match included bundle bytes"
-            );
-        }
+        assert_eq!(artifacts.len(), 36);
+        assert_eq!(artifacts[0].id, "bootstrap");
+        assert_eq!(artifacts[0].role, TsjsArtifactRole::Bootstrap);
+        assert_eq!(artifacts[1].id, "first_display");
+        assert_eq!(artifacts[1].role, TsjsArtifactRole::FirstDisplayBase);
+        assert!(
+            artifacts[2..15]
+                .iter()
+                .all(|artifact| artifact.role == TsjsArtifactRole::FirstDisplaySlice)
+        );
+        assert_eq!(artifacts[15].id, "core");
+        assert_eq!(artifacts[15].role, TsjsArtifactRole::Core);
+        assert!(
+            artifacts[16..]
+                .iter()
+                .all(|artifact| artifact.role == TsjsArtifactRole::Integration)
+        );
+        assert_eq!(all_module_ids().len(), 21);
+        assert_eq!(all_first_display_ids().len(), 14);
     }
 
     #[test]
-    fn concatenated_hash_matches_concatenated_bundle_contents() {
-        let available_ids = all_module_ids();
-        let non_core_ids = available_ids
+    fn first_display_composition_is_closed_and_canonical() {
+        let body = concatenate_first_display_slices(&["gpt_initial", "aps_initial"])
+            .expect("should compose known unique slices");
+        let base = first_display_component_bundle("first_display")
+            .expect("should embed first-display base");
+        let aps = first_display_component_bundle("aps_initial")
+            .expect("should embed APS first-display slice");
+        let gpt = first_display_component_bundle("gpt_initial")
+            .expect("should embed GPT first-display slice");
+
+        assert!(body.starts_with(base));
+        assert!(
+            body.find(aps).expect("should contain APS")
+                < body.find(gpt).expect("should contain GPT")
+        );
+        assert!(concatenate_first_display_slices(&["aps_initial", "aps_initial"]).is_none());
+        assert!(concatenate_first_display_slices(&["first_display"]).is_none());
+        assert!(concatenate_first_display_slices(&["unknown"]).is_none());
+    }
+
+    #[test]
+    fn generated_runtime_modules_resolve_from_artifact_metadata() {
+        for artifact in TSJS_ARTIFACTS
             .iter()
-            .copied()
-            .filter(|id| *id != "core")
-            .take(3)
-            .collect::<Vec<_>>();
-
-        let mut cases: Vec<Vec<&str>> = vec![Vec::new()];
-        if let Some(first) = non_core_ids.first().copied() {
-            cases.push(vec![first]);
-        }
-        if non_core_ids.len() >= 2 {
-            cases.push(non_core_ids[..2].to_vec());
-            cases.push(non_core_ids[..2].iter().rev().copied().collect());
-        }
-        if non_core_ids.len() >= 3 {
-            cases.push(non_core_ids[..3].to_vec());
-        }
-
-        for ids in cases {
-            let concatenated = concatenate_modules(&ids);
+            .filter(|artifact| artifact.role == "core" || artifact.role == "integration")
+        {
             assert_eq!(
-                concatenated_hash(&ids),
-                sha256_hex(concatenated.as_bytes()),
-                "concatenated hash should match concatenated bundle bytes for {ids:?}"
+                module_bundle(artifact.id),
+                Some(artifact.bundle),
+                "generated module bundle should resolve for {}",
+                artifact.id
             );
         }
+    }
+
+    #[test]
+    fn concatenated_hash_matches_the_generated_module_bytes() {
+        let ids = ["gpt", "prebid"];
+        let body = concatenate_modules(&ids);
+
+        assert_eq!(
+            concatenated_hash(&ids),
+            encode(Sha256::digest(body.as_bytes())),
+            "concatenated hash should cover the exact generated bytes"
+        );
     }
 }

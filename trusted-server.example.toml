@@ -163,11 +163,9 @@ rewrite_creatives = true
 # Strip executable markup (script/object/embed/form/...) from winning-bid adm,
 # removing those elements together with their inner content.
 #
-# Defaults to false: executable markup is preserved rather than stripped. Note
-# this is not "untouched" — with the default `rewrite_creatives = true` above,
-# eligible URLs are still rewritten to first-party endpoints, bidder `<base>`
-# elements are removed, and the creative TSJS runtime is injected.
-#
+# Defaults to false: executable markup is preserved rather than stripped. With
+# the default `rewrite_creatives = true`, eligible URLs are still rewritten,
+# bidder `<base>` elements are removed, and the creative runtime is injected.
 # Enable whenever creatives can render in a context that shares the publisher's
 # origin — it is the primary defence there.
 #
@@ -191,9 +189,6 @@ debug = false
 # inventory_page_origin = "https://www.publisher.example"
 # Script creatives require separate security validation before opt-in.
 allow_script_creatives = false
-# Default: Trusted Server's opaque static renderer route. Set publisher_native only
-# for the controlled publisher-origin friendly-frame experiment.
-rendering_mode = "trusted_server"
 
 [integrations.google_tag_manager]
 enabled = false
@@ -215,6 +210,15 @@ ja4_endpoint_enabled = false
 # "redacted" validates response metadata but still includes bid-level fields
 # and creative previews; it is not a fully anonymized dump.
 auction_html_comment = false
+
+# Expose GET /_ts/trace, which toggles the `ts-trace` cookie and redirects to /.
+# While the cookie is set, the TSJS overlay draws a floating panel summarising
+# every traced ad slot (render path, bidder, and GAM/injected/visible state)
+# plus a confirmation badge on each genuinely-rendered creative. It only
+# surfaces data already present on window.tsjs, so it leaks nothing new — but
+# it is off by default so the toggle route is not live on deployments that
+# never asked for it. Enable only for render-verification debugging.
+# trace_route_enabled = false
 
 [debug.auction_html_comment_options]
 include_provider_responses = true

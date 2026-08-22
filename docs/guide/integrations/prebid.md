@@ -107,16 +107,11 @@ the generated manifest. Upload the generated JavaScript file manually, set
 any redirect targets) in `proxy.allowed_domains` before running
 `ts config validate` or `ts config push`.
 
-The generated bundle is pure Prebid.js — core, consent modules, User ID
-modules, and the selected bid adapters. The Trusted Server shim
-(`tsjs-prebid`) is served separately by the server as a deferred script and
-installs itself onto the `window.pbjs` global the bundle populates. The two
-artifacts ship in lockstep: a bundle generated before the shim was split out
-still carries a baked-in copy of the shim, so upgrading the server requires
-regenerating and re-uploading the bundle (and pushing the updated
-`external_bundle_sha256`/`external_bundle_sri` config) as part of the same
-rollout. The shim refuses to install twice on one page via the
-`window.__tsjsPrebidShimInstalled` sentinel.
+The generated bundle is pure Prebid.js — core, consent modules, User ID modules,
+and the selected bid adapters. Trusted Server serves that external artifact through
+the configured first-party route. The release-bound Prebid registrar then validates
+its exact artifact stamp and exposes it only through the runtime's Prebid adapter;
+there is no second TSJS runtime or install sentinel in the external bundle.
 
 ## Debug Mode
 
@@ -354,9 +349,10 @@ the configured suffixes with an exact, case-sensitive `endsWith()` match. A matc
 slot is omitted from the synthetic Prebid refresh ad units, but it remains in the
 original GPT refresh call. In a mixed global refresh, normal display slots still
 auction and receive refreshed Prebid targeting while excluded slots still refresh in
-GAM. Because the original refresh is preserved as one GPT call, an excluded slot in
-that mixed refresh waits for the auction to complete or the refresh watchdog to fire
-(up to 1.5 seconds by default); an all-excluded refresh passes through immediately.
+GAM. The wrapper still issues one GPT call for the whole target set, so an
+excluded slot in that mixed refresh waits for the auction to complete or the
+refresh watchdog to fire (up to 1.5 seconds by default); an all-excluded refresh
+passes through immediately.
 
 Each suffix must be a non-empty slash-prefixed path with no surrounding whitespace.
 The root suffix (`"/"`) is rejected, as are suffixes without a leading slash; exact
@@ -369,12 +365,11 @@ Server fails open and runs the normal refresh auction. The option affects only t
 Trusted Server GPT-refresh wrapper; it does not block direct publisher Prebid,
 APS, or other auction flows.
 
-The filter runs in the server-served `tsjs-prebid` shim, and the server injects its
-suffix list into the same page. Deploy the updated Trusted Server application and
-configuration together; this option does not require regenerating the external Prebid
-bundle. Follow the [External Bundle Generation](#external-bundle-generation) migration
-note only when upgrading a bundle generated before the shim split, or when changing
-external Prebid adapters or User ID modules.
+The filter runs in the release-bound `prebid_later` registrar module, while the
+external Prebid artifact remains independently hosted. Deploy the Trusted Server
+application and configuration together; this option does not require regenerating
+the external Prebid bundle. Regenerate that artifact only when its adapters or User
+ID modules change.
 
 ## Client-Side Bidders
 
@@ -382,8 +377,8 @@ Some Prebid.js bid adapters do not work well through Prebid Server (e.g. Magnite
 
 ### How it works
 
-1. The server injects the `clientSideBidders` list into the page via `window.__tsjs_prebid`.
-2. When `pbjs.requestBids()` is called, the TSJS shim checks each bid against the list.
+1. The server emits `clientSideBidders` as release-bound typed integration configuration; the module loader validates, freezes, and consumes it before committing the public API.
+2. When `pbjs.requestBids()` is called, the Prebid adapter checks each bid against the immutable list.
 3. **Client-side bidders** are left as standalone bids — their native Prebid.js adapters handle them in the browser.
 4. **All other bidders** are absorbed into the `trustedServer` adapter and routed through the `/auction` orchestrator to Prebid Server.
 5. Both sets of bids compete in the same Prebid.js auction.
@@ -419,8 +414,8 @@ Adding a new client-side bidder requires both a config change (`client_side_bidd
 ## User ID Modules
 
 Prebid.js can expose publisher-configured User ID Module output via
-`pbjs.getUserIdsAsEids()`. The TSJS Prebid shim reads those current-request
-EIDs after auctions and forwards them to Trusted Server when they are available.
+`pbjs.getUserIdsAsEids()`. The TSJS Prebid adapter reads those current-request EIDs
+after auctions and forwards them to Trusted Server when they are available.
 
 User ID submodule inclusion is selected by the external bundle generator. The
 available modules and default preset are checked in at
@@ -428,11 +423,10 @@ available modules and default preset are checked in at
 `--user-id-modules` to `build-prebid-external.mjs` when a publisher needs a
 specific subset; omit it to use the default preset.
 
-This is deliberate: the external bundle is pure Prebid.js (core, consent and
-User ID modules, and client-side bid adapters) while the server-served TSJS
-prebid shim installs the `trustedServer` adapter onto `window.pbjs` and routes
-auctions through `/auction` — but publishers often need different User ID
-submodules. Moving that selection to the external bundle keeps
+This is deliberate: the external bundle is pure Prebid.js (core, consent and User ID
+modules, and client-side bid adapters), while the release-bound TSJS Prebid registrar
+routes auctions through `/auction`. Publishers often need different User ID
+submodules, so keeping that selection in the external bundle keeps
 publisher-specific Prebid choices out of the Trusted Server WASM artifact while
 preserving a manifest and bundle hash for auditing.
 

@@ -3,9 +3,12 @@ use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
 use error_stack::{Report, ResultExt as _};
+#[cfg(feature = "aps-runner-proxy")]
+use std::io::Write as _;
 use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use tempfile::{NamedTempFile, TempDir};
 
 /// Cloudflare Workers runtime via `wrangler dev`.
 ///
@@ -26,6 +29,14 @@ const CLOUDFLARE_DEFAULT_PORT: u16 = 8787;
 const CI_CONFIG_TEMPLATE: &str = "wrangler.ci.toml";
 const GENERATED_CI_CONFIG: &str = "wrangler.integration.generated.toml";
 const TRUSTED_SERVER_CONFIG_PLACEHOLDER: &str = "TRUSTED_SERVER_CONFIG = \"{}\"";
+#[cfg(feature = "aps-runner-proxy")]
+const APS_RUNNER_PROXY_CONFIG_TEMPLATE: &str = "wrangler.aps-runner-proxy.toml";
+#[cfg(feature = "aps-runner-proxy")]
+const APS_RUNNER_PROXY_FIXTURE_CONFIG: &str =
+    include_str!("../../fixtures/configs/cloudflare-aps-runner-proxy-fixture.toml");
+#[cfg(feature = "aps-runner-proxy")]
+const APS_RUNNER_PROXY_ENDPOINT_PLACEHOLDER: &str =
+    "APS_RUNNER_PROXY_TEST_ENDPOINT = \"__APS_RUNNER_PROXY_TEST_ENDPOINT__\"";
 
 fn write_generated_ci_config(wrangler_dir: &Path) -> TestResult<String> {
     let template_path = wrangler_dir.join(CI_CONFIG_TEMPLATE);
@@ -59,6 +70,173 @@ fn inject_cloudflare_config(template: &str, config_json: &str) -> TestResult<Str
         TRUSTED_SERVER_CONFIG_PLACEHOLDER,
         &format!("TRUSTED_SERVER_CONFIG = '''{config_json}'''"),
     ))
+}
+
+#[cfg(feature = "aps-runner-proxy")]
+fn validate_loopback_fixture_url(fixture_url: &str) -> TestResult<()> {
+    let url = reqwest::Url::parse(fixture_url)
+        .change_context(TestError::RuntimeSpawn)
+        .attach("Cloudflare APS proxy fixture URL is invalid")?;
+    let is_loopback = url
+        .host_str()
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback());
+    if url.scheme() != "http"
+        || !is_loopback
+        || url.port().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(Report::new(TestError::RuntimeSpawn).attach(
+            "Cloudflare APS proxy fixture URL must be explicit loopback HTTP without credentials, query, or fragment",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "aps-runner-proxy")]
+fn write_temporary_config(directory: &Path, contents: &str) -> TestResult<NamedTempFile> {
+    let _: toml::Value = toml::from_str(contents)
+        .change_context(TestError::RuntimeSpawn)
+        .attach("generated Cloudflare APS proxy Wrangler config is invalid")?;
+    let mut config = tempfile::Builder::new()
+        .prefix(".aps-runner-proxy-")
+        .suffix(".toml")
+        .tempfile_in(directory)
+        .change_context(TestError::RuntimeSpawn)
+        .attach("failed to create temporary Cloudflare APS proxy Wrangler config")?;
+    config
+        .write_all(contents.as_bytes())
+        .change_context(TestError::RuntimeSpawn)
+        .attach("failed to write temporary Cloudflare APS proxy Wrangler config")?;
+    Ok(config)
+}
+
+#[cfg(feature = "aps-runner-proxy")]
+fn generated_aps_runner_proxy_configs(
+    wrangler_dir: &Path,
+    fixture_url: &str,
+) -> TestResult<(NamedTempFile, NamedTempFile)> {
+    validate_loopback_fixture_url(fixture_url)?;
+
+    let main_template_path = wrangler_dir.join(APS_RUNNER_PROXY_CONFIG_TEMPLATE);
+    let main_template = std::fs::read_to_string(&main_template_path)
+        .change_context(TestError::RuntimeSpawn)
+        .attach(format!(
+            "failed to read Cloudflare APS proxy config at {}",
+            main_template_path.display()
+        ))?;
+    let config_json = cloudflare_config_json(origin_port())?;
+    let main_config = inject_cloudflare_config(&main_template, &config_json)?;
+
+    let placeholder_count = APS_RUNNER_PROXY_FIXTURE_CONFIG
+        .matches(APS_RUNNER_PROXY_ENDPOINT_PLACEHOLDER)
+        .count();
+    if placeholder_count != 1 {
+        return Err(Report::new(TestError::RuntimeSpawn).attach(format!(
+            "Cloudflare APS fixture config must contain one endpoint placeholder, found {placeholder_count}"
+        )));
+    }
+    let endpoint = toml::Value::String(fixture_url.to_string()).to_string();
+    let fixture_config = APS_RUNNER_PROXY_FIXTURE_CONFIG.replace(
+        APS_RUNNER_PROXY_ENDPOINT_PLACEHOLDER,
+        &format!("APS_RUNNER_PROXY_TEST_ENDPOINT = {endpoint}"),
+    );
+    let fixture_config_directory =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/configs");
+
+    Ok((
+        write_temporary_config(wrangler_dir, &main_config)?,
+        write_temporary_config(&fixture_config_directory, &fixture_config)?,
+    ))
+}
+
+#[cfg(feature = "aps-runner-proxy")]
+#[derive(Default)]
+struct CloudflareApsRouteReadiness {
+    consecutive_exact_contracts: u8,
+}
+
+#[cfg(feature = "aps-runner-proxy")]
+impl CloudflareApsRouteReadiness {
+    fn observe(
+        &mut self,
+        status: u16,
+        allow: Option<&str>,
+        cache_control: Option<&str>,
+        body_is_empty: bool,
+    ) -> bool {
+        let is_exact_contract = status == 405
+            && allow == Some("GET")
+            && cache_control == Some("no-store")
+            && body_is_empty;
+        self.consecutive_exact_contracts = if is_exact_contract {
+            self.consecutive_exact_contracts.saturating_add(1)
+        } else {
+            0
+        };
+        self.consecutive_exact_contracts >= 2
+    }
+}
+
+#[cfg(feature = "aps-runner-proxy")]
+fn wait_for_aps_route_ready(base_url: &str, options: super::ReadyCheckOptions) -> TestResult<()> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(options.interval)
+        .build()
+        .change_context(TestError::RuntimeSpawn)
+        .attach("failed to build Cloudflare APS readiness client")?;
+    let renderer_url = format!(
+        "{}{}",
+        base_url,
+        trusted_server_core::integrations::aps::APS_RENDERER_V2_ROUTE
+    );
+    let probe_method =
+        reqwest::Method::from_bytes(b"PROPFIND").expect("should parse PROPFIND readiness method");
+    let mut readiness = CloudflareApsRouteReadiness::default();
+
+    for _ in 0..options.max_attempts {
+        if let Ok(response) = client.request(probe_method.clone(), &renderer_url).send() {
+            let status = response.status().as_u16();
+            let allow = response
+                .headers()
+                .get(reqwest::header::ALLOW)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let cache_control = response
+                .headers()
+                .get(reqwest::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let semantic_headers_are_exact = response
+                .headers()
+                .keys()
+                .map(reqwest::header::HeaderName::as_str)
+                .filter(|name| {
+                    !matches!(
+                        *name,
+                        "connection" | "content-length" | "date" | "server" | "transfer-encoding"
+                    )
+                })
+                .all(|name| matches!(name, "allow" | "cache-control"));
+            let body_is_empty = response.bytes().is_ok_and(|body| body.is_empty());
+
+            if readiness.observe(
+                status,
+                allow.as_deref(),
+                cache_control.as_deref(),
+                semantic_headers_are_exact && body_is_empty,
+            ) {
+                return Ok(());
+            }
+        }
+
+        std::thread::sleep(options.interval);
+    }
+
+    Err(Report::new(options.timeout_error).attach(options.timeout_message))
 }
 
 impl RuntimeEnvironment for CloudflareWorkers {
@@ -127,6 +305,7 @@ impl RuntimeEnvironment for CloudflareWorkers {
             ))?;
 
         let mut child = child;
+        super::register_process_group(&mut child)?;
         if let Some(stderr) = child.stderr.take() {
             std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
@@ -138,10 +317,110 @@ impl RuntimeEnvironment for CloudflareWorkers {
             });
         }
 
-        let handle = CloudflareHandle { child };
+        let handle = CloudflareHandle {
+            child,
+            _configs: Vec::new(),
+            _state_directory: None,
+        };
         let base_url = format!("http://127.0.0.1:{port}");
 
         super::wait_for_ready(&base_url, self.health_check_path(), true)?;
+
+        Ok(RuntimeProcess {
+            inner: Box::new(handle),
+            base_url,
+        })
+    }
+
+    #[cfg(feature = "aps-runner-proxy")]
+    fn spawn_aps_runner_proxy(
+        &self,
+        _wasm_path: &Path,
+        fixture_url: &str,
+    ) -> TestResult<RuntimeProcess> {
+        let wrangler_dir = self.wrangler_dir();
+        let (main_config, fixture_config) =
+            generated_aps_runner_proxy_configs(&wrangler_dir, fixture_url)?;
+        let state_directory = tempfile::tempdir()
+            .change_context(TestError::RuntimeSpawn)
+            .attach("failed to create temporary Cloudflare APS proxy state directory")?;
+        let port = super::find_available_port()?;
+
+        let mut command = Command::new("wrangler");
+        command
+            .arg("dev")
+            .arg("--config")
+            .arg(main_config.path())
+            .arg("--config")
+            .arg(fixture_config.path())
+            .args(["--port", &port.to_string(), "--ip", "127.0.0.1"])
+            .arg("--persist-to")
+            .arg(state_directory.path())
+            .args(["--local", "--log-level", "info"])
+            .env(
+                "WRANGLER_LOG_PATH",
+                state_directory.path().join("wrangler.log"),
+            )
+            .current_dir(&wrangler_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+        let mut child = command
+            .spawn()
+            .change_context(TestError::RuntimeSpawn)
+            .attach(format!(
+                "failed to spawn Cloudflare APS proxy Worker in {}",
+                wrangler_dir.display()
+            ))?;
+        super::register_process_group(&mut child)?;
+
+        if let Some(stdout) = child.stdout.take() {
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().map_while(Result::ok) {
+                    if !line.is_empty() {
+                        log::debug!("cloudflare APS proxy: {line}");
+                    }
+                }
+            });
+        }
+        if let Some(stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    if !line.is_empty() {
+                        log::debug!("cloudflare APS proxy: {line}");
+                    }
+                }
+            });
+        }
+
+        let handle = CloudflareHandle {
+            child,
+            _configs: vec![main_config, fixture_config],
+            _state_directory: Some(state_directory),
+        };
+        let base_url = format!("http://127.0.0.1:{port}");
+        wait_for_aps_route_ready(
+            &base_url,
+            super::ReadyCheckOptions {
+                // Wrangler performs noticeably more startup work for the
+                // two-Worker service-binding fixture than the other local
+                // runtimes. Keep this process-readiness allowance independent
+                // from the APS proxy's strict upstream deadlines.
+                max_attempts: 120,
+                interval: std::time::Duration::from_millis(500),
+                fallback_to_root: false,
+                timeout_error: TestError::RuntimeNotReady,
+                timeout_message: format!(
+                    "Cloudflare APS runtime at {base_url} not ready after 60s"
+                ),
+            },
+        )?;
 
         Ok(RuntimeProcess {
             inner: Box::new(handle),
@@ -170,6 +449,8 @@ impl CloudflareWorkers {
 
 struct CloudflareHandle {
     child: Child,
+    _configs: Vec<NamedTempFile>,
+    _state_directory: Option<TempDir>,
 }
 
 impl RuntimeProcessHandle for CloudflareHandle {}
@@ -232,5 +513,78 @@ mod tests {
         let result = inject_cloudflare_config(&template, r#"{"app_config":"blob"}"#);
 
         assert!(result.is_err(), "should reject duplicate placeholders");
+    }
+
+    #[test]
+    #[cfg(feature = "aps-runner-proxy")]
+    fn aps_fixture_config_has_one_private_endpoint_placeholder() {
+        assert_eq!(
+            APS_RUNNER_PROXY_FIXTURE_CONFIG
+                .matches(APS_RUNNER_PROXY_ENDPOINT_PLACEHOLDER)
+                .count(),
+            1,
+            "should define exactly one private fixture endpoint"
+        );
+        assert!(
+            !APS_RUNNER_PROXY_FIXTURE_CONFIG.contains("https://*:*"),
+            "should not grant wildcard outbound access"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "aps-runner-proxy")]
+    fn aps_fixture_url_rejects_non_loopback_targets() {
+        assert!(
+            validate_loopback_fixture_url("https://example.com/prebid-creative.js").is_err(),
+            "should reject a public fixture target"
+        );
+        assert!(
+            validate_loopback_fixture_url("http://127.0.0.1:1234/prebid-creative.js").is_ok(),
+            "should accept an explicit loopback fixture target"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "aps-runner-proxy")]
+    fn aps_route_readiness_requires_two_consecutive_exact_contracts() {
+        let mut readiness = CloudflareApsRouteReadiness::default();
+
+        assert!(
+            !readiness.observe(405, Some("GET"), Some("no-store"), true),
+            "should not accept only one exact observation"
+        );
+        assert!(
+            !readiness.observe(503, None, None, false),
+            "should reset after a transient startup response"
+        );
+        assert!(
+            !readiness.observe(405, Some("GET"), Some("no-store"), true),
+            "should restart the consecutive count"
+        );
+        assert!(
+            readiness.observe(405, Some("GET"), Some("no-store"), true),
+            "should accept two consecutive exact observations"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "aps-runner-proxy")]
+    fn aps_route_readiness_rejects_partial_405_contracts() {
+        for (status, allow, cache_control, body_is_empty) in [
+            (200, Some("GET"), Some("no-store"), true),
+            (405, Some("POST"), Some("no-store"), true),
+            (405, Some("GET"), Some("public"), true),
+            (405, Some("GET"), Some("no-store"), false),
+        ] {
+            let mut readiness = CloudflareApsRouteReadiness::default();
+            assert!(
+                !readiness.observe(status, allow, cache_control, body_is_empty),
+                "should reject an incomplete local method contract"
+            );
+            assert!(
+                !readiness.observe(405, Some("GET"), Some("no-store"), true),
+                "should require two exact observations after rejection"
+            );
+        }
     }
 }

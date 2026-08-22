@@ -33,11 +33,21 @@ function createStore(): GptDiagnosticsStore {
 
 function createManager(
   store: GptDiagnosticsStore,
-  scheduleFrame?: (callback: () => void) => void
+  scheduleFrame?: (callback: () => void) => () => void
 ): GptDiagnosticsBindingManager {
   const manager = new GptDiagnosticsBindingManager(store, { scheduleFrame });
   managers.push(manager);
   return manager;
+}
+
+function queueFrame(frames: Array<() => void>): (callback: () => void) => () => void {
+  return (callback) => {
+    frames.push(callback);
+    return () => {
+      const index = frames.indexOf(callback);
+      if (index >= 0) frames.splice(index, 1);
+    };
+  };
 }
 
 function setRectangle(
@@ -108,6 +118,35 @@ describe('GptDiagnosticsBindingManager', () => {
     });
   });
 
+  it('fails closed when the supplied realm has a hostile HTMLElement constructor', () => {
+    const element = document.createElement('div');
+    element.id = 'hostile-realm-slot';
+    document.body.append(element);
+    const store = createStore();
+    store.recordSlotRequested(fakeSlot(element.id));
+    const hostileWindow = {
+      CSS: window.CSS,
+      MutationObserver: undefined,
+      addEventListener: window.addEventListener.bind(window),
+      get HTMLElement(): never {
+        throw new Error('hostile HTMLElement constructor');
+      },
+      innerHeight: window.innerHeight,
+      innerWidth: window.innerWidth,
+      removeEventListener: window.removeEventListener.bind(window),
+    };
+
+    const manager = new GptDiagnosticsBindingManager(store, {
+      window: hostileWindow as never,
+    });
+    managers.push(manager);
+
+    expect(manager.get(1)).toMatchObject({
+      binding: { status: 'unbound', reason: 'missing_element' },
+      visible: false,
+    });
+  });
+
   it('reports an empty GPT element ID as unbound without a synthetic DOM ID', () => {
     const store = createStore();
     store.recordSlotRequested(fakeSlot());
@@ -118,7 +157,7 @@ describe('GptDiagnosticsBindingManager', () => {
       status: 'unbound',
       reason: 'missing_slot_element_id',
     });
-    expect(store.snapshot().slots[0].slotElementId).toBeUndefined();
+    expect(store.snapshot().slots[0]!.slotElementId).toBeUndefined();
   });
 
   it('treats duplicate DOM IDs as ambiguous', () => {
@@ -258,7 +297,7 @@ describe('GptDiagnosticsBindingManager', () => {
     document.body.append(element);
     const store = createStore();
     store.recordSlotRequested(fakeSlot('observed'));
-    const manager = createManager(store, (callback) => frames.push(callback));
+    const manager = createManager(store, queueFrame(frames));
 
     const unrelated = document.createElement('div');
     unrelated.id = 'unrelated';
@@ -284,7 +323,7 @@ describe('GptDiagnosticsBindingManager', () => {
   it('coalesces store-driven refreshes to one animation frame', () => {
     const scheduled: Array<() => void> = [];
     const store = createStore();
-    const manager = createManager(store, (callback) => scheduled.push(callback));
+    const manager = createManager(store, queueFrame(scheduled));
     const listener = vi.fn();
     manager.subscribe(listener);
     const slot = fakeSlot('scheduled');
@@ -300,5 +339,53 @@ describe('GptDiagnosticsBindingManager', () => {
       status: 'unbound',
       reason: 'missing_element',
     });
+  });
+
+  it('cancels a pending refresh on destroy and suppresses a hostile late callback', () => {
+    const frames: Array<() => void> = [];
+    const cancel = vi.fn();
+    const store = createStore();
+    const manager = createManager(store, (callback) => {
+      frames.push(callback);
+      return cancel;
+    });
+    const listener = vi.fn();
+    manager.subscribe(listener);
+    store.recordSlotRequested(fakeSlot('pending-destroy'));
+
+    manager.destroy();
+    frames[0]?.();
+
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it('runs one scheduled refresh callback at most once', () => {
+    const frames: Array<() => void> = [];
+    const store = createStore();
+    const manager = createManager(store, (callback) => {
+      frames.push(callback);
+      return vi.fn();
+    });
+    const listener = vi.fn();
+    manager.subscribe(listener);
+    store.recordSlotRequested(fakeSlot('once'));
+
+    frames[0]?.();
+    frames[0]?.();
+
+    expect(listener).toHaveBeenCalledOnce();
+  });
+
+  it('isolates a hostile frame cancellation during destroy', () => {
+    const store = createStore();
+    const cancel = vi.fn(() => {
+      throw new Error('cancel failed');
+    });
+    const manager = createManager(store, () => cancel);
+    store.recordSlotRequested(fakeSlot('hostile-cancel'));
+
+    expect(() => manager.destroy()).not.toThrow();
+    expect(cancel).toHaveBeenCalledOnce();
   });
 });

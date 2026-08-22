@@ -45,10 +45,12 @@ and non-storeable.
 
 ### Auction correlation token
 
-Enabling the integration has one further server-side effect, beyond module
-availability, that does not depend on browser activation. For each server-side auction
-that produced winning bids, Trusted Server mints a fresh correlation token and publishes
-it as `hb_auction_id` on each winning bid in `window.tsjs.bids`:
+Enabling the integration has one server-side effect that does not depend on browser
+activation. For each server-side auction that produced winning bids, Trusted Server
+mints a fresh correlation token and publishes it as `hb_auction_id` on each winning
+bid targeting record in the initial immutable `tsjs.boot.auctionProjection`. A later
+SPA page-bids response keeps its replacement projection internal to that navigation
+session:
 
 ```text
 ts-auc-2f8c1d5a4b7e4c0f9a3d6b1e8c5f2a7d
@@ -65,7 +67,7 @@ ts-auc-2f8c1d5a4b7e4c0f9a3d6b1e8c5f2a7d
   produced no winning bids.
 - It is published on every document whose auction produced winning bids, including
   documents with no active console session, because the console reads it from the same
-  page bid state the GPT integration already consumes.
+  navigation-scoped auction projection the GPT integration already consumes.
 
 ## Activate or Deactivate a Browser Session
 
@@ -109,6 +111,8 @@ Visible, Filled, Empty, Pending/Incomplete, and Unbound/Ambiguous slots.
 
 Each request cycle can show:
 
+- Exact GPT slot element ID and ad unit path.
+- Initial request and numbered refresh cycles.
 - The observed request path, request-intent ID, and direct Trusted Server opportunity.
 - Opaque Trusted Server auction-ID correlation and opportunity-to-request latency when available.
 - Observed replacement of an earlier retained filled render, including GPT creative-ID transitions.
@@ -390,7 +394,7 @@ use live on a separate internal channel (`window.tsjs.gptDiagnosticsRecorder`) t
 is not part of this contract and is not supported for operator use.
 
 ```js
-const diagnostics = window.tsjs.gptDiagnostics
+const diagnostics = window.tsjs.diagnostics.gpt
 
 diagnostics.snapshot()
 diagnostics.export()

@@ -1,12 +1,20 @@
 import { test, expect } from "@playwright/test";
 import { runtimeUrl } from "../../helpers/state.js";
+import {
+  routeRuntimeTsjsFixture,
+  runtimeTsjsFixture,
+  serverBootTransportLiteralV1,
+  type RuntimeTsjsFixture,
+} from "../../helpers/tsjs-fixture.js";
+
+const CREATIVE_FIXTURE = runtimeTsjsFixture(["render_runtime", "creative"]);
 
 // Creative iframes are sandboxed WITHOUT `allow-same-origin`, so the creative
 // runtime executes in an opaque origin whose `location.href` is `about:srcdoc`.
 // jsdom cannot reproduce either condition, so the recovery path these tests
 // cover — resolve against the stamped first-party origin, skip the CORS-doomed
-// POST, navigate the GET rebuild fallback, follow the re-signed click — is only
-// observable in a real browser.
+// POST, navigate the GET rebuild fallback — is only observable in a real
+// browser.
 const CREATIVE_SANDBOX_TOKENS = [
   "allow-forms",
   "allow-popups",
@@ -15,33 +23,75 @@ const CREATIVE_SANDBOX_TOKENS = [
   "allow-top-navigation-by-user-activation",
 ].join(" ");
 
-// A creative <head> script that tries to redirect click resolution to an
-// attacker origin. It executes before the runtime injected at the top of
-// <body>, so the stamp must be non-writable for the recovery below to stay on
-// the first-party origin.
-const HOSTILE_STAMP_OVERWRITE = `<script>
-  try { window.__tsCreativeOrigin = 'https://attacker.invalid'; } catch (e) {}
-</script>`;
+// Mirrors the srcdoc document the client builds: the first-party parent stamps
+// its own origin ahead of any creative markup, then the runtime, then the
+// creative. The anchor carries a root-relative signed click exactly as the
+// server-side rewriter emits it.
+function creativeDocument(
+  origin: string,
+  bundleUrl: string,
+  fixture: RuntimeTsjsFixture,
+  signedClick: string,
+): string {
+  const transport = serverBootTransportLiteralV1({
+    abi: 1,
+    releaseId: fixture.releaseId,
+    manifest: fixture.manifest,
+    auctionProjection: {
+      version: 1,
+      auction: { version: 1, auctionId: "creative-sandbox", results: [] },
+      slots: [],
+      bids: [],
+    },
+    integrations: { version: 1, entries: [] },
+    creative: {
+      version: 1,
+      enabled: true,
+      clickGuard: true,
+      renderGuard: false,
+    },
+    diagnostics: {
+      version: 1,
+      renderTraceOverlay: false,
+      gpt: { active: false },
+    },
+  });
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <script>
+      Object.defineProperty(window, '__tsCreativeOrigin', {
+        value: ${JSON.stringify(origin)},
+        writable: false,
+        configurable: false,
+        enumerable: false,
+      });
+      window.tsjs = { que: [] };
+      const __TSJS_SERVER_BOOT_TRANSPORT_V1__ = ${transport};
+      ${fixture.bootstrapBody}
+    </script>
+    <script>
+      try { window.__tsCreativeOrigin = 'https://attacker.invalid'; } catch (_error) {}
+    </script>
+    <script src="${bundleUrl}" id="trustedserver-js"></script>
+  </head>
+  <body>
+    <a id="creative-link" href="${signedClick}" data-tsclick="${signedClick}">ad</a>
+  </body>
+</html>`;
+}
 
 test.describe("Sandboxed creative iframe", () => {
-  test("recovers a mutated click through the signed GET rebuild chain", async ({
+  test("recovers a mutated click through the GET rebuild fallback", async ({
     page,
   }) => {
     const origin = new URL(runtimeUrl("/")).origin;
-
-    // Mint a genuinely signed click without knowing the proxy secret: the
-    // signing endpoint computes its token over `tsurl` plus params, which is
-    // exactly what the click endpoint validates, so the same query is valid
-    // under either path.
     const landing = runtimeUrl("/health");
     const signResponse = await page.request.post(
       runtimeUrl("/first-party/sign"),
       { data: { url: landing } },
     );
-    expect(
-      signResponse.ok(),
-      "signing endpoint should mint a token for the fixture URL",
-    ).toBe(true);
+    expect(signResponse.ok()).toBe(true);
     const signedProxyHref = ((await signResponse.json()) as { href: string })
       .href;
     const signedClick = signedProxyHref.replace(
@@ -52,38 +102,8 @@ test.describe("Sandboxed creative iframe", () => {
 
     await page.goto(runtimeUrl("/"), { waitUntil: "domcontentloaded" });
 
-    // Reuse whichever hashed bundle URL the server injected into the page so
-    // this test never has to know the current content hash; fall back to the
-    // stable unified path if the fixture page carries no injected script.
-    const injectedBundle = await page.evaluate(() => {
-      const script = Array.from(document.querySelectorAll("script[src]")).find(
-        (element) =>
-          (element as HTMLScriptElement).src.includes("/static/tsjs="),
-      );
-      return script ? (script as HTMLScriptElement).src : null;
-    });
-    const bundleUrl =
-      injectedBundle ?? runtimeUrl("/static/tsjs=tsjs-unified.min.js");
-
-    // Mirrors the srcdoc document the client builds: the first-party parent
-    // stamps its own origin ahead of any creative markup, then the runtime,
-    // then the creative — here preceded by hostile markup attempting to move
-    // the stamp.
-    const creativeDocument = `<!DOCTYPE html>
-<html>
-  <head>
-    <script>
-      Object.defineProperty(window, '__tsCreativeOrigin', {
-        value: '${origin}', writable: false, configurable: false, enumerable: false,
-      });
-    </script>
-  </head>
-  <body>
-    ${HOSTILE_STAMP_OVERWRITE}
-    <script src="${bundleUrl}"></script>
-    <a id="creative-link" href="${signedClick}" data-tsclick="${signedClick}">ad</a>
-  </body>
-</html>`;
+    await routeRuntimeTsjsFixture(page, CREATIVE_FIXTURE);
+    const bundleUrl = new URL(CREATIVE_FIXTURE.runtimeSrc, origin).toString();
 
     const rebuildResponse = page.waitForResponse(
       (response) => response.url().includes("/first-party/proxy-rebuild"),
@@ -105,31 +125,65 @@ test.describe("Sandboxed creative iframe", () => {
         iframe.style.height = "250px";
         document.body.appendChild(iframe);
       },
-      { sandbox: CREATIVE_SANDBOX_TOKENS, html: creativeDocument },
+      {
+        sandbox: CREATIVE_SANDBOX_TOKENS,
+        html: creativeDocument(
+          origin,
+          bundleUrl,
+          CREATIVE_FIXTURE,
+          signedClick,
+        ),
+      },
     );
 
     const frame = page.frameLocator("iframe");
     const link = frame.locator("#creative-link");
     await link.waitFor({ state: "attached", timeout: 10_000 });
+    await expect
+      .poll(() =>
+        frame.locator("html").evaluate(() => {
+          const api = (window as any).tsjs;
+          return {
+            state: api?._internal?.state,
+            names: Object.getOwnPropertyNames(api ?? {}).sort(),
+            legacyCreativeGlobal: Object.prototype.hasOwnProperty.call(
+              window,
+              "tscreative",
+            ),
+          };
+        }),
+      )
+      .toEqual({
+        state: "kernel",
+        names: [
+          "_internal",
+          "_registerIntegration",
+          "addAdUnits",
+          "boot",
+          "diagnostics",
+          "log",
+          "que",
+          "releaseId",
+          "requestAds",
+          "version",
+        ],
+        legacyCreativeGlobal: false,
+      });
 
     // The creative mutates its own click target, the shape the click guard
     // exists to repair.
-    await link.evaluate((element, click: string) => {
+    await link.evaluate((element, click) => {
       element.setAttribute("href", `${click}&bar=2`);
     }, signedClick);
 
     await link.click({ force: true });
 
     const rebuild = await rebuildResponse;
-    // The hostile overwrite must not have moved resolution off the first-party
-    // origin, and the rebuild must actually succeed rather than error.
     expect(rebuild.url().startsWith(origin)).toBe(true);
-    expect(rebuild.status(), "GET rebuild should redirect").toBe(302);
-
+    expect(rebuild.status()).toBe(302);
     const click = await clickResponse;
     expect(click.url().startsWith(origin)).toBe(true);
-    expect(click.status(), "re-signed click should redirect").toBe(302);
-    // The rebuilt click carries the mutation the creative added.
+    expect(click.status()).toBe(302);
     expect(decodeURIComponent(click.url())).toContain("bar=2");
   });
 });
