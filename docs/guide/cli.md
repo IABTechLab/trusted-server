@@ -122,6 +122,21 @@ ts deploy --adapter fastly --service-id <service-id> --staging
 ts deploy --adapter fastly -- --comment "release"
 ```
 
+A staged deploy only redirects the staged version's config selector at the
+`<logical-store-id>_staging` key — it does not copy the production config blob
+there. Push the staged config before probing the staged version, or it comes up
+with no config at all:
+
+```bash
+ts config push --adapter fastly --staging
+ts config diff --adapter fastly --staging
+```
+
+`--staging` on `config push` / `config diff` writes and compares the
+`<logical-store-id>_staging` key in the same store. It is mutually exclusive
+with `--key`: the staging key is derived from the store's logical id, so an
+explicit key would be written where nothing reads it.
+
 Inspect and verify deployments with the deploy lifecycle commands:
 
 ```bash
@@ -137,8 +152,9 @@ ts rollback --adapter fastly --service-id <service-id> \
   --version <bad-version> --rollback-to <previous-version>
 ```
 
-`healthcheck` probes `/` by default (`--path` overrides) and retries 3 times
-with a 5 second delay and 10 second timeout (`--retry`, `--retry-delay`,
+`healthcheck` probes `/` by default (`--path` overrides) and makes 3 total
+attempts — not 3 retries after a first try — with a 5 second delay between
+attempts and a 10 second per-attempt timeout (`--retry`, `--retry-delay`,
 `--timeout`). With `--staging` it resolves the staged version's IP from the
 service id and probes that instead of the production endpoint.
 
