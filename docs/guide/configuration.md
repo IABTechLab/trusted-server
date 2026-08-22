@@ -370,7 +370,14 @@ it but keep using their own runtime client address.
 | `shared_secret` | String | Yes      | Secret shared with the trusted front door, 32+ ASCII graphic bytes, no whitespace |
 
 All three fields are required when the section exists. When the section is
-absent, Trusted Server continues to use the immediate peer address.
+absent, Trusted Server continues to use the immediate peer address, and
+`ts config push` omits the section from the published config blob so instances
+running an older binary keep accepting the blob.
+
+Once the section is configured, the pushed blob carries it. Instances running a
+binary that predates trusted client-IP support reject that blob, so upgrade
+every instance before pushing a config that enables this section, and restore a
+config without the section before rolling instances back.
 
 ```toml
 [trusted_client_ip]

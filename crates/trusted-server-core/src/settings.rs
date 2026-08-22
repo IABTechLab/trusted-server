@@ -2023,7 +2023,14 @@ pub struct Settings {
     #[serde(default)]
     pub tester_cookie: TesterCookieConfig,
     /// Optional authenticated trusted client IP forwarding configuration.
-    #[serde(default)]
+    ///
+    /// `None` must stay omitted from serialized config blobs: `Settings`
+    /// schemas that predate this field reject unknown keys, so emitting
+    /// `trusted_client_ip: null` would make an unchanged `ts config push`
+    /// break older instances during rollout or rollback. A configured value
+    /// remains serialized and requires restoring a compatible blob before
+    /// rolling back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(nested)]
     pub trusted_client_ip: Option<TrustedClientIpConfig>,
     #[serde(default)]
@@ -2778,6 +2785,74 @@ mod tests {
             settings.trusted_client_ip.is_none(),
             "should leave trusted client IP configuration disabled by default"
         );
+    }
+
+    /// Mirrors the `Settings` schema of the revision that predates
+    /// `trusted_client_ip`: every key that revision knew, and
+    /// `deny_unknown_fields` so an extra key fails deserialization exactly as an
+    /// older binary would reject a pushed config blob.
+    // The fields exist to model the accepted key set, never to be read.
+    #[allow(dead_code)]
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BaseRevisionSettings {
+        #[serde(default)]
+        publisher: serde::de::IgnoredAny,
+        #[serde(default)]
+        tester_cookie: serde::de::IgnoredAny,
+        #[serde(default)]
+        ec: serde::de::IgnoredAny,
+        #[serde(default)]
+        integrations: serde::de::IgnoredAny,
+        #[serde(default)]
+        handlers: serde::de::IgnoredAny,
+        #[serde(default)]
+        response_headers: serde::de::IgnoredAny,
+        #[serde(default)]
+        request_signing: serde::de::IgnoredAny,
+        #[serde(default)]
+        rewrite: serde::de::IgnoredAny,
+        #[serde(default)]
+        auction: serde::de::IgnoredAny,
+        #[serde(default)]
+        consent: serde::de::IgnoredAny,
+        #[serde(default)]
+        proxy: serde::de::IgnoredAny,
+        #[serde(default)]
+        creative_opportunities: serde::de::IgnoredAny,
+        #[serde(default)]
+        image_optimizer: serde::de::IgnoredAny,
+        #[serde(default)]
+        tinybird: serde::de::IgnoredAny,
+        #[serde(default)]
+        debug: serde::de::IgnoredAny,
+    }
+
+    #[test]
+    fn trusted_client_ip_is_omitted_from_serialized_config_when_unset() {
+        // `ts config push` serializes `Settings` verbatim. Emitting the key —
+        // even as `null` — makes a `deny_unknown_fields` binary from the base
+        // revision reject the blob during rollout or rollback.
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without trusted client IP configuration");
+
+        let value = serde_json::to_value(&settings).expect("should serialize settings");
+
+        assert!(
+            value.get("trusted_client_ip").is_none(),
+            "unset trusted_client_ip should not be serialized, got {value}"
+        );
+    }
+
+    #[test]
+    fn serialized_default_config_stays_readable_by_the_base_revision_schema() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without trusted client IP configuration");
+
+        let value = serde_json::to_value(&settings).expect("should serialize settings");
+
+        serde_json::from_value::<BaseRevisionSettings>(value)
+            .expect("base revision schema should accept a config blob with no trusted client IP");
     }
 
     #[test]
