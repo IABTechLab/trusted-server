@@ -34,6 +34,14 @@ jobs:
           target: wasm32-wasip1
           cache-shared-key: cargo-${{ runner.os }}
 
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Configure sccache for Rust
+        run: |
+          echo "SCCACHE_GHA_ENABLED=on" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
       - name: Cache Viceroy binary
         id: cache-viceroy
         uses: actions/cache@v4
@@ -67,6 +75,14 @@ jobs:
           # build" step below; the axum build and tests are native.
           target: wasm32-wasip1
           cache-shared-key: cargo-${{ runner.os }}
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Configure sccache for Rust
+        run: |
+          echo "SCCACHE_GHA_ENABLED=on" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       - name: Build Axum adapter
         run: cargo build -p trusted-server-adapter-axum
@@ -108,6 +124,14 @@ jobs:
           target: wasm32-unknown-unknown
           cache-shared-key: cargo-${{ runner.os }}
 
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Configure sccache for Rust
+        run: |
+          echo "SCCACHE_GHA_ENABLED=on" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
       - name: Check Cloudflare adapter (native host)
         run: cargo check -p trusted-server-adapter-cloudflare
 
@@ -134,6 +158,14 @@ jobs:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-wasip1
           cache-shared-key: cargo-${{ runner.os }}
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Configure sccache for Rust
+        run: |
+          echo "SCCACHE_GHA_ENABLED=on" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       - name: Check Spin adapter (native host)
         run: cargo check -p trusted-server-adapter-spin
@@ -174,6 +206,14 @@ jobs:
           components: clippy, rustfmt
           cache-shared-key: cargo-${{ runner.os }}
 
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Configure sccache for Rust
+        run: |
+          echo "SCCACHE_GHA_ENABLED=on" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
       - name: Format check (parity test crate)
         run: cargo fmt --manifest-path crates/trusted-server-integration-tests/Cargo.toml -- --check
 
@@ -205,6 +245,14 @@ jobs:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
           components: "clippy, rustfmt"
           cache-shared-key: cargo-cli-${{ runner.os }}
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Configure sccache for Rust
+        run: |
+          echo "SCCACHE_GHA_ENABLED=on" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       # No separate `cargo fmt` here: `trusted-server-cli` is a workspace member,
       # so the main `cargo fmt --all` job already formats it. Clippy still needs a
