@@ -922,12 +922,23 @@ pub fn select_first_display_slices_v1(
             }
             match &bid.render_source {
                 BidRenderSourceV1::Aps(_) => {
+                    if !bid.renderer_reservation_id.as_deref().is_some_and(
+                        crate::auction::formats::coordinated_cutover_v1::valid_renderer_reservation_id,
+                    ) {
+                        return None;
+                    }
                     if !enabled.contains("aps") {
                         return None;
                     }
                     aps_participates = true;
                 }
-                BidRenderSourceV1::Adm(_) => {}
+                BidRenderSourceV1::Adm(_) => {
+                    if !bid.renderer_reservation_id.as_deref().is_some_and(
+                        crate::auction::formats::coordinated_cutover_v1::valid_renderer_reservation_id,
+                    ) {
+                        return None;
+                    }
+                }
                 BidRenderSourceV1::PbsCache(_) => return None,
             }
             winner_count += 1;
@@ -941,6 +952,7 @@ pub fn select_first_display_slices_v1(
         && config.creative.enabled
         && (config.creative.click_guard || config.creative.render_guard);
     let gpt_participates = winner_count > 0 || config.gam_attribution_enabled;
+    let render_owner_participates = winner_count > 0;
     let prebid_participates =
         enabled.contains("prebid") && projection.bids.iter().any(|bid| bid.provider == "prebid");
     let mut mask = 0_u16;
@@ -951,6 +963,7 @@ pub fn select_first_display_slices_v1(
     {
         let selected = match metadata.include {
             Some("eligible_batch") => true,
+            Some("render_owner_participates") => render_owner_participates,
             Some("aps_participates") => aps_participates,
             Some("creative_guard") => creative_guard,
             Some("gpt_initial") => gpt_participates,
@@ -1643,7 +1656,7 @@ mod tests {
             "typed GAM attribution must select the GPT parser-time owner: {script}"
         );
         assert!(
-            script.contains("m=0041"),
+            script.contains("m=0081"),
             "attribution-only first display must use the admitted GPT mask: {script}"
         );
     }
@@ -2118,7 +2131,7 @@ mod tests {
                         targeting: std::collections::BTreeMap::new(),
                         renderer_reservation_id: match render_source {
                             BidRenderSourceV1::Aps(_) | BidRenderSourceV1::Adm(_) => {
-                                Some("reservation-1".to_string())
+                                Some("r1_aaaaaaaaaaaaaaaaaaaaaa".to_string())
                             }
                             BidRenderSourceV1::PbsCache(_) => None,
                         },
@@ -2203,8 +2216,28 @@ mod tests {
             },
         )
         .expect("closed GPT ADM batch should select GPT initial ownership");
-        assert_eq!(adm_selected.mask(), 0x0041);
-        assert_eq!(adm_selected.slices(), &["first_display", "gpt_initial"]);
+        assert_eq!(adm_selected.mask(), 0x0083);
+        assert_eq!(
+            adm_selected.slices(),
+            &["first_display", "render_owner_initial", "gpt_initial"]
+        );
+
+        for invalid in [None, Some("not-a-reservation".to_string())] {
+            let mut malformed = adm.clone();
+            malformed.bids[0].renderer_reservation_id = invalid;
+            assert!(
+                select_first_display_slices_v1(
+                    &malformed,
+                    FirstDisplaySelectionConfigV1 {
+                        enabled_integrations: &enabled,
+                        creative: CreativeBootConfigV1::default(),
+                        gam_attribution_enabled: false,
+                    },
+                )
+                .is_none(),
+                "a rendering mask must require one exact reservation capability"
+            );
+        }
 
         assert!(
             select_first_display_slices_v1(
@@ -2252,9 +2285,14 @@ mod tests {
 
         assert_eq!(
             creative_selected.slices(),
-            &["first_display", "creative_initial", "gpt_initial"]
+            &[
+                "first_display",
+                "render_owner_initial",
+                "creative_initial",
+                "gpt_initial",
+            ]
         );
-        assert_eq!(creative_selected.mask(), 0x0045);
+        assert_eq!(creative_selected.mask(), 0x008b);
 
         let aps_selected = select_first_display_slices_v1(
             &first_display_projection(Some(aps_source())),
@@ -2267,9 +2305,29 @@ mod tests {
         .expect("bounded APS/GPT configuration should select the agent");
         assert_eq!(
             aps_selected.slices(),
-            &["first_display", "aps_initial", "gpt_initial"]
+            &[
+                "first_display",
+                "render_owner_initial",
+                "aps_initial",
+                "gpt_initial",
+            ]
         );
-        assert_eq!(aps_selected.mask(), 0x0043);
+        assert_eq!(aps_selected.mask(), 0x0087);
+
+        let aps_creative_selected = select_first_display_slices_v1(
+            &first_display_projection(Some(aps_source())),
+            FirstDisplaySelectionConfigV1 {
+                enabled_integrations: &["aps", "creative", "gpt"],
+                creative: CreativeBootConfigV1 {
+                    enabled: true,
+                    click_guard: true,
+                    render_guard: false,
+                },
+                gam_attribution_enabled: false,
+            },
+        )
+        .expect("bounded APS/creative/GPT configuration should select the agent");
+        assert_eq!(aps_creative_selected.mask(), 0x008f);
 
         let mut prebid_projection = first_display_projection(Some(adm_source()));
         prebid_projection.bids[0].provider = "prebid".to_owned();
@@ -2284,9 +2342,14 @@ mod tests {
         .expect("bounded Prebid/GPT configuration should select the agent");
         assert_eq!(
             prebid_selected.slices(),
-            &["first_display", "gpt_initial", "prebid_initial"]
+            &[
+                "first_display",
+                "render_owner_initial",
+                "gpt_initial",
+                "prebid_initial",
+            ]
         );
-        assert_eq!(prebid_selected.mask(), 0x0841);
+        assert_eq!(prebid_selected.mask(), 0x1083);
     }
 
     #[test]
@@ -2307,10 +2370,26 @@ mod tests {
         ];
         let mut projection = first_display_projection(Some(adm_source()));
         projection.bids[0].provider = "prebid".to_owned();
+        assert!(
+            select_first_display_slices_v1(
+                &projection,
+                FirstDisplaySelectionConfigV1 {
+                    enabled_integrations: &enabled,
+                    creative: CreativeBootConfigV1 {
+                        enabled: true,
+                        click_guard: false,
+                        render_guard: true,
+                    },
+                    gam_attribution_enabled: false,
+                },
+            )
+            .is_none(),
+            "an oversized optional composition must fall through to persistent boot"
+        );
         let selected = select_first_display_slices_v1(
             &projection,
             FirstDisplaySelectionConfigV1 {
-                enabled_integrations: &enabled,
+                enabled_integrations: &["creative", "gpt", "prebid"],
                 creative: CreativeBootConfigV1 {
                     enabled: true,
                     click_guard: false,
@@ -2319,7 +2398,7 @@ mod tests {
                 gam_attribution_enabled: false,
             },
         )
-        .expect("the optimized closed composition should fit the generated budget");
+        .expect("the bounded owner/creative/GPT/Prebid composition should fit");
         assert!(trusted_server_js::first_display_mask_is_permitted(
             selected.mask()
         ));

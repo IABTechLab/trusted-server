@@ -1,8 +1,9 @@
 import type { FirstDisplaySliceActivationContext } from '../../shared/first_display_transaction';
-import {
-  createFirstDisplayRenderBridge,
-  type FirstDisplayRenderBridgeOptionsV1,
-} from '../render_bridge';
+import { createFirstDisplayApsRenderStrategy } from '../render_bridge';
+import type {
+  FirstDisplayRenderOwnerOptionsV1,
+  FirstDisplayRenderStrategyV1,
+} from '../render_journal';
 
 export type FirstDisplayApsDocumentMessageV1 =
   | Readonly<{ kind: 'document_accepted' }>
@@ -11,6 +12,14 @@ export type FirstDisplayApsDocumentMessageV1 =
   | Readonly<{
       kind: 'render_failed';
       reason: 'descriptor_invalid' | 'runner_no_load' | 'runner_failed';
+    }>;
+
+export type FirstDisplayApsWindowMessageV1 =
+  | Readonly<{ kind: 'bootstrap_ready'; bootstrap: string }>
+  | Readonly<{
+      kind: 'container_ready';
+      bootstrap: string;
+      renderer: string;
     }>;
 
 export interface FirstDisplayApsBootstrapPolicyV2 {
@@ -26,13 +35,9 @@ export interface FirstDisplayApsProtocolV1 {
   readonly sandbox: string;
   readonly permanentSandbox: string;
   readonly deadlines: Readonly<{
-    insertionMs: 1_000;
     documentAcceptanceMs: 3_000;
     completionMs: 10_000;
-    ownerSettlementMs: 20_000;
   }>;
-  readonly isReservationId: (candidate: unknown) => candidate is string;
-  readonly isLifecycleTicket: (candidate: unknown) => candidate is string;
   readonly isBootstrapNonce: (candidate: unknown) => candidate is string;
   readonly isRendererNonce: (candidate: unknown) => candidate is string;
   readonly bootstrapPolicy: (
@@ -42,9 +47,10 @@ export interface FirstDisplayApsProtocolV1 {
     candidate: unknown,
     expectedNonce: string
   ) => FirstDisplayApsDocumentMessageV1 | undefined;
-  readonly createRenderBridge: (
-    options: Omit<FirstDisplayRenderBridgeOptionsV1, 'getAps'>
-  ) => ReturnType<typeof createFirstDisplayRenderBridge>;
+  readonly parseWindowMessage: (candidate: unknown) => FirstDisplayApsWindowMessageV1 | undefined;
+  readonly createRenderStrategy: (
+    options: FirstDisplayRenderOwnerOptionsV1
+  ) => FirstDisplayRenderStrategyV1;
 }
 
 interface ApsInitialBindings {
@@ -53,7 +59,7 @@ interface ApsInitialBindings {
   readonly register: (protocol: FirstDisplayApsProtocolV1) => () => void;
 }
 
-const OPAQUE_ID = /^[abrtn]1_[A-Za-z0-9_-]{22}$/;
+const OPAQUE_ID = /^[bn]1_[A-Za-z0-9_-]{22}$/;
 const LOOPBACK_IPV4 = /^127(?:\.\d{1,3}){3}$/;
 const FAILURE_REASONS = new Set(['descriptor_invalid', 'runner_no_load', 'runner_failed']);
 const SANDBOX =
@@ -130,10 +136,7 @@ function bindings(candidate: unknown): ApsInitialBindings | undefined {
   }
 }
 
-function exactOpaqueId(
-  candidate: unknown,
-  prefix: 'r1_' | 't1_' | 'b1_' | 'n1_'
-): candidate is string {
+function exactOpaqueId(candidate: unknown, prefix: 'b1_' | 'n1_'): candidate is string {
   return typeof candidate === 'string' && candidate.startsWith(prefix) && OPAQUE_ID.test(candidate);
 }
 
@@ -165,6 +168,51 @@ function parseDocumentMessage(
     return Object.freeze({
       kind: 'render_failed',
       reason: failed.reason as 'descriptor_invalid' | 'runner_no_load' | 'runner_failed',
+    });
+  }
+  return undefined;
+}
+
+function parseWindowMessage(candidate: unknown): FirstDisplayApsWindowMessageV1 | undefined {
+  if (typeof candidate !== 'string' || candidate.length > 4_096) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(candidate) as unknown;
+  } catch {
+    return undefined;
+  }
+  const bootstrap = exactRecord(parsed, ['message', 'version', 'bootstrapNonce']);
+  if (
+    bootstrap?.message === 'TS APS Bootstrap Ready' &&
+    bootstrap.version === 1 &&
+    exactOpaqueId(bootstrap.bootstrapNonce, 'b1_') &&
+    candidate ===
+      JSON.stringify({
+        message: 'TS APS Bootstrap Ready',
+        version: 1,
+        bootstrapNonce: bootstrap.bootstrapNonce,
+      })
+  ) {
+    return Object.freeze({ kind: 'bootstrap_ready', bootstrap: bootstrap.bootstrapNonce });
+  }
+  const container = exactRecord(parsed, ['message', 'version', 'bootstrapNonce', 'rendererNonce']);
+  if (
+    container?.message === 'TS APS Container Ready' &&
+    container.version === 1 &&
+    exactOpaqueId(container.bootstrapNonce, 'b1_') &&
+    exactOpaqueId(container.rendererNonce, 'n1_') &&
+    candidate ===
+      JSON.stringify({
+        message: 'TS APS Container Ready',
+        version: 1,
+        bootstrapNonce: container.bootstrapNonce,
+        rendererNonce: container.rendererNonce,
+      })
+  ) {
+    return Object.freeze({
+      kind: 'container_ready',
+      bootstrap: container.bootstrapNonce,
+      renderer: container.rendererNonce,
     });
   }
   return undefined;
@@ -243,19 +291,16 @@ export function installApsInitial(
     sandbox: SANDBOX,
     permanentSandbox: PERMANENT_SANDBOX,
     deadlines: Object.freeze({
-      insertionMs: 1_000,
       documentAcceptanceMs: 3_000,
       completionMs: 10_000,
-      ownerSettlementMs: 20_000,
     }),
-    isReservationId: (input: unknown): input is string => exactOpaqueId(input, 'r1_'),
-    isLifecycleTicket: (input: unknown): input is string => exactOpaqueId(input, 't1_'),
     isBootstrapNonce: (input: unknown): input is string => exactOpaqueId(input, 'b1_'),
     isRendererNonce: (input: unknown): input is string => exactOpaqueId(input, 'n1_'),
     bootstrapPolicy: (renderer: unknown) => bootstrapPolicy(renderer, value.publisherOrigin),
     parseDocumentMessage,
-    createRenderBridge: (options: Omit<FirstDisplayRenderBridgeOptionsV1, 'getAps'>) =>
-      createFirstDisplayRenderBridge({ ...options, getAps: () => protocol }),
+    parseWindowMessage,
+    createRenderStrategy: (options: FirstDisplayRenderOwnerOptionsV1) =>
+      createFirstDisplayApsRenderStrategy(options, protocol),
   });
   const release = value.register(protocol);
   if (typeof release !== 'function') throw new TypeError('tsjs');

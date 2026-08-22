@@ -105,6 +105,8 @@ const CURRENT_PROVIDER_SOURCE_OWNERS = Object.freeze({
   'src/integrations/sourcepoint/consent.ts': 'sourcepoint_consent',
 });
 const CURRENT_EXACT_SOURCE_OWNERS = Object.freeze({
+  'src/first_display/render_journal.ts': 'render_owner_initial',
+  'src/first_display/render_bridge.ts': 'aps_initial',
   'src/core/adapters/gam_attribution.ts': 'bootstrap',
   'src/core/bootstrap.ts': 'bootstrap',
   'src/core/contracts/server_boot_transport.ts': 'bootstrap',
@@ -267,7 +269,7 @@ const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
   'src/core/trace.ts': Object.freeze(['core', 'gpt_diagnostics']),
   'src/kernel/contracts/message_protocol.ts': Object.freeze(['core', 'gpt']),
   'src/kernel/contracts/release_capacity.ts': Object.freeze(['core']),
-  'src/kernel/contracts/puc_dynamic_owner.ts': Object.freeze(['aps_initial', 'gpt']),
+  'src/kernel/contracts/puc_dynamic_owner.ts': Object.freeze(['render_owner_initial', 'gpt']),
   'src/kernel/diagnostics.ts': Object.freeze(['core']),
   'src/kernel/disposable.ts': Object.freeze(['core', 'gpt']),
   'src/kernel/fallback.ts': Object.freeze(['bootstrap', 'core']),
@@ -637,8 +639,8 @@ function validateMetricSets(sets, label) {
 /** Validate semantic set membership against exact release artifact ownership. */
 export function validateSemanticBundleSets(metrics, release, catalog) {
   if (catalog?.version !== 1) fail('catalog.version must equal 1');
-  if (!Array.isArray(catalog.firstDisplay) || catalog.firstDisplay.length !== 13) {
-    fail('catalog.firstDisplay must contain the closed thirteen-row inventory');
+  if (!Array.isArray(catalog.firstDisplay) || catalog.firstDisplay.length !== 14) {
+    fail('catalog.firstDisplay must contain the closed fourteen-row inventory');
   }
   if (release?.version !== 1 || !Array.isArray(release.artifacts)) {
     fail('release inventory is invalid');
@@ -875,6 +877,21 @@ function validateCurrentSourceOwnership(currentGraph, release) {
           violations.push(`${owner} reaches first-display source ${source}`);
         }
       }
+      const policy = currentExactSourceOwner(source);
+      if (policy) {
+        if (!artifactIds.has(policy.owner)) {
+          violations.push(`${source} requires missing current owner ${policy.owner}`);
+        } else {
+          for (const owner of owners) {
+            if (owner !== policy.owner) {
+              violations.push(`${owner} reaches ${policy.owner}-owned source ${source}`);
+            }
+          }
+          if (!owners.includes(policy.owner)) {
+            violations.push(`${source} is not reached by required owner ${policy.owner}`);
+          }
+        }
+      }
       continue;
     }
     const sharedOwners = CURRENT_SHARED_SOURCE_OWNER_POLICIES[source];
@@ -1053,7 +1070,9 @@ export function buildCandidateArchitectureSizeReport({
   const largestRaw = largestMask(permittedMasks, 'rawBytes');
   const largestGzip = largestMask(permittedMasks, 'gzipBytes');
   const largestBrotli = largestMask(permittedMasks, 'brotliBytes');
-  const maximalFiles = release.artifacts.map(({ file }) => file);
+  const maximalFiles = release.artifacts
+    .filter(({ role }) => role !== 'bootstrap')
+    .map(({ file }) => file);
   const maximalTotal = measureBundleSet(maximalFiles, currentArtifactContents);
   const named = {
     minimal: namedFirstDisplayMask(masks, ['first_display'], 'minimal'),
@@ -1064,7 +1083,7 @@ export function buildCandidateArchitectureSizeReport({
     ),
     aps: namedFirstDisplayMask(
       masks,
-      ['first_display', 'aps_initial', 'creative_initial', 'gpt_initial'],
+      ['first_display', 'render_owner_initial', 'aps_initial', 'creative_initial', 'gpt_initial'],
       'APS'
     ),
     largestRaw,

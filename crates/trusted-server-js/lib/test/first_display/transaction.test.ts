@@ -58,7 +58,7 @@ describe('release-private first-display transaction', () => {
     ).toBe(true);
     expect(
       transaction.register(
-        registration('gpt_initial', 7, (own) => {
+        registration('gpt_initial', 8, (own) => {
           own(() => events.push('dispose-gpt'));
           events.push('activate-gpt');
         })
@@ -91,7 +91,7 @@ describe('release-private first-display transaction', () => {
       }),
     });
     transaction.register(
-      registration('gpt_initial', 7, () => {
+      registration('gpt_initial', 8, () => {
         events.push('activate-gpt');
       })
     );
@@ -120,7 +120,7 @@ describe('release-private first-display transaction', () => {
     const omitted = make();
     expect(omitted.register(registration('first_display', 1))).toBe(true);
     expect(omitted.activate()).toBe(false);
-    expect(make().register(registration('gpt_initial', 7))).toBe(false);
+    expect(make().register(registration('gpt_initial', 8))).toBe(false);
     expect(
       make().register({ ...registration('first_display', 1), releaseId: 'b'.repeat(64) })
     ).toBe(false);
@@ -129,9 +129,9 @@ describe('release-private first-display transaction', () => {
     expect(make().register(accessor)).toBe(false);
     const late = make();
     expect(late.register(registration('first_display', 1))).toBe(true);
-    expect(late.register(registration('gpt_initial', 7))).toBe(true);
+    expect(late.register(registration('gpt_initial', 8))).toBe(true);
     expect(late.activate()).toBe(true);
-    expect(late.register(registration('gpt_initial', 7))).toBe(false);
+    expect(late.register(registration('gpt_initial', 8))).toBe(false);
   });
 
   it('authenticates the exact parser-inserted current script and current generation', () => {
@@ -177,7 +177,7 @@ describe('release-private first-display transaction', () => {
       })
     );
     transaction.register(
-      registration('gpt_initial', 7, (own) => {
+      registration('gpt_initial', 8, (own) => {
         own(() => events.push('dispose-c'));
         throw new Error('boom');
       })
@@ -186,5 +186,65 @@ describe('release-private first-display transaction', () => {
     expect(transaction.activate()).toBe(false);
     expect(events).toEqual(['dispose-c', 'dispose-b', 'dispose-a']);
     expect(transaction.state).toBe('failed');
+  });
+
+  it('cannot continue activation or resurrect after a slice disposes reentrantly', () => {
+    const { document, script } = documentWithScript();
+    const events: string[] = [];
+    const transaction = createFirstDisplayTransaction({
+      document,
+      script,
+      releaseId: RELEASE_ID,
+      generation: 7,
+      expectedSliceIds: ['first_display', 'gpt_initial'],
+      isCurrentGeneration: () => true,
+    });
+    transaction.register(
+      registration('first_display', 1, (own) => {
+        own(() => events.push('dispose-base'));
+        events.push('activate-base');
+        transaction.dispose();
+      })
+    );
+    transaction.register(
+      registration('gpt_initial', 8, () => {
+        events.push('activate-gpt');
+      })
+    );
+
+    expect(transaction.activate()).toBe(false);
+    expect(transaction.state).toBe('disposed');
+    expect(events).toEqual(['activate-base', 'dispose-base']);
+  });
+
+  it('removes each disposer before invoking it during recursive rollback', () => {
+    const { document, script } = documentWithScript();
+    const events: string[] = [];
+    const transaction = createFirstDisplayTransaction({
+      document,
+      script,
+      releaseId: RELEASE_ID,
+      generation: 7,
+      expectedSliceIds: ['first_display', 'gpt_initial'],
+      isCurrentGeneration: () => true,
+    });
+    transaction.register(
+      registration('first_display', 1, (own) => {
+        own(() => events.push('dispose-a'));
+        own(() => {
+          events.push('dispose-b');
+          transaction.dispose();
+        });
+      })
+    );
+    transaction.register(
+      registration('gpt_initial', 8, () => {
+        throw new Error('boom');
+      })
+    );
+
+    expect(transaction.activate()).toBe(false);
+    expect(transaction.state).toBe('disposed');
+    expect(events).toEqual(['dispose-b', 'dispose-a']);
   });
 });

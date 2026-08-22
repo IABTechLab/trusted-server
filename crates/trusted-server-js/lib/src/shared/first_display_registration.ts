@@ -6,6 +6,7 @@ const COMPONENT_ID = /^[a-z][a-z0-9_]{0,63}$/;
 const FIRST_DISPLAY_SRC =
   /^\/static\/tsjs=tsjs-first-display\.min\.js\?m=[0-9a-f]{4}&v=[0-9a-f]{64}$/;
 const PARSER_SLICE_ORDER = Object.freeze([
+  'render_owner_initial',
   'aps_initial',
   'creative_initial',
   'datadome_initial',
@@ -187,7 +188,7 @@ export function snapshotFirstDisplayComponentRegistration(
       !HASH.test(registration.releaseId) ||
       !Number.isInteger(registration.order) ||
       registration.order < 1 ||
-      registration.order > 13 ||
+      registration.order > 14 ||
       typeof registration.prepare !== 'function'
     ) {
       return undefined;

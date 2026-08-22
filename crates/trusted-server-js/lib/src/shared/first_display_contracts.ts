@@ -3,6 +3,7 @@ import type { FirstDisplayGptDiagnosticsV1, FirstDisplayGptFactV1 } from '../sha
 
 export const FIRST_DISPLAY_CONTRACT_IDS: readonly FirstDisplaySliceId[] = Object.freeze([
   'first_display',
+  'render_owner_initial',
   'aps_initial',
   'creative_initial',
   'datadome_initial',
@@ -198,6 +199,13 @@ function snapshotSlices(value: unknown): readonly FirstDisplaySliceId[] | undefi
     const order = FIRST_DISPLAY_ORDER.get(slice as FirstDisplaySliceId);
     if (!order || order <= previous) return undefined;
     previous = order;
+  }
+  const renderOwner = slices.includes('render_owner_initial');
+  if (
+    (slices.includes('aps_initial') && !renderOwner) ||
+    (renderOwner && !slices.includes('gpt_initial'))
+  ) {
+    return undefined;
   }
   return slices as readonly FirstDisplaySliceId[];
 }
@@ -467,6 +475,7 @@ function validParserValues(
   const integer = (value: string | number | boolean | null): value is number =>
     typeof value === 'number' && Number.isInteger(value) && value >= 0;
   switch (sliceId) {
+    case 'render_owner_initial':
     case 'aps_initial':
     case 'prebid_initial':
       return single('protocol_version', (value) => value === 1);
@@ -519,7 +528,9 @@ function snapshotParserState(value: unknown): Readonly<Record<string, unknown>> 
   const entries = exactArray(fields?.values, 256);
   if (
     !fields ||
-    !snapshotSlices(['first_display', fields.sliceId]) ||
+    typeof fields.sliceId !== 'string' ||
+    fields.sliceId === 'first_display' ||
+    !FIRST_DISPLAY_ORDER.has(fields.sliceId as FirstDisplaySliceId) ||
     !observations ||
     !entries ||
     observations.length !== entries.length

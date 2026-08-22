@@ -7,4 +7,4 @@ export const CREATIVE_INITIAL_SLICE = defineInitialSlice(
   installCreativeInitial
 );
 
-registerInitialSlice(CREATIVE_INITIAL_SLICE, 3);
+registerInitialSlice(CREATIVE_INITIAL_SLICE, 4);

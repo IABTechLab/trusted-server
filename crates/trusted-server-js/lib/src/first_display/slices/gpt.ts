@@ -12,4 +12,4 @@ export const GPT_INITIAL_SLICE = defineInitialSlice('gpt_initial', (candidate, o
   )
 );
 
-registerInitialSlice(GPT_INITIAL_SLICE, 7);
+registerInitialSlice(GPT_INITIAL_SLICE, 8);

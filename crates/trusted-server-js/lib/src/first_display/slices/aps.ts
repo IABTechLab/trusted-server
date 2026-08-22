@@ -4,4 +4,4 @@ import { defineInitialSlice, registerInitialSlice } from './definition';
 
 export const APS_INITIAL_SLICE = defineInitialSlice('aps_initial', installApsInitial);
 
-registerInitialSlice(APS_INITIAL_SLICE, 2);
+registerInitialSlice(APS_INITIAL_SLICE, 3);

@@ -915,40 +915,46 @@ fn first_display_static_transport_selections(
     let creative_guard = creative.enabled && (creative.click_guard || creative.render_guard);
     let mut selections = Vec::new();
     for gpt_participates in [false, true] {
-        for aps_participates in aps_values {
-            if *aps_participates && !gpt_participates {
+        for render_owner_participates in [false, true] {
+            if render_owner_participates && !gpt_participates {
                 continue;
             }
-            for prebid_participates in prebid_values {
-                if *prebid_participates && !gpt_participates {
+            for aps_participates in aps_values {
+                if *aps_participates && !render_owner_participates {
                     continue;
                 }
-                let mut mask = 0_u16;
-                let mut slices = Vec::new();
-                for (index, metadata) in trusted_server_js::all_first_display_metadata()
-                    .into_iter()
-                    .enumerate()
-                {
-                    let selected = match metadata.include {
-                        Some("eligible_batch") => true,
-                        Some("gpt_initial") => gpt_participates,
-                        Some("aps_participates") => *aps_participates,
-                        Some("creative_guard") => creative_guard,
-                        Some("prebid_participates") => *prebid_participates,
-                        Some(predicate) => predicate
-                            .strip_prefix("integration:")
-                            .is_some_and(|id| inner.enabled_integration_ids.contains(&id)),
-                        None => false,
-                    };
-                    if selected {
-                        mask |= 1_u16 << index;
-                        slices.push(metadata.id);
+                for prebid_participates in prebid_values {
+                    if *prebid_participates && !gpt_participates {
+                        continue;
                     }
-                }
-                if slices.first() == Some(&"first_display")
-                    && trusted_server_js::first_display_mask_is_permitted(mask)
-                {
-                    selections.push((mask, slices));
+                    let mut mask = 0_u16;
+                    let mut slices = Vec::new();
+                    for (index, metadata) in trusted_server_js::all_first_display_metadata()
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let selected = match metadata.include {
+                            Some("eligible_batch") => true,
+                            Some("render_owner_participates") => render_owner_participates,
+                            Some("gpt_initial") => gpt_participates,
+                            Some("aps_participates") => *aps_participates,
+                            Some("creative_guard") => creative_guard,
+                            Some("prebid_participates") => *prebid_participates,
+                            Some(predicate) => predicate
+                                .strip_prefix("integration:")
+                                .is_some_and(|id| inner.enabled_integration_ids.contains(&id)),
+                            None => false,
+                        };
+                        if selected {
+                            mask |= 1_u16 << index;
+                            slices.push(metadata.id);
+                        }
+                    }
+                    if slices.first() == Some(&"first_display")
+                        && trusted_server_js::first_display_mask_is_permitted(mask)
+                    {
+                        selections.push((mask, slices));
+                    }
                 }
             }
         }
@@ -2707,12 +2713,20 @@ mod tests {
                     .expect("catalog should contain slice")
         };
         let fixed = bit("first_display") | bit("creative_initial");
+        let owner = bit("render_owner_initial");
         let gpt = bit("gpt_initial");
         let aps = bit("aps_initial");
         let prebid = bit("prebid_initial");
         assert_eq!(
             masks,
-            vec![fixed, fixed | gpt, fixed | gpt | aps, fixed | gpt | prebid,],
+            vec![
+                fixed,
+                fixed | gpt,
+                fixed | owner | gpt,
+                fixed | owner | aps | gpt,
+                fixed | gpt | prebid,
+                fixed | owner | gpt | prebid,
+            ],
             "registry should enumerate every configuration-reachable mask admitted by the fixed transfer ceiling"
         );
         for mask in masks {

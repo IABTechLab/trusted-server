@@ -1,38 +1,19 @@
-import { PUC_DYNAMIC_OWNER } from '../kernel/contracts/puc_dynamic_owner';
-
-import type {
-  FirstDisplayGptBoundCycleV1,
-  FirstDisplayGptRenderResult,
-} from './adapters/googletag';
-import type { FirstDisplayRenderBridgeV1 } from './driver';
+import type { FirstDisplayGptBoundCycleV1 } from './adapters/googletag';
 import type { FirstDisplayApsProtocolV1 } from './leaf/aps_protocol';
+import type {
+  FirstDisplayCommittedRenderArtifactV1,
+  FirstDisplayRenderOwnerOptionsV1,
+  FirstDisplayRenderStrategyAttemptV1,
+  FirstDisplayRenderStrategyCallbacksV1,
+  FirstDisplayRenderStrategyV1,
+} from './render_journal';
 
-const ADM_SANDBOX =
-  'allow-forms allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation';
 const RENDERER_DOCUMENT_NO_LOAD = 'renderer_document_no_load';
 const INTERNAL_ERROR = 'internal_error';
 const RUNNER_FAILED = 'runner_failed';
-const ADM_DOCUMENT_NO_LOAD = 'adm_document_no_load';
 const WINNER_NOT_RENDERABLE = 'winner_not_renderable';
-const NAVIGATION_DISPOSED = 'navigation_disposed';
-const SLOT_UNRESOLVED = 'slot_unresolved';
-const CLAIM_DEADLINE_MS = 3_000;
-const ADM_LOAD_DEADLINE_MS = 5_000;
-const TICKET_TTL_MS = 3_000;
-const RESERVATION_TTL_MS = 15 * 60 * 1_000;
-const MAX_CAPABILITIES = 320;
-const MAX_NONCES = 256;
 const MAX_DRAWS = 8;
-const MAX_GLOBAL_MESSAGE_BYTES = 4_096;
-const MAX_DOMAIN_BYTES = 2_048;
-const MAX_OWNER_BYTES = 64 * 1_024;
-const MAX_RESPONSE_BYTES = 72 * 1_024;
-const RESERVATION_ID = /^r1_[A-Za-z0-9_-]{22}$/;
-const TICKET_ID = /^t1_[A-Za-z0-9_-]{22}$/;
-const BOOTSTRAP_NONCE_ID = /^b1_[A-Za-z0-9_-]{22}$/;
-const NONCE_ID = /^n1_[A-Za-z0-9_-]{22}$/;
 const BASE64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-const textEncoder = new TextEncoder();
 
 interface PortLike {
   readonly addEventListener?: (name: string, listener: (event: unknown) => void) => void;
@@ -42,278 +23,31 @@ interface PortLike {
   readonly start?: () => void;
 }
 
-interface ChannelLike {
-  readonly port1: PortLike;
-  readonly port2: PortLike;
-}
-
-export interface FirstDisplayRenderBridgeOptionsV1 {
-  readonly browser: Window;
-  readonly clearTimer: (handle: unknown) => void;
-  readonly createChannel: () => ChannelLike;
-  readonly document: Document;
-  readonly fillRandom: (bytes: Uint8Array) => void;
-  readonly getAps: () => FirstDisplayApsProtocolV1 | undefined;
-  readonly now: () => number;
-  readonly onNativeMutation?: () => boolean;
-  readonly setTimer: (callback: () => void, delayMs: number) => unknown;
-}
-
-interface PendingClaim {
-  readonly port: PortLike;
-  readonly source: object;
-}
-
-interface Attempt {
+interface ApsAttempt {
+  readonly callbacks: FirstDisplayRenderStrategyCallbacksV1;
   readonly cycle: FirstDisplayGptBoundCycleV1;
-  readonly onTerminal: (result: 'accepted' | 'failed' | 'cancelled', reason: string | null) => void;
-  readonly reservationId: string;
+  readonly overlay: boolean;
   active: boolean;
+  accepted: boolean;
   bootstrapNavigated: boolean;
-  bootstrapNonce: string | undefined;
+  bootstrapNonceInternal: string;
   bootstrapSource: object | undefined;
-  claim: PendingClaim | undefined;
-  claimTimer: unknown;
   completionTimer: unknown;
-  controlPort: PortLike | undefined;
-  controlRelease: (() => void) | undefined;
-  directFrame: HTMLIFrameElement | undefined;
   documentAccepted: boolean;
-  documentAcceptancePending: boolean;
   documentPort: PortLike | undefined;
   documentRelease: (() => void) | undefined;
   documentTimer: unknown;
-  documentTransferred: PortLike | undefined;
-  gam: FirstDisplayGptRenderResult | undefined;
+  frame: HTMLIFrameElement;
   hostPositionOwned: boolean;
-  inserted: boolean;
-  insertionTimer: unknown;
-  ownerTicket: string | undefined;
-  overlay: boolean;
-  previousHostPosition: string;
-  previousHostPositionPriority: string;
-  rendererNonce: string | undefined;
-  ownerSource: object | undefined;
-  pendingDocumentTerminal:
+  pendingTerminal:
     | 'completed'
     | typeof WINNER_NOT_RENDERABLE
     | 'runner_no_load'
     | typeof RUNNER_FAILED
     | undefined;
-  phaseValue:
-    | 'waiting_for_gam_and_claim'
-    | 'waiting_for_owner'
-    | 'waiting_for_insertion'
-    | 'rendering_direct';
-  ticket: string | undefined;
-}
-
-interface LiveTicket {
-  readonly attempt: Attempt;
-  readonly expiresAtInternal: number;
-  readonly ordinalInternal: number;
-  readonly registryState: 'live';
-  timer?: unknown;
-}
-
-interface TicketTombstone {
-  readonly expiresAtInternal: number;
-  readonly ordinalInternal: number;
-  readonly registryState: 'tombstone';
-  timer?: unknown;
-}
-
-type TicketEntry = LiveTicket | TicketTombstone;
-
-interface ReservationEntry {
-  readonly expiresAtInternal: number;
-  readonly ordinalInternal: number;
-  readonly registryState: 'live' | 'tombstone';
-}
-
-function utf8Length(value: string): number {
-  return textEncoder.encode(value).byteLength;
-}
-
-function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | undefined {
-  try {
-    if (
-      typeof value !== 'object' ||
-      value === null ||
-      Array.isArray(value) ||
-      Object.getPrototypeOf(value) !== Object.prototype ||
-      Object.getOwnPropertySymbols(value).length !== 0
-    ) {
-      return undefined;
-    }
-    const names = Object.getOwnPropertyNames(value).sort();
-    const expected = [...keys].sort();
-    if (names.length !== expected.length) return undefined;
-    const result: Record<string, unknown> = {};
-    for (let index = 0; index < expected.length; index += 1) {
-      const name = expected[index];
-      if (!name || names[index] !== name) return undefined;
-      const descriptor = Object.getOwnPropertyDescriptor(value, name);
-      if (!descriptor?.enumerable || !('value' in descriptor)) return undefined;
-      result[name] = descriptor.value;
-    }
-    return result;
-  } catch {
-    return undefined;
-  }
-}
-
-function skipJsonWhitespace(source: string, start: number): number {
-  let index = start;
-  while (
-    source[index] === ' ' ||
-    source[index] === '\t' ||
-    source[index] === '\n' ||
-    source[index] === '\r'
-  ) {
-    index += 1;
-  }
-  return index;
-}
-
-function scanJsonString(source: string, start: number): number | undefined {
-  if (source[start] !== '"') return undefined;
-  let index = start + 1;
-  while (index < source.length) {
-    const character = source[index];
-    if (character === '"') return index + 1;
-    if (character === '\\') {
-      index += 1;
-      if (index >= source.length) return undefined;
-      if (source[index] === 'u') {
-        if (!/^[0-9a-fA-F]{4}$/.test(source.slice(index + 1, index + 5))) return undefined;
-        index += 4;
-      }
-    } else if (character !== undefined && character.charCodeAt(0) < 0x20) {
-      return undefined;
-    }
-    index += 1;
-  }
-  return undefined;
-}
-
-function scanJsonValue(source: string, start: number): number | undefined {
-  let index = skipJsonWhitespace(source, start);
-  if (source[index] === '"') return scanJsonString(source, index);
-  if (source[index] === '[') {
-    index = skipJsonWhitespace(source, index + 1);
-    if (source[index] === ']') return index + 1;
-    while (index < source.length) {
-      const end = scanJsonValue(source, index);
-      if (end === undefined) return undefined;
-      index = skipJsonWhitespace(source, end);
-      if (source[index] === ']') return index + 1;
-      if (source[index] !== ',') return undefined;
-      index = skipJsonWhitespace(source, index + 1);
-    }
-    return undefined;
-  }
-  if (source[index] === '{') {
-    const keys = new Set<string>();
-    index = skipJsonWhitespace(source, index + 1);
-    if (source[index] === '}') return index + 1;
-    while (index < source.length) {
-      const keyEnd = scanJsonString(source, index);
-      if (keyEnd === undefined) return undefined;
-      let key: unknown;
-      try {
-        key = JSON.parse(source.slice(index, keyEnd)) as unknown;
-      } catch {
-        return undefined;
-      }
-      if (typeof key !== 'string' || keys.has(key)) return undefined;
-      keys.add(key);
-      index = skipJsonWhitespace(source, keyEnd);
-      if (source[index] !== ':') return undefined;
-      const valueEnd = scanJsonValue(source, index + 1);
-      if (valueEnd === undefined) return undefined;
-      index = skipJsonWhitespace(source, valueEnd);
-      if (source[index] === '}') return index + 1;
-      if (source[index] !== ',') return undefined;
-      index = skipJsonWhitespace(source, index + 1);
-    }
-    return undefined;
-  }
-  const match = /^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/.exec(
-    source.slice(index)
-  );
-  return match ? index + match[0].length : undefined;
-}
-
-function parseJson(source: string): unknown {
-  if (utf8Length(source) > MAX_GLOBAL_MESSAGE_BYTES) return undefined;
-  const end = scanJsonValue(source, 0);
-  if (end === undefined || skipJsonWhitespace(source, end) !== source.length) return undefined;
-  try {
-    return JSON.parse(source) as unknown;
-  } catch {
-    return undefined;
-  }
-}
-
-function routingMessage(data: unknown): Readonly<{
-  adId?: string;
-  lifecycleTicket?: string;
-  message?: string;
-}> {
-  const value = typeof data === 'string' ? parseJson(data) : data;
-  try {
-    if (
-      typeof value !== 'object' ||
-      value === null ||
-      Array.isArray(value) ||
-      Object.getPrototypeOf(value) !== Object.prototype
-    ) {
-      return Object.freeze({});
-    }
-    const read = (name: string): string | undefined => {
-      const descriptor = Object.getOwnPropertyDescriptor(value, name);
-      return descriptor?.enumerable && 'value' in descriptor && typeof descriptor.value === 'string'
-        ? descriptor.value
-        : undefined;
-    };
-    const message = read('message');
-    const adId = read('adId');
-    const lifecycleTicket = read('lifecycleTicket');
-    return Object.freeze({
-      ...(message ? { message } : {}),
-      ...(adId ? { adId } : {}),
-      ...(lifecycleTicket ? { lifecycleTicket } : {}),
-    });
-  } catch {
-    return Object.freeze({});
-  }
-}
-
-function exactPrebidRequest(data: unknown): Record<string, unknown> | undefined {
-  if (typeof data !== 'string') return undefined;
-  const fields = exactRecord(parseJson(data), ['message', 'adId', 'adServerDomain']);
-  return fields?.message === 'Prebid Request' &&
-    typeof fields.adId === 'string' &&
-    RESERVATION_ID.test(fields.adId) &&
-    typeof fields.adServerDomain === 'string' &&
-    fields.adServerDomain.length > 0 &&
-    utf8Length(fields.adServerDomain) <= MAX_DOMAIN_BYTES
-    ? fields
-    : undefined;
-}
-
-function exactOwnerRegistration(data: unknown): Record<string, unknown> | undefined {
-  if (typeof data !== 'string') return undefined;
-  const fields = exactRecord(parseJson(data), ['message', 'adId', 'version', 'lifecycleTicket']);
-  return fields?.message === 'TS Render Owner Register' &&
-    fields.version === 1 &&
-    typeof fields.adId === 'string' &&
-    RESERVATION_ID.test(fields.adId) &&
-    typeof fields.lifecycleTicket === 'string' &&
-    TICKET_ID.test(fields.lifecycleTicket)
-    ? fields
-    : undefined;
+  previousHostPosition: string;
+  previousHostPositionPriority: string;
+  rendererNonceInternal: string;
 }
 
 function eventField(
@@ -347,22 +81,18 @@ function usablePort(value: unknown): value is PortLike {
   }
 }
 
-function inspectPorts(
+function exactPorts(
   event: unknown,
-  trustedPrototype: object | undefined
-):
-  | Readonly<{
-      exact: boolean;
-      originalCount: number;
-      ports: readonly PortLike[];
-    }>
-  | undefined {
+  trustedPrototype: object | undefined,
+  expected: 0 | 1
+): readonly PortLike[] | undefined {
   const value = eventField(event, 'ports', trustedPrototype);
   try {
     if (!Array.isArray(value)) return undefined;
     const length = Object.getOwnPropertyDescriptor(value, 'length');
     if (!length || !('value' in length) || !Number.isSafeInteger(length.value)) return undefined;
     let exact =
+      length.value === expected &&
       Object.getPrototypeOf(value) === Array.prototype &&
       Object.getOwnPropertySymbols(value).length === 0 &&
       Object.getOwnPropertyNames(value).length === length.value + 1;
@@ -381,7 +111,9 @@ function inspectPorts(
       seen.add(descriptor.value);
       ports.push(descriptor.value);
     }
-    return Object.freeze({ exact, originalCount: length.value, ports: Object.freeze(ports) });
+    if (exact && ports.length === expected) return ports;
+    for (const port of ports) closePort(port);
+    return undefined;
   } catch {
     return undefined;
   }
@@ -394,60 +126,31 @@ function eventSource(event: unknown, trustedPrototype: object | undefined): obje
     : undefined;
 }
 
-function suppress(event: unknown): boolean {
-  try {
-    if (typeof event !== 'object' || event === null) return false;
-    const stop = Reflect.get(event, 'stopImmediatePropagation');
-    if (typeof stop !== 'function') return false;
-    Reflect.apply(stop, event, []);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function closePort(port: PortLike | undefined): void {
   try {
     port?.close();
   } catch {
-    // Authority is already inert; endpoint cleanup remains best-effort.
+    // The endpoint is already generation-inert.
   }
 }
 
-function post(port: PortLike, data: unknown, transfer: readonly PortLike[] = []): boolean {
+function post(port: PortLike, message: unknown): boolean {
   try {
-    Reflect.apply(port.postMessage, port, [data, transfer]);
+    Reflect.apply(port.postMessage, port, [message, []]);
     return true;
   } catch {
     return false;
   }
 }
 
-function listen(
-  port: PortLike,
-  receive: (event: unknown) => void,
-  receiveError: () => void
-): (() => void) | undefined {
+function postWindow(target: object, message: string): boolean {
   try {
-    if (typeof port.addEventListener !== 'function') return undefined;
-    Reflect.apply(port.addEventListener, port, ['message', receive]);
-    Reflect.apply(port.addEventListener, port, ['messageerror', receiveError]);
-    if (typeof port.start === 'function') Reflect.apply(port.start, port, []);
-    let live = true;
-    return () => {
-      if (!live) return;
-      live = false;
-      try {
-        if (typeof port.removeEventListener === 'function') {
-          Reflect.apply(port.removeEventListener, port, ['message', receive]);
-          Reflect.apply(port.removeEventListener, port, ['messageerror', receiveError]);
-        }
-      } catch {
-        // Port closure below remains authoritative.
-      }
-    };
+    const postMessage = Reflect.get(target, 'postMessage');
+    if (typeof postMessage !== 'function') return false;
+    Reflect.apply(postMessage, target, [message, '*', []]);
+    return true;
   } catch {
-    return undefined;
+    return false;
   }
 }
 
@@ -468,155 +171,24 @@ function encodeOpaque(bytes: Uint8Array): string {
   return output;
 }
 
-function validCycle(cycle: FirstDisplayGptBoundCycleV1): boolean {
+function snapshotFrameAttributes(frame: HTMLIFrameElement): string | undefined {
   try {
-    const source = cycle.bid.renderSource;
-    const document = cycle.element.ownerDocument;
-    let exactElementMatches = 0;
-    const elements = document.getElementsByTagName('*');
-    for (let index = 0; index < elements.length; index += 1) {
-      const candidate = elements.item(index);
-      if (candidate?.id !== cycle.element.id) continue;
-      if (candidate !== cycle.element) return false;
-      exactElementMatches += 1;
-    }
-    return (
-      cycle.isCurrent() &&
-      cycle.slotId === cycle.bid.slot &&
-      cycle.slotId === cycle.placement.slot &&
-      exactElementMatches === 1 &&
-      document.getElementById(cycle.element.id) === cycle.element &&
-      RESERVATION_ID.test(cycle.bid.rendererReservationId) &&
-      (source.type === 'adm' || source.type === 'aps')
-    );
+    return frame.outerHTML;
   } catch {
-    return false;
+    return undefined;
   }
 }
 
-function refusedResponse(adId: string): string {
-  return JSON.stringify({
-    message: 'Prebid Response',
-    adId,
-    rendererVersion: '4',
-    tsOwner: { version: 1, status: 'refused' },
-  });
-}
-
-function ownerRefused(adId: string): string {
-  return JSON.stringify({ message: 'TS Render Owner Refused', adId, version: 1 });
-}
-
-function resizeCollapsedPucShell(
-  document: Document,
-  source: object,
-  width: number,
-  height: number
-): boolean {
-  try {
-    const browser = document.defaultView;
-    if (
-      !browser ||
-      !Number.isFinite(width) ||
-      !Number.isFinite(height) ||
-      width <= 0 ||
-      height <= 0
-    ) {
-      return false;
-    }
-    const frames = document.querySelectorAll('iframe');
-    let selected: HTMLIFrameElement | undefined;
-    for (let index = 0; index < frames.length; index += 1) {
-      const candidate = frames.item(index);
-      if (candidate?.isConnected && candidate.contentWindow === source) {
-        if (selected) return false;
-        selected = candidate;
-      }
-    }
-    const onePixelAttribute = (element: Element, name: 'width' | 'height'): boolean => {
-      const value = element.getAttribute(name);
-      if (value === null || !/^\d+(?:\.\d+)?$/.test(value)) return false;
-      const parsed = Number(value);
-      return Number.isFinite(parsed) && parsed <= 1;
-    };
-    const ordinaryCollapsed = (element: HTMLElement): boolean => {
-      const style = browser.getComputedStyle(element);
-      const pixel = (value: string): boolean => {
-        const match = /^(\d+(?:\.\d+)?)px$/.exec(value);
-        return match !== null && Number(match[1]) <= 1;
-      };
-      return (
-        style.position !== 'fixed' &&
-        style.position !== 'sticky' &&
-        pixel(style.width) &&
-        pixel(style.height)
-      );
-    };
-    if (
-      !selected ||
-      !onePixelAttribute(selected, 'width') ||
-      !onePixelAttribute(selected, 'height') ||
-      !ordinaryCollapsed(selected) ||
-      selected.closest('a,[data-anchor-status]') !== null
-    ) {
-      return false;
-    }
-    const wrapper = selected.parentElement;
-    if (
-      !wrapper ||
-      wrapper === document.body ||
-      wrapper === document.documentElement ||
-      wrapper.tagName === 'A' ||
-      !wrapper.isConnected ||
-      !ordinaryCollapsed(wrapper) ||
-      wrapper.closest('a,[data-anchor-status]') !== null
-    ) {
-      return false;
-    }
-    selected.style.setProperty('width', `${width}px`);
-    selected.style.setProperty('height', `${height}px`);
-    wrapper.style.setProperty('width', `${width}px`);
-    wrapper.style.setProperty('height', `${height}px`);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Own the bounded APS/ADM authority used only by the immutable first-display batch. */
-export function createFirstDisplayRenderBridge(
-  options: FirstDisplayRenderBridgeOptionsV1
-): FirstDisplayRenderBridgeV1 {
-  const attempts = new Map<string, Attempt>();
-  const reservations = new Map<string, ReservationEntry>();
-  const tickets = new Map<string, TicketEntry>();
-  const bootstrapNonces = new Map<string, Attempt>();
-  const rendererNonces = new Map<string, Attempt>();
-  const committedFrames = new Map<
-    string,
-    Readonly<{
-      frame: HTMLIFrameElement;
-      frameAttributes: string;
-      frameContentWindow: Window;
-      frameSource: string;
-      frameSourceDocument: string;
-      host: HTMLElement;
-      hostPosition: string | null;
-      hostPositionPriority: string | null;
-      kind: 'gpt_adm' | 'aps';
-      owner: 'trusted_server';
-      token: string;
-    }>
-  >();
+/** Create the APS-owned URL, nonce, document-port, and overlay strategy. */
+export function createFirstDisplayApsRenderStrategy(
+  options: FirstDisplayRenderOwnerOptionsV1,
+  aps: FirstDisplayApsProtocolV1
+): FirstDisplayRenderStrategyV1 {
+  const attempts = new Set<ApsAttempt>();
+  const bootstrapNonces = new Map<string, ApsAttempt>();
+  const rendererNonces = new Map<string, ApsAttempt>();
   const timers = new Set<unknown>();
   let disposed = false;
-  let sealed = false;
-  let ingressClosed = false;
-  let handoffCaptured = false;
-  let committedArtifactsDetached = false;
-  let nextTicketOrdinal = 1;
-  let nextReservationOrdinal = 1;
-  let lastNow = Number.NEGATIVE_INFINITY;
   const messageEventPrototype = (() => {
     try {
       const constructor = Reflect.get(options.browser, 'MessageEvent');
@@ -628,128 +200,12 @@ export function createFirstDisplayRenderBridge(
     }
   })();
 
-  const apsProtocol = (): FirstDisplayApsProtocolV1 | undefined => {
-    try {
-      return options.getAps();
-    } catch {
-      return undefined;
-    }
-  };
-
-  const readNow = (): number | undefined => {
-    try {
-      const value = options.now();
-      if (!Number.isFinite(value) || value < 0 || value < lastNow) return undefined;
-      lastNow = value;
-      return value;
-    } catch {
-      return undefined;
-    }
-  };
-
   const notifyNativeMutation = (): void => {
     try {
       options.onNativeMutation?.();
     } catch {
-      // Mutation observation cannot alter the admitted publisher or browser event.
+      // Observation cannot alter admitted APS state.
     }
-  };
-
-  const disposeCommittedFrame = (
-    entry: Readonly<{
-      frame: HTMLIFrameElement;
-      host: HTMLElement;
-      hostPosition: string | null;
-      hostPositionPriority: string | null;
-    }>
-  ): void => {
-    try {
-      entry.frame.onload = null;
-      entry.frame.onerror = null;
-      entry.frame.remove();
-    } catch {
-      // The exact TS node loses authority even when hostile DOM cleanup fails.
-    }
-    if (entry.hostPosition === null) return;
-    try {
-      const style = entry.host.style;
-      if (
-        style.getPropertyValue('position') !== 'relative' ||
-        style.getPropertyPriority('position') !== ''
-      ) {
-        return;
-      }
-      if (entry.hostPosition === '') style.removeProperty('position');
-      else style.setProperty('position', entry.hostPosition, entry.hostPositionPriority ?? '');
-    } catch {
-      // Compare-owned restoration cannot overwrite publisher style changes.
-    }
-  };
-
-  const snapshotFrameAttributes = (frame: HTMLIFrameElement): string | undefined => {
-    try {
-      return JSON.stringify(
-        [...frame.attributes]
-          .map((attribute) => [attribute.name, attribute.value] as const)
-          .sort(([left], [right]) => left.localeCompare(right))
-      );
-    } catch {
-      return undefined;
-    }
-  };
-
-  const retireCommitted = (cycle: FirstDisplayGptBoundCycleV1): boolean => {
-    if (disposed || committedArtifactsDetached) return false;
-    const entry = committedFrames.get(cycle.slotId);
-    if (!entry || entry.token !== cycle.bid.rendererReservationId) return false;
-    committedFrames.delete(cycle.slotId);
-    disposeCommittedFrame(entry);
-    notifyNativeMutation();
-    return true;
-  };
-
-  const committedFrameCurrent = (entry: {
-    readonly frame: HTMLIFrameElement;
-    readonly frameAttributes: string;
-    readonly frameContentWindow: Window;
-    readonly frameSource: string;
-    readonly frameSourceDocument: string;
-    readonly host: HTMLElement;
-    readonly hostPosition: string | null;
-  }): boolean => {
-    try {
-      return (
-        entry.frame.ownerDocument === options.document &&
-        entry.host.ownerDocument === options.document &&
-        entry.frame.parentNode === entry.host &&
-        entry.frame.isConnected &&
-        entry.frame.contentWindow === entry.frameContentWindow &&
-        entry.frame.src === entry.frameSource &&
-        entry.frame.srcdoc === entry.frameSourceDocument &&
-        snapshotFrameAttributes(entry.frame) === entry.frameAttributes &&
-        entry.host.isConnected &&
-        entry.host.id.length > 0 &&
-        options.document.getElementById(entry.host.id) === entry.host &&
-        (entry.hostPosition === null ||
-          (entry.host.style.getPropertyValue('position') === 'relative' &&
-            entry.host.style.getPropertyPriority('position') === ''))
-      );
-    } catch {
-      return false;
-    }
-  };
-
-  const sweepCommittedArtifacts = (): number => {
-    if (disposed || committedArtifactsDetached) return 0;
-    let retired = 0;
-    for (const [slotId, entry] of [...committedFrames.entries()]) {
-      if (committedFrames.get(slotId) !== entry || committedFrameCurrent(entry)) continue;
-      committedFrames.delete(slotId);
-      disposeCommittedFrame(entry);
-      retired += 1;
-    }
-    if (retired > 0) notifyNativeMutation();
-    return retired;
   };
 
   const clearOwnedTimer = (handle: unknown): void => {
@@ -757,26 +213,42 @@ export function createFirstDisplayRenderBridge(
     try {
       options.clearTimer(handle);
     } catch {
-      // The state guarded by the timer is already generation-inert.
+      // Timer state is already detached.
     }
   };
 
   const arm = (callback: () => void, delayMs: number): unknown => {
     let handle: unknown;
+    let scheduling = true;
+    let firedSynchronously = false;
     try {
       handle = options.setTimer(() => {
+        if (scheduling) {
+          firedSynchronously = true;
+          return;
+        }
         if (!timers.delete(handle)) return;
         callback();
       }, delayMs);
     } catch {
       handle = undefined;
     }
-    if (handle !== undefined) timers.add(handle);
+    scheduling = false;
+    if (handle === undefined) return undefined;
+    if (firedSynchronously) {
+      try {
+        options.clearTimer(handle);
+      } catch {
+        // Synchronous timers are refused regardless of cleanup outcome.
+      }
+      return undefined;
+    }
+    timers.add(handle);
     return handle;
   };
 
   const mint = (
-    prefix: 't1_' | 'b1_' | 'n1_',
+    prefix: 'b1_' | 'n1_',
     registry: ReadonlyMap<string, unknown>
   ): string | undefined => {
     for (let draw = 0; draw < MAX_DRAWS; draw += 1) {
@@ -792,713 +264,13 @@ export function createFirstDisplayRenderBridge(
     return undefined;
   };
 
-  const retireTicket = (attempt: Attempt): void => {
-    const ticket = attempt.ticket;
-    attempt.ticket = undefined;
-    if (!ticket) return;
-    const entry = tickets.get(ticket);
-    if (entry?.registryState !== 'live' || entry.attempt !== attempt) return;
-    tickets.set(ticket, {
-      registryState: 'tombstone',
-      expiresAtInternal: entry.expiresAtInternal,
-      ordinalInternal: entry.ordinalInternal,
-      timer: entry.timer,
-    });
-    notifyNativeMutation();
-  };
-
-  const retireReservation = (attempt: Attempt): void => {
-    const entry = reservations.get(attempt.reservationId);
-    if (entry?.registryState !== 'live') return;
-    reservations.set(attempt.reservationId, {
-      expiresAtInternal: entry.expiresAtInternal,
-      ordinalInternal: entry.ordinalInternal,
-      registryState: 'tombstone',
-    });
-    notifyNativeMutation();
-  };
-
-  const releaseAttempt = (attempt: Attempt, removeFrame: boolean): void => {
-    clearOwnedTimer(attempt.claimTimer);
-    clearOwnedTimer(attempt.completionTimer);
-    clearOwnedTimer(attempt.documentTimer);
-    clearOwnedTimer(attempt.insertionTimer);
-    attempt.claimTimer = undefined;
-    attempt.completionTimer = undefined;
-    attempt.documentTimer = undefined;
-    attempt.insertionTimer = undefined;
-    const claim = attempt.claim;
-    attempt.claim = undefined;
-    closePort(claim?.port);
-    attempt.controlRelease?.();
-    attempt.documentRelease?.();
-    attempt.controlRelease = undefined;
-    attempt.documentRelease = undefined;
-    closePort(attempt.controlPort);
-    closePort(attempt.documentPort);
-    closePort(attempt.documentTransferred);
-    attempt.controlPort = undefined;
-    attempt.documentPort = undefined;
-    attempt.documentTransferred = undefined;
-    if (attempt.bootstrapNonce && bootstrapNonces.get(attempt.bootstrapNonce) === attempt) {
-      bootstrapNonces.delete(attempt.bootstrapNonce);
-    }
-    if (attempt.rendererNonce && rendererNonces.get(attempt.rendererNonce) === attempt) {
-      rendererNonces.delete(attempt.rendererNonce);
-    }
-    attempt.bootstrapNavigated = false;
-    attempt.bootstrapNonce = undefined;
-    attempt.bootstrapSource = undefined;
-    attempt.rendererNonce = undefined;
-    retireTicket(attempt);
-    retireReservation(attempt);
-    attempts.delete(attempt.reservationId);
-    if (attempt.directFrame) {
-      try {
-        attempt.directFrame.onload = null;
-        attempt.directFrame.onerror = null;
-        if (removeFrame) attempt.directFrame.remove();
-      } catch {
-        // The exact frame is no longer authoritative after terminal settlement.
-      }
-    }
-    if (removeFrame && attempt.hostPositionOwned) {
-      attempt.hostPositionOwned = false;
-      try {
-        const style = attempt.cycle.element.style;
-        if (
-          style.getPropertyValue('position') === 'relative' &&
-          style.getPropertyPriority('position') === ''
-        ) {
-          if (attempt.previousHostPosition === '') style.removeProperty('position');
-          else {
-            style.setProperty(
-              'position',
-              attempt.previousHostPosition,
-              attempt.previousHostPositionPriority
-            );
-          }
-        }
-      } catch {
-        // Compare-owned publisher style restoration is best-effort.
-      }
-    }
-    attempt.directFrame = undefined;
-  };
-
-  const settle = (
-    attempt: Attempt,
-    result: 'accepted' | 'failed' | 'cancelled',
-    reason = result === 'cancelled' ? NAVIGATION_DISPOSED : INTERNAL_ERROR
-  ): boolean => {
-    if (!attempt.active) return false;
-    attempt.active = false;
-    if (attempt.controlPort && attempt.ownerTicket) {
-      const settlement: Record<string, unknown> = {
-        message: 'TS Owner Settled',
-        version: 1,
-        lifecycleTicket: attempt.ownerTicket,
-        outcome: result,
-      };
-      if (result !== 'accepted') settlement.reason = reason;
-      post(attempt.controlPort, settlement);
-    }
-    const committedFrame = result === 'accepted' ? attempt.directFrame : undefined;
-    releaseAttempt(attempt, result !== 'accepted');
-    const frameAttributes = committedFrame ? snapshotFrameAttributes(committedFrame) : undefined;
-    const frameContentWindow = committedFrame?.contentWindow;
-    if (committedFrame?.isConnected && frameAttributes !== undefined && frameContentWindow) {
-      committedFrames.set(
-        attempt.cycle.slotId,
-        Object.freeze({
-          frame: committedFrame,
-          frameAttributes,
-          frameContentWindow,
-          frameSource: committedFrame.src,
-          frameSourceDocument: committedFrame.srcdoc,
-          host: attempt.cycle.element,
-          hostPosition:
-            attempt.overlay && attempt.hostPositionOwned ? attempt.previousHostPosition : null,
-          hostPositionPriority:
-            attempt.overlay && attempt.hostPositionOwned
-              ? attempt.previousHostPositionPriority
-              : null,
-          kind: attempt.cycle.bid.renderSource.type === 'adm' ? 'gpt_adm' : 'aps',
-          owner: 'trusted_server',
-          token: attempt.reservationId,
-        })
-      );
-    }
-    try {
-      attempt.onTerminal(result, result === 'accepted' ? null : reason);
-    } catch {
-      // A consumer callback cannot restore released render authority.
-    }
-    notifyNativeMutation();
-    return true;
-  };
-
-  const fail = (attempt: Attempt, reason: string, refuseClaim = false): boolean => {
-    if (!attempt.active) return false;
-    if (refuseClaim && attempt.claim) {
-      const claim = attempt.claim;
-      attempt.claim = undefined;
-      post(claim.port, refusedResponse(attempt.reservationId));
-      closePort(claim.port);
-    }
-    return settle(attempt, 'failed', reason);
-  };
-
-  const issueBootstrapNonce = (attempt: Attempt): string | undefined => {
-    if (bootstrapNonces.size >= MAX_NONCES || attempt.bootstrapNonce) return undefined;
-    const nonce = mint('b1_', bootstrapNonces);
-    if (!nonce || !BOOTSTRAP_NONCE_ID.test(nonce)) return undefined;
-    bootstrapNonces.set(nonce, attempt);
-    attempt.bootstrapNonce = nonce;
-    return nonce;
-  };
-
-  const issueRendererNonce = (attempt: Attempt): string | undefined => {
-    if (rendererNonces.size >= MAX_NONCES || attempt.rendererNonce) return undefined;
-    const nonce = mint('n1_', rendererNonces);
-    if (!nonce || !NONCE_ID.test(nonce)) return undefined;
-    rendererNonces.set(nonce, attempt);
-    attempt.rendererNonce = nonce;
-    return nonce;
-  };
-
-  const exactApsFrame = (attempt: Attempt, permanent: boolean): boolean => {
-    const aps = apsProtocol();
-    const frame = attempt.directFrame;
-    const bootstrapNonce = attempt.bootstrapNonce;
-    if (!aps || !frame || !bootstrapNonce || !attempt.bootstrapSource) return false;
-    try {
-      return (
-        attempt.active &&
-        (attempt.phaseValue === 'rendering_direct' ||
-          (attempt.overlay && attempt.phaseValue === 'waiting_for_insertion')) &&
-        validCycle(attempt.cycle) &&
-        attempt.inserted &&
-        frame.isConnected &&
-        frame.parentNode === attempt.cycle.element &&
-        frame.contentWindow === attempt.bootstrapSource &&
-        frame.getAttribute('src') === aps.rendererUrl + '#' + bootstrapNonce &&
-        frame.src === aps.rendererUrl + '#' + bootstrapNonce &&
-        frame.getAttribute('sandbox') === (permanent ? aps.permanentSandbox : aps.sandbox)
-      );
-    } catch {
-      return false;
-    }
-  };
-
-  const postWindow = (target: object, message: string): boolean => {
-    try {
-      const postMessage = Reflect.get(target, 'postMessage');
-      if (typeof postMessage !== 'function') return false;
-      Reflect.apply(postMessage, target, [message, '*', []]);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  const handleApsWindowMessage = (
-    event: unknown,
-    data: unknown,
-    message: string | undefined
-  ): boolean => {
-    if (message !== 'TS APS Bootstrap Ready' && message !== 'TS APS Container Ready') {
-      return false;
-    }
-    if (typeof data !== 'string') return true;
-    const origin = eventField(event, 'origin', messageEventPrototype);
-    const source = eventSource(event, messageEventPrototype);
-    if (origin !== 'null' || !source) return true;
-
-    if (message === 'TS APS Bootstrap Ready') {
-      const fields = exactRecord(parseJson(data), ['message', 'version', 'bootstrapNonce']);
-      const bootstrapNonce = fields?.['bootstrapNonce'];
-      if (
-        fields?.message !== message ||
-        fields.version !== 1 ||
-        typeof bootstrapNonce !== 'string' ||
-        !BOOTSTRAP_NONCE_ID.test(bootstrapNonce) ||
-        data !==
-          JSON.stringify({
-            message,
-            version: 1,
-            ['bootstrapNonce']: bootstrapNonce,
-          })
-      ) {
-        return true;
-      }
-      const attempt = bootstrapNonces.get(bootstrapNonce);
-      if (!attempt || source !== attempt.bootstrapSource) return true;
-      const inspection = inspectPorts(event, messageEventPrototype);
-      if (!inspection?.exact || inspection.originalCount !== 0 || inspection.ports.length !== 0) {
-        for (const port of inspection?.ports ?? []) closePort(port);
-        fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
-        return true;
-      }
-      const aps = apsProtocol();
-      if (!aps || attempt.bootstrapNavigated || !exactApsFrame(attempt, false)) {
-        fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
-        return true;
-      }
-      const rendererNonce = attempt.rendererNonce;
-      const policy = aps.bootstrapPolicy(attempt.cycle.bid.renderSource);
-      if (!rendererNonce || !policy) {
-        fail(attempt, WINNER_NOT_RENDERABLE);
-        return true;
-      }
-      try {
-        attempt.directFrame?.setAttribute('sandbox', aps.permanentSandbox);
-      } catch {
-        fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
-        return true;
-      }
-      const navigation = JSON.stringify({
-        message: 'TS APS Bootstrap Configure',
-        version: 2,
-        ['bootstrapNonce']: bootstrapNonce,
-        ['rendererNonce']: rendererNonce,
-        creativeOrigin: policy.creativeOrigin,
-        tagType: policy.tagType,
-      });
-      if (!exactApsFrame(attempt, true) || !postWindow(source, navigation)) {
-        fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
-        return true;
-      }
-      attempt.bootstrapNavigated = true;
-      return true;
-    }
-
-    const fields = exactRecord(parseJson(data), [
-      'message',
-      'version',
-      'bootstrapNonce',
-      'rendererNonce',
-    ]);
-    const bootstrapNonce = fields?.['bootstrapNonce'];
-    const rendererNonce = fields?.['rendererNonce'];
-    if (
-      fields?.message !== message ||
-      fields.version !== 1 ||
-      typeof bootstrapNonce !== 'string' ||
-      !BOOTSTRAP_NONCE_ID.test(bootstrapNonce) ||
-      typeof rendererNonce !== 'string' ||
-      !NONCE_ID.test(rendererNonce) ||
-      data !==
-        JSON.stringify({
-          message,
-          version: 1,
-          ['bootstrapNonce']: bootstrapNonce,
-          ['rendererNonce']: rendererNonce,
-        })
-    ) {
-      return true;
-    }
-    const attempt = bootstrapNonces.get(bootstrapNonce);
-    if (
-      !attempt ||
-      rendererNonces.get(rendererNonce) !== attempt ||
-      source !== attempt.bootstrapSource
-    ) {
-      return true;
-    }
-    const inspection = inspectPorts(event, messageEventPrototype);
-    const port = inspection?.ports[0];
-    if (
-      !inspection?.exact ||
-      inspection.originalCount !== 1 ||
-      inspection.ports.length !== 1 ||
-      !port ||
-      !attempt.bootstrapNavigated ||
-      attempt.documentPort ||
-      !exactApsFrame(attempt, true)
-    ) {
-      for (const candidate of inspection?.ports ?? []) closePort(candidate);
-      fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
-      return true;
-    }
-    attempt.documentPort = port;
-    attempt.documentRelease = listen(
-      port,
-      (portEvent) => handleApsDocument(attempt, portEvent),
-      () => fail(attempt, attempt.documentAccepted ? RUNNER_FAILED : RENDERER_DOCUMENT_NO_LOAD)
-    );
-    if (!attempt.documentRelease) {
-      fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
-      return true;
-    }
-    bootstrapNonces.delete(bootstrapNonce);
-    const aps = apsProtocol();
-    if (
-      !aps ||
-      !post(port, {
-        version: 1,
-        nonce: rendererNonce,
-        publisherOrigin: aps.publisherOrigin,
-        renderer: attempt.cycle.bid.renderSource,
-      }) ||
-      !exactApsFrame(attempt, true)
-    ) {
-      fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
-    }
-    return true;
-  };
-
-  function handleApsDocument(attempt: Attempt, event: unknown): void {
-    const aps = apsProtocol();
-    if (!attempt.active || !attempt.rendererNonce || !aps) return;
-    if (!exactApsFrame(attempt, true)) {
-      fail(attempt, attempt.documentAccepted ? RUNNER_FAILED : RENDERER_DOCUMENT_NO_LOAD);
-      return;
-    }
-    const inspection = inspectPorts(event, messageEventPrototype);
-    if (!inspection?.exact || inspection.originalCount !== 0 || inspection.ports.length !== 0) {
-      fail(attempt, attempt.documentAccepted ? RUNNER_FAILED : RENDERER_DOCUMENT_NO_LOAD);
-      return;
-    }
-    const parsed = aps.parseDocumentMessage(
-      eventField(event, 'data', messageEventPrototype),
-      attempt.rendererNonce
-    );
-    if (!parsed) {
-      fail(attempt, attempt.documentAccepted ? RUNNER_FAILED : RENDERER_DOCUMENT_NO_LOAD);
-      return;
-    }
-    const acceptDocument = (): void => {
-      if (!attempt.active || attempt.documentAccepted || !attempt.inserted) return;
-      attempt.documentAccepted = true;
-      if (rendererNonces.get(attempt.rendererNonce!) === attempt) {
-        rendererNonces.delete(attempt.rendererNonce!);
-      }
-      attempt.documentAcceptancePending = false;
-      clearOwnedTimer(attempt.documentTimer);
-      attempt.documentTimer = undefined;
-      attempt.completionTimer = arm(() => fail(attempt, RUNNER_FAILED), aps.deadlines.completionMs);
-      const pending = attempt.pendingDocumentTerminal;
-      attempt.pendingDocumentTerminal = undefined;
-      if (pending === 'completed') completeAps(attempt);
-      else if (pending) fail(attempt, pending);
-    };
-    if (parsed.kind === 'document_accepted') {
-      if (attempt.documentAccepted) return;
-      if (!attempt.inserted) attempt.documentAcceptancePending = true;
-      else acceptDocument();
-      return;
-    }
-    if (parsed.kind === 'runner_loaded') {
-      return;
-    }
-    if (parsed.kind === 'render_completed') {
-      if (attempt.documentAccepted) completeAps(attempt);
-      else if (attempt.documentAcceptancePending && !attempt.pendingDocumentTerminal) {
-        attempt.pendingDocumentTerminal = 'completed';
-      } else fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
-      return;
-    }
-    const failureReason =
-      parsed.reason === 'descriptor_invalid' ? WINNER_NOT_RENDERABLE : parsed.reason;
-    if (attempt.documentAccepted) fail(attempt, failureReason);
-    else if (attempt.documentAcceptancePending && !attempt.pendingDocumentTerminal) {
-      attempt.pendingDocumentTerminal = failureReason;
-    } else fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
-  }
-
-  function completeAps(attempt: Attempt): void {
-    if (!attempt.active || !exactApsFrame(attempt, true)) {
-      fail(attempt, SLOT_UNRESOLVED);
-      return;
-    }
-    if (attempt.overlay) {
-      try {
-        const frame = attempt.directFrame;
-        if (!frame) {
-          fail(attempt, SLOT_UNRESOLVED);
-          return;
-        }
-        frame.style.setProperty('visibility', 'visible');
-        if (frame.style.getPropertyValue('visibility') !== 'visible') {
-          fail(attempt, INTERNAL_ERROR);
-          return;
-        }
-      } catch {
-        fail(attempt, INTERNAL_ERROR);
-        return;
-      }
-    }
-    settle(attempt, 'accepted');
-  }
-
-  const ownerInserted = (attempt: Attempt): void => {
-    if (!attempt.active || attempt.inserted) return;
-    attempt.inserted = true;
-    clearOwnedTimer(attempt.insertionTimer);
-    attempt.insertionTimer = undefined;
-    if (attempt.cycle.bid.renderSource.type === 'adm') {
-      attempt.documentTimer = arm(() => fail(attempt, ADM_DOCUMENT_NO_LOAD), ADM_LOAD_DEADLINE_MS);
-    } else if (attempt.documentAcceptancePending) {
-      const nonce = attempt.rendererNonce;
-      if (nonce) {
-        handleApsDocument(attempt, {
-          data: { message: 'TS APS Document Accepted', version: 1, nonce },
-          ports: [],
-        });
-      }
-    } else {
-      const aps = apsProtocol();
-      attempt.documentTimer = arm(
-        () => fail(attempt, RENDERER_DOCUMENT_NO_LOAD),
-        aps?.deadlines.documentAcceptanceMs ?? 3_000
-      );
-    }
-  };
-
-  const handleOwnerControl = (attempt: Attempt, event: unknown): void => {
-    if (!attempt.active) return;
-    const ports = inspectPorts(event, messageEventPrototype);
-    if (!ports?.exact || ports.originalCount !== 0 || ports.ports.length !== 0) {
-      fail(attempt, INTERNAL_ERROR);
-      return;
-    }
-    const data = eventField(event, 'data', messageEventPrototype);
-    const ticket = attempt.ownerTicket;
-    const inserted = exactRecord(data, ['message', 'version', 'lifecycleTicket']);
-    if (
-      attempt.cycle.bid.renderSource.type === 'adm' &&
-      inserted?.message === 'TS Owner Inserted' &&
-      inserted.version === 1 &&
-      inserted.lifecycleTicket === ticket
-    ) {
-      ownerInserted(attempt);
-      return;
-    }
-    if (attempt.cycle.bid.renderSource.type !== 'adm') {
-      fail(attempt, INTERNAL_ERROR);
-      return;
-    }
-    const loaded = exactRecord(data, ['message', 'version', 'lifecycleTicket']);
-    if (
-      loaded?.message === 'TS ADM Loaded' &&
-      loaded.version === 1 &&
-      loaded.lifecycleTicket === ticket &&
-      attempt.inserted
-    ) {
-      settle(attempt, 'accepted');
-      return;
-    }
-    if (
-      loaded?.message === 'TS ADM Failed' &&
-      loaded.version === 1 &&
-      loaded.lifecycleTicket === ticket
-    ) {
-      fail(attempt, ADM_DOCUMENT_NO_LOAD);
-      return;
-    }
-    fail(attempt, ADM_DOCUMENT_NO_LOAD);
-  };
-
-  const startOwner = (attempt: Attempt): boolean => {
-    const controlPort = attempt.controlPort;
-    const ticket = attempt.ownerTicket;
-    if (!controlPort || !ticket || !attempt.active) return false;
-    const aps = apsProtocol();
-    attempt.insertionTimer = arm(
-      () => fail(attempt, 'owner_insertion_timeout'),
-      aps?.deadlines.insertionMs ?? 1_000
-    );
-    if (attempt.cycle.bid.renderSource.type === 'adm') {
-      return post(controlPort, {
-        message: 'TS ADM Start',
-        version: 1,
-        lifecycleTicket: ticket,
-        source: attempt.cycle.bid.renderSource,
-      });
-    }
-    if (!aps) return fail(attempt, WINNER_NOT_RENDERABLE);
-    attempt.overlay = true;
-    if (!renderAps(attempt)) return false;
-    return (
-      post(controlPort, {
-        message: 'TS APS Top Mount Started',
-        version: 1,
-        lifecycleTicket: ticket,
-      }) || fail(attempt, INTERNAL_ERROR)
-    );
-  };
-
-  const handleOwnerRegistration = (
-    event: unknown,
-    data: unknown,
-    routing: Readonly<{ adId?: string; lifecycleTicket?: string }>
-  ): void => {
-    const ticket = routing.lifecycleTicket;
-    if (!ticket) return;
-    const entry = tickets.get(ticket);
-    if (!entry || !suppress(event)) return;
-    const inspection = inspectPorts(event, messageEventPrototype);
-    const responsePort = inspection?.ports[0];
-    const refuse = (): void => {
-      if (responsePort) post(responsePort, ownerRefused(routing.adId ?? ''));
-      for (const port of inspection?.ports ?? []) closePort(port);
-    };
-    if (entry.registryState !== 'live') {
-      refuse();
-      return;
-    }
-    const exact = exactOwnerRegistration(data);
-    const attempt = entry.attempt;
-    if (
-      !exact ||
-      !inspection?.exact ||
-      inspection.originalCount !== 1 ||
-      inspection.ports.length !== 1 ||
-      !responsePort ||
-      exact.adId !== attempt.reservationId ||
-      exact.lifecycleTicket !== ticket ||
-      eventSource(event, messageEventPrototype) !== attempt.ownerSource ||
-      !attempt.active ||
-      attempt.phaseValue !== 'waiting_for_owner'
-    ) {
-      refuse();
-      if (attempt.active) fail(attempt, 'bridge_id_mismatch');
-      return;
-    }
-    retireTicket(attempt);
-    let channel: ChannelLike;
-    try {
-      channel = options.createChannel();
-    } catch {
-      post(responsePort, ownerRefused(attempt.reservationId));
-      closePort(responsePort);
-      fail(attempt, INTERNAL_ERROR);
-      return;
-    }
-    attempt.ownerTicket = ticket;
-    attempt.controlPort = channel.port1;
-    attempt.controlRelease = listen(
-      channel.port1,
-      (message) => handleOwnerControl(attempt, message),
-      () =>
-        fail(
-          attempt,
-          attempt.cycle.bid.renderSource.type === 'adm' ? ADM_DOCUMENT_NO_LOAD : INTERNAL_ERROR
-        )
-    );
-    attempt.phaseValue = 'waiting_for_insertion';
-    const registered = JSON.stringify({
-      message: 'TS Render Owner Registered',
-      adId: attempt.reservationId,
-      version: 1,
-      lifecycleTicket: ticket,
-    });
-    const posted =
-      Boolean(attempt.controlRelease) && post(responsePort, registered, [channel.port2]);
-    closePort(responsePort);
-    closePort(channel.port2);
-    if (!posted || !startOwner(attempt)) {
-      if (attempt.active) fail(attempt, INTERNAL_ERROR);
-    }
-  };
-
-  const issueTicket = (attempt: Attempt): string | undefined => {
-    if (tickets.size >= MAX_CAPABILITIES || utf8Length(PUC_DYNAMIC_OWNER) > MAX_OWNER_BYTES) {
-      return undefined;
-    }
-    const ticket = mint('t1_', tickets);
-    if (!ticket || !TICKET_ID.test(ticket)) return undefined;
-    const issuedAt = readNow();
-    if (issuedAt === undefined) return undefined;
-    const expiresAt = issuedAt + TICKET_TTL_MS;
-    const ordinal = nextTicketOrdinal;
-    nextTicketOrdinal += 1;
-    const entry: LiveTicket = {
-      registryState: 'live',
-      attempt,
-      expiresAtInternal: expiresAt,
-      ordinalInternal: ordinal,
-    };
-    tickets.set(ticket, entry);
-    attempt.ticket = ticket;
-    entry.timer = arm(() => {
-      const current = tickets.get(ticket);
-      if (current !== entry) {
-        const observedAt = readNow();
-        if (
-          current?.registryState === 'tombstone' &&
-          observedAt !== undefined &&
-          current.expiresAtInternal <= observedAt
-        ) {
-          tickets.delete(ticket);
-          notifyNativeMutation();
-        }
-        return;
-      }
-      tickets.delete(ticket);
-      attempt.ticket = undefined;
-      notifyNativeMutation();
-      fail(attempt, 'owner_registration_timeout');
-    }, TICKET_TTL_MS);
-    if (entry.timer === undefined) {
-      tickets.delete(ticket);
-      attempt.ticket = undefined;
-      return undefined;
-    }
-    return ticket;
-  };
-
-  const join = (attempt: Attempt): boolean => {
-    const claim = attempt.claim;
-    if (
-      !attempt.active ||
-      !claim ||
-      attempt.gam !== 'nonempty_gam' ||
-      attempt.phaseValue !== 'waiting_for_gam_and_claim'
-    ) {
-      return false;
-    }
-    clearOwnedTimer(attempt.claimTimer);
-    attempt.claimTimer = undefined;
-    const ticket = issueTicket(attempt);
-    if (!ticket) return fail(attempt, 'capability_registry_full', true);
-    const owner = {
-      version: 1,
-      status: 'ready',
-      kind: attempt.cycle.bid.renderSource.type,
-      lifecycleTicket: ticket,
-    };
-    const response = JSON.stringify({
-      message: 'Prebid Response',
-      adId: attempt.reservationId,
-      renderer: PUC_DYNAMIC_OWNER,
-      rendererVersion: '4',
-      tsOwner: owner,
-    });
-    attempt.claim = undefined;
-    const posted = utf8Length(response) <= MAX_RESPONSE_BYTES && post(claim.port, response);
-    closePort(claim.port);
-    if (!posted || !attempt.active) {
-      if (attempt.active) fail(attempt, INTERNAL_ERROR);
-      return false;
-    }
-    attempt.ownerSource = claim.source;
-    attempt.phaseValue = 'waiting_for_owner';
-    retireReservation(attempt);
-    const source = attempt.cycle.bid.renderSource;
-    resizeCollapsedPucShell(options.document, claim.source, source.width, source.height);
-    return true;
-  };
-
   const configureFrame = (
     frame: HTMLIFrameElement,
     width: number,
     height: number,
-    sandbox: string,
-    overlay = false
+    overlay: boolean
   ): void => {
-    frame.setAttribute('sandbox', sandbox);
+    frame.setAttribute('sandbox', aps.sandbox);
     frame.setAttribute('referrerpolicy', 'no-referrer');
     frame.setAttribute('width', String(width));
     frame.setAttribute('height', String(height));
@@ -1516,13 +288,34 @@ export function createFirstDisplayRenderBridge(
     );
   };
 
-  const acquireOverlayPosition = (attempt: Attempt): boolean => {
+  const restoreHostPosition = (attempt: ApsAttempt): void => {
+    if (!attempt.hostPositionOwned) return;
+    attempt.hostPositionOwned = false;
+    try {
+      const style = attempt.cycle.element.style;
+      if (
+        style.getPropertyValue('position') !== 'relative' ||
+        style.getPropertyPriority('position') !== ''
+      )
+        return;
+      if (attempt.previousHostPosition === '') style.removeProperty('position');
+      else
+        style.setProperty(
+          'position',
+          attempt.previousHostPosition,
+          attempt.previousHostPositionPriority
+        );
+    } catch {
+      // Compare-owned restoration never overwrites publisher changes.
+    }
+  };
+
+  const acquireHostPosition = (attempt: ApsAttempt): boolean => {
     if (!attempt.overlay) return true;
     try {
-      if (!validCycle(attempt.cycle)) return false;
       const host = attempt.cycle.element;
       const browser = host.ownerDocument.defaultView;
-      if (!browser) return false;
+      if (!browser || !attempt.cycle.isCurrent()) return false;
       if (browser.getComputedStyle(host).position !== 'static') return true;
       attempt.previousHostPosition = host.style.getPropertyValue('position');
       attempt.previousHostPositionPriority = host.style.getPropertyPriority('position');
@@ -1530,141 +323,354 @@ export function createFirstDisplayRenderBridge(
       attempt.hostPositionOwned =
         host.style.getPropertyValue('position') === 'relative' &&
         host.style.getPropertyPriority('position') === '';
-      return attempt.hostPositionOwned && validCycle(attempt.cycle);
+      return attempt.hostPositionOwned && attempt.cycle.isCurrent();
     } catch {
       return false;
     }
   };
 
-  const renderDirectAdm = (attempt: Attempt): boolean => {
-    const source = attempt.cycle.bid.renderSource;
-    if (source.type !== 'adm') return false;
+  const exactFrame = (attempt: ApsAttempt, permanent: boolean): boolean => {
     try {
-      const frame = options.document.createElement('iframe');
-      configureFrame(frame, source.width, source.height, ADM_SANDBOX);
-      const intended = `<!doctype html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><style>html,body{border:0;margin:0;padding:0;overflow:hidden}</style></head><body>${source.adm}</body></html>`;
-      frame.onload = () => {
-        if (
-          attempt.active &&
-          attempt.directFrame === frame &&
-          frame.parentNode === attempt.cycle.element &&
-          frame.srcdoc === intended &&
-          frame.getAttribute('src') === null
-        ) {
-          settle(attempt, 'accepted');
+      return (
+        attempt.active &&
+        attempt.cycle.isCurrent() &&
+        attempt.frame.isConnected &&
+        attempt.frame.parentNode === attempt.cycle.element &&
+        attempt.frame.contentWindow === attempt.bootstrapSource &&
+        attempt.frame.getAttribute('src') ===
+          `${aps.rendererUrl}#${attempt.bootstrapNonceInternal}` &&
+        attempt.frame.src === `${aps.rendererUrl}#${attempt.bootstrapNonceInternal}` &&
+        attempt.frame.getAttribute('sandbox') ===
+          (permanent ? aps.permanentSandbox : aps.sandbox) &&
+        (!attempt.hostPositionOwned ||
+          (attempt.cycle.element.style.getPropertyValue('position') === 'relative' &&
+            attempt.cycle.element.style.getPropertyPriority('position') === ''))
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  const releasePort = (attempt: ApsAttempt): void => {
+    const release = attempt.documentRelease;
+    const port = attempt.documentPort;
+    attempt.documentRelease = undefined;
+    attempt.documentPort = undefined;
+    try {
+      release?.();
+    } catch {
+      // Port closure remains authoritative.
+    }
+    closePort(port);
+  };
+
+  const detachAttempt = (attempt: ApsAttempt): void => {
+    clearOwnedTimer(attempt.documentTimer);
+    clearOwnedTimer(attempt.completionTimer);
+    attempt.documentTimer = undefined;
+    attempt.completionTimer = undefined;
+    if (bootstrapNonces.get(attempt.bootstrapNonceInternal) === attempt) {
+      bootstrapNonces.delete(attempt.bootstrapNonceInternal);
+    }
+    if (rendererNonces.get(attempt.rendererNonceInternal) === attempt) {
+      rendererNonces.delete(attempt.rendererNonceInternal);
+    }
+    attempts.delete(attempt);
+    releasePort(attempt);
+  };
+
+  const cancelAttempt = (attempt: ApsAttempt): void => {
+    if (!attempt.active && !attempt.accepted) return;
+    attempt.active = false;
+    attempt.accepted = false;
+    detachAttempt(attempt);
+    attempt.frame.onload = null;
+    attempt.frame.onerror = null;
+    try {
+      attempt.frame.remove();
+    } catch {
+      // The exact node cannot regain authority.
+    }
+    restoreHostPosition(attempt);
+    notifyNativeMutation();
+  };
+
+  const fail = (attempt: ApsAttempt, reason: string): void => {
+    if (!attempt.active) return;
+    attempt.active = false;
+    detachAttempt(attempt);
+    attempt.frame.onload = null;
+    attempt.frame.onerror = null;
+    try {
+      attempt.frame.remove();
+    } catch {
+      // Failed APS identity is already detached.
+    }
+    restoreHostPosition(attempt);
+    notifyNativeMutation();
+    try {
+      attempt.callbacks.fail(reason);
+    } catch {
+      // Consumers cannot restore APS authority.
+    }
+  };
+
+  const installDocumentPort = (
+    attempt: ApsAttempt,
+    port: PortLike,
+    receive: (event: unknown) => void,
+    receiveError: () => void
+  ): boolean => {
+    try {
+      if (typeof port.addEventListener !== 'function') return false;
+      let live = true;
+      const release = (): void => {
+        if (!live) return;
+        live = false;
+        try {
+          if (typeof port.removeEventListener === 'function') {
+            Reflect.apply(port.removeEventListener, port, ['message', receive]);
+            Reflect.apply(port.removeEventListener, port, ['messageerror', receiveError]);
+          }
+        } catch {
+          // Port closure remains authoritative.
         }
       };
-      frame.onerror = () => fail(attempt, ADM_DOCUMENT_NO_LOAD);
-      frame.srcdoc = intended;
-      attempt.directFrame = frame;
-      attempt.documentTimer = arm(() => fail(attempt, ADM_DOCUMENT_NO_LOAD), ADM_LOAD_DEADLINE_MS);
-      attempt.cycle.element.appendChild(frame);
-      return true;
+      Reflect.apply(port.addEventListener, port, ['message', receive]);
+      Reflect.apply(port.addEventListener, port, ['messageerror', receiveError]);
+      attempt.documentRelease = release;
+      if (typeof port.start === 'function') Reflect.apply(port.start, port, []);
+      return live && attempt.active && attempt.documentPort === port;
     } catch {
-      return fail(attempt, ADM_DOCUMENT_NO_LOAD);
+      return false;
     }
   };
 
-  const renderAps = (attempt: Attempt): boolean => {
-    const source = attempt.cycle.bid.renderSource;
-    const aps = apsProtocol();
-    if (source.type !== 'aps' || !aps) return false;
-    if (attempt.insertionTimer === undefined) {
-      attempt.insertionTimer = arm(
-        () => fail(attempt, 'owner_insertion_timeout'),
-        aps.deadlines.insertionMs
-      );
+  const complete = (attempt: ApsAttempt): void => {
+    if (!attempt.active || !exactFrame(attempt, true)) {
+      fail(attempt, 'slot_unresolved');
+      return;
     }
-    if (attempt.insertionTimer === undefined) return fail(attempt, INTERNAL_ERROR);
-    const bootstrapNonce = issueBootstrapNonce(attempt);
-    const rendererNonce = issueRendererNonce(attempt);
-    if (!bootstrapNonce || !rendererNonce) return fail(attempt, 'capability_registry_full');
-    let policy: ReturnType<FirstDisplayApsProtocolV1['bootstrapPolicy']>;
-    try {
-      policy = aps.bootstrapPolicy(source);
-    } catch {
-      policy = undefined;
+    if (attempt.overlay) {
+      try {
+        attempt.frame.style.setProperty('visibility', 'visible');
+        if (attempt.frame.style.getPropertyValue('visibility') !== 'visible') {
+          fail(attempt, INTERNAL_ERROR);
+          return;
+        }
+      } catch {
+        fail(attempt, INTERNAL_ERROR);
+        return;
+      }
     }
-    if (!policy) return fail(attempt, WINNER_NOT_RENDERABLE);
+    const attributes = snapshotFrameAttributes(attempt.frame);
+    const frameWindow = attempt.frame.contentWindow;
+    const frameSource = attempt.frame.src;
+    const frameSourceDocument = attempt.frame.srcdoc;
+    if (attributes === undefined || !frameWindow) {
+      fail(attempt, INTERNAL_ERROR);
+      return;
+    }
+    attempt.active = false;
+    attempt.accepted = true;
+    detachAttempt(attempt);
+    attempt.frame.onload = null;
+    attempt.frame.onerror = null;
+    let artifactLive = true;
+    const retire = (): void => {
+      if (!artifactLive) return;
+      artifactLive = false;
+      attempt.accepted = false;
+      try {
+        attempt.frame.remove();
+      } catch {
+        // Exact-node retirement is best-effort.
+      }
+      restoreHostPosition(attempt);
+      notifyNativeMutation();
+    };
+    const artifact: FirstDisplayCommittedRenderArtifactV1 = Object.freeze({
+      hostPosition: attempt.hostPositionOwned ? attempt.previousHostPosition : null,
+      hostPositionPriority: attempt.hostPositionOwned ? attempt.previousHostPositionPriority : null,
+      identity: attempt.frame,
+      kind: 'aps',
+      owner: 'trusted_server',
+      slotId: attempt.cycle.slotId,
+      token: attempt.cycle.bid.rendererReservationId,
+      current: () => {
+        try {
+          return (
+            artifactLive &&
+            attempt.accepted &&
+            attempt.cycle.isCurrent() &&
+            attempt.frame.isConnected &&
+            attempt.frame.parentNode === attempt.cycle.element &&
+            attempt.frame.contentWindow === frameWindow &&
+            attempt.frame.src === frameSource &&
+            attempt.frame.srcdoc === frameSourceDocument &&
+            snapshotFrameAttributes(attempt.frame) === attributes &&
+            (!attempt.hostPositionOwned ||
+              (attempt.cycle.element.style.getPropertyValue('position') === 'relative' &&
+                attempt.cycle.element.style.getPropertyPriority('position') === ''))
+          );
+        } catch {
+          return false;
+        }
+      },
+      retire,
+    });
+    notifyNativeMutation();
     try {
-      const frame = options.document.createElement('iframe');
-      configureFrame(frame, source.width, source.height, aps.sandbox, attempt.overlay);
-      const intended = aps.rendererUrl + '#' + bootstrapNonce;
-      frame.onerror = () => fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
-      frame.src = intended;
-      attempt.directFrame = frame;
-      if (!acquireOverlayPosition(attempt)) return fail(attempt, SLOT_UNRESOLVED);
-      attempt.cycle.element.appendChild(frame);
-      const intendedWindow = frame.contentWindow;
-      if (!intendedWindow) return fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
-      attempt.bootstrapSource = intendedWindow;
-      ownerInserted(attempt);
-      return exactApsFrame(attempt, false) || fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
+      attempt.callbacks.accept(artifact);
     } catch {
-      return fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
+      retire();
     }
   };
 
-  const renderDirectFallback = (attempt: Attempt): boolean => {
-    attempt.phaseValue = 'rendering_direct';
-    retireReservation(attempt);
-    const claim = attempt.claim;
-    attempt.claim = undefined;
-    if (claim) {
-      post(claim.port, refusedResponse(attempt.reservationId));
-      closePort(claim.port);
+  const handleDocument = (attempt: ApsAttempt, event: unknown): void => {
+    if (!attempt.active || !exactFrame(attempt, true)) {
+      fail(attempt, attempt.documentAccepted ? RUNNER_FAILED : RENDERER_DOCUMENT_NO_LOAD);
+      return;
     }
-    return attempt.cycle.bid.renderSource.type === 'adm'
-      ? renderDirectAdm(attempt)
-      : renderAps(attempt);
+    if (!exactPorts(event, messageEventPrototype, 0)) {
+      fail(attempt, attempt.documentAccepted ? RUNNER_FAILED : RENDERER_DOCUMENT_NO_LOAD);
+      return;
+    }
+    const parsed = aps.parseDocumentMessage(
+      eventField(event, 'data', messageEventPrototype),
+      attempt.rendererNonceInternal
+    );
+    if (!parsed) {
+      fail(attempt, attempt.documentAccepted ? RUNNER_FAILED : RENDERER_DOCUMENT_NO_LOAD);
+      return;
+    }
+    if (parsed.kind === 'document_accepted') {
+      if (attempt.documentAccepted) return;
+      attempt.documentAccepted = true;
+      if (rendererNonces.get(attempt.rendererNonceInternal) === attempt) {
+        rendererNonces.delete(attempt.rendererNonceInternal);
+      }
+      clearOwnedTimer(attempt.documentTimer);
+      attempt.documentTimer = undefined;
+      attempt.completionTimer = arm(() => fail(attempt, RUNNER_FAILED), aps.deadlines.completionMs);
+      if (attempt.completionTimer === undefined) {
+        fail(attempt, INTERNAL_ERROR);
+        return;
+      }
+      const pending = attempt.pendingTerminal;
+      attempt.pendingTerminal = undefined;
+      if (pending === 'completed') complete(attempt);
+      else if (pending) fail(attempt, pending);
+      return;
+    }
+    if (parsed.kind === 'runner_loaded') return;
+    if (parsed.kind === 'render_completed') {
+      if (attempt.documentAccepted) complete(attempt);
+      else if (!attempt.pendingTerminal) attempt.pendingTerminal = 'completed';
+      else fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
+      return;
+    }
+    const failureReason =
+      parsed.reason === 'descriptor_invalid' ? WINNER_NOT_RENDERABLE : parsed.reason;
+    if (attempt.documentAccepted) fail(attempt, failureReason);
+    else if (!attempt.pendingTerminal) attempt.pendingTerminal = failureReason;
+    else fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
   };
 
   const dispatch = (event: unknown): void => {
-    if (disposed || ingressClosed) return;
+    if (disposed) return;
     const data = eventField(event, 'data', messageEventPrototype);
-    const routing = routingMessage(data);
-    if (handleApsWindowMessage(event, data, routing.message)) return;
-    if (routing.message === 'TS Render Owner Register') {
-      notifyNativeMutation();
-      handleOwnerRegistration(event, data, routing);
+    const message = aps.parseWindowMessage(data);
+    if (!message) return;
+    if (message.kind === 'bootstrap_ready') {
+      const nonce = message.bootstrap;
+      const attempt = bootstrapNonces.get(nonce);
+      const source = eventSource(event, messageEventPrototype);
+      if (
+        !attempt ||
+        eventField(event, 'origin', messageEventPrototype) !== 'null' ||
+        source !== attempt.bootstrapSource
+      )
+        return;
+      if (!exactPorts(event, messageEventPrototype, 0)) {
+        fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
+        return;
+      }
+      if (attempt.bootstrapNavigated || !exactFrame(attempt, false)) {
+        fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
+        return;
+      }
+      const policy = aps.bootstrapPolicy(attempt.cycle.bid.renderSource);
+      if (!policy) {
+        fail(attempt, WINNER_NOT_RENDERABLE);
+        return;
+      }
+      try {
+        attempt.frame.setAttribute('sandbox', aps.permanentSandbox);
+      } catch {
+        fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
+        return;
+      }
+      const navigation = JSON.stringify({
+        message: 'TS APS Bootstrap Configure',
+        version: 2,
+        bootstrapNonce: nonce,
+        rendererNonce: attempt.rendererNonceInternal,
+        creativeOrigin: policy.creativeOrigin,
+        tagType: policy.tagType,
+      });
+      if (!exactFrame(attempt, true) || !postWindow(source!, navigation)) {
+        fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
+        return;
+      }
+      attempt.bootstrapNavigated = true;
       return;
     }
-    if (routing.message !== 'Prebid Request' || !routing.adId) return;
-    const reservationState = reservations.get(routing.adId);
-    if (!reservationState || !suppress(event)) return;
-    notifyNativeMutation();
-    const inspection = inspectPorts(event, messageEventPrototype);
-    const responsePort = inspection?.ports[0];
-    const exact = exactPrebidRequest(data);
-    const refuse = (): void => {
-      if (responsePort) post(responsePort, refusedResponse(routing.adId!));
-      for (const port of inspection?.ports ?? []) closePort(port);
-    };
-    if (
-      reservationState.registryState !== 'live' ||
-      !inspection?.exact ||
-      inspection.originalCount !== 1 ||
-      inspection.ports.length !== 1 ||
-      !responsePort ||
-      !exact ||
-      exact.adId !== routing.adId
-    ) {
-      refuse();
-      return;
-    }
-    const attempt = attempts.get(routing.adId);
+
+    const { bootstrap: bootstrapNonce, renderer: rendererNonce } = message;
+    const attempt = bootstrapNonces.get(bootstrapNonce);
     const source = eventSource(event, messageEventPrototype);
     if (
-      !attempt?.active ||
-      attempt.phaseValue !== 'waiting_for_gam_and_claim' ||
-      attempt.claim ||
-      !source
+      !attempt ||
+      rendererNonces.get(rendererNonce) !== attempt ||
+      eventField(event, 'origin', messageEventPrototype) !== 'null' ||
+      source !== attempt.bootstrapSource
+    )
+      return;
+    const ports = exactPorts(event, messageEventPrototype, 1);
+    const port = ports?.[0];
+    if (
+      !port ||
+      !attempt.bootstrapNavigated ||
+      attempt.documentPort ||
+      !exactFrame(attempt, true)
     ) {
-      refuse();
+      fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
       return;
     }
-    attempt.claim = Object.freeze({ port: responsePort, source });
-    if (attempt.gam === 'nonempty_gam') join(attempt);
+    attempt.documentPort = port;
+    const listening = installDocumentPort(
+      attempt,
+      port,
+      (portEvent) => handleDocument(attempt, portEvent),
+      () => fail(attempt, attempt.documentAccepted ? RUNNER_FAILED : RENDERER_DOCUMENT_NO_LOAD)
+    );
+    if (!listening || !attempt.active) {
+      if (attempt.active) fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
+      return;
+    }
+    bootstrapNonces.delete(bootstrapNonce);
+    if (
+      !post(port, {
+        version: 1,
+        nonce: rendererNonce,
+        publisherOrigin: aps.publisherOrigin,
+        renderer: attempt.cycle.bid.renderSource,
+      }) ||
+      !attempt.active ||
+      !exactFrame(attempt, true)
+    )
+      fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
   };
 
   try {
@@ -1674,207 +680,102 @@ export function createFirstDisplayRenderBridge(
   }
 
   return Object.freeze({
-    bind: (
+    supports: (source: unknown): boolean => {
+      try {
+        return aps.bootstrapPolicy(source) !== undefined;
+      } catch {
+        return false;
+      }
+    },
+    start: (
       cycle: FirstDisplayGptBoundCycleV1,
-      onTerminal: (result: 'accepted' | 'failed' | 'cancelled', reason: string | null) => void
-    ): boolean => {
-      if (
-        disposed ||
-        ingressClosed ||
-        sealed ||
-        typeof onTerminal !== 'function' ||
-        !validCycle(cycle) ||
-        reservations.size >= MAX_CAPABILITIES ||
-        reservations.has(cycle.bid.rendererReservationId)
-      ) {
-        return false;
+      overlay: boolean,
+      callbacks: FirstDisplayRenderStrategyCallbacksV1
+    ): FirstDisplayRenderStrategyAttemptV1 | undefined => {
+      const source = cycle.bid.renderSource;
+      if (disposed || source.type !== 'aps' || !cycle.isCurrent() || !aps.bootstrapPolicy(source)) {
+        return undefined;
       }
-      const observedAt = readNow();
-      if (observedAt === undefined) return false;
-      const expiresAt = observedAt + RESERVATION_TTL_MS;
-      const reservationOrdinal = nextReservationOrdinal;
+      const bootstrapNonce = mint('b1_', bootstrapNonces);
+      const rendererNonce = mint('n1_', rendererNonces);
       if (
-        !Number.isFinite(expiresAt) ||
-        expiresAt <= observedAt ||
-        reservationOrdinal > 4_294_967_295
-      ) {
-        return false;
+        !bootstrapNonce ||
+        !rendererNonce ||
+        !aps.isBootstrapNonce(bootstrapNonce) ||
+        !aps.isRendererNonce(rendererNonce)
+      )
+        return undefined;
+      let frame: HTMLIFrameElement;
+      try {
+        frame = options.document.createElement('iframe');
+        configureFrame(frame, source.width, source.height, overlay);
+      } catch {
+        return undefined;
       }
-      const attempt: Attempt = {
+      const attempt: ApsAttempt = {
         active: true,
+        accepted: false,
         bootstrapNavigated: false,
-        bootstrapNonce: undefined,
+        bootstrapNonceInternal: bootstrapNonce,
         bootstrapSource: undefined,
-        claim: undefined,
-        claimTimer: undefined,
+        callbacks,
         completionTimer: undefined,
-        controlPort: undefined,
-        controlRelease: undefined,
         cycle,
-        directFrame: undefined,
         documentAccepted: false,
-        documentAcceptancePending: false,
         documentPort: undefined,
         documentRelease: undefined,
         documentTimer: undefined,
-        documentTransferred: undefined,
-        gam: undefined,
+        frame,
         hostPositionOwned: false,
-        inserted: false,
-        insertionTimer: undefined,
-        ownerTicket: undefined,
-        overlay: false,
+        overlay,
+        pendingTerminal: undefined,
         previousHostPosition: '',
         previousHostPositionPriority: '',
-        rendererNonce: undefined,
-        onTerminal,
-        ownerSource: undefined,
-        pendingDocumentTerminal: undefined,
-        reservationId: cycle.bid.rendererReservationId,
-        phaseValue: 'waiting_for_gam_and_claim',
-        ticket: undefined,
+        rendererNonceInternal: rendererNonce,
       };
-      attempts.set(attempt.reservationId, attempt);
-      reservations.set(attempt.reservationId, {
-        expiresAtInternal: expiresAt,
-        ordinalInternal: reservationOrdinal,
-        registryState: 'live',
-      });
-      nextReservationOrdinal += 1;
-      return true;
-    },
-    recordGam: (
-      cycle: FirstDisplayGptBoundCycleV1,
-      result: FirstDisplayGptRenderResult
-    ): boolean => {
-      const attempt = attempts.get(cycle.bid.rendererReservationId);
-      if (
-        !attempt?.active ||
-        attempt.cycle !== cycle ||
-        attempt.gam ||
-        attempt.phaseValue !== 'waiting_for_gam_and_claim'
-      ) {
-        return false;
-      }
-      attempt.gam = result;
-      if (result === 'gam_empty') return renderDirectFallback(attempt);
-      if (attempt.claim) return join(attempt);
-      attempt.claimTimer = arm(() => fail(attempt, 'bridge_claim_timeout'), CLAIM_DEADLINE_MS);
-      return attempt.claimTimer !== undefined || fail(attempt, INTERNAL_ERROR);
-    },
-    recordFailure: (cycle: FirstDisplayGptBoundCycleV1): boolean => {
-      const attempt = attempts.get(cycle.bid.rendererReservationId);
-      return Boolean(
-        attempt?.active && attempt.cycle === cycle && fail(attempt, 'gpt_request_failed')
-      );
-    },
-    retire: retireCommitted,
-    sweepCommittedArtifacts,
-    sealTsAdmission: (): void => {
-      if (disposed || [...attempts.values()].some((attempt) => attempt.active)) {
-        throw new TypeError('tsjs');
-      }
-      sealed = true;
-    },
-    closeIngress: (): boolean => {
-      if (
-        disposed ||
-        ingressClosed ||
-        !sealed ||
-        [...attempts.values()].some((attempt) => attempt.active)
-      ) {
-        return false;
-      }
-      ingressClosed = true;
+      attempts.add(attempt);
+      bootstrapNonces.set(bootstrapNonce, attempt);
+      rendererNonces.set(rendererNonce, attempt);
       try {
-        options.browser.removeEventListener('message', dispatch as EventListener, true);
+        frame.onerror = () => fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
+        frame.src = `${aps.rendererUrl}#${bootstrapNonce}`;
+        if (!acquireHostPosition(attempt)) {
+          cancelAttempt(attempt);
+          return undefined;
+        }
+        cycle.element.appendChild(frame);
+        const frameWindow = frame.contentWindow;
+        if (!frameWindow) {
+          cancelAttempt(attempt);
+          return undefined;
+        }
+        attempt.bootstrapSource = frameWindow;
+        attempt.documentTimer = arm(
+          () => fail(attempt, RENDERER_DOCUMENT_NO_LOAD),
+          aps.deadlines.documentAcceptanceMs
+        );
+        if (attempt.documentTimer === undefined || !exactFrame(attempt, false)) {
+          cancelAttempt(attempt);
+          return undefined;
+        }
       } catch {
-        // The closed generation cannot regain authority through a failed physical removal.
+        cancelAttempt(attempt);
+        return undefined;
       }
-      for (const handle of [...timers]) clearOwnedTimer(handle);
-      return true;
-    },
-    captureHandoff: () => {
-      if (disposed || !ingressClosed || handoffCaptured) return undefined;
-      sweepCommittedArtifacts();
-      const observedAt = readNow();
-      if (observedAt === undefined) return undefined;
-      const reservationTombstones = [...reservations.entries()]
-        .filter((entry): entry is [string, ReservationEntry] => {
-          const value = entry[1];
-          return value.registryState === 'tombstone' && value.expiresAtInternal > observedAt;
-        })
-        .map(([value, entry]) =>
-          Object.freeze({
-            kind: 'reservation' as const,
-            value,
-            expiresAtMs: entry.expiresAtInternal,
-            ordinal: entry.ordinalInternal,
-          })
-        );
-      const ticketTombstones = [...tickets.entries()]
-        .filter((entry): entry is [string, TicketTombstone] => {
-          const value = entry[1];
-          return value.registryState === 'tombstone' && value.expiresAtInternal > observedAt;
-        })
-        .map(([value, entry]) =>
-          Object.freeze({
-            kind: 'ticket' as const,
-            value,
-            expiresAtMs: entry.expiresAtInternal,
-            ordinal: entry.ordinalInternal,
-          })
-        );
-      const artifacts = [...committedFrames.entries()].map(([slotId, entry]) =>
-        Object.freeze({
-          hostPosition: entry.hostPosition,
-          hostPositionPriority: entry.hostPositionPriority,
-          identity: entry.frame,
-          kind: entry.kind,
-          owner: entry.owner,
-          slotId,
-          token: entry.token,
-        })
-      );
-      handoffCaptured = true;
-      return Object.freeze({
-        artifacts: Object.freeze(artifacts),
-        clockEpochMs: observedAt,
-        nextReservationOrdinal,
-        nextTicketOrdinal,
-        tombstones: Object.freeze([...reservationTombstones, ...ticketTombstones]),
-      });
-    },
-    detachCommittedArtifacts: (): boolean => {
-      if (disposed || !ingressClosed || !handoffCaptured || committedArtifactsDetached) {
-        return false;
-      }
-      if (sweepCommittedArtifacts() > 0) return false;
-      committedArtifactsDetached = true;
-      return true;
+      notifyNativeMutation();
+      return Object.freeze({ cancel: () => cancelAttempt(attempt) });
     },
     dispose: (): void => {
       if (disposed) return;
       disposed = true;
-      if (!ingressClosed) {
-        ingressClosed = true;
-        try {
-          options.browser.removeEventListener('message', dispatch as EventListener, true);
-        } catch {
-          // Generation latching makes a failed physical removal inert.
-        }
+      try {
+        options.browser.removeEventListener('message', dispatch as EventListener, true);
+      } catch {
+        // Generation state remains authoritative.
       }
-      for (const attempt of [...attempts.values()]) {
-        if (attempt.active) settle(attempt, 'cancelled', NAVIGATION_DISPOSED);
-      }
+      for (const attempt of [...attempts]) cancelAttempt(attempt);
       for (const handle of [...timers]) clearOwnedTimer(handle);
-      if (!committedArtifactsDetached) {
-        for (const entry of committedFrames.values()) disposeCommittedFrame(entry);
-      }
-      committedFrames.clear();
       attempts.clear();
-      reservations.clear();
-      tickets.clear();
       bootstrapNonces.clear();
       rendererNonces.clear();
     },

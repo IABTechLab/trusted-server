@@ -75,32 +75,61 @@ const EXPECTED = [
 ] as const;
 
 describe('canonical release catalog', () => {
-  it('pins the exact thirteen first-display rows and closed server-owned selection', () => {
+  it('pins the exact fourteen first-display rows and closed server-owned selection', () => {
     expect(FIRST_DISPLAY_CONTRACT_IDS).toEqual(FIRST_DISPLAY_CATALOG.map(({ id }) => id));
     expect(FIRST_DISPLAY_CATALOG.map(({ order, id }) => [order, id])).toEqual([
       [1, 'first_display'],
-      [2, 'aps_initial'],
-      [3, 'creative_initial'],
-      [4, 'datadome_initial'],
-      [5, 'didomi_initial'],
-      [6, 'google_tag_manager_initial'],
-      [7, 'gpt_initial'],
-      [8, 'lockr_initial'],
-      [9, 'osano_initial'],
-      [10, 'permutive_initial'],
-      [11, 'sourcepoint_initial'],
-      [12, 'prebid_initial'],
-      [13, 'testlight_initial'],
+      [2, 'render_owner_initial'],
+      [3, 'aps_initial'],
+      [4, 'creative_initial'],
+      [5, 'datadome_initial'],
+      [6, 'didomi_initial'],
+      [7, 'google_tag_manager_initial'],
+      [8, 'gpt_initial'],
+      [9, 'lockr_initial'],
+      [10, 'osano_initial'],
+      [11, 'permutive_initial'],
+      [12, 'sourcepoint_initial'],
+      [13, 'prebid_initial'],
+      [14, 'testlight_initial'],
     ]);
-    expect(MAX_FIRST_DISPLAY_SLICES).toBe(13);
+    expect(MAX_FIRST_DISPLAY_SLICES).toBe(14);
     expect(
       selectFirstDisplayCatalog({
         eligibleBatch: true,
         integrations: ['aps', 'gpt', 'prebid'],
         apsParticipates: true,
+        renderOwnerParticipates: true,
         prebidParticipates: true,
       }).map(({ id }) => id)
-    ).toEqual(['first_display', 'aps_initial', 'gpt_initial', 'prebid_initial']);
+    ).toEqual([
+      'first_display',
+      'render_owner_initial',
+      'aps_initial',
+      'gpt_initial',
+      'prebid_initial',
+    ]);
+    expect(
+      selectFirstDisplayCatalog({
+        eligibleBatch: true,
+        integrations: ['gpt'],
+        renderOwnerParticipates: true,
+      }).map(({ id }) => id)
+    ).toEqual(['first_display', 'render_owner_initial', 'gpt_initial']);
+    expect(
+      selectFirstDisplayCatalog({
+        eligibleBatch: true,
+        integrations: ['gpt'],
+        renderOwnerParticipates: false,
+      }).map(({ id }) => id)
+    ).toEqual(['first_display', 'gpt_initial']);
+    expect(
+      selectFirstDisplayCatalog({
+        eligibleBatch: true,
+        integrations: ['gpt'],
+        apsParticipates: true,
+      }).map(({ id }) => id)
+    ).toEqual(['first_display', 'gpt_initial']);
     expect(selectFirstDisplayCatalog({ eligibleBatch: false, integrations: [] })).toEqual([]);
     expect(() =>
       selectFirstDisplayCatalog({ eligibleBatch: true, integrations: ['unknown'] })

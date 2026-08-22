@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
 
 import type { FirstDisplayGptBoundCycleV1 } from '../../src/first_display/adapters/googletag';
-import { createFirstDisplayAdmRenderBridge } from '../../src/first_display/adm_render_bridge';
+
+import { createTestFirstDisplayRenderBridge } from './helpers/render_owner_composition';
 
 const RESERVATION_ID = `r1_${'a'.repeat(22)}`;
 
@@ -48,9 +49,15 @@ function harness() {
   let now = 0;
   const terminal = vi.fn();
   const mutation = vi.fn(() => true);
-  const bridge = createFirstDisplayAdmRenderBridge({
+  const bridge = createTestFirstDisplayRenderBridge({
+    browser: dom.window as unknown as Window,
     clearTimer: (handle) => timers.delete(handle as object),
+    createChannel: () => {
+      throw new Error('ADM fallback must not create an owner channel');
+    },
     document: dom.window.document,
+    fillRandom: () => undefined,
+    getAps: () => undefined,
     now: () => now,
     onNativeMutation: mutation,
     setTimer: (callback) => {
@@ -74,33 +81,7 @@ function harness() {
   };
 }
 
-describe('ADM-only first-display render bridge', () => {
-  it('accepts a nonempty GAM result without installing PUC/message authority', () => {
-    const h = harness();
-
-    expect(h.bridge.recordGam(h.cycle, 'nonempty_gam')).toBe(true);
-    expect(h.terminal).toHaveBeenCalledWith('accepted', null);
-    expect(h.element.querySelector('iframe')).toBeNull();
-    expect(h.timers).toHaveLength(0);
-
-    expect(() => h.bridge.sealTsAdmission()).not.toThrow();
-    expect(h.bridge.closeIngress()).toBe(true);
-    expect(h.bridge.captureHandoff()).toEqual({
-      artifacts: [],
-      clockEpochMs: 0,
-      nextReservationOrdinal: 2,
-      nextTicketOrdinal: 1,
-      tombstones: [
-        {
-          expiresAtMs: 900_000,
-          kind: 'reservation',
-          ordinal: 1,
-          value: RESERVATION_ID,
-        },
-      ],
-    });
-  });
-
+describe('ADM-only shared first-display render journal', () => {
   it('owns only the attributable empty-GAM ADM frame and transfers it once', () => {
     const h = harness();
 

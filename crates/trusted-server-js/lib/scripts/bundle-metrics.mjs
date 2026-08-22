@@ -190,8 +190,8 @@ function concatenateBundleSet(files, contents) {
 
 /** Enumerate every reachable base mask; APS and Prebid participation require GPT. */
 export function enumerateReachableFirstDisplayMasks(catalog) {
-  if (!Array.isArray(catalog) || catalog.length !== 13) {
-    fail('first-display catalog must contain exactly thirteen rows');
+  if (!Array.isArray(catalog) || catalog.length !== 14) {
+    fail('first-display catalog must contain exactly fourteen rows');
   }
   const ids = new Set();
   const files = new Set();
@@ -213,17 +213,23 @@ export function enumerateReachableFirstDisplayMasks(catalog) {
     fail('first-display catalog bit zero must be the base');
   }
   const gpt = catalog.find(({ id }) => id === 'gpt_initial');
+  const renderOwner = catalog.find(({ id }) => id === 'render_owner_initial');
   const aps = catalog.find(({ id }) => id === 'aps_initial');
   const prebid = catalog.find(({ id }) => id === 'prebid_initial');
   if (!gpt) fail('first-display catalog must contain gpt_initial');
-  if (!aps || !prebid) fail('first-display catalog must contain APS and Prebid participation');
+  if (!renderOwner || !aps || !prebid) {
+    fail('first-display catalog must contain render-owner, APS, and Prebid participation');
+  }
   const required = 1 << catalog[0].maskBit;
   const maximumMask = 1 << catalog.length;
   const result = [];
   for (let mask = 0; mask < maximumMask; mask += 1) {
     if ((mask & required) !== required) continue;
     const hasGpt = (mask & (1 << gpt.maskBit)) !== 0;
-    if (!hasGpt && ((mask & (1 << aps.maskBit)) !== 0 || (mask & (1 << prebid.maskBit)) !== 0)) {
+    const hasRenderOwner = (mask & (1 << renderOwner.maskBit)) !== 0;
+    const hasAps = (mask & (1 << aps.maskBit)) !== 0;
+    const hasPrebid = (mask & (1 << prebid.maskBit)) !== 0;
+    if ((!hasGpt && (hasRenderOwner || hasAps || hasPrebid)) || (hasAps && !hasRenderOwner)) {
       continue;
     }
     const selected = catalog.filter(({ maskBit }) => (mask & (1 << maskBit)) !== 0);

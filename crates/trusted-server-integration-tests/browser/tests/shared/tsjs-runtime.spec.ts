@@ -1,5 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
+import { installGptStub } from "../../helpers/gpt-stub.js";
 import {
+  firstDisplayTsjsFixture,
   loadRuntimeTsjsFixture,
   runtimeTsjsFixture,
   serverBootTransportLiteralV1,
@@ -8,6 +10,65 @@ import {
 
 const KERNEL_FIXTURE = runtimeTsjsFixture(["render_runtime"]);
 const FALLBACK_FIXTURE = runtimeTsjsFixture([]);
+const FIRST_DISPLAY_SLOT = "first-display-owner-slot";
+const FIRST_DISPLAY_FIXTURE = firstDisplayTsjsFixture({
+  firstDisplayIds: ["first_display", "render_owner_initial", "gpt_initial"],
+  takeoverIds: ["render_runtime", "gpt"],
+  auctionProjection: {
+    version: 1,
+    auction: {
+      version: 1,
+      auctionId: "browser-first-display-owner",
+      results: [
+        {
+          slot: FIRST_DISPLAY_SLOT,
+          outcome: "winner",
+          candidateId: "AAAAAAAAAAAA",
+        },
+      ],
+    },
+    slots: [
+      {
+        slot: FIRST_DISPLAY_SLOT,
+        gamUnitPath: `/123/${FIRST_DISPLAY_SLOT}`,
+        divId: FIRST_DISPLAY_SLOT,
+        formats: [[300, 250]],
+        targeting: {},
+      },
+    ],
+    bids: [
+      {
+        candidateId: "AAAAAAAAAAAA",
+        slot: FIRST_DISPLAY_SLOT,
+        provider: "fictional",
+        upstreamBidId: "first-display-owner-bid",
+        cpm: 1.25,
+        currency: "USD",
+        targeting: { hb_bidder: "fictional" },
+        rendererReservationId: "r1_AAAAAAAAAAAAAAAAAAAAAA",
+        renderSource: {
+          type: "adm",
+          version: 1,
+          adm: "<main>fictional first-display creative</main>",
+          width: 300,
+          height: 250,
+        },
+      },
+    ],
+  },
+  integrations: {
+    version: 1,
+    entries: [
+      {
+        id: "gpt",
+        config: {
+          gamAttributionEnabled: false,
+          pageBidsEnabled: true,
+        },
+      },
+    ],
+  },
+});
 
 function boot(fixture: RuntimeTsjsFixture) {
   return {
@@ -61,7 +122,217 @@ async function openRuntimePage(page: Page) {
   await page.goto("https://runtime.test/fixture");
 }
 
+async function installFirstDisplayResourceProbe(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const events: Array<{ kind: string; beforePaint: boolean }> = [];
+    const record = (kind: string): void => {
+      events.push({
+        kind,
+        beforePaint:
+          performance.getEntriesByName("tsjs:first-display-paint", "mark")
+            .length === 0,
+      });
+    };
+
+    const nativeCreateElement = Document.prototype.createElement;
+    Document.prototype.createElement = function (
+      qualifiedName: string,
+      options?: ElementCreationOptions,
+    ): HTMLElement {
+      const normalized = String(qualifiedName).toLowerCase();
+      if (normalized === "script" || normalized === "link") {
+        record(`create:${normalized}`);
+      }
+      return nativeCreateElement.call(this, qualifiedName, options);
+    };
+
+    const nativeFetch = window.fetch;
+    window.fetch = ((...arguments_: Parameters<typeof window.fetch>) => {
+      record("fetch");
+      return Reflect.apply(nativeFetch, window, arguments_);
+    }) as typeof window.fetch;
+
+    const nativeXhrOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (...arguments_: unknown[]): void {
+      record("xhr");
+      Reflect.apply(nativeXhrOpen, this, arguments_);
+    } as typeof XMLHttpRequest.prototype.open;
+
+    const wrapConstructor = (name: "Worker" | "SharedWorker"): void => {
+      const nativeConstructor = Reflect.get(window, name);
+      if (typeof nativeConstructor !== "function") return;
+      const wrapped = function (this: unknown, ...arguments_: unknown[]) {
+        record(name.toLowerCase());
+        return Reflect.construct(nativeConstructor, arguments_, new.target);
+      };
+      Object.setPrototypeOf(wrapped, nativeConstructor);
+      Object.defineProperty(wrapped, "prototype", {
+        value: nativeConstructor.prototype,
+      });
+      Reflect.set(window, name, wrapped);
+    };
+    wrapConstructor("Worker");
+    wrapConstructor("SharedWorker");
+
+    const nativeCreateObjectUrl = URL.createObjectURL;
+    URL.createObjectURL = ((object: Blob | MediaSource): string => {
+      record("blob-url");
+      return Reflect.apply(nativeCreateObjectUrl, URL, [object]) as string;
+    }) as typeof URL.createObjectURL;
+
+    Object.defineProperty(window, "__firstDisplayResourceProbe", {
+      value: () => events.map((entry) => ({ ...entry })),
+    });
+  });
+}
+
 test.describe("TSJS hard-cutover runtime", () => {
+  test("loads the render owner only inside one parser-blocking first-display request before paint", async ({
+    page,
+  }) => {
+    await installGptStub(page);
+    await installFirstDisplayResourceProbe(page);
+    const firstDisplayUrl = new URL(
+      FIRST_DISPLAY_FIXTURE.firstDisplaySrc,
+      "https://runtime.test",
+    ).toString();
+    const runtimeUrl = new URL(
+      FIRST_DISPLAY_FIXTURE.runtimeSrc,
+      "https://runtime.test",
+    ).toString();
+    const firstDisplayRequests: string[] = [];
+    const allRequests: string[] = [];
+    const pageErrors: string[] = [];
+    const consoleMessages: string[] = [];
+    page.on("request", (request) => allRequests.push(request.url()));
+    page.on("pageerror", (error) => pageErrors.push(error.message));
+    page.on("console", (message) =>
+      consoleMessages.push(`${message.type()}: ${message.text()}`),
+    );
+    await page.route(firstDisplayUrl, (route) => {
+      firstDisplayRequests.push(route.request().url());
+      return route.fulfill({
+        status: 200,
+        contentType: "application/javascript; charset=utf-8",
+        headers: { "x-content-type-options": "nosniff" },
+        body: FIRST_DISPLAY_FIXTURE.firstDisplayBody,
+      });
+    });
+    await page.route(runtimeUrl, (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/javascript; charset=utf-8",
+        headers: { "x-content-type-options": "nosniff" },
+        body: FIRST_DISPLAY_FIXTURE.runtimeBody,
+      }),
+    );
+    await page.route("https://runtime.test/first-display-owner", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "text/html; charset=utf-8",
+        body: `<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><script>window.tsjs={que:[]};window.__gptDiagnosticsStub.emitRequestStartOnDisplay();const __TSJS_SERVER_BOOT_TRANSPORT_V1__=${serverBootTransportLiteralV1(FIRST_DISPLAY_FIXTURE.boot, FIRST_DISPLAY_FIXTURE.outline)};${FIRST_DISPLAY_FIXTURE.bootstrapBody}</script></head><body><div id="${FIRST_DISPLAY_SLOT}"></div><script src="${FIRST_DISPLAY_FIXTURE.firstDisplaySrc}" id="trustedserver-js"></script><script>window.__firstDisplayParserObservation={async:document.querySelector("script#trustedserver-js").async,defer:document.querySelector("script#trustedserver-js").defer,firstAction:performance.getEntriesByName("tsjs:first-display","mark").length};window.__gptDiagnosticsStub.emit("slotRenderEnded",${JSON.stringify(FIRST_DISPLAY_SLOT)},{isEmpty:true,responseIdentifier:"fictional-empty-gam"});</script></body></html>`,
+      }),
+    );
+
+    await page.goto("https://runtime.test/first-display-owner");
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            performance.getEntriesByName("tsjs:first-display-paint", "mark")
+              .length,
+        ),
+      )
+      .toBe(1);
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (
+              window as unknown as {
+                tsjs?: { _internal?: { state?: string } };
+              }
+            ).tsjs?._internal?.state,
+        ),
+      )
+      .toMatch(/^(?:kernel|fallback)$/u);
+    const runtimeDiagnostic = await page.evaluate(() => ({
+      internal: (
+        window as unknown as {
+          tsjs?: { _internal?: unknown };
+        }
+      ).tsjs?._internal,
+      marks: performance
+        .getEntriesByType("mark")
+        .map((entry) => ({ name: entry.name, startTime: entry.startTime })),
+      frames: [...document.querySelectorAll("iframe")].map((frame) => ({
+        connected: frame.isConnected,
+        parent: frame.parentElement?.id ?? null,
+        title: frame.title,
+      })),
+    }));
+    expect(
+      runtimeDiagnostic.internal,
+      JSON.stringify({
+        ...runtimeDiagnostic,
+        allRequests,
+        consoleMessages,
+        firstDisplayRequests,
+        pageErrors,
+      }),
+    ).toMatchObject({ state: "kernel" });
+
+    const observation = await page.evaluate((slotId) => {
+      const browserWindow = window as unknown as {
+        __firstDisplayParserObservation: {
+          async: boolean;
+          defer: boolean;
+          firstAction: number;
+        };
+        __firstDisplayResourceProbe(): Array<{
+          kind: string;
+          beforePaint: boolean;
+        }>;
+      };
+      return {
+        parser: browserWindow.__firstDisplayParserObservation,
+        loaderCallsBeforePaint: browserWindow
+          .__firstDisplayResourceProbe()
+          .filter((entry) => entry.beforePaint)
+          .map((entry) => entry.kind),
+        loaderCallsAfterPaint: browserWindow
+          .__firstDisplayResourceProbe()
+          .filter((entry) => !entry.beforePaint)
+          .map((entry) => entry.kind),
+        firstDisplayScripts: document.querySelectorAll(
+          "script#trustedserver-js",
+        ).length,
+        creativeFrames: document.querySelectorAll(
+          `#${slotId} > iframe[title="Ad content"]`,
+        ).length,
+      };
+    }, FIRST_DISPLAY_SLOT);
+
+    expect(firstDisplayRequests).toEqual([firstDisplayUrl]);
+    expect(allRequests).toEqual([
+      "https://runtime.test/first-display-owner",
+      firstDisplayUrl,
+      runtimeUrl,
+    ]);
+    expect(
+      allRequests.filter((url) => /tsjs-render_owner_initial/u.test(url)),
+    ).toEqual([]);
+    expect(observation.parser).toEqual({
+      async: false,
+      defer: false,
+      firstAction: 1,
+    });
+    expect(observation.loaderCallsBeforePaint).toEqual([]);
+    expect(observation.loaderCallsAfterPaint).toEqual(["create:script"]);
+    expect(observation.firstDisplayScripts).toBe(1);
+    expect(observation.creativeFrames).toBe(1);
+  });
+
   test("generated bootstrap transfers one direct-runtime watchdog to the persistent owner", async ({
     page,
   }) => {

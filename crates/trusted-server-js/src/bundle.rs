@@ -135,7 +135,7 @@ pub fn all_integration_metadata() -> Vec<TsjsArtifactMetadata> {
         .collect()
 }
 
-/// Return generated metadata for the base and twelve first-display components.
+/// Return generated metadata for the base and thirteen first-display slices.
 #[must_use]
 pub fn all_first_display_metadata() -> Vec<TsjsArtifactMetadata> {
     TSJS_ARTIFACTS
@@ -388,25 +388,25 @@ mod tests {
     fn generated_artifact_inventory_includes_bootstrap_core_and_catalog_once() {
         let artifacts = all_artifact_metadata();
 
-        assert_eq!(artifacts.len(), 35);
+        assert_eq!(artifacts.len(), 36);
         assert_eq!(artifacts[0].id, "bootstrap");
         assert_eq!(artifacts[0].role, TsjsArtifactRole::Bootstrap);
         assert_eq!(artifacts[1].id, "first_display");
         assert_eq!(artifacts[1].role, TsjsArtifactRole::FirstDisplayBase);
         assert!(
-            artifacts[2..14]
+            artifacts[2..15]
                 .iter()
                 .all(|artifact| artifact.role == TsjsArtifactRole::FirstDisplaySlice)
         );
-        assert_eq!(artifacts[14].id, "core");
-        assert_eq!(artifacts[14].role, TsjsArtifactRole::Core);
+        assert_eq!(artifacts[15].id, "core");
+        assert_eq!(artifacts[15].role, TsjsArtifactRole::Core);
         assert!(
-            artifacts[15..]
+            artifacts[16..]
                 .iter()
                 .all(|artifact| artifact.role == TsjsArtifactRole::Integration)
         );
         assert_eq!(all_module_ids().len(), 21);
-        assert_eq!(all_first_display_ids().len(), 13);
+        assert_eq!(all_first_display_ids().len(), 14);
     }
 
     #[test]

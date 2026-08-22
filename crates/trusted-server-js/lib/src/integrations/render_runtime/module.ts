@@ -318,7 +318,8 @@ export function adoptInitialRenderArtifactsFromHandoff(
       if (
         typeof slotId !== 'string' ||
         (kind !== 'aps' && kind !== 'gpt_adm') ||
-        owner !== 'trusted_server' ||
+        (owner !== 'trusted_server' && owner !== 'publisher') ||
+        (owner === 'publisher' && kind !== 'gpt_adm') ||
         typeof token !== 'string' ||
         !/^r1_[A-Za-z0-9_-]{22}$/.test(token) ||
         (hostPosition === null && hostPositionPriority !== null) ||
@@ -336,6 +337,7 @@ export function adoptInitialRenderArtifactsFromHandoff(
       const previousHostPosition = hostPosition as string | null;
       const previousHostPositionPriority = hostPositionPriority as '' | 'important' | null;
       const frame = identity;
+      const expectedParent = frame.parentNode;
       const expectedContentWindow = frame.contentWindow;
       const expectedSourceAttribute = frame.getAttribute('src');
       const expectedSource = frame.src;
@@ -346,7 +348,8 @@ export function adoptInitialRenderArtifactsFromHandoff(
       if (
         !host.isConnected ||
         host.ownerDocument !== document ||
-        frame.parentNode !== host ||
+        !expectedParent ||
+        (owner === 'trusted_server' && expectedParent !== host) ||
         !frame.isConnected ||
         frame.ownerDocument !== document ||
         !expectedContentWindow ||
@@ -368,7 +371,7 @@ export function adoptInitialRenderArtifactsFromHandoff(
         dispose: (): void => {
           if (disposed) return;
           disposed = true;
-          if (!armed) return;
+          if (!armed || owner === 'publisher') return;
           try {
             frame.remove();
           } catch {
@@ -398,7 +401,7 @@ export function adoptInitialRenderArtifactsFromHandoff(
               document.getElementById(domId as string) === host &&
               host.isConnected &&
               host.ownerDocument === document &&
-              frame.parentNode === host &&
+              frame.parentNode === expectedParent &&
               frame.isConnected &&
               frame.ownerDocument === document &&
               frame.contentWindow === expectedContentWindow &&

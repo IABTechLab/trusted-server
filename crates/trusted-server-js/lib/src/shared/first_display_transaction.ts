@@ -8,6 +8,7 @@ const FIRST_DISPLAY_SRC =
 const FIRST_DISPLAY_ORDER = new Map(
   [
     'first_display',
+    'render_owner_initial',
     'aps_initial',
     'creative_initial',
     'datadome_initial',
@@ -167,6 +168,7 @@ class FirstDisplayTransactionOwner implements FirstDisplayTransaction {
     ) {
       return this.reject();
     }
+    if (this.stateValue !== 'collecting') return false;
     const prepared: PreparedFirstDisplaySliceV1[] = [];
     this.stateValue = 'preparing';
     try {
@@ -178,6 +180,7 @@ class FirstDisplayTransactionOwner implements FirstDisplayTransaction {
             sliceId: registration.id,
           })
         );
+        if (this.stateValue !== 'preparing') throw new TypeError('stale slice preparation');
         const fields = exactRecord(candidate, ['activate']);
         if (!fields || typeof fields.activate !== 'function')
           throw new TypeError('invalid prepared slice');
@@ -185,42 +188,56 @@ class FirstDisplayTransactionOwner implements FirstDisplayTransaction {
           Object.freeze({ activate: fields.activate as PreparedFirstDisplaySliceV1['activate'] })
         );
       }
-      if (!this.authenticated()) throw new TypeError('stale first-display owner');
+      if (!this.authenticated() || this.stateValue !== 'preparing') {
+        throw new TypeError('stale first-display owner');
+      }
       this.stateValue = 'activating';
       let ownershipOpen = true;
       let afterActivation: (() => void) | undefined;
-      for (let index = 0; index < prepared.length; index += 1) {
-        const slice = prepared[index];
-        if (!slice) throw new TypeError('missing prepared first-display slice');
-        slice.activate(
-          Object.freeze({
-            own: (dispose: () => void): void => {
-              if (!ownershipOpen || typeof dispose !== 'function') {
-                throw new TypeError('first-display disposer registration is closed');
-              }
-              this.disposers.push(dispose);
-            },
-            afterActivate: (callback: () => void): void => {
-              if (
-                !ownershipOpen ||
-                index !== 0 ||
-                afterActivation !== undefined ||
-                typeof callback !== 'function'
-              ) {
-                throw new TypeError('invalid first-display post-activation callback');
-              }
-              afterActivation = callback;
-            },
-          })
-        );
+      try {
+        for (let index = 0; index < prepared.length; index += 1) {
+          const slice = prepared[index];
+          if (!slice) throw new TypeError('missing prepared first-display slice');
+          slice.activate(
+            Object.freeze({
+              own: (dispose: () => void): void => {
+                if (!ownershipOpen || typeof dispose !== 'function') {
+                  throw new TypeError('first-display disposer registration is closed');
+                }
+                this.disposers.push(dispose);
+              },
+              afterActivate: (callback: () => void): void => {
+                if (
+                  !ownershipOpen ||
+                  index !== 0 ||
+                  afterActivation !== undefined ||
+                  typeof callback !== 'function'
+                ) {
+                  throw new TypeError('invalid first-display post-activation callback');
+                }
+                afterActivation = callback;
+              },
+            })
+          );
+          if (this.stateValue !== 'activating') {
+            throw new TypeError('stale first-display activation');
+          }
+        }
+      } finally {
+        ownershipOpen = false;
       }
-      ownershipOpen = false;
       afterActivation?.();
-      if (!this.authenticated()) throw new TypeError('stale first-display activation');
+      if (
+        !this.stateCurrent('activating') ||
+        !this.authenticated() ||
+        !this.stateCurrent('activating')
+      ) {
+        throw new TypeError('stale first-display activation');
+      }
       this.stateValue = 'active';
       return true;
     } catch {
-      this.stateValue = 'failed';
+      if (!this.stateCurrent('disposed')) this.stateValue = 'failed';
       this.unwind();
       return false;
     }
@@ -231,6 +248,10 @@ class FirstDisplayTransactionOwner implements FirstDisplayTransaction {
     this.stateValue = 'disposed';
     this.unwind();
     this.registrations.length = 0;
+  }
+
+  private stateCurrent(expected: FirstDisplayTransactionState): boolean {
+    return this.stateValue === expected;
   }
 
   private authenticated(): boolean {
@@ -262,9 +283,10 @@ class FirstDisplayTransactionOwner implements FirstDisplayTransaction {
   }
 
   private unwind(): void {
-    for (let index = this.disposers.length - 1; index >= 0; index -= 1) {
+    while (this.disposers.length > 0) {
+      const dispose = this.disposers.pop();
       try {
-        this.disposers[index]?.();
+        dispose?.();
       } catch (error) {
         try {
           this.options.onDisposalError?.(error);
@@ -273,7 +295,6 @@ class FirstDisplayTransactionOwner implements FirstDisplayTransaction {
         }
       }
     }
-    this.disposers.length = 0;
   }
 }
 

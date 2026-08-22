@@ -4,6 +4,10 @@ pub mod tests {
     use serde::Deserialize as _;
 
     /// Decode the one server-sealed lexical TSJS boot transport from generated HTML.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the script omits the sealed transport or contains invalid JSON.
     #[must_use]
     pub fn bootstrap_transport(script: &str) -> serde_json::Value {
         let encoded = script

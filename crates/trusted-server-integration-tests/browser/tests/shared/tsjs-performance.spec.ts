@@ -362,11 +362,17 @@ function loadReleaseFixtureResources(
     performanceCase === "aps"
       ? ([
           "first_display",
+          "render_owner_initial",
           "aps_initial",
           "creative_initial",
           "gpt_initial",
         ] as const)
-      : (["first_display", "creative_initial", "gpt_initial"] as const);
+      : ([
+          "first_display",
+          "render_owner_initial",
+          "creative_initial",
+          "gpt_initial",
+        ] as const);
   const firstDisplayArtifacts = firstDisplayIds.map((id) =>
     exactArtifact(release, id),
   );
@@ -376,7 +382,7 @@ function loadReleaseFixtureResources(
     .map((artifact) => readFileSync(resolve(dist, artifact.file), "utf8"))
     .join(";\n");
   const selectedHash = createHash("sha256").update(selectedBody).digest("hex");
-  const mask = performanceCase === "aps" ? "0047" : "0045";
+  const mask = performanceCase === "aps" ? "008f" : "008b";
   const selectedSrc = `/static/tsjs=tsjs-first-display.min.js?m=${mask}&v=${selectedHash}`;
   const deferred = new Map<string, { body: string; src: string }>();
   for (const id of DEFERRED_IDS) {
@@ -432,8 +438,10 @@ function loadReleaseFixtureResources(
   expect(controllerDocument.match(/tsjs:bids-script/gu)).toHaveLength(2);
   expect(controllerDocument.match(/id="trustedserver-js"/gu)).toHaveLength(1);
   expect(controllerDocument).toContain(selectedTag);
-  expect(controllerDocument).toContain(`"releaseId":"${release.releaseId}"`);
-  expect(controllerDocument).toContain(`"runtimeSrc":"${runtimeSrc}"`);
+  expect(controllerDocument).toContain(
+    `\\"releaseId\\":\\"${release.releaseId}\\"`,
+  );
+  expect(controllerDocument).toContain(`\\"runtimeSrc\\":\\"${runtimeSrc}\\"`);
   expect(controllerDocument).not.toContain(
     `<script src="${runtimeSrc}" id="trustedserver-js"></script>`,
   );

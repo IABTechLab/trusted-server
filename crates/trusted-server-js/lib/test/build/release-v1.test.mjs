@@ -39,6 +39,7 @@ const bundle = (id, logical, role = 'integration', phase = 'takeover', trigger =
 const EXPECTED_RELEASE_BUNDLE_ORDER = [
   'bootstrap',
   'first_display',
+  'render_owner_initial',
   'aps_initial',
   'creative_initial',
   'datadome_initial',
@@ -206,7 +207,7 @@ test('generated release inventory pins the server bundle order', () => {
   );
   assert.equal(manifest.artifacts.filter(({ role }) => role === 'bootstrap').length, 1);
   assert.equal(manifest.artifacts.filter(({ role }) => role === 'first_display_base').length, 1);
-  assert.equal(manifest.artifacts.filter(({ role }) => role === 'first_display_slice').length, 12);
+  assert.equal(manifest.artifacts.filter(({ role }) => role === 'first_display_slice').length, 13);
   assert.equal(manifest.artifacts.filter(({ role }) => role === 'core').length, 1);
   assert.equal(manifest.artifacts.filter(({ role }) => role === 'integration').length, 20);
   for (const artifact of manifest.artifacts) {
@@ -243,7 +244,7 @@ test('generated first-display components self-register through one authenticated
   );
   const firstDisplay = release.artifacts.filter(({ phase }) => phase === 'first_display');
   const dom = new JSDOM(
-    `<!doctype html><script id="trustedserver-js" src="/static/tsjs=tsjs-first-display.min.js?m=1fff&v=${'b'.repeat(64)}"></script>`,
+    `<!doctype html><script id="trustedserver-js" src="/static/tsjs=tsjs-first-display.min.js?m=3fff&v=${'b'.repeat(64)}"></script>`,
     {
       runScripts: 'outside-only',
       url: 'https://publisher.example/article',
@@ -418,6 +419,18 @@ test('generated first-display components self-register through one authenticated
           onFailure: function() {}
         }),
         sliceBindings: function(id) {
+          if (id === 'render_owner_initial') {
+            return Object.freeze({
+              bindings: Object.freeze({
+                observe: function() {},
+                register: function(protocol) {
+                  window.__firstDisplayEvents.push('render_owner:' + protocol.id);
+                  return function() {};
+                }
+              }),
+              config: Object.freeze({})
+            });
+          }
           if (id === 'aps_initial') {
             return Object.freeze({
               bindings: Object.freeze({
@@ -457,10 +470,14 @@ test('generated first-display components self-register through one authenticated
       });
     `);
     const activatedBase = registrations[0].prepare(dom.window.__firstDisplayBaseHost);
+    const activatedRenderOwner = registrations
+      .find(({ id }) => id === 'render_owner_initial')
+      .prepare(activatedBase.sliceHost);
     const activatedGpt = registrations
       .find(({ id }) => id === 'gpt_initial')
       .prepare(activatedBase.sliceHost);
     activatedBase.activate(dom.window.__firstDisplayActivation);
+    activatedRenderOwner.activate(dom.window.__firstDisplaySliceActivation);
     activatedGpt.activate(dom.window.__firstDisplaySliceActivation);
     dom.window.__firstDisplayAfterActivate();
     const directFrame = dom.window.document.querySelector('#slot-1 iframe');
@@ -468,7 +485,13 @@ test('generated first-display components self-register through one authenticated
     directFrame.dispatchEvent(new dom.window.Event('load'));
     assert.deepEqual(
       [...dom.window.__firstDisplayEvents],
-      ['gpt:gpt', 'bootstrap:register', 'bootstrap:action', 'gpt:display']
+      [
+        'render_owner:render_owner',
+        'gpt:gpt',
+        'bootstrap:register',
+        'bootstrap:action',
+        'gpt:display',
+      ]
     );
   } finally {
     dom.window.close();
@@ -967,15 +990,22 @@ test('bundle metrics enumerate and hash every reachable first-display mask', () 
   const masks = metrics.firstDisplay.masks;
 
   assert.ok(Array.isArray(masks));
-  assert.equal(masks.length, 2_560);
+  assert.equal(masks.length, 3_584);
   assert.equal(new Set(masks.map(({ mask }) => mask)).size, masks.length);
   assert.equal(new Set(masks.map(({ sha256 }) => sha256)).size, masks.length);
   for (const measurement of masks) {
     assert.match(measurement.mask, /^[0-9a-f]{4}$/u);
     assert.equal(measurement.ids[0], 'first_display');
     if (!measurement.ids.includes('gpt_initial')) {
+      assert.equal(measurement.ids.includes('render_owner_initial'), false);
       assert.equal(measurement.ids.includes('aps_initial'), false);
       assert.equal(measurement.ids.includes('prebid_initial'), false);
+    }
+    if (measurement.ids.includes('aps_initial')) {
+      assert.equal(measurement.ids.includes('render_owner_initial'), true);
+    }
+    if (measurement.ids.includes('render_owner_initial')) {
+      assert.equal(measurement.ids.includes('gpt_initial'), true);
     }
     assert.deepEqual(
       measurement.files,
@@ -1005,7 +1035,7 @@ test('candidate architecture obeys every independent absolute transfer ceiling',
   });
 
   assert.doesNotThrow(() => bundleBudgets.enforceCandidateArchitectureSizeCeilings(report));
-  assert.equal(report.firstDisplay.masks.length, 2_560);
+  assert.equal(report.firstDisplay.masks.length, 3_584);
   assert.ok(report.firstDisplay.permittedMasks.length > 0);
   assert.ok(report.firstDisplay.permittedMasks.length < report.firstDisplay.masks.length);
   for (const name of ['minimal', 'reference', 'aps']) {
@@ -1020,6 +1050,7 @@ test('candidate architecture obeys every independent absolute transfer ceiling',
   ]);
   assert.deepEqual(report.firstDisplay.named.aps.ids, [
     'first_display',
+    'render_owner_initial',
     'aps_initial',
     'creative_initial',
     'gpt_initial',
@@ -1038,6 +1069,15 @@ test('candidate architecture obeys every independent absolute transfer ceiling',
     'referencePersistent',
     'maximalTotal',
   ]);
+  const maximalNonBootstrap = bundleMetrics.measureBundleSet(
+    release.artifacts.filter(({ role }) => role !== 'bootstrap').map(({ file }) => file),
+    currentArtifactContents
+  );
+  assert.deepEqual(report.maximalTotal, {
+    rawBytes: maximalNonBootstrap.rawBytes,
+    gzipBytes: maximalNonBootstrap.gzipBytes,
+    brotliBytes: maximalNonBootstrap.brotliBytes,
+  });
 });
 
 test('absolute transfer ceilings reject independent one-byte regressions', () => {
@@ -1833,6 +1873,54 @@ test('production bundle graphs reject every current forbidden edge', () => {
   );
 });
 
+test('first-display render ownership is physically split at the source-neutral boundary', () => {
+  const { metrics, release } = readBuildEvidence();
+  const sources = (id) =>
+    new Set(
+      metrics.modules.find(({ file }) => file === `tsjs-${id}.js`).sources.map(({ file }) => file)
+    );
+  const ownerSources = sources('render_owner_initial');
+  const apsSources = sources('aps_initial');
+  const baseSources = sources('first_display');
+
+  assert.equal(ownerSources.has('src/first_display/render_journal.ts'), true);
+  assert.equal(ownerSources.has('src/kernel/contracts/puc_dynamic_owner.ts'), true);
+  assert.equal(ownerSources.has('src/first_display/render_bridge.ts'), false);
+  assert.equal(ownerSources.has('src/first_display/leaf/aps_protocol.ts'), false);
+  assert.equal(apsSources.has('src/first_display/render_bridge.ts'), true);
+  assert.equal(apsSources.has('src/first_display/leaf/aps_protocol.ts'), true);
+  assert.equal(apsSources.has('src/first_display/render_journal.ts'), false);
+  assert.equal(apsSources.has('src/kernel/contracts/puc_dynamic_owner.ts'), false);
+  assert.equal(baseSources.has('src/first_display/render_journal.ts'), false);
+  assert.equal(baseSources.has('src/first_display/adm_render_bridge.ts'), false);
+
+  const ownerBody = fs.readFileSync(
+    path.resolve(libDirectory, '../dist/tsjs-render_owner_initial.js'),
+    'utf8'
+  );
+  const apsLiterals = [...ownerBody.matchAll(/TS APS [A-Za-z ]+/gu)].map(([value]) => value);
+  assert.ok(apsLiterals.length > 0);
+  assert.deepEqual(new Set(apsLiterals), new Set(['TS APS Top Mount Started']));
+
+  const movedJournal = structuredClone(metrics);
+  movedJournal.modules
+    .find(({ file }) => file === 'tsjs-aps_initial.js')
+    .sources.push({ file: 'src/first_display/render_journal.ts', renderedBytes: 1 });
+  assert.match(
+    bundleBudgets.findProductionGraphViolations(movedJournal, release).join('\n'),
+    /render_owner_initial-owned source src\/first_display\/render_journal\.ts/
+  );
+
+  const movedAps = structuredClone(metrics);
+  movedAps.modules
+    .find(({ file }) => file === 'tsjs-render_owner_initial.js')
+    .sources.push({ file: 'src/first_display/render_bridge.ts', renderedBytes: 1 });
+  assert.match(
+    bundleBudgets.findProductionGraphViolations(movedAps, release).join('\n'),
+    /aps_initial-owned source src\/first_display\/render_bridge\.ts/
+  );
+});
+
 test('production bundle graphs scan bootstrap sources for test and fake seams', () => {
   const { metrics, release } = readBuildEvidence();
   metrics.bootstrap.sources.push({ file: 'src/test/fake_adapter.ts', renderedBytes: 1 });
@@ -1976,7 +2064,7 @@ test('bundle check authenticates frozen captures and reports both without enforc
   }
 
   const commandReport = bundleBudgets.summarizeBundleBudgetCommandReport(result);
-  assert.equal(commandReport.candidateArchitecture.firstDisplay.reachableMaskCount, 2_560);
+  assert.equal(commandReport.candidateArchitecture.firstDisplay.reachableMaskCount, 3_584);
   assert.equal(
     commandReport.candidateArchitecture.firstDisplay.permittedMaskCount,
     result.candidateArchitecture.firstDisplay.permittedMasks.length

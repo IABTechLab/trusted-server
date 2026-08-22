@@ -29,10 +29,13 @@ import type {
   FirstDisplayGptDiagnosticCycleV1,
   FirstDisplayGptHandoffCycleV1,
 } from './adapters/googletag';
-import { createFirstDisplayAdmRenderBridge } from './adm_render_bridge';
 import { createFirstDisplayProjectedDriver, type FirstDisplayRenderBridgeV1 } from './driver';
 import type { FirstDisplayApsProtocolV1 } from './leaf/aps_protocol';
 import type { FirstDisplayGptProtocolV1 } from './leaf/gpt_protocol';
+import type {
+  FirstDisplayRenderOwnerOptionsV1,
+  FirstDisplayRenderOwnerProtocolV1,
+} from './render_journal';
 import { registerCurrentFirstDisplayComponent } from './registration_client';
 import type {
   FirstDisplaySliceHost,
@@ -45,11 +48,11 @@ import {
   type FirstDisplayBatchOutcomeV1,
   type FirstDisplayBatchV1,
 } from './leaf/projection';
-import type { FirstDisplayRenderBridgeOptionsV1 } from './render_bridge';
 
 const MAX_U32 = 4_294_967_295;
 const BUNDLE_PARTIAL: BootFailureReason = 'bundle_partial';
 const AUCTION_PROTOCOLS = ['aps', 'gpt', 'prebid'] as const;
+const SLICE_PROTOCOLS = ['render_owner', ...AUCTION_PROTOCOLS] as const;
 const ACTION_KINDS = new Set(['gpt_adm', 'aps']);
 const TERMINAL_RESULTS = new Set(['accepted', 'failed', 'cancelled']);
 
@@ -159,7 +162,7 @@ export interface FirstDisplayAgentRegistrationHostV1 {
 
 function createBrowserMessageChannel(
   browser: Window
-): ReturnType<FirstDisplayRenderBridgeOptionsV1['createChannel']> {
+): ReturnType<FirstDisplayRenderOwnerOptionsV1['createChannel']> {
   const constructor = Reflect.get(browser, 'MessageChannel');
   if (typeof constructor !== 'function') {
     throw new TypeError('tsjs');
@@ -170,7 +173,7 @@ function createBrowserMessageChannel(
   if (typeof port1 !== 'object' || port1 === null || typeof port2 !== 'object' || port2 === null) {
     throw new TypeError('tsjs');
   }
-  return { port1, port2 } as ReturnType<FirstDisplayRenderBridgeOptionsV1['createChannel']>;
+  return { port1, port2 } as ReturnType<FirstDisplayRenderOwnerOptionsV1['createChannel']>;
 }
 
 function fillBrowserRandom(browser: Window, bytes: Uint8Array): void {
@@ -249,9 +252,12 @@ function protocolIdentity(candidate: unknown, expected: FirstDisplayAuctionProto
   }
 }
 
+type FirstDisplayRegisteredProtocolId =
+  FirstDisplayAuctionProtocolId | FirstDisplayRenderOwnerProtocolV1['id'];
+
 function fullProtocolIdentity(
   candidate: unknown,
-  expected: FirstDisplayAuctionProtocolId
+  expected: FirstDisplayRegisteredProtocolId
 ): boolean {
   try {
     if (
@@ -280,8 +286,8 @@ function fullProtocolIdentity(
 
 function captureProtocolRegistration(
   candidate: unknown,
-  protocolId: FirstDisplayAuctionProtocolId,
-  protocols: Map<FirstDisplayAuctionProtocolId, unknown>
+  protocolId: FirstDisplayRegisteredProtocolId,
+  protocols: Map<FirstDisplayRegisteredProtocolId, unknown>
 ): unknown {
   try {
     if (
@@ -960,6 +966,52 @@ export function createFirstDisplayAgent(options: FirstDisplayAgentOptions): Firs
   });
 }
 
+function createNonRenderingBridge(now: () => number): FirstDisplayRenderBridgeV1 {
+  let phase = 0;
+  return Object.freeze({
+    bind: () => false,
+    recordGam: () => false,
+    recordFailure: () => false,
+    retire: () => false,
+    sweepCommittedArtifacts: () => 0,
+    sealTsAdmission: (): void => {
+      if (phase !== 0) throw new TypeError('tsjs');
+      phase = 1;
+    },
+    closeIngress: (): boolean => {
+      if (phase !== 1) return false;
+      phase = 2;
+      return true;
+    },
+    captureHandoff: () => {
+      if (phase !== 2) return undefined;
+      let observedAt: number;
+      try {
+        observedAt = now();
+      } catch {
+        return undefined;
+      }
+      if (!Number.isFinite(observedAt)) return undefined;
+      phase = 3;
+      return Object.freeze({
+        artifacts: Object.freeze([]),
+        clockEpochMs: observedAt,
+        nextReservationOrdinal: 1,
+        nextTicketOrdinal: 1,
+        tombstones: Object.freeze([]),
+      });
+    },
+    detachCommittedArtifacts: (): boolean => {
+      if (phase !== 3) return false;
+      phase = 4;
+      return true;
+    },
+    dispose: (): void => {
+      phase = 5;
+    },
+  });
+}
+
 function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
   try {
     if (
@@ -989,7 +1041,7 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
     const options = descriptor.value as FirstDisplayAgentRegistrationHostV1['options'];
     const sliceBindings = bindingsDescriptor.value as (id: string) => unknown;
     const auctionProtocols = new Map<FirstDisplayAuctionProtocolId, unknown>();
-    const fullProtocols = new Map<FirstDisplayAuctionProtocolId, unknown>();
+    const fullProtocols = new Map<FirstDisplayRegisteredProtocolId, unknown>();
     const parserState = createFirstDisplayParserStateCollector();
     let agent: FirstDisplayAgent | undefined;
     const sliceConfigValid = (id: OptionalFirstDisplaySliceId, candidate: unknown): boolean => {
@@ -1013,7 +1065,7 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
           throw new TypeError('tsjs');
         }
         const protocolId = id.endsWith('_initial')
-          ? (id.slice(0, -'_initial'.length) as FirstDisplayAuctionProtocolId)
+          ? (id.slice(0, -'_initial'.length) as FirstDisplayRegisteredProtocolId)
           : undefined;
         const transported = sliceBindings(id);
         if (
@@ -1047,17 +1099,21 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
           }
         );
         const installed = install(
-          protocolId && AUCTION_PROTOCOLS.includes(protocolId)
+          protocolId && SLICE_PROTOCOLS.includes(protocolId)
             ? captureProtocolRegistration(candidate, protocolId, fullProtocols)
             : candidate,
           own,
           config.value
         );
-        if (protocolId && AUCTION_PROTOCOLS.includes(protocolId)) {
-          if (auctionProtocols.has(protocolId) || !protocolIdentity(installed, protocolId)) {
+        if (protocolId && SLICE_PROTOCOLS.includes(protocolId)) {
+          if (!fullProtocolIdentity(installed, protocolId)) {
             throw new TypeError('tsjs');
           }
-          auctionProtocols.set(protocolId, installed);
+          if (AUCTION_PROTOCOLS.includes(protocolId as FirstDisplayAuctionProtocolId)) {
+            const auctionProtocolId = protocolId as FirstDisplayAuctionProtocolId;
+            if (auctionProtocols.has(auctionProtocolId)) throw new TypeError('tsjs');
+            auctionProtocols.set(auctionProtocolId, installed);
+          }
         }
       },
     });
@@ -1075,13 +1131,21 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
           if (!batch) throw new TypeError('tsjs');
           const gpt = fullProtocols.get('gpt');
           const aps = fullProtocols.get('aps');
+          const renderOwner = fullProtocols.get('render_owner');
+          const requiresRenderOwner = batch.outcomes.some(({ kind }) => ACTION_KINDS.has(kind));
           if (batch.requiredProtocols.includes('gpt') && !fullProtocolIdentity(gpt, 'gpt')) {
             throw new TypeError('tsjs');
           }
           if (batch.requiredProtocols.includes('aps') && !fullProtocolIdentity(aps, 'aps')) {
             throw new TypeError('tsjs');
           }
-          const renderOptions: Omit<FirstDisplayRenderBridgeOptionsV1, 'getAps'> = {
+          if (
+            requiresRenderOwner !== fullProtocolIdentity(renderOwner, 'render_owner') ||
+            (aps !== undefined && renderOwner === undefined)
+          ) {
+            throw new TypeError('tsjs');
+          }
+          const renderOptions: FirstDisplayRenderOwnerOptionsV1 = {
             browser: options.gptInput.browser,
             clearTimer: options.gptInput.clearTimer,
             createChannel: () => createBrowserMessageChannel(options.gptInput.browser),
@@ -1094,9 +1158,13 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
           const apsProtocol = fullProtocolIdentity(aps, 'aps')
             ? (aps as FirstDisplayApsProtocolV1)
             : undefined;
-          const renderer = apsProtocol
-            ? apsProtocol.createRenderBridge(renderOptions)
-            : createFirstDisplayAdmRenderBridge(renderOptions);
+          const renderStrategy = apsProtocol?.createRenderStrategy(renderOptions);
+          const renderer = renderOwner
+            ? (renderOwner as FirstDisplayRenderOwnerProtocolV1).createRenderBridge(
+                renderOptions,
+                renderStrategy
+              )
+            : createNonRenderingBridge(renderOptions.now);
           rendererOwner.value = renderer;
           const driver = createFirstDisplayProjectedDriver({
             batch,

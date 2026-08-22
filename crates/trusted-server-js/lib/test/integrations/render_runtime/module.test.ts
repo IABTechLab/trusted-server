@@ -204,6 +204,65 @@ describe('render_runtime provider', () => {
     expect(batch.dispose).toHaveBeenCalledTimes(2);
   });
 
+  it('adopts a publisher-owned PUC shell without claiming its DOM lifetime', () => {
+    const host = document.createElement('div');
+    host.id = 'div-1';
+    const publisherWrapper = document.createElement('div');
+    const frame = document.createElement('iframe');
+    frame.src = 'https://publisher.example/universal-creative';
+    publisherWrapper.append(frame);
+    document.body.append(host, publisherWrapper);
+    const navigationGeneration = {};
+    const batch = Object.freeze({
+      createRenderAttempt: vi.fn(() =>
+        Object.freeze({
+          ok: true as const,
+          value: Object.freeze({ id: `a1_${'A'.repeat(22)}`, navigationGeneration }),
+        })
+      ),
+      dispose: vi.fn(),
+    });
+    const navigation = Object.freeze({
+      generation: navigationGeneration,
+      createAuctionBatch: vi.fn(() => batch),
+      isCurrent: () => true,
+    }) as unknown as NavigationSession;
+    const adoption = Object.freeze({
+      version: 1 as const,
+      adoptInitialDisplay: true as const,
+      handoff: Object.freeze({
+        slots: Object.freeze([Object.freeze({ id: 'slot-1', domId: 'div-1' })]),
+        cycles: Object.freeze([Object.freeze({ slotId: 'slot-1' })]),
+        artifacts: Object.freeze([
+          Object.freeze({
+            hostPosition: null,
+            hostPositionPriority: null,
+            kind: 'gpt_adm' as const,
+            owner: 'publisher' as const,
+            slotId: 'slot-1',
+            token: `r1_${'a'.repeat(22)}`,
+          }),
+        ]),
+      }),
+      identities: Object.freeze([Object.freeze({}), frame]),
+    });
+    const store = createCommittedArtifactStore();
+    const committed = adoptInitialRenderArtifactsFromHandoff(
+      adoption,
+      navigation,
+      store,
+      createArtifactHostPositionLeaseRegistry(),
+      document
+    );
+
+    expect(committed).toBeDefined();
+    committed?.arm();
+    frame.style.setProperty('visibility', 'hidden');
+    expect(store.sweep()).toBe(1);
+    expect(frame.isConnected).toBe(true);
+    expect(batch.dispose).toHaveBeenCalledOnce();
+  });
+
   it.each(['reparented', 'frame_style'] as const)(
     'retires an adopted APS mount on %s loss and compare-restores only owned style',
     (mutation) => {

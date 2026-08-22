@@ -11033,14 +11033,26 @@ mod tests {
         let mut settings = create_test_settings();
         settings
             .integrations
+            .insert_config(
+                "creative",
+                &serde_json::json!({
+                    "enabled": false,
+                    "click_guard": false,
+                    "render_guard": false
+                }),
+            )
+            .expect("should disable the creative guard");
+        settings
+            .integrations
             .insert_config("gpt", &serde_json::json!({}))
             .expect("should enable GPT");
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
-        let mask = *registry
-            .tsjs_first_display_masks()
-            .first()
-            .expect("GPT should permit one first-display mask");
+        let mask = 0x0083;
+        assert!(
+            registry.tsjs_first_display_masks().contains(&mask),
+            "GPT must precompute the ADM render-owner mask"
+        );
         let selected = trusted_server_js::all_first_display_ids()
             .into_iter()
             .enumerate()
@@ -11110,6 +11122,25 @@ mod tests {
                 "case {suffix}"
             );
         }
+
+        let owner_hash =
+            trusted_server_js::concatenated_first_display_hash(&["render_owner_initial"])
+                .expect("render owner should have one generated component hash");
+        let owner_request = build_request(
+            Method::GET,
+            &format!(
+                "https://publisher.example/static/tsjs=tsjs-render_owner_initial.min.js?v={owner_hash}"
+            ),
+        );
+        let owner_response =
+            handle_tsjs_dynamic(&owner_request, &registry, EdgeCacheHeader::SMaxageFallback)
+                .expect("standalone owner route should reject locally");
+        assert_eq!(owner_response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            owner_response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        assert!(!owner_response.headers().contains_key(header::LOCATION));
     }
 
     #[test]

@@ -2571,6 +2571,15 @@ that slice, and neither slice imports or instantiates a second complete render b
 | `prebid_initial`             | Prebid participates in the initial batch                                           | artifact admission, publisher queue, bidder/user-ID/EID setup, initial TS bid/PUC path            |
 | `testlight_initial`          | Testlight is enabled                                                               | capture preexisting callbacks before publisher replacement/drain                                  |
 
+The canonical low-order examples are part of the server/build contract: no-bid is
+`0001`, GPT attribution-only is `0081`, ADM is `0083`, creative-guarded ADM is
+`008b`, APS is `0087`, creative-guarded APS is `008f`, and Prebid-plus-ADM is
+`1083`. These examples do not create aliases: the route accepts only the exact
+generated mask/hash pair admitted for the current configuration. APS participation
+without enabled APS configuration is invalid rather than a reason to select the
+render owner, and `render_owner_initial` has no independently routable production
+asset; its bytes exist only inside the selected first-display composition.
+
 Every slice registers into the bootstrap's release-private first-display sink from
 the expected parser-inserted artifact and `document.currentScript`. The build fixes
 their order, interfaces, and allowed imports; there is no public service locator or

@@ -35,10 +35,14 @@ const bootstrapPrivateProperties =
 const firstDisplayBasePrivateProperties =
   /^(?:options|stateValue|agentBatch|slotResults|handoffOwner|mutationObserver|observedMutationRevision|displayWasCommitted|sealed|failed|pending|reasons|actionStarted|disposedDriver|handoffFinalized|committedArtifactsDetached|lastTimingMs|firstActionAtMs|terminalAtMs|paintAtMs|nextTraceSequence|acceptedTrace|recordTerminal|recordFirstAction|scheduleProtectedPaint|readTiming|captureHandoffData|disposeDriver|installNativeMutationIngress|observeDomMutations|isOwnedRuntimeInsertion|closeNativeMutationIngress|disposeNativeMutationIngress|claimTimer|completionTimer|controlRelease|directFrame|documentAccepted|documentAcceptancePending|documentRelease|documentTimer|documentTransferred|insertionTimer|pendingDocumentTerminal|ownerSource|ownerTicket|bootstrapNonce|rendererNonce|phaseValue|registryState|expiresAtInternal|ordinalInternal|controlPort|claim|gam|inserted|ticket|active|cycle|onTerminal|reservationId|timer|attempt|recordFailure)$/;
 
-// APS adds one private render state machine inside its independently built slice.
-// These fields never enter registration, message, or handoff objects.
+// The source-neutral owner keeps these fields inside one independently built IIFE.
+const firstDisplayRenderOwnerPrivateProperties =
+  /^(?:claimTimer|controlRelease|insertionTimer|ownerSource|ownerTicket|phaseValue|registryState|expiresAtInternal|ordinalInternal|controlPort|claim|gam|inserted|ticket|active|cycle|onTerminal|reservationId|timer|attempt|execution|originalCount|exact|exactShape|ports|port|source)$/;
+
+// APS keeps these renderer-specific fields inside its independently built IIFE.
+// Cross-artifact strategy, protocol, callback, and artifact keys remain authored.
 const firstDisplayApsPrivateProperties =
-  /^(?:options|stateValue|agentBatch|slotResults|handoffOwner|mutationObserver|observedMutationRevision|displayWasCommitted|sealed|failed|pending|reasons|actionStarted|disposedDriver|handoffFinalized|committedArtifactsDetached|lastTimingMs|firstActionAtMs|terminalAtMs|paintAtMs|nextTraceSequence|acceptedTrace|recordTerminal|recordFirstAction|scheduleProtectedPaint|readTiming|captureHandoffData|disposeDriver|installNativeMutationIngress|observeDomMutations|isOwnedRuntimeInsertion|closeNativeMutationIngress|disposeNativeMutationIngress|claimTimer|completionTimer|controlRelease|directFrame|documentAccepted|documentAcceptancePending|documentRelease|documentTimer|documentTransferred|insertionTimer|pendingDocumentTerminal|ownerSource|ownerTicket|bootstrapNonce|rendererNonce|phaseValue|registryState|expiresAtInternal|ordinalInternal|controlPort|claim|gam|inserted|ticket|active|cycle|onTerminal|reservationId|timer|attempt|recordFailure|hostPositionOwned|previousHostPosition|previousHostPositionPriority|frameAttributes|frameContentWindow|frameSource|frameSourceDocument|bootstrapNavigated|bootstrapPolicy|bootstrapSource|originalCount|isReservationId|isLifecycleTicket|isBootstrapNonce|isRendererNonce|parseDocumentMessage|rendererUrl|sandbox|permanentSandbox|deadlines|insertionMs|documentAcceptanceMs|completionMs|ownerSettlementMs)$/;
+  /^(?:callbacks|overlay|active|accepted|bootstrapNavigated|bootstrapNonceInternal|bootstrapSource|completionTimer|cycle|documentAccepted|documentPort|documentRelease|documentTimer|frame|hostPositionOwned|pendingTerminal|previousHostPosition|previousHostPositionPriority|rendererNonceInternal|originalCount|exact|ports|publisherOrigin|rendererUrl|sandbox|permanentSandbox|deadlines|documentAcceptanceMs|completionMs|isBootstrapNonce|isRendererNonce|bootstrapPolicy|parseDocumentMessage|parseWindowMessage)$/;
 
 // These names are private to the GPT initial IIFE and never cross its protocol
 // receipt or handoff boundary. Keep the cross-artifact protocol keys authored.
@@ -68,8 +72,8 @@ const releaseCatalog = catalogModule.RELEASE_CATALOG;
 const firstDisplayCatalog = catalogModule.FIRST_DISPLAY_CATALOG;
 catalogModule.validateReleaseCatalog(releaseCatalog);
 if (releaseCatalog.length !== 20) throw new Error('[build-all] Catalog must contain 20 rows');
-if (firstDisplayCatalog.length !== 13 || firstDisplayCatalog[0]?.id !== 'first_display') {
-  throw new Error('[build-all] First-display catalog must contain its base and twelve slices');
+if (firstDisplayCatalog.length !== 14 || firstDisplayCatalog[0]?.id !== 'first_display') {
+  throw new Error('[build-all] First-display catalog must contain its base and thirteen slices');
 }
 const runtimeCatalog = releaseCatalog.map(({ id, phase, trigger, config, consumes, provides }) => ({
   id,
@@ -106,6 +110,7 @@ const sourceById = Object.freeze({
 
 const firstDisplaySourceById = Object.freeze({
   first_display: 'first_display/agent.ts',
+  render_owner_initial: 'first_display/slices/render_owner.ts',
   aps_initial: 'first_display/slices/aps.ts',
   creative_initial: 'first_display/slices/creative.ts',
   datadome_initial: 'first_display/slices/datadome.ts',
@@ -206,11 +211,13 @@ async function buildArtifact(artifact) {
       ? { esbuild: { mangleProps: bootstrapPrivateProperties } }
       : artifact.id === 'first_display'
         ? { esbuild: { mangleProps: firstDisplayBasePrivateProperties } }
-        : artifact.id === 'aps_initial'
-          ? { esbuild: { mangleProps: firstDisplayApsPrivateProperties } }
-          : artifact.id === 'gpt_initial'
-            ? { esbuild: { mangleProps: firstDisplayGptPrivateProperties } }
-            : {}),
+        : artifact.id === 'render_owner_initial'
+          ? { esbuild: { mangleProps: firstDisplayRenderOwnerPrivateProperties } }
+          : artifact.id === 'aps_initial'
+            ? { esbuild: { mangleProps: firstDisplayApsPrivateProperties } }
+            : artifact.id === 'gpt_initial'
+              ? { esbuild: { mangleProps: firstDisplayGptPrivateProperties } }
+              : {}),
     define: {
       __TSJS_EMBEDDED_RELEASE_ID_V1__: JSON.stringify(RELEASE_SENTINEL),
       __TSJS_EMBEDDED_INTEGRATION_IDS_V1__: JSON.stringify(catalogIds),

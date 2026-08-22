@@ -7,4 +7,4 @@ export const TESTLIGHT_INITIAL_SLICE = defineInitialSlice(
   installTestlightInitial
 );
 
-registerInitialSlice(TESTLIGHT_INITIAL_SLICE, 13);
+registerInitialSlice(TESTLIGHT_INITIAL_SLICE, 14);

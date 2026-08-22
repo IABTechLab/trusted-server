@@ -7,4 +7,4 @@ export const DATADOME_INITIAL_SLICE = defineInitialSlice(
   installDataDomeInitial
 );
 
-registerInitialSlice(DATADOME_INITIAL_SLICE, 4);
+registerInitialSlice(DATADOME_INITIAL_SLICE, 5);
