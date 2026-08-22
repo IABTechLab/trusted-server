@@ -79,6 +79,33 @@ describe('build-prebid-external metadata', () => {
     }
   }, 120_000);
 
+  it('builds and stamps identityLinkIdSystem when explicitly selected', async () => {
+    const outputDirectory = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'trusted-server-liveramp-prebid-build-test-')
+    );
+
+    try {
+      await main([
+        '--adapters',
+        'rubicon',
+        '--user-id-modules',
+        'identityLinkIdSystem',
+        '--out',
+        outputDirectory,
+      ]);
+
+      const manifest = JSON.parse(
+        fs.readFileSync(path.join(outputDirectory, 'manifest.json'), 'utf8')
+      );
+      const bundle = fs.readFileSync(path.join(outputDirectory, manifest.filename), 'utf8');
+
+      expect(manifest.userIdModules).toEqual(['identityLinkIdSystem']);
+      expect(bundle).toContain('identityLinkIdSystem');
+    } finally {
+      fs.rmSync(outputDirectory, { recursive: true, force: true });
+    }
+  }, 120_000);
+
   it('resolves relative output paths against the current working directory', () => {
     const parsed = parseArgs(['--adapters', 'rubicon', '--out', 'dist/prebid']);
 

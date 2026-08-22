@@ -1244,6 +1244,46 @@ mod tests {
     }
 
     #[test]
+    fn merge_auction_eids_deduplicates_liveramp_and_prefers_resolved_metadata() {
+        let client_eids = Some(vec![Eid {
+            source: "liveramp.com".to_string(),
+            uids: vec![Uid {
+                id: "opaque-test-envelope".to_string(),
+                atype: None,
+                ext: Some(json!({ "origin": "client" })),
+            }],
+        }]);
+        let resolved_eids = Some(vec![Eid {
+            source: "liveramp.com".to_string(),
+            uids: vec![Uid {
+                id: "opaque-test-envelope".to_string(),
+                atype: Some(3),
+                ext: Some(json!({ "origin": "server" })),
+            }],
+        }]);
+
+        let merged =
+            merge_auction_eids(client_eids, resolved_eids).expect("should merge LiveRamp EIDs");
+
+        assert_eq!(merged.len(), 1, "should retain one LiveRamp source");
+        assert_eq!(merged[0].uids.len(), 1, "should deduplicate the envelope");
+        assert_eq!(
+            merged[0].uids[0].id, "opaque-test-envelope",
+            "should preserve the opaque envelope"
+        );
+        assert_eq!(
+            merged[0].uids[0].atype,
+            Some(3),
+            "should prefer resolved atype metadata"
+        );
+        assert_eq!(
+            merged[0].uids[0].ext,
+            Some(json!({ "origin": "server" })),
+            "should prefer resolved extension metadata"
+        );
+    }
+
+    #[test]
     fn auction_rejects_oversized_body() {
         futures::executor::block_on(async {
             use edgezero_core::body::Body as EdgeBody;

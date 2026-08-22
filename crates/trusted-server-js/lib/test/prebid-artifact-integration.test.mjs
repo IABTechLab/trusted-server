@@ -34,7 +34,7 @@ beforeAll(async () => {
     '--adapters',
     'adf',
     '--user-id-modules',
-    'sharedIdSystem',
+    'sharedIdSystem,identityLinkIdSystem',
     '--out',
     outputDirectory,
   ]);
@@ -132,7 +132,16 @@ describe('external bundle + served shim evaluated together', () => {
     // Mirror the server's head-injected state, which always precedes the
     // bundle script in document order.
     pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
-    pageWindow.__tsjs_prebid = { clientSideBidders: [] };
+    pageWindow.__tsjs_prebid = {
+      clientSideBidders: [],
+      liveRamp: {
+        placementId: '999',
+        notUse3P: false,
+        storageType: 'cookie',
+        expiresDays: 15,
+        refreshInSeconds: 1800,
+      },
+    };
 
     pageWindow.eval(bundleCode);
 
@@ -144,7 +153,10 @@ describe('external bundle + served shim evaluated together', () => {
       'adform',
       'adformOpenRTB',
     ]);
-    expect([...pageWindow.__tsjs_prebid_bundle.userIdModules]).toEqual(['sharedIdSystem']);
+    expect([...pageWindow.__tsjs_prebid_bundle.userIdModules]).toEqual([
+      'sharedIdSystem',
+      'identityLinkIdSystem',
+    ]);
 
     // Count trustedServer registrations across repeated shim evaluations.
     const originalRegisterBidAdapter = pageWindow.pbjs.registerBidAdapter.bind(pageWindow.pbjs);
@@ -153,6 +165,39 @@ describe('external bundle + served shim evaluated together', () => {
 
     pageWindow.eval(shimCode);
     const wrappedRequestBids = pageWindow.pbjs.requestBids;
+
+    expect(pageWindow.pbjs.getConfig('userSync.userIds')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: 'identityLink',
+          params: { pid: '999', notUse3P: false },
+          storage: expect.objectContaining({ name: 'idl_env' }),
+        }),
+      ])
+    );
+
+    // Exercise the real Prebid mergeConfig implementation. It closes over
+    // Prebid's internal setConfig, so the shim must guard mergeConfig itself
+    // to prevent a publisher-owned duplicate from bypassing the setConfig guard.
+    pageWindow.pbjs.mergeConfig({
+      userSync: {
+        userIds: [
+          { name: 'sharedId' },
+          { name: 'identityLink', params: { pid: 'publisher-value' } },
+        ],
+      },
+    });
+
+    const mergedUserIds = pageWindow.pbjs.getConfig('userSync.userIds');
+    expect(mergedUserIds.filter(({ name }) => name === 'identityLink')).toEqual([
+      expect.objectContaining({
+        name: 'identityLink',
+        params: { pid: '999', notUse3P: false },
+      }),
+    ]);
+    expect(mergedUserIds).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'sharedId' })])
+    );
 
     // A second evaluation (double script inclusion, or a legacy bundle that
     // still carries a baked-in shim running after this one) must be a no-op.

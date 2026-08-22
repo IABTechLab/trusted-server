@@ -39,6 +39,14 @@ excluded_gam_ad_unit_path_suffixes = ["/trackingonly"]
 # Script interception patterns (optional - defaults shown below)
 script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
 
+# Optional operator-owned LiveRamp RampID configuration.
+[integrations.prebid.liveramp]
+placement_id = "999"
+not_use_3p = false
+storage_type = "cookie"
+expires_days = 15
+refresh_in_seconds = 1800
+
 # Required when external_bundle_url is configured. Include the bundle host and
 # any HTTPS redirect targets used by that host.
 [proxy]
@@ -47,7 +55,7 @@ allowed_domains = ["assets.example"]
 # External bundle generation inputs used by `ts prebid bundle`.
 [integrations.prebid.bundle]
 adapters = ["rubicon"]
-user_id_modules = ["sharedIdSystem"]
+user_id_modules = ["sharedIdSystem", "identityLinkIdSystem"]
 
 # Optional static per-bidder param overrides (shallow merge)
 [integrations.prebid.bid_param_overrides.criteo]
@@ -90,6 +98,11 @@ set = { placementId = "_s2sHeaderPlacement" }
 | `script_patterns`                    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                                      |
 | `bundle.adapters`                    | Array[String] | Required for `ts prebid bundle`                                        | Prebid.js bidder adapter modules imported into the generated external browser bundle                                                                             |
 | `bundle.user_id_modules`             | Array[String] | Generator default preset when omitted                                  | Prebid User ID modules imported into the generated external browser bundle                                                                                       |
+| `liveramp.placement_id`              | String        | Required when subsection exists                                        | Numeric LiveRamp Placement ID for the approved publisher origin                                                                                                  |
+| `liveramp.not_use_3p`                | Boolean       | `false`                                                                | Disable cookie-recognized RampID envelopes when `true`                                                                                                           |
+| `liveramp.storage_type`              | String        | `cookie`                                                               | Browser storage used by IdentityLink: `cookie` or `html5`                                                                                                        |
+| `liveramp.expires_days`              | Integer       | `15`                                                                   | Envelope storage lifetime in days; valid range is 1–30                                                                                                           |
+| `liveramp.refresh_in_seconds`        | Integer       | `1800`                                                                 | Positive interval before retrieving a potentially refreshed envelope                                                                                             |
 
 ## External Bundle Generation
 
@@ -457,6 +470,101 @@ Example EID source mapping:
 
 User ID module selection is separate from `--adapters`, which controls
 client-side bidder adapter modules.
+
+## Managed LiveRamp RampID
+
+Trusted Server can configure Prebid's `identityLink` User ID submodule and
+forward the resulting RampID identity envelope through the existing EID path.
+This feature does not collect email addresses, hash identifiers, call a
+server-to-server ATS API, or add a new application-facing envelope API.
+
+### Prerequisites
+
+Before enabling the subsection, obtain a test or production Placement ID from
+LiveRamp, have the exact publisher origin approved by LiveRamp, and confirm the
+publisher's CMP and LiveRamp contract permit the intended recognition mode.
+The external Prebid bundle must include `identityLinkIdSystem`:
+
+```toml
+[integrations.prebid.bundle]
+adapters = ["rubicon"]
+user_id_modules = ["identityLinkIdSystem"]
+
+[integrations.prebid.liveramp]
+placement_id = "999"
+not_use_3p = false
+storage_type = "cookie"
+expires_days = 15
+refresh_in_seconds = 1800
+```
+
+Run `ts prebid bundle`, upload the generated content-addressed bundle, copy its
+hash metadata into `[integrations.prebid]`, and validate the configuration
+before rollout. The storage name is fixed to `idl_env`; operators choose only
+the storage type, expiry, and refresh interval.
+
+When enabled, Trusted Server owns one deterministic `identityLink` entry in
+`userSync.userIds` for publisher configuration applied through the public
+`pbjs.setConfig` and `pbjs.mergeConfig` APIs. Other publisher-configured User ID
+entries are preserved, but calls through those APIs that add, remove, or replace
+`identityLink` are normalized back to the operator-managed values. This is a
+configuration-ownership convention, not a security boundary against same-origin
+code that retained a pre-wrapper function reference or directly mutates Prebid's
+internal configuration. Including `identityLinkIdSystem` in a bundle is inert
+until this configuration is enabled.
+
+### Resolution timing and data flow
+
+IdentityLink resolves asynchronously. A new browser's first auction can run
+before RampID is available; later auctions can include it without blocking the
+page or auction. When available, the opaque value follows the standard path:
+
+1. `pbjs.getUserIdsAsEids()` exposes an entry whose source is `liveramp.com`.
+2. The current `/auction` request includes that entry.
+3. Trusted Server merges and consent-gates it, then forwards it to Prebid
+   Server as `user.ext.eids`.
+4. The browser persists the same opaque value in the bounded `ts-eids` cookie.
+5. A later request can ingest it into an EC/KV partner configured with
+   `source_domain = "liveramp.com"`.
+
+Trusted Server treats the RampID envelope as an opaque string. Do not log,
+decode, publish, or dimension metrics by the value. Source names, counts,
+booleans, and status codes are sufficient for diagnostics.
+
+### Degraded behavior
+
+| Condition                                                                    | Result                                                                 |
+| ---------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| Required consent is absent in a regulated jurisdiction, or the user opts out | No LiveRamp EID is forwarded; the auction continues                    |
+| LiveRamp cannot recognize the browser                                        | IdentityLink yields no EID; the auction continues                      |
+| LiveRamp network resolution fails                                            | The current auction continues without RampID                           |
+| `identityLinkIdSystem` is missing from the bundle                            | Existing diagnostics report the missing module; auctions continue      |
+| The origin is not approved by LiveRamp                                       | Resolution yields no usable EID; the auction continues                 |
+| EC/KV is unavailable                                                         | A current-request EID can still reach `/auction`; persistence degrades |
+
+### Credential-based validation
+
+Live validation must run outside CI on a LiveRamp-approved non-production
+origin. Never commit a live Placement ID or envelope. Record only the approved
+domain, booleans, source names, counts, and status codes:
+
+1. Build a bundle containing `identityLinkIdSystem` and configure the test
+   Placement ID.
+2. With positive consent, confirm `idl_env` is created or refreshed.
+3. Confirm `pbjs.getUserIdsAsEids()` reports source `liveramp.com` without
+   recording its value.
+4. Confirm a controlled Prebid Server request contains that source in
+   `user.ext.eids`.
+5. Confirm a later request ingests the source into the configured
+   `liveramp.com` EC partner.
+6. Repeat with opt-out or no consent and confirm no LiveRamp EID is forwarded.
+7. Repeat on an unapproved origin and confirm identity resolution degrades
+   without blocking the auction.
+
+This integration forwards RampID identity envelopes through the Prebid auction
+path. LiveRamp ATS Direct audience segments, including `_lr_atsDirect` storage
+and GAM or Prebid segment activation, require a separate integration and are
+not passed by this implementation.
 
 ## Identity Forwarding
 

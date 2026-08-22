@@ -199,6 +199,62 @@ fn extract_prebid_error_message(
 #[cfg(test)]
 const GPC_US_PRIVACY: &str = "1YYN";
 
+const fn default_liveramp_expires_days() -> u16 {
+    15
+}
+
+const fn default_liveramp_refresh_in_seconds() -> u32 {
+    1800
+}
+
+fn validate_liveramp_placement_id(value: &str) -> Result<(), ValidationError> {
+    if !value.is_empty() && value.trim() == value && value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Ok(());
+    }
+
+    let mut error = ValidationError::new("invalid_liveramp_placement_id");
+    error.message = Some(
+        "LiveRamp placement_id must be a non-empty ASCII-digit string without surrounding whitespace"
+            .into(),
+    );
+    Err(error)
+}
+
+/// Browser storage mechanism used by Prebid's `LiveRamp` `IdentityLink` module.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrebidLiveRampStorageType {
+    /// Store the opaque `RampID` envelope in a browser cookie.
+    #[default]
+    Cookie,
+    /// Store the opaque `RampID` envelope in browser local storage.
+    Html5,
+}
+
+/// Operator-owned configuration for Prebid's `LiveRamp` `IdentityLink` module.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct PrebidLiveRampConfig {
+    /// Numeric Placement ID assigned by `LiveRamp` for the approved publisher origin.
+    #[validate(custom(function = "validate_liveramp_placement_id"))]
+    pub placement_id: String,
+    /// Disable third-party-cookie recognition when `true`.
+    #[serde(default)]
+    pub not_use_3p: bool,
+    /// Browser storage mechanism for the opaque `RampID` envelope.
+    #[serde(default)]
+    pub storage_type: PrebidLiveRampStorageType,
+    /// Number of days for which the browser stores the opaque envelope.
+    #[serde(default = "default_liveramp_expires_days")]
+    #[validate(range(min = 1, max = 30))]
+    pub expires_days: u16,
+    /// Number of seconds before Prebid may refresh the opaque envelope.
+    #[serde(default = "default_liveramp_refresh_in_seconds")]
+    #[validate(range(min = 1))]
+    pub refresh_in_seconds: u32,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct PrebidIntegrationConfig {
     #[serde(default = "default_enabled")]
@@ -210,6 +266,10 @@ pub struct PrebidIntegrationConfig {
     /// it in JavaScript.
     #[serde(default)]
     pub account_id: Option<String>,
+    /// Optional managed `LiveRamp` `RampID` configuration for Prebid.js.
+    #[serde(default)]
+    #[validate(nested)]
+    pub liveramp: Option<PrebidLiveRampConfig>,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u32,
     #[serde(
@@ -1080,8 +1140,21 @@ impl IntegrationHeadInjector for PrebidIntegration {
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
+        struct InjectedPrebidLiveRampConfig<'a> {
+            placement_id: &'a str,
+            #[serde(rename = "notUse3P")]
+            not_use_3p: bool,
+            storage_type: PrebidLiveRampStorageType,
+            expires_days: u16,
+            refresh_in_seconds: u32,
+        }
+
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
         struct InjectedPrebidClientConfig<'a> {
             account_id: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            live_ramp: Option<InjectedPrebidLiveRampConfig<'a>>,
             timeout: u32,
             debug: bool,
             bidders: &'a [String],
@@ -1091,14 +1164,24 @@ impl IntegrationHeadInjector for PrebidIntegration {
             excluded_gam_ad_unit_path_suffixes: &'a [String],
         }
 
-        let payload = InjectedPrebidClientConfig {
-            account_id: self.config.account_id.as_deref().unwrap_or_default(),
-            timeout: self.config.timeout_ms,
-            debug: self.config.debug,
-            bidders: &self.config.bidders,
-            client_side_bidders: &self.config.client_side_bidders,
-            excluded_gam_ad_unit_path_suffixes: &self.config.excluded_gam_ad_unit_path_suffixes,
-        };
+        let payload =
+            InjectedPrebidClientConfig {
+                account_id: self.config.account_id.as_deref().unwrap_or_default(),
+                live_ramp: self.config.liveramp.as_ref().map(|config| {
+                    InjectedPrebidLiveRampConfig {
+                        placement_id: &config.placement_id,
+                        not_use_3p: config.not_use_3p,
+                        storage_type: config.storage_type,
+                        expires_days: config.expires_days,
+                        refresh_in_seconds: config.refresh_in_seconds,
+                    }
+                }),
+                timeout: self.config.timeout_ms,
+                debug: self.config.debug,
+                bidders: &self.config.bidders,
+                client_side_bidders: &self.config.client_side_bidders,
+                excluded_gam_ad_unit_path_suffixes: &self.config.excluded_gam_ad_unit_path_suffixes,
+            };
 
         // Escape `</` to prevent breaking out of the script tag.
         let config_json = serde_json::to_string(&payload)
@@ -2730,6 +2813,7 @@ mod tests {
             enabled: true,
             server_url: "https://prebid.example".to_string(),
             account_id: Some("test-account".to_string()),
+            liveramp: None,
             timeout_ms: 1000,
             bidders: vec!["exampleBidder".to_string()],
             debug: false,
@@ -2749,6 +2833,16 @@ mod tests {
             consent_forwarding: ConsentForwardingMode::Both,
             suppress_nurl: false,
             suppress_nurl_bidders: Vec::new(),
+        }
+    }
+
+    fn valid_liveramp_config() -> PrebidLiveRampConfig {
+        PrebidLiveRampConfig {
+            placement_id: "999".to_string(),
+            not_use_3p: false,
+            storage_type: PrebidLiveRampStorageType::Cookie,
+            expires_days: 15,
+            refresh_in_seconds: 1800,
         }
     }
 
@@ -3119,6 +3213,129 @@ server_url = "https://prebid.example/openrtb2/auction"
             ),
             "should inject the canonical suffix list: {}",
             inserts[0]
+        );
+    }
+
+    #[test]
+    fn liveramp_config_parses_with_documented_defaults() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+
+[integrations.prebid.liveramp]
+placement_id = "999"
+"#,
+        );
+
+        let liveramp = config.liveramp.expect("should parse LiveRamp config");
+        assert_eq!(liveramp.placement_id, "999", "should preserve placement ID");
+        assert!(
+            !liveramp.not_use_3p,
+            "should allow cookie recognition by default"
+        );
+        assert_eq!(
+            liveramp.storage_type,
+            PrebidLiveRampStorageType::Cookie,
+            "should default to cookie storage"
+        );
+        assert_eq!(
+            liveramp.expires_days, 15,
+            "should default to conservative expiry"
+        );
+        assert_eq!(
+            liveramp.refresh_in_seconds, 1800,
+            "should default to LiveRamp's recommended refresh"
+        );
+    }
+
+    #[test]
+    fn liveramp_config_accepts_explicit_supported_values() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+
+[integrations.prebid.liveramp]
+placement_id = "12345"
+not_use_3p = true
+storage_type = "html5"
+expires_days = 30
+refresh_in_seconds = 3600
+"#,
+        );
+
+        let liveramp = config.liveramp.expect("should parse LiveRamp config");
+        assert!(liveramp.not_use_3p, "should preserve not_use_3p");
+        assert_eq!(
+            liveramp.storage_type,
+            PrebidLiveRampStorageType::Html5,
+            "should preserve HTML5 storage"
+        );
+        assert_eq!(
+            liveramp.expires_days, 30,
+            "should preserve configured expiry"
+        );
+        assert_eq!(
+            liveramp.refresh_in_seconds, 3600,
+            "should preserve configured refresh interval"
+        );
+    }
+
+    #[test]
+    fn liveramp_config_rejects_invalid_values() {
+        for (name, live_ramp_section) in [
+            ("missing placement ID", "not_use_3p = true"),
+            ("empty placement ID", "placement_id = \"\""),
+            ("padded placement ID", "placement_id = \" 999 \""),
+            (
+                "nonnumeric placement ID",
+                "placement_id = \"placement-999\"",
+            ),
+            ("zero expiry", "placement_id = \"999\"\nexpires_days = 0"),
+            (
+                "expiry above limit",
+                "placement_id = \"999\"\nexpires_days = 31",
+            ),
+            (
+                "zero refresh",
+                "placement_id = \"999\"\nrefresh_in_seconds = 0",
+            ),
+            (
+                "unknown storage",
+                "placement_id = \"999\"\nstorage_type = \"session\"",
+            ),
+            (
+                "unknown field",
+                "placement_id = \"999\"\nunsupported = true",
+            ),
+        ] {
+            let result = parse_prebid_toml_result(&format!(
+                r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+
+[integrations.prebid.liveramp]
+{live_ramp_section}
+"#
+            ));
+
+            assert!(result.is_err(), "should reject {name}");
+        }
+    }
+
+    #[test]
+    fn liveramp_config_is_optional() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+"#,
+        );
+
+        assert!(
+            config.liveramp.is_none(),
+            "should omit LiveRamp configuration by default"
         );
     }
 
@@ -4024,6 +4241,86 @@ external_bundle_sri = "sha384-AAAA"
             !script.contains("excludedGamAdUnitPathSuffixes"),
             "should omit empty refresh-auction exclusions: {}",
             script
+        );
+    }
+
+    #[test]
+    fn head_injector_includes_liveramp_config() {
+        let mut config = base_config();
+        config.liveramp = Some(PrebidLiveRampConfig {
+            placement_id: "999".to_string(),
+            not_use_3p: true,
+            storage_type: PrebidLiveRampStorageType::Html5,
+            expires_days: 30,
+            refresh_in_seconds: 3600,
+        });
+        let integration = PrebidIntegration::new(config);
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        let script = &inserts[0];
+
+        assert!(
+            script.contains(
+                r#""liveRamp":{"placementId":"999","notUse3P":true,"storageType":"html5","expiresDays":30,"refreshInSeconds":3600}"#
+            ),
+            "should inject camel-cased LiveRamp config: {script}"
+        );
+    }
+
+    #[test]
+    fn head_injector_omits_liveramp_config_when_absent() {
+        let integration = PrebidIntegration::new(base_config());
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        let script = &inserts[0];
+
+        assert!(
+            !script.contains("liveRamp"),
+            "should omit LiveRamp config when absent: {script}"
+        );
+    }
+
+    #[test]
+    fn head_injector_escapes_script_breakout_in_liveramp_config() {
+        let mut config = base_config();
+        config.liveramp = Some(PrebidLiveRampConfig {
+            placement_id: "1</script><script>alert(1)</script>".to_string(),
+            ..valid_liveramp_config()
+        });
+        let integration = PrebidIntegration::new(config);
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        let script = &inserts[0];
+
+        assert!(
+            script.contains(r#""placementId":"1<\/script><script>alert(1)<\/script>""#),
+            "should retain the escaped LiveRamp placement ID: {script}"
+        );
+        assert_eq!(
+            script.matches("</script>").count(),
+            1,
+            "should contain only the legitimate outer closing script tag"
         );
     }
 
