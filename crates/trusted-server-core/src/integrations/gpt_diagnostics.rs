@@ -589,7 +589,7 @@ mod tests {
 
         assert_eq!(
             response.headers()[header::CACHE_CONTROL],
-            "private, no-store",
+            "no-store, private",
             "should stamp diagnostics responses non-storable"
         );
         assert_eq!(response.headers()[header::SET_COOKIE], SET_CONSOLE_COOKIE);

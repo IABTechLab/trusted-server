@@ -11,6 +11,7 @@ use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
+use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -205,7 +206,7 @@ fn edgezero_main(mut req: FastlyRequest) {
     }
 
     if let Some(policy) = asset_cache_policy {
-        policy.apply_after_route_finalization(&mut response);
+        policy.apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
     }
 
     if let Some(ec_state) = ec_state {
@@ -376,10 +377,11 @@ fn apply_terminal_response_effects(
         trusted_server_core::response_privacy::enforce_private_no_store(response);
     }
 
-    // Final cache guard: EC finalization and request-filter effects may have
-    // added a per-user Set-Cookie after `apply_finalize_headers` ran, so
-    // re-apply the privacy downgrade before send.
+    // Final cache guards: EC finalization and request-filter effects may have
+    // added a per-user Set-Cookie or a private/no-store directive after
+    // `apply_finalize_headers` and normalized asset policy reapplication ran.
     crate::middleware::enforce_set_cookie_cache_privacy(response);
+    crate::middleware::enforce_uncacheable_cache_privacy(response);
 }
 
 const FALLBACK_UNAVAILABLE: &str = "unavailable";
@@ -600,7 +602,7 @@ mod tests {
                 .headers()
                 .get("cache-control")
                 .and_then(|value| value.to_str().ok()),
-            Some("private, no-store")
+            Some("no-store, private")
         );
         assert!(response.headers().get("surrogate-control").is_none());
         assert!(response.headers().get("cdn-cache-control").is_none());
@@ -626,7 +628,7 @@ mod tests {
                 .headers()
                 .get("cache-control")
                 .and_then(|value| value.to_str().ok()),
-            Some("private, no-store")
+            Some("no-store, private")
         );
         assert!(response.headers().get("surrogate-control").is_none());
         assert!(response.headers().get("cdn-cache-control").is_none());
@@ -711,7 +713,7 @@ mod tests {
                 .headers()
                 .get("cache-control")
                 .and_then(|value| value.to_str().ok()),
-            Some("private, no-store"),
+            Some("no-store, private"),
             "request-scoped diagnostics HTML must never become shared-cacheable"
         );
         assert!(

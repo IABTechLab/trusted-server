@@ -1081,21 +1081,15 @@ export function installTsAdInit(): void {
         // Diagnostics are observational only. A missing or malformed debug
         // implementation must never interrupt slot mapping or delivery.
         try {
+          const requestedSlotSizes = ts.gptSlotHandoffs?.[slotDivId2]?.formats;
           const opportunity = trustedServerOpportunity(bid);
-          if (bid.hb_auction_id !== undefined) {
-            ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
-              gptSlot,
-              slot.id,
-              opportunity,
-              bid.hb_auction_id
-            );
-          } else {
-            ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
-              gptSlot,
-              slot.id,
-              opportunity
-            );
-          }
+          ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
+            gptSlot,
+            slot.id,
+            opportunity,
+            bid.hb_auction_id,
+            requestedSlotSizes
+          );
         } catch {
           // Diagnostics must not alter ad delivery.
         }
