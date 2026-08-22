@@ -144,6 +144,17 @@ mod tests {
     }
 
     #[test]
+    fn top_level_version_flag_is_available() {
+        let err = Args::try_parse_from(["ts", "--version"])
+            .expect_err("should short-circuit parsing on --version");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::DisplayVersion,
+            "should print the version rather than fail to parse"
+        );
+    }
+
+    #[test]
     fn parses_active_version() {
         let args = parse(&[
             "ts",
@@ -179,7 +190,11 @@ mod tests {
         };
         assert_eq!(healthcheck.domain, "edge.example");
         assert_eq!(healthcheck.version, "7");
-        assert_eq!(healthcheck.retry, 3, "should default to 3 retries");
+        assert_eq!(healthcheck.path, "/", "should default to probing `/`");
+        assert_eq!(
+            healthcheck.retry, 3,
+            "should default to 3 total attempts, not 3 retries after a first try"
+        );
         assert_eq!(
             healthcheck.retry_delay, 5,
             "should default to a 5s retry delay"
@@ -475,6 +490,51 @@ mod tests {
     }
 
     #[test]
+    fn config_push_parses_staging_and_rejects_explicit_key() {
+        let args = parse(&["ts", "config", "push", "--adapter", "fastly", "--staging"]);
+        let Command::Config(ConfigCommand::Push(push)) = args.command else {
+            panic!("expected config push command");
+        };
+        assert!(push.staging, "should target the derived staging key");
+
+        Args::try_parse_from([
+            "ts",
+            "config",
+            "push",
+            "--adapter",
+            "fastly",
+            "--staging",
+            "--key",
+            "custom",
+        ])
+        .expect_err("should reject --key with --staging; the staging key is derived");
+    }
+
+    #[test]
+    fn config_diff_parses_staging_and_rejects_explicit_key() {
+        let args = parse(&["ts", "config", "diff", "--adapter", "fastly", "--staging"]);
+        let Command::Config(ConfigCommand::Diff(diff)) = args.command else {
+            panic!("expected config diff command");
+        };
+        assert!(
+            diff.staging,
+            "should compare against the derived staging key"
+        );
+
+        Args::try_parse_from([
+            "ts",
+            "config",
+            "diff",
+            "--adapter",
+            "fastly",
+            "--staging",
+            "--key",
+            "custom",
+        ])
+        .expect_err("should reject --key with --staging; the staging key is derived");
+    }
+
+    #[test]
     fn config_gc_previews_by_default() {
         let args = parse(&["ts", "config", "gc", "--adapter", "fastly"]);
         let Command::Config(ConfigCommand::Gc(gc)) = args.command else {
@@ -487,6 +547,10 @@ mod tests {
         );
         assert!(!gc.dry_run);
         assert!(!gc.no_env);
+        assert!(
+            !gc.yes,
+            "should not delete without an explicit --yes; --yes is the only destructive gate"
+        );
     }
 
     #[test]
