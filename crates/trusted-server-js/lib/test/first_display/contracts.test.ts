@@ -192,6 +192,19 @@ describe('first-display immutable contracts', () => {
       snapshotTakeoverOutlineV1(outline({ slices: ['gpt_initial', 'first_display'] }))
     ).toBeUndefined();
     expect(
+      snapshotTakeoverOutlineV1(
+        outline({ slices: ['first_display', 'aps_initial', 'gpt_initial'] })
+      )
+    ).toBeUndefined();
+    expect(
+      snapshotTakeoverOutlineV1(outline({ slices: ['first_display', 'render_owner_initial'] }))
+    ).toBeUndefined();
+    expect(
+      snapshotTakeoverOutlineV1(
+        outline({ slices: ['first_display', 'render_owner_initial', 'gpt_initial'] })
+      )?.slices
+    ).toEqual(['first_display', 'render_owner_initial', 'gpt_initial']);
+    expect(
       snapshotTakeoverOutlineV1(outline({ capabilities: ['gpt_slot', 'gpt_slot'] }))
     ).toBeUndefined();
     expect(
@@ -343,6 +356,25 @@ describe('first-display immutable contracts', () => {
         })
       )
     ).toBeUndefined();
+  });
+
+  it('validates the render-owner parser row inside a complete owner-to-GPT handoff', () => {
+    const gptParserState = (handoff().parserState as object[])[0]!;
+    const accepted = snapshotFirstDisplayHandoffV1(
+      handoff({
+        slices: ['first_display', 'render_owner_initial', 'gpt_initial'],
+        parserState: [
+          {
+            sliceId: 'render_owner_initial',
+            observations: ['protocol_version'],
+            values: [['protocol_version', 1]],
+          },
+          gptParserState,
+        ],
+      })
+    );
+
+    expect(accepted?.slices).toEqual(['first_display', 'render_owner_initial', 'gpt_initial']);
   });
 
   it('enforces 255/256/257 slot and outcome boundaries and strict high-water counters', () => {

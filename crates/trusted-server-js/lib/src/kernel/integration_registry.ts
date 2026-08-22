@@ -448,7 +448,7 @@ export function validateRuntimeManifestV1(
       firstDisplay = null;
     } else {
       const fields = readExactDataFields(manifestFields.firstDisplay, ['src', 'slices']);
-      const slices = snapshotExactArray(fields?.slices, 13);
+      const slices = snapshotExactArray(fields?.slices, 14);
       if (
         !fields ||
         typeof fields.src !== 'string' ||

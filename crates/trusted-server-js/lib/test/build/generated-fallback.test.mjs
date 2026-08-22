@@ -321,6 +321,56 @@ test('generated takeover completion leaves terminal fallback ownership with boot
   dom.window.close();
 });
 
+test('generated bootstrap stops slice activation after a reentrant terminal callback', () => {
+  const { dom, selected } = createDocument();
+  const target = { que: [] };
+  const events = [];
+  const src = `/static/tsjs=tsjs-first-display.min.js?m=0081&v=${'c'.repeat(64)}`;
+  selected.src = src;
+  const bootValue = boot();
+  bootValue.manifest.firstDisplay = {
+    src,
+    slices: ['first_display', 'gpt_initial'],
+  };
+  const outlineValue = outline();
+  outlineValue.slices = ['first_display', 'gpt_initial'];
+  dom.window.tsjs = target;
+  evaluateTransport(dom, transport(bootValue, outlineValue));
+
+  const base = {
+    abi: 1,
+    id: 'first_display',
+    releaseId: manifest.releaseId,
+    prepare: (host) =>
+      Object.freeze({
+        sliceHost: Object.freeze({}),
+        activate: ({ own }) => {
+          own(() => events.push('dispose-base'));
+          events.push('activate-base');
+          host.options.onFailure('bundle_partial');
+        },
+      }),
+  };
+  const gpt = {
+    abi: 1,
+    id: 'gpt_initial',
+    releaseId: manifest.releaseId,
+    prepare: () =>
+      Object.freeze({
+        activate: () => events.push('activate-gpt'),
+      }),
+  };
+
+  assert.equal(target._registerFirstDisplay.call(target, base, selected), true);
+  assert.equal(target._registerFirstDisplay.call(target, gpt, selected), false);
+  assert.deepEqual(events, ['activate-base', 'dispose-base']);
+  assert.equal(
+    Object.getOwnPropertyDescriptor(target, '_internal')?.value.reason,
+    'bundle_partial'
+  );
+  dom.window.close();
+});
+
 test('generated bootstrap commits one non-rendering terminal shell after registration failure', async () => {
   const { dom, selected } = createDocument();
   const drained = [];

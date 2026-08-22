@@ -24,6 +24,7 @@ const INTEGRATION_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const RELEASE_ID = /^[0-9a-f]{64}$/;
 const FIRST_DISPLAY_IDS = Object.freeze([
   'first_display',
+  'render_owner_initial',
   'aps_initial',
   'creative_initial',
   'datadome_initial',
@@ -160,6 +161,8 @@ function snapshotManifest(candidate: unknown, releaseId: string): BootManifestV1
     if (
       (mask & 1) === 0 ||
       mask >>> FIRST_DISPLAY_IDS.length !== 0 ||
+      ((mask & 4) !== 0 && (mask & 2) === 0) ||
+      ((mask & 2) !== 0 && (mask & 128) === 0) ||
       selected.length !== slices.length ||
       selected.some((id, index) => id !== slices[index])
     ) {

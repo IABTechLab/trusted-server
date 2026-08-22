@@ -53,6 +53,10 @@ import { createDidomiRuntime } from '../../src/integrations/didomi/module';
 import { shouldProxyExternalUrl } from '../../src/integrations/creative/proxy_sign';
 import { getPermutiveSegments } from '../../src/integrations/permutive/segments';
 import { mirrorSourcepointConsent } from '../../src/integrations/sourcepoint/consent_mirror';
+import {
+  installRenderOwnerInitial,
+  type FirstDisplayRenderOwnerProtocolV1,
+} from '../../src/first_display/render_journal';
 
 const RELEASE_ID = 'a'.repeat(64);
 
@@ -187,6 +191,61 @@ describe('first-display initial slice definitions', () => {
     }
   });
 
+  it('installs one source-neutral render journal and gives its slice disposer final ownership', () => {
+    const dom = new JSDOM('<!doctype html><div id="slot-1"></div>', {
+      url: 'https://publisher.example/',
+    });
+    const removeEventListener = vi.spyOn(dom.window, 'removeEventListener');
+    const release = vi.fn();
+    const owned: Array<() => void> = [];
+    let protocol: FirstDisplayRenderOwnerProtocolV1 | undefined;
+
+    expect(
+      installRenderOwnerInitial(
+        Object.freeze({
+          observe: vi.fn(),
+          register: (candidate: FirstDisplayRenderOwnerProtocolV1) => {
+            protocol = candidate;
+            return release;
+          },
+        }),
+        (dispose) => owned.push(dispose)
+      )
+    ).toEqual({ version: 1, id: 'render_owner' });
+    const bridge = protocol?.createRenderBridge({
+      browser: dom.window as unknown as Window,
+      clearTimer: () => undefined,
+      createChannel: () => {
+        throw new Error('unused');
+      },
+      document: dom.window.document,
+      fillRandom: () => undefined,
+      now: () => 0,
+      setTimer: () => ({}),
+    });
+
+    expect(bridge).toBeDefined();
+    expect(() =>
+      protocol?.createRenderBridge({
+        browser: dom.window as unknown as Window,
+        clearTimer: () => undefined,
+        createChannel: () => {
+          throw new Error('unused');
+        },
+        document: dom.window.document,
+        fillRandom: () => undefined,
+        now: () => 0,
+        setTimer: () => ({}),
+      })
+    ).toThrow(TypeError);
+
+    expect(owned).toHaveLength(1);
+    owned[0]?.();
+    expect(release).toHaveBeenCalledOnce();
+    expect(removeEventListener).toHaveBeenCalledWith('message', expect.any(Function), true);
+    dom.window.close();
+  });
+
   it.each([false, true])(
     'projects the typed GAM attribution flag into the first-display GPT owner (%s)',
     (gamAttributionEnabled) => {
@@ -233,8 +292,9 @@ describe('first-display initial slice definitions', () => {
     }
   );
 
-  it('pins the exact twelve optional slices in build order', () => {
+  it('pins the exact thirteen optional slices in build order', () => {
     expect(INITIAL_SLICE_DEFINITIONS.map(({ id }) => id)).toEqual([
+      'render_owner_initial',
       'aps_initial',
       'creative_initial',
       'datadome_initial',
@@ -282,6 +342,12 @@ describe('first-display initial slice definitions', () => {
     ).toBeUndefined();
     expect(
       selectInitialSliceDefinitions(['first_display', 'prebid_initial', 'gpt_initial'])
+    ).toBeUndefined();
+    expect(
+      selectInitialSliceDefinitions(['first_display', 'aps_initial', 'gpt_initial'])
+    ).toBeUndefined();
+    expect(
+      selectInitialSliceDefinitions(['first_display', 'render_owner_initial'])
     ).toBeUndefined();
     expect(
       selectInitialSliceDefinitions(['first_display', 'unknown_initial' as 'gpt_initial'])
@@ -1119,7 +1185,7 @@ describe('first-display initial slice definitions', () => {
     }
   });
 
-  it('registers the closed APS reservation and document-channel protocol', () => {
+  it('registers the closed APS nonce, policy, and document-channel protocol', () => {
     const release = vi.fn();
     const disposers: Array<() => void> = [];
     let protocol: FirstDisplayApsProtocolV1 | undefined;
@@ -1157,17 +1223,12 @@ describe('first-display initial slice definitions', () => {
       'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts allow-top-navigation-by-user-activation'
     );
     expect(protocol?.deadlines).toEqual({
-      insertionMs: 1_000,
       documentAcceptanceMs: 3_000,
       completionMs: 10_000,
-      ownerSettlementMs: 20_000,
     });
-    expect(protocol?.isReservationId(`r1_${'a'.repeat(22)}`)).toBe(true);
-    expect(protocol?.isLifecycleTicket(`t1_${'a'.repeat(22)}`)).toBe(true);
     expect(protocol?.isBootstrapNonce(`b1_${'a'.repeat(22)}`)).toBe(true);
     expect(protocol?.isRendererNonce(`n1_${'a'.repeat(22)}`)).toBe(true);
     expect(protocol?.isBootstrapNonce(`n1_${'a'.repeat(22)}`)).toBe(false);
-    expect(protocol?.isReservationId(`r1_${'a'.repeat(21)}`)).toBe(false);
     const nonce = `n1_${'b'.repeat(22)}`;
     expect(
       protocol?.parseDocumentMessage(

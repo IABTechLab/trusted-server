@@ -4,4 +4,4 @@ import { defineInitialSlice, registerInitialSlice } from './definition';
 
 export const PREBID_INITIAL_SLICE = defineInitialSlice('prebid_initial', installPrebidInitial);
 
-registerInitialSlice(PREBID_INITIAL_SLICE, 12);
+registerInitialSlice(PREBID_INITIAL_SLICE, 13);

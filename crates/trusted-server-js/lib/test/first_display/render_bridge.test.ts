@@ -2,8 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
 
 import type { FirstDisplayGptBoundCycleV1 } from '../../src/first_display/adapters/googletag';
-import { createFirstDisplayRenderBridge } from '../../src/first_display/render_bridge';
 import { PUC_DYNAMIC_OWNER } from '../../src/kernel/contracts/puc_dynamic_owner';
+
+import { createTestFirstDisplayRenderBridge } from './helpers/render_owner_composition';
 
 const RESERVATION_ID = `r1_${'a'.repeat(22)}`;
 
@@ -95,22 +96,25 @@ function fixture(kind: 'adm' | 'aps' = 'adm') {
 
 function harness(kind: 'adm' | 'aps' = 'adm', onNativeMutation?: () => boolean) {
   const value = fixture(kind);
-  let listener: ((event: Record<string, unknown>) => void) | undefined;
+  const listeners: Array<(event: Record<string, unknown>) => void> = [];
   const target = {
     addEventListener: vi.fn(
       (name: string, next: (event: Record<string, unknown>) => void, capture: boolean) => {
         expect(name).toBe('message');
         expect(capture).toBe(true);
-        listener = next;
+        listeners.push(next);
       }
     ),
-    removeEventListener: vi.fn(),
+    removeEventListener: vi.fn((_name: string, next: (event: Record<string, unknown>) => void) => {
+      const index = listeners.indexOf(next);
+      if (index >= 0) listeners.splice(index, 1);
+    }),
   };
   const channels: Array<{ port1: FakePort; port2: FakePort }> = [];
   const timers = new Map<object, Readonly<{ callback: () => void; delayMs: number }>>();
   let randomByte = 1;
   let now = 0;
-  const bridge = createFirstDisplayRenderBridge({
+  const bridge = createTestFirstDisplayRenderBridge({
     getAps: () =>
       kind === 'aps'
         ? Object.freeze({
@@ -123,15 +127,9 @@ function harness(kind: 'adm' | 'aps' = 'adm', onNativeMutation?: () => boolean) 
             permanentSandbox:
               'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts allow-top-navigation-by-user-activation',
             deadlines: Object.freeze({
-              insertionMs: 1_000 as const,
               documentAcceptanceMs: 3_000 as const,
               completionMs: 10_000 as const,
-              ownerSettlementMs: 20_000 as const,
             }),
-            isReservationId: (candidate: unknown): candidate is string =>
-              typeof candidate === 'string' && /^r1_[A-Za-z0-9_-]{22}$/.test(candidate),
-            isLifecycleTicket: (candidate: unknown): candidate is string =>
-              typeof candidate === 'string' && /^t1_[A-Za-z0-9_-]{22}$/.test(candidate),
             isBootstrapNonce: (candidate: unknown): candidate is string =>
               typeof candidate === 'string' && /^b1_[A-Za-z0-9_-]{22}$/.test(candidate),
             isRendererNonce: (candidate: unknown): candidate is string =>
@@ -141,8 +139,26 @@ function harness(kind: 'adm' | 'aps' = 'adm', onNativeMutation?: () => boolean) 
                 creativeOrigin: 'https://creative.example',
                 tagType: 'iframe' as const,
               }),
-            createRenderBridge: () => {
-              throw new Error('the full bridge fixture already owns construction');
+            createRenderStrategy: () => {
+              throw new Error('the legacy bridge fixture already owns construction');
+            },
+            parseWindowMessage: (candidate: unknown) => {
+              if (typeof candidate !== 'string') return undefined;
+              const message = JSON.parse(candidate) as Record<string, unknown>;
+              if (message.message === 'TS APS Bootstrap Ready') {
+                return Object.freeze({
+                  kind: 'bootstrap_ready' as const,
+                  bootstrap: message.bootstrapNonce as string,
+                });
+              }
+              if (message.message === 'TS APS Container Ready') {
+                return Object.freeze({
+                  kind: 'container_ready' as const,
+                  bootstrap: message.bootstrapNonce as string,
+                  renderer: message.rendererNonce as string,
+                });
+              }
+              return undefined;
             },
             parseDocumentMessage: (candidate: unknown, nonce: string) => {
               const message = candidate as Record<string, unknown>;
@@ -200,8 +216,8 @@ function harness(kind: 'adm' | 'aps' = 'adm', onNativeMutation?: () => boolean) 
     })
   ).toBe(true);
   const dispatch = (event: Record<string, unknown>): void => {
-    if (!listener) throw new Error('expected capture listener');
-    listener(event);
+    if (listeners.length === 0) throw new Error('expected capture listener');
+    for (const listener of [...listeners]) listener(event);
   };
   const fire = (delayMs: number): void => {
     const entry = [...timers.entries()].find(([, timer]) => timer.delayMs === delayMs);
@@ -278,8 +294,8 @@ function collapsedShell(h: ReturnType<typeof harness>) {
   return { frame, wrapper };
 }
 
-function registerOwner(h: ReturnType<typeof harness>) {
-  const source = {};
+function registerOwner(h: ReturnType<typeof harness>, ownerSource?: object) {
+  const source = ownerSource ?? {};
   const responsePort = new FakePort();
   h.dispatch(requestEvent(responsePort, { source }));
   expect(h.bridge.recordGam(h.cycle, 'nonempty_gam')).toBe(true);
@@ -307,6 +323,7 @@ function startApsDocument(h: ReturnType<typeof harness>) {
     ports: [],
     source: frame.contentWindow,
   });
+  expect(h.terminalFacts).toEqual([]);
   const navigation = JSON.parse(postMessage.mock.calls[0]?.[0] as string) as Record<
     string,
     unknown
@@ -345,12 +362,89 @@ function acceptPucAps(h: ReturnType<typeof harness>): HTMLIFrameElement {
   return frame;
 }
 
+function bindMixedAdm(h: ReturnType<typeof harness>) {
+  const element = h.dom.window.document.createElement('div');
+  element.id = 'slot-2';
+  h.dom.window.document.body.appendChild(element);
+  const reservationId = `r1_${'b'.repeat(22)}`;
+  const cycle: FirstDisplayGptBoundCycleV1 = Object.freeze({
+    bid: Object.freeze({
+      candidateId: 'candidate002',
+      slot: 'slot-2',
+      provider: 'example',
+      upstreamBidId: 'upstream-2',
+      cpm: 1.5,
+      currency: 'USD' as const,
+      targeting: Object.freeze({}),
+      rendererReservationId: reservationId,
+      renderSource: Object.freeze({
+        type: 'adm' as const,
+        version: 1 as const,
+        adm: '<main>mixed ADM creative</main>',
+        width: 300,
+        height: 250,
+      }),
+    }),
+    element,
+    ownership: 'trusted_server',
+    physicalSlot: {},
+    isCurrent: () => true,
+    placement: Object.freeze({
+      slot: 'slot-2',
+      gamUnitPath: '/123/example-2',
+      divId: 'slot-2',
+      formats: Object.freeze([Object.freeze([300, 250] as const)]),
+      targeting: Object.freeze({}),
+    }),
+    slotId: 'slot-2',
+    traceToken: 'gt1_2',
+  });
+  const terminal = vi.fn();
+  expect(h.bridge.bind(cycle, terminal)).toBe(true);
+  return { cycle, element, reservationId, terminal };
+}
+
 describe('bounded first-display render bridge', () => {
+  it('isolates interleaved APS and ADM ownership in one shared journal', () => {
+    const h = harness('aps');
+    const adm = bindMixedAdm(h);
+    registerOwner(h);
+
+    expect(h.bridge.recordGam(adm.cycle, 'gam_empty')).toBe(true);
+    const admFrame = adm.element.querySelector<HTMLIFrameElement>('iframe');
+    expect(admFrame?.srcdoc).toContain('mixed ADM creative');
+    admFrame?.dispatchEvent(new h.dom.window.Event('load'));
+    expect(adm.terminal).toHaveBeenCalledWith('accepted', null);
+    expect(h.terminals).toEqual([]);
+
+    const { documentPort, frame: apsFrame, nonce } = startApsDocument(h);
+    documentPort.dispatch({ message: 'TS APS Document Accepted', version: 1, nonce });
+    documentPort.dispatch({ message: 'TS APS Render Completed', version: 1, nonce });
+    expect(h.terminals).toEqual(['accepted']);
+
+    h.bridge.sealTsAdmission();
+    expect(h.bridge.closeIngress()).toBe(true);
+    const handoff = h.bridge.captureHandoff();
+    expect(handoff?.artifacts.map(({ kind, slotId, token }) => ({ kind, slotId, token }))).toEqual([
+      { kind: 'gpt_adm', slotId: 'slot-2', token: adm.reservationId },
+      { kind: 'aps', slotId: 'slot-1', token: RESERVATION_ID },
+    ]);
+    expect(
+      new Set(
+        handoff?.tombstones.filter(({ kind }) => kind === 'reservation').map(({ value }) => value)
+      )
+    ).toEqual(new Set([adm.reservationId, RESERVATION_ID]));
+    expect(h.bridge.detachCommittedArtifacts()).toBe(true);
+    h.bridge.dispose();
+    expect(admFrame?.isConnected).toBe(true);
+    expect(apsFrame.isConnected).toBe(true);
+  });
+
   it('observes admitted bridge activity and terminal tombstone expiry', () => {
     const mutations = vi.fn(() => true);
     const h = harness('adm', mutations);
     const shell = collapsedShell(h);
-    const owner = registerOwner(h);
+    const owner = registerOwner(h, shell.frame.contentWindow!);
     h.channels[0]?.port1.dispatch({
       message: 'TS Owner Inserted',
       version: 1,

@@ -12,54 +12,9 @@ function installPucDynamicOwner(): void {
   const reservationPattern = /^r1_[A-Za-z0-9_-]{22}$/;
   const admSandbox =
     'allow-forms allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation';
-  const renderFailureReasons = new Set([
-    'auction_timeout',
-    'auction_disabled',
-    'consent_denied',
-    'slot_not_eligible',
-    'provider_timeout',
-    'provider_error',
-    'invalid_provider_response',
-    'mediation_failed',
-    'winner_not_renderable',
-    'internal_error',
-    'network_error',
-    'http_error',
-    'invalid_response',
-    'slot_unresolved',
-    'descriptor_invalid',
-    'invalid_dimensions',
-    'dimensions_out_of_range',
-    'no_render_source',
-    'registry_full',
-    'capability_registry_full',
-    'external_queue_full',
-    'external_ready_timeout',
-    'external_artifact_incompatible',
-    'prebid_admission_failed',
-    'prebid_contract_violation',
-    'prebid_selection_timeout',
-    'reservation_collision',
-    'identity_generation_failed',
-    'cycle_unattributable',
-    'slot_quarantined',
-    'gpt_request_failed',
-    'gpt_request_timeout',
-    'gpt_completion_timeout',
-    'reconciliation_capacity',
-    'gam_empty',
-    'bridge_claim_timeout',
-    'bridge_id_mismatch',
-    'owner_registration_timeout',
-    'owner_insertion_timeout',
-    'renderer_document_no_load',
-    'runner_no_load',
-    'runner_failed',
-    'adm_document_no_load',
-    'abi_mismatch',
-    'bundle_partial',
-  ]);
-  const cancellationReasons = new Set(['caller_aborted', 'superseded', 'navigation_disposed']);
+  const renderFailureReason =
+    /^(?:auction_timeout|auction_disabled|consent_denied|slot_not_eligible|provider_timeout|provider_error|invalid_provider_response|mediation_failed|winner_not_renderable|internal_error|network_error|http_error|invalid_response|slot_unresolved|descriptor_invalid|invalid_dimensions|dimensions_out_of_range|no_render_source|registry_full|capability_registry_full|external_queue_full|external_ready_timeout|external_artifact_incompatible|prebid_admission_failed|prebid_contract_violation|prebid_selection_timeout|reservation_collision|identity_generation_failed|cycle_unattributable|slot_quarantined|gpt_request_failed|gpt_request_timeout|gpt_completion_timeout|reconciliation_capacity|gam_empty|bridge_claim_timeout|bridge_id_mismatch|owner_registration_timeout|owner_insertion_timeout|renderer_document_no_load|runner_no_load|runner_failed|adm_document_no_load|abi_mismatch|bundle_partial)$/;
+  const cancellationReason = /^(?:caller_aborted|superseded|navigation_disposed)$/;
   const messageEventDataGetter = Object.getOwnPropertyDescriptor(MessageEvent.prototype, 'data')
     ?.get as ((this: MessageEvent) => unknown) | undefined;
   const messageEventPortsGetter = Object.getOwnPropertyDescriptor(MessageEvent.prototype, 'ports')
@@ -193,109 +148,6 @@ function installPucDynamicOwner(): void {
       } catch {
         // Late or malformed endpoints are still contained independently.
       }
-    }
-  };
-  const skipJsonWhitespace = (source: string, start: number): number => {
-    let index = start;
-    while (
-      source[index] === ' ' ||
-      source[index] === '\t' ||
-      source[index] === '\n' ||
-      source[index] === '\r'
-    ) {
-      index += 1;
-    }
-    return index;
-  };
-  const scanJsonString = (source: string, start: number): number | undefined => {
-    if (source[start] !== '"') return undefined;
-    let index = start + 1;
-    while (index < source.length) {
-      const character = source[index];
-      if (character === '"') return index + 1;
-      if (character === '\\') {
-        index += 1;
-        if (index >= source.length) return undefined;
-        if (source[index] === 'u') {
-          if (!/^[0-9a-fA-F]{4}$/.test(source.slice(index + 1, index + 5))) return undefined;
-          index += 4;
-        }
-      } else if (character !== undefined && character.charCodeAt(0) < 0x20) {
-        return undefined;
-      }
-      index += 1;
-    }
-    return undefined;
-  };
-  const scanJsonValue = (source: string, start: number): number | undefined => {
-    let index = skipJsonWhitespace(source, start);
-    if (source[index] === '"') return scanJsonString(source, index);
-    if (source[index] === '[') {
-      index = skipJsonWhitespace(source, index + 1);
-      if (source[index] === ']') return index + 1;
-      while (index < source.length) {
-        const end = scanJsonValue(source, index);
-        if (end === undefined) return undefined;
-        index = skipJsonWhitespace(source, end);
-        if (source[index] === ']') return index + 1;
-        if (source[index] !== ',') return undefined;
-        index = skipJsonWhitespace(source, index + 1);
-      }
-      return undefined;
-    }
-    if (source[index] === '{') {
-      const keys = new Set<string>();
-      index = skipJsonWhitespace(source, index + 1);
-      if (source[index] === '}') return index + 1;
-      while (index < source.length) {
-        const keyEnd = scanJsonString(source, index);
-        if (keyEnd === undefined) return undefined;
-        let key: unknown;
-        try {
-          key = JSON.parse(source.slice(index, keyEnd)) as unknown;
-        } catch {
-          return undefined;
-        }
-        if (typeof key !== 'string' || keys.has(key)) return undefined;
-        keys.add(key);
-        index = skipJsonWhitespace(source, keyEnd);
-        if (source[index] !== ':') return undefined;
-        const valueEnd = scanJsonValue(source, index + 1);
-        if (valueEnd === undefined) return undefined;
-        index = skipJsonWhitespace(source, valueEnd);
-        if (source[index] === '}') return index + 1;
-        if (source[index] !== ',') return undefined;
-        index = skipJsonWhitespace(source, index + 1);
-      }
-      return undefined;
-    }
-    const match = /^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/.exec(
-      source.slice(index)
-    );
-    return match ? index + match[0].length : undefined;
-  };
-  const parseJsonWithoutDuplicateKeys = (source: string): unknown => {
-    const end = scanJsonValue(source, 0);
-    if (end === undefined || skipJsonWhitespace(source, end) !== source.length) return undefined;
-    try {
-      return JSON.parse(source) as unknown;
-    } catch {
-      return undefined;
-    }
-  };
-  const parseRegistration = (value: unknown): Record<string, unknown> | undefined => {
-    try {
-      if (typeof value !== 'string' || new TextEncoder().encode(value).byteLength > 4096) {
-        return undefined;
-      }
-      return exactRecord(parseJsonWithoutDuplicateKeys(value), [
-        'message',
-        'adId',
-        'version',
-        'lifecycleTicket',
-      ]);
-    } catch {
-      return undefined;
     }
   };
   const validDimension = (value: unknown): value is number =>
@@ -586,7 +438,7 @@ function installPucDynamicOwner(): void {
           if (
             message['outcome'] === 'failed' &&
             typeof message['reason'] === 'string' &&
-            renderFailureReasons.has(message['reason'])
+            renderFailureReason.test(message['reason'])
           ) {
             finish(false, message['reason']);
             return;
@@ -594,7 +446,7 @@ function installPucDynamicOwner(): void {
           if (
             message['outcome'] === 'cancelled' &&
             typeof message['reason'] === 'string' &&
-            cancellationReasons.has(message['reason'])
+            cancellationReason.test(message['reason'])
           ) {
             finish(false, String(message['reason']));
             return;
@@ -613,14 +465,20 @@ function installPucDynamicOwner(): void {
         clearTimer(registrationTimer);
         const ports = eventPorts(event, 1);
         const dataValue = eventDataValue(event);
-        const response = parseRegistration(dataValue);
+        const response =
+          typeof dataValue === 'string' &&
+          dataValue ===
+            JSON.stringify({
+              message: 'TS Render Owner Registered',
+              adId,
+              version: 1,
+              lifecycleTicket,
+            });
         if (
           !ports ||
           !response ||
-          response['message'] !== 'TS Render Owner Registered' ||
-          response['adId'] !== adId ||
-          response['version'] !== 1 ||
-          response['lifecycleTicket'] !== lifecycleTicket
+          typeof adId !== 'string' ||
+          typeof lifecycleTicket !== 'string'
         ) {
           closeEventPorts(event);
           finish(false, 'TS render owner registration refused');

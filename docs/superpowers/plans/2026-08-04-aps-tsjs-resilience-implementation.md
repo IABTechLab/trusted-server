@@ -1304,27 +1304,45 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 
 - Create: `crates/trusted-server-js/lib/src/first_display/render_journal.ts`
 - Create: `crates/trusted-server-js/lib/src/first_display/slices/render_owner.ts`
+- Create: `crates/trusted-server-js/lib/test/first_display/helpers/render_owner_composition.ts`
+- Delete: `crates/trusted-server-js/lib/src/first_display/adm_render_bridge.ts`
+- Modify: `crates/trusted-server-core/src/auction/formats.rs`
+- Modify: `crates/trusted-server-core/src/integrations/registry.rs`
+- Modify: `crates/trusted-server-core/src/publisher.rs`
 - Modify: `crates/trusted-server-core/src/tsjs.rs`
+- Modify: `crates/trusted-server-js/build.rs`
+- Modify: `crates/trusted-server-js/src/bundle.rs`
 - Modify: `crates/trusted-server-js/lib/src/first_display/agent.ts`
-- Modify: `crates/trusted-server-js/lib/src/first_display/adm_render_bridge.ts`
+- Modify: `crates/trusted-server-js/lib/src/first_display/composition.ts`
 - Modify: `crates/trusted-server-js/lib/src/first_display/render_bridge.ts`
 - Modify: `crates/trusted-server-js/lib/src/first_display/leaf/aps_protocol.ts`
-- Modify: `crates/trusted-server-js/lib/src/first_display/slices/aps.ts`
+- Modify: `crates/trusted-server-js/lib/src/first_display/slices/*.ts`
+- Modify: `crates/trusted-server-js/lib/src/core/bootstrap.ts`
+- Modify: `crates/trusted-server-js/lib/src/core/contracts/boot.ts`
 - Modify: `crates/trusted-server-js/lib/src/core/contracts/server_boot_transport.ts`
+- Modify: `crates/trusted-server-js/lib/src/integrations/render_runtime/module.ts`
 - Modify: `crates/trusted-server-js/lib/src/kernel/contracts/puc_dynamic_owner.ts`
+- Modify: `crates/trusted-server-js/lib/src/kernel/integration_registry.ts`
 - Modify: `crates/trusted-server-js/lib/src/kernel/release_catalog.ts`
 - Modify: `crates/trusted-server-js/lib/src/shared/first_display_transaction.ts`
 - Modify: `crates/trusted-server-js/lib/src/shared/first_display_registration.ts`
 - Modify: `crates/trusted-server-js/lib/src/shared/first_display_contracts.ts`
 - Modify: `crates/trusted-server-js/lib/build-all.mjs`
+- Modify: `crates/trusted-server-js/lib/scripts/bundle-metrics.mjs`
 - Modify: `crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs`
+- Modify: `crates/trusted-server-js/lib/scripts/print-release-id.mjs`
+- Modify: `scripts/validate-tsjs-performance-evidence.mjs`
+- Modify: `crates/trusted-server-integration-tests/browser/helpers/tsjs-fixture.ts`
 - Test: `crates/trusted-server-js/lib/test/first_display/{agent,adm_render_bridge,render_bridge,slices}.test.ts`
 - Test: `crates/trusted-server-js/lib/test/first_display/transaction.test.ts`
 - Test: `crates/trusted-server-js/lib/test/first_display/contracts.test.ts`
+- Test: `crates/trusted-server-js/lib/test/core/bootstrap.test.ts`
+- Test: `crates/trusted-server-js/lib/test/integrations/render_runtime/module.test.ts`
 - Test: `crates/trusted-server-js/lib/test/kernel/release_catalog.test.ts`
 - Test: `crates/trusted-server-js/lib/test/services/puc_bridge.test.ts`
+- Test: `crates/trusted-server-js/lib/test/build/generated-fallback.test.mjs`
 - Test: `crates/trusted-server-js/lib/test/build/release-v1.test.mjs`
-- Test: `crates/trusted-server-integration-tests/browser/tests/shared/{aps-renderer,aps-puc-lifecycle,tsjs-runtime}.spec.ts`
+- Test: `crates/trusted-server-integration-tests/browser/tests/shared/{aps-renderer,aps-puc-lifecycle,tsjs-performance,tsjs-runtime}.spec.ts`
 
 - [ ] **Step 1: Add RED catalog, selection, and source-ownership tests.** Add
       `render_owner_initial` as catalog order 2 and shift the remaining optional
@@ -1341,14 +1359,24 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
       renderer-document parsing, mount code, or top-mount policy. ADM-only masks still
       receive the self-contained v4 owner. Assert exact catalog order 1–14 and the
       implications APS ⇒ render owner ⇒ GPT, ADM ⇒ render owner without APS, and
-      no-bid/nonrendering ⇒ no render owner.
+      no-bid/nonrendering ⇒ no render owner. Pin the server masks `0001` no-bid,
+      `0081` attribution-only, `0083` ADM, `008b` creative ADM, `0087` APS, `008f`
+      creative APS, and `1083` Prebid ADM. Reject an APS participation fact when APS
+      is not enabled. Update the Rust build consumer, generated Rust inventory,
+      release-id printer, persistent manifest capacity, and all slice registration
+      orders from 13/35 to 14/36 rather than leaving a dead build scalar or a stale
+      hard-coded index.
 
 - [ ] **Step 2: Add RED parity tests before extracting code.** Run the same journal
       corpus against ADM-only, APS-only, and mixed APS/ADM batches. Cover accepted,
       failed, cancelled, empty-GAM fallback, replacement success/failure, moved or
       mutated nodes, navigation, handoff, post-detach reentrancy, overlay-lease
-      transfer, targeting restoration, and final retirement. The new tests must fail
-      only because a shared base journal is not yet exposed.
+      transfer, targeting restoration, and final retirement. Include the first-display
+      APS adoption → persistent APS replacement → final-retirement sequence and the
+      publisher-owned PUC handoff. Keep the old harness shape only in a test helper
+      that composes the neutral journal with the APS strategy; production has no
+      compatibility wrapper. The new tests must fail only because a shared base
+      journal is not yet exposed.
 
 - [ ] **Step 3: Add RED compact-owner tests.** Keep the exact successful/refused v4
       outer shapes and the complete current adversarial corpus, while requiring the
@@ -1360,7 +1388,9 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
       route test must also prove `render_owner_initial` is concatenated into the one
       served mask body, has no independently routable/requested production asset, and
       can create no script, preload, fetch, dynamic-import, worker, or blob request
-      before paint.
+      before paint. Measure the browser-observed call-time boundary, not a potentially
+      backdated `PerformanceResourceTiming.startTime`, and assert the exact request
+      sequence document → selected first-display artifact → persistent runtime.
 
 - [ ] **Step 4: Run RED.**
 
@@ -1374,7 +1404,11 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
       detach state, timers, and retirement bookkeeping. Expose only the exact frozen
       operations the APS protocol needs through the release-private slice host. Keep
       APS descriptor parsing, nonce registries, document parser, mount policy, and
-      overlay behavior in `aps_initial`.
+      overlay behavior in `aps_initial`. Instantiate exactly one journal during
+      render-owner activation, pass its one-use private capability through the base
+      host to APS, and let the render-owner slice disposer own it. The APS protocol
+      may import the neutral interface as a type only; the owner must have no runtime
+      dependency on APS.
 
 - [ ] **Step 6: Compact the dynamic owner in place.** Deduplicate its exact record,
       event/port, timer, and terminal helpers without removing checks or changing a
@@ -1399,7 +1433,11 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
   Expected: every focused behavior is unchanged, the production graph has one
   render journal, and the exact mandatory APS mask remains admitted. If the combined
   inline-plus-mask semantic bytes still exceed the rc × 1.10 allowance, stop and
-  revisit the approved split rather than weakening a gate.
+  revisit the approved split rather than weakening a gate. The release proof must
+  show 36 artifacts, 14 first-display rows, 3,584 reachable masks, the exact
+  generated admitted subset, a largest admitted first-display body no greater than
+  90,000/30,000/26,000 raw/gzip/Brotli bytes, and a maximal total that excludes the
+  bootstrap role.
 
 - [ ] **Step 8: Run the three-browser focused lifecycle proof.** In
       `tsjs-runtime.spec.ts`, assert exactly one parser-blocking first-display TSJS
@@ -1413,7 +1451,7 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 - [ ] **Step 9: Commit.**
 
   ```bash
-  git add crates/trusted-server-core/src/tsjs.rs crates/trusted-server-js/lib/src/first_display crates/trusted-server-js/lib/src/core/contracts/server_boot_transport.ts crates/trusted-server-js/lib/src/kernel/contracts/puc_dynamic_owner.ts crates/trusted-server-js/lib/src/kernel/release_catalog.ts crates/trusted-server-js/lib/src/shared/first_display_transaction.ts crates/trusted-server-js/lib/src/shared/first_display_registration.ts crates/trusted-server-js/lib/src/shared/first_display_contracts.ts crates/trusted-server-js/lib/build-all.mjs crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs crates/trusted-server-js/lib/test/first_display crates/trusted-server-js/lib/test/kernel/release_catalog.test.ts crates/trusted-server-js/lib/test/services/puc_bridge.test.ts crates/trusted-server-js/lib/test/build/release-v1.test.mjs crates/trusted-server-integration-tests/browser/tests/shared/aps-renderer.spec.ts crates/trusted-server-integration-tests/browser/tests/shared/aps-puc-lifecycle.spec.ts crates/trusted-server-integration-tests/browser/tests/shared/tsjs-runtime.spec.ts
+  git add -A
   git commit -m "Thin the APS first-display owner"
   ```
 

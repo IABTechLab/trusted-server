@@ -38,12 +38,12 @@ function apsDescriptor() {
     creativeId: "fictional-creative",
     tagType: bid.ext.tagtype,
     creativeUrl: bid.ext.creativeurl,
-    width: bid.w,
-    height: bid.h,
     aaxResponse: Buffer.from(
       JSON.stringify({ seatbid: [{ bid: [bid] }] }),
       "utf8",
     ).toString("base64"),
+    width: bid.w,
+    height: bid.h,
   };
 }
 
@@ -184,7 +184,21 @@ async function openLifecyclePage(
           ).tsjs?._internal?.state,
       ),
     )
-    .toBe("kernel");
+    .toMatch(/^(?:kernel|fallback)$/u);
+  const runtimeState = await page.evaluate(() => {
+    const browserWindow = window as unknown as {
+      tsjs?: { _internal?: unknown };
+    };
+    return {
+      internal: browserWindow.tsjs?._internal,
+      marks: performance
+        .getEntriesByType("mark")
+        .map((entry) => ({ name: entry.name, startTime: entry.startTime })),
+    };
+  });
+  expect(runtimeState.internal, JSON.stringify(runtimeState)).toMatchObject({
+    state: "kernel",
+  });
   await expect
     .poll(() =>
       page.evaluate(() =>

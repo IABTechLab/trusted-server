@@ -113,6 +113,21 @@ function transportInput(firstDisplay = false): Record<string, unknown> {
   };
 }
 
+function selectFirstDisplay(
+  input: Record<string, unknown>,
+  mask: string,
+  slices: readonly string[]
+): void {
+  const boot = input.boot as Record<string, unknown>;
+  const manifest = boot.manifest as Record<string, unknown>;
+  manifest.firstDisplay = {
+    src: `/static/tsjs=tsjs-first-display.min.js?m=${mask}&v=${'c'.repeat(64)}`,
+    slices: [...slices],
+  };
+  const outline = input.outline as Record<string, unknown>;
+  outline.slices = [...slices];
+}
+
 describe('sealed production boot transport', () => {
   it.each([false, true])('parses and recursively freezes a fresh %s transport', (firstDisplay) => {
     const original = transportInput(firstDisplay);
@@ -188,6 +203,26 @@ describe('sealed production boot transport', () => {
     deferred.src = `/static/tsjs=tsjs-evil.min.js?v=${'e'.repeat(64)}`;
     expect(snapshotServerBootTransportV1(JSON.stringify(value), RELEASE)).toBeUndefined();
   });
+
+  it.each([
+    ['APS without the render owner', '0085', ['first_display', 'aps_initial', 'gpt_initial']],
+    ['the render owner without GPT', '0003', ['first_display', 'render_owner_initial']],
+  ])('rejects %s before exposing the compact boot', (_name, mask, slices) => {
+    const value = transportInput(true);
+    selectFirstDisplay(value, mask, slices);
+
+    expect(snapshotServerBootTransportV1(JSON.stringify(value), RELEASE)).toBeUndefined();
+  });
+
+  it.each([
+    ['0081', ['first_display', 'gpt_initial']],
+    ['0083', ['first_display', 'render_owner_initial', 'gpt_initial']],
+  ])('admits the closed non-APS slice relationship %s', (mask, slices) => {
+    const value = transportInput(true);
+    selectFirstDisplay(value, mask, slices);
+
+    expect(snapshotServerBootTransportV1(JSON.stringify(value), RELEASE)).toBeDefined();
+  });
 });
 
 describe('bootstrap integration configuration admission', () => {
@@ -253,6 +288,16 @@ describe('bootstrap integration configuration admission', () => {
     const outline = input.outline as Record<string, unknown>;
     outline.slotCount = 2;
     outline.outcomeCount = 2;
+
+    expect(snapshotBootstrapInputV1(input, RELEASE)).toBeUndefined();
+  });
+
+  it.each([
+    ['APS without the render owner', '0085', ['first_display', 'aps_initial', 'gpt_initial']],
+    ['the render owner without GPT', '0003', ['first_display', 'render_owner_initial']],
+  ])('rejects %s before retaining the full boot', (_name, mask, slices) => {
+    const input = firstDisplayInput();
+    selectFirstDisplay(input, mask, slices);
 
     expect(snapshotBootstrapInputV1(input, RELEASE)).toBeUndefined();
   });

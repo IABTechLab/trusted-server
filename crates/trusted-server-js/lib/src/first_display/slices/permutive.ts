@@ -7,4 +7,4 @@ export const PERMUTIVE_INITIAL_SLICE = defineInitialSlice(
   installPermutiveInitial
 );
 
-registerInitialSlice(PERMUTIVE_INITIAL_SLICE, 10);
+registerInitialSlice(PERMUTIVE_INITIAL_SLICE, 11);

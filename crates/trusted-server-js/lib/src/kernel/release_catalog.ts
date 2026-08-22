@@ -61,6 +61,7 @@ export interface ReleaseCatalogSelection {
 
 export type FirstDisplaySliceId =
   | 'first_display'
+  | 'render_owner_initial'
   | 'aps_initial'
   | 'creative_initial'
   | 'datadome_initial'
@@ -76,6 +77,7 @@ export type FirstDisplaySliceId =
 
 export type FirstDisplayIncludePredicate =
   | 'eligible_batch'
+  | 'render_owner_participates'
   | 'aps_participates'
   | 'creative_guard'
   | 'gpt_initial'
@@ -104,6 +106,7 @@ export interface FirstDisplayCatalogSelection {
   readonly eligibleBatch: boolean;
   readonly integrations: readonly string[];
   readonly apsParticipates?: boolean;
+  readonly renderOwnerParticipates?: boolean;
   readonly prebidParticipates?: boolean;
   readonly creative?: Readonly<{
     enabled: boolean;
@@ -132,7 +135,6 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
       'shared/first_display_registration',
       'shared/first_display_transaction',
       'shared/integration_config_validators',
-      'first_display/adm_render_bridge',
       'first_display/driver',
       'first_display/leaf/projection',
       'first_display/registration_client',
@@ -145,6 +147,22 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
   }),
   firstDisplayRow({
     order: 2,
+    id: 'render_owner_initial',
+    include: 'render_owner_participates',
+    allowedImports: [
+      'shared/first_display_contracts',
+      'first_display/registration_client',
+      'first_display/slices/definition',
+      'first_display/render_journal',
+      'kernel/contracts/puc_dynamic_owner',
+    ],
+    inputs: ['first_display.control.v1'],
+    outputs: ['render_owner.initial.v1'],
+    obligation:
+      'Own source-neutral reservation, ticket, v4 PUC, render journal, handoff, and retirement state',
+  }),
+  firstDisplayRow({
+    order: 3,
     id: 'aps_initial',
     include: 'aps_participates',
     allowedImports: [
@@ -153,14 +171,13 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
       'first_display/slices/definition',
       'first_display/leaf/aps_protocol',
       'first_display/render_bridge',
-      'kernel/contracts/puc_dynamic_owner',
     ],
-    inputs: ['first_display.control.v1'],
+    inputs: ['first_display.control.v1', 'render_owner.initial.v1'],
     outputs: ['aps.initial.v1'],
-    obligation: 'Own initial reservation, PUC, and APS document protocols',
+    obligation: 'Own APS URL, nonce, renderer-document, and top-mount authority',
   }),
   firstDisplayRow({
-    order: 3,
+    order: 4,
     id: 'creative_initial',
     include: 'creative_guard',
     allowedImports: [
@@ -174,7 +191,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     obligation: 'Install current parser-time creative guards and record initial observations only',
   }),
   firstDisplayRow({
-    order: 4,
+    order: 5,
     id: 'datadome_initial',
     include: 'integration:datadome',
     allowedImports: [
@@ -188,7 +205,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     obligation: 'Install the initial DataDome script and preload route guard',
   }),
   firstDisplayRow({
-    order: 5,
+    order: 6,
     id: 'didomi_initial',
     include: 'integration:didomi',
     allowedImports: [
@@ -202,7 +219,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     obligation: 'Install the configured Didomi SDK path before SDK evaluation',
   }),
   firstDisplayRow({
-    order: 6,
+    order: 7,
     id: 'google_tag_manager_initial',
     include: 'integration:google_tag_manager',
     allowedImports: [
@@ -216,7 +233,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     obligation: 'Install initial GTM script, preload, beacon, and fetch guards',
   }),
   firstDisplayRow({
-    order: 7,
+    order: 8,
     id: 'gpt_initial',
     include: 'gpt_initial',
     allowedImports: [
@@ -231,7 +248,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     obligation: 'Sole provisional GPT adapter, listeners, targeting, request, and handoff capture',
   }),
   firstDisplayRow({
-    order: 8,
+    order: 9,
     id: 'lockr_initial',
     include: 'integration:lockr',
     allowedImports: [
@@ -245,7 +262,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     obligation: 'Install the initial Lockr script guard and bounded readiness observation',
   }),
   firstDisplayRow({
-    order: 9,
+    order: 10,
     id: 'osano_initial',
     include: 'integration:osano',
     allowedImports: [
@@ -259,7 +276,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     obligation: 'Capture the initial consent mirrors required by the protected batch',
   }),
   firstDisplayRow({
-    order: 10,
+    order: 11,
     id: 'permutive_initial',
     include: 'integration:permutive',
     allowedImports: [
@@ -273,7 +290,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     obligation: 'Install initial guard/readiness and capture normalized segments',
   }),
   firstDisplayRow({
-    order: 11,
+    order: 12,
     id: 'sourcepoint_initial',
     include: 'integration:sourcepoint',
     allowedImports: [
@@ -287,7 +304,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     obligation: 'Install the initial SDK guard and capture the GPP mirror',
   }),
   firstDisplayRow({
-    order: 12,
+    order: 13,
     id: 'prebid_initial',
     include: 'prebid_participates',
     allowedImports: [
@@ -302,7 +319,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
       'Own initial artifact admission, queue, bidder, identity, EID, TS bid, and PUC setup',
   }),
   firstDisplayRow({
-    order: 13,
+    order: 14,
     id: 'testlight_initial',
     include: 'integration:testlight',
     allowedImports: [
@@ -347,6 +364,12 @@ export function selectFirstDisplayCatalog(
 
   const include = (predicate: FirstDisplayIncludePredicate): boolean => {
     if (predicate === 'eligible_batch') return true;
+    if (predicate === 'render_owner_participates') {
+      return (
+        selection.renderOwnerParticipates === true ||
+        (selection.apsParticipates === true && integrations.has('aps'))
+      );
+    }
     if (predicate === 'aps_participates') {
       return selection.apsParticipates === true && integrations.has('aps');
     }

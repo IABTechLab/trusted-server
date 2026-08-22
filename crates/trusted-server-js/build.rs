@@ -158,8 +158,8 @@ fn read_and_validate_catalog(dist_dir: &Path, release: &ReleaseManifest) -> Cata
         .collect::<Vec<_>>();
     assert_eq!(
         catalog.first_display.len(),
-        13,
-        "tsjs: first-display catalog must contain base plus twelve slices"
+        14,
+        "tsjs: first-display catalog must contain base plus thirteen slices"
     );
     assert_eq!(
         first_display_artifacts.len(),
@@ -181,6 +181,7 @@ fn read_and_validate_catalog(dist_dir: &Path, release: &ReleaseManifest) -> Cata
             .unwrap_or_else(|| panic!("tsjs: first-display catalog is missing {id}"))
     };
     let gpt_mask = mask_bit("gpt_initial");
+    let render_owner_mask = mask_bit("render_owner_initial");
     let aps_mask = mask_bit("aps_initial");
     let prebid_mask = mask_bit("prebid_initial");
     for encoded in &catalog.permitted_first_display_masks {
@@ -203,8 +204,12 @@ fn read_and_validate_catalog(dist_dir: &Path, release: &ReleaseManifest) -> Cata
             "tsjs: permitted first-display mask contains an unknown slice bit"
         );
         assert!(
-            mask & (aps_mask | prebid_mask) == 0 || mask & gpt_mask != 0,
-            "tsjs: APS and Prebid participation require GPT initial ownership"
+            mask & (render_owner_mask | aps_mask | prebid_mask) == 0 || mask & gpt_mask != 0,
+            "tsjs: render-owner, APS, and Prebid participation require GPT initial ownership"
+        );
+        assert!(
+            mask & aps_mask == 0 || mask & render_owner_mask != 0,
+            "tsjs: APS participation requires render-owner initial ownership"
         );
         assert!(
             previous_mask.is_none_or(|previous| mask > previous),
@@ -241,6 +246,7 @@ fn read_and_validate_catalog(dist_dir: &Path, release: &ReleaseManifest) -> Cata
         assert!(!module.obligation.is_empty());
         assert!(
             module.include == "eligible_batch"
+                || module.include == "render_owner_participates"
                 || module.include == "aps_participates"
                 || module.include == "creative_guard"
                 || module.include == "gpt_initial"
@@ -295,15 +301,15 @@ fn read_and_validate_release(dist_dir: &Path) -> ReleaseManifest {
     );
     assert_eq!(
         manifest.artifacts.len(),
-        35,
-        "tsjs: release must contain bootstrap, thirteen first-display components, core, and twenty integrations"
+        36,
+        "tsjs: release must contain bootstrap, fourteen first-display components, core, and twenty integrations"
     );
     assert_eq!(manifest.artifacts[0].id, "bootstrap");
     assert_eq!(manifest.artifacts[0].role, "bootstrap");
     assert_eq!(manifest.artifacts[1].id, "first_display");
     assert_eq!(manifest.artifacts[1].role, "first_display_base");
-    assert_eq!(manifest.artifacts[14].id, "core");
-    assert_eq!(manifest.artifacts[14].role, "core");
+    assert_eq!(manifest.artifacts[15].id, "core");
+    assert_eq!(manifest.artifacts[15].role, "core");
 
     let mut canonical = Vec::new();
     canonical.extend_from_slice(RELEASE_PREFIX);
@@ -317,12 +323,12 @@ fn read_and_validate_release(dist_dir: &Path) -> ReleaseManifest {
                 assert!(artifact.phase.is_none() && artifact.trigger.is_none());
             }
             "first_display_base" | "first_display_slice" => {
-                assert!((1..=13).contains(&index));
+                assert!((1..=14).contains(&index));
                 assert_eq!(artifact.phase.as_deref(), Some("first_display"));
                 assert!(artifact.trigger.is_none());
             }
             "integration" => {
-                assert!(index >= 15);
+                assert!(index >= 16);
                 if integration_index < 14 {
                     assert_eq!(artifact.phase.as_deref(), Some("takeover"));
                     assert!(artifact.trigger.is_none());

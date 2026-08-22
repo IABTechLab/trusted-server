@@ -7,4 +7,4 @@ export const SOURCEPOINT_INITIAL_SLICE = defineInitialSlice(
   installSourcepointInitial
 );
 
-registerInitialSlice(SOURCEPOINT_INITIAL_SLICE, 11);
+registerInitialSlice(SOURCEPOINT_INITIAL_SLICE, 12);

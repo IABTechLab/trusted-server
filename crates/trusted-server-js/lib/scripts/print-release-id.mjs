@@ -7,7 +7,7 @@ import { computeReleaseId, RELEASE_SENTINEL } from './release-v1.mjs';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const distDirectory = path.resolve(directory, '..', '..', 'dist');
-const FIRST_DISPLAY_ARTIFACT_COUNT = 13;
+const FIRST_DISPLAY_ARTIFACT_COUNT = 14;
 const CORE_ARTIFACT_INDEX = 1 + FIRST_DISPLAY_ARTIFACT_COUNT;
 const INTEGRATION_ARTIFACT_COUNT = 20;
 const RELEASE_ARTIFACT_COUNT = CORE_ARTIFACT_INDEX + 1 + INTEGRATION_ARTIFACT_COUNT;

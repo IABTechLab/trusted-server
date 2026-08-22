@@ -354,7 +354,7 @@ pub(crate) mod coordinated_cutover_v1 {
         value.len() == 12 && value.bytes().all(is_base64url_byte)
     }
 
-    fn valid_renderer_reservation_id(value: &str) -> bool {
+    pub(crate) fn valid_renderer_reservation_id(value: &str) -> bool {
         value
             .strip_prefix("r1_")
             .is_some_and(|token| token.len() == 22 && token.bytes().all(is_base64url_byte))

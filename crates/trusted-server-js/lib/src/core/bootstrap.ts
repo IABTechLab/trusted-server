@@ -411,14 +411,14 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
   };
   const disposeAgent = (): void => {
     removePrivate('_registerFirstDisplay');
-    for (let index = disposers.length - 1; index >= 0; index -= 1) {
+    while (disposers.length > 0) {
+      const dispose = disposers.pop();
       try {
-        disposers[index]?.();
+        dispose?.();
       } catch {
         // Continue releasing every independently owned provisional effect.
       }
     }
-    disposers.length = 0;
     registrations.length = 0;
     agent = undefined;
   };
@@ -574,6 +574,9 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
         register,
       });
     }
+    if (id === 'render_owner_initial') {
+      return Object.freeze({ observe, register });
+    }
     if (id === 'aps_initial') {
       return Object.freeze({ observe, publisherOrigin: location.origin, register });
     }
@@ -589,7 +592,12 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
   };
   const binding = (id: string): unknown => {
     const product = id.endsWith('_initial') ? id.slice(0, -'_initial'.length) : '';
-    let config: unknown = id === 'creative_initial' ? boot.creative : undefined;
+    let config: unknown =
+      id === 'creative_initial'
+        ? boot.creative
+        : id === 'render_owner_initial'
+          ? Object.freeze({})
+          : undefined;
     if (config === undefined && product !== '') {
       for (const entry of boot.integrations.entries) {
         if (entry.id === product) {
@@ -654,6 +662,7 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
       ) {
         return fail();
       }
+      if (terminal || !current) return false;
       const fields = candidate as Readonly<{
         abi: unknown;
         id: unknown;
@@ -679,6 +688,7 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
       let sliceHost: unknown;
       for (const component of registrations) {
         const value = component.prepare(component.id === 'first_display' ? host : sliceHost);
+        if (terminal || !current) return false;
         if (typeof value !== 'object' || value === null || !Object.isFrozen(value)) {
           return fail();
         }
@@ -693,23 +703,38 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
         prepared.push(activate as (context: FirstDisplaySliceActivationContext) => void);
       }
       let afterActivate: (() => void) | undefined;
-      for (let index = 0; index < prepared.length; index += 1) {
-        prepared[index]!(
-          Object.freeze({
-            own: (dispose: () => void) => {
-              if (typeof dispose !== 'function') throw new TypeError('tsjs');
-              disposers.push(dispose);
-            },
-            afterActivate: (callback: () => void) => {
-              if (index !== 0 || afterActivate || typeof callback !== 'function') {
-                throw new TypeError('tsjs');
-              }
-              afterActivate = callback;
-            },
-          })
-        );
+      let ownershipOpen = true;
+      try {
+        for (let index = 0; index < prepared.length; index += 1) {
+          prepared[index]!(
+            Object.freeze({
+              own: (dispose: () => void) => {
+                if (!ownershipOpen || terminal || typeof dispose !== 'function') {
+                  throw new TypeError('tsjs');
+                }
+                disposers.push(dispose);
+              },
+              afterActivate: (callback: () => void) => {
+                if (
+                  !ownershipOpen ||
+                  terminal ||
+                  index !== 0 ||
+                  afterActivate ||
+                  typeof callback !== 'function'
+                ) {
+                  throw new TypeError('tsjs');
+                }
+                afterActivate = callback;
+              },
+            })
+          );
+          if (terminal || !current) return false;
+        }
+      } finally {
+        ownershipOpen = false;
       }
       afterActivate?.();
+      if (terminal || !current) return false;
       return Boolean(agent && !terminal);
     } catch {
       return fail();

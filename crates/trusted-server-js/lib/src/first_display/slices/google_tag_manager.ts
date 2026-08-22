@@ -7,4 +7,4 @@ export const GOOGLE_TAG_MANAGER_INITIAL_SLICE = defineInitialSlice(
   installGoogleTagManagerInitial
 );
 
-registerInitialSlice(GOOGLE_TAG_MANAGER_INITIAL_SLICE, 6);
+registerInitialSlice(GOOGLE_TAG_MANAGER_INITIAL_SLICE, 7);

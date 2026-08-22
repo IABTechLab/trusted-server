@@ -374,6 +374,12 @@ describe('Universal Creative bridge dispatcher', () => {
     expect(PUC_DYNAMIC_OWNER).not.toContain('rendererUrl');
     expect(PUC_DYNAMIC_OWNER).not.toContain('aaxResponse');
     expect(PUC_DYNAMIC_OWNER).toContain('TS APS Top Mount Started');
+    expect(PUC_DYNAMIC_OWNER).not.toMatch(
+      /\b(?:fetch|XMLHttpRequest|WebSocket|EventSource|Worker|SharedWorker|Blob)\b/
+    );
+    expect(PUC_DYNAMIC_OWNER).not.toContain('import(');
+    expect(PUC_DYNAMIC_OWNER).not.toContain('createObjectURL');
+    expect(PUC_DYNAMIC_OWNER).not.toMatch(/createElement\(["'](?:script|link)["']\)/);
   });
 
   it('binds ADM load and final acceptance to the exact inserted navigation', () => {
@@ -742,6 +748,92 @@ describe('Universal Creative bridge dispatcher', () => {
     } finally {
       delete dynamicWindow.render;
       document.body.innerHTML = '';
+    }
+  });
+
+  it('contains synchronous helper registration and control-port settlement reentrancy', async () => {
+    const dynamicWindow = window as unknown as {
+      render?: (
+        data: Readonly<Record<string, unknown>>,
+        helper: Readonly<Record<string, unknown>>,
+        ownerWindow: Window
+      ) => Promise<void>;
+    };
+    window.eval(PUC_DYNAMIC_OWNER);
+    const stopListening = vi.fn();
+    let controlListener: ((event: unknown) => void) | undefined;
+    const controlPort = {
+      close: vi.fn(),
+      postMessage: vi.fn(),
+      set onmessage(listener: ((event: unknown) => void) | null) {
+        controlListener = listener ?? undefined;
+      },
+      set onmessageerror(_listener: ((event: unknown) => void) | null) {},
+      start: vi.fn(() => {
+        controlListener?.({
+          data: {
+            message: 'TS APS Top Mount Started',
+            version: 1,
+            lifecycleTicket: LIFECYCLE_TICKET,
+          },
+          ports: [],
+        });
+        controlListener?.({
+          data: {
+            message: 'TS Owner Settled',
+            version: 1,
+            lifecycleTicket: LIFECYCLE_TICKET,
+            outcome: 'accepted',
+          },
+          ports: [],
+        });
+      }),
+    };
+    const sendMessage = vi.fn(
+      (
+        _type: string,
+        _payload: Readonly<Record<string, unknown>>,
+        callback: (event: unknown) => void
+      ) => {
+        callback({
+          data: JSON.stringify({
+            message: 'TS Render Owner Registered',
+            adId: RESERVATION_ID,
+            version: 1,
+            lifecycleTicket: LIFECYCLE_TICKET,
+          }),
+          ports: [controlPort],
+        });
+        return stopListening;
+      }
+    );
+
+    try {
+      const rendered = dynamicWindow.render!(
+        window.JSON.parse(
+          JSON.stringify({
+            adId: RESERVATION_ID,
+            message: 'Prebid Response',
+            renderer: PUC_DYNAMIC_OWNER,
+            rendererVersion: '4',
+            tsOwner: {
+              version: 1,
+              status: 'ready',
+              kind: 'aps',
+              lifecycleTicket: LIFECYCLE_TICKET,
+            },
+          })
+        ) as Readonly<Record<string, unknown>>,
+        { sendMessage },
+        window
+      );
+
+      await expect(rendered).resolves.toBeUndefined();
+      expect(controlPort.start).toHaveBeenCalledOnce();
+      expect(controlPort.close).toHaveBeenCalledOnce();
+      expect(stopListening).toHaveBeenCalledOnce();
+    } finally {
+      delete dynamicWindow.render;
     }
   });
 
@@ -1576,6 +1668,14 @@ describe('Universal Creative bridge dispatcher', () => {
 
     expect(order).toEqual([`lookup:${RESERVATION_ID}`, 'stop']);
     expect(port.postMessage).toHaveBeenCalledOnce();
+    expect(String(port.postMessage.mock.calls[0]?.[0])).toBe(
+      JSON.stringify({
+        message: 'Prebid Response',
+        adId: RESERVATION_ID,
+        rendererVersion: '4',
+        tsOwner: { version: 1, status: 'refused' },
+      })
+    );
     expect(JSON.parse(String(port.postMessage.mock.calls[0]?.[0]))).toEqual({
       message: 'Prebid Response',
       adId: RESERVATION_ID,
@@ -1858,7 +1958,8 @@ describe('Universal Creative bridge dispatcher', () => {
     expect(gam.attempt.admitClaimedWinner).toHaveBeenCalledOnce();
     expect(gam.attempt.ownerClaimed).toHaveBeenCalledOnce();
     expect(port.postMessage).toHaveBeenCalledOnce();
-    const response = JSON.parse(String(port.postMessage.mock.calls[0]?.[0]));
+    const rawResponse = String(port.postMessage.mock.calls[0]?.[0]);
+    const response = JSON.parse(rawResponse);
     expect(
       new TextEncoder().encode(String(port.postMessage.mock.calls[0]?.[0])).byteLength
     ).toBeLessThanOrEqual(72 * 1_024);
@@ -1874,6 +1975,20 @@ describe('Universal Creative bridge dispatcher', () => {
         lifecycleTicket: LIFECYCLE_TICKET,
       },
     });
+    expect(rawResponse).toBe(
+      JSON.stringify({
+        message: 'Prebid Response',
+        adId: RESERVATION_ID,
+        renderer: PUC_DYNAMIC_OWNER,
+        rendererVersion: '4',
+        tsOwner: {
+          version: 1,
+          status: 'ready',
+          kind: 'aps',
+          lifecycleTicket: LIFECYCLE_TICKET,
+        },
+      })
+    );
     expect(response).not.toHaveProperty('source');
     expect(response).not.toHaveProperty('renderSource');
     expect(response).not.toHaveProperty('winnerContext');

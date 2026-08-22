@@ -11,10 +11,12 @@ import { LOCKR_INITIAL_SLICE } from './slices/lockr';
 import { OSANO_INITIAL_SLICE } from './slices/osano';
 import { PERMUTIVE_INITIAL_SLICE } from './slices/permutive';
 import { PREBID_INITIAL_SLICE } from './slices/prebid';
+import { RENDER_OWNER_INITIAL_SLICE } from './slices/render_owner';
 import { SOURCEPOINT_INITIAL_SLICE } from './slices/sourcepoint';
 import { TESTLIGHT_INITIAL_SLICE } from './slices/testlight';
 
 export const INITIAL_SLICE_DEFINITIONS: readonly InitialSliceDefinition[] = Object.freeze([
+  RENDER_OWNER_INITIAL_SLICE,
   APS_INITIAL_SLICE,
   CREATIVE_INITIAL_SLICE,
   DATADOME_INITIAL_SLICE,
@@ -38,6 +40,11 @@ export function selectInitialSliceDefinitions(
   }
   const requested = new Set(selected.slice(1));
   if (requested.size !== selected.length - 1) return undefined;
+  if (
+    (requested.has('aps_initial') && !requested.has('render_owner_initial')) ||
+    (requested.has('render_owner_initial') && !requested.has('gpt_initial'))
+  )
+    return undefined;
   const definitions = INITIAL_SLICE_DEFINITIONS.filter(({ id }) => requested.has(id));
   if (definitions.length !== requested.size) return undefined;
   const canonical = ['first_display', ...definitions.map(({ id }) => id)];

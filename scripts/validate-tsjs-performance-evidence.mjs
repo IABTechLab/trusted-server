@@ -100,7 +100,7 @@ function validateReferenceTransfer(
   expectedSha,
   expectedModel,
   path,
-  firstDisplayMask = "0045",
+  firstDisplayMask = "008b",
 ) {
   exactKeys(
     value,
@@ -707,14 +707,14 @@ export function validateEvidence(evidence, expected) {
     expected.baseSha,
     apsFirstAction.baseline.artifactModel,
     "aps.transfer.baselineReferenceTransfer",
-    "0047",
+    "008f",
   );
   const apsCandidateTransfer = validateReferenceTransfer(
     evidence.aps.transfer.candidateReferenceTransfer,
     expected.headSha,
     apsFirstAction.candidate.artifactModel,
     "aps.transfer.candidateReferenceTransfer",
-    "0047",
+    "008f",
   );
   if (
     apsFirstAction.baseline.selectedTransferBytes !==
@@ -964,7 +964,7 @@ function validFixture() {
               sha256: "4".repeat(64),
             },
             {
-              semanticEndpoint: `external:/static/tsjs=tsjs-first-display.min.js?m=0045&v=${"5".repeat(64)}`,
+              semanticEndpoint: `external:/static/tsjs=tsjs-first-display.min.js?m=008b&v=${"5".repeat(64)}`,
               delivery: "external",
               rawBytes: 79_000,
               gzipBytes: 19_000,
@@ -1097,7 +1097,7 @@ function validFixture() {
                 sha256: "9".repeat(64),
               },
               {
-                semanticEndpoint: `external:/static/tsjs=tsjs-first-display.min.js?m=0047&v=${"a".repeat(64)}`,
+                semanticEndpoint: `external:/static/tsjs=tsjs-first-display.min.js?m=008f&v=${"a".repeat(64)}`,
                 delivery: "external",
                 rawBytes: 79_500,
                 gzipBytes: 19_500,
@@ -1162,7 +1162,7 @@ function runSelfTest() {
     )[0];
   releaseBaselineFixture.transfer.baselineReferenceTransfer.sources[0].semanticEndpoint =
     "inline:boot-controller";
-  releaseBaselineFixture.transfer.baselineReferenceTransfer.sources[1].semanticEndpoint = `external:/static/tsjs=tsjs-first-display.min.js?m=0045&v=${"3".repeat(64)}`;
+  releaseBaselineFixture.transfer.baselineReferenceTransfer.sources[1].semanticEndpoint = `external:/static/tsjs=tsjs-first-display.min.js?m=008b&v=${"3".repeat(64)}`;
   for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
     releaseBaselineFixture.transfer.baselineReferenceTransfer[metric] -=
       removedLegacyInit[metric];
@@ -1247,7 +1247,7 @@ function runSelfTest() {
     [
       "mismatched first-display mask",
       (value) => {
-        value.transfer.candidateReferenceTransfer.sources[1].semanticEndpoint = `external:/static/tsjs=tsjs-first-display.min.js?m=0047&v=${"5".repeat(64)}`;
+        value.transfer.candidateReferenceTransfer.sources[1].semanticEndpoint = `external:/static/tsjs=tsjs-first-display.min.js?m=008f&v=${"5".repeat(64)}`;
       },
     ],
     [
@@ -1535,7 +1535,7 @@ function runSelfTest() {
   );
   assert.match(
     performanceTest,
-    /performanceCase === "aps" \? "0047" : "0045"/u,
+    /performanceCase === "aps" \? "008f" : "008b"/u,
     "the release-v1 semantic transfer must measure the exact admitted GPT and APS agents",
   );
   assert.match(
