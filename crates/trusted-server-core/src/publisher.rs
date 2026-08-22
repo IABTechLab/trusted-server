@@ -50,6 +50,9 @@ use crate::auction::telemetry::{
 use crate::auction::types::{
     AuctionContext, AuctionRequest, Bid, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
 };
+use crate::cache_policy::{
+    CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
+};
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
@@ -292,6 +295,7 @@ fn accept_encoding_qvalue(header_value: &str, target: &str) -> Option<f32> {
 pub fn handle_tsjs_dynamic(
     req: &Request<EdgeBody>,
     integration_registry: &IntegrationRegistry,
+    edge_header: EdgeCacheHeader,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     const PREFIX: &str = "/static/tsjs=";
     const UNIFIED_FILENAMES: &[&str] = &["tsjs-unified.js", "tsjs-unified.min.js"];
@@ -303,13 +307,11 @@ pub fn handle_tsjs_dynamic(
     let filename = &path[PREFIX.len()..];
 
     if UNIFIED_FILENAMES.contains(&filename) {
-        // Serve core + immediate modules (excludes deferred like prebid)
+        // Serve core + immediate modules (excludes deferred like prebid).
         let module_ids = integration_registry.js_module_ids_immediate();
         let body = trusted_server_js::concatenate_modules(&module_ids);
-        let mut resp = serve_static_with_etag(&body, req, "application/javascript; charset=utf-8");
-        resp.headers_mut()
-            .insert(HEADER_X_COMPRESS_HINT, HeaderValue::from_static("on"));
-        return Ok(resp);
+        let hash = trusted_server_js::concatenated_hash(&module_ids);
+        return Ok(serve_tsjs_static(req, &body, &hash, edge_header));
     }
 
     if let Some(module_id) = parse_single_module_filename(filename) {
@@ -323,16 +325,44 @@ pub fn handle_tsjs_dynamic(
         if !deferred_ids.contains(&module_id) && !diagnostics_standalone {
             return Ok(not_found_response());
         }
-        if let Some(content) = trusted_server_js::module_bundle(module_id) {
-            let mut resp =
-                serve_static_with_etag(content, req, "application/javascript; charset=utf-8");
-            resp.headers_mut()
-                .insert(HEADER_X_COMPRESS_HINT, HeaderValue::from_static("on"));
-            return Ok(resp);
+        if let (Some(content), Some(hash)) = (
+            trusted_server_js::module_bundle(module_id),
+            trusted_server_js::single_module_hash(module_id),
+        ) {
+            return Ok(serve_tsjs_static(req, content, hash, edge_header));
         }
     }
 
     Ok(not_found_response())
+}
+
+fn serve_tsjs_static(
+    req: &Request<EdgeBody>,
+    body: &str,
+    expected_hash: &str,
+    edge_header: EdgeCacheHeader,
+) -> Response<EdgeBody> {
+    let mut response = serve_static_with_etag(
+        body,
+        req,
+        "application/javascript; charset=utf-8",
+        edge_header,
+    );
+    if request_version_hash(req).is_some_and(|hash| hash == expected_hash) {
+        CachePolicy::public_immutable(Duration::from_secs(31_536_000))
+            .apply_to_headers(response.headers_mut(), edge_header);
+    }
+    response
+        .headers_mut()
+        .insert(HEADER_X_COMPRESS_HINT, HeaderValue::from_static("on"));
+    response
+}
+
+fn request_version_hash(req: &Request<EdgeBody>) -> Option<&str> {
+    req.uri().query()?.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == "v").then_some(value)
+    })
 }
 
 /// Extract a module ID from a deferred-module filename like `tsjs-sourcepoint.min.js`.
@@ -1069,6 +1099,41 @@ pub(crate) fn classify_response_route(
     }
 
     ResponseRoute::Stream
+}
+
+fn response_cache_control_is_private_or_no_store(response: &Response<EdgeBody>) -> bool {
+    cache_control_headers_are_private_or_no_store(response.headers())
+}
+
+fn apply_publisher_asset_cache_policy(
+    settings: &Settings,
+    path: &str,
+    method: &Method,
+    edge_header: EdgeCacheHeader,
+    response: &mut Response<EdgeBody>,
+) -> Result<(), Report<TrustedServerError>> {
+    let is_cacheable_method = *method == Method::GET || *method == Method::HEAD;
+    if !is_cacheable_method
+        || response_cache_control_is_private_or_no_store(response)
+        || response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(is_html_content_type)
+    {
+        return Ok(());
+    }
+
+    let status = response.status();
+    if !(status.is_success() || status == StatusCode::NOT_MODIFIED) {
+        return Ok(());
+    }
+
+    if let Some(policy) = settings.asset_cache_policy_for_path(path)? {
+        policy.apply_to_headers(response.headers_mut(), edge_header);
+    }
+
+    Ok(())
 }
 
 /// Owned version of [`ProcessResponseParams`] for returning from
@@ -2710,6 +2775,7 @@ pub async fn handle_publisher_request(
     ec_context: &mut EcContext,
     auction: AuctionDispatch<'_>,
     mut req: Request<EdgeBody>,
+    edge_header: EdgeCacheHeader,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
 
@@ -3117,11 +3183,25 @@ pub async fn handle_publisher_request(
     let origin_content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or_default();
-    if should_run_ad_stack && is_html_content_type(origin_content_type) {
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if should_run_ad_stack && is_html_content_type(&origin_content_type) {
         enforce_synthesized_html_cache_privacy(&mut response);
     }
+    apply_datadome_client_tag_cache_privacy(
+        &mut response,
+        &request_method,
+        suppress_datadome_client_side_tag,
+        &origin_content_type,
+    );
+    apply_publisher_asset_cache_policy(
+        settings,
+        &request_path,
+        &request_method,
+        edge_header,
+        &mut response,
+    )?;
 
     let content_type = response
         .headers()
@@ -3212,12 +3292,6 @@ pub async fn handle_publisher_request(
                 content_encoding
             );
 
-            apply_datadome_client_tag_cache_privacy(
-                &mut response,
-                &request_method,
-                suppress_datadome_client_side_tag,
-                &content_type,
-            );
             let body = std::mem::replace(response.body_mut(), EdgeBody::empty());
             response.headers_mut().remove(header::CONTENT_LENGTH);
 
@@ -4311,7 +4385,7 @@ mod tests {
         build_services_with_secret_http_client_and_client_ip, noop_services,
         noop_services_with_telemetry_sink,
     };
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use edgezero_core::body::Body as EdgeBody;
     use http::{Method, Request as HttpRequest, StatusCode, header};
     use std::sync::Arc;
@@ -5349,9 +5423,192 @@ mod tests {
                 registry: None,
             },
             req,
+            EdgeCacheHeader::SurrogateControl,
         )
         .await
         .expect("should proxy publisher request")
+    }
+
+    #[tokio::test]
+    async fn publisher_asset_cache_policy_applies_to_non_html_response() {
+        let settings = Settings::from_toml(&format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "publisher-fingerprinted-assets"
+            enabled = true
+            path_globs = ["/assets/**/*.png"]
+            fingerprint_style = "hex"
+            visibility = "public"
+            browser_ttl_seconds = 31536000
+            edge_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        ))
+        .expect("should parse settings with cache rule");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"png".to_vec(),
+            vec![
+                (header::CONTENT_TYPE.as_str(), "image/png"),
+                (header::CACHE_CONTROL.as_str(), "public, max-age=60"),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/assets/logo.0123abcd.png")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = run_publisher_proxy(&settings, &services, request).await;
+        let PublisherResponse::PassThrough { response, .. } = response else {
+            panic!("should pass through non-HTML asset response");
+        };
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("public, max-age=31536000, immutable"),
+            "matched publisher asset should receive immutable browser policy"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("surrogate-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("max-age=31536000"),
+            "matched publisher asset should receive Fastly edge policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn publisher_asset_policy_response_with_cookie_is_private_after_finalization() {
+        let settings = Settings::from_toml(&format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "publisher-fingerprinted-assets"
+            enabled = true
+            path_globs = ["/assets/**/*.png"]
+            fingerprint_style = "hex"
+            visibility = "public"
+            browser_ttl_seconds = 31536000
+            edge_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        ))
+        .expect("should parse settings with cache rule");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"png".to_vec(),
+            vec![
+                (header::CONTENT_TYPE.as_str(), "image/png"),
+                (header::CACHE_CONTROL.as_str(), "public, max-age=60"),
+                (header::SET_COOKIE.as_str(), "viewer=example; Path=/"),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/assets/logo.0123abcd.png")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = run_publisher_proxy(&settings, &services, request).await;
+        let PublisherResponse::PassThrough { mut response, .. } = response else {
+            panic!("should pass through non-HTML asset response");
+        };
+        crate::response_privacy::apply_response_headers_with_cache_privacy(
+            &settings,
+            &mut response,
+        );
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, max-age=0"),
+            "publisher asset with Set-Cookie must become private after finalization"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "publisher asset with Set-Cookie must not retain a shared-cache header"
+        );
+    }
+
+    #[tokio::test]
+    async fn publisher_asset_cache_policy_skips_html_response() {
+        let settings = Settings::from_toml(&format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "broad-publisher-path"
+            enabled = true
+            path_glob = "/news/*.html"
+            visibility = "public"
+            browser_ttl_seconds = 31536000
+            edge_ttl_seconds = 31536000
+            immutable = true
+            fingerprint_style = "hex"
+        "#,
+            crate_test_settings_str()
+        ))
+        .expect("should parse settings with cache rule");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"<html><body>news</body></html>".to_vec(),
+            vec![
+                (header::CONTENT_TYPE.as_str(), "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL.as_str(), "public, max-age=60"),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/news/story.0123abcd.html")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = run_publisher_proxy(&settings, &services, request).await;
+        let response = match response {
+            PublisherResponse::Stream { response, .. } | PublisherResponse::Buffered(response) => {
+                response
+            }
+            PublisherResponse::PassThrough { .. } => {
+                panic!("should classify HTML response for processing")
+            }
+        };
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("public, max-age=60"),
+            "asset policy must not cache publisher HTML"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "HTML response must not receive a shared-cache header"
+        );
     }
 
     mod ssat_cache_policy_tests {
@@ -5617,6 +5874,7 @@ mod tests {
                     registry: None,
                 },
                 req,
+                EdgeCacheHeader::SMaxageFallback,
             )
             .await
             .expect("should proxy publisher request")
@@ -5678,7 +5936,7 @@ mod tests {
                     .headers
                     .get(header::CACHE_CONTROL)
                     .and_then(|value| value.to_str().ok()),
-                Some("private, no-store"),
+                Some("no-store, private"),
                 "eligible HTML response should be private and non-storable"
             );
             for header_name in [
@@ -6278,6 +6536,7 @@ mod tests {
                 registry: None,
             },
             req,
+            EdgeCacheHeader::SMaxageFallback,
         )
         .await
         .expect("should proxy publisher request");
@@ -6426,7 +6685,7 @@ mod tests {
                 .headers()
                 .get(header::CACHE_CONTROL)
                 .and_then(|value| value.to_str().ok()),
-            Some("private, no-store"),
+            Some("no-store, private"),
             "suppressed HTML should be private and non-storable"
         );
         assert!(
@@ -6471,7 +6730,7 @@ mod tests {
                 .headers()
                 .get(header::CACHE_CONTROL)
                 .and_then(|value| value.to_str().ok()),
-            Some("private, no-store"),
+            Some("no-store, private"),
             "suppressed HTML should use the exact synthesized-HTML policy"
         );
     }
@@ -7250,7 +7509,8 @@ mod tests {
             "https://publisher.example/static/tsjs=unknown.js",
         );
 
-        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should handle tsjs request");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -7264,7 +7524,8 @@ mod tests {
             "https://publisher.example/static/tsjs=tsjs-unified.min.js",
         );
 
-        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should handle tsjs request");
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -7286,7 +7547,8 @@ mod tests {
             HeaderValue::from_static("__Host-ts-console=1"),
         );
 
-        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should handle tsjs request");
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!response.headers().contains_key(header::SET_COOKIE));
@@ -7348,7 +7610,8 @@ mod tests {
             "https://publisher.example/static/tsjs=tsjs-prebid.min.js",
         );
 
-        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should handle tsjs request");
         assert_eq!(
             response.status(),
             StatusCode::OK,
@@ -7377,7 +7640,8 @@ mod tests {
             "https://publisher.example/static/tsjs=tsjs-prebid.min.js",
         );
 
-        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should handle tsjs request");
         assert_eq!(
             response.status(),
             StatusCode::NOT_FOUND,
@@ -7395,11 +7659,112 @@ mod tests {
             "https://publisher.example/static/tsjs=tsjs-evil.min.js",
         );
 
-        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should handle tsjs request");
         assert_eq!(
             response.status(),
             StatusCode::NOT_FOUND,
             "should reject unknown module names"
+        );
+    }
+
+    #[test]
+    fn tsjs_dynamic_uses_immutable_cache_for_matching_hash() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let module_ids = registry.js_module_ids_immediate();
+        let hash = trusted_server_js::concatenated_hash(&module_ids);
+        let request = build_request(
+            Method::GET,
+            &format!("https://publisher.example/static/tsjs=tsjs-unified.min.js?v={hash}"),
+        );
+
+        let response = handle_tsjs_dynamic(&request, &registry, EdgeCacheHeader::SurrogateControl)
+            .expect("should handle tsjs request");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("public, max-age=31536000, immutable"),
+            "matching content-versioned bundle should be immutable"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("surrogate-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("max-age=31536000"),
+            "matching content-versioned bundle should set the Fastly edge TTL"
+        );
+    }
+
+    #[test]
+    fn tsjs_dynamic_uses_cloudflare_edge_header_when_selected() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let module_ids = registry.js_module_ids_immediate();
+        let hash = trusted_server_js::concatenated_hash(&module_ids);
+        let request = build_request(
+            Method::GET,
+            &format!("https://publisher.example/static/tsjs=tsjs-unified.min.js?v={hash}"),
+        );
+
+        let response = handle_tsjs_dynamic(
+            &request,
+            &registry,
+            EdgeCacheHeader::CloudflareCdnCacheControl,
+        )
+        .expect("should handle tsjs request");
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cloudflare-cdn-cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("max-age=31536000"),
+            "Cloudflare requests should use its edge cache header"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "Cloudflare requests should not emit Fastly's edge cache header"
+        );
+    }
+
+    #[test]
+    fn tsjs_dynamic_keeps_short_cache_for_mismatched_hash() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let request = build_request(
+            Method::GET,
+            "https://publisher.example/static/tsjs=tsjs-unified.min.js?v=not-the-hash",
+        );
+
+        let response = handle_tsjs_dynamic(&request, &registry, EdgeCacheHeader::SurrogateControl)
+            .expect("should handle tsjs request");
+        let cache_control = response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .expect("should set cache-control");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            cache_control.contains("max-age=300") && !cache_control.contains("immutable"),
+            "mismatched hash should retain the short, mutable cache policy"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("surrogate-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("max-age=300, stale-while-revalidate=60, stale-if-error=86400"),
+            "mismatched hash should retain the short Fastly edge TTL"
         );
     }
 
@@ -12163,6 +12528,7 @@ mod tests {
                     registry: None,
                 },
                 req,
+                EdgeCacheHeader::SMaxageFallback,
             )
             .await
             .expect("should proxy publisher request");
@@ -12246,6 +12612,7 @@ mod tests {
                     registry: None,
                 },
                 req,
+                EdgeCacheHeader::SMaxageFallback,
             )
             .await
             .expect("should proxy publisher request");

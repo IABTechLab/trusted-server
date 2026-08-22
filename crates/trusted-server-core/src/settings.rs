@@ -1,6 +1,7 @@
 #[cfg(test)]
 use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
+use glob::{MatchOptions, Pattern};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
@@ -8,10 +9,12 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::OnceLock;
+use std::time::Duration;
 use url::Url;
 use validator::{Validate, ValidationError};
 
 use crate::auction_config_types::AuctionConfig;
+use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::error::TrustedServerError;
@@ -1866,6 +1869,504 @@ fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<Tru
     Ok(())
 }
 
+/// Cache behavior configuration.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheSettings {
+    /// Ordered static/rehosted asset rules. The first enabled matching rule wins.
+    #[serde(default)]
+    pub asset_rules: Vec<CacheAssetRule>,
+}
+
+impl CacheSettings {
+    fn normalize(&mut self) {
+        for rule in &mut self.asset_rules {
+            rule.normalize();
+        }
+    }
+
+    /// Eagerly validate runtime-only cache settings artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if any rule ID is duplicate, or if an
+    /// enabled rule has an invalid policy/matcher or cannot compile its regex/glob.
+    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        let mut seen_ids = HashSet::new();
+        for rule in &self.asset_rules {
+            if rule.id.is_empty() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: "cache.asset_rules id must not be empty".to_string(),
+                }));
+            }
+            if !seen_ids.insert(rule.id.clone()) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!("cache.asset_rules contains duplicate id `{}`", rule.id),
+                }));
+            }
+        }
+        for rule in &self.asset_rules {
+            rule.prepare_runtime()?;
+        }
+        Ok(())
+    }
+
+    /// Resolve the first enabled asset cache rule that matches `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if a lazily prepared matcher unexpectedly
+    /// fails to compile.
+    pub fn asset_policy_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<CachePolicy>, Report<TrustedServerError>> {
+        for rule in &self.asset_rules {
+            if rule.matches_path(path)? {
+                return Ok(Some(rule.cache_policy()));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// A configurable cache rule for publisher-origin or rehosted static assets.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheAssetRule {
+    /// Stable operator-facing identifier for logs/tests/config errors.
+    pub id: String,
+    /// Whether this rule participates in matching.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Built-in framework/static preset matcher.
+    #[serde(default)]
+    pub preset: Option<CacheAssetPreset>,
+    /// Raw path prefix matcher.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    /// Single glob matcher retained for concise configs.
+    #[serde(default)]
+    pub path_glob: Option<String>,
+    /// Multiple glob matchers.
+    #[serde(default)]
+    pub path_globs: Vec<String>,
+    /// Regex matcher applied to the request path.
+    #[serde(default)]
+    pub path_regex: Option<String>,
+    /// File extensions matched against the request path, case-insensitively.
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    /// Bundler fingerprint style required in the filename before matching.
+    #[serde(default)]
+    pub fingerprint_style: Option<CacheAssetFingerprintStyle>,
+    /// Browser-facing cache visibility.
+    #[serde(default)]
+    pub visibility: CachePolicyVisibility,
+    /// Browser cache TTL rendered as `max-age`.
+    #[serde(default)]
+    pub browser_ttl_seconds: Option<u64>,
+    /// Shared edge cache TTL rendered as runtime-specific edge control.
+    #[serde(default)]
+    pub edge_ttl_seconds: Option<u64>,
+    /// Optional stale-while-revalidate duration.
+    #[serde(default)]
+    pub stale_while_revalidate_seconds: Option<u64>,
+    /// Optional stale-if-error duration.
+    #[serde(default)]
+    pub stale_if_error_seconds: Option<u64>,
+    /// Whether browser caches may treat the response as immutable.
+    #[serde(default)]
+    pub immutable: bool,
+    #[serde(skip)]
+    compiled_regex: OnceLock<Result<Regex, String>>,
+    #[serde(skip)]
+    compiled_globs: OnceLock<Result<Vec<Pattern>, String>>,
+}
+
+impl CacheAssetRule {
+    fn normalize(&mut self) {
+        self.id = self.id.trim().to_string();
+        self.path_prefix = self
+            .path_prefix
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.path_glob = self
+            .path_glob
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.path_globs = self
+            .path_globs
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect();
+        self.path_regex = self
+            .path_regex
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.extensions = self
+            .extensions
+            .iter()
+            .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect();
+    }
+
+    fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        self.validate_matcher_shape()?;
+        self.compiled_regex().map(|_| ())?;
+        self.compiled_globs().map(|_| ())?;
+        self.validate_policy_shape()?;
+        Ok(())
+    }
+
+    fn validate_matcher_shape(&self) -> Result<(), Report<TrustedServerError>> {
+        if self.path_glob.is_some() && !self.path_globs.is_empty() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` must use path_glob or path_globs, not both",
+                    self.id
+                ),
+            }));
+        }
+
+        let matcher_count = usize::from(self.preset.is_some())
+            + usize::from(self.path_prefix.is_some())
+            + usize::from(self.path_glob.is_some() || !self.path_globs.is_empty())
+            + usize::from(self.path_regex.is_some())
+            + usize::from(!self.extensions.is_empty());
+
+        if matcher_count != 1 {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` must configure exactly one matcher",
+                    self.id
+                ),
+            }));
+        }
+        Ok(())
+    }
+
+    fn validate_policy_shape(&self) -> Result<(), Report<TrustedServerError>> {
+        if self.visibility == CachePolicyVisibility::Private {
+            if self.edge_ttl_seconds.is_some() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "cache.asset_rules `{}` sets edge_ttl_seconds with private visibility; private rules must use browser_ttl_seconds",
+                        self.id
+                    ),
+                }));
+            }
+            if self.browser_ttl_seconds.is_none() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "cache.asset_rules `{}` with private visibility must configure browser_ttl_seconds",
+                        self.id
+                    ),
+                }));
+            }
+        } else if self.browser_ttl_seconds.is_none() && self.edge_ttl_seconds.is_none() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` must configure browser_ttl_seconds or edge_ttl_seconds",
+                    self.id
+                ),
+            }));
+        }
+
+        if !self.immutable {
+            return Ok(());
+        }
+
+        if self
+            .browser_ttl_seconds
+            .is_none_or(|browser_ttl| browser_ttl == 0)
+        {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` sets immutable without a positive browser_ttl_seconds",
+                    self.id
+                ),
+            }));
+        }
+
+        let preset_is_content_addressed =
+            matches!(self.preset, Some(CacheAssetPreset::NextJsStatic));
+        if !preset_is_content_addressed {
+            match self.fingerprint_style {
+                None => {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "cache.asset_rules `{}` sets immutable without fingerprint_style or a content-addressed preset",
+                            self.id
+                        ),
+                    }));
+                }
+                Some(CacheAssetFingerprintStyle::ViteBase64Url) => {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "cache.asset_rules `{}` cannot set immutable with vite-base64-url; use a content-addressed preset or an unambiguous fingerprint_style",
+                            self.id
+                        ),
+                    }));
+                }
+                Some(_) => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    fn compiled_regex(&self) -> Result<Option<&Regex>, Report<TrustedServerError>> {
+        let Some(pattern) = self.path_regex.as_deref() else {
+            return Ok(None);
+        };
+        match self
+            .compiled_regex
+            .get_or_init(|| Regex::new(pattern).map_err(|err| err.to_string()))
+        {
+            Ok(regex) => Ok(Some(regex)),
+            Err(message) => Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` path_regex `{pattern}` failed to compile: {message}",
+                    self.id
+                ),
+            })),
+        }
+    }
+
+    fn compiled_globs(&self) -> Result<Option<&[Pattern]>, Report<TrustedServerError>> {
+        if self.path_glob.is_none() && self.path_globs.is_empty() {
+            return Ok(None);
+        }
+
+        match self.compiled_globs.get_or_init(|| {
+            let mut compiled = Vec::new();
+            let source_patterns = self
+                .path_glob
+                .iter()
+                .chain(self.path_globs.iter())
+                .map(String::as_str);
+            for pattern in source_patterns {
+                compile_cache_asset_glob_patterns(pattern, &mut compiled)?;
+            }
+            Ok(compiled)
+        }) {
+            Ok(patterns) => Ok(Some(patterns.as_slice())),
+            Err(message) => Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` glob matcher failed to compile: {message}",
+                    self.id
+                ),
+            })),
+        }
+    }
+
+    fn matches_path(&self, path: &str) -> Result<bool, Report<TrustedServerError>> {
+        if !self.enabled || !self.matcher_matches_path(path)? {
+            return Ok(false);
+        }
+
+        if let Some(style) = self.fingerprint_style
+            && !filename_contains_fingerprint(path, style)
+        {
+            log::debug!(
+                "cache asset rule `{}` rejects path `{path}` because the filename has no {style:?} fingerprint",
+                self.id
+            );
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    fn matcher_matches_path(&self, path: &str) -> Result<bool, Report<TrustedServerError>> {
+        if let Some(preset) = self.preset {
+            return Ok(preset.matches_path(path));
+        }
+        if let Some(prefix) = self.path_prefix.as_deref() {
+            return Ok(path.starts_with(prefix));
+        }
+        if let Some(patterns) = self.compiled_globs()? {
+            return Ok(patterns
+                .iter()
+                .any(|pattern| pattern.matches_with(path, CACHE_ASSET_GLOB_MATCH_OPTIONS)));
+        }
+        if let Some(regex) = self.compiled_regex()? {
+            return Ok(regex.is_match(path));
+        }
+        if !self.extensions.is_empty() {
+            return Ok(path_extension(path).is_some_and(|extension| {
+                self.extensions
+                    .iter()
+                    .any(|candidate| candidate == &extension)
+            }));
+        }
+        Ok(false)
+    }
+
+    fn cache_policy(&self) -> CachePolicy {
+        CachePolicy {
+            visibility: self.visibility.into(),
+            browser_ttl: self.browser_ttl_seconds.map(Duration::from_secs),
+            edge_ttl: self.edge_ttl_seconds.map(Duration::from_secs),
+            stale_while_revalidate: self.stale_while_revalidate_seconds.map(Duration::from_secs),
+            stale_if_error: self.stale_if_error_seconds.map(Duration::from_secs),
+            immutable: self.immutable,
+        }
+    }
+}
+
+const CACHE_ASSET_GLOB_MATCH_OPTIONS: MatchOptions = MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: true,
+    require_literal_leading_dot: false,
+};
+
+fn compile_cache_asset_glob_patterns(
+    pattern: &str,
+    compiled: &mut Vec<Pattern>,
+) -> Result<(), String> {
+    let mut variants = vec![pattern.to_string()];
+    let mut variant_index = 0;
+
+    while variant_index < variants.len() {
+        let variant = variants[variant_index].clone();
+        let optional_segments = variant
+            .match_indices("**/")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for segment_start in optional_segments {
+            let without_segment = format!(
+                "{}{}",
+                &variant[..segment_start],
+                &variant[segment_start + "**/".len()..]
+            );
+            if !variants.contains(&without_segment) {
+                variants.push(without_segment);
+            }
+        }
+        variant_index += 1;
+    }
+
+    for variant in variants {
+        compiled.push(Pattern::new(&variant).map_err(|err| err.to_string())?);
+    }
+
+    Ok(())
+}
+
+/// Built-in cache-rule presets that operators can enable explicitly.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CacheAssetPreset {
+    /// Next.js build output under `/_next/static/`.
+    #[serde(rename = "nextjs-static")]
+    NextJsStatic,
+}
+
+impl CacheAssetPreset {
+    fn matches_path(self, path: &str) -> bool {
+        match self {
+            Self::NextJsStatic => path.starts_with("/_next/static/"),
+        }
+    }
+}
+
+/// Cache visibility parsed from operator configuration.
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CachePolicyVisibility {
+    /// Public browser/cache visibility.
+    #[default]
+    Public,
+    /// Private browser visibility.
+    Private,
+}
+
+impl From<CachePolicyVisibility> for CacheVisibility {
+    fn from(value: CachePolicyVisibility) -> Self {
+        match value {
+            CachePolicyVisibility::Public => Self::Public,
+            CachePolicyVisibility::Private => Self::Private,
+        }
+    }
+}
+
+fn path_extension(path: &str) -> Option<String> {
+    let filename = path.rsplit('/').next()?;
+    let (_, extension) = filename.rsplit_once('.')?;
+    (!extension.is_empty()).then(|| extension.to_ascii_lowercase())
+}
+
+/// Operator-selected filename fingerprint convention for a cache rule.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CacheAssetFingerprintStyle {
+    /// A hexadecimal suffix, such as `app.0123abcd.js`.
+    Hex,
+    /// An eight-character uppercase Base32 suffix, such as `app-VRTVD5R5.js`.
+    EsbuildBase32,
+    /// An eight-character `Base64URL` suffix for non-immutable rules, such as `index-BsELY24f.js`.
+    ViteBase64Url,
+}
+
+impl CacheAssetFingerprintStyle {
+    fn matches_candidate(self, candidate: &str) -> bool {
+        match self {
+            Self::Hex => {
+                candidate.len() >= 8
+                    && candidate.chars().all(|ch| ch.is_ascii_hexdigit())
+                    && candidate.chars().any(|ch| ch.is_ascii_alphabetic())
+            }
+            Self::EsbuildBase32 => {
+                candidate.len() == 8
+                    && candidate
+                        .chars()
+                        .all(|ch| ch.is_ascii_uppercase() || matches!(ch, '2'..='7'))
+                    && candidate.chars().any(|ch| ch.is_ascii_alphabetic())
+            }
+            Self::ViteBase64Url => {
+                candidate.len() == 8
+                    && candidate
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+                    && candidate.chars().any(|ch| ch.is_ascii_uppercase())
+                    && candidate.chars().any(|ch| {
+                        ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_')
+                    })
+            }
+        }
+    }
+}
+
+fn filename_contains_fingerprint(path: &str, style: CacheAssetFingerprintStyle) -> bool {
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    let Some((stem, extension)) = filename.rsplit_once('.') else {
+        return false;
+    };
+    if stem.is_empty() || extension.is_empty() {
+        return false;
+    }
+
+    stem.char_indices()
+        .filter(|(_, ch)| matches!(ch, '.' | '-' | '_' | '~'))
+        .any(|(separator_index, separator)| {
+            let candidate_start = separator_index + separator.len_utf8();
+            let prefix = &stem[..separator_index];
+            let candidate = &stem[candidate_start..];
+            !prefix.is_empty() && style.matches_candidate(candidate)
+        })
+}
+
 /// Debug-only features. All flags default to `false` (off in production).
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -2121,6 +2622,8 @@ pub struct Settings {
     #[serde(default)]
     pub consent: ConsentConfig,
     #[serde(default)]
+    pub cache: CacheSettings,
+    #[serde(default)]
     pub proxy: Proxy,
     #[serde(default)]
     pub creative_opportunities: Option<CreativeOpportunitiesConfig>,
@@ -2203,6 +2706,7 @@ impl Settings {
         mut settings: Self,
         validation_label: &str,
     ) -> Result<Self, Report<TrustedServerError>> {
+        settings.cache.normalize();
         settings.proxy.normalize();
         settings.image_optimizer.normalize();
         settings.debug.auction_html_comment_options.normalize();
@@ -2238,6 +2742,7 @@ impl Settings {
     /// [`AuctionDebugCommentOptions::metadata_keys`] names an unsupported key.
     pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.image_optimizer.prepare_runtime()?;
+        self.cache.prepare_runtime()?;
         self.proxy.prepare_runtime()?;
         self.tinybird.prepare_runtime()?;
         self.debug
@@ -2356,6 +2861,18 @@ impl Settings {
         Ok(())
     }
 
+    /// Resolve the first matching configured asset cache policy for the request path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if matcher preparation unexpectedly fails.
+    pub fn asset_cache_policy_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<CachePolicy>, Report<TrustedServerError>> {
+        self.cache.asset_policy_for_path(path)
+    }
+
     /// Resolve the longest matching asset route for the request path.
     #[must_use]
     pub fn asset_route_for_path(&self, path: &str) -> Option<&ProxyAssetRoute> {
@@ -2380,15 +2897,62 @@ impl Settings {
         Ok(None)
     }
 
+    /// Returns whether `path` is within the reserved Trusted Server admin
+    /// namespace.
+    #[must_use]
+    pub(crate) fn is_admin_path(path: &str) -> bool {
+        path == "/_ts/admin" || path.starts_with("/_ts/admin/")
+    }
+
     /// Known admin endpoint paths that must be covered by a handler.
     ///
     /// [`from_toml`](Self::from_toml) rejects configurations
     /// where any of these paths lack a matching handler, ensuring admin
     /// endpoints are always protected by authentication.
     /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
-    /// admin routes to `crates/trusted-server-adapter-fastly/src/main.rs`.
-    pub(crate) const ADMIN_ENDPOINTS: &[&str] =
-        &["/_ts/admin/keys/rotate", "/_ts/admin/keys/deactivate"];
+    /// admin routes to `crates/trusted-server-adapter-fastly/src/app.rs`.
+    ///
+    /// The `/_ts/admin/ec/{id}` entry is the canonical router pattern. Its
+    /// coverage is checked via [`admin_auth_probes`](Self::admin_auth_probes),
+    /// while validation errors continue to report this operator-facing route
+    /// template.
+    pub(crate) const ADMIN_ENDPOINTS: &[&str] = &[
+        "/_ts/admin/keys/rotate",
+        "/_ts/admin/keys/deactivate",
+        "/_ts/admin/ec",
+        "/_ts/admin/ec/{id}",
+        "/_ts/admin/eids",
+    ];
+
+    /// Probes that establish handler coverage for the dynamic
+    /// `/_ts/admin/ec/{id}` route.
+    ///
+    /// Coverage cannot be sampled: the router accepts any single segment after
+    /// `/_ts/admin/ec/` and basic auth runs on the raw path before routing, so
+    /// a handler that matches only some ID shapes leaves the rest of the route
+    /// surface — including malformed IDs, which still reach the admin handler —
+    /// unauthenticated at configuration time and fail-closed at runtime.
+    ///
+    /// Both probes must match the same configuration for the route to count as
+    /// covered. The bare prefix rejects handlers anchored to specific ID
+    /// shapes; the concrete ID rejects handlers anchored to the prefix itself
+    /// (`^/_ts/admin/ec/$`). Together they admit only prefix-level matchers
+    /// such as `^/_ts/admin` or `^/_ts/admin/ec/`.
+    const ADMIN_EC_ID_AUTH_PROBES: [&str; 2] = [
+        "/_ts/admin/ec/",
+        concat!(
+            "/_ts/admin/ec/",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ".Ab12Z9",
+        ),
+    ];
+
+    fn admin_auth_probes(path: &'static str) -> [&'static str; 2] {
+        match path {
+            "/_ts/admin/ec/{id}" => Self::ADMIN_EC_ID_AUTH_PROBES,
+            path => [path, path],
+        }
+    }
 
     /// Returns admin endpoint paths that no configured handler covers.
     ///
@@ -2404,12 +2968,16 @@ impl Settings {
     ) -> Result<Vec<&'static str>, Report<TrustedServerError>> {
         let mut uncovered = Vec::new();
         for &path in Self::ADMIN_ENDPOINTS {
-            let mut covered = false;
-            for h in &self.handlers {
-                if h.matches_path(path)? {
-                    covered = true;
-                    break;
+            let mut covered = true;
+            for probe in Self::admin_auth_probes(path) {
+                let mut probe_covered = false;
+                for handler in &self.handlers {
+                    if handler.matches_path(probe)? {
+                        probe_covered = true;
+                        break;
+                    }
                 }
+                covered &= probe_covered;
             }
             if !covered {
                 uncovered.push(path);
@@ -2439,18 +3007,19 @@ impl Settings {
         }))
     }
 
+    /// Rejects placeholder and well-known weak handler passwords.
+    ///
+    /// Applies to every handler rather than to handlers inferred to cover an
+    /// admin endpoint: handler selection is first-match-wins over operator
+    /// regexes, so a narrow handler can shadow the admin namespace for paths no
+    /// probe enumerates. Handlers are Trusted Server's own basic-auth gates, so
+    /// a placeholder password is never valid on any of them.
     fn validate_admin_handler_passwords(&self) -> Result<(), Report<TrustedServerError>> {
         for handler in &self.handlers {
-            let covers_admin = Self::ADMIN_ENDPOINTS
-                .iter()
-                .try_fold(false, |covered, path| {
-                    handler.matches_path(path).map(|matches| covered || matches)
-                })?;
-
-            if covers_admin && is_admin_placeholder_password(handler.password.expose()) {
+            if is_admin_placeholder_password(handler.password.expose()) {
                 return Err(Report::new(TrustedServerError::Configuration {
                     message: format!(
-                        "Admin handler `{}` uses a placeholder password; configure a strong secret",
+                        "Handler `{}` uses a placeholder password; configure a strong secret",
                         handler.path
                     ),
                 }));
@@ -3082,6 +3651,445 @@ mod tests {
         assert!(
             settings.tester_cookie.enabled,
             "tester-cookie config should enable the route"
+        );
+    }
+
+    #[test]
+    fn cache_asset_rule_nextjs_preset_is_operator_controlled() {
+        let toml_str = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "nextjs-static"
+            enabled = true
+            preset = "nextjs-static"
+            visibility = "public"
+            browser_ttl_seconds = 31536000
+            edge_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse cache asset rule");
+
+        let policy = settings
+            .asset_cache_policy_for_path("/_next/static/chunks/app.js")
+            .expect("should evaluate cache rules")
+            .expect("should match enabled Next.js preset");
+        assert_eq!(
+            policy,
+            CachePolicy::public_immutable(Duration::from_secs(31_536_000)),
+            "enabled preset should produce immutable static policy"
+        );
+
+        let disabled_toml = toml_str.replace("enabled = true", "enabled = false");
+        let disabled_settings =
+            Settings::from_toml(&disabled_toml).expect("should parse disabled cache asset rule");
+        assert!(
+            disabled_settings
+                .asset_cache_policy_for_path("/_next/static/chunks/app.js")
+                .expect("should evaluate disabled cache rules")
+                .is_none(),
+            "disabled preset must not mark framework paths immutable"
+        );
+    }
+
+    #[test]
+    fn cache_asset_rule_requires_selected_fingerprint_style() {
+        let expected_policy = CachePolicy::public_immutable(Duration::from_secs(31_536_000));
+        for (style, matching_path, non_matching_path) in [
+            ("hex", "/assets/app.0123abcd.js", "/assets/app-VRTVD5R5.js"),
+            (
+                "esbuild-base32",
+                "/assets/app-VRTVD5R5.js",
+                "/assets/index-BsELY24f.js",
+            ),
+        ] {
+            let toml_str = format!(
+                r#"{}
+
+                [[cache.asset_rules]]
+                id = "publisher-assets"
+                enabled = true
+                path_globs = ["/assets/**/*.js"]
+                fingerprint_style = "{style}"
+                visibility = "public"
+                browser_ttl_seconds = 31536000
+                edge_ttl_seconds = 31536000
+                immutable = true
+            "#,
+                crate_test_settings_str()
+            );
+            let settings = Settings::from_toml(&toml_str).expect("should parse cache asset rule");
+
+            assert_eq!(
+                settings
+                    .asset_cache_policy_for_path(matching_path)
+                    .expect("should evaluate cache rules"),
+                Some(expected_policy),
+                "{style} should match its configured fingerprint convention"
+            );
+            assert!(
+                settings
+                    .asset_cache_policy_for_path(non_matching_path)
+                    .expect("should evaluate cache rules")
+                    .is_none(),
+                "{style} should not fall through to another fingerprint convention"
+            );
+        }
+    }
+
+    #[test]
+    fn immutable_vite_style_cannot_cache_human_named_assets() {
+        let rule = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "vite-assets"
+            enabled = true
+            path_globs = ["/assets/**/*.js", "/assets/**/*.jpg", "/assets/**/*.png", "/assets/**/*.svg"]
+            fingerprint_style = "vite-base64-url"
+            visibility = "public"
+            browser_ttl_seconds = 31536000
+            edge_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+
+        for path in [
+            "/assets/hero-Portrait.jpg",
+            "/assets/logo-DarkMode.svg",
+            "/assets/banner-Summer24.png",
+        ] {
+            let error = Settings::from_toml(&rule)
+                .expect_err("should reject immutable Vite-style cache rule");
+            assert!(
+                format!("{error:?}").contains("cannot set immutable with vite-base64-url"),
+                "{path} must not receive an immutable policy through a Vite-style rule"
+            );
+        }
+    }
+
+    #[test]
+    fn non_immutable_vite_style_remains_available_for_cache_matching() {
+        let toml = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "vite-assets"
+            enabled = true
+            path_glob = "/assets/*.js"
+            fingerprint_style = "vite-base64-url"
+            browser_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let settings =
+            Settings::from_toml(&toml).expect("should allow Vite-style matching without immutable");
+
+        assert!(
+            settings
+                .asset_cache_policy_for_path("/assets/index-BsELY24f.js")
+                .expect("should evaluate Vite-style cache rule")
+                .is_some(),
+            "non-immutable Vite-style rule should still match a Vite output filename"
+        );
+    }
+
+    #[test]
+    fn cache_asset_rule_globs_respect_path_separators() {
+        let toml_str = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "direct-assets"
+            enabled = true
+            path_glob = "/assets/*.js"
+            browser_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse cache asset rule");
+
+        assert!(
+            settings
+                .asset_cache_policy_for_path("/assets/app.js")
+                .expect("should evaluate direct asset rule")
+                .is_some(),
+            "single-star glob should match a direct child"
+        );
+        for path in ["/assets/vendor/app.js", "/assets/app.JS"] {
+            assert!(
+                settings
+                    .asset_cache_policy_for_path(path)
+                    .expect("should evaluate direct asset rule")
+                    .is_none(),
+                "single-star glob should not match {path}"
+            );
+        }
+
+        let recursive_toml = toml_str.replace("/assets/*.js", "/assets/**/*.js");
+        let recursive_settings =
+            Settings::from_toml(&recursive_toml).expect("should parse recursive cache asset rule");
+        for path in ["/assets/app.js", "/assets/vendor/app.js"] {
+            assert!(
+                recursive_settings
+                    .asset_cache_policy_for_path(path)
+                    .expect("should evaluate recursive asset rule")
+                    .is_some(),
+                "double-star glob should match {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_asset_rule_globs_expand_each_optional_recursive_segment() {
+        let toml = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "nested-assets"
+            enabled = true
+            path_glob = "/a/**/b/**/c.js"
+            browser_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse recursive cache rule");
+
+        for path in ["/a/x/b/y/c.js", "/a/b/y/c.js", "/a/x/b/c.js", "/a/b/c.js"] {
+            assert!(
+                settings
+                    .asset_cache_policy_for_path(path)
+                    .expect("should evaluate recursive cache rule")
+                    .is_some(),
+                "recursive pattern should match {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_cache_asset_rules_defer_matcher_and_policy_validation() {
+        let toml_str = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "disabled-invalid-regex"
+            enabled = false
+            path_regex = "["
+
+            [[cache.asset_rules]]
+            id = "disabled-placeholder"
+            enabled = false
+
+            [[cache.asset_rules]]
+            id = "disabled-unsafe-immutable"
+            enabled = false
+            path_prefix = "/assets/"
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+
+        let settings =
+            Settings::from_toml(&toml_str).expect("should defer disabled rule validation");
+        assert!(
+            settings
+                .asset_cache_policy_for_path("/assets/app-DA15JTLU.js")
+                .expect("should evaluate disabled cache rules")
+                .is_none(),
+            "disabled rules should never match"
+        );
+    }
+
+    #[test]
+    fn cache_asset_rule_policy_validation_rejects_unsafe_config() {
+        let missing_ttl = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "missing-ttl"
+            enabled = true
+            path_prefix = "/assets/"
+        "#,
+            crate_test_settings_str()
+        );
+        let missing_ttl_err =
+            Settings::from_toml(&missing_ttl).expect_err("should reject rule without a TTL");
+        assert!(
+            format!("{missing_ttl_err:?}").contains("browser_ttl_seconds or edge_ttl_seconds"),
+            "should explain missing TTL: {missing_ttl_err:?}"
+        );
+
+        let immutable_without_fingerprint_style = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "unsafe-immutable"
+            enabled = true
+            path_prefix = "/assets/"
+            browser_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+        let fingerprint_style_err = Settings::from_toml(&immutable_without_fingerprint_style)
+            .expect_err("should reject immutable rule without a fingerprint style");
+        assert!(
+            format!("{fingerprint_style_err:?}").contains("fingerprint_style"),
+            "should explain immutable fingerprint-style requirement: {fingerprint_style_err:?}"
+        );
+
+        let immutable_without_browser_ttl = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "immutable-without-browser-ttl"
+            enabled = true
+            path_prefix = "/assets/"
+            fingerprint_style = "hex"
+            browser_ttl_seconds = 0
+            edge_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+        let browser_ttl_err = Settings::from_toml(&immutable_without_browser_ttl)
+            .expect_err("should reject immutable rule without positive browser TTL");
+        assert!(
+            format!("{browser_ttl_err:?}").contains("positive browser_ttl_seconds"),
+            "should explain immutable browser TTL requirement: {browser_ttl_err:?}"
+        );
+
+        let private_edge_only = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "private-edge-only"
+            enabled = true
+            path_prefix = "/assets/"
+            visibility = "private"
+            edge_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let private_edge_only_err = Settings::from_toml(&private_edge_only)
+            .expect_err("should reject private rule with only an edge TTL");
+        assert!(
+            format!("{private_edge_only_err:?}").contains("edge_ttl_seconds"),
+            "should explain that private rules cannot use an edge TTL: {private_edge_only_err:?}"
+        );
+
+        let private_dual_ttl = private_edge_only.replace(
+            "id = \"private-edge-only\"",
+            "id = \"private-dual-ttl\"\n            browser_ttl_seconds = 300",
+        );
+        let private_dual_ttl_err = Settings::from_toml(&private_dual_ttl)
+            .expect_err("should reject private rule with browser and edge TTLs");
+        assert!(
+            format!("{private_dual_ttl_err:?}").contains("edge_ttl_seconds"),
+            "should reject edge TTL even when a private rule has a browser TTL: {private_dual_ttl_err:?}"
+        );
+
+        let private_browser_ttl = private_edge_only.replace(
+            "id = \"private-edge-only\"\n            enabled = true\n            path_prefix = \"/assets/\"\n            visibility = \"private\"\n            edge_ttl_seconds = 300",
+            "id = \"private-browser-ttl\"\n            enabled = true\n            path_prefix = \"/assets/\"\n            visibility = \"private\"\n            browser_ttl_seconds = 300",
+        );
+        let private_settings = Settings::from_toml(&private_browser_ttl)
+            .expect("should accept a private rule with a browser TTL");
+        let private_policy = private_settings
+            .asset_cache_policy_for_path("/assets/app.js")
+            .expect("should evaluate private cache rule")
+            .expect("should match private cache rule");
+        assert_eq!(
+            private_policy
+                .cache_control_value(crate::cache_policy::EdgeCacheHeader::SurrogateControl),
+            "private, max-age=300",
+            "private rules should render their browser TTL"
+        );
+        assert_eq!(
+            private_policy
+                .edge_header_value(crate::cache_policy::EdgeCacheHeader::SurrogateControl),
+            None,
+            "private rules should not render an edge cache TTL"
+        );
+    }
+
+    #[test]
+    fn cache_asset_rule_validation_rejects_invalid_config() {
+        let duplicate_ids = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "duplicate"
+            enabled = true
+            path_prefix = "/assets/"
+
+            [[cache.asset_rules]]
+            id = "duplicate"
+            enabled = true
+            path_prefix = "/static/"
+        "#,
+            crate_test_settings_str()
+        );
+        let duplicate_err =
+            Settings::from_toml(&duplicate_ids).expect_err("should reject duplicate rule ids");
+        assert!(
+            format!("{duplicate_err:?}").contains("duplicate id"),
+            "should explain duplicate rule id: {duplicate_err:?}"
+        );
+
+        let invalid_regex = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "bad-regex"
+            enabled = true
+            path_regex = "["
+        "#,
+            crate_test_settings_str()
+        );
+        let regex_err =
+            Settings::from_toml(&invalid_regex).expect_err("should reject invalid regex");
+        assert!(
+            format!("{regex_err:?}").contains("path_regex"),
+            "should explain invalid regex: {regex_err:?}"
+        );
+
+        let invalid_shape = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "too-many-matchers"
+            enabled = true
+            path_prefix = "/assets/"
+            extensions = ["js"]
+        "#,
+            crate_test_settings_str()
+        );
+        let shape_err =
+            Settings::from_toml(&invalid_shape).expect_err("should reject invalid matcher shape");
+        assert!(
+            format!("{shape_err:?}").contains("exactly one matcher"),
+            "should explain invalid matcher shape: {shape_err:?}"
+        );
+
+        let missing_matcher = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "missing-matcher"
+            enabled = true
+            browser_ttl_seconds = 60
+        "#,
+            crate_test_settings_str()
+        );
+        let missing_matcher_err =
+            Settings::from_toml(&missing_matcher).expect_err("should reject missing matcher");
+        assert!(
+            format!("{missing_matcher_err:?}").contains("exactly one matcher"),
+            "should explain missing matcher: {missing_matcher_err:?}"
         );
     }
 
@@ -5230,7 +6238,13 @@ origin_host_header_overide = "www.example.com""#,
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec!["/_ts/admin/keys/rotate", "/_ts/admin/keys/deactivate"],
+            vec![
+                "/_ts/admin/keys/rotate",
+                "/_ts/admin/keys/deactivate",
+                "/_ts/admin/ec",
+                "/_ts/admin/ec/{id}",
+                "/_ts/admin/eids",
+            ],
             "should report every admin endpoint as uncovered"
         );
     }
@@ -5264,9 +6278,193 @@ origin_host_header_overide = "www.example.com""#,
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec!["/_ts/admin/keys/deactivate"],
+            vec![
+                "/_ts/admin/keys/deactivate",
+                "/_ts/admin/ec",
+                "/_ts/admin/ec/{id}",
+                "/_ts/admin/eids",
+            ],
             "should detect the admin endpoints not covered by the narrow handler"
         );
+    }
+
+    #[test]
+    fn from_toml_rejects_literal_parameter_template_auth_coverage() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/[{]id[}]$"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject literal parameter-template auth coverage");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("/_ts/admin/ec/{id}"),
+            "should identify the concrete EC route as uncovered, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_lowercase_only_dynamic_admin_ec_auth_coverage() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/[a-f0-9]{64}[.][a-z0-9]{6}$"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject lowercase-only dynamic EC auth coverage");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("/_ts/admin/ec/{id}"),
+            "should identify the mixed-case EC route as uncovered, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_placeholder_password_on_shadowing_admin_handler() {
+        // Handler selection is first-match-wins, so a narrow handler placed
+        // ahead of the admin matcher governs the EC IDs it matches. No probe
+        // enumerates those IDs, so the placeholder check cannot be limited to
+        // handlers inferred to cover an admin endpoint.
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/ec/[a-f0-9]{64}[.]zzzzzz$"
+            username = "admin"
+            password = "change-me-admin-password"
+
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject placeholder password on shadowing admin handler");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("placeholder password"),
+            "should identify the placeholder handler password, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_weak_password_on_non_admin_handler() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/private"
+            username = "admin"
+            password = "changeme""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject a weak password on any handler");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("placeholder password"),
+            "should identify the weak handler password, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_sampled_id_only_dynamic_admin_ec_auth_coverage() {
+        // A handler anchored to the full EC ID grammar still leaves the rest of
+        // the route surface (malformed IDs, which the router accepts and the
+        // admin handler rejects with 400) unauthenticated, so coverage must not
+        // be inferred from ID-shaped samples.
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/[a-f0-9]{64}[.][A-Za-z0-9]{6}$"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject ID-sampled dynamic EC auth coverage");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("/_ts/admin/ec/{id}"),
+            "should identify the dynamic EC route as uncovered, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_prefix_anchored_admin_ec_auth_coverage() {
+        // `^/_ts/admin/ec/$` matches the prefix probe but no actual lookup.
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/$"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject prefix-anchored dynamic EC auth coverage");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("/_ts/admin/ec/{id}"),
+            "should identify the dynamic EC route as uncovered, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_accepts_prefix_matcher_admin_ec_auth_coverage() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        Settings::from_toml(&toml_str)
+            .expect("should accept a prefix-level matcher for the dynamic EC route");
     }
 
     #[test]
