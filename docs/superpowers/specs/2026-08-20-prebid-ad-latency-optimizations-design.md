@@ -188,7 +188,7 @@ Numeric gates:
 
 | Signal                                    | Source                                                                                                                                        | Type / cadence                     |
 | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
-| Merged-auction count / drain state        | `constituentCallCount` in server auction telemetry + Tinybird column                                                                          | new; continuous                    |
+| Merged-auction count / drain state        | `coalesced` group counting via the `auction_coalescing_daily` rollup                                                                          | new; continuous                    |
 | `/auction` volume per property            | existing server telemetry                                                                                                                     | existing; continuous               |
 | Fill/revenue, bid rate, timeout rate      | ad-server / PBS reporting vs. 7-day pre-enable baseline; alert on >5% adverse move; owner: property operator; reporting maturation delay 48 h | existing; daily                    |
 | First-render / per-slot latency           | scheduled synthetic harness runs against production                                                                                           | synthetic; daily during holds      |
