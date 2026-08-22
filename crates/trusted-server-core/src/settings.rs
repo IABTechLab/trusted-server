@@ -1,6 +1,7 @@
 #[cfg(test)]
 use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
+use glob::{MatchOptions, Pattern};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
@@ -9,11 +10,13 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::OnceLock;
+use std::time::Duration;
 use subtle::ConstantTimeEq as _;
 use url::Url;
 use validator::{Validate, ValidationError};
 
 use crate::auction_config_types::AuctionConfig;
+use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::error::TrustedServerError;
@@ -1868,6 +1871,504 @@ fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<Tru
     Ok(())
 }
 
+/// Cache behavior configuration.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheSettings {
+    /// Ordered static/rehosted asset rules. The first enabled matching rule wins.
+    #[serde(default)]
+    pub asset_rules: Vec<CacheAssetRule>,
+}
+
+impl CacheSettings {
+    fn normalize(&mut self) {
+        for rule in &mut self.asset_rules {
+            rule.normalize();
+        }
+    }
+
+    /// Eagerly validate runtime-only cache settings artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if any rule ID is duplicate, or if an
+    /// enabled rule has an invalid policy/matcher or cannot compile its regex/glob.
+    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        let mut seen_ids = HashSet::new();
+        for rule in &self.asset_rules {
+            if rule.id.is_empty() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: "cache.asset_rules id must not be empty".to_string(),
+                }));
+            }
+            if !seen_ids.insert(rule.id.clone()) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!("cache.asset_rules contains duplicate id `{}`", rule.id),
+                }));
+            }
+        }
+        for rule in &self.asset_rules {
+            rule.prepare_runtime()?;
+        }
+        Ok(())
+    }
+
+    /// Resolve the first enabled asset cache rule that matches `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if a lazily prepared matcher unexpectedly
+    /// fails to compile.
+    pub fn asset_policy_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<CachePolicy>, Report<TrustedServerError>> {
+        for rule in &self.asset_rules {
+            if rule.matches_path(path)? {
+                return Ok(Some(rule.cache_policy()));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// A configurable cache rule for publisher-origin or rehosted static assets.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheAssetRule {
+    /// Stable operator-facing identifier for logs/tests/config errors.
+    pub id: String,
+    /// Whether this rule participates in matching.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Built-in framework/static preset matcher.
+    #[serde(default)]
+    pub preset: Option<CacheAssetPreset>,
+    /// Raw path prefix matcher.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    /// Single glob matcher retained for concise configs.
+    #[serde(default)]
+    pub path_glob: Option<String>,
+    /// Multiple glob matchers.
+    #[serde(default)]
+    pub path_globs: Vec<String>,
+    /// Regex matcher applied to the request path.
+    #[serde(default)]
+    pub path_regex: Option<String>,
+    /// File extensions matched against the request path, case-insensitively.
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    /// Bundler fingerprint style required in the filename before matching.
+    #[serde(default)]
+    pub fingerprint_style: Option<CacheAssetFingerprintStyle>,
+    /// Browser-facing cache visibility.
+    #[serde(default)]
+    pub visibility: CachePolicyVisibility,
+    /// Browser cache TTL rendered as `max-age`.
+    #[serde(default)]
+    pub browser_ttl_seconds: Option<u64>,
+    /// Shared edge cache TTL rendered as runtime-specific edge control.
+    #[serde(default)]
+    pub edge_ttl_seconds: Option<u64>,
+    /// Optional stale-while-revalidate duration.
+    #[serde(default)]
+    pub stale_while_revalidate_seconds: Option<u64>,
+    /// Optional stale-if-error duration.
+    #[serde(default)]
+    pub stale_if_error_seconds: Option<u64>,
+    /// Whether browser caches may treat the response as immutable.
+    #[serde(default)]
+    pub immutable: bool,
+    #[serde(skip)]
+    compiled_regex: OnceLock<Result<Regex, String>>,
+    #[serde(skip)]
+    compiled_globs: OnceLock<Result<Vec<Pattern>, String>>,
+}
+
+impl CacheAssetRule {
+    fn normalize(&mut self) {
+        self.id = self.id.trim().to_string();
+        self.path_prefix = self
+            .path_prefix
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.path_glob = self
+            .path_glob
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.path_globs = self
+            .path_globs
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect();
+        self.path_regex = self
+            .path_regex
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.extensions = self
+            .extensions
+            .iter()
+            .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect();
+    }
+
+    fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        self.validate_matcher_shape()?;
+        self.compiled_regex().map(|_| ())?;
+        self.compiled_globs().map(|_| ())?;
+        self.validate_policy_shape()?;
+        Ok(())
+    }
+
+    fn validate_matcher_shape(&self) -> Result<(), Report<TrustedServerError>> {
+        if self.path_glob.is_some() && !self.path_globs.is_empty() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` must use path_glob or path_globs, not both",
+                    self.id
+                ),
+            }));
+        }
+
+        let matcher_count = usize::from(self.preset.is_some())
+            + usize::from(self.path_prefix.is_some())
+            + usize::from(self.path_glob.is_some() || !self.path_globs.is_empty())
+            + usize::from(self.path_regex.is_some())
+            + usize::from(!self.extensions.is_empty());
+
+        if matcher_count != 1 {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` must configure exactly one matcher",
+                    self.id
+                ),
+            }));
+        }
+        Ok(())
+    }
+
+    fn validate_policy_shape(&self) -> Result<(), Report<TrustedServerError>> {
+        if self.visibility == CachePolicyVisibility::Private {
+            if self.edge_ttl_seconds.is_some() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "cache.asset_rules `{}` sets edge_ttl_seconds with private visibility; private rules must use browser_ttl_seconds",
+                        self.id
+                    ),
+                }));
+            }
+            if self.browser_ttl_seconds.is_none() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "cache.asset_rules `{}` with private visibility must configure browser_ttl_seconds",
+                        self.id
+                    ),
+                }));
+            }
+        } else if self.browser_ttl_seconds.is_none() && self.edge_ttl_seconds.is_none() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` must configure browser_ttl_seconds or edge_ttl_seconds",
+                    self.id
+                ),
+            }));
+        }
+
+        if !self.immutable {
+            return Ok(());
+        }
+
+        if self
+            .browser_ttl_seconds
+            .is_none_or(|browser_ttl| browser_ttl == 0)
+        {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` sets immutable without a positive browser_ttl_seconds",
+                    self.id
+                ),
+            }));
+        }
+
+        let preset_is_content_addressed =
+            matches!(self.preset, Some(CacheAssetPreset::NextJsStatic));
+        if !preset_is_content_addressed {
+            match self.fingerprint_style {
+                None => {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "cache.asset_rules `{}` sets immutable without fingerprint_style or a content-addressed preset",
+                            self.id
+                        ),
+                    }));
+                }
+                Some(CacheAssetFingerprintStyle::ViteBase64Url) => {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "cache.asset_rules `{}` cannot set immutable with vite-base64-url; use a content-addressed preset or an unambiguous fingerprint_style",
+                            self.id
+                        ),
+                    }));
+                }
+                Some(_) => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    fn compiled_regex(&self) -> Result<Option<&Regex>, Report<TrustedServerError>> {
+        let Some(pattern) = self.path_regex.as_deref() else {
+            return Ok(None);
+        };
+        match self
+            .compiled_regex
+            .get_or_init(|| Regex::new(pattern).map_err(|err| err.to_string()))
+        {
+            Ok(regex) => Ok(Some(regex)),
+            Err(message) => Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` path_regex `{pattern}` failed to compile: {message}",
+                    self.id
+                ),
+            })),
+        }
+    }
+
+    fn compiled_globs(&self) -> Result<Option<&[Pattern]>, Report<TrustedServerError>> {
+        if self.path_glob.is_none() && self.path_globs.is_empty() {
+            return Ok(None);
+        }
+
+        match self.compiled_globs.get_or_init(|| {
+            let mut compiled = Vec::new();
+            let source_patterns = self
+                .path_glob
+                .iter()
+                .chain(self.path_globs.iter())
+                .map(String::as_str);
+            for pattern in source_patterns {
+                compile_cache_asset_glob_patterns(pattern, &mut compiled)?;
+            }
+            Ok(compiled)
+        }) {
+            Ok(patterns) => Ok(Some(patterns.as_slice())),
+            Err(message) => Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` glob matcher failed to compile: {message}",
+                    self.id
+                ),
+            })),
+        }
+    }
+
+    fn matches_path(&self, path: &str) -> Result<bool, Report<TrustedServerError>> {
+        if !self.enabled || !self.matcher_matches_path(path)? {
+            return Ok(false);
+        }
+
+        if let Some(style) = self.fingerprint_style
+            && !filename_contains_fingerprint(path, style)
+        {
+            log::debug!(
+                "cache asset rule `{}` rejects path `{path}` because the filename has no {style:?} fingerprint",
+                self.id
+            );
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    fn matcher_matches_path(&self, path: &str) -> Result<bool, Report<TrustedServerError>> {
+        if let Some(preset) = self.preset {
+            return Ok(preset.matches_path(path));
+        }
+        if let Some(prefix) = self.path_prefix.as_deref() {
+            return Ok(path.starts_with(prefix));
+        }
+        if let Some(patterns) = self.compiled_globs()? {
+            return Ok(patterns
+                .iter()
+                .any(|pattern| pattern.matches_with(path, CACHE_ASSET_GLOB_MATCH_OPTIONS)));
+        }
+        if let Some(regex) = self.compiled_regex()? {
+            return Ok(regex.is_match(path));
+        }
+        if !self.extensions.is_empty() {
+            return Ok(path_extension(path).is_some_and(|extension| {
+                self.extensions
+                    .iter()
+                    .any(|candidate| candidate == &extension)
+            }));
+        }
+        Ok(false)
+    }
+
+    fn cache_policy(&self) -> CachePolicy {
+        CachePolicy {
+            visibility: self.visibility.into(),
+            browser_ttl: self.browser_ttl_seconds.map(Duration::from_secs),
+            edge_ttl: self.edge_ttl_seconds.map(Duration::from_secs),
+            stale_while_revalidate: self.stale_while_revalidate_seconds.map(Duration::from_secs),
+            stale_if_error: self.stale_if_error_seconds.map(Duration::from_secs),
+            immutable: self.immutable,
+        }
+    }
+}
+
+const CACHE_ASSET_GLOB_MATCH_OPTIONS: MatchOptions = MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: true,
+    require_literal_leading_dot: false,
+};
+
+fn compile_cache_asset_glob_patterns(
+    pattern: &str,
+    compiled: &mut Vec<Pattern>,
+) -> Result<(), String> {
+    let mut variants = vec![pattern.to_string()];
+    let mut variant_index = 0;
+
+    while variant_index < variants.len() {
+        let variant = variants[variant_index].clone();
+        let optional_segments = variant
+            .match_indices("**/")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for segment_start in optional_segments {
+            let without_segment = format!(
+                "{}{}",
+                &variant[..segment_start],
+                &variant[segment_start + "**/".len()..]
+            );
+            if !variants.contains(&without_segment) {
+                variants.push(without_segment);
+            }
+        }
+        variant_index += 1;
+    }
+
+    for variant in variants {
+        compiled.push(Pattern::new(&variant).map_err(|err| err.to_string())?);
+    }
+
+    Ok(())
+}
+
+/// Built-in cache-rule presets that operators can enable explicitly.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CacheAssetPreset {
+    /// Next.js build output under `/_next/static/`.
+    #[serde(rename = "nextjs-static")]
+    NextJsStatic,
+}
+
+impl CacheAssetPreset {
+    fn matches_path(self, path: &str) -> bool {
+        match self {
+            Self::NextJsStatic => path.starts_with("/_next/static/"),
+        }
+    }
+}
+
+/// Cache visibility parsed from operator configuration.
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CachePolicyVisibility {
+    /// Public browser/cache visibility.
+    #[default]
+    Public,
+    /// Private browser visibility.
+    Private,
+}
+
+impl From<CachePolicyVisibility> for CacheVisibility {
+    fn from(value: CachePolicyVisibility) -> Self {
+        match value {
+            CachePolicyVisibility::Public => Self::Public,
+            CachePolicyVisibility::Private => Self::Private,
+        }
+    }
+}
+
+fn path_extension(path: &str) -> Option<String> {
+    let filename = path.rsplit('/').next()?;
+    let (_, extension) = filename.rsplit_once('.')?;
+    (!extension.is_empty()).then(|| extension.to_ascii_lowercase())
+}
+
+/// Operator-selected filename fingerprint convention for a cache rule.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CacheAssetFingerprintStyle {
+    /// A hexadecimal suffix, such as `app.0123abcd.js`.
+    Hex,
+    /// An eight-character uppercase Base32 suffix, such as `app-VRTVD5R5.js`.
+    EsbuildBase32,
+    /// An eight-character `Base64URL` suffix for non-immutable rules, such as `index-BsELY24f.js`.
+    ViteBase64Url,
+}
+
+impl CacheAssetFingerprintStyle {
+    fn matches_candidate(self, candidate: &str) -> bool {
+        match self {
+            Self::Hex => {
+                candidate.len() >= 8
+                    && candidate.chars().all(|ch| ch.is_ascii_hexdigit())
+                    && candidate.chars().any(|ch| ch.is_ascii_alphabetic())
+            }
+            Self::EsbuildBase32 => {
+                candidate.len() == 8
+                    && candidate
+                        .chars()
+                        .all(|ch| ch.is_ascii_uppercase() || matches!(ch, '2'..='7'))
+                    && candidate.chars().any(|ch| ch.is_ascii_alphabetic())
+            }
+            Self::ViteBase64Url => {
+                candidate.len() == 8
+                    && candidate
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+                    && candidate.chars().any(|ch| ch.is_ascii_uppercase())
+                    && candidate.chars().any(|ch| {
+                        ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_')
+                    })
+            }
+        }
+    }
+}
+
+fn filename_contains_fingerprint(path: &str, style: CacheAssetFingerprintStyle) -> bool {
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    let Some((stem, extension)) = filename.rsplit_once('.') else {
+        return false;
+    };
+    if stem.is_empty() || extension.is_empty() {
+        return false;
+    }
+
+    stem.char_indices()
+        .filter(|(_, ch)| matches!(ch, '.' | '-' | '_' | '~'))
+        .any(|(separator_index, separator)| {
+            let candidate_start = separator_index + separator.len_utf8();
+            let prefix = &stem[..separator_index];
+            let candidate = &stem[candidate_start..];
+            !prefix.is_empty() && style.matches_candidate(candidate)
+        })
+}
+
 /// Debug-only features. All flags default to `false` (off in production).
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1880,15 +2381,26 @@ pub struct DebugConfig {
     #[serde(default)]
     pub ja4_endpoint_enabled: bool,
 
-    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` dumping a
-    /// redacted per-provider auction result: pipeline stats (SSP count, mediator
-    /// status, winning bid count) plus every provider response — each bid's
-    /// creative previewed (not the full `adm` markup) and provider metadata
-    /// filtered to a fail-closed allowlist that drops identity-bearing keys.
-    /// Never enable in production — visible in page source and injects (bounded)
-    /// raw HTML from SSPs.
+    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` dumping
+    /// per-provider auction diagnostics. The default validates response-level
+    /// metadata, but bid fields and bounded creative previews remain visible;
+    /// this is not a fully anonymized dump. Never enable in production.
     #[serde(default)]
     pub auction_html_comment: bool,
+
+    /// Content and verbosity of the `auction_html_comment` dump. Ignored
+    /// when `auction_html_comment` is false.
+    ///
+    /// The default table must stay omitted from serialized config blobs:
+    /// [`DebugConfig`] denies unknown fields, so an older binary rejects a blob
+    /// carrying this table during a mixed-version deployment or rollback. Any
+    /// non-default table still serializes and requires restoring a compatible
+    /// blob before rolling back.
+    #[serde(
+        default,
+        skip_serializing_if = "is_default_auction_debug_comment_options"
+    )]
+    pub auction_html_comment_options: AuctionDebugCommentOptions,
 
     /// Enable the testing-only direct GAM-replace path and the verbose per-bid
     /// `debug_bid` blob in `window.tsjs.bids`.
@@ -1903,6 +2415,179 @@ pub struct DebugConfig {
     /// un-sanitized creative for diagnostics, so never enable in production.
     #[serde(default)]
     pub inject_adm_for_testing: bool,
+}
+
+/// Metadata keys safe to surface in the `ts-debug` auction comment.
+///
+/// Fail-closed superset: any key not listed here — notably `debug`, which
+/// carries the resolved `OpenRTB` request (EC ID, `user.ext.eids`, the TC
+/// consent string, `device.ip`, `device.geo`) plus per-bidder `httpcalls` —
+/// is dropped in [`AuctionDebugCommentVerbosity::Redacted`] mode regardless
+/// of what an operator lists in [`AuctionDebugCommentOptions::metadata_keys`].
+/// `metadata_keys` is a subset selector against this const, never a way to
+/// add new keys.
+pub(crate) const AUCTION_DEBUG_METADATA_ALLOWLIST: &[&str] =
+    &["error_type", "http_status", "message"];
+
+/// Provider-controlled diagnostic keys exposed only by `Upstream` or `Full`.
+///
+/// Values remain untyped upstream JSON and may contain request or identity
+/// data. Keeping this list separate prevents [`AuctionDebugCommentOptions::metadata_keys`]
+/// from widening the default response-metadata boundary.
+pub(crate) const AUCTION_DEBUG_UPSTREAM_METADATA_KEYS: &[&str] = &[
+    "errors",
+    "warnings",
+    "responsetimemillis",
+    "bidstatus",
+    "upstream_message",
+    "upstream_message_truncated",
+];
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_auction_debug_metadata_keys() -> Vec<String> {
+    AUCTION_DEBUG_METADATA_ALLOWLIST
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect()
+}
+
+// This predicate preserves rollback compatibility by omitting the default table.
+fn is_default_auction_debug_comment_options(value: &AuctionDebugCommentOptions) -> bool {
+    *value == AuctionDebugCommentOptions::default()
+}
+
+/// Behavior of the `<!-- ts-debug: ... -->` auction dump. Only consulted when
+/// [`DebugConfig::auction_html_comment`] is true.
+///
+/// `deny_unknown_fields` matches the convention used by sibling config
+/// structs in this file, including the `DebugConfig` this struct nests
+/// under: an operator typo (e.g. `metadata_key` instead of `metadata_keys`)
+/// must fail config load loudly, not be silently ignored.
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuctionDebugCommentOptions {
+    /// Include the `provider_responses` section at all.
+    #[serde(default = "default_true")]
+    pub include_provider_responses: bool,
+
+    /// Include `mediator_response` when a mediator ran.
+    #[serde(default = "default_true")]
+    pub include_mediator_response: bool,
+
+    /// Include each provider's `bids` array (vs. status/metadata only).
+    #[serde(default = "default_true")]
+    pub include_bids: bool,
+
+    /// Subset of [`AUCTION_DEBUG_METADATA_ALLOWLIST`] to surface in
+    /// [`AuctionDebugCommentVerbosity::Redacted`] mode. This selector cannot
+    /// unlock provider diagnostics, and entries outside the fixed allowlist are
+    /// rejected at config load by
+    /// [`validate_metadata_keys`](Self::validate_metadata_keys).
+    ///
+    /// [`AuctionDebugCommentVerbosity::Upstream`] builds on the redacted
+    /// metadata, so this subset still gates those three keys there; the six
+    /// upstream diagnostics are unlocked by `verbosity` alone. Ignored entirely
+    /// when `verbosity` is [`AuctionDebugCommentVerbosity::Full`].
+    #[serde(default = "default_auction_debug_metadata_keys")]
+    pub metadata_keys: Vec<String>,
+
+    /// `Redacted` (default): validated `metadata_keys` subset only, with
+    /// creative previews truncated to `MAX_BID_CREATIVE_DUMP_BYTES`.
+    /// `Upstream`: redacted fields plus six untyped provider diagnostics;
+    /// creative previews remain truncated.
+    /// `Full`: raw `response.metadata` verbatim, including the `debug`
+    /// subtree (httpcalls/resolvedrequest) when present, and no creative
+    /// truncation. The total dump byte cap and comment-terminator
+    /// neutralization still apply unconditionally.
+    ///
+    /// NEVER enable `Upstream` or `Full` in production — identity-bearing
+    /// request/response data may become visible via view-source.
+    #[serde(default)]
+    pub verbosity: AuctionDebugCommentVerbosity,
+
+    /// JSON representation used for the outer auction dump.
+    #[serde(default)]
+    pub format: AuctionDebugCommentFormat,
+}
+
+impl Default for AuctionDebugCommentOptions {
+    fn default() -> Self {
+        Self {
+            include_provider_responses: true,
+            include_mediator_response: true,
+            include_bids: true,
+            metadata_keys: default_auction_debug_metadata_keys(),
+            verbosity: AuctionDebugCommentVerbosity::Redacted,
+            format: AuctionDebugCommentFormat::Compact,
+        }
+    }
+}
+
+impl AuctionDebugCommentOptions {
+    pub(crate) fn normalize(&mut self) {
+        self.metadata_keys = self
+            .metadata_keys
+            .drain(..)
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty())
+            .collect();
+    }
+
+    /// Reject [`Self::metadata_keys`] entries outside
+    /// [`AUCTION_DEBUG_METADATA_ALLOWLIST`].
+    ///
+    /// Render time intersects the configured list with the allowlist, so an
+    /// entry outside it is dead config that silently renders `metadata: {}`.
+    /// Fail the load loudly instead, matching the `deny_unknown_fields`
+    /// contract on this struct. The render-time intersection stays as
+    /// defense-in-depth for config paths that bypass this check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] naming every unknown key.
+    pub(crate) fn validate_metadata_keys(&self) -> Result<(), Report<TrustedServerError>> {
+        let unknown: Vec<&str> = self
+            .metadata_keys
+            .iter()
+            .map(String::as_str)
+            .filter(|key| !AUCTION_DEBUG_METADATA_ALLOWLIST.contains(key))
+            .collect();
+
+        if unknown.is_empty() {
+            return Ok(());
+        }
+
+        Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "debug.auction_html_comment_options.metadata_keys contains unsupported keys [{}]; supported keys are [{}]",
+                unknown.join(", "),
+                AUCTION_DEBUG_METADATA_ALLOWLIST.join(", ")
+            ),
+        }))
+    }
+}
+
+/// Verbosity of the `ts-debug` auction comment. See
+/// [`AuctionDebugCommentOptions::verbosity`].
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuctionDebugCommentVerbosity {
+    #[default]
+    Redacted,
+    Upstream,
+    Full,
+}
+
+/// JSON representation used for the outer `ts-debug` auction dump.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuctionDebugCommentFormat {
+    #[default]
+    Compact,
+    Pretty,
 }
 
 /// Tester-cookie endpoint configuration.
@@ -2052,6 +2737,8 @@ pub struct Settings {
     #[serde(default)]
     pub consent: ConsentConfig,
     #[serde(default)]
+    pub cache: CacheSettings,
+    #[serde(default)]
     pub proxy: Proxy,
     #[serde(default)]
     pub creative_opportunities: Option<CreativeOpportunitiesConfig>,
@@ -2134,8 +2821,10 @@ impl Settings {
         mut settings: Self,
         validation_label: &str,
     ) -> Result<Self, Report<TrustedServerError>> {
+        settings.cache.normalize();
         settings.proxy.normalize();
         settings.image_optimizer.normalize();
+        settings.debug.auction_html_comment_options.normalize();
         settings.consent.validate();
 
         settings.prepare_runtime()?;
@@ -2163,12 +2852,17 @@ impl Settings {
     /// # Errors
     ///
     /// Returns a configuration error if any cached runtime artifact cannot be
-    /// prepared, if any handler path regex does not compile, or if a creative
-    /// opportunity slot is invalid.
+    /// prepared, if any handler path regex does not compile, if a creative
+    /// opportunity slot is invalid, or if
+    /// [`AuctionDebugCommentOptions::metadata_keys`] names an unsupported key.
     pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.image_optimizer.prepare_runtime()?;
+        self.cache.prepare_runtime()?;
         self.proxy.prepare_runtime()?;
         self.tinybird.prepare_runtime()?;
+        self.debug
+            .auction_html_comment_options
+            .validate_metadata_keys()?;
         self.validate_asset_image_optimizer_profile_sets()?;
 
         for handler in &self.handlers {
@@ -2287,6 +2981,18 @@ impl Settings {
             }
         }
         Ok(())
+    }
+
+    /// Resolve the first matching configured asset cache policy for the request path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if matcher preparation unexpectedly fails.
+    pub fn asset_cache_policy_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<CachePolicy>, Report<TrustedServerError>> {
+        self.cache.asset_policy_for_path(path)
     }
 
     /// Resolve the longest matching asset route for the request path.
@@ -2817,6 +3523,8 @@ mod tests {
         #[serde(default)]
         consent: serde::de::IgnoredAny,
         #[serde(default)]
+        cache: serde::de::IgnoredAny,
+        #[serde(default)]
         proxy: serde::de::IgnoredAny,
         #[serde(default)]
         creative_opportunities: serde::de::IgnoredAny,
@@ -3278,6 +3986,173 @@ mod tests {
     }
 
     #[test]
+    fn auction_debug_comment_options_default_matches_serde_defaults() {
+        let opts = AuctionDebugCommentOptions::default();
+        assert!(opts.include_provider_responses, "should default to true");
+        assert!(opts.include_mediator_response, "should default to true");
+        assert!(opts.include_bids, "should default to true");
+        assert_eq!(
+            opts.metadata_keys,
+            vec![
+                "error_type".to_string(),
+                "http_status".to_string(),
+                "message".to_string(),
+            ],
+            "should default to only schema-validated response metadata"
+        );
+        assert_eq!(
+            opts.verbosity,
+            AuctionDebugCommentVerbosity::Redacted,
+            "should default to Redacted"
+        );
+        assert_eq!(
+            opts.format,
+            AuctionDebugCommentFormat::Compact,
+            "should default to compact output"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_normalize_trims_and_drops_empty_keys() {
+        let mut opts = AuctionDebugCommentOptions {
+            metadata_keys: vec![
+                " http_status ".to_string(),
+                "".to_string(),
+                "debug".to_string(),
+            ],
+            ..AuctionDebugCommentOptions::default()
+        };
+        opts.normalize();
+        assert_eq!(
+            opts.metadata_keys,
+            vec!["http_status".to_string(), "debug".to_string()]
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_deserializes_upstream_verbosity() {
+        let options: AuctionDebugCommentOptions = toml::from_str(r#"verbosity = "upstream""#)
+            .expect("should deserialize upstream verbosity");
+        assert_eq!(options.verbosity, AuctionDebugCommentVerbosity::Upstream);
+    }
+
+    #[test]
+    fn auction_debug_comment_options_deserializes_pretty_format() {
+        let options: AuctionDebugCommentOptions =
+            toml::from_str(r#"format = "pretty""#).expect("should deserialize pretty format");
+        assert_eq!(options.format, AuctionDebugCommentFormat::Pretty);
+    }
+
+    #[test]
+    fn auction_debug_comment_options_bad_format_fails_config_load() {
+        let result: Result<AuctionDebugCommentOptions, _> =
+            toml::from_str(r#"format = "expanded""#);
+        assert!(
+            result.is_err(),
+            "unrecognized format must fail to deserialize, not silently fall back"
+        );
+    }
+
+    #[test]
+    fn bad_verbosity_string_fails_config_load() {
+        // Deserialize AuctionDebugCommentOptions directly, not a full Settings —
+        // Settings has required fields with no #[serde(default)] (e.g.
+        // `publisher`), so a full-Settings fixture missing them would fail with
+        // "missing field `publisher`" regardless of whether `verbosity` itself
+        // deserialized correctly, testing the wrong thing.
+        let result: Result<AuctionDebugCommentOptions, _> =
+            toml::from_str(r#"verbosity = "everything""#);
+        assert!(
+            result.is_err(),
+            "unrecognized verbosity must fail to deserialize, not silently fall back"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_unknown_metadata_key_fails_config_load() {
+        let toml = format!(
+            "{}\n[debug]\nauction_html_comment = true\n\n[debug.auction_html_comment_options]\nmetadata_keys = [\"http_staus\", \"errors\"]\n",
+            crate_test_settings_str()
+        );
+        let error = Settings::from_toml(&toml)
+            .expect_err("should reject metadata keys outside the fixed allowlist");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("http_staus") && rendered.contains("errors"),
+            "error should name every unsupported key, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_allowlisted_metadata_keys_load() {
+        let toml = format!(
+            "{}\n[debug]\nauction_html_comment = true\n\n[debug.auction_html_comment_options]\nmetadata_keys = [\" message \"]\n",
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml).expect("should accept an allowlisted key");
+        assert_eq!(
+            settings.debug.auction_html_comment_options.metadata_keys,
+            vec!["message".to_string()],
+            "normalize should trim before validation runs"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_unknown_field_fails_config_load() {
+        let result: Result<AuctionDebugCommentOptions, _> =
+            toml::from_str(r#"metadata_key = ["message"]"#);
+        assert!(
+            result.is_err(),
+            "a misspelled field must fail config load, not be silently ignored"
+        );
+    }
+
+    #[test]
+    fn default_auction_debug_comment_options_stay_out_of_serialized_config() {
+        // Rollback contract: `DebugConfig` denies unknown fields, so the
+        // previous binary rejects a config blob carrying a table it does not
+        // know. Defaults must therefore serialize to nothing.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyDebugConfig {
+            #[serde(default)]
+            ja4_endpoint_enabled: bool,
+            #[serde(default)]
+            auction_html_comment: bool,
+            #[serde(default)]
+            inject_adm_for_testing: bool,
+        }
+
+        let value = serde_json::to_value(DebugConfig::default())
+            .expect("should serialize the default debug config");
+        assert!(
+            value.get("auction_html_comment_options").is_none(),
+            "default options table should not be serialized, got {value}"
+        );
+
+        let legacy: LegacyDebugConfig = serde_json::from_value(value)
+            .expect("legacy schema should accept the default debug payload");
+        assert!(!legacy.ja4_endpoint_enabled);
+        assert!(!legacy.auction_html_comment);
+        assert!(!legacy.inject_adm_for_testing);
+
+        let configured = DebugConfig {
+            auction_html_comment: true,
+            auction_html_comment_options: AuctionDebugCommentOptions {
+                include_bids: false,
+                ..AuctionDebugCommentOptions::default()
+            },
+            ..DebugConfig::default()
+        };
+        let value =
+            serde_json::to_value(&configured).expect("should serialize a configured debug config");
+        assert!(
+            value.get("auction_html_comment_options").is_some(),
+            "non-default options must still serialize, got {value}"
+        );
+    }
+
+    #[test]
     fn tinybird_defaults_to_disabled_placeholders() {
         let settings = Settings::from_toml(&crate_test_settings_str())
             .expect("should parse settings without tinybird block");
@@ -3408,6 +4283,445 @@ mod tests {
         assert!(
             settings.tester_cookie.enabled,
             "tester-cookie config should enable the route"
+        );
+    }
+
+    #[test]
+    fn cache_asset_rule_nextjs_preset_is_operator_controlled() {
+        let toml_str = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "nextjs-static"
+            enabled = true
+            preset = "nextjs-static"
+            visibility = "public"
+            browser_ttl_seconds = 31536000
+            edge_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse cache asset rule");
+
+        let policy = settings
+            .asset_cache_policy_for_path("/_next/static/chunks/app.js")
+            .expect("should evaluate cache rules")
+            .expect("should match enabled Next.js preset");
+        assert_eq!(
+            policy,
+            CachePolicy::public_immutable(Duration::from_secs(31_536_000)),
+            "enabled preset should produce immutable static policy"
+        );
+
+        let disabled_toml = toml_str.replace("enabled = true", "enabled = false");
+        let disabled_settings =
+            Settings::from_toml(&disabled_toml).expect("should parse disabled cache asset rule");
+        assert!(
+            disabled_settings
+                .asset_cache_policy_for_path("/_next/static/chunks/app.js")
+                .expect("should evaluate disabled cache rules")
+                .is_none(),
+            "disabled preset must not mark framework paths immutable"
+        );
+    }
+
+    #[test]
+    fn cache_asset_rule_requires_selected_fingerprint_style() {
+        let expected_policy = CachePolicy::public_immutable(Duration::from_secs(31_536_000));
+        for (style, matching_path, non_matching_path) in [
+            ("hex", "/assets/app.0123abcd.js", "/assets/app-VRTVD5R5.js"),
+            (
+                "esbuild-base32",
+                "/assets/app-VRTVD5R5.js",
+                "/assets/index-BsELY24f.js",
+            ),
+        ] {
+            let toml_str = format!(
+                r#"{}
+
+                [[cache.asset_rules]]
+                id = "publisher-assets"
+                enabled = true
+                path_globs = ["/assets/**/*.js"]
+                fingerprint_style = "{style}"
+                visibility = "public"
+                browser_ttl_seconds = 31536000
+                edge_ttl_seconds = 31536000
+                immutable = true
+            "#,
+                crate_test_settings_str()
+            );
+            let settings = Settings::from_toml(&toml_str).expect("should parse cache asset rule");
+
+            assert_eq!(
+                settings
+                    .asset_cache_policy_for_path(matching_path)
+                    .expect("should evaluate cache rules"),
+                Some(expected_policy),
+                "{style} should match its configured fingerprint convention"
+            );
+            assert!(
+                settings
+                    .asset_cache_policy_for_path(non_matching_path)
+                    .expect("should evaluate cache rules")
+                    .is_none(),
+                "{style} should not fall through to another fingerprint convention"
+            );
+        }
+    }
+
+    #[test]
+    fn immutable_vite_style_cannot_cache_human_named_assets() {
+        let rule = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "vite-assets"
+            enabled = true
+            path_globs = ["/assets/**/*.js", "/assets/**/*.jpg", "/assets/**/*.png", "/assets/**/*.svg"]
+            fingerprint_style = "vite-base64-url"
+            visibility = "public"
+            browser_ttl_seconds = 31536000
+            edge_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+
+        for path in [
+            "/assets/hero-Portrait.jpg",
+            "/assets/logo-DarkMode.svg",
+            "/assets/banner-Summer24.png",
+        ] {
+            let error = Settings::from_toml(&rule)
+                .expect_err("should reject immutable Vite-style cache rule");
+            assert!(
+                format!("{error:?}").contains("cannot set immutable with vite-base64-url"),
+                "{path} must not receive an immutable policy through a Vite-style rule"
+            );
+        }
+    }
+
+    #[test]
+    fn non_immutable_vite_style_remains_available_for_cache_matching() {
+        let toml = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "vite-assets"
+            enabled = true
+            path_glob = "/assets/*.js"
+            fingerprint_style = "vite-base64-url"
+            browser_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let settings =
+            Settings::from_toml(&toml).expect("should allow Vite-style matching without immutable");
+
+        assert!(
+            settings
+                .asset_cache_policy_for_path("/assets/index-BsELY24f.js")
+                .expect("should evaluate Vite-style cache rule")
+                .is_some(),
+            "non-immutable Vite-style rule should still match a Vite output filename"
+        );
+    }
+
+    #[test]
+    fn cache_asset_rule_globs_respect_path_separators() {
+        let toml_str = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "direct-assets"
+            enabled = true
+            path_glob = "/assets/*.js"
+            browser_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse cache asset rule");
+
+        assert!(
+            settings
+                .asset_cache_policy_for_path("/assets/app.js")
+                .expect("should evaluate direct asset rule")
+                .is_some(),
+            "single-star glob should match a direct child"
+        );
+        for path in ["/assets/vendor/app.js", "/assets/app.JS"] {
+            assert!(
+                settings
+                    .asset_cache_policy_for_path(path)
+                    .expect("should evaluate direct asset rule")
+                    .is_none(),
+                "single-star glob should not match {path}"
+            );
+        }
+
+        let recursive_toml = toml_str.replace("/assets/*.js", "/assets/**/*.js");
+        let recursive_settings =
+            Settings::from_toml(&recursive_toml).expect("should parse recursive cache asset rule");
+        for path in ["/assets/app.js", "/assets/vendor/app.js"] {
+            assert!(
+                recursive_settings
+                    .asset_cache_policy_for_path(path)
+                    .expect("should evaluate recursive asset rule")
+                    .is_some(),
+                "double-star glob should match {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_asset_rule_globs_expand_each_optional_recursive_segment() {
+        let toml = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "nested-assets"
+            enabled = true
+            path_glob = "/a/**/b/**/c.js"
+            browser_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse recursive cache rule");
+
+        for path in ["/a/x/b/y/c.js", "/a/b/y/c.js", "/a/x/b/c.js", "/a/b/c.js"] {
+            assert!(
+                settings
+                    .asset_cache_policy_for_path(path)
+                    .expect("should evaluate recursive cache rule")
+                    .is_some(),
+                "recursive pattern should match {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_cache_asset_rules_defer_matcher_and_policy_validation() {
+        let toml_str = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "disabled-invalid-regex"
+            enabled = false
+            path_regex = "["
+
+            [[cache.asset_rules]]
+            id = "disabled-placeholder"
+            enabled = false
+
+            [[cache.asset_rules]]
+            id = "disabled-unsafe-immutable"
+            enabled = false
+            path_prefix = "/assets/"
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+
+        let settings =
+            Settings::from_toml(&toml_str).expect("should defer disabled rule validation");
+        assert!(
+            settings
+                .asset_cache_policy_for_path("/assets/app-DA15JTLU.js")
+                .expect("should evaluate disabled cache rules")
+                .is_none(),
+            "disabled rules should never match"
+        );
+    }
+
+    #[test]
+    fn cache_asset_rule_policy_validation_rejects_unsafe_config() {
+        let missing_ttl = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "missing-ttl"
+            enabled = true
+            path_prefix = "/assets/"
+        "#,
+            crate_test_settings_str()
+        );
+        let missing_ttl_err =
+            Settings::from_toml(&missing_ttl).expect_err("should reject rule without a TTL");
+        assert!(
+            format!("{missing_ttl_err:?}").contains("browser_ttl_seconds or edge_ttl_seconds"),
+            "should explain missing TTL: {missing_ttl_err:?}"
+        );
+
+        let immutable_without_fingerprint_style = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "unsafe-immutable"
+            enabled = true
+            path_prefix = "/assets/"
+            browser_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+        let fingerprint_style_err = Settings::from_toml(&immutable_without_fingerprint_style)
+            .expect_err("should reject immutable rule without a fingerprint style");
+        assert!(
+            format!("{fingerprint_style_err:?}").contains("fingerprint_style"),
+            "should explain immutable fingerprint-style requirement: {fingerprint_style_err:?}"
+        );
+
+        let immutable_without_browser_ttl = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "immutable-without-browser-ttl"
+            enabled = true
+            path_prefix = "/assets/"
+            fingerprint_style = "hex"
+            browser_ttl_seconds = 0
+            edge_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+        let browser_ttl_err = Settings::from_toml(&immutable_without_browser_ttl)
+            .expect_err("should reject immutable rule without positive browser TTL");
+        assert!(
+            format!("{browser_ttl_err:?}").contains("positive browser_ttl_seconds"),
+            "should explain immutable browser TTL requirement: {browser_ttl_err:?}"
+        );
+
+        let private_edge_only = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "private-edge-only"
+            enabled = true
+            path_prefix = "/assets/"
+            visibility = "private"
+            edge_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let private_edge_only_err = Settings::from_toml(&private_edge_only)
+            .expect_err("should reject private rule with only an edge TTL");
+        assert!(
+            format!("{private_edge_only_err:?}").contains("edge_ttl_seconds"),
+            "should explain that private rules cannot use an edge TTL: {private_edge_only_err:?}"
+        );
+
+        let private_dual_ttl = private_edge_only.replace(
+            "id = \"private-edge-only\"",
+            "id = \"private-dual-ttl\"\n            browser_ttl_seconds = 300",
+        );
+        let private_dual_ttl_err = Settings::from_toml(&private_dual_ttl)
+            .expect_err("should reject private rule with browser and edge TTLs");
+        assert!(
+            format!("{private_dual_ttl_err:?}").contains("edge_ttl_seconds"),
+            "should reject edge TTL even when a private rule has a browser TTL: {private_dual_ttl_err:?}"
+        );
+
+        let private_browser_ttl = private_edge_only.replace(
+            "id = \"private-edge-only\"\n            enabled = true\n            path_prefix = \"/assets/\"\n            visibility = \"private\"\n            edge_ttl_seconds = 300",
+            "id = \"private-browser-ttl\"\n            enabled = true\n            path_prefix = \"/assets/\"\n            visibility = \"private\"\n            browser_ttl_seconds = 300",
+        );
+        let private_settings = Settings::from_toml(&private_browser_ttl)
+            .expect("should accept a private rule with a browser TTL");
+        let private_policy = private_settings
+            .asset_cache_policy_for_path("/assets/app.js")
+            .expect("should evaluate private cache rule")
+            .expect("should match private cache rule");
+        assert_eq!(
+            private_policy
+                .cache_control_value(crate::cache_policy::EdgeCacheHeader::SurrogateControl),
+            "private, max-age=300",
+            "private rules should render their browser TTL"
+        );
+        assert_eq!(
+            private_policy
+                .edge_header_value(crate::cache_policy::EdgeCacheHeader::SurrogateControl),
+            None,
+            "private rules should not render an edge cache TTL"
+        );
+    }
+
+    #[test]
+    fn cache_asset_rule_validation_rejects_invalid_config() {
+        let duplicate_ids = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "duplicate"
+            enabled = true
+            path_prefix = "/assets/"
+
+            [[cache.asset_rules]]
+            id = "duplicate"
+            enabled = true
+            path_prefix = "/static/"
+        "#,
+            crate_test_settings_str()
+        );
+        let duplicate_err =
+            Settings::from_toml(&duplicate_ids).expect_err("should reject duplicate rule ids");
+        assert!(
+            format!("{duplicate_err:?}").contains("duplicate id"),
+            "should explain duplicate rule id: {duplicate_err:?}"
+        );
+
+        let invalid_regex = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "bad-regex"
+            enabled = true
+            path_regex = "["
+        "#,
+            crate_test_settings_str()
+        );
+        let regex_err =
+            Settings::from_toml(&invalid_regex).expect_err("should reject invalid regex");
+        assert!(
+            format!("{regex_err:?}").contains("path_regex"),
+            "should explain invalid regex: {regex_err:?}"
+        );
+
+        let invalid_shape = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "too-many-matchers"
+            enabled = true
+            path_prefix = "/assets/"
+            extensions = ["js"]
+        "#,
+            crate_test_settings_str()
+        );
+        let shape_err =
+            Settings::from_toml(&invalid_shape).expect_err("should reject invalid matcher shape");
+        assert!(
+            format!("{shape_err:?}").contains("exactly one matcher"),
+            "should explain invalid matcher shape: {shape_err:?}"
+        );
+
+        let missing_matcher = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "missing-matcher"
+            enabled = true
+            browser_ttl_seconds = 60
+        "#,
+            crate_test_settings_str()
+        );
+        let missing_matcher_err =
+            Settings::from_toml(&missing_matcher).expect_err("should reject missing matcher");
+        assert!(
+            format!("{missing_matcher_err:?}").contains("exactly one matcher"),
+            "should explain missing matcher: {missing_matcher_err:?}"
         );
     }
 

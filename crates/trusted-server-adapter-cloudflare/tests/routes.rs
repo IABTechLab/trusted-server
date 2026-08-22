@@ -203,6 +203,43 @@ async fn tsjs_route_is_routed_not_5xx() {
     assert!(status < 500, "tsjs route must not 5xx: got {status}");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tsjs_route_emits_cloudflare_cache_header_for_matching_hash() {
+    let router = test_router();
+    let src = trusted_server_core::tsjs::tsjs_script_src(&["creative"]);
+    let req = request_builder()
+        .method("GET")
+        .uri(src)
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request");
+
+    let resp = route(router, req).await;
+
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "matching TSJS hash should serve OK"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("public, max-age=31536000, immutable"),
+        "browser cache policy should be immutable for matching TSJS hash"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("cloudflare-cdn-cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("max-age=31536000"),
+        "Cloudflare adapter should emit the Cloudflare-specific edge header"
+    );
+    assert!(
+        resp.headers().get("surrogate-control").is_none(),
+        "Cloudflare adapter must not emit Fastly Surrogate-Control"
+    );
+}
+
 /// Verify that every expected explicit route is registered in the route table.
 ///
 /// Uses [`RouterService::routes()`] for introspection rather than checking

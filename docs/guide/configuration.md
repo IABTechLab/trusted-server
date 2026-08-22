@@ -73,6 +73,7 @@ fail and the service will return its startup-error response.
 | `[ec]`                | Edge Cookie (EC) ID generation               |
 | `[tester_cookie]`     | Optional tester-cookie endpoint              |
 | `[proxy]`             | Proxy SSRF allowlist and asset routes        |
+| `[cache]`             | Static/rehosted asset cache policy rules     |
 | `[image_optimizer]`   | Reusable Image Optimizer profile sets        |
 | `[request_signing]`   | Ed25519 request signing                      |
 | `[auction]`           | Auction orchestration                        |
@@ -1124,6 +1125,125 @@ when_missing = "smart"
 
 See [Asset Routes](/guide/asset-routes) for request flow, S3 auth details, and Image Optimizer behavior.
 
+## Cache Configuration
+
+Static and rehosted asset cache upgrades are operator-controlled. By default,
+Trusted Server leaves arbitrary publisher-origin assets under origin cache
+control. Add `[[cache.asset_rules]]` entries only for paths that are known to be
+content-addressed or otherwise safe for the configured TTL.
+
+### `[[cache.asset_rules]]`
+
+Rules are evaluated in file order; the first enabled matching rule wins.
+Disabled rules never match, and their matcher and policy validation is deferred
+until they are enabled. Rule IDs are always normalized and must remain nonempty
+and unique, including for disabled placeholders.
+
+| Field                            | Type          | Required | Description                                                                        |
+| -------------------------------- | ------------- | -------- | ---------------------------------------------------------------------------------- |
+| `id`                             | String        | Yes      | Unique operator-facing rule identifier                                             |
+| `enabled`                        | Boolean       | No       | Whether the rule participates in matching (default `false`)                        |
+| `preset`                         | String        | Matcher  | Built-in preset such as `nextjs-static`                                            |
+| `path_prefix`                    | String        | Matcher  | Request path prefix                                                                |
+| `path_glob`                      | String        | Matcher  | Single glob matched against the request path                                       |
+| `path_globs`                     | Array[String] | Matcher  | Multiple globs matched against the request path                                    |
+| `path_regex`                     | String        | Matcher  | Regex matched against the request path                                             |
+| `extensions`                     | Array[String] | Matcher  | Case-insensitive file extensions                                                   |
+| `fingerprint_style`              | String        | No       | Required bundler fingerprint convention before matching                            |
+| `visibility`                     | String        | No       | `public` or `private` (default `public`)                                           |
+| `browser_ttl_seconds`            | Integer       | Policy   | Browser `max-age`; required for private rules and positive with `immutable = true` |
+| `edge_ttl_seconds`               | Integer       | Policy   | Public rules only: TTL emitted through the runtime-specific shared-cache directive |
+| `stale_while_revalidate_seconds` | Integer       | No       | Optional `stale-while-revalidate`                                                  |
+| `stale_if_error_seconds`         | Integer       | No       | Optional `stale-if-error`                                                          |
+| `immutable`                      | Boolean       | No       | Add `immutable` for a validated content-addressed rule                             |
+
+An enabled rule must configure exactly one matcher. Public rules must configure
+at least one of `browser_ttl_seconds` or `edge_ttl_seconds`; private rules must
+configure `browser_ttl_seconds` and must not configure `edge_ttl_seconds`.
+`path_glob` and `path_globs` are mutually exclusive. `immutable = true`
+additionally requires a positive browser TTL and either the content-addressed
+`nextjs-static` preset, `hex`, or `esbuild-base32`.
+
+The filename fingerprint check examines the suffix immediately before the final
+extension and requires a nonempty filename prefix separated by `.`, `-`, `_`,
+or `~`. The accepted immutable conventions are:
+
+- `hex`: hexadecimal suffixes of at least eight characters containing a letter,
+  such as `app.0123abcd.js`;
+- `esbuild-base32`: eight-character uppercase Base32 suffixes, such as
+  `app-VRTVD5R5.js`.
+
+`vite-base64-url` remains available for non-immutable cache rules, but it cannot
+prove content addressing. Ordinary names such as `hero-Portrait.jpg` can match
+its eight-character Base64URL shape. A matching rule whose selected fingerprint
+style fails emits a debug log with the rule ID and rejected path.
+
+Glob patterns are case-sensitive. `*` matches within a single path component,
+while `**` matches recursively: `/assets/*.js` matches `/assets/app.js` but not
+`/assets/vendor/app.js`; `/assets/**/*.js` matches both.
+
+**Next.js preset example** (disabled until the publisher confirms
+`/_next/static/` is content-addressed):
+
+```toml
+[[cache.asset_rules]]
+id = "nextjs-static"
+enabled = false
+preset = "nextjs-static"
+visibility = "public"
+browser_ttl_seconds = 31536000
+edge_ttl_seconds = 31536000
+immutable = true
+```
+
+**Publisher allowlist example** (enable only for an unambiguous immutable
+filename convention):
+
+```toml
+[[cache.asset_rules]]
+id = "publisher-fingerprinted-assets"
+enabled = false
+path_globs = [
+  "/assets/**/*.js",
+  "/assets/**/*.css",
+  "/assets/**/*.png",
+  "/assets/**/*.webp",
+]
+fingerprint_style = "hex"
+visibility = "public"
+browser_ttl_seconds = 31536000
+edge_ttl_seconds = 31536000
+immutable = true
+```
+
+If `[cache]` is omitted or no enabled rule matches, Trusted Server preserves the
+origin cache policy for publisher-origin assets. On the publisher pass-through
+path, an origin `private` or `no-store` directive vetoes a matching rule. Other
+origin cache directives, including `no-cache`, are replaced by the configured
+policy. `Vary` is preserved, so do not assign a public immutable rule to paths
+that vary by cookies or other user-specific request state.
+
+On a configured Fastly asset-rehost route, a matching rule is authoritative
+over the third-party origin's cache defaults, including `no-store`, because
+Trusted Server owns the rehosted copy. A later Trusted Server or operator-applied
+`private` or `no-store` directive still vetoes public policy reapplication and
+removes shared-cache headers.
+
+TS-owned validated hash URLs such as `/static/tsjs=...js?v=<hash>` use their
+built-in cache policy and do not require an asset rule. Shared-cache keys for
+`/static/tsjs=` must preserve `v`; otherwise a matching immutable response can
+collide with the missing or mismatched version's short-TTL response.
+
+`edge_ttl_seconds` only emits the selected runtime's shared-cache directive for
+public rules. The runtime or service must also enable and consume that
+directive. The checked-in Cloudflare manifests intentionally do not enable
+Workers Cache: the Worker serves the full publisher gateway, not an isolated
+static-only entrypoint. Emitting `Cloudflare-CDN-Cache-Control` alone must not
+be treated as permission to cache every response. Any future Workers Cache
+opt-in must isolate or explicitly allowlist cacheable traffic. Fastly synthetic
+and final egress responses still require explicit runtime cache integration,
+tracked in [#908](https://github.com/IABTechLab/trusted-server/issues/908).
+
 ## Integration Configurations
 
 Settings for built-in integrations (Prebid, Next.js, Osano, Permutive, Testlight). For other
@@ -1459,6 +1579,134 @@ gam_unit_path = "/{network_id}/example/{section}"
 page_patterns = ["/", "/news", "/news/*", "/reviews", "/reviews/*"]
 formats = [{ width = 728, height = 90 }]
 ```
+
+### Shared template assembly (`assembly_mode = "esi"`)
+
+This configuration is an experimental validation spike scoped to
+[IABTechLab/trusted-server#1009](https://github.com/IABTechLab/trusted-server/issues/1009),
+not a settled production cache interface.
+
+`assembly_mode` controls how initial-page slot and bid state is delivered:
+
+- `inline` (default) transforms every origin response and injects the current
+  reader's slots and bids directly.
+- `esi` opts into a reader-neutral transformed-template cache on Fastly. The
+  cache stores identity bytes containing one inert, versioned comment. On an
+  authorized cold miss, Fastly replaces that comment in a private working copy
+  with one synthetic ESI include and resolves it from the already-built reader
+  state using the pinned `stackpop/esi` parser. No HTTP fragment request occurs.
+  Warm hits use an exact byte split instead, preserving the fast article-prefix
+  stream while the auction finishes.
+
+This is deliberately not general publisher-controlled ESI. A transformed origin
+document containing any `<esi:` directive bypasses the template cache and the parser, while the
+ordinary byte seam still produces the reader's complete response. The stored shared template
+object never contains executable ESI markup.
+
+Only Fastly currently supplies the Core Cache backend used by the shared template cache. Other adapters accept
+the mode but safely fall back to the inline transform on every request. This is
+not a top-level HTTP cache hit: Compute still runs and the final assembled
+response is always `Cache-Control: private, no-store`.
+
+All four keys below belong directly under `[creative_opportunities]`. They are
+one feature contract: `assembly_mode` selects how creative-opportunity state is
+delivered, while the other three constrain when and how long that mode may share
+its template.
+They are not a general top-level HTTP-cache configuration.
+
+```toml
+[creative_opportunities]
+assembly_mode = "esi"
+
+# Every request header, except Accept-Encoding, that the publisher origin can
+# name in Vary for these documents. Names are validated and de-duplicated.
+template_cache_vary = [
+  "rsc",
+  "next-router-state-tree",
+  "next-router-prefetch",
+  "next-router-segment-prefetch",
+]
+
+# Safety ceiling for the shared template. Defaults to 60; valid range 1–86400.
+# The origin's remaining edge freshness may make the actual lifetime shorter.
+template_cache_max_age_seconds = 1200
+
+# Default false. Enable only after proving publisher HTML ignores Cookie.
+origin_is_cookie_independent = true
+```
+
+The cache fails closed. A template is stored only for a `GET` with a processable
+`200 text/html` origin response, a supported content encoding, and explicit
+positive shared freshness. `private`, `no-store`, `no-cache`, exhausted or
+malformed freshness, `Set-Cookie`, `Vary: *`, `Vary: Cookie`, uncovered `Vary`
+names, response-bound CSP nonces, authorization, diagnostics sessions, range or
+conditional requests, positive or malformed request `max-age`, `min-fresh`, and
+unsupported CDN-specific cache policy fields all bypass the template cache. Fastly
+`Surrogate-Control` is the narrow exception: the template cache accepts exactly one positive
+`max-age` plus optional valid `stale-while-revalidate` and `stale-if-error`
+delta-seconds. Restrictive, duplicated, malformed, or unknown directives fail
+closed. Stale windows never extend template-cache freshness. Freshness follows Fastly edge
+precedence: `Surrogate-Control: max-age`, then `Cache-Control: s-maxage`,
+`Cache-Control: max-age`, then `Expires`. Restrictive directives in either policy
+still refuse sharing. Origin `Age` and apparent age from `Date` are deducted, time
+spent transforming the page continues consuming freshness, and the remaining
+lifetime is capped by `template_cache_max_age_seconds`.
+
+A browser reload commonly sends `Cache-Control: max-age=0`. TS may reuse a fresh
+reader-neutral shared template for that reload, but it still builds a new private
+response and runs a new per-reader auction. Explicit `no-cache`, `no-store`,
+positive or malformed request `max-age`, range, and conditional requests still bypass the template cache.
+Check `X-TS-Template-Cache: hit` to verify template reuse.
+
+`template_cache_vary` is necessary because lookup occurs before the origin can
+return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
+origin identity, complete template-shaping settings, TSJS content, and schema
+version all participate in an opaque SHA-256 cache key. `Accept-Encoding` does
+not: the stored template is decoded identity and the assembled result is encoded
+for each reader with `Vary: Accept-Encoding`. This assumes the origin's
+`Accept-Encoding` variants differ only by HTTP content coding, as normal
+compression negotiation does. Do not enable ESI for an origin that changes the
+document's meaning based on `Accept-Encoding`. Never put `Cookie` in
+`template_cache_vary`; startup rejects it because a per-cookie object is not a
+reader-neutral template. With `origin_is_cookie_independent = false` (the safe
+default), all cookie-bearing requests bypass. With it set to `true`, an origin
+`Vary: Cookie` still overrides the assertion and refuses storage.
+Every other name the origin emits in `Vary` must appear in the configured list;
+an uncovered name safely refuses template storage.
+
+For a canary, inspect `X-TS-Template-Cache`. Its bounded values are `hit`,
+`miss-stored`, `miss-store-error`, `miss-reserved`, `bypass-request`,
+`bypass-response`, `unsupported`, `invalid`, and `backend-error`. No URL, header
+value, or cache key is exposed. `invalid` and `backend-error` fail open to a
+fresh origin response; they do not fail the page. The corresponding
+`template_cache` logs provide server-side observability for this path.
+
+`X-TS-Assembly` identifies how the private response was assembled:
+
+- `esi-parser` — authorized cold miss assembled by the repaired parser;
+- `byte-seam` — warm template-cache hit using the streaming byte seam;
+- `byte-seam-fallback` — cold response safely assembled by byte seam because
+  the platform parser was unavailable or rejected the document.
+
+The two headers together are the reliable verification signal. Timing alone can
+vary with the origin, auction, compression, browser connection reuse, and local
+proxy buffering.
+
+Rollback must preserve configuration compatibility:
+
+1. Change `assembly_mode` to `inline` and deploy/push that configuration.
+2. Before rolling back to a binary that predates these fields, remove
+   `assembly_mode`, `template_cache_vary`, `template_cache_max_age_seconds`, and
+   `origin_is_cookie_independent`, then push the cleaned configuration. Older binaries
+   use `deny_unknown_fields` and intentionally reject unknown keys.
+3. Purge the Fastly surrogate key `ts-template` using the service's normal purge
+   tooling, or wait for the bounded origin-derived lifetime to expire.
+
+Run `scripts/template-cache-local-test.sh esi` before a rollout and
+`scripts/template-cache-local-test.sh inline` as its control. The harness uses a temporary
+manifest, never edits the tracked `fastly.toml`, verifies cold/warm origin
+counts and response integrity, and executes the generated GPT module against
+the served seam to require a real `defineSlot` call.
 
 ### `gam_unit_path` templating
 
