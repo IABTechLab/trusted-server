@@ -25,6 +25,7 @@
 ### Task 1: Parse and wire generation scrolling
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/run.rs`
 - Modify: `crates/trusted-server-cli/src/commands/audit/mod.rs`
 - Modify: `crates/trusted-server-cli/src/commands/audit/generate/browser_collector.rs`
@@ -104,6 +105,7 @@ git commit -m "Add scroll option to ad-template generation"
 ### Task 2: Share and execute deterministic scrolling
 
 **Files:**
+
 - Create: `crates/trusted-server-cli/src/commands/audit/browser_scroll.rs`
 - Modify: `crates/trusted-server-cli/src/commands/audit/mod.rs`
 - Modify: `crates/trusted-server-cli/src/commands/audit/browser.rs`
@@ -203,6 +205,7 @@ git commit -m "Collect lazy ad slots during generation scroll"
 ### Task 3: Report unmatched slots preserved by merge
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/commands/audit/generate/slot_toml.rs`
 - Modify: `crates/trusted-server-cli/src/commands/audit/generate/mod.rs`
 
@@ -282,6 +285,7 @@ git commit -m "Warn about preserved unobserved ad slots"
 ### Task 4: Document and verify
 
 **Files:**
+
 - Modify: `docs/guide/cli.md`
 
 - [ ] **Step 1: Document both behaviors**
