@@ -255,9 +255,9 @@ function liveRampUserId(config: InjectedLiveRampConfig): PrebidUserIdConfigEntry
 }
 
 function withManagedLiveRampUserId(
-  config: Record<string, unknown>,
+  config: PbjsConfig,
   managedEntry: PrebidUserIdConfigEntry
-): Record<string, unknown> {
+): PbjsConfig {
   if (!hasUserIdsPath(config)) return config;
 
   const retained = configuredUserIdEntries(config.userSync.userIds).filter(
@@ -269,7 +269,7 @@ function withManagedLiveRampUserId(
       ...config.userSync,
       userIds: [...retained, managedEntry],
     },
-  };
+  } as PbjsConfig;
 }
 
 function readConfiguredUserIdNames(): string[] {
@@ -1167,24 +1167,27 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   };
 
   const managedPbjs = pbjs as typeof pbjs & Record<string, unknown>;
-  if (injected?.liveRamp && managedPbjs[LIVE_RAMP_SET_CONFIG_SENTINEL] !== true) {
+  const liveRampConfig = injected?.liveRamp;
+  if (liveRampConfig && managedPbjs[LIVE_RAMP_SET_CONFIG_SENTINEL] !== true) {
     const originalSetConfig = pbjs.setConfig.bind(pbjs);
     const prebidConfigApi = pbjs as typeof pbjs & {
       mergeConfig?: typeof pbjs.setConfig;
     };
     const originalMergeConfig = prebidConfigApi.mergeConfig?.bind(pbjs);
-    const managedEntry = liveRampUserId(injected.liveRamp);
 
     const normalizePublisherConfig = (publisherConfig: PbjsConfig): PbjsConfig => {
-      let nextConfig = publisherConfig;
       try {
-        if (hasUserIdsPath(publisherConfig)) {
-          nextConfig = withManagedLiveRampUserId(publisherConfig, managedEntry) as PbjsConfig;
-        }
-      } catch {
-        log.error('[tsjs-prebid] LiveRamp configuration could not be normalized');
+        // Build the managed entry per call rather than sharing one object.
+        // Prebid retains whatever it receives as `submodule.config` for the
+        // life of the page, so a shared instance would let any mutation there
+        // leak into every later normalization.
+        return withManagedLiveRampUserId(publisherConfig, liveRampUserId(liveRampConfig));
+      } catch (error) {
+        // Publisher configuration is arbitrary page data: a throwing accessor
+        // must not break the publisher's own setConfig call.
+        log.error('[tsjs-prebid] LiveRamp configuration could not be normalized', error);
+        return publisherConfig;
       }
-      return nextConfig;
     };
 
     pbjs.setConfig = ((publisherConfig: PbjsConfig) => {
@@ -1198,11 +1201,18 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     managedPbjs[LIVE_RAMP_SET_CONFIG_SENTINEL] = true;
 
     const getConfig = (pbjs as unknown as { getConfig?: (key?: string) => unknown }).getConfig;
-    const effectiveUserIds =
-      typeof getConfig === 'function'
-        ? configuredUserIdEntries(getConfig.call(pbjs, 'userSync.userIds'))
-        : [];
-    pbjs.setConfig({ userSync: { userIds: effectiveUserIds } } as PbjsConfig);
+    if (typeof getConfig === 'function') {
+      const effectiveUserIds = configuredUserIdEntries(getConfig.call(pbjs, 'userSync.userIds'));
+      pbjs.setConfig({ userSync: { userIds: effectiveUserIds } } as PbjsConfig);
+    } else {
+      // Without getConfig the effective User ID entries cannot be read, and
+      // seeding the managed entry alone would silently drop every publisher
+      // module already configured. Leave the wrappers installed so the next
+      // publisher userIds call still gets the managed entry.
+      log.error(
+        '[tsjs-prebid] window.pbjs.getConfig is unavailable; managed LiveRamp entry not seeded'
+      );
+    }
   }
 
   auctionEndpoint = merged.endpoint ?? '/auction';

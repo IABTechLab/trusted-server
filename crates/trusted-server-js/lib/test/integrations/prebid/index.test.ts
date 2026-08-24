@@ -443,6 +443,7 @@ describe('prebid/installPrebidNpm', () => {
     mockPbjs.processQueue = mockProcessQueue;
     mockPbjs.adUnits = [];
     mockPbjs.que = [];
+    mockPbjs.getConfig = mockGetConfig;
     mockGetUserIdsAsEids.mockReset();
     mockGetUserIdsAsEids.mockReturnValue([]);
     mockGetConfig.mockReset();
@@ -1004,6 +1005,65 @@ describe('prebid/installPrebidNpm', () => {
     expect(mockPbjs.mergeConfig).toBe(managedMergeConfig);
     mockPbjs.setConfig({ userSync: { userIds: [] } });
     expect(mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([EXPECTED_IDENTITY_LINK]);
+  });
+
+  it('skips seeding the managed entry when getConfig is unavailable', () => {
+    // Seeding needs the effective User ID entries. Without getConfig they
+    // cannot be read, and installing the managed entry alone would silently
+    // drop every publisher-configured module.
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    delete (mockPbjs as { getConfig?: unknown }).getConfig;
+
+    expect(() => installPrebidNpm()).not.toThrow();
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] window.pbjs.getConfig is unavailable; managed LiveRamp entry not seeded'
+    );
+
+    // The wrappers are still installed, so the next publisher userIds call
+    // still gets the managed entry.
+    mockPbjs.setConfig({ userSync: { userIds: [{ name: 'sharedId' }] } });
+    expect(mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([
+      { name: 'sharedId' },
+      EXPECTED_IDENTITY_LINK,
+    ]);
+  });
+
+  it('passes the publisher config through when normalization throws', () => {
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    installPrebidNpm();
+    const hostileConfig = {
+      userSync: {
+        get userIds(): never {
+          throw new Error('example accessor failure');
+        },
+      },
+    };
+
+    mockPbjs.setConfig(hostileConfig as unknown as Parameters<typeof mockPbjs.setConfig>[0]);
+
+    expect(mockSetConfig.mock.calls.at(-1)?.[0]).toBe(hostileConfig);
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] LiveRamp configuration could not be normalized',
+      expect.any(Error)
+    );
+  });
+
+  it('hands Prebid a distinct managed entry object per normalization', () => {
+    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    installPrebidNpm();
+
+    mockPbjs.setConfig({ userSync: { userIds: [] } });
+    const first = mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds[0];
+    mockPbjs.setConfig({ userSync: { userIds: [] } });
+    const second = mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds[0];
+
+    expect(first).toEqual(EXPECTED_IDENTITY_LINK);
+    expect(second).toEqual(EXPECTED_IDENTITY_LINK);
+    expect(second).not.toBe(first);
   });
 
   it('reports identityLink missing when its bundle module is absent', () => {
