@@ -26,10 +26,30 @@ import { main } from '../build-prebid-external.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const libDir = path.resolve(__dirname, '..');
 
-const LIVE_RAMP_ENVELOPE_ENDPOINT = 'api.rlcdn.com';
+const LIVE_RAMP_ENVELOPE_HOST = 'api.rlcdn.com';
 const LIVE_RAMP_STORAGE_NAME = 'idl_env';
 // LiveRamp's IAB Global Vendor List ID.
 const LIVE_RAMP_GVL_VENDOR_ID = 97;
+
+/**
+ * Requests the page made to LiveRamp's envelope endpoint.
+ *
+ * Matches the parsed hostname rather than a substring: `includes()` would also
+ * match an unrelated host that merely carries this one in its name or query
+ * string, which could let the granted-consent assertion count the wrong
+ * request.
+ *
+ * @returns the matching URLs
+ */
+function envelopeRequests(urls) {
+  return urls.filter((url) => {
+    try {
+      return new URL(String(url), 'https://pub.example.com').hostname === LIVE_RAMP_ENVELOPE_HOST;
+    } catch {
+      return false;
+    }
+  });
+}
 
 let outputDirectory;
 let bundleCode;
@@ -191,9 +211,7 @@ describe('external bundle TCF enforcement', () => {
   it('blocks IdentityLink storage and vendor calls when Purpose 1 is denied', async () => {
     const { requestedUrls, cookies } = await runGdprPage(false);
 
-    expect(
-      requestedUrls.filter((url) => String(url).includes(LIVE_RAMP_ENVELOPE_ENDPOINT))
-    ).toEqual([]);
+    expect(envelopeRequests(requestedUrls)).toEqual([]);
     expect(cookies).not.toContain(LIVE_RAMP_STORAGE_NAME);
     expect(cookies).not.toContain('_lr_retry_request');
   });
@@ -201,9 +219,7 @@ describe('external bundle TCF enforcement', () => {
   it('still resolves IdentityLink when the required purposes are granted', async () => {
     const { requestedUrls, cookies } = await runGdprPage(true);
 
-    expect(
-      requestedUrls.filter((url) => String(url).includes(LIVE_RAMP_ENVELOPE_ENDPOINT))
-    ).toHaveLength(1);
+    expect(envelopeRequests(requestedUrls)).toHaveLength(1);
     expect(cookies).toContain(LIVE_RAMP_STORAGE_NAME);
   });
 });
