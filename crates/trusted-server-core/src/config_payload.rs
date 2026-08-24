@@ -49,6 +49,7 @@ pub fn settings_from_config_blob(
     })?;
 
     let mut data = envelope.into_data();
+    remove_inactive_secret_references(&mut data);
     resolve_secret_references::<TrustedServerAppConfig>(
         &mut data,
         secret_store,
@@ -59,11 +60,58 @@ pub fn settings_from_config_blob(
     Ok(settings)
 }
 
+fn remove_inactive_secret_references(data: &mut serde_json::Value) {
+    if data
+        .pointer("/tinybird/enabled")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+        && let Some(tinybird) = data
+            .get_mut("tinybird")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        tinybird.remove("auction_token_secret");
+        tinybird.remove("access_token_secret");
+    }
+
+    let Some(datadome) = data
+        .pointer_mut("/integrations/datadome")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let integration_enabled =
+        datadome.get("enabled").and_then(serde_json::Value::as_bool) != Some(false);
+    let protection_enabled = integration_enabled
+        && datadome
+            .get("enable_protection")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    if !protection_enabled {
+        datadome.remove("server_side_key_secret_name");
+    }
+
+    let bypass_enabled = protection_enabled
+        && datadome
+            .get("protection_test_bypass")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|bypass| bypass.get("enabled"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    if !bypass_enabled
+        && let Some(bypass) = datadome
+            .get_mut("protection_test_bypass")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        bypass.remove("credential_secret_name");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
+    use crate::settings::{AssetOriginAuth, ProxyAssetRoute, S3SigV4AuthConfig};
     use crate::test_support::tests::crate_test_settings_str;
     use serde::Deserialize;
 
@@ -124,6 +172,44 @@ mod tests {
         }
     }
 
+    struct UnifiedSecretStore;
+
+    impl PlatformSecretStore for UnifiedSecretStore {
+        fn get_bytes(
+            &self,
+            store_name: &StoreName,
+            key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            if store_name.as_ref() != "ts_secrets" || key.starts_with("unused-") {
+                return Err(Report::new(PlatformError::SecretStore));
+            }
+            let value = match key {
+                "unit-test-proxy-secret" => "unit-test-proxy-secret-32-bytes-ok",
+                "tinybird-token-key" => "resolved-tinybird-token",
+                "datadome-server-key" => "resolved-datadome-server-key",
+                "datadome-bypass-key" => "resolved-datadome-bypass-credential-32-bytes",
+                "s3-access-key" => "AKIAIOSFODNN7EXAMPLE",
+                "s3-secret-key" => "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                "s3-session-key" => "resolved-session-token",
+                _ => key,
+            };
+            Ok(value.as_bytes().to_vec())
+        }
+
+        fn create(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+
+        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+    }
+
     fn envelope_json(settings: &Settings) -> String {
         let data = serde_json::to_value(settings).expect("should serialize settings to JSON");
         let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_string());
@@ -156,6 +242,144 @@ mod tests {
             reconstructed.handlers.len(),
             original.handlers.len(),
             "should preserve arrays"
+        );
+    }
+
+    #[test]
+    fn resolves_all_static_credentials_from_the_mapped_default_store() {
+        let mut original = test_settings();
+        original.tinybird.enabled = true;
+        original.tinybird.api_host = "api.example.com".to_string();
+        original.tinybird.auction_token_secret =
+            Some(Redacted::new("tinybird-token-key".to_string()));
+        original
+            .integrations
+            .insert_config(
+                "datadome",
+                &serde_json::json!({
+                    "enabled": true,
+                    "enable_protection": true,
+                    "server_side_key_secret_name": "datadome-server-key",
+                    "protection_test_bypass": {
+                        "enabled": true,
+                        "credential_secret_name": "datadome-bypass-key",
+                    },
+                }),
+            )
+            .expect("should configure DataDome references");
+        let mut route = ProxyAssetRoute::new(
+            "/assets/",
+            "https://examplebucket.s3.us-east-1.amazonaws.com",
+        );
+        route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+            region: "us-east-1".to_string(),
+            secret_store: Some("legacy-s3-store".to_string()),
+            access_key_id: Redacted::new("s3-access-key".to_string()),
+            secret_access_key: Redacted::new("s3-secret-key".to_string()),
+            session_token: Some(Redacted::new("s3-session-key".to_string())),
+            origin_query: None,
+        }));
+        original.proxy.asset_routes.push(route);
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should resolve every static credential from the mapped store");
+
+        assert_eq!(
+            reconstructed
+                .tinybird
+                .auction_token_secret
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-tinybird-token")
+        );
+        let datadome = reconstructed
+            .integration_config::<crate::integrations::datadome::DataDomeConfig>("datadome")
+            .expect("should parse DataDome config")
+            .expect("should enable DataDome");
+        assert_eq!(
+            datadome
+                .server_side_key_secret_name
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-datadome-server-key")
+        );
+        let bypass = datadome
+            .protection_test_bypass
+            .as_ref()
+            .expect("should configure bypass");
+        assert_eq!(
+            bypass
+                .credential_secret_name
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-datadome-bypass-credential-32-bytes")
+        );
+        let auth = reconstructed.proxy.asset_routes[0]
+            .auth
+            .as_ref()
+            .expect("should preserve S3 auth");
+        let AssetOriginAuth::S3SigV4(auth) = auth;
+        assert_eq!(auth.access_key_id.expose(), "AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(
+            auth.secret_access_key.expose(),
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+        );
+        assert_eq!(
+            auth.session_token
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-session-token")
+        );
+        assert!(auth.secret_store.is_none());
+    }
+
+    #[test]
+    fn inactive_optional_features_do_not_resolve_stale_secret_references() {
+        let mut original = test_settings();
+        original.tinybird.auction_token_secret =
+            Some(Redacted::new("unused-tinybird-key".to_string()));
+        original
+            .integrations
+            .insert_config(
+                "datadome",
+                &serde_json::json!({
+                    "enabled": true,
+                    "enable_protection": false,
+                    "server_side_key_secret_name": "unused-datadome-key",
+                    "protection_test_bypass": {
+                        "enabled": false,
+                        "credential_secret_name": "unused-bypass-key",
+                    },
+                }),
+            )
+            .expect("should configure inactive references");
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should skip inactive optional feature references");
+
+        assert!(reconstructed.tinybird.auction_token_secret.is_none());
+        let datadome = reconstructed
+            .integration_config::<crate::integrations::datadome::DataDomeConfig>("datadome")
+            .expect("should parse inactive DataDome config")
+            .expect("client-side DataDome remains enabled");
+        assert!(datadome.server_side_key_secret_name.is_none());
+        assert!(
+            datadome
+                .protection_test_bypass
+                .as_ref()
+                .is_some_and(|bypass| bypass.credential_secret_name.is_none())
         );
     }
 

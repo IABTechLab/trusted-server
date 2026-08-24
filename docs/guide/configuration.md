@@ -47,17 +47,31 @@ ts config push --adapter fastly
 
 ### Secret-store migration
 
-The five app-config secret fields contain stable key names only:
-`publisher.proxy_secret`, `ec.passphrase`, `ec.partners[*].api_token`,
-`ec.partners[*].ts_pull_token` (when used), and `handlers[*].password`.
+Static app-config credentials contain stable key names only. This includes
+publisher, EC, handler, Tinybird, DataDome, and S3 credential fields:
+
+- `publisher.proxy_secret`
+- `ec.passphrase`
+- `ec.partners[*].api_token`
+- `ec.partners[*].ts_pull_token`, when used
+- `handlers[*].password`
+- `tinybird.auction_token_secret`, when Tinybird auction telemetry is enabled
+- `integrations.datadome.server_side_key_secret_name`, when protection is enabled
+- `integrations.datadome.protection_test_bypass.credential_secret_name`, when the bypass is enabled
+- `proxy.asset_routes[*].auth.access_key_id`, `secret_access_key`, and optional `session_token`
+
 Their values belong in the logical `trusted_server_secrets` store and are
-resolved only while an instance builds runtime settings.
+resolved only while an instance builds runtime settings. An adapter can map the
+logical ID to a different physical name. For example, Fastly commonly maps
+`trusted_server_secrets` to physical store `ts_secrets`.
 
 Migrate an existing deployment in this order:
 
-1. Create/populate `trusted_server_secrets` with the existing credential values
-   without printing them in shell history, logs, or CI output.
-2. Replace the five config values with stable key names.
+1. Populate the physical store mapped from `trusted_server_secrets` with the
+   existing credential values without printing them in shell history, logs, or
+   CI output.
+2. Replace each active credential value with a stable key name and remove the
+   legacy Tinybird, DataDome, and S3 `secret_store` selectors.
 3. Run `ts config validate`, then `ts config push --adapter fastly --no-diff`.
 4. Restart/redeploy instances as needed to load the new values. Rotation is
    startup-scoped; changing a store value does not alter already-built state.
@@ -80,6 +94,25 @@ For local Spin development, add `--local` to the push command. Also declare a
 component variable for each chosen secret key name using the encoder documented
 in `spin.toml`. Missing stores, keys, invalid UTF-8, and empty values fail
 closed; inline plaintext fallback is not supported.
+
+### Tinybird auction telemetry
+
+Tinybird uses the same typed secret-reference path as the other static
+credentials. Do not configure a feature-specific store:
+
+```toml
+[tinybird]
+enabled = true
+api_host = "api.example.com"
+auction_dataset = "auction_events_raw"
+auction_token_secret = "tinybird_auction_append_token"
+```
+
+Store the APPEND token value under `tinybird_auction_append_token` in the
+physical store mapped from `trusted_server_secrets`. The token is resolved once
+at startup. Disabled Tinybird telemetry does not require or resolve the token.
+The legacy `tinybird.secret_store` field is accepted for one migration release,
+but it is ignored and omitted from newly pushed config.
 
 ### Generate Secure Secrets
 
@@ -955,15 +988,14 @@ target_path = "/image/upload/$1.$2"
 
 The first supported origin auth type is `s3_sigv4`.
 
-| Field               | Type   | Required | Default             | Description                                     |
-| ------------------- | ------ | -------- | ------------------- | ----------------------------------------------- |
-| `type`              | String | Yes      | none                | Must be `s3_sigv4`                              |
-| `region`            | String | Yes      | none                | AWS region used in the SigV4 credential scope   |
-| `secret_store`      | String | No       | `s3-auth`           | Runtime secret store containing AWS credentials |
-| `access_key_id`     | String | No       | `access_key_id`     | Secret key containing the AWS access key ID     |
-| `secret_access_key` | String | No       | `secret_access_key` | Secret key containing the AWS secret access key |
-| `session_token`     | String | No       | unset               | Optional secret key containing a session token  |
-| `origin_query`      | String | No       | route default       | `preserve` or `strip`                           |
+| Field               | Type   | Required | Default             | Description                                                  |
+| ------------------- | ------ | -------- | ------------------- | ------------------------------------------------------------ |
+| `type`              | String | Yes      | none                | Must be `s3_sigv4`                                           |
+| `region`            | String | Yes      | none                | AWS region used in the SigV4 credential scope                |
+| `access_key_id`     | String | No       | `access_key_id`     | Default-store secret reference for the AWS access key ID     |
+| `secret_access_key` | String | No       | `secret_access_key` | Default-store secret reference for the AWS secret access key |
+| `session_token`     | String | No       | unset               | Optional secret key containing a session token               |
+| `origin_query`      | String | No       | route default       | `preserve` or `strip`                                        |
 
 **Example**:
 
@@ -976,13 +1008,12 @@ origin_url = "https://bucket.s3.us-east-1.amazonaws.com"
 type = "s3_sigv4"
 region = "us-east-1"
 origin_query = "strip"
-secret_store = "s3-auth"
-access_key_id = "access_key_id"
-secret_access_key = "secret_access_key"
-# session_token = "session_token"
+access_key_id = "s3_access_key_id"
+secret_access_key = "s3_secret_access_key"
+# session_token = "s3_session_token"
 ```
 
-S3 auth uses header-based AWS SigV4 with `UNSIGNED-PAYLOAD`. It is scoped to read-only asset requests and expects `origin_url` to use the S3 host that AWS validates. Credentials are cached per process by configured secret names after the first successful read.
+S3 auth uses header-based AWS SigV4 with `UNSIGNED-PAYLOAD`. It is scoped to read-only asset requests and expects `origin_url` to use the S3 host that AWS validates. Credential references resolve from `trusted_server_secrets` at startup, and request signing performs no secret-store reads.
 
 Effective `origin_query` precedence is auth-level `origin_query`, then enabled Image Optimizer `origin_query`, then the route default.
 

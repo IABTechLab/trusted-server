@@ -84,15 +84,41 @@ Used for storing public configuration (e.g., public keys, key metadata):
 fastly config-store create --name jwks_store
 ```
 
-### Secret Store
+### Secret Stores
 
-Used for storing sensitive data (e.g., private signing keys):
+Trusted Server keeps static app-config credentials under logical store ID
+`trusted_server_secrets`. The physical Fastly store can use another name, such
+as `ts_secrets`. Request-signing private keys remain in their separate,
+runtime-managed store.
+
+Set the physical mapping before provisioning:
+
+```bash
+export EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
+ts provision --adapter fastly
+```
+
+Provisioning creates or reuses the physical store and persists this runtime
+mapping in Fastly Config Store `edgezero_runtime_env`:
+
+```text
+EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
+```
+
+The Fastly service must link both `ts_secrets` and `edgezero_runtime_env` to the
+active service version. The custom streaming entry point reads the mapping
+before loading app config, so every startup and reload resolves static
+credentials from `ts_secrets` while the portable manifest continues to declare
+`trusted_server_secrets`.
+
+Create the separate request-signing store when that feature is enabled:
 
 ```bash
 fastly secret-store create --name signing_keys
 ```
 
-Note the store IDs - you'll need them for your `trusted-server.toml` configuration.
+Do not copy the same app credential store under a second hardcoded
+`trusted_server_secrets` Fastly link. Configure the mapping instead.
 
 ## Create EC KV Store
 

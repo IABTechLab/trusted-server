@@ -78,6 +78,7 @@ use crate::integrations::{
     collect_body_bounded, collect_response_bounded, ensure_integration_backend,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
+use crate::redacted::Redacted;
 use crate::settings::{IntegrationConfig, Settings};
 
 mod protection;
@@ -90,6 +91,7 @@ pub use protection_scope::{
 use protection_scope::ProtectionScope;
 
 pub(crate) const DATADOME_INTEGRATION_ID: &str = "datadome";
+pub(super) const MIN_TEST_BYPASS_CREDENTIAL_BYTES: usize = 32;
 /// Fixed request header used by the staging-only protection test bypass.
 pub(crate) const HEADER_DATADOME_TEST_BYPASS: &str = "x-ts-datadome-bypass";
 
@@ -133,13 +135,13 @@ pub struct ProtectionTestBypassConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Secret Store containing the temporary bypass credential.
-    #[serde(default = "default_protection_test_bypass_secret_store")]
-    pub credential_secret_store: String,
+    /// Deprecated feature-specific store selector accepted for migration only.
+    #[serde(default)]
+    pub credential_secret_store: Option<String>,
 
-    /// Secret name containing at least 32 bytes of high-entropy bypass material.
-    #[serde(default = "default_protection_test_bypass_secret_name")]
-    pub credential_secret_name: String,
+    /// Secret reference containing at least 32 bytes of high-entropy bypass material.
+    #[serde(default)]
+    pub credential_secret_name: Option<Redacted<String>>,
 }
 
 /// Configuration for `DataDome` integration.
@@ -175,13 +177,13 @@ pub struct DataDomeConfig {
     #[serde(default)]
     pub enable_protection: bool,
 
-    /// Runtime secret store containing the `DataDome` server-side key.
-    #[serde(default = "default_server_side_key_secret_store")]
-    pub server_side_key_secret_store: String,
+    /// Deprecated feature-specific store selector accepted for migration only.
+    #[serde(default)]
+    pub server_side_key_secret_store: Option<String>,
 
-    /// Secret name containing the `DataDome` server-side key.
-    #[serde(default = "default_server_side_key_secret_name")]
-    pub server_side_key_secret_name: String,
+    /// Secret reference containing the `DataDome` server-side key.
+    #[serde(default)]
+    pub server_side_key_secret_name: Option<Redacted<String>>,
 
     /// Base URL for the `DataDome` Protection API.
     #[serde(default = "default_protection_api_origin")]
@@ -273,22 +275,6 @@ fn default_protection_api_origin() -> String {
     "https://api-fastly.datadome.co".to_string()
 }
 
-fn default_server_side_key_secret_store() -> String {
-    "ts_secrets".to_string()
-}
-
-fn default_server_side_key_secret_name() -> String {
-    "datadome_server_side_key".to_string()
-}
-
-fn default_protection_test_bypass_secret_store() -> String {
-    "ts_secrets".to_string()
-}
-
-fn default_protection_test_bypass_secret_name() -> String {
-    "datadome_test_bypass".to_string()
-}
-
 fn default_timeout_ms() -> u32 {
     1500
 }
@@ -356,8 +342,8 @@ impl Default for DataDomeConfig {
             cache_ttl_seconds: default_cache_ttl(),
             rewrite_sdk: default_rewrite_sdk(),
             enable_protection: false,
-            server_side_key_secret_store: default_server_side_key_secret_store(),
-            server_side_key_secret_name: default_server_side_key_secret_name(),
+            server_side_key_secret_store: None,
+            server_side_key_secret_name: None,
             protection_api_origin: default_protection_api_origin(),
             timeout_ms: default_timeout_ms(),
             protection_excluded_methods: default_protection_excluded_methods(),
@@ -394,28 +380,48 @@ impl DataDomeIntegration {
         Self::try_new(config).expect("should create DataDome integration")
     }
 
-    fn try_new(mut config: DataDomeConfig) -> Result<Arc<Self>, Report<TrustedServerError>> {
-        config.server_side_key_secret_store =
-            config.server_side_key_secret_store.trim().to_string();
-        config.server_side_key_secret_name = config.server_side_key_secret_name.trim().to_string();
+    fn try_new(config: DataDomeConfig) -> Result<Arc<Self>, Report<TrustedServerError>> {
+        Self::try_new_with_secret_validation(config, true)
+    }
+
+    fn try_new_with_secret_validation(
+        mut config: DataDomeConfig,
+        validate_resolved_secrets: bool,
+    ) -> Result<Arc<Self>, Report<TrustedServerError>> {
+        if config.server_side_key_secret_store.take().is_some() {
+            log::warn!(
+                "DataDome server_side_key_secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
+            );
+        }
+        config.server_side_key_secret_name =
+            config.server_side_key_secret_name.take().and_then(|value| {
+                let value = value.expose().trim().to_string();
+                (!value.is_empty()).then(|| Redacted::new(value))
+            });
         config.protection_api_origin = config.protection_api_origin.trim().to_string();
         config.client_side_tag_url = config.client_side_tag_url.trim().to_string();
         if let Some(bypass) = &mut config.protection_test_bypass {
-            bypass.credential_secret_store = bypass.credential_secret_store.trim().to_string();
-            bypass.credential_secret_name = bypass.credential_secret_name.trim().to_string();
+            if bypass.credential_secret_store.take().is_some() {
+                log::warn!(
+                    "DataDome credential_secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
+                );
+            }
+            bypass.credential_secret_name =
+                bypass.credential_secret_name.take().and_then(|value| {
+                    let value = value.expose().trim().to_string();
+                    (!value.is_empty()).then(|| Redacted::new(value))
+                });
         }
 
         if config.enable_protection {
-            if config.server_side_key_secret_store.is_empty()
-                || config.server_side_key_secret_name.is_empty()
-            {
+            if config.server_side_key_secret_name.is_none() {
                 return Err(Report::new(Self::error(
-                    "server_side_key_secret_store and server_side_key_secret_name are required when enable_protection is true",
+                    "server_side_key_secret_name is required when enable_protection is true",
                 )));
             }
             Self::validate_protection_api_origin(&config.protection_api_origin)?;
         }
-        Self::validate_protection_test_bypass(&config)?;
+        Self::validate_protection_test_bypass(&config, validate_resolved_secrets)?;
 
         if config.inject_client_side_tag {
             Self::validate_client_side_tag_url(&config.client_side_tag_url)?;
@@ -477,6 +483,12 @@ impl DataDomeIntegration {
         Self::try_new(config).map(|_| ())
     }
 
+    pub(crate) fn validate_config_for_deploy(
+        config: DataDomeConfig,
+    ) -> Result<(), Report<TrustedServerError>> {
+        Self::try_new_with_secret_validation(config, false).map(|_| ())
+    }
+
     fn active_protection_test_bypass(&self) -> Option<&ProtectionTestBypassConfig> {
         if std::env::var(ENV_FASTLY_IS_STAGING).as_deref() != Ok("1") {
             return None;
@@ -490,6 +502,7 @@ impl DataDomeIntegration {
 
     fn validate_protection_test_bypass(
         config: &DataDomeConfig,
+        validate_resolved_secret: bool,
     ) -> Result<(), Report<TrustedServerError>> {
         let Some(bypass) = config
             .protection_test_bypass
@@ -504,10 +517,16 @@ impl DataDomeIntegration {
                 "protection_test_bypass requires enable_protection to be true",
             )));
         }
-        if bypass.credential_secret_store.is_empty() || bypass.credential_secret_name.is_empty() {
+        let Some(credential) = bypass.credential_secret_name.as_ref() else {
             return Err(Report::new(Self::error(
-                "protection_test_bypass credential_secret_store and credential_secret_name must not be empty when enabled",
+                "protection_test_bypass credential_secret_name is required when enabled",
             )));
+        };
+        if validate_resolved_secret && credential.expose().len() < MIN_TEST_BYPASS_CREDENTIAL_BYTES
+        {
+            return Err(Report::new(Self::error(format!(
+                "protection_test_bypass credential_secret_name must resolve to at least {MIN_TEST_BYPASS_CREDENTIAL_BYTES} bytes"
+            ))));
         }
 
         Ok(())
@@ -1013,6 +1032,7 @@ mod tests {
             api_origin: "https://api-js.datadome.co".to_string(),
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
+            server_side_key_secret_name: Some(Redacted::new("server-side-key".to_string())),
             ..DataDomeConfig::default()
         }
     }
@@ -1200,14 +1220,11 @@ mod tests {
     }
 
     #[test]
-    fn protection_secret_defaults_match_sample_config() {
+    fn protection_secrets_are_absent_by_default() {
         let config = DataDomeConfig::default();
 
-        assert_eq!(config.server_side_key_secret_store, "ts_secrets");
-        assert_eq!(
-            config.server_side_key_secret_name,
-            "datadome_server_side_key"
-        );
+        assert!(config.server_side_key_secret_store.is_none());
+        assert!(config.server_side_key_secret_name.is_none());
         assert!(
             config.protection_test_bypass.is_none(),
             "the temporary test bypass should be disabled by default"
@@ -1234,33 +1251,40 @@ mod tests {
 
         assert!(bypass.enabled, "should retain the enabled flag");
         assert_eq!(
-            bypass.credential_secret_store, "ts_secrets",
-            "should retain the configured credential Secret Store"
+            bypass.credential_secret_store.as_deref(),
+            Some("ts_secrets"),
+            "should accept the deprecated credential Secret Store"
         );
         assert_eq!(
-            bypass.credential_secret_name, "datadome_test_bypass",
-            "should retain the configured credential secret name"
+            bypass
+                .credential_secret_name
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("datadome_test_bypass"),
+            "should retain the configured credential secret reference"
         );
     }
 
     #[test]
-    fn protection_test_bypass_requires_protection_and_secret_references() {
-        for (enable_protection, store, name, expected_message) in [
+    fn protection_test_bypass_requires_protection_and_resolved_credential() {
+        for (enable_protection, credential, expected_message) in [
             (
                 false,
-                "ts_secrets",
-                "datadome_test_bypass",
+                Some("test-bypass-credential-at-least-32-bytes"),
                 "requires enable_protection",
             ),
-            (true, "", "datadome_test_bypass", "credential_secret_store"),
-            (true, "ts_secrets", "", "credential_secret_name"),
+            (true, None, "credential_secret_name"),
+            (true, Some("short"), "at least 32 bytes"),
         ] {
             let mut config = test_config();
             config.enable_protection = enable_protection;
+            config.server_side_key_secret_name =
+                Some(Redacted::new("resolved-server-key".to_string()));
             config.protection_test_bypass = Some(ProtectionTestBypassConfig {
                 enabled: true,
-                credential_secret_store: store.to_string(),
-                credential_secret_name: name.to_string(),
+                credential_secret_store: None,
+                credential_secret_name: credential.map(|value| Redacted::new(value.to_string())),
             });
 
             let err = match DataDomeIntegration::try_new(config) {
@@ -1275,26 +1299,10 @@ mod tests {
     }
 
     #[test]
-    fn protection_enabled_requires_server_side_key_secret_store() {
-        let mut config = test_config();
-        config.enable_protection = true;
-        config.server_side_key_secret_store = " ".to_string();
-
-        let err = match DataDomeIntegration::try_new(config) {
-            Ok(_) => panic!("should reject empty store"),
-            Err(err) => err,
-        };
-        assert!(
-            format!("{err:?}").contains("server_side_key_secret_store"),
-            "should mention secret store config"
-        );
-    }
-
-    #[test]
     fn protection_enabled_requires_server_side_key_secret_name() {
         let mut config = test_config();
         config.enable_protection = true;
-        config.server_side_key_secret_name = " ".to_string();
+        config.server_side_key_secret_name = Some(Redacted::new(" ".to_string()));
 
         let err = match DataDomeIntegration::try_new(config) {
             Ok(_) => panic!("should reject empty name"),
