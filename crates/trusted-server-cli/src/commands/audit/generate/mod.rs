@@ -731,9 +731,14 @@ pub(crate) fn run_update_slots(
         &fragmented,
         &mut notes,
     )?;
-    let (merged, merge_diagnostics) = slot_toml::merge_render_slots_with_diagnostics(
+    let observed_div_ids = table
+        .slots()
+        .map(|slot| slot.div_id.clone())
+        .collect::<Vec<_>>();
+    let (merged, merge_diagnostics) = slot_toml::merge_render_slots_with_observed_diagnostics(
         request.existing_creative,
         slots,
+        &observed_div_ids,
         request.replace,
     );
     notes.extend(merge_diagnostics.notes);
@@ -2231,6 +2236,82 @@ mod tests {
                 "dry-run should preserve the original config"
             );
         }
+    }
+
+    #[test]
+    fn observed_but_refused_slot_is_not_reported_as_unobserved() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        let mut original = loadable_config();
+        original.push_str(
+            "\n[[creative_opportunities.slot]]\n\
+             id = \"stable\"\n\
+             div_id = \"ad-stable\"\n\
+             gam_unit_path = \"/123456789/site/header\"\n\
+             page_patterns = [\"/\"]\n\
+             formats = [{ width = 728, height = 90 }]\n\n\
+             [[creative_opportunities.slot]]\n\
+             id = \"refused\"\n\
+             div_id = \"ad-refused\"\n\
+             gam_unit_path = \"/123456789/desktop/homepage\"\n\
+             page_patterns = [\"/\"]\n\
+             formats = [{ width = 300, height = 250 }]\n",
+        );
+        fs::write(&config_path, &original).expect("should write config");
+        let existing = crate::commands::audit::creative_config(&original, &config_path)
+            .expect("should parse config")
+            .expect("should have creative opportunities");
+
+        let page = |profile: &str| {
+            let mut page = collected_page();
+            page.requested_url = "https://publisher.example/".to_string();
+            page.final_url = page.requested_url.clone();
+            page.gpt_slots = vec![
+                collector::CollectedGptSlot {
+                    gam_unit_path: "/123456789/site/header".to_string(),
+                    div_id: "ad-stable".to_string(),
+                    sizes: vec![(728, 90)],
+                },
+                collector::CollectedGptSlot {
+                    gam_unit_path: format!("/123456789/{profile}/homepage"),
+                    div_id: "ad-refused".to_string(),
+                    sizes: vec![(300, 250)],
+                },
+            ];
+            page
+        };
+        let desktop = FakeCollector::new(page("desktop"));
+        let mobile = FakeCollector::new(page("mobile"));
+        let mut out = Vec::new();
+        let mut notes = Vec::new();
+
+        run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: Some(&existing),
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: true,
+                scroll: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &desktop), ("mobile", &mobile)],
+            &mut out,
+            &mut notes,
+        )
+        .expect("the accepted slot should let generation complete");
+
+        let notes = String::from_utf8(notes).expect("notes should be UTF-8");
+        assert!(
+            notes.contains("skipped refused slot `ad-refused` (`ad-refused`)"),
+            "should retain the refusal diagnostic, got {notes:?}"
+        );
+        assert!(
+            !notes.contains("not observed during this crawl: refused"),
+            "a crawl-observed refused slot must not be labeled unobserved, got {notes:?}"
+        );
     }
 
     #[test]

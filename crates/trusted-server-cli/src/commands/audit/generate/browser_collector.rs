@@ -1108,22 +1108,25 @@ mod tests {
     <div id="ad-lazy-0"></div>
     <script>
       window.addEventListener('scroll', function installLazySlot() {
-        if (window.scrollY <= 0 || window.googletag) return
-        var slot = {
-          getAdUnitPath: function () { return '/123/lazy' },
-          getSlotElementId: function () { return 'ad-lazy-0' },
-          getSizes: function () {
-            return [{
-              getWidth: function () { return 300 },
-              getHeight: function () { return 250 },
-            }]
-          },
-        }
-        window.googletag = {
-          pubads: function () {
-            return { getSlots: function () { return [slot] } }
-          },
-        }
+        if (window.scrollY <= 0 || window.lazySlotScheduled) return
+        window.lazySlotScheduled = true
+        setTimeout(function () {
+          var slot = {
+            getAdUnitPath: function () { return '/123/lazy' },
+            getSlotElementId: function () { return 'ad-lazy-0' },
+            getSizes: function () {
+              return [{
+                getWidth: function () { return 300 },
+                getHeight: function () { return 250 },
+              }]
+            },
+          }
+          window.googletag = {
+            pubads: function () {
+              return { getSlots: function () { return [slot] } }
+            },
+          }
+        }, 1500)
       })
     </script>
   </body>

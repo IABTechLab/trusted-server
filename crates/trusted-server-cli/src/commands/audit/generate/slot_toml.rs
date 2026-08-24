@@ -182,14 +182,34 @@ pub(super) fn merge_render_slots(
 pub(super) struct MergeDiagnostics {
     /// Operator-facing reconciliation notes.
     pub(super) notes: Vec<String>,
-    /// Configured slots preserved without matching any discovered slot.
+    /// Configured slots preserved without matching any div observed in the raw crawl.
     pub(super) unobserved_existing_slot_ids: Vec<String>,
 }
 
 /// Merges slots and reports prefix collisions and unobserved preserved slots.
+#[cfg(test)]
 pub(super) fn merge_render_slots_with_diagnostics(
     existing: Option<&CreativeOpportunitiesConfig>,
     discovered_slots: Vec<RenderSlot>,
+    replace: bool,
+) -> (Vec<RenderSlot>, MergeDiagnostics) {
+    let observed_div_ids = discovered_slots
+        .iter()
+        .filter_map(|slot| slot.div_id.clone())
+        .collect::<Vec<_>>();
+    merge_render_slots_with_observed_diagnostics(
+        existing,
+        discovered_slots,
+        &observed_div_ids,
+        replace,
+    )
+}
+
+/// Merges renderable slots while treating every raw crawl div as observed.
+pub(super) fn merge_render_slots_with_observed_diagnostics(
+    existing: Option<&CreativeOpportunitiesConfig>,
+    discovered_slots: Vec<RenderSlot>,
+    observed_div_ids: &[String],
     replace: bool,
 ) -> (Vec<RenderSlot>, MergeDiagnostics) {
     let existing_slots = existing.map(|config| config.slot.as_slice()).unwrap_or(&[]);
@@ -202,7 +222,11 @@ pub(super) fn merge_render_slots_with_diagnostics(
         .map(RenderSlot::from_existing)
         .collect();
     let mut prefix_claims: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
-    let mut observed_existing = BTreeSet::new();
+    let mut observed_existing = observed_div_ids
+        .iter()
+        .filter_map(|div_id| matching_div_id_index(&merged, div_id))
+        .filter(|index| *index < existing_slots.len())
+        .collect::<BTreeSet<_>>();
     for mut slot in discovered_slots {
         if let Some(index) = matching_slot_index(&merged, &slot) {
             if index < existing_slots.len() {
@@ -293,24 +317,28 @@ fn unique_slot_id(candidate: &str, existing: &[RenderSlot]) -> String {
 /// config order. The prior exact key behavior remains as a fallback.
 fn matching_slot_index(existing: &[RenderSlot], discovered: &RenderSlot) -> Option<usize> {
     if let Some(discovered_div) = discovered.div_id.as_deref() {
-        let mut best = None;
-        let mut best_length = 0;
-        for (index, slot) in existing.iter().enumerate() {
-            let Some(prefix) = slot.div_id.as_deref().filter(|prefix| !prefix.is_empty()) else {
-                continue;
-            };
-            if discovered_div.starts_with(prefix) && prefix.len() > best_length {
-                best = Some(index);
-                best_length = prefix.len();
-            }
-        }
-        if best.is_some() {
-            return best;
+        if let Some(index) = matching_div_id_index(existing, discovered_div) {
+            return Some(index);
         }
     }
 
     let key = discovered.key();
     existing.iter().position(|slot| slot.key() == key)
+}
+
+fn matching_div_id_index(existing: &[RenderSlot], discovered_div: &str) -> Option<usize> {
+    let mut best = None;
+    let mut best_length = 0;
+    for (index, slot) in existing.iter().enumerate() {
+        let Some(prefix) = slot.div_id.as_deref().filter(|prefix| !prefix.is_empty()) else {
+            continue;
+        };
+        if discovered_div.starts_with(prefix) && prefix.len() > best_length {
+            best = Some(index);
+            best_length = prefix.len();
+        }
+    }
+    best
 }
 
 /// Header comment emitted above the structurally replaced managed slot array.
