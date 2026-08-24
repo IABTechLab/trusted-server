@@ -352,6 +352,9 @@ describe('publisher-native APS runner contract tests', () => {
     expect(trustedServer).not.toHaveBeenCalled();
 
     const runnerDocument = frame.contentDocument!;
+    expect(runnerDocument.querySelector('meta[name="referrer"]')?.getAttribute('content')).toBe(
+      'no-referrer'
+    );
     expect(runnerDocument.documentElement.style.margin).toBe('0px');
     expect(runnerDocument.documentElement.style.padding).toBe('0px');
     expect(runnerDocument.body.style.margin).toBe('0px');
@@ -535,6 +538,42 @@ describe('direct APS rendering', () => {
   afterEach(() => {
     vi.restoreAllMocks();
     document.body.innerHTML = '';
+  });
+
+  it('keeps a valid default frame when an invalid replacement is rejected', () => {
+    const trustedServer = (renderer: ApsRendererV1): boolean =>
+      renderApsCreative({ slotId: 'fictional-slot', renderer });
+    expect(
+      dispatchDefaultApsRendering({
+        slotId: 'fictional-slot',
+        renderer: descriptor(),
+        trustedServer,
+      })
+    ).toBe(true);
+
+    const slot = document.getElementById('fictional-slot')!;
+    const iframe = slot.querySelector('iframe')!;
+    const postMessage = vi.spyOn(iframe.contentWindow!, 'postMessage');
+    iframe.dispatchEvent(new Event('load'));
+    const sent = postMessage.mock.calls[0][0] as { nonce: string };
+
+    expect(
+      dispatchDefaultApsRendering({
+        slotId: 'fictional-slot',
+        renderer: descriptor({ aaxResponse: 'invalid' }),
+        trustedServer,
+      })
+    ).toBe(false);
+    expect(iframe.isConnected).toBe(true);
+
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        data: { message: 'trusted-server/aps/renderer-ready', nonce: sent.nonce },
+        source: iframe.contentWindow,
+      })
+    );
+    expect(slot.querySelector('span')).toBeNull();
+    expect(iframe.style.display).toBe('');
   });
 
   it('loads the static route with a fragment-bound 128-bit nonce and opaque sandbox', () => {
