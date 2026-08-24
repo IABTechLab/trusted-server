@@ -205,7 +205,7 @@ pub(super) fn merge_render_slots_with_diagnostics(
     )
 }
 
-/// Merges renderable slots while treating every raw crawl div as observed.
+/// Merges renderable slots using normalized evidence div IDs for observation.
 pub(super) fn merge_render_slots_with_observed_diagnostics(
     existing: Option<&CreativeOpportunitiesConfig>,
     discovered_slots: Vec<RenderSlot>,
@@ -315,11 +315,11 @@ fn unique_slot_id(candidate: &str, existing: &[RenderSlot]) -> String {
     }
 }
 
-/// Finds the most specific configured slot matching a discovered live div.
+/// Finds the configured slot matching a discovered normalized slot.
 ///
-/// Configured `div_id` values are runtime prefixes. Exact matches naturally
-/// win because they are the longest possible prefix; equal-length ties retain
-/// config order. The prior exact key behavior remains as a fallback.
+/// Stable-key equality wins first. Otherwise, configured `div_id` values are
+/// eligible runtime prefixes unless that value was itself observed as a
+/// distinct literal. Equal-length prefix ties retain configuration order.
 fn matching_slot_index(
     existing: &[RenderSlot],
     discovered: &RenderSlot,
@@ -1648,6 +1648,7 @@ slot_id = "sidebar"
         assert!(merged.iter().any(|slot| slot.id == "ad-sidebar-10"));
         assert!(merged.iter().any(|slot| slot.id == "ad-sidebar-11"));
         assert!(diagnostics.notes.is_empty());
+        assert!(diagnostics.unobserved_existing_slot_ids.is_empty());
     }
 
     #[test]
