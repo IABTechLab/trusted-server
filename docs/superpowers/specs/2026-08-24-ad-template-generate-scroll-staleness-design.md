@@ -5,7 +5,8 @@
 `ts audit ad-templates generate` currently collects each page only after its
 initial settle. Unlike `ts audit page` and `ts audit ad-templates verify`, it
 cannot request the deterministic scroll pass that triggers lazy ad inventory.
-On Autoblog this produced fewer observable frames than a scrolled page audit.
+On a lazy-loading publisher site this produced fewer observable frames than a
+scrolled page audit of the same page.
 
 Generation also merges by default, deliberately preserving configured slots
 that the current crawl did not rediscover. That safety behavior is correct, but
@@ -92,6 +93,7 @@ contracts.
 
 Verification will run the host CLI test suite and relevant Chrome-backed CLI
 tests, followed by the repository-required formatting and CLI lint gates. A
-manual dry run against Autoblog may be used when a fresh bot-protection cookie
+manual dry run against a live publisher site may be used when a fresh
+bot-protection cookie
 and proxy are available, but network-dependent behavior is not a required CI
 test.

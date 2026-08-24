@@ -192,10 +192,23 @@ pub(super) fn merge_render_slots_with_diagnostics(
         .iter()
         .map(RenderSlot::from_existing)
         .collect();
+    let existing_count = merged.len();
     let mut prefix_claims: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
     for mut slot in discovered_slots {
-        if let Some(index) = matching_slot_index(&merged, &slot) {
-            if index < existing_slots.len()
+        // Prefix reconciliation is a property of the operator's config, so only
+        // the slots that were already configured may claim a discovered div.
+        // Slots this run appended match by exact identity instead, otherwise
+        // discovery order decides whether `ad-top` swallows a later
+        // `ad-top-sidebar` and discards its unit path and provider state.
+        let matched = matching_slot_index(&merged[..existing_count], &slot).or_else(|| {
+            let key = slot.key();
+            merged[existing_count..]
+                .iter()
+                .position(|added| added.key() == key)
+                .map(|offset| offset + existing_count)
+        });
+        if let Some(index) = matched {
+            if index < existing_count
                 && let (Some(prefix), Some(discovered_div)) =
                     (merged[index].div_id.as_deref(), slot.div_id.as_deref())
                 && discovered_div.starts_with(prefix)
@@ -1577,6 +1590,88 @@ slot_id = "sidebar"
             "diagnostic should explain the runtime consequence"
         );
         assert!(diagnostics[0].contains("ad-header"));
+    }
+
+    #[test]
+    fn a_slot_appended_this_run_never_absorbs_a_later_discovery() {
+        // Prefix reconciliation belongs to the operator's config. If a slot
+        // appended during this run could act as a prefix, `ad-top` would swallow
+        // `ad-top-sidebar` whenever discovery happened to see it first, dropping
+        // the absorbed slot's unit path and provider state, and no broad-prefix
+        // diagnostic would report it.
+        let existing = existing_config(
+            "gam_network_id = \"222\"\n\n\
+             [[slot]]\nid = \"sidebar\"\ndiv_id = \"sidebar-ad\"\n\
+             gam_unit_path = \"/222/sidebar\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 300, height = 600 }]\n",
+        );
+        let candidates = [
+            RenderSlot::from_evidence(
+                "ad-top",
+                "ad-top",
+                Some("/222/top".to_string()),
+                [(728, 90)],
+                vec!["/".to_string()],
+                false,
+            ),
+            RenderSlot::from_evidence(
+                "ad-top-sidebar",
+                "ad-top-sidebar",
+                Some("/222/top-sidebar".to_string()),
+                [(300, 250)],
+                vec!["/news/*".to_string()],
+                true,
+            ),
+        ];
+
+        for order in [[0_usize, 1], [1, 0]] {
+            let discovered: Vec<RenderSlot> = order
+                .iter()
+                .map(|index| candidates[*index].clone())
+                .collect();
+
+            let (merged, diagnostics) =
+                merge_render_slots_with_diagnostics(Some(&existing), discovered, false);
+
+            assert!(
+                diagnostics.is_empty(),
+                "no configured prefix claimed a discovered div in order {order:?}, got {diagnostics:?}"
+            );
+            assert_eq!(
+                merged.len(),
+                3,
+                "both discovered slots must survive in order {order:?}"
+            );
+            let sidebar_ad = merged
+                .iter()
+                .find(|slot| slot.div_id.as_deref() == Some("ad-top-sidebar"))
+                .unwrap_or_else(|| {
+                    panic!("the longer div must stay its own slot in order {order:?}")
+                });
+            assert_eq!(
+                sidebar_ad.gam_unit_path.as_deref(),
+                Some("/222/top-sidebar"),
+                "the absorbed slot's unit path must survive in order {order:?}"
+            );
+            assert_eq!(
+                sidebar_ad.page_patterns,
+                ["/news/*"],
+                "patterns must not be pooled in order {order:?}"
+            );
+            assert!(
+                sidebar_ad.prebid_bidders.is_some(),
+                "provider state must survive in order {order:?}"
+            );
+            let top = merged
+                .iter()
+                .find(|slot| slot.div_id.as_deref() == Some("ad-top"))
+                .unwrap_or_else(|| panic!("the shorter div must stay in order {order:?}"));
+            assert_eq!(
+                top.page_patterns,
+                ["/"],
+                "the longer slot's pattern must not leak into the shorter one in order {order:?}"
+            );
+        }
     }
 
     #[test]
