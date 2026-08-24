@@ -9,7 +9,8 @@ use crate::error::TrustedServerError;
 use crate::platform::{PlatformConfigStore, PlatformSecretStore, StoreName};
 use crate::settings::Settings;
 
-const DEFAULT_CONFIG_STORE_ID: &str = "trusted_server_config";
+/// Canonical logical config store used by Trusted Server app config.
+pub const DEFAULT_CONFIG_STORE_ID: &str = "trusted_server_config";
 const FASTLY_CHUNK_POINTER_KIND: &str = "fastly_config_chunks";
 const FASTLY_CONFIG_ENTRY_LIMIT: usize = 8_000;
 

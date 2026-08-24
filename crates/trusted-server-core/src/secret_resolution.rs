@@ -26,12 +26,13 @@ pub fn resolve_secret_references<C: AppConfigMeta>(
     secret_store: &dyn PlatformSecretStore,
     default_store_name: &StoreName,
 ) -> Result<(), Report<TrustedServerError>> {
+    let mut resolved_data = data.clone();
     for field in C::secret_fields() {
         if matches!(field.kind, SecretKind::StoreRef) {
             continue;
         }
         resolve_field(
-            data,
+            &mut resolved_data,
             &field,
             &field.path,
             "",
@@ -39,6 +40,7 @@ pub fn resolve_secret_references<C: AppConfigMeta>(
             default_store_name,
         )?;
     }
+    *data = resolved_data;
     Ok(())
 }
 
@@ -59,6 +61,19 @@ fn resolve_field(
             secret_store,
             default_store_name,
         ),
+        Some((SecretPathSegment::OptionalField(name), [])) => {
+            if matches!(node.get(name.as_ref()), None | Some(Value::Null)) {
+                return Ok(());
+            }
+            resolve_leaf(
+                node,
+                field,
+                name.as_ref(),
+                rendered_path,
+                secret_store,
+                default_store_name,
+            )
+        }
         Some((SecretPathSegment::Field(name), rest)) => {
             let next_path = join_field(rendered_path, name.as_ref());
             let child = node
@@ -67,6 +82,26 @@ fn resolve_field(
                 .ok_or_else(|| missing_path(&next_path))?;
             if child.is_null() {
                 return Err(missing_path(&next_path));
+            }
+            resolve_field(
+                child,
+                field,
+                rest,
+                &next_path,
+                secret_store,
+                default_store_name,
+            )
+        }
+        Some((SecretPathSegment::OptionalField(name), rest)) => {
+            let next_path = join_field(rendered_path, name.as_ref());
+            let Some(child) = node
+                .as_object_mut()
+                .and_then(|object| object.get_mut(name.as_ref()))
+            else {
+                return Ok(());
+            };
+            if child.is_null() {
+                return Ok(());
             }
             resolve_field(
                 child,
@@ -217,6 +252,14 @@ mod tests {
                         SecretPathSegment::Field("optional".into()),
                     ],
                 },
+                SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    optional: false,
+                    path: vec![
+                        SecretPathSegment::OptionalField("feature".into()),
+                        SecretPathSegment::Field("credential".into()),
+                    ],
+                },
             ]
         }
     }
@@ -226,6 +269,7 @@ mod tests {
             values: BTreeMap::from([
                 ("token-a".to_owned(), b"resolved-a".to_vec()),
                 ("token-b".to_owned(), b"resolved-b".to_vec()),
+                ("feature-key".to_owned(), b"resolved-feature".to_vec()),
             ]),
         }
     }
@@ -245,6 +289,24 @@ mod tests {
         assert_eq!(data["outer"][0]["token"], "resolved-a");
         assert_eq!(data["outer"][1]["token"], "resolved-b");
         assert!(data["outer"][0]["optional"].is_null());
+    }
+
+    #[test]
+    fn resolves_present_and_skips_absent_optional_intermediate() {
+        let mut absent = serde_json::json!({
+            "outer": [{"token": "token-a"}]
+        });
+        resolve_secret_references::<Fixture>(&mut absent, &store(), &StoreName::from("secrets"))
+            .expect("should skip absent optional intermediate");
+
+        let mut present = serde_json::json!({
+            "outer": [{"token": "token-a"}],
+            "feature": {"credential": "feature-key"}
+        });
+        resolve_secret_references::<Fixture>(&mut present, &store(), &StoreName::from("secrets"))
+            .expect("should resolve present optional intermediate");
+
+        assert_eq!(present["feature"]["credential"], "resolved-feature");
     }
 
     #[test]
