@@ -336,7 +336,6 @@ fn send_edgezero_response(
     request_filter_effects: Option<&RequestFilterEffects>,
 ) {
     apply_terminal_response_effects(&mut response, request_filter_effects);
-    crate::middleware::enforce_uncacheable_cache_privacy(&mut response);
 
     let (parts, body) = response.into_parts();
 
@@ -370,12 +369,10 @@ fn apply_terminal_response_effects(
     response: &mut HttpResponse,
     request_filter_effects: Option<&RequestFilterEffects>,
 ) {
-    let must_remain_private =
-        trusted_server_core::response_privacy::is_private_or_no_store(response.headers())
-            || response
-                .extensions()
-                .get::<TerminalPrivateResponse>()
-                .is_some();
+    let must_remain_private = response
+        .extensions()
+        .get::<TerminalPrivateResponse>()
+        .is_some();
     if let Some(effects) = request_filter_effects {
         effects.apply_to_response(response);
     }
@@ -383,10 +380,11 @@ fn apply_terminal_response_effects(
         trusted_server_core::response_privacy::enforce_private_no_store(response);
     }
 
-    // Final cache guard: EC finalization and request-filter effects may have
-    // added a per-user Set-Cookie after `apply_finalize_headers` ran, so
-    // re-apply the privacy downgrade before send.
+    // Final cache guards: EC finalization and request-filter effects may have
+    // added a per-user Set-Cookie or a private/no-store directive after
+    // `apply_finalize_headers` and normalized asset policy reapplication ran.
     crate::middleware::enforce_set_cookie_cache_privacy(response);
+    crate::middleware::enforce_uncacheable_cache_privacy(response);
 }
 
 const FALLBACK_UNAVAILABLE: &str = "unavailable";
@@ -612,6 +610,156 @@ mod tests {
         assert!(response.headers().get("surrogate-control").is_none());
         assert!(response.headers().get("cdn-cache-control").is_none());
         assert!(response.headers().get("etag").is_none());
+    }
+
+    #[test]
+    fn late_filter_effects_cannot_make_a_page_bids_response_public() {
+        let mut response = trusted_server_core::publisher::page_bids_preflight_denied();
+        let effects = RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("cache-control", "public, s-maxage=3600"),
+                HeaderMutation::set("surrogate-control", "max-age=3600"),
+                HeaderMutation::set("cdn-cache-control", "public, max-age=3600"),
+            ],
+        };
+
+        apply_terminal_response_effects(&mut response, Some(&effects));
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("private, no-store")
+        );
+        assert!(response.headers().get("surrogate-control").is_none());
+        assert!(response.headers().get("cdn-cache-control").is_none());
+    }
+
+    fn diagnostics_settings() -> Settings {
+        Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+
+            [integrations.gpt_diagnostics]
+            enabled = true
+            "#,
+        )
+        .expect("should parse diagnostics settings")
+    }
+
+    #[test]
+    fn late_filter_effects_cannot_make_an_active_diagnostics_response_public() {
+        // The narrowest hole: an established diagnostics session sets no new cookie, so
+        // the `Set-Cookie` privacy net never fires, and before this the decision only
+        // stamped `Cache-Control` without leaving a marker for the terminal guard.
+        let mut request = edgezero_core::http::request_builder()
+            .method(fastly::http::Method::GET)
+            .uri("https://test-publisher.com/article")
+            .header("sec-fetch-dest", "document")
+            .header("cookie", "__Host-ts-console=1")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let decision = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+            &diagnostics_settings(),
+            &mut request,
+        )
+        .expect("should prepare the diagnostics decision");
+        assert!(
+            decision.active(),
+            "the session cookie should activate diagnostics"
+        );
+
+        let mut response = response_builder()
+            .header("cache-control", "public, max-age=600")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        trusted_server_core::integrations::gpt_diagnostics::finalize_response(
+            &decision,
+            &mut response,
+        );
+
+        let effects = RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("cache-control", "public, s-maxage=3600"),
+                HeaderMutation::set("surrogate-control", "max-age=3600"),
+            ],
+        };
+
+        apply_terminal_response_effects(&mut response, Some(&effects));
+
+        assert!(
+            response.headers().get("set-cookie").is_none(),
+            "the case under test is the one with no Set-Cookie to protect it"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("private, no-store"),
+            "request-scoped diagnostics HTML must never become shared-cacheable"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "should strip CDN cache directives a late filter added"
+        );
+    }
+
+    #[test]
+    fn terminal_response_preserves_unmarked_origin_private_policy() {
+        let mut response = response_builder()
+            .header("cache-control", "private, max-age=600")
+            .header("etag", "\"origin\"")
+            .header("last-modified", "Wed, 12 Aug 2026 00:00:00 GMT")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+
+        apply_terminal_response_effects(&mut response, None);
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("private, max-age=600"),
+            "should preserve the origin browser-cache policy"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("etag")
+                .and_then(|value| value.to_str().ok()),
+            Some("\"origin\""),
+            "should preserve the origin validator"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("last-modified")
+                .and_then(|value| value.to_str().ok()),
+            Some("Wed, 12 Aug 2026 00:00:00 GMT"),
+            "should preserve the origin modification date"
+        );
     }
 
     #[test]

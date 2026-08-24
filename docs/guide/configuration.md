@@ -1614,8 +1614,6 @@ TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED=false
 
 ### Shared template assembly (`assembly_mode = "esi"`)
 
-### Shared template assembly (`assembly_mode = "esi"`)
-
 This configuration is an experimental validation spike scoped to
 [IABTechLab/trusted-server#1009](https://github.com/IABTechLab/trusted-server/issues/1009),
 not a settled production cache interface.
