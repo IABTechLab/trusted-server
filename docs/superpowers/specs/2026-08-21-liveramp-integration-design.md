@@ -312,22 +312,33 @@ APIs before calling `pbjs.processQueue()`:
 
 1. Capture and bind the real `pbjs.setConfig` and, when present,
    `pbjs.mergeConfig` implementations.
-2. Replace both public APIs with wrappers that only normalize calls containing
-   `userSync.userIds`. Other configuration calls pass through unchanged.
-3. For a `userSync.userIds` call, preserve every non-`identityLink` entry,
+2. Replace both public APIs with wrappers that normalize every call containing
+   a `userSync` object. Calls without `userSync` pass through unchanged.
+3. For a call with an explicit `userSync.userIds`, preserve every
+   non-`identityLink` entry,
    remove all publisher-supplied `identityLink` entries, and append exactly one
    operator-managed entry. Preserve sibling `userSync` and top-level fields.
-4. Read the already-effective `pbjs.getConfig('userSync.userIds')` value,
+4. For a `pbjs.setConfig` call whose `userSync` object omits `userIds`, read the
+   effective `pbjs.getConfig('userSync.userIds')` value and carry that list into
+   the replacement `userSync` object before normalizing it. Pinned Prebid
+   replaces a top-level `userSync` value in `setConfig`; it does not merge the
+   replacement with the current value. This preservation step prevents an
+   otherwise unrelated update such as `userSync.syncDelay` from silently
+   deleting the managed entry and every publisher User ID entry. Apply the
+   same invariant to `mergeConfig`, even though its current implementation
+   deep-merges, so ownership does not depend on an undocumented closure detail.
+5. During initial installation, read the already-effective
+   `pbjs.getConfig('userSync.userIds')` value,
    normalize its supported array/config shape, preserve its non-`identityLink`
    entries, append the managed entry, and apply that merged list synchronously
    through the captured function. This covers publisher configuration that ran
    after the external Prebid bundle loaded but before the deferred TSJS shim.
    An absent or malformed effective list degrades to an empty publisher list.
    Complete this step before processing any existing queue entries.
-5. Call `pbjs.processQueue()`. Queued publisher `setConfig` and `mergeConfig`
+6. Call `pbjs.processQueue()`. Queued publisher `setConfig` and `mergeConfig`
    calls flow through the wrappers, so a later queued `requestBids` observes
    the managed entry.
-6. Keep the wrappers installed after queue processing so later publisher calls
+7. Keep the wrappers installed after queue processing so later publisher calls
    through either public configuration API cannot silently replace or delete
    the operator-owned LiveRamp policy. Repeated TSJS installation must not
    stack wrappers.
@@ -393,6 +404,19 @@ ingestion provide reuse on later requests.
   Equivalent GPP/US-state activity controls (`gppControl_usnat`,
   `gppControl_usstates`) remain unbundled; US opt-outs are still enforced only
   at the server's forwarding gate.
+- Pinned Prebid's default `tcfControl` rules do not treat every denied purpose
+  identically. Purpose 1 plus the module's GVL vendor consent controls
+  IdentityLink device access, resolution, and storage. Purpose 2 controls bid
+  fetching. Purpose 3 has no standalone default `tcfControl` rule. Purpose 4
+  controls user-provided-data activity. With the default
+  `eidsRequireP4Consent: false`, EID transmission is permitted when any Purpose
+  2–10 has the required purpose/legal-interest and vendor basis; publishers may
+  opt into requiring Purpose 4 specifically. Therefore a Purpose 3 or Purpose
+  4 denial alone does not establish that the LiveRamp vendor request or
+  `idl_env` write is blocked. Automated artifact tests must vary Purpose 1,
+  Purposes 3/4, and vendor 97 independently, and the operator guide must
+  describe these exact defaults rather than claiming that every denied purpose
+  blocks resolution.
 - LiveRamp envelope values are opaque identifiers. They must never appear in
   logs, public diagnostics, error bodies, or telemetry dimensions.
 - The implementation does not collect plaintext or hashed email and does not
@@ -413,7 +437,9 @@ ingestion provide reuse on later requests.
 | Invalid Placement ID or unsafe bounds               | Reject configuration at startup/validation time.                                                   |
 | `identityLinkIdSystem` missing from external bundle | Emit existing missing-module diagnostics; continue auctions without LiveRamp EID.                  |
 | LiveRamp network or recognition failure             | Prebid module yields no EID; continue auction normally.                                            |
-| No consent or opted-out user                        | Forward no LiveRamp EID; continue auction normally.                                                |
+| TCF Purpose 1 or LiveRamp vendor consent denied     | Default `tcfControl` blocks IdentityLink resolution/storage; continue auction normally.            |
+| TCF Purpose 3 or 4 denied alone                     | Default rules do not prove resolution/storage is blocked; publisher policy may add stricter rules. |
+| US-state opt-out                                    | Server forwarding gate drops the LiveRamp EID; browser activity controls remain a documented gap.  |
 | Malformed LiveRamp EID                              | Existing client/server EID sanitizers drop it.                                                     |
 | Oversized `ts-eids` payload                         | Existing bounded cookie behavior truncates whole UID/source entries; no partial UID is written.    |
 | EC/KV unavailable                                   | Current-request EID can still reach `/auction`; persistence degrades without blocking the auction. |
@@ -462,7 +488,12 @@ Add tests in
 - a publisher `identityLink` update through `setConfig` after `processQueue()`
   is normalized back to the operator-managed values;
 - repeated installation does not stack either configuration wrapper;
-- configuration calls unrelated to `userSync.userIds` pass through unchanged;
+- configuration calls without `userSync` pass through unchanged;
+- a queued or late `setConfig` call that replaces `userSync` without an
+  explicit `userIds` list preserves the effective publisher entries and the
+  single managed `identityLink` entry;
+- a queued or late `mergeConfig` call whose `userSync` object omits `userIds`
+  preserves the same effective list;
 - missing `identityLinkIdSystem` appears in existing diagnostics;
 - `getUserIdsAsEids()` output for `liveramp.com` enters the current auction;
 - malformed and empty envelope values are dropped;
@@ -478,6 +509,13 @@ Extend external bundle tests to prove:
 - explicitly selecting it stamps the module into the manifest;
 - selecting a bundle without it produces a deterministic diagnostic when
   LiveRamp configuration is present.
+- a generated-real-bundle case that denies only Purpose 1 while granting
+  Purposes 3/4 and vendor 97 produces no LiveRamp request and no `idl_env`;
+- a separate case that denies only vendor 97 while granting Purposes 1/3/4
+  produces no LiveRamp request and no `idl_env`;
+- separate cases that deny only Purpose 3 or only Purpose 4 while granting
+  Purpose 1 and vendor 97 still produce one LiveRamp request and write
+  `idl_env` under pinned Prebid's default rules.
 
 ### 11.4 Rust auction/EC regression tests
 
