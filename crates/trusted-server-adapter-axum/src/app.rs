@@ -37,7 +37,7 @@ use trusted_server_core::settings_data::{
 
 use trusted_server_core::platform::RuntimeServices;
 
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
+use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
 use crate::platform::{AxumPlatformConfigStore, build_runtime_services};
 
 // ---------------------------------------------------------------------------
@@ -600,6 +600,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
     let fallback = fallback_handler(Arc::clone(state));
 
     let mut router = RouterService::builder()
+        // Outermost middleware: strips the configured trusted-client-IP
+        // headers before anything else sees the request. Must stay first —
+        // any middleware registered ahead of it would observe the
+        // shared-secret authentication header.
+        .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
         .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
         .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
 

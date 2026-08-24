@@ -35,7 +35,9 @@ use trusted_server_core::request_signing::{
 };
 use trusted_server_core::settings::Settings;
 
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware};
+use crate::middleware::{
+    AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware, SanitizeRequestMiddleware,
+};
 use crate::platform::build_runtime_services;
 
 // ---------------------------------------------------------------------------
@@ -766,6 +768,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             |_ctx: RequestContext| async { Ok::<Response, EdgeError>(legacy_admin_alias_denied()) };
 
         let mut builder = RouterService::builder()
+            // Outermost middleware: strips the configured trusted-client-IP
+            // headers before anything else sees the request. Must stay first —
+            // any middleware registered ahead of it would observe the
+            // shared-secret authentication header.
+            .middleware(SanitizeRequestMiddleware::new(Arc::clone(&state.settings)))
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             // Innermost middleware: normalize every routed request (strip

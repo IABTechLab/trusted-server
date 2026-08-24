@@ -18,6 +18,7 @@ use validator::{Validate, ValidationError};
 use crate::auction_config_types::AuctionConfig;
 use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
+use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
@@ -2670,7 +2671,7 @@ fn validate_trusted_client_ip(config: &TrustedClientIpConfig) -> Result<(), Vali
     }
 
     for header in [&ip_header, &auth_header] {
-        if matches!(header.as_str(), "x-ts-tls-protocol" | "x-ts-tls-cipher") {
+        if INTERNAL_HEADERS.contains(&header.as_str()) {
             return Err(ValidationError::new("reserved_trusted_client_ip_header"));
         }
     }
@@ -3690,23 +3691,26 @@ mod tests {
     }
 
     #[test]
-    fn trusted_client_ip_rejects_reserved_tls_bridge_headers() {
+    fn trusted_client_ip_rejects_reserved_internal_headers() {
         for (ip_header, auth_header) in [
             ("x-ts-tls-protocol", "x-trusted-client-auth"),
             ("x-ts-tls-cipher", "x-trusted-client-auth"),
             ("fastly-client-ip", "x-ts-tls-protocol"),
             ("fastly-client-ip", "x-ts-tls-cipher"),
+            ("x-forwarded-for", "x-trusted-client-auth"),
+            ("x-geo-info-available", "x-trusted-client-auth"),
+            ("fastly-client-ip", "x-ts-ec"),
         ] {
             let error = Settings::from_toml(&trusted_client_ip_toml(
                 ip_header,
                 auth_header,
                 "fictional-shared-secret-0123456789",
             ))
-            .expect_err("should reject reserved TLS bridge headers");
+            .expect_err("should reject reserved internal headers");
 
             assert!(
                 format!("{error:?}").contains("reserved_trusted_client_ip_header"),
-                "should identify reserved TLS bridge headers"
+                "should identify reserved internal headers"
             );
         }
     }
