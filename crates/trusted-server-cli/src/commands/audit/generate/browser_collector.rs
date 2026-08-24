@@ -216,6 +216,15 @@ struct SessionSettings {
     settle_max: Duration,
 }
 
+/// Per-page behavior shared by every tab in one browser session.
+#[derive(Debug, Clone, Copy)]
+struct PageCollectionSettings {
+    assume_consent: bool,
+    scroll: bool,
+    settle_quiet: Duration,
+    settle_max: Duration,
+}
+
 impl BrowserAuditCollector {
     fn session(&self) -> SessionSettings {
         SessionSettings {
@@ -405,6 +414,12 @@ async fn with_browser(
     })?;
 
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let page_settings = PageCollectionSettings {
+        assume_consent,
+        scroll,
+        settle_quiet,
+        settle_max,
+    };
 
     // Sitemap discovery is a whole-site fact, so only the first target pays for it.
     let mut result: CliResult<()> = Ok(());
@@ -431,17 +446,9 @@ async fn with_browser(
             result = Err(error);
             break;
         }
-        let collected = collect_page_from_browser(
-            &mut browser,
-            &target,
-            cookies,
-            index == 0,
-            assume_consent,
-            scroll,
-            settle_quiet,
-            settle_max,
-        )
-        .await;
+        let collected =
+            collect_page_from_browser(&mut browser, &target, cookies, index == 0, page_settings)
+                .await;
         if index == 0
             && let Some(planner) = root_planner.as_deref_mut()
             && let Ok(root_page) = &collected
@@ -520,10 +527,7 @@ async fn collect_page_from_browser(
     target_url: &Url,
     cookies: &[(String, String)],
     discover_sitemap: bool,
-    assume_consent: bool,
-    scroll: bool,
-    settle_quiet: Duration,
-    settle_max: Duration,
+    settings: PageCollectionSettings,
 ) -> CliResult<CollectedPage> {
     // Per-page failures below return the message unlogged: the crawl attributes
     // each one to its page once, and `report_error` would also log an unscoped
@@ -539,10 +543,10 @@ async fn collect_page_from_browser(
         &page,
         target_url,
         discover_sitemap,
-        assume_consent,
-        scroll,
-        settle_quiet,
-        settle_max,
+        settings.assume_consent,
+        settings.scroll,
+        settings.settle_quiet,
+        settings.settle_max,
     )
     .await;
     let close_result = timeout(BROWSER_CLOSE_TIMEOUT, page.close()).await;
