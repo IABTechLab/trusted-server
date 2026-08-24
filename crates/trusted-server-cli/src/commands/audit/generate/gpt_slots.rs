@@ -273,16 +273,19 @@ fn volatile_prefix_before_placement(div_id: &str) -> Option<String> {
     None
 }
 
-/// Whether one div-id segment is a per-render token: a long leading digit run (a
-/// millisecond timestamp) followed by more alphanumerics (a random suffix).
+/// Whether one div-id segment is a per-render token: a long leading digit run
+/// followed by alphanumerics, or a shorter counter paired with a long random
+/// suffix.
 ///
-/// Both halves are required. A bare digit run is how publishers write stable
-/// placement indices, and a token with a non-alphanumeric character is some
-/// other structure than a generated id.
+/// Both halves are required. Eight-digit values need at least eight suffix
+/// characters, which avoids treating short calendar labels as generated ids. A
+/// bare digit run is how publishers write stable placement indices, and a token
+/// with a non-alphanumeric character is some other structure than a generated
+/// id.
 fn is_per_render_token(segment: &str) -> bool {
     let leading_digits = segment.bytes().take_while(u8::is_ascii_digit).count();
-    leading_digits >= 10
-        && segment.len() > leading_digits
+    let suffix_length = segment.len().saturating_sub(leading_digits);
+    ((leading_digits >= 10 && suffix_length >= 1) || (leading_digits >= 8 && suffix_length >= 8))
         && segment.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
@@ -613,6 +616,7 @@ mod tests {
         &dids=div-gpt-ad-leaderboard-1\
         &prev_scp=ad-loc%3Dleaderboard-1%26baseDivId%3Ddiv-gpt-ad-leaderboard-1%26test%3Dprebid%26tude%3Dtrue\
         &pb_szs=970x250%7C620x366";
+    const AUTOBLOG_VOLATILE_DIV: &str = "rh-gam-kso_263392209ccovqIJPwwl_ei_overlay_1";
 
     fn request(url: &str) -> CollectedRequest {
         CollectedRequest {
@@ -1257,12 +1261,49 @@ mod tests {
     }
 
     #[test]
+    fn autoblog_shaped_singleton_registry_slot_is_refused() {
+        let discovered = discover_gpt_slots(
+            &[registry_slot(
+                "/22558409563,88059007/autoblog.com_Overlay_Mobile_ESP_oXD8xlB6P1",
+                AUTOBLOG_VOLATILE_DIV,
+                &[(300, 250)],
+            )],
+            &[],
+            false,
+        );
+
+        assert!(discovered.had_slot_evidence);
+        assert!(
+            discovered.slots.is_empty(),
+            "a singleton per-render ID must not be written literally"
+        );
+        assert_volatile_prefix_warning(&discovered, "rh-gam-kso");
+    }
+
+    #[test]
+    fn autoblog_shaped_singleton_request_slot_is_refused() {
+        let discovered = from_requests(&[request(&format!(
+            "https://securepubads.g.doubleclick.net/gampad/ads?\
+             iu_parts=22558409563%2Cautoblog.com_Overlay_Mobile_ESP_oXD8xlB6P1\
+             &dids={AUTOBLOG_VOLATILE_DIV}&prev_iu_szs=300x250"
+        ))]);
+
+        assert!(discovered.had_slot_evidence);
+        assert!(
+            discovered.slots.is_empty(),
+            "request fallback must not write a singleton per-render ID"
+        );
+        assert_volatile_prefix_warning(&discovered, "rh-gam-kso");
+    }
+
+    #[test]
     fn volatile_prefix_covers_every_placement_after_the_token() {
         // The token's position is what makes the id unusable, so the placement
         // that follows it is irrelevant: every one of these leaves `vendor-tag`
         // as the only stable prefix, and that prefix reaches all of them.
         for volatile in [
             "vendor-tag_1724112345678AbCdEfGh_slot_inarticle_1",
+            "vendor-tag_12345678AbCdEfGh_slot_inarticle_1",
             "vendor-tag_1724112345678AbCdEfGh_slot_overlay_1-container",
             "vendor-tag_1724112345678AbCdEfGh_slot_sidebar_1",
             "vendor-tag_1724112345678AbCdEfGh_slot_overlay_stable",
@@ -1284,6 +1325,9 @@ mod tests {
             // A bare digit run is how stable placement indices are written.
             "vendor-tag_12345678_slot_inarticle_1",
             "ad-slot-1234567890123456-tail",
+            // Shorter counter/suffix combinations do not carry enough entropy.
+            "vendor-tag_1234567AbCdEfGh_slot_inarticle_1",
+            "vendor-tag_12345678AbCdEfG_slot_inarticle_1",
             // An eight-digit calendar date plus a stable suffix is not a
             // timestamp-like per-render token.
             "promo-20260820a-sidebar",
