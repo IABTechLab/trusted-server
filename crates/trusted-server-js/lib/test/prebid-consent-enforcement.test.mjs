@@ -103,7 +103,7 @@ afterAll(() => {
 // `tcfControl` reads the CMP's structured `vendorData`, not the encoded string,
 // so the purpose and vendor grants below are what the rules actually evaluate.
 // The string only has to be present and non-empty.
-function tcData(granted) {
+function tcData({ purpose1 = true, purpose3 = true, purpose4 = true, vendor97 = true } = {}) {
   return {
     gdprApplies: true,
     tcString: 'CPexampleTCStringForTests',
@@ -111,11 +111,11 @@ function tcData(granted) {
     cmpStatus: 'loaded',
     apiVersion: '2',
     purpose: {
-      consents: { 1: granted, 3: granted, 4: granted },
+      consents: { 1: purpose1, 3: purpose3, 4: purpose4 },
       legitimateInterests: {},
     },
     vendor: {
-      consents: { [LIVE_RAMP_GVL_VENDOR_ID]: granted },
+      consents: { [LIVE_RAMP_GVL_VENDOR_ID]: vendor97 },
       legitimateInterests: {},
     },
     publisher: { restrictions: {} },
@@ -125,11 +125,11 @@ function tcData(granted) {
 
 /**
  * Evaluates both artifacts on a GDPR page whose CMP grants or denies the
- * purposes IdentityLink needs, then runs one auction.
+ * purpose and vendor grants, then runs one auction.
  *
  * @returns the URLs the page requested and the cookies it managed to set.
  */
-async function runGdprPage(granted) {
+async function runGdprPage(grants = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
     url: 'https://pub.example.com/article',
     runScripts: 'outside-only',
@@ -160,7 +160,7 @@ async function runGdprPage(granted) {
     pageWindow.isSecureContext = true;
   }
 
-  const consentData = tcData(granted);
+  const consentData = tcData(grants);
   pageWindow.__tcfapi = (command, _version, callback) => {
     if (command === 'addEventListener' || command === 'getTCData') {
       callback(consentData, true);
@@ -209,15 +209,37 @@ describe('external bundle TCF enforcement', () => {
   });
 
   it('blocks IdentityLink storage and vendor calls when Purpose 1 is denied', async () => {
-    const { requestedUrls, cookies } = await runGdprPage(false);
+    const { requestedUrls, cookies } = await runGdprPage({ purpose1: false });
 
     expect(envelopeRequests(requestedUrls)).toEqual([]);
     expect(cookies).not.toContain(LIVE_RAMP_STORAGE_NAME);
     expect(cookies).not.toContain('_lr_retry_request');
   });
 
-  it('still resolves IdentityLink when the required purposes are granted', async () => {
-    const { requestedUrls, cookies } = await runGdprPage(true);
+  it('blocks IdentityLink storage and vendor calls when vendor 97 is denied', async () => {
+    const { requestedUrls, cookies } = await runGdprPage({ vendor97: false });
+
+    expect(envelopeRequests(requestedUrls)).toEqual([]);
+    expect(cookies).not.toContain(LIVE_RAMP_STORAGE_NAME);
+    expect(cookies).not.toContain('_lr_retry_request');
+  });
+
+  it('still resolves IdentityLink when Purpose 3 alone is denied', async () => {
+    const { requestedUrls, cookies } = await runGdprPage({ purpose3: false });
+
+    expect(envelopeRequests(requestedUrls)).toHaveLength(1);
+    expect(cookies).toContain(LIVE_RAMP_STORAGE_NAME);
+  });
+
+  it('still resolves IdentityLink when Purpose 4 alone is denied', async () => {
+    const { requestedUrls, cookies } = await runGdprPage({ purpose4: false });
+
+    expect(envelopeRequests(requestedUrls)).toHaveLength(1);
+    expect(cookies).toContain(LIVE_RAMP_STORAGE_NAME);
+  });
+
+  it('resolves IdentityLink when all relevant grants are present', async () => {
+    const { requestedUrls, cookies } = await runGdprPage();
 
     expect(envelopeRequests(requestedUrls)).toHaveLength(1);
     expect(cookies).toContain(LIVE_RAMP_STORAGE_NAME);

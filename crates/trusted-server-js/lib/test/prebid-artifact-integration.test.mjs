@@ -144,6 +144,10 @@ describe('external bundle + served shim evaluated together', () => {
     };
 
     pageWindow.eval(bundleCode);
+    pageWindow.pbjs.setConfig({
+      userSync: { userIds: [{ name: 'sharedId' }] },
+    });
+    pageWindow.pbjs.setConfig({ userSync: { syncDelay: 41 } });
 
     expect(typeof pageWindow.pbjs.requestBids).toBe('function');
     expect(typeof pageWindow.pbjs.registerBidAdapter).toBe('function');
@@ -168,6 +172,7 @@ describe('external bundle + served shim evaluated together', () => {
 
     expect(pageWindow.pbjs.getConfig('userSync.userIds')).toEqual(
       expect.arrayContaining([
+        expect.objectContaining({ name: 'sharedId' }),
         expect.objectContaining({
           name: 'identityLink',
           params: { pid: '999', notUse3P: false },
@@ -175,6 +180,22 @@ describe('external bundle + served shim evaluated together', () => {
         }),
       ])
     );
+
+    // Characterize the pinned Prebid artifact: partial userSync updates retain
+    // its effective User ID list, including the operator-managed entry.
+    pageWindow.pbjs.setConfig({ userSync: { syncDelay: 50 } });
+
+    const userIdsAfterPartialUpdate = pageWindow.pbjs.getConfig('userSync.userIds');
+    expect(userIdsAfterPartialUpdate.filter(({ name }) => name === 'identityLink')).toEqual([
+      expect.objectContaining({
+        name: 'identityLink',
+        params: { pid: '999', notUse3P: false },
+      }),
+    ]);
+    expect(userIdsAfterPartialUpdate).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'sharedId' })])
+    );
+    expect(pageWindow.pbjs.getConfig('userSync.syncDelay')).toBe(50);
 
     // Exercise the real Prebid mergeConfig implementation. It closes over
     // Prebid's internal setConfig, so the shim must guard mergeConfig itself
@@ -198,6 +219,20 @@ describe('external bundle + served shim evaluated together', () => {
     expect(mergedUserIds).toEqual(
       expect.arrayContaining([expect.objectContaining({ name: 'sharedId' })])
     );
+
+    pageWindow.pbjs.mergeConfig({ userSync: { syncDelay: 75 } });
+
+    const userIdsAfterPartialMerge = pageWindow.pbjs.getConfig('userSync.userIds');
+    expect(userIdsAfterPartialMerge.filter(({ name }) => name === 'identityLink')).toEqual([
+      expect.objectContaining({
+        name: 'identityLink',
+        params: { pid: '999', notUse3P: false },
+      }),
+    ]);
+    expect(userIdsAfterPartialMerge).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'sharedId' })])
+    );
+    expect(pageWindow.pbjs.getConfig('userSync.syncDelay')).toBe(75);
 
     // A second evaluation (double script inclusion, or a legacy bundle that
     // still carries a baked-in shim running after this one) must be a no-op.

@@ -318,15 +318,12 @@ APIs before calling `pbjs.processQueue()`:
    non-`identityLink` entry,
    remove all publisher-supplied `identityLink` entries, and append exactly one
    operator-managed entry. Preserve sibling `userSync` and top-level fields.
-4. For a `pbjs.setConfig` call whose `userSync` object omits `userIds`, read the
-   effective `pbjs.getConfig('userSync.userIds')` value and carry that list into
-   the replacement `userSync` object before normalizing it. Pinned Prebid
-   replaces a top-level `userSync` value in `setConfig`; it does not merge the
-   replacement with the current value. This preservation step prevents an
-   otherwise unrelated update such as `userSync.syncDelay` from silently
-   deleting the managed entry and every publisher User ID entry. Apply the
-   same invariant to `mergeConfig`, even though its current implementation
-   deep-merges, so ownership does not depend on an undocumented closure detail.
+4. Calls whose `userSync` object omits `userIds` pass through unchanged. The
+   pinned generated Prebid artifact retains its effective `userIds` defaults
+   across partial `setConfig` and `mergeConfig` updates, so injecting a copied
+   list in the shim would duplicate Prebid behavior and make the wrapper depend
+   on a mocked configuration model that does not match the shipped artifact.
+   A real-artifact characterization test protects this pinned behavior.
 5. During initial installation, read the already-effective
    `pbjs.getConfig('userSync.userIds')` value,
    normalize its supported array/config shape, preserve its non-`identityLink`
@@ -488,12 +485,8 @@ Add tests in
 - a publisher `identityLink` update through `setConfig` after `processQueue()`
   is normalized back to the operator-managed values;
 - repeated installation does not stack either configuration wrapper;
-- configuration calls without `userSync` pass through unchanged;
-- a queued or late `setConfig` call that replaces `userSync` without an
-  explicit `userIds` list preserves the effective publisher entries and the
-  single managed `identityLink` entry;
-- a queued or late `mergeConfig` call whose `userSync` object omits `userIds`
-  preserves the same effective list;
+- configuration calls without an explicit `userIds` list pass through
+  unchanged;
 - missing `identityLinkIdSystem` appears in existing diagnostics;
 - `getUserIdsAsEids()` output for `liveramp.com` enters the current auction;
 - malformed and empty envelope values are dropped;
@@ -516,6 +509,8 @@ Extend external bundle tests to prove:
 - separate cases that deny only Purpose 3 or only Purpose 4 while granting
   Purpose 1 and vendor 97 still produce one LiveRamp request and write
   `idl_env` under pinned Prebid's default rules.
+- a generated-real-bundle case proves a partial `userSync` update retains the
+  publisher entry and exactly one managed `identityLink` entry.
 
 ### 11.4 Rust auction/EC regression tests
 

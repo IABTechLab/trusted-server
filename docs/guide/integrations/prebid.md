@@ -131,14 +131,13 @@ regenerating and re-uploading the bundle (and pushing the updated
 rollout. The shim refuses to install twice on one page via the
 `window.__tsjsPrebidShimInstalled` sentinel.
 
-The consent modules include Prebid's `tcfControl`, so a regenerated bundle
-**enforces** the TCF signal it collects rather than only reporting it. Under
-GDPR, activities whose purposes the CMP denies — device access, user sync, EID
-enrichment and transmission, bid requests — are blocked client-side for every
-bidder and User ID module, not only for LiveRamp. Publishers whose CMP does not
-actually grant the purposes their current setup relies on will see EU activity
-drop once they regenerate, so validate a regenerated bundle against a live CMP
-before rolling it out broadly.
+The consent modules include Prebid's `tcfControl`, so a regenerated bundle can
+enforce the TCF signal it collects rather than only reporting it. Its default
+rules are activity-specific. For the managed IdentityLink entry, Purpose 1 and
+LiveRamp vendor consent gate browser resolution and storage. Purpose 3 has no
+standalone default rule, while Purpose 4 controls user-provided-data activity
+rather than IdentityLink resolution. Validate a regenerated bundle against a
+live CMP before rolling it out broadly.
 
 ## Debug Mode
 
@@ -517,11 +516,19 @@ list to take the generator's default preset, which includes it.
 
 The generated bundle carries Prebid's `tcfControl` module alongside the
 `consentManagement*` modules. That pairing is what makes the TCF signal
-enforceable: `consentManagement*` only retrieves the consent string, while
-`tcfControl` registers the activity controls (device access, user sync, EID
-enrichment and transmission) that act on it. A bundle built without it collects
-consent and then ignores it — every User ID submodule would still write browser
-storage and still call its vendor endpoint on a denied purpose.
+enforceable: `consentManagement*` retrieves the consent data, while `tcfControl`
+registers activity controls that act on it. Under pinned Prebid's defaults,
+Purpose 1 and LiveRamp's GVL vendor consent (vendor 97) gate IdentityLink
+resolution and storage. Purpose 3 has no standalone default rule. Purpose 4
+controls user-provided-data activity, but denying it alone does not block
+IdentityLink resolution or storage.
+
+Default EID transmission accepts a qualifying purpose and vendor basis from any
+of Purposes 2–10. Publishers can require Purpose 4 specifically by enabling
+Prebid's `eidsRequireP4Consent` setting. These are the generated bundle's TCF
+defaults; equivalent GPP/US-state browser activity-control modules are not
+bundled, so US-state opt-outs remain enforced at Trusted Server's forwarding
+gate.
 
 When enabled, Trusted Server owns one deterministic `identityLink` entry in
 `userSync.userIds` for publisher configuration applied through the public
@@ -577,15 +584,16 @@ server-to-server ATS API.
 
 ### Degraded behavior
 
-| Condition                                         | Result                                                                 |
-| ------------------------------------------------- | ---------------------------------------------------------------------- |
-| Required TCF purposes are denied                  | `tcfControl` blocks resolution: no vendor call, no `idl_env`, no EID   |
-| The user opts out under a US state signal         | No LiveRamp EID is forwarded; the auction continues                    |
-| LiveRamp cannot recognize the browser             | IdentityLink yields no EID; the auction continues                      |
-| LiveRamp network resolution fails                 | The current auction continues without RampID                           |
-| `identityLinkIdSystem` is missing from the bundle | Existing diagnostics report the missing module; auctions continue      |
-| The origin is not approved by LiveRamp            | Resolution yields no usable EID; the auction continues                 |
-| EC/KV is unavailable                              | A current-request EID can still reach `/auction`; persistence degrades |
+| Condition                                          | Result                                                                  |
+| -------------------------------------------------- | ----------------------------------------------------------------------- |
+| TCF Purpose 1 or LiveRamp vendor consent is denied | Default `tcfControl` blocks IdentityLink resolution and storage         |
+| TCF Purpose 3 or 4 alone is denied                 | Resolution/storage continues under defaults; publisher rules may differ |
+| The user opts out under a US state signal          | No LiveRamp EID is forwarded; the auction continues                     |
+| LiveRamp cannot recognize the browser              | IdentityLink yields no EID; the auction continues                       |
+| LiveRamp network resolution fails                  | The current auction continues without RampID                            |
+| `identityLinkIdSystem` is missing from the bundle  | Existing diagnostics report the missing module; auctions continue       |
+| The origin is not approved by LiveRamp             | Resolution yields no usable EID; the auction continues                  |
+| EC/KV is unavailable                               | A current-request EID can still reach `/auction`; persistence degrades  |
 
 ### Credential-based validation
 

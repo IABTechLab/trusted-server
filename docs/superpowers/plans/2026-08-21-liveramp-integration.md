@@ -944,55 +944,17 @@ Do not create an empty verification commit.
 ## Correction tasks added after PR #1054 review (2026-08-24)
 
 These tasks implement the reviewed correction in the specification. Complete
-them in order and preserve the red/green evidence for the managed-config bug.
+them in order and preserve artifact-level evidence for configuration behavior.
 
-## Task 6: Preserve managed IDs across partial `userSync` replacement
+## Task 6: Characterize partial `userSync` updates
 
 **Files:**
 
-- Modify: `crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts:985`
 - Modify: `crates/trusted-server-js/lib/test/prebid-artifact-integration.test.mjs:179`
-- Modify: `crates/trusted-server-js/lib/src/integrations/prebid/index.ts:228-273`
-- Modify: `crates/trusted-server-js/lib/src/integrations/prebid/index.ts:1169-1216`
 
-- [ ] **Step 1: Replace the unsafe pass-through unit test with failing ownership regressions**
+- [x] **Step 1: Test the review premise against the generated artifact**
 
-Change the current `passes unrelated publisher configuration through by
-reference` test so only a configuration without `userSync` must retain object
-identity. Add queued and late cases for both public APIs. Each case must arrange
-`pbjs.getConfig('userSync.userIds')` to return a publisher entry plus the
-managed entry, invoke a partial update such as:
-
-```ts
-mockPbjs.setConfig({
-  priceGranularity: 'medium',
-  userSync: { syncDelay: 50 },
-})
-```
-
-and assert that the captured call contains:
-
-```ts
-expect.objectContaining({
-  priceGranularity: 'medium',
-  userSync: {
-    syncDelay: 50,
-    userIds: [{ name: 'sharedId' }, EXPECTED_IDENTITY_LINK],
-  },
-})
-```
-
-For `mergeConfig`, assert the same invariant without depending on its current
-internal deep-merge implementation. Its late-call case must change the
-`mockGetConfig` result after installation—for example from `sharedId` to
-`id5Id`—before invoking the partial update, then assert that the newly effective
-`id5Id` survives. This proves the wrapper reads at call time instead of caching
-the installation-time list. Keep the existing explicit-`userIds`, idempotence,
-throwing-accessor, and missing-`getConfig` cases.
-
-- [ ] **Step 2: Add a failing real-artifact replacement regression**
-
-After the existing real `mergeConfig` assertions, call:
+Preconfigure a publisher `sharedId`, install the shim, then call:
 
 ```js
 pageWindow.pbjs.setConfig({ userSync: { syncDelay: 50 } })
@@ -1000,10 +962,10 @@ pageWindow.pbjs.setConfig({ userSync: { syncDelay: 50 } })
 
 Assert that `getConfig('userSync.userIds')` still contains `sharedId` and exactly
 one managed `identityLink`, and that `getConfig('userSync.syncDelay')` is `50`.
-This test must use the generated Prebid bundle and generated TSJS shim, not a
-mock of `setConfig`.
+This test uses the generated Prebid bundle and generated TSJS shim, not a mock
+of `setConfig`.
 
-- [ ] **Step 3: Run the focused tests and verify the ownership regression is red**
+- [x] **Step 2: Verify actual pinned behavior**
 
 Run:
 
@@ -1012,41 +974,18 @@ cd crates/trusted-server-js/lib
 npx vitest run test/integrations/prebid/index.test.ts test/prebid-artifact-integration.test.mjs
 ```
 
-Expected: the new partial-`userSync` assertions fail because the managed and
-publisher User ID entries disappear. Existing tests must continue to execute.
+Observed: all focused tests pass. The pinned Prebid artifact retains its
+effective `userIds` list across the partial update. Mock-only tests that expected
+the shim to inject `userIds` into the forwarded argument were discarded because
+the mock does not model the shipped artifact's effective configuration behavior.
+No production wrapper change is required.
 
-- [ ] **Step 4: Implement the minimal normalization correction**
-
-Refactor the managed helper so it distinguishes these cases:
-
-```ts
-// No userSync object: return the publisher object unchanged.
-// Explicit userSync.userIds: normalize that supplied list.
-// userSync without userIds: read the effective list through bound getConfig,
-// carry it into the replacement object, then normalize it.
-```
-
-Read `getConfig('userSync.userIds')` at call time so late publisher changes are
-preserved. If `getConfig` is unavailable and `userIds` is omitted, retain the
-existing fail-open behavior rather than fabricating an empty publisher list.
-Build a fresh managed entry for every normalization and continue catching
-throwing page-owned accessors.
-
-- [ ] **Step 5: Re-run focused tests and verify green**
-
-Run the Step 3 command again.
-
-Expected: all focused unit and real-artifact tests pass with no unhandled
-errors.
-
-- [ ] **Step 6: Commit the ownership correction**
+- [x] **Step 3: Commit the artifact characterization**
 
 ```bash
 git add \
-  crates/trusted-server-js/lib/src/integrations/prebid/index.ts \
-  crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts \
   crates/trusted-server-js/lib/test/prebid-artifact-integration.test.mjs
-git commit -m "Preserve managed LiveRamp IDs across userSync updates"
+git commit -m "Characterize partial Prebid userSync updates"
 ```
 
 ## Task 7: Characterize exact default TCF enforcement
@@ -1058,7 +997,7 @@ git commit -m "Preserve managed LiveRamp IDs across userSync updates"
 - Modify: `docs/guide/integrations/prebid.md:518-524`
 - Modify: `docs/guide/integrations/prebid.md:578-588`
 
-- [ ] **Step 1: Replace the combined consent boolean with independent grants**
+- [x] **Step 1: Replace the combined consent boolean with independent grants**
 
 Change the fixture API to accept explicit grants with safe defaults:
 
@@ -1085,7 +1024,7 @@ function tcData({
 
 Pass this object through `runGdprPage` without combining the grants.
 
-- [ ] **Step 2: Add four independent artifact cases plus the granted baseline**
+- [x] **Step 2: Add four independent artifact cases plus the granted baseline**
 
 Assert the exact pinned defaults:
 
@@ -1095,7 +1034,7 @@ Assert the exact pinned defaults:
 4. Purpose 4 denied alone: one LiveRamp request and `idl_env` written.
 5. All relevant grants present: one LiveRamp request and `idl_env` written.
 
-- [ ] **Step 3: Run the consent artifact suite**
+- [x] **Step 3: Run the consent artifact suite**
 
 Run:
 
@@ -1108,7 +1047,7 @@ Expected: all five behavioral cases and the module-presence assertion pass
 against the real generated artifacts. If a case differs, inspect pinned Prebid
 before changing the expected policy.
 
-- [ ] **Step 4: Correct the operator-facing consent claims**
+- [x] **Step 4: Correct the operator-facing consent claims**
 
 Document that default client-side resolution/storage is blocked by Purpose 1
 and LiveRamp vendor consent. State that Purpose 3 has no standalone default
@@ -1116,7 +1055,7 @@ rule, Purpose 4 controls UFPD, and default EID transmission accepts qualifying
 purpose/vendor basis from any Purpose 2–10 unless the publisher enables
 `eidsRequireP4Consent`. Preserve the existing explicit GPP/US-state limitation.
 
-- [ ] **Step 5: Format and verify the focused documentation**
+- [x] **Step 5: Format and verify the focused documentation**
 
 ```bash
 cd docs
@@ -1127,7 +1066,7 @@ npm run format
 Expected: the guide is formatted and makes no broader enforcement claim than
 the artifact matrix proves.
 
-- [ ] **Step 6: Commit the consent characterization**
+- [x] **Step 6: Commit the consent characterization**
 
 ```bash
 git add \
@@ -1143,7 +1082,7 @@ git commit -m "Clarify LiveRamp TCF enforcement defaults"
 - Verify: all PR files
 - Update externally: PR #1054 description
 
-- [ ] **Step 1: Run TypeScript tests, build, and formatting**
+- [x] **Step 1: Run TypeScript tests, build, and formatting**
 
 ```bash
 cd crates/trusted-server-js/lib
@@ -1155,7 +1094,7 @@ npm run format
 
 Expected: every command exits 0.
 
-- [ ] **Step 2: Run repository Rust and documentation gates**
+- [x] **Step 2: Run repository Rust and documentation gates**
 
 ```bash
 cd /Users/prk-jr/Desktop/opensource/rust/trusted-server
