@@ -15,6 +15,7 @@ use crate::commands::audit::browser::{
     BrowserLaunchOptions, CONSENT_STUB_SCRIPT as SHARED_CONSENT_STUB_SCRIPT, build_browser_config,
     resolve_chrome, set_browser_cookies,
 };
+use crate::commands::audit::browser_scroll;
 use crate::commands::audit::collector::{
     GENERATE_SETTLE_MAX_MS, GENERATE_SETTLE_QUIET_MS, GenerateBrowserOpts,
 };
@@ -571,7 +572,7 @@ async fn collect_open_page(
     target_url: &Url,
     discover_sitemap: bool,
     assume_consent: bool,
-    _scroll: bool,
+    scroll: bool,
     settle_quiet: Duration,
     settle_max: Duration,
 ) -> CliResult<CollectedPage> {
@@ -629,6 +630,22 @@ async fn collect_open_page(
             "browser audit timed out while waiting for the page to settle; results may be partial"
                 .to_string(),
         );
+    }
+
+    if scroll {
+        warnings.extend(
+            browser_scroll::scroll_page(page)
+                .await
+                .into_iter()
+                .map(|failure| failure.to_string()),
+        );
+        if !wait_for_page_settle(page, settle_quiet, settle_max).await? {
+            warnings.push(
+                "browser audit timed out while waiting for the page to settle after scroll; \
+                 results may be partial"
+                    .to_string(),
+            );
+        }
     }
 
     match timeout(PAGE_OPERATION_TIMEOUT, page.frames()).await {
@@ -1074,6 +1091,8 @@ struct BrowserPerformanceEntry {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
     use std::sync::Arc;
 
     use chromiumoxide::cdp::browser_protocol::network::{Headers, RequestId, Response};
@@ -1082,6 +1101,63 @@ mod tests {
 
     use super::*;
     use crate::commands::audit::browser::browser_fixture_available;
+
+    const LAZY_GPT_FIXTURE: &str = r#"<!doctype html>
+<html>
+  <body style="height: 4000px">
+    <div id="ad-lazy-0"></div>
+    <script>
+      window.addEventListener('scroll', function installLazySlot() {
+        if (window.scrollY <= 0 || window.googletag) return
+        var slot = {
+          getAdUnitPath: function () { return '/123/lazy' },
+          getSlotElementId: function () { return 'ad-lazy-0' },
+          getSizes: function () {
+            return [{
+              getWidth: function () { return 300 },
+              getHeight: function () { return 250 },
+            }]
+          },
+        }
+        window.googletag = {
+          pubads: function () {
+            return { getSlots: function () { return [slot] } }
+          },
+        }
+      })
+    </script>
+  </body>
+</html>"#;
+
+    fn lazy_gpt_fixture_url() -> Url {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("should bind fixture server");
+        let address = listener.local_addr().expect("should read fixture address");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("should accept browser request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("should set fixture read timeout");
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut chunk = [0_u8; 1024];
+                let chunk_len = stream.read(&mut chunk).expect("should read HTTP request");
+                assert!(chunk_len > 0, "request should contain complete headers");
+                request.extend_from_slice(&chunk[..chunk_len]);
+                assert!(
+                    request.len() <= 16 * 1024,
+                    "request headers should be bounded"
+                );
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                LAZY_GPT_FIXTURE.len(),
+                LAZY_GPT_FIXTURE,
+            )
+            .expect("should write fixture response");
+        });
+        Url::parse(&format!("http://{address}/")).expect("should parse fixture URL")
+    }
 
     #[test]
     fn successful_navigation_status_allows_redirects_but_rejects_errors() {
@@ -1245,6 +1321,34 @@ mod tests {
             "should preserve progress failure, got {rendered_error}"
         );
         assert_eq!(phases, ["launching", "loading", "finalizing"]);
+    }
+
+    #[test]
+    #[ignore = "requires local Chrome/Chromium; run through scripts/test-cli.sh"]
+    fn collects_lazy_gpt_slot_only_when_scroll_is_enabled() {
+        if !browser_fixture_available() {
+            return;
+        }
+
+        let without_scroll = BrowserAuditCollector::default()
+            .collect_page(&lazy_gpt_fixture_url(), &[])
+            .expect("should collect without scrolling");
+        let with_scroll = BrowserAuditCollector::default()
+            .with_scroll(true)
+            .collect_page(&lazy_gpt_fixture_url(), &[])
+            .expect("should collect with scrolling");
+
+        assert!(
+            without_scroll.gpt_slots.is_empty(),
+            "lazy GPT slot should not exist before scrolling"
+        );
+        assert!(
+            with_scroll
+                .gpt_slots
+                .iter()
+                .any(|slot| { slot.gam_unit_path == "/123/lazy" && slot.div_id == "ad-lazy-0" }),
+            "scrolling should trigger and collect the lazy GPT slot"
+        );
     }
 
     fn navigation_response_with_status(status: i64, status_text: &str) -> ArcHttpRequest {

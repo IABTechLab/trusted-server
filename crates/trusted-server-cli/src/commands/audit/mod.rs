@@ -7,6 +7,7 @@
 
 pub mod ad_templates;
 pub mod browser;
+mod browser_scroll;
 pub mod collector;
 pub mod generate;
 pub mod page;
