@@ -90,8 +90,9 @@ use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
-use edgezero_core::app::{App, Hooks};
+use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
+use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
@@ -102,6 +103,7 @@ use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
@@ -119,7 +121,9 @@ use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
 };
-use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
+use trusted_server_core::platform::{
+    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName,
+};
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
@@ -134,9 +138,7 @@ use trusted_server_core::request_signing::{
     handle_verify_signature,
 };
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
-use trusted_server_core::settings_data::{
-    default_config_key, default_config_store_name, get_settings_from_config_store,
-};
+use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
@@ -148,6 +150,23 @@ use crate::platform::{
 // ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeStoreConfig {
+    pub(crate) config_store_name: StoreName,
+    pub(crate) config_key: String,
+    pub(crate) secret_store_name: StoreName,
+}
+
+impl RuntimeStoreConfig {
+    pub(crate) fn from_env(env: &EnvConfig) -> Self {
+        Self {
+            config_store_name: StoreName::from(env.store_name("config", DEFAULT_CONFIG_STORE_ID)),
+            config_key: env.store_key("config", DEFAULT_CONFIG_STORE_ID),
+            secret_store_name: StoreName::from(env.store_name("secrets", DEFAULT_SECRET_STORE_ID)),
+        }
+    }
+}
 
 /// Application state built once per Wasm instance and shared for its lifetime.
 ///
@@ -167,19 +186,21 @@ pub(crate) struct AppState {
 ///
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
-pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    build_state_from_settings(load_settings_from_config_store()?)
+pub(crate) fn build_state(
+    stores: &RuntimeStoreConfig,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_from_settings(load_settings_from_config_store(stores)?)
 }
 
-pub(crate) fn load_settings_from_config_store() -> Result<Settings, Report<TrustedServerError>> {
-    let store_name = default_config_store_name();
-    let config_key = default_config_key();
+pub(crate) fn load_settings_from_config_store(
+    stores: &RuntimeStoreConfig,
+) -> Result<Settings, Report<TrustedServerError>> {
     get_settings_from_config_store(
         &FastlyPlatformConfigStore,
         &FastlyPlatformSecretStore,
-        &store_name,
-        &config_key,
-        &trusted_server_core::settings_data::default_secret_store_name(),
+        &stores.config_store_name,
+        &stores.config_key,
+        &stores.secret_store_name,
     )
 }
 
@@ -1234,15 +1255,17 @@ fn fallback_route_handler(
 pub struct TrustedServerApp;
 
 impl TrustedServerApp {
-    pub(crate) fn build_app_with_state() -> (App, Option<Arc<AppState>>) {
-        let (router, state) = Self::router_with_state();
+    pub(crate) fn build_app_with_state(
+        stores: &RuntimeStoreConfig,
+    ) -> (App, Option<Arc<AppState>>) {
+        let (router, state) = Self::router_with_state(stores);
         let mut app = App::with_name(router, Self::name());
         Self::configure(&mut app);
         (app, state)
     }
 
-    fn router_with_state() -> (RouterService, Option<Arc<AppState>>) {
-        let state = match build_state() {
+    fn router_with_state(stores: &RuntimeStoreConfig) -> (RouterService, Option<Arc<AppState>>) {
+        let state = match build_state(stores) {
             Ok(state) => state,
             Err(ref e) => {
                 log::error!("failed to build application state: {:?}", e);
@@ -1300,7 +1323,25 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        Self::router_with_state().0
+        let stores = RuntimeStoreConfig::from_env(&EnvConfig::from_env());
+        Self::router_with_state(&stores).0
+    }
+
+    fn stores() -> StoresMetadata {
+        StoresMetadata {
+            config: Some(StoreMetadata {
+                default: DEFAULT_CONFIG_STORE_ID,
+                ids: &[DEFAULT_CONFIG_STORE_ID],
+            }),
+            kv: Some(StoreMetadata {
+                default: "trusted_server_kv",
+                ids: &["trusted_server_kv"],
+            }),
+            secrets: Some(StoreMetadata {
+                default: DEFAULT_SECRET_STORE_ID,
+                ids: &[DEFAULT_SECRET_STORE_ID],
+            }),
+        }
     }
 }
 
@@ -1310,13 +1351,15 @@ mod tests {
 
     use super::{
         AppState, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
-        TrustedServerApp, build_per_request_services, build_state_from_settings,
-        startup_error_router,
+        RuntimeStoreConfig, TrustedServerApp, build_per_request_services,
+        build_state_from_settings, startup_error_router,
     };
     use base64::Engine as _;
     use bytes::Bytes;
+    use edgezero_core::app::Hooks as _;
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
+    use edgezero_core::env_config::EnvConfig;
     use edgezero_core::http::{Method, Response, StatusCode, header, request_builder};
     use edgezero_core::key_value_store::NoopKvStore;
     use edgezero_core::params::PathParams;
@@ -1340,6 +1383,53 @@ mod tests {
         PlatformSelectResult, RuntimeServices,
     };
     use trusted_server_core::settings::Settings;
+
+    #[test]
+    fn hooks_expose_the_manifest_store_metadata_used_by_fastly_runtime_mapping() {
+        let metadata = TrustedServerApp::stores();
+
+        assert_eq!(
+            metadata.config.map(|store| store.default),
+            Some("trusted_server_config")
+        );
+        assert_eq!(
+            metadata.secrets.map(|store| store.default),
+            Some("trusted_server_secrets")
+        );
+    }
+
+    #[test]
+    fn runtime_store_config_maps_logical_store_names_and_config_key() {
+        let env = EnvConfig::from_vars([
+            (
+                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME",
+                "physical_config",
+            ),
+            (
+                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY",
+                "active_config",
+            ),
+            (
+                "EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME",
+                "ts_secrets",
+            ),
+        ]);
+
+        let stores = RuntimeStoreConfig::from_env(&env);
+
+        assert_eq!(stores.config_store_name.as_ref(), "physical_config");
+        assert_eq!(stores.config_key, "active_config");
+        assert_eq!(stores.secret_store_name.as_ref(), "ts_secrets");
+    }
+
+    #[test]
+    fn runtime_store_config_uses_logical_defaults_without_overrides() {
+        let stores = RuntimeStoreConfig::from_env(&EnvConfig::default());
+
+        assert_eq!(stores.config_store_name.as_ref(), "trusted_server_config");
+        assert_eq!(stores.config_key, "trusted_server_config");
+        assert_eq!(stores.secret_store_name.as_ref(), "trusted_server_secrets");
+    }
 
     fn settings_with_missing_consent_store() -> Settings {
         Settings::from_toml(

@@ -349,9 +349,8 @@ auction_timeout_ms = 500
 # [tinybird]
 # enabled = true
 # api_host = "api.us-east.tinybird.example"   # required when enabled; host only
-# secret_store = "ts_secrets"                 # Secret Store holding the append token
 # auction_dataset = "auction_events"          # Events API datasource name
-# auction_token_secret = "tinybird_auction_append_token"  # Secret Store key for the token
+# auction_token_secret = "tinybird_auction_append_token"  # Key in trusted_server_secrets
 
 # Debug endpoints (all default false — never enable in production).
 # [debug]
@@ -483,7 +482,8 @@ enabled = false
 # rewrite_sdk = true
 # Server-side Protection API validation (fails open on timeout/error):
 # enable_protection = false
-# server_side_key_secret_store = "ts_secrets"
+# Required when enable_protection = true. The value is a key in
+# trusted_server_secrets, not the DataDome credential itself.
 # server_side_key_secret_name = "datadome_server_side_key"
 # protection_api_origin = "https://api.example.com"
 # timeout_ms = 1500

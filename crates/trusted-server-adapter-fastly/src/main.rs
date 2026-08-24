@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
+use edgezero_adapter_fastly::env_config_from_runtime_dictionary;
 use edgezero_adapter_fastly::request::into_core_request;
+use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
@@ -40,24 +42,22 @@ mod rate_limiter;
 mod template_cache;
 mod tinybird;
 
-use crate::app::{EcFinalizeState, TrustedServerApp, load_settings_from_config_store};
+use crate::app::{
+    EcFinalizeState, RuntimeStoreConfig, TrustedServerApp, load_settings_from_config_store,
+};
 use crate::ec_kv::FastlyEcKvStore;
 use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, resolve_geo_for_response};
 use crate::platform::{FastlyPlatformGeo, client_info_from_request};
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
-
-const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
 
 /// Opens the Fastly Config Store used by the `EdgeZero` dispatcher.
 ///
 /// # Errors
 ///
 /// Returns [`fastly::Error`] if the config store cannot be opened.
-fn open_trusted_server_config_store() -> Result<ConfigStoreHandle, fastly::Error> {
-    let store = EdgeZeroFastlyConfigStore::try_open(TRUSTED_SERVER_CONFIG_STORE).map_err(|e| {
-        fastly::Error::msg(format!(
-            "failed to open config store `{TRUSTED_SERVER_CONFIG_STORE}`: {e}"
-        ))
+fn open_trusted_server_config_store(store_name: &str) -> Result<ConfigStoreHandle, fastly::Error> {
+    let store = EdgeZeroFastlyConfigStore::try_open(store_name).map_err(|e| {
+        fastly::Error::msg(format!("failed to open config store `{store_name}`: {e}"))
     })?;
     Ok(ConfigStoreHandle::new(Arc::new(store)))
 }
@@ -90,11 +90,14 @@ fn main() {
 
 /// Handles a request through the `EdgeZero` router path.
 fn edgezero_main(mut req: FastlyRequest) {
+    let runtime_env = env_config_from_runtime_dictionary(TrustedServerApp::stores());
+    let runtime_stores = RuntimeStoreConfig::from_env(&runtime_env);
+
     // Short-circuit the JA4 debug probe before app construction. Must run here
     // because TLS/JA4 accessors are only available on FastlyRequest before
     // conversion to edgezero types.
     if req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
-        match load_settings_from_config_store() {
+        match load_settings_from_config_store(&runtime_stores) {
             Ok(settings) if settings.debug.ja4_endpoint_enabled => {
                 build_ja4_debug_response(&req).send_to_client();
             }
@@ -111,18 +114,19 @@ fn edgezero_main(mut req: FastlyRequest) {
         return;
     }
 
-    let config_store = match open_trusted_server_config_store() {
-        Ok(cs) => cs,
-        Err(e) => {
-            log::error!("failed to open config store: {e}");
-            FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
-                .with_body_text_plain("Internal Server Error")
-                .send_to_client();
-            return;
-        }
-    };
+    let config_store =
+        match open_trusted_server_config_store(runtime_stores.config_store_name.as_ref()) {
+            Ok(cs) => cs,
+            Err(e) => {
+                log::error!("failed to open config store: {e}");
+                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_body_text_plain("Internal Server Error")
+                    .send_to_client();
+                return;
+            }
+        };
 
-    let (app, app_state) = TrustedServerApp::build_app_with_state();
+    let (app, app_state) = TrustedServerApp::build_app_with_state(&runtime_stores);
     let settings_snapshot = app_state.as_ref().map(|state| Arc::clone(&state.settings));
 
     // Strip client-spoofable forwarded headers before dispatch.
@@ -194,7 +198,7 @@ fn edgezero_main(mut req: FastlyRequest) {
         if let Some(settings) = settings_snapshot.as_deref() {
             apply_entry_point_finalize_headers(settings, &mut response, client_ip);
         } else {
-            match load_settings_from_config_store() {
+            match load_settings_from_config_store(&runtime_stores) {
                 Ok(settings) => {
                     apply_entry_point_finalize_headers(&settings, &mut response, client_ip);
                 }
@@ -224,7 +228,7 @@ fn edgezero_main(mut req: FastlyRequest) {
                 }
             }
         } else {
-            match load_settings_from_config_store() {
+            match load_settings_from_config_store(&runtime_stores) {
                 Ok(settings) => {
                     match apply_edgezero_ec_finalize(&settings, &ec_state, &mut response) {
                         Ok(partner_registry) => {
