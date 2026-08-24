@@ -157,8 +157,9 @@ Edit `trusted-server.toml` to configure:
 - Consent settings (`[gdpr]`)
 - Stable key names for `trusted_server_secrets`
 
-Provision `trusted_server_secrets` with the existing credential values before
-pushing a migrated config. Then validate and push:
+Provision the physical store mapped from logical `trusted_server_secrets` with
+the existing credential values before pushing a migrated config. On Fastly,
+`ts_secrets` is the documented example physical name. Then validate and push:
 
 ```bash
 ts config validate

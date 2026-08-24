@@ -114,6 +114,16 @@ sdk_origin = "https://sdk.example.com"
 api_origin = "https://api.example.com"
 cache_ttl_seconds = 3600
 rewrite_sdk = true
+# Required when enable_protection = true. The value is a key in
+# trusted_server_secrets, not the DataDome credential itself.
+# server_side_key_secret_name = "datadome_server_side_key"
+
+[tinybird]
+enabled = false
+# api_host = "api.example.com"
+# auction_dataset = "auction_events_raw"
+# Required when enabled. The value is a key in trusted_server_secrets.
+# auction_token_secret = "tinybird_auction_append_token"
 
 [integrations.gpt]
 enabled = false

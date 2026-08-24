@@ -14077,6 +14077,7 @@ mod tests {
                 &serde_json::json!({
                     "enabled": true,
                     "enable_protection": true,
+                    "server_side_key_secret_name": "server-side-key",
                     "protection_excluded_ip_cidrs": ["192.0.2.0/24"],
                     "client_side_key": "test-client-key",
                 }),
