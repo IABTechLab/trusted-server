@@ -365,6 +365,7 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
                     replace: gen_args.replace,
                     cookies: &gen_args.cookies,
                     dry_run: gen_args.dry_run,
+                    scroll: gen_args.scroll,
                     budget: gen_args.budget(),
                 },
                 &selected,

@@ -177,15 +177,24 @@ pub(super) fn merge_render_slots(
     merge_render_slots_with_diagnostics(existing, discovered_slots, replace).0
 }
 
-/// Merges slots and reports configured prefixes that claimed several live divs.
+/// Diagnostics produced while merging discovered and configured slots.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct MergeDiagnostics {
+    /// Operator-facing reconciliation notes.
+    pub(super) notes: Vec<String>,
+    /// Configured slots preserved without matching any discovered slot.
+    pub(super) unobserved_existing_slot_ids: Vec<String>,
+}
+
+/// Merges slots and reports prefix collisions and unobserved preserved slots.
 pub(super) fn merge_render_slots_with_diagnostics(
     existing: Option<&CreativeOpportunitiesConfig>,
     discovered_slots: Vec<RenderSlot>,
     replace: bool,
-) -> (Vec<RenderSlot>, Vec<String>) {
+) -> (Vec<RenderSlot>, MergeDiagnostics) {
     let existing_slots = existing.map(|config| config.slot.as_slice()).unwrap_or(&[]);
     if replace || existing_slots.is_empty() {
-        return (discovered_slots, Vec::new());
+        return (discovered_slots, MergeDiagnostics::default());
     }
 
     let mut merged: Vec<RenderSlot> = existing_slots
@@ -193,8 +202,12 @@ pub(super) fn merge_render_slots_with_diagnostics(
         .map(RenderSlot::from_existing)
         .collect();
     let mut prefix_claims: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
+    let mut observed_existing = BTreeSet::new();
     for mut slot in discovered_slots {
         if let Some(index) = matching_slot_index(&merged, &slot) {
+            if index < existing_slots.len() {
+                observed_existing.insert(index);
+            }
             if index < existing_slots.len()
                 && let (Some(prefix), Some(discovered_div)) =
                     (merged[index].div_id.as_deref(), slot.div_id.as_deref())
@@ -221,7 +234,7 @@ pub(super) fn merge_render_slots_with_diagnostics(
             merged.push(slot);
         }
     }
-    let diagnostics = prefix_claims
+    let notes = prefix_claims
         .into_iter()
         .filter(|(_, divs)| divs.len() > 1)
         .map(|(index, divs)| {
@@ -243,7 +256,19 @@ pub(super) fn merge_render_slots_with_diagnostics(
             )
         })
         .collect();
-    (merged, diagnostics)
+    let unobserved_existing_slot_ids = existing_slots
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !observed_existing.contains(index))
+        .map(|(_, slot)| slot.id.clone())
+        .collect();
+    (
+        merged,
+        MergeDiagnostics {
+            notes,
+            unobserved_existing_slot_ids,
+        },
+    )
 }
 
 fn unique_slot_id(candidate: &str, existing: &[RenderSlot]) -> String {
@@ -1569,14 +1594,15 @@ slot_id = "sidebar"
             1,
             "the configured prefix still controls merging"
         );
-        assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].contains("matched 2 discovered divs"));
-        assert!(diagnostics[0].contains("ad-footer"));
+        assert_eq!(diagnostics.notes.len(), 1);
+        assert!(diagnostics.notes[0].contains("matched 2 discovered divs"));
+        assert!(diagnostics.notes[0].contains("ad-footer"));
         assert!(
-            diagnostics[0].contains("runtime can resolve this configured slot to at most one"),
+            diagnostics.notes[0]
+                .contains("runtime can resolve this configured slot to at most one"),
             "diagnostic should explain the runtime consequence"
         );
-        assert!(diagnostics[0].contains("ad-header"));
+        assert!(diagnostics.notes[0].contains("ad-header"));
     }
 
     #[test]
@@ -1639,6 +1665,75 @@ slot_id = "sidebar"
             Some(0.5),
             "hand-tuned fields preserved"
         );
+    }
+
+    #[test]
+    fn merge_reports_preserved_unobserved_slots_in_config_order() {
+        let existing = existing_config(
+            "gam_network_id = \"222\"\n\n\
+             [[slot]]\nid = \"header\"\ndiv_id = \"div-gpt-ad-header\"\n\
+             gam_unit_path = \"/222/header\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 728, height = 90 }]\n\n\
+             [[slot]]\nid = \"sidebar\"\ndiv_id = \"ad-sidebar\"\n\
+             gam_unit_path = \"/222/sidebar\"\npage_patterns = [\"/news/*\"]\n\
+             formats = [{ width = 300, height = 250 }]\n\n\
+             [[slot]]\nid = \"footer\"\ndiv_id = \"ad-footer\"\n\
+             gam_unit_path = \"/222/footer\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 728, height = 90 }]\n",
+        );
+        let discovered = vec![RenderSlot::from_evidence(
+            "header",
+            "div-gpt-ad-header",
+            Some("/222/header".to_string()),
+            [(728, 90)],
+            vec!["/".to_string()],
+            false,
+        )];
+
+        let (_, diagnostics) =
+            merge_render_slots_with_diagnostics(Some(&existing), discovered, false);
+
+        assert_eq!(
+            diagnostics.unobserved_existing_slot_ids,
+            ["sidebar", "footer"],
+            "unobserved slots should retain configuration order"
+        );
+
+        let all_discovered = vec![
+            RenderSlot::from_evidence(
+                "header",
+                "div-gpt-ad-header",
+                Some("/222/header".to_string()),
+                [(728, 90)],
+                vec!["/".to_string()],
+                false,
+            ),
+            RenderSlot::from_evidence(
+                "sidebar",
+                "ad-sidebar",
+                Some("/222/sidebar".to_string()),
+                [(300, 250)],
+                vec!["/news/*".to_string()],
+                false,
+            ),
+            RenderSlot::from_evidence(
+                "footer",
+                "ad-footer",
+                Some("/222/footer".to_string()),
+                [(728, 90)],
+                vec!["/".to_string()],
+                false,
+            ),
+        ];
+        let (_, fully_observed) =
+            merge_render_slots_with_diagnostics(Some(&existing), all_discovered.clone(), false);
+        let (_, replaced) =
+            merge_render_slots_with_diagnostics(Some(&existing), all_discovered.clone(), true);
+        let (_, no_existing) = merge_render_slots_with_diagnostics(None, all_discovered, false);
+
+        assert!(fully_observed.unobserved_existing_slot_ids.is_empty());
+        assert!(replaced.unobserved_existing_slot_ids.is_empty());
+        assert!(no_existing.unobserved_existing_slot_ids.is_empty());
     }
 
     #[test]
