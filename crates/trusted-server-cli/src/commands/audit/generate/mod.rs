@@ -2251,8 +2251,7 @@ mod tests {
              page_patterns = [\"/\"]\n\
              formats = [{ width = 728, height = 90 }]\n\n\
              [[creative_opportunities.slot]]\n\
-             id = \"refused\"\n\
-             div_id = \"ad-refused\"\n\
+             id = \"ad-refused\"\n\
              gam_unit_path = \"/123456789/desktop/homepage\"\n\
              page_patterns = [\"/\"]\n\
              formats = [{ width = 300, height = 250 }]\n",
@@ -2309,7 +2308,7 @@ mod tests {
             "should retain the refusal diagnostic, got {notes:?}"
         );
         assert!(
-            !notes.contains("not observed during this crawl: refused"),
+            !notes.contains("not observed during this crawl: ad-refused"),
             "a crawl-observed refused slot must not be labeled unobserved, got {notes:?}"
         );
     }

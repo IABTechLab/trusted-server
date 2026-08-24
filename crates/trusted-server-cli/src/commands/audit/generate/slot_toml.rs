@@ -224,7 +224,7 @@ pub(super) fn merge_render_slots_with_observed_diagnostics(
     let mut prefix_claims: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
     let mut observed_existing = observed_div_ids
         .iter()
-        .filter_map(|div_id| matching_div_id_index(&merged, div_id))
+        .filter_map(|div_id| matching_observed_div_index(&merged, div_id))
         .filter(|index| *index < existing_slots.len())
         .collect::<BTreeSet<_>>();
     for mut slot in discovered_slots {
@@ -339,6 +339,18 @@ fn matching_div_id_index(existing: &[RenderSlot], discovered_div: &str) -> Optio
         }
     }
     best
+}
+
+/// Matches raw crawl evidence with the same div-prefix then stable-key rules as
+/// [`matching_slot_index`]. The key fallback covers configured slots whose
+/// omitted `div_id` resolves to `id` at runtime.
+fn matching_observed_div_index(existing: &[RenderSlot], discovered_div: &str) -> Option<usize> {
+    matching_div_id_index(existing, discovered_div).or_else(|| {
+        let discovered_key = discovered_div.trim_end_matches('-');
+        existing
+            .iter()
+            .position(|slot| slot.key() == discovered_key)
+    })
 }
 
 /// Header comment emitted above the structurally replaced managed slot array.
