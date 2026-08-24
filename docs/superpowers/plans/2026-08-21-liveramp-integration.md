@@ -1134,7 +1134,7 @@ Review the entire `origin/main...HEAD` diff with special attention to the
 partial-`userSync` real-artifact case and the independent consent matrix. Fix
 all Critical or Important findings and repeat affected gates.
 
-- [ ] **Step 5: Push and update the draft PR description**
+- [x] **Step 5: Push and update the draft PR description**
 
 Push without force. Create `/tmp/pr-1054-body.md` with the repository PR
 template and these exact sections:
