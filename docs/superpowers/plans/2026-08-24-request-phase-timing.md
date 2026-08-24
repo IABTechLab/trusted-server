@@ -245,8 +245,9 @@ pub struct RequestTimings(Arc<Mutex<Inner>>);
 
 Implementation notes (all bodies in this task, none deferred):
 
-- Every method takes `if let Ok(mut inner) = self.0.lock()` and silently returns on
-  poison, per the infallibility constraint.
+- Every method takes `if let Ok(mut inner) = self.0.try_lock()` and silently
+  returns otherwise: contention and poison both drop the sample instead of waiting,
+  per the infallibility constraint.
 - `record` accumulates with `saturating_add` semantics
   (`Some(existing.saturating_add(dur))`).
 - `mark_headers_ready` and `mark_request_elapsed` write `t0.elapsed()` only when the
@@ -471,11 +472,13 @@ if settings_enabled_server_timing && conclusively_private {
 }
 ```
 
-`settings_enabled_server_timing` arrives as a `bool` captured from the settings
-snapshot at the call sites (the function already receives per-call context; extend its
-parameters, staying at or under seven, or pass a small
-`SendContext { timings: RequestTimings, server_timing_enabled: bool }`). Return
-`DeliveryOutcome`; existing callers ignore it in this task (Task 8 consumes it).
+`settings_enabled_server_timing` arrives inside a small
+`SendContext { timings: RequestTimings, server_timing_enabled: bool }` so the
+function stays at or under seven parameters. Return `DeliveryOutcome` with per-mode
+semantics: buffered bodies capture the byte count from the body length before
+`send_to_client()` (which returns no delivery result) and report complete-on-return;
+the streaming branch gains a counting writer in Task 6. Existing callers ignore the
+outcome in this task (Task 8 consumes it).
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -608,8 +611,14 @@ fn template_cache_span_recorded_only_when_lookup_runs() {
 
 #[test]
 fn kv_span_accumulates_across_graph_operations() {
-    // Stub KV recording two operations through KvIdentityGraph; assert kv_ms Some and
-    // covers both (accumulated, not last-write).
+    // Stub KV recording two operations through a TimedKvStore-wrapped graph; assert
+    // kv_ms Some and covers both (accumulated, not last-write).
+}
+
+#[test]
+fn consent_store_reads_are_timed_and_pull_sync_is_not() {
+    // Consent read through the decorated RuntimeServices store: kv_ms Some.
+    // Pull-sync graph built from the untimed store: records nothing.
 }
 
 #[test]
@@ -635,11 +644,15 @@ Expected: FAIL.
   response headers are available (directly after the `match` arm binds the response).
 - Template cache: same guard pattern around
   `services.template_cache().lookup_or_reserve(key).await`.
-- KV: `KvIdentityGraph` stores `timings: Option<RequestTimings>`; each public
-  operation (`get`, `write_entry`, `create_or_revive`, `upsert_partner_ids`,
-  `write_withdrawal_tombstone`, batch accessors) wraps its store call in
-  `Phase::EcKv` spans when the handle is present. `ec_finalize_response` keeps seven
-  arguments: the handle rides inside the graph, which it already receives.
+- KV: add `TimedKvStore` (new type in `crates/trusted-server-core/src/platform/`),
+  a decorator implementing `PlatformKvStore` that wraps `Arc<dyn PlatformKvStore>`
+  plus a `RequestTimings` handle and records `Phase::EcKv` around every trait
+  method. Every request-path `KvIdentityGraph` construction site (request setup,
+  identify, admin lookup, batch sync, finalization) receives the timed store;
+  consent-store access through `RuntimeServices` uses the same decorator; pull-sync
+  constructs its graph from the untimed store explicitly (add a test asserting the
+  pull-sync store records nothing). `ec_finalize_response` keeps seven arguments:
+  the handle rides inside the store the graph already receives.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -708,11 +721,13 @@ Expected: FAIL.
   is `Clone`; add a field).
 - Buffered path (`buffer_publisher_response_async` and the shared-template miss
   finalizer): same measurement with `AuctionWaitPlacement::PreHeader`.
-- Adapter stream drive: wrap the `block_on(stream_asset_body(...))` region; record
-  `Phase::Stream` with the elapsed drive time, count bytes written into
-  `DeliveryOutcome.bytes`, call `timings.set_resp_bytes(bytes)` and
+- Adapter stream drive: wrap the `block_on(stream_asset_body(...))` region with a
+  counting writer that tallies bytes and observes truncation/error, record
+  `Phase::Stream` with the elapsed drive time, populate `DeliveryOutcome` with
+  bytes and Complete/Partial/Error, call `timings.set_resp_bytes(bytes)` and
   `timings.mark_request_elapsed()` immediately after the drive returns, before
-  anything else post-send.
+  anything else post-send. Buffered responses keep the Task 3 complete-on-return
+  semantics; `body_mode` distinguishes the regimes in the row.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -734,8 +749,10 @@ git commit -m "Capture stream duration, auction wait placement, and response byt
 
 - Create: `crates/trusted-server-core/src/access_telemetry.rs`
 - Modify: `crates/trusted-server-core/src/lib.rs`
-- Modify: `crates/trusted-server-adapter-fastly/src/app.rs` (route class at handler
-  selection), `main.rs` (snapshot build at freeze point)
+- Modify: `crates/trusted-server-adapter-fastly/src/app.rs` (RouteMetadata attach at
+  handler wrappers), `main.rs` (snapshot build at freeze point),
+  `crates/trusted-server-core/src/publisher.rs` (typed template-cache state
+  extension)
 
 **Interfaces:**
 
@@ -791,13 +808,20 @@ Expected: compile FAIL.
 
 Row serialization via `serde_json::json!` mapping spec section 9 column names exactly
 (`time_elapsed_ms`, `appbuild_ms`, ..., `auction_wait_placement` as
-`pre_header|in_stream|none`). `env`/`pop`/`service_id` read by the adapter from
-settings state and Fastly env (`FASTLY_SERVICE_ID`, `FASTLY_POP`), defaulting
-`"unknown"`. Route class assigned in the named-route table (add a `RouteClass` column
-to `NAMED_ROUTES`) and `RouteClass::PublisherHtml`/`Tsjs` for the fallback and tsjs
-handlers. The snapshot is built unconditionally in `send_edgezero_response` right
-after `mark_headers_ready()` and returned to the caller inside `DeliveryOutcome` (add
-field `pub snapshot: AccessTelemetrySnapshot`).
+`pre_header|in_stream|none`). `pop`/`service_id` read from Fastly env
+(`FASTLY_SERVICE_ID`, `FASTLY_POP`), defaulting `"unknown"`; `env` derived by the
+adapter from `FASTLY_IS_STAGING` (the `x-ts-env` input), never from `Settings`.
+Route identity travels as a typed `RouteMetadata` response extension
+(`pub struct RouteMetadata { pub route_class: RouteClass, pub route_template: String }`
+in `access_telemetry.rs`): each named-route handler wrapper attaches its matched
+route-table pattern verbatim, and the fallback and tsjs handlers attach their class
+plus the coarse template; the freeze point consumes the extension (no `RouteClass`
+column in `NAMED_ROUTES`, no reconstruction from a handler enum). Also in this task:
+make `TemplateCacheResponseState` a typed response extension in `publisher.rs`, set
+at every point that writes `x-ts-template-cache` so header and extension cannot
+drift; the row reads the extension. The snapshot is built unconditionally in
+`send_edgezero_response` right after `mark_headers_ready()` and returned inside
+`DeliveryOutcome` (add field `pub snapshot: AccessTelemetrySnapshot`).
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -824,9 +848,12 @@ git commit -m "Add access telemetry snapshot, route classes, and coarse route te
 
 - Consumes: `AccessTelemetrySnapshot` + `access_event_row` (Task 7), settings flags
   (Task 2), `DeliveryOutcome` (Tasks 3/6).
-- Produces: `pub(crate) async fn emit_access_event(services: &RuntimeServices, target: &TinybirdEventsTarget, row: String) -> Result<(), Report<TrustedServerError>>` ,
-  sends via `http_client().send(...)` (the blocking variant, post-delivery), checks
-  `response.status().is_success()`, warns with status otherwise.
+- Produces: `pub(crate) async fn emit_access_event(client: &FastlyPlatformHttpClient, target: &TinybirdEventsTarget, row: String) -> Result<(), Report<TrustedServerError>>`,
+  sending via the adapter's stateless platform client (the blocking variant,
+  post-delivery), checking `response.status().is_success()`, warning with status
+  otherwise. The transport context is adapter-owned and route-independent (target
+  derived from settings once at entry), so asset, admin, and error responses emit
+  without `RuntimeServices` or `EcFinalizeState`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -957,10 +984,12 @@ fn axum_health_is_excluded() { /* /health: no ts-total */ }
 Run: `cargo test-axum axum_emits axum_404 axum_health`
 Expected: FAIL.
 
-- [ ] **Step 3: Implement** the terminal layer: create `RequestTimings::new()` per
-      request at the outermost service layer, insert into request extensions, and at the
-      layer's response side call `mark_headers_ready()` +
-      `append_server_timing_if_private(...)`, skipping the `/health` path.
+- [ ] **Step 3: Implement** an outer service wrapper around the `RouterService`
+      inside `AxumDevServer` (not router middleware, which router-generated 404/405
+      responses bypass and which returns before body serialization): create
+      `RequestTimings::new()` per request in the wrapper, insert into request
+      extensions, and on the wrapper's response side call `mark_headers_ready()` +
+      `append_server_timing_if_private(...)`, skipping the `/health` path by match.
 
 - [ ] **Step 4: Run to verify pass**
 

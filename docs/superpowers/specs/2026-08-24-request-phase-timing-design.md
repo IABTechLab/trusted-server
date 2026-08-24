@@ -125,8 +125,9 @@ New module `crates/trusted-server-core/src/request_timing.rs`.
 - Sharing: `RequestTimings` is a cheap-clone handle, `Arc<Mutex<Inner>>`. It crosses
   three boundaries: adapter entry to core handlers, the streaming body closure (records
   body-phase spans after the response object has been handed off), and the adapter's
-  post-send emission read. A poisoned or contended lock must never fail a request: all
-  recording methods are infallible and drop the sample on lock failure.
+  post-send emission read. Access is exclusively `try_lock()`: a contended or
+  poisoned lock drops the sample immediately rather than waiting, so recording can
+  never delay a request.
 - Recording API: `timings.record(Phase::Geo, dur)` and a scope guard
   `timings.span(Phase::Origin)` that records on drop. Guards use saturating duration
   math; a non-monotonic reading records zero rather than panicking. The auction-wait
@@ -154,16 +155,24 @@ so no new clock abstraction is needed.
 Naming follows the completed template-cache terminology migration (`x-ts-template-cache`
 is the emitted header on `main`; `c2` naming is retired).
 
-`ts-kv` is instrumented at the shared identity-graph/KV abstraction
-(`KvIdentityGraph` and the platform KV store wrapper), not at individual call sites, so
-new callers cannot silently escape the span. Included pre-send operations: EC
+`ts-kv` is instrumented by a timing decorator implementing `PlatformKvStore` that
+wraps the store handed to request-scoped consumers, because no single existing
+abstraction covers the taxonomy: EC graph operations go through `KvIdentityGraph`
+while consent persistence uses `PlatformKvStore` directly, and graphs are constructed
+independently in request setup, identify, admin lookup, batch sync, and finalization.
+Every request-path graph construction receives the timed store; pull-sync explicitly
+constructs its graph from an untimed store. Consent-store reads pass through the same
+decorator and are timed like any other store call. Included pre-send operations: EC
 generation `create_or_revive`, identify-path graph reads and evaluation, finalize-path
 `ingest_eid_cookies`/`upsert_partner_ids` and withdrawal tombstones, consent-store
 reads on consent routes, and batch-sync graph access when it runs before send.
 Explicitly excluded: pull-sync work, which runs strictly after `send_to_client` and is
-invisible to both surfaces. The timings handle reaches `ec_finalize_response` through
-an existing context or a parameter object; that function already has the repository
-maximum of seven arguments and does not gain an eighth.
+invisible to both surfaces. The decorator measures store-call latency only: no value
+passing through it is read, parsed, or recorded, and the emitted surfaces carry no
+consent or identity payloads. This feature therefore needs no consent gate; it is the
+site measuring its own infrastructure, not processing user data. The timings handle
+reaches `ec_finalize_response` inside the graph it already receives; that function
+keeps the repository maximum of seven arguments and does not gain an eighth.
 
 Row-only fields:
 
@@ -252,9 +261,11 @@ structurally and its emissions are defined accordingly rather than pretending pa
 - `body_mode` is always `buffered`: the Axum HTTP client buffers upstream bodies, so
   `stream_ms` measures buffered-body write-out and `auction_wait_placement` is always
   `pre_header`.
-- The freeze point is an Axum-terminal middleware layer that runs after all response
-  mutation, covering router-generated 404/405 responses; Axum's `/health` sits inside
-  the middleware stack and is excluded explicitly by route match.
+- The freeze point is an outer service wrapper around the `RouterService` inside
+  `AxumDevServer`, not router middleware: router-generated 404/405 responses bypass
+  router middleware, and middleware returns before Axum serializes the body. The
+  wrapper sees every response including router-generated ones; `/health` is excluded
+  by path match inside the wrapper.
 - Axum emits the header only; no Tinybird rows in v1 (unchanged).
 
 Cloudflare and Spin: collection compiles, no emission wiring in v1 (unchanged).
@@ -287,7 +298,7 @@ ClickHouse sorting keys cannot contain nullable columns):
 ```
 `service_id`            LowCardinality(String),      -- FASTLY_SERVICE_ID; immutable deployment identity
 `publisher_domain`      LowCardinality(String),      -- matches auction schema
-`env`                   LowCardinality(String),      -- from typed settings state, never from a response header
+`env`                   LowCardinality(String),      -- adapter-derived: production | staging | unknown
 `route_class`           LowCardinality(String),      -- publisher_html | tsjs | integration_proxy | ec | auction_api | other
 `route_template`        String,                      -- bounded, normalized; replaces path
 `body_mode`             LowCardinality(String),      -- streamed | buffered
@@ -308,10 +319,21 @@ ClickHouse sorting keys cannot contain nullable columns):
 `pop`                   LowCardinality(String)       -- FASTLY_POP, 'unknown' when absent
 ```
 
-Typed sources only: `env` comes from settings state (production configs may set no
-header), `template_cache_state` from the typed response extension rather than the
-`x-ts-template-cache` header (operator-configured response headers can override
-managed headers), `service_id` and `pop` from the Fastly environment. `cache_state`
+The matched route pattern does not survive dispatch today, so a typed
+`RouteMetadata` response extension carries `route_class` and `route_template`: each
+named-route handler wrapper attaches its route-table pattern verbatim (handlers
+serving multiple patterns attach the one that matched), and the fallback and tsjs
+handlers attach their class plus the coarse template. The freeze point consumes the
+extension; nothing reconstructs routes from a handler enum or path regex.
+
+Typed sources only: `env` is adapter-owned, derived from the same Fastly
+`FASTLY_IS_STAGING` input that drives `x-ts-env` (`Settings` has no environment
+field and does not gain one). `template_cache_state` comes from a typed response
+extension, not the `x-ts-template-cache` header (operator-configured response
+headers can override managed headers): the currently private
+`TemplateCacheResponseState` in `publisher.rs` becomes a typed response extension,
+and every state transition sets the managed header and the extension together so
+the two can never drift. `service_id` and `pop` come from the Fastly environment. `cache_state`
 from the reserved schema is dropped: the guest cannot observe the fronting cache, and
 guest-visible cache behavior is already carried by `template_cache_state` and
 `origin_ms`. Rows exist only for guest-handled requests; fronting-cache hits are
@@ -329,15 +351,22 @@ ships as a versioned replacement datasource with a cutover, not an in-place edit
 
 - `AccessTelemetrySnapshot`: built unconditionally at the freeze point, before
   `into_parts()` consumes the response. It captures method, status, route metadata
-  (`route_class`, `route_template`), typed dimension states (`env`,
-  `template_cache_state`, geo country), and the transport context needed to emit
-  (backend spec, secret store name, dataset, token secret). It exists because nothing
-  else survives to post-send on every path: the request is consumed by dispatch, the
-  response by `into_parts()`, and `EcFinalizeState` is absent on asset, admin, and
-  error paths.
-- `send_edgezero_response` returns the delivery outcome (bytes written and
-  success/partial/error) instead of `()`; the outcome feeds `resp_bytes` and lets a
-  partial delivery be recorded rather than silently averaged in.
+  (from the `RouteMetadata` extension), and typed dimension states (`env`,
+  `template_cache_state`, geo country). It exists because nothing else survives to
+  post-send on every path: the request is consumed by dispatch, the response by
+  `into_parts()`, and `EcFinalizeState` is absent on asset, admin, and error paths.
+- The emitter's transport context is adapter-owned and route-independent: the
+  Events API target (backend spec, secret store name, dataset, token secret, sample
+  rate) derives from settings once at entry in `main.rs`, and the HTTP client is the
+  adapter's stateless platform client. Asset, admin, and error responses therefore
+  emit without `RuntimeServices` or `EcFinalizeState`.
+- `send_edgezero_response` returns a delivery outcome instead of `()`, with
+  per-mode semantics because the two body paths observe different things. Streamed
+  bodies: a counting writer reports bytes written and distinguishes complete,
+  partial (truncated), and error outcomes. Buffered bodies: `send_to_client()`
+  returns no delivery result, so the byte count is captured from the body length
+  before the send and the outcome is complete-on-return with no partial detection;
+  `body_mode` in the row keeps the two regimes distinguishable in analysis.
 - Ordering after the body-stream drive returns: snapshot `request_elapsed_ms` first,
   run the existing pull-sync dispatch unchanged, then telemetry emission last, so
   pull-sync is never delayed behind the ingest await and never included in
