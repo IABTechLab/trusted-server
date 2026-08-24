@@ -6,7 +6,7 @@
 > implementation keeps the public `esi` spelling but uses Fastly C2 plus exact byte-seam
 > assembly. See
 > [the merge-hardening design](../specs/2026-08-12-1009-esi-merge-hardening-design.md) and
-> [implementation plan](./2026-08-12-1009-esi-merge-hardening.md).
+> [implementation plan](../plans/2026-08-12-1009-esi-merge-hardening.md).
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps
@@ -36,7 +36,7 @@ read the 2026-08-10 correction at the top and
 [§6.6](./2026-08-08-esi-cacheable-root-validation-design.md#66-the-esi-pipeline-corrected)
 before writing any code.
 
-**Control:** [the Stage 0 plan](./2026-08-08-1009-measurement-and-stage-0.md). Its
+**Control:** [the Stage 0 plan](../plans/2026-08-08-1009-measurement-and-stage-0.md). Its
 instrumentation and its bypass flag are prerequisites — this plan compares against them
 and does not duplicate them.
 
@@ -163,14 +163,14 @@ version, since `regex`, `bytes`, and `log` are used across the workspace. Adding
 major that coexists is harmless; moving an existing one is not. If one moves, fix with a
 targeted `cargo update -p <crate> --precise <version>` — **never a full update**.
 
-**Already run and recorded** in [the findings](./2026-08-08-1009-measurement-findings.md):
+**Already run and recorded** in [the findings](../plans/2026-08-08-1009-measurement-findings.md):
 no existing shared dependency moved.
 
 - [ ] **Step 4: Record and commit, or stop**
 
 **Task 1 is complete — verdict PASS, recorded 2026-08-10.** `esi` 0.7.1 compiles clean on
 Rust 1.95.0 / `wasm32-wasip1`, all six clippy targets pass, and no existing shared
-dependency moved. See [the findings](./2026-08-08-1009-measurement-findings.md).
+dependency moved. See [the findings](../plans/2026-08-08-1009-measurement-findings.md).
 
 Had Step 2 failed, this plan would have stopped here with #1009 answered "not on this
 toolchain." It did not.
@@ -189,7 +189,7 @@ works locally.** A probe exercised `cache::core::insert`, `lookup`, `finish`, `t
 and — the shape Task 3 Step 4 actually specifies — `Transaction::lookup`,
 `must_insert_or_update`, `insert(...).surrogate_keys(...).execute_and_stream_back()`, and
 hit-after-insert semantics. All passed. Recorded in
-[the findings](./2026-08-08-1009-measurement-findings.md).
+[the findings](../plans/2026-08-08-1009-measurement-findings.md).
 
 That reorders this plan. An earlier revision made provisioning a Fastly service Task 2 and
 a blocker on everything after it. It is not a blocker: **almost all of the correctness and

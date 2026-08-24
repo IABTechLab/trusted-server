@@ -10,7 +10,7 @@ cross-reference point at it. The subject moved, the path did not._
 > subrequest described below belongs to a rejected spike; do not use those sections to
 > infer current runtime behavior. The final branch retains `assembly_mode = "esi"` only as
 > the operator spelling for Fastly C2 plus exact byte-seam assembly. See
-> [the merge-hardening design](./2026-08-12-1009-esi-merge-hardening-design.md).
+> [the merge-hardening design](../specs/2026-08-12-1009-esi-merge-hardening-design.md).
 
 **Revised:** 2026-08-10
 **Baseline:** citations verified at `cfb98f4`; unchanged as of `b0ce56c3`.
@@ -251,7 +251,7 @@ Two regression signals, both checked before the win is:
 **Why it is safe in principle.** The conditional-header strip runs 34 lines earlier
 under the same gate (`publisher.rs:2832-2836`,
 which also strips `Range`/`If-Range`), so the request already reaches the cache
-unconditional and a HIT returns a full body. [The 304-prevention design](./2026-07-22-ssat-root-document-304-prevention-design.md)
+unconditional and a HIT returns a full body. [The 304-prevention design](../specs/2026-07-22-ssat-root-document-304-prevention-design.md)
 added the bypass as belt-and-braces and listed the TTFB cost under its own Risks. The
 strip alone satisfies its invariant.
 
