@@ -1149,6 +1149,18 @@ impl IntegrationHeadInjector for PrebidIntegration {
             refresh_in_seconds: u32,
         }
 
+        impl<'a> From<&'a PrebidLiveRampConfig> for InjectedPrebidLiveRampConfig<'a> {
+            fn from(config: &'a PrebidLiveRampConfig) -> Self {
+                Self {
+                    placement_id: &config.placement_id,
+                    not_use_3p: config.not_use_3p,
+                    storage_type: config.storage_type,
+                    expires_days: config.expires_days,
+                    refresh_in_seconds: config.refresh_in_seconds,
+                }
+            }
+        }
+
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct InjectedPrebidClientConfig<'a> {
@@ -1164,24 +1176,19 @@ impl IntegrationHeadInjector for PrebidIntegration {
             excluded_gam_ad_unit_path_suffixes: &'a [String],
         }
 
-        let payload =
-            InjectedPrebidClientConfig {
-                account_id: self.config.account_id.as_deref().unwrap_or_default(),
-                live_ramp: self.config.liveramp.as_ref().map(|config| {
-                    InjectedPrebidLiveRampConfig {
-                        placement_id: &config.placement_id,
-                        not_use_3p: config.not_use_3p,
-                        storage_type: config.storage_type,
-                        expires_days: config.expires_days,
-                        refresh_in_seconds: config.refresh_in_seconds,
-                    }
-                }),
-                timeout: self.config.timeout_ms,
-                debug: self.config.debug,
-                bidders: &self.config.bidders,
-                client_side_bidders: &self.config.client_side_bidders,
-                excluded_gam_ad_unit_path_suffixes: &self.config.excluded_gam_ad_unit_path_suffixes,
-            };
+        let payload = InjectedPrebidClientConfig {
+            account_id: self.config.account_id.as_deref().unwrap_or_default(),
+            live_ramp: self
+                .config
+                .liveramp
+                .as_ref()
+                .map(InjectedPrebidLiveRampConfig::from),
+            timeout: self.config.timeout_ms,
+            debug: self.config.debug,
+            bidders: &self.config.bidders,
+            client_side_bidders: &self.config.client_side_bidders,
+            excluded_gam_ad_unit_path_suffixes: &self.config.excluded_gam_ad_unit_path_suffixes,
+        };
 
         // Escape `</` to prevent breaking out of the script tag.
         let config_json = serde_json::to_string(&payload)
