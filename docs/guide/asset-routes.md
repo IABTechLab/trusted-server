@@ -64,10 +64,9 @@ origin_url = "https://bucket.s3.us-east-1.amazonaws.com"
 type = "s3_sigv4"
 region = "us-east-1"
 origin_query = "strip"
-secret_store = "s3-auth"
-access_key_id = "access_key_id"
-secret_access_key = "secret_access_key"
-# session_token = "session_token"
+access_key_id = "s3_access_key_id"
+secret_access_key = "s3_secret_access_key"
+# session_token = "s3_session_token"
 ```
 
 ### S3 requirements
@@ -77,22 +76,21 @@ secret_access_key = "secret_access_key"
 - S3 support is for `GET` and `HEAD` asset reads.
 - Signing uses header-based AWS SigV4, not presigned URLs.
 - The signer uses `x-amz-content-sha256: UNSIGNED-PAYLOAD`.
-- Credentials are loaded from the configured runtime secret store and cached per process by configured secret names.
+- Credential references resolve from the logical `trusted_server_secrets` store while runtime settings are built. Signing performs no request-time secret-store reads.
 - Successful authenticated S3 responses preserve the origin `Cache-Control`; configure object cache headers intentionally.
 - Existing client `Authorization` and `x-amz-*` signing headers are replaced before signing.
 
 ### Secret store values
 
-The default secret store and key names are:
+Credential fields contain secret key references:
 
-| Config field        | Default value       | Secret value                         |
+| Config field        | Default key         | Resolved value                       |
 | ------------------- | ------------------- | ------------------------------------ |
-| `secret_store`      | `s3-auth`           | Secret store name                    |
 | `access_key_id`     | `access_key_id`     | AWS access key ID                    |
 | `secret_access_key` | `secret_access_key` | AWS secret access key                |
 | `session_token`     | unset               | Optional AWS temporary session token |
 
-Use private deployment configuration for environment-specific store names or profile tables.
+Place those values in the logical `trusted_server_secrets` store. Adapter configuration maps that logical ID to an environment-specific physical store such as Fastly `ts_secrets`. The legacy `secret_store` field is accepted for one migration release but ignored and omitted from newly pushed config.
 
 ## Origin query policy
 

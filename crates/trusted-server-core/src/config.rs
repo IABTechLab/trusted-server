@@ -23,7 +23,7 @@ use crate::integrations::{
     osano::OsanoConfig, permutive::PermutiveConfig, prebid, sourcepoint::SourcepointConfig,
     testlight::TestlightConfig,
 };
-use crate::settings::{IntegrationConfig, Settings};
+use crate::settings::{AssetOriginAuth, IntegrationConfig, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
 const MIN_PROXY_SECRET_LENGTH: usize = 32;
@@ -130,6 +130,8 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
             path,
         };
         let object = |name: &'static str| SecretPathSegment::Field(Cow::Borrowed(name));
+        let optional_object =
+            |name: &'static str| SecretPathSegment::OptionalField(Cow::Borrowed(name));
 
         vec![
             field(vec![object("publisher"), object("proxy_secret")], false),
@@ -160,6 +162,57 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                 ],
                 false,
             ),
+            field(
+                vec![optional_object("tinybird"), object("auction_token_secret")],
+                true,
+            ),
+            field(
+                vec![
+                    optional_object("integrations"),
+                    optional_object("datadome"),
+                    object("server_side_key_secret_name"),
+                ],
+                true,
+            ),
+            field(
+                vec![
+                    optional_object("integrations"),
+                    optional_object("datadome"),
+                    optional_object("protection_test_bypass"),
+                    object("credential_secret_name"),
+                ],
+                true,
+            ),
+            field(
+                vec![
+                    optional_object("proxy"),
+                    optional_object("asset_routes"),
+                    SecretPathSegment::ArrayEach,
+                    optional_object("auth"),
+                    object("access_key_id"),
+                ],
+                false,
+            ),
+            field(
+                vec![
+                    optional_object("proxy"),
+                    optional_object("asset_routes"),
+                    SecretPathSegment::ArrayEach,
+                    optional_object("auth"),
+                    object("secret_access_key"),
+                ],
+                false,
+            ),
+            field(
+                vec![
+                    optional_object("proxy"),
+                    optional_object("asset_routes"),
+                    SecretPathSegment::ArrayEach,
+                    optional_object("auth"),
+                    object("session_token"),
+                ],
+                true,
+            ),
         ]
     }
 }
@@ -182,7 +235,7 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     structural_settings.prepare_runtime()?;
     structural_settings.validate_admin_coverage()?;
 
-    let enabled_auction_providers = validate_enabled_integrations(settings)?;
+    let enabled_auction_providers = validate_enabled_integrations(settings, false)?;
     validate_auction_provider_names(settings, &enabled_auction_providers)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
     Ok(())
@@ -200,7 +253,7 @@ pub fn validate_settings_for_runtime(
     settings.reject_placeholder_secrets()?;
     validate_proxy_secret_strength(settings)?;
     settings.validate_admin_handler_passwords()?;
-    let enabled_auction_providers = validate_enabled_integrations(settings)?;
+    let enabled_auction_providers = validate_enabled_integrations(settings, true)?;
     validate_auction_provider_names(settings, &enabled_auction_providers)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
     Ok(())
@@ -208,6 +261,7 @@ pub fn validate_settings_for_runtime(
 
 fn validate_enabled_integrations(
     settings: &Settings,
+    resolved_secrets: bool,
 ) -> Result<HashSet<&'static str>, Report<TrustedServerError>> {
     let mut enabled_auction_providers = HashSet::new();
 
@@ -229,7 +283,13 @@ fn validate_enabled_integrations(
     validate_integration::<OsanoConfig>(settings, "osano")?;
     validate_integration::<GoogleTagManagerConfig>(settings, "google_tag_manager")?;
     if let Some(config) = settings.integration_config::<DataDomeConfig>("datadome")? {
-        crate::integrations::datadome::DataDomeIntegration::validate_config_for_startup(config)?;
+        if resolved_secrets {
+            crate::integrations::datadome::DataDomeIntegration::validate_config_for_startup(
+                config,
+            )?;
+        } else {
+            crate::integrations::datadome::DataDomeIntegration::validate_config_for_deploy(config)?;
+        }
     }
     validate_integration::<GptConfig>(settings, "gpt")?;
     validate_integration::<GptDiagnosticsConfig>(settings, "gpt_diagnostics")?;
@@ -280,6 +340,67 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
         )?;
     }
 
+    if settings.tinybird.enabled {
+        let token = settings
+            .tinybird
+            .auction_token_secret
+            .as_ref()
+            .ok_or_else(|| missing_secret_key_reference("tinybird.auction_token_secret"))?;
+        validate_secret_key_reference("tinybird.auction_token_secret", token.expose())?;
+    }
+
+    if let Some(datadome) = settings.integration_config::<DataDomeConfig>("datadome")? {
+        if datadome.enable_protection {
+            let key = datadome
+                .server_side_key_secret_name
+                .as_ref()
+                .ok_or_else(|| {
+                    missing_secret_key_reference(
+                        "integrations.datadome.server_side_key_secret_name",
+                    )
+                })?;
+            validate_secret_key_reference(
+                "integrations.datadome.server_side_key_secret_name",
+                key.expose(),
+            )?;
+        }
+        if let Some(bypass) = datadome
+            .protection_test_bypass
+            .as_ref()
+            .filter(|bypass| bypass.enabled)
+        {
+            let credential = bypass.credential_secret_name.as_ref().ok_or_else(|| {
+                missing_secret_key_reference(
+                    "integrations.datadome.protection_test_bypass.credential_secret_name",
+                )
+            })?;
+            validate_secret_key_reference(
+                "integrations.datadome.protection_test_bypass.credential_secret_name",
+                credential.expose(),
+            )?;
+        }
+    }
+
+    for (index, route) in settings.proxy.asset_routes.iter().enumerate() {
+        let Some(AssetOriginAuth::S3SigV4(auth)) = route.auth.as_ref() else {
+            continue;
+        };
+        validate_secret_key_reference(
+            &format!("proxy.asset_routes[{index}].auth.access_key_id"),
+            auth.access_key_id.expose(),
+        )?;
+        validate_secret_key_reference(
+            &format!("proxy.asset_routes[{index}].auth.secret_access_key"),
+            auth.secret_access_key.expose(),
+        )?;
+        if let Some(token) = &auth.session_token {
+            validate_secret_key_reference(
+                &format!("proxy.asset_routes[{index}].auth.session_token"),
+                token.expose(),
+            )?;
+        }
+    }
+
     Ok(())
 }
 
@@ -288,11 +409,15 @@ fn validate_secret_key_reference(
     key_name: &str,
 ) -> Result<(), Report<TrustedServerError>> {
     if key_name.is_empty() {
-        return Err(Report::new(TrustedServerError::Configuration {
-            message: format!("secret key reference at `{path}` must not be empty"),
-        }));
+        return Err(missing_secret_key_reference(path));
     }
     Ok(())
+}
+
+fn missing_secret_key_reference(path: &str) -> Report<TrustedServerError> {
+    Report::new(TrustedServerError::Configuration {
+        message: format!("secret key reference at `{path}` must not be empty"),
+    })
 }
 
 fn validate_proxy_secret_strength(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
@@ -345,6 +470,7 @@ fn report_to_validation_error(
 mod tests {
     use super::*;
     use crate::redacted::Redacted;
+    use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig};
     use crate::test_support::tests::crate_test_settings_str;
     use edgezero_core::app_config::AppConfigMeta;
 
@@ -464,6 +590,22 @@ formats = [{ width = 300, height = 250 }]
                 ("ec.partners[*].api_token".to_owned(), false),
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
                 ("handlers[*].password".to_owned(), false),
+                ("tinybird.auction_token_secret".to_owned(), true),
+                (
+                    "integrations.datadome.server_side_key_secret_name".to_owned(),
+                    true,
+                ),
+                (
+                    "integrations.datadome.protection_test_bypass.credential_secret_name"
+                        .to_owned(),
+                    true,
+                ),
+                ("proxy.asset_routes[*].auth.access_key_id".to_owned(), false),
+                (
+                    "proxy.asset_routes[*].auth.secret_access_key".to_owned(),
+                    false,
+                ),
+                ("proxy.asset_routes[*].auth.session_token".to_owned(), true),
             ],
             "should expose the native EdgeZero secret metadata contract"
         );
@@ -474,6 +616,77 @@ formats = [{ width = 300, height = 250 }]
             )),
             "all Trusted Server app secrets should use the default secret store"
         );
+    }
+
+    #[test]
+    fn legacy_static_secret_store_selectors_are_accepted_but_not_serialized() {
+        let mut settings = valid_settings();
+        settings.tinybird.secret_store = Some("legacy-tinybird-store".to_string());
+        settings
+            .integrations
+            .insert_config(
+                "datadome",
+                &serde_json::json!({
+                    "enabled": true,
+                    "server_side_key_secret_store": "legacy-datadome-store",
+                    "protection_test_bypass": {
+                        "enabled": false,
+                        "credential_secret_store": "legacy-bypass-store",
+                    },
+                }),
+            )
+            .expect("should insert legacy DataDome selectors");
+        let mut route = ProxyAssetRoute::new(
+            "/assets/",
+            "https://examplebucket.s3.us-east-1.amazonaws.com",
+        );
+        route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+            region: "us-east-1".to_string(),
+            secret_store: Some("legacy-s3-store".to_string()),
+            access_key_id: Redacted::new("s3-access-key".to_string()),
+            secret_access_key: Redacted::new("s3-secret-key".to_string()),
+            session_token: None,
+            origin_query: None,
+        }));
+        settings.proxy.asset_routes.push(route);
+
+        settings.normalize_deserialized();
+        let serialized = serde_json::to_string(&settings).expect("should serialize settings");
+
+        for legacy_store in [
+            "legacy-tinybird-store",
+            "legacy-datadome-store",
+            "legacy-bypass-store",
+            "legacy-s3-store",
+        ] {
+            assert!(
+                !serialized.contains(legacy_store),
+                "serialized config should omit deprecated selector {legacy_store}"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_debug_redacts_resolved_static_credentials() {
+        let mut settings = valid_settings();
+        settings.tinybird.auction_token_secret =
+            Some(Redacted::new("resolved-tinybird-secret".to_string()));
+        settings
+            .integrations
+            .insert_config(
+                "datadome",
+                &serde_json::json!({
+                    "enabled": true,
+                    "server_side_key_secret_name": "resolved-datadome-secret",
+                }),
+            )
+            .expect("should insert resolved DataDome config");
+
+        let debug = format!("{settings:?}");
+
+        assert!(!debug.contains("resolved-tinybird-secret"));
+        assert!(!debug.contains("resolved-datadome-secret"));
+        assert!(debug.contains("datadome"));
     }
 
     #[test]
@@ -637,15 +850,9 @@ password = "production-admin-password-32-bytes"
 
     #[test]
     fn deploy_validation_rejects_invalid_datadome_test_bypass() {
-        for (enable_protection, store, name, expected_message) in [
-            (
-                false,
-                "ts_secrets",
-                "datadome_test_bypass",
-                "requires enable_protection",
-            ),
-            (true, "", "datadome_test_bypass", "credential_secret_store"),
-            (true, "ts_secrets", "", "credential_secret_name"),
+        for (enable_protection, name, expected_message) in [
+            (false, "datadome_test_bypass", "requires enable_protection"),
+            (true, "", "credential_secret_name"),
         ] {
             let mut settings = valid_settings();
             settings
@@ -655,9 +862,9 @@ password = "production-admin-password-32-bytes"
                     &serde_json::json!({
                         "enabled": true,
                         "enable_protection": enable_protection,
+                        "server_side_key_secret_name": "datadome_server_side_key",
                         "protection_test_bypass": {
                             "enabled": true,
-                            "credential_secret_store": store,
                             "credential_secret_name": name,
                         },
                     }),

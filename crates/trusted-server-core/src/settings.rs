@@ -160,10 +160,21 @@ impl Publisher {
     }
 }
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Default, Clone, Deserialize, Serialize)]
 pub struct IntegrationSettings {
     #[serde(flatten)]
     entries: HashMap<String, JsonValue>,
+}
+
+impl std::fmt::Debug for IntegrationSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut integration_ids = self.entries.keys().collect::<Vec<_>>();
+        integration_ids.sort_unstable();
+        formatter
+            .debug_struct("IntegrationSettings")
+            .field("integration_ids", &integration_ids)
+            .finish()
+    }
 }
 
 pub trait IntegrationConfig: DeserializeOwned + Validate {
@@ -198,6 +209,29 @@ impl IntegrationSettings {
             .and_then(|map| map.get("enabled"))
             .and_then(JsonValue::as_bool)
             == Some(false)
+    }
+
+    fn remove_legacy_static_secret_store_selectors(&mut self) {
+        let Some(datadome) = self
+            .entries
+            .get_mut("datadome")
+            .and_then(JsonValue::as_object_mut)
+        else {
+            return;
+        };
+
+        let mut removed = datadome.remove("server_side_key_secret_store").is_some();
+        if let Some(bypass) = datadome
+            .get_mut("protection_test_bypass")
+            .and_then(JsonValue::as_object_mut)
+        {
+            removed |= bypass.remove("credential_secret_store").is_some();
+        }
+        if removed {
+            log::warn!(
+                "DataDome secret-store selectors are deprecated and ignored; static credentials resolve through the default app-config secret store"
+            );
+        }
     }
 
     /// Retrieves and validates a typed configuration for an integration.
@@ -628,16 +662,12 @@ fn default_request_signing_enabled() -> bool {
     false
 }
 
-fn default_s3_secret_store() -> String {
-    "s3-auth".to_string()
+fn default_s3_access_key_id() -> Redacted<String> {
+    Redacted::new("access_key_id".to_string())
 }
 
-fn default_s3_access_key_id() -> String {
-    "access_key_id".to_string()
-}
-
-fn default_s3_secret_access_key() -> String {
-    "secret_access_key".to_string()
+fn default_s3_secret_access_key() -> Redacted<String> {
+    Redacted::new("secret_access_key".to_string())
 }
 
 fn default_asset_image_optimizer_enabled() -> bool {
@@ -724,25 +754,25 @@ impl AssetOriginAuth {
 /// AWS Signature Version 4 configuration for `S3` asset origins.
 ///
 /// The route `origin_url` must use the same `S3` host that `AWS` validates in
-/// the `SigV4` canonical request. Credentials are read from the named runtime
-/// secret store and cached per process by configured secret names.
+/// the `SigV4` canonical request. Credential fields hold secret-store key names
+/// in app config and resolved values at runtime.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct S3SigV4AuthConfig {
     /// `AWS` region used in the credential scope.
     pub region: String,
-    /// Runtime secret store containing `S3` credentials.
-    #[serde(default = "default_s3_secret_store")]
-    pub secret_store: String,
-    /// Secret name containing the `AWS` access key ID.
+    /// Deprecated per-route store selector accepted for migration only.
+    #[serde(default, skip_serializing)]
+    pub secret_store: Option<String>,
+    /// Secret reference containing the `AWS` access key ID.
     #[serde(default = "default_s3_access_key_id")]
-    pub access_key_id: String,
-    /// Secret name containing the `AWS` secret access key.
+    pub access_key_id: Redacted<String>,
+    /// Secret reference containing the `AWS` secret access key.
     #[serde(default = "default_s3_secret_access_key")]
-    pub secret_access_key: String,
-    /// Optional secret name containing an `AWS` session token.
+    pub secret_access_key: Redacted<String>,
+    /// Optional secret reference containing an `AWS` session token.
     #[serde(default)]
-    pub session_token: Option<String>,
+    pub session_token: Option<Redacted<String>>,
     /// Query-string handling policy for the signed `S3` origin request.
     ///
     /// Set this to `strip` when request query parameters are transformation
@@ -761,14 +791,17 @@ fn s3_region_is_valid(region: &str) -> bool {
 impl S3SigV4AuthConfig {
     fn normalize(&mut self) {
         self.region = self.region.trim().to_string();
-        self.secret_store = self.secret_store.trim().to_string();
-        self.access_key_id = self.access_key_id.trim().to_string();
-        self.secret_access_key = self.secret_access_key.trim().to_string();
-        self.session_token = self
-            .session_token
-            .take()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        if self.secret_store.take().is_some() {
+            log::warn!(
+                "S3 secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
+            );
+        }
+        self.access_key_id = Redacted::new(self.access_key_id.expose().trim().to_string());
+        self.secret_access_key = Redacted::new(self.secret_access_key.expose().trim().to_string());
+        self.session_token = self.session_token.take().and_then(|value| {
+            let value = value.expose().trim().to_string();
+            (!value.is_empty()).then(|| Redacted::new(value))
+        });
     }
 
     fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
@@ -784,12 +817,9 @@ impl S3SigV4AuthConfig {
                         .to_string(),
             }));
         }
-        if self.secret_store.is_empty()
-            || self.access_key_id.is_empty()
-            || self.secret_access_key.is_empty()
-        {
+        if self.access_key_id.expose().is_empty() || self.secret_access_key.expose().is_empty() {
             return Err(Report::new(TrustedServerError::Configuration {
-                message: "proxy.asset_routes auth s3_sigv4 secret names must not be empty"
+                message: "proxy.asset_routes auth s3_sigv4 credentials must not be empty after secret resolution"
                     .to_string(),
             }));
         }
@@ -1707,15 +1737,15 @@ pub struct TinybirdSettings {
     /// Regional Tinybird API host, without scheme or path.
     #[serde(default)]
     pub api_host: String,
-    /// Fastly Secret Store name containing Tinybird append tokens.
-    #[serde(default = "default_tinybird_secret_store")]
-    pub secret_store: String,
+    /// Deprecated feature-specific store selector accepted for migration only.
+    #[serde(default, skip_serializing)]
+    pub secret_store: Option<String>,
     /// Auction Events API datasource name.
     #[serde(default = "default_tinybird_auction_dataset")]
     pub auction_dataset: String,
-    /// Secret key containing the auction datasource APPEND token.
-    #[serde(default = "default_tinybird_auction_token_secret")]
-    pub auction_token_secret: String,
+    /// Secret reference containing the auction datasource APPEND token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auction_token_secret: Option<Redacted<String>>,
     /// Reserved for future access-log telemetry.
     ///
     /// `true` is rejected until an access-log emitter is wired, so operators
@@ -1725,9 +1755,9 @@ pub struct TinybirdSettings {
     /// Future access-log Events API datasource name.
     #[serde(default = "default_tinybird_access_dataset")]
     pub access_dataset: String,
-    /// Future Secret Store key containing the access-log datasource APPEND token.
-    #[serde(default = "default_tinybird_access_token_secret")]
-    pub access_token_secret: String,
+    /// Deprecated placeholder for the unwired access-log APPEND token.
+    #[serde(default, skip_serializing)]
+    pub access_token_secret: Option<Redacted<String>>,
     /// Future fraction of requests to emit for optional access telemetry.
     #[serde(default)]
     pub access_sample_rate: f64,
@@ -1736,24 +1766,12 @@ pub struct TinybirdSettings {
     pub max_body_bytes: usize,
 }
 
-fn default_tinybird_secret_store() -> String {
-    "ts_secrets".to_owned()
-}
-
 fn default_tinybird_auction_dataset() -> String {
     "auction_events_raw".to_owned()
 }
 
-fn default_tinybird_auction_token_secret() -> String {
-    "tinybird_auction_append_token".to_owned()
-}
-
 fn default_tinybird_access_dataset() -> String {
     "access_logs_raw".to_owned()
-}
-
-fn default_tinybird_access_token_secret() -> String {
-    "tinybird_access_append_token".to_owned()
 }
 
 fn default_tinybird_max_body_bytes() -> usize {
@@ -1765,12 +1783,12 @@ impl Default for TinybirdSettings {
         Self {
             enabled: false,
             api_host: String::new(),
-            secret_store: default_tinybird_secret_store(),
+            secret_store: None,
             auction_dataset: default_tinybird_auction_dataset(),
-            auction_token_secret: default_tinybird_auction_token_secret(),
+            auction_token_secret: None,
             access_enabled: false,
             access_dataset: default_tinybird_access_dataset(),
-            access_token_secret: default_tinybird_access_token_secret(),
+            access_token_secret: None,
             access_sample_rate: 0.0,
             max_body_bytes: default_tinybird_max_body_bytes(),
         }
@@ -1780,11 +1798,18 @@ impl Default for TinybirdSettings {
 impl TinybirdSettings {
     fn normalize(&mut self) {
         self.api_host = self.api_host.trim().to_ascii_lowercase();
-        self.secret_store = self.secret_store.trim().to_owned();
+        if self.secret_store.take().is_some() {
+            log::warn!(
+                "tinybird.secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
+            );
+        }
         self.auction_dataset = self.auction_dataset.trim().to_owned();
-        self.auction_token_secret = self.auction_token_secret.trim().to_owned();
+        self.auction_token_secret = self.auction_token_secret.take().and_then(|value| {
+            let value = value.expose().trim().to_owned();
+            (!value.is_empty()).then(|| Redacted::new(value))
+        });
         self.access_dataset = self.access_dataset.trim().to_owned();
-        self.access_token_secret = self.access_token_secret.trim().to_owned();
+        self.access_token_secret = None;
     }
 
     fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
@@ -1808,18 +1833,15 @@ impl TinybirdSettings {
             return Ok(());
         }
         validate_tinybird_api_host(&self.api_host)?;
-        if self.secret_store.is_empty() {
-            return Err(Report::new(TrustedServerError::Configuration {
+        validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
+        let token = self.auction_token_secret.as_ref().ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
                 message:
-                    "tinybird.secret_store must not be empty when Tinybird telemetry is enabled"
+                    "tinybird.auction_token_secret is required when Tinybird telemetry is enabled"
                         .to_owned(),
-            }));
-        }
-        if self.enabled {
-            validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
-            validate_tinybird_secret(&self.auction_token_secret, "tinybird.auction_token_secret")?;
-        }
-        Ok(())
+            })
+        })?;
+        validate_tinybird_secret(token.expose(), "tinybird.auction_token_secret")
     }
 }
 
@@ -1860,7 +1882,7 @@ fn validate_tinybird_dataset(value: &str, setting: &str) -> Result<(), Report<Tr
 fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
     if value.is_empty() || value.chars().any(char::is_control) {
         return Err(Report::new(TrustedServerError::Configuration {
-            message: format!("{setting} must be a non-empty Secret Store key"),
+            message: format!("{setting} must be non-empty after secret resolution"),
         }));
     }
     Ok(())
@@ -2018,6 +2040,9 @@ impl Settings {
     pub(crate) fn normalize_deserialized(&mut self) {
         self.proxy.normalize();
         self.image_optimizer.normalize();
+        self.tinybird.normalize();
+        self.integrations
+            .remove_legacy_static_secret_store_selectors();
         self.consent.validate();
     }
 
@@ -2653,12 +2678,9 @@ mod tests {
             !settings.tinybird.enabled,
             "Tinybird should default disabled"
         );
-        assert_eq!(settings.tinybird.secret_store, "ts_secrets");
+        assert_eq!(settings.tinybird.secret_store, None);
         assert_eq!(settings.tinybird.auction_dataset, "auction_events_raw");
-        assert_eq!(
-            settings.tinybird.auction_token_secret,
-            "tinybird_auction_append_token"
-        );
+        assert!(settings.tinybird.auction_token_secret.is_none());
     }
 
     #[test]
@@ -2678,7 +2700,7 @@ mod tests {
     #[test]
     fn tinybird_accepts_region_host_without_scheme() {
         let toml = format!(
-            "{}\n[tinybird]\nenabled = true\napi_host = \"api.us-east.aws.tinybird.co\"\n",
+            "{}\n[tinybird]\nenabled = true\napi_host = \"api.us-east.aws.tinybird.co\"\nauction_token_secret = \"test-auction-token\"\n",
             crate_test_settings_str()
         );
 
@@ -4259,9 +4281,9 @@ origin_host_header_overide = "www.example.com""#,
         match route.auth.as_ref().expect("should configure route auth") {
             AssetOriginAuth::S3SigV4(config) => {
                 assert_eq!(config.region, "us-east-1");
-                assert_eq!(config.secret_store, "s3-auth");
-                assert_eq!(config.access_key_id, "access_key_id");
-                assert_eq!(config.secret_access_key, "secret_access_key");
+                assert_eq!(config.secret_store, None);
+                assert_eq!(config.access_key_id.expose(), "access_key_id");
+                assert_eq!(config.secret_access_key.expose(), "secret_access_key");
             }
         }
     }

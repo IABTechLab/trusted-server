@@ -7,9 +7,7 @@ use error_stack::{Report, ResultExt};
 use futures::StreamExt as _;
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::io::{Cursor, Write};
-use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use web_time::{SystemTime, UNIX_EPOCH};
 
@@ -22,13 +20,10 @@ use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
 use crate::platform::{
     DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, PlatformHttpRequest, PlatformResponse,
-    RuntimeServices, StoreName,
+    RuntimeServices,
 };
-use crate::redacted::Redacted;
 use crate::s3_sigv4::{self, S3Credentials};
-use crate::settings::{
-    AssetOriginAuth, OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, Settings,
-};
+use crate::settings::{AssetOriginAuth, OriginQueryPolicy, ProxyAssetRoute, Settings};
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 
 /// Chunk size used for streaming content through the rewrite pipeline.
@@ -199,17 +194,6 @@ impl AssetProxyResponse {
         (self.response, self.stream_body)
     }
 }
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct S3CredentialsCacheKey {
-    secret_store: String,
-    access_key_id: String,
-    secret_access_key: String,
-    session_token: Option<String>,
-}
-
-static S3_CREDENTIALS_CACHE: LazyLock<Mutex<HashMap<S3CredentialsCacheKey, Arc<S3Credentials>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Convert a platform-neutral response into a buffered [`Response`] for downstream processing.
 ///
@@ -854,76 +838,7 @@ fn asset_origin_host_header(
     })
 }
 
-fn s3_credentials_cache_key(config: &S3SigV4AuthConfig) -> S3CredentialsCacheKey {
-    S3CredentialsCacheKey {
-        secret_store: config.secret_store.clone(),
-        access_key_id: config.access_key_id.clone(),
-        secret_access_key: config.secret_access_key.clone(),
-        session_token: config.session_token.clone(),
-    }
-}
-
-fn load_s3_credentials(
-    services: &RuntimeServices,
-    config: &S3SigV4AuthConfig,
-) -> Result<Arc<S3Credentials>, Report<TrustedServerError>> {
-    let cache_key = s3_credentials_cache_key(config);
-    if let Some(credentials) = S3_CREDENTIALS_CACHE
-        .lock()
-        .expect("should lock S3 credentials cache")
-        .get(&cache_key)
-        .cloned()
-    {
-        return Ok(credentials);
-    }
-
-    let store_name = StoreName::from(config.secret_store.as_str());
-    let access_key_id = services
-        .secret_store()
-        .get_string(&store_name, &config.access_key_id)
-        .change_context(TrustedServerError::Proxy {
-            message: "failed to read S3 access key ID from secret store".to_string(),
-        })?;
-    let secret_access_key = services
-        .secret_store()
-        .get_string(&store_name, &config.secret_access_key)
-        .change_context(TrustedServerError::Proxy {
-            message: "failed to read S3 secret access key from secret store".to_string(),
-        })?;
-    let session_token = config
-        .session_token
-        .as_deref()
-        .map(|key| {
-            services
-                .secret_store()
-                .get_string(&store_name, key)
-                .change_context(TrustedServerError::Proxy {
-                    message: "failed to read S3 session token from secret store".to_string(),
-                })
-        })
-        .transpose()?;
-    let credentials = Arc::new(S3Credentials {
-        access_key_id,
-        secret_access_key: Redacted::new(secret_access_key),
-        session_token: session_token.map(Redacted::new),
-    });
-
-    let mut cache = S3_CREDENTIALS_CACHE
-        .lock()
-        .expect("should lock S3 credentials cache");
-    Ok(Arc::clone(cache.entry(cache_key).or_insert(credentials)))
-}
-
-#[cfg(test)]
-fn clear_s3_credentials_cache_for_tests() {
-    S3_CREDENTIALS_CACHE
-        .lock()
-        .expect("should lock S3 credentials cache")
-        .clear();
-}
-
 fn apply_asset_origin_auth(
-    services: &RuntimeServices,
     method: &Method,
     target_url: &url::Url,
     headers: &mut http::HeaderMap,
@@ -931,13 +846,17 @@ fn apply_asset_origin_auth(
 ) -> Result<(), Report<TrustedServerError>> {
     match auth {
         AssetOriginAuth::S3SigV4(config) => {
-            let credentials = load_s3_credentials(services, config)?;
+            let credentials = S3Credentials {
+                access_key_id: config.access_key_id.expose().clone(),
+                secret_access_key: config.secret_access_key.clone(),
+                session_token: config.session_token.clone(),
+            };
             s3_sigv4::sign_headers(
                 method,
                 target_url,
                 headers,
                 &config.region,
-                credentials.as_ref(),
+                &credentials,
                 // s3_sigv4 converts this via chrono's `DateTime::<Utc>::from`, which
                 // only accepts `std::time::SystemTime`. `std::time::SystemTime::now()`
                 // panics on `wasm32-unknown-unknown` (Cloudflare Workers), so derive an
@@ -1052,7 +971,7 @@ async fn preflight_s3_origin_for_image_optimizer(
     // HEAD preflight lets missing or unauthorized objects return raw S3 errors
     // without invoking IO on the failure path.
     let mut head_headers = unsigned_headers.clone();
-    apply_asset_origin_auth(services, &Method::HEAD, target_url, &mut head_headers, auth)?;
+    apply_asset_origin_auth(&Method::HEAD, target_url, &mut head_headers, auth)?;
     let head_response = send_asset_origin_request(
         services,
         backend_name,
@@ -1075,7 +994,7 @@ async fn preflight_s3_origin_for_image_optimizer(
     }
 
     let mut get_headers = unsigned_headers.clone();
-    apply_asset_origin_auth(services, &Method::GET, target_url, &mut get_headers, auth)?;
+    apply_asset_origin_auth(&Method::GET, target_url, &mut get_headers, auth)?;
     let mut response = send_asset_origin_request(
         services,
         backend_name,
@@ -1179,13 +1098,7 @@ pub async fn handle_asset_proxy_request(
     }
 
     if let Some(auth) = &route.auth {
-        apply_asset_origin_auth(
-            services,
-            req.method(),
-            &target_url,
-            &mut outbound_headers,
-            auth,
-        )?;
+        apply_asset_origin_auth(req.method(), &target_url, &mut outbound_headers, auth)?;
     }
 
     let mut platform_req =
@@ -2171,11 +2084,10 @@ mod tests {
     use super::{
         AssetProxyCachePolicy, IMAGE_FALLBACK_CONTENT_TYPE, ProxyRequestConfig,
         SUPPORTED_ENCODINGS, asset_origin_host_header, asset_path_skips_image_optimizer,
-        build_asset_proxy_target_url, clear_s3_credentials_cache_for_tests,
-        handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
-        handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, is_host_allowed,
-        proxy_request, rebuild_response_with_body, reconstruct_and_validate_signed_target,
-        redirect_is_permitted, stream_asset_body,
+        build_asset_proxy_target_url, handle_asset_proxy_request, handle_first_party_click,
+        handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
+        is_host_allowed, proxy_request, rebuild_response_with_body,
+        reconstruct_and_validate_signed_target, redirect_is_permitted, stream_asset_body,
     };
     use crate::constants::{HEADER_ACCEPT, HEADER_X_FORWARDED_FOR};
     use crate::creative;
@@ -2188,6 +2100,7 @@ mod tests {
         PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
         PlatformResponse, PlatformSecretStore, PlatformSelectResult, StoreId, StoreName,
     };
+    use crate::redacted::Redacted;
     use crate::settings::{
         AssetImageOptimizerConfig, AssetOriginAuth, ImageOptimizerAspectRatioConfig,
         ImageOptimizerCropOffsetsConfig, ImageOptimizerProfileSet, ImageOptimizerSettings,
@@ -4351,9 +4264,11 @@ mod tests {
         );
         route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
             region: "us-east-1".to_string(),
-            secret_store: "s3-auth".to_string(),
-            access_key_id: "access_key_id".to_string(),
-            secret_access_key: "secret_access_key".to_string(),
+            secret_store: None,
+            access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
+            secret_access_key: Redacted::new(
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+            ),
             session_token: None,
             origin_query: None,
         }));
@@ -4395,9 +4310,11 @@ mod tests {
             );
             route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
                 region: "us-east-1".to_string(),
-                secret_store: "s3-auth".to_string(),
-                access_key_id: "access_key_id".to_string(),
-                secret_access_key: "secret_access_key".to_string(),
+                secret_store: None,
+                access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
+                secret_access_key: Redacted::new(
+                    "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+                ),
                 session_token: None,
                 origin_query: Some(OriginQueryPolicy::Strip),
             }));
@@ -4437,23 +4354,12 @@ mod tests {
     }
 
     #[test]
-    fn handle_asset_proxy_request_caches_s3_credentials_for_repeated_signing() {
+    fn handle_asset_proxy_request_uses_resolved_s3_credentials_without_store_reads() {
         futures::executor::block_on(async {
-            clear_s3_credentials_cache_for_tests();
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, Vec::new());
             stub.push_response(200, b"optimized".to_vec());
-            let secret_store = CountingSecretStore::new(HashMap::from([
-                (
-                    "cache_access_key_id".to_string(),
-                    b"AKIAIOSFODNN7EXAMPLE".to_vec(),
-                ),
-                (
-                    "cache_secret_access_key".to_string(),
-                    b"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_vec(),
-                ),
-                ("cache_session_token".to_string(), b"session-token".to_vec()),
-            ]));
+            let secret_store = CountingSecretStore::new(HashMap::new());
             let observed_secret_store = secret_store.clone();
             let services = build_services_with_secret_and_http_client(
                 secret_store,
@@ -4470,10 +4376,12 @@ mod tests {
             let mut route = test_s3_image_optimizer_route();
             route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
                 region: "us-east-1".to_string(),
-                secret_store: "s3-auth-cache".to_string(),
-                access_key_id: "cache_access_key_id".to_string(),
-                secret_access_key: "cache_secret_access_key".to_string(),
-                session_token: Some("cache_session_token".to_string()),
+                secret_store: None,
+                access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
+                secret_access_key: Redacted::new(
+                    "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+                ),
+                session_token: Some(Redacted::new("session-token".to_string())),
                 origin_query: None,
             }));
 
@@ -4487,19 +4395,9 @@ mod tests {
                 "should sign both the S3 preflight and final request"
             );
             assert_eq!(
-                observed_secret_store.read_count("cache_access_key_id"),
-                1,
-                "should read S3 access key ID once despite repeated signing"
-            );
-            assert_eq!(
-                observed_secret_store.read_count("cache_secret_access_key"),
-                1,
-                "should read S3 secret access key once despite repeated signing"
-            );
-            assert_eq!(
-                observed_secret_store.read_count("cache_session_token"),
-                1,
-                "should read S3 session token once despite repeated signing"
+                observed_secret_store.read_count("AKIAIOSFODNN7EXAMPLE"),
+                0,
+                "should not read S3 credentials from the runtime secret store"
             );
             let headers = stub.recorded_request_headers();
             assert!(
