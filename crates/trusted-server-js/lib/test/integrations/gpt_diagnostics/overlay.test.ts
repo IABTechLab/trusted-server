@@ -405,6 +405,18 @@ describe('GptDiagnosticsOverlay', () => {
     const element = document.createElement('div');
     element.id = 'filled-slot';
     document.body.append(element);
+    store.recordTrustedServerOpportunity(
+      filledSlot,
+      'filled-slot-auction',
+      'renderable_candidate',
+      undefined,
+      [
+        [300, 250],
+        [728, 90],
+        [320, 50],
+        [970, 250],
+      ]
+    );
     store.recordSlotRequested(filledSlot);
     now = 20;
     store.recordSlotResponseReceived(filledSlot);
@@ -414,6 +426,7 @@ describe('GptDiagnosticsOverlay', () => {
       size: [300, 250],
       isBackfill: true,
     });
+    store.recordObservedSlotSize(1, 1, [320, 270]);
     now = 30;
     store.recordSlotOnload(filledSlot);
     now = 35;
@@ -457,7 +470,9 @@ describe('GptDiagnosticsOverlay', () => {
     expect(root!.textContent).toContain('/example/site/filled-slot');
     expect(root!.textContent).toContain('Empty');
     expect(root!.textContent).toContain('Previous requests (1)');
-    expect(root!.textContent).toContain('Rendered size 300×250');
+    expect(root!.textContent).toContain('Requested slot sizes 300×250, 728×90, 320×50, 970×250');
+    expect(root!.textContent).toContain('GPT-reported fill size 300×250');
+    expect(root!.textContent).toContain('Observed outer slot box 320×270');
     expect(root!.textContent).toContain('Backfill yes');
     expect(root!.textContent).toContain('GPT slot onload observed');
     expect(root!.textContent).toContain('GPT impressionViewable observed');
