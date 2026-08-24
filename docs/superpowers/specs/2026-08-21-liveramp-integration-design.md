@@ -383,6 +383,16 @@ ingestion provide reuse on later requests.
 - Prebid's User ID and consent-management modules remain responsible for
   deciding whether the browser may call LiveRamp. LiveRamp must be configured
   correctly in the publisher's CMP/GVL posture.
+- Correction applied during implementation: `consentManagementTcf` only
+  _retrieves_ the TC string. Enforcement lives in Prebid's `tcfControl`
+  activity-control module, which the generated external bundle did not carry.
+  Without it a denied Purpose 1 still permitted the vendor call and the
+  `idl_env` write; only EID _forwarding_ was gated, server-side. The bundle now
+  imports `tcfControl`, covered by
+  `crates/trusted-server-js/lib/test/prebid-consent-enforcement.test.mjs`.
+  Equivalent GPP/US-state activity controls (`gppControl_usnat`,
+  `gppControl_usstates`) remain unbundled; US opt-outs are still enforced only
+  at the server's forwarding gate.
 - LiveRamp envelope values are opaque identifiers. They must never appear in
   logs, public diagnostics, error bodies, or telemetry dimensions.
 - The implementation does not collect plaintext or hashed email and does not

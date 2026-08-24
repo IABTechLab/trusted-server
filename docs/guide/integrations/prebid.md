@@ -131,6 +131,15 @@ regenerating and re-uploading the bundle (and pushing the updated
 rollout. The shim refuses to install twice on one page via the
 `window.__tsjsPrebidShimInstalled` sentinel.
 
+The consent modules include Prebid's `tcfControl`, so a regenerated bundle
+**enforces** the TCF signal it collects rather than only reporting it. Under
+GDPR, activities whose purposes the CMP denies — device access, user sync, EID
+enrichment and transmission, bid requests — are blocked client-side for every
+bidder and User ID module, not only for LiveRamp. Publishers whose CMP does not
+actually grant the purposes their current setup relies on will see EU activity
+drop once they regenerate, so validate a regenerated bundle against a live CMP
+before rolling it out broadly.
+
 ## Debug Mode
 
 When `debug = true`, the Prebid integration enables additional diagnostics on both the outgoing OpenRTB request and the incoming response.
@@ -501,7 +510,18 @@ refresh_in_seconds = 1800
 Run `ts prebid bundle`, upload the generated content-addressed bundle, copy its
 hash metadata into `[integrations.prebid]`, and validate the configuration
 before rollout. The storage name is fixed to `idl_env`; operators choose only
-the storage type, expiry, and refresh interval.
+the storage type, expiry, and refresh interval. `ts prebid bundle` rejects a
+config that sets `[integrations.prebid.liveramp]` while pinning
+`bundle.user_id_modules` to a list without `identityLinkIdSystem`; omit the
+list to take the generator's default preset, which includes it.
+
+The generated bundle carries Prebid's `tcfControl` module alongside the
+`consentManagement*` modules. That pairing is what makes the TCF signal
+enforceable: `consentManagement*` only retrieves the consent string, while
+`tcfControl` registers the activity controls (device access, user sync, EID
+enrichment and transmission) that act on it. A bundle built without it collects
+consent and then ignores it — every User ID submodule would still write browser
+storage and still call its vendor endpoint on a denied purpose.
 
 When enabled, Trusted Server owns one deterministic `identityLink` entry in
 `userSync.userIds` for publisher configuration applied through the public
@@ -531,16 +551,41 @@ Trusted Server treats the RampID envelope as an opaque string. Do not log,
 decode, publish, or dimension metrics by the value. Source names, counts,
 booleans, and status codes are sufficient for diagnostics.
 
+### Browser network and storage footprint
+
+With the default `not_use_3p = false`, the IdentityLink submodule performs
+third-party recognition from the browser. Operators should plan for this before
+enabling the subsection:
+
+| Effect                  | Detail                                                                                                                                              |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Outbound request        | A credentialed `GET` from the page to LiveRamp's envelope endpoint (`api.rlcdn.com`). Trusted Server does not proxy it.                             |
+| Content Security Policy | Publishers running a strict CSP must allow that host in `connect-src`, or recognition fails silently.                                               |
+| Browser storage         | `idl_env` plus IdentityLink's bookkeeping entries (`idl_env_cst`, `idl_env_last`, `_lr_retry_request`, `_lr_env_src_ats`).                          |
+| Recognition opt-out     | `not_use_3p = true` suppresses the third-party request. RampID then resolves only where an authenticated envelope is already available on the page. |
+
+Because the request leaves the browser directly rather than through the edge,
+this integration is not a first-party replacement for LiveRamp recognition; it
+configures Prebid's client-side submodule on the operator's behalf. Server-side
+resolution is tracked separately (see the design document's out-of-scope
+section).
+
+If the publisher's page already loads LiveRamp's ATS library, the submodule
+prefers `window.ats.retrieveEnvelope` over the third-party endpoint. That is
+the submodule's own behavior — Trusted Server neither loads ATS nor calls a
+server-to-server ATS API.
+
 ### Degraded behavior
 
-| Condition                                                                    | Result                                                                 |
-| ---------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| Required consent is absent in a regulated jurisdiction, or the user opts out | No LiveRamp EID is forwarded; the auction continues                    |
-| LiveRamp cannot recognize the browser                                        | IdentityLink yields no EID; the auction continues                      |
-| LiveRamp network resolution fails                                            | The current auction continues without RampID                           |
-| `identityLinkIdSystem` is missing from the bundle                            | Existing diagnostics report the missing module; auctions continue      |
-| The origin is not approved by LiveRamp                                       | Resolution yields no usable EID; the auction continues                 |
-| EC/KV is unavailable                                                         | A current-request EID can still reach `/auction`; persistence degrades |
+| Condition                                         | Result                                                                 |
+| ------------------------------------------------- | ---------------------------------------------------------------------- |
+| Required TCF purposes are denied                  | `tcfControl` blocks resolution: no vendor call, no `idl_env`, no EID   |
+| The user opts out under a US state signal         | No LiveRamp EID is forwarded; the auction continues                    |
+| LiveRamp cannot recognize the browser             | IdentityLink yields no EID; the auction continues                      |
+| LiveRamp network resolution fails                 | The current auction continues without RampID                           |
+| `identityLinkIdSystem` is missing from the bundle | Existing diagnostics report the missing module; auctions continue      |
+| The origin is not approved by LiveRamp            | Resolution yields no usable EID; the auction continues                 |
+| EC/KV is unavailable                              | A current-request EID can still reach `/auction`; persistence degrades |
 
 ### Credential-based validation
 
@@ -557,7 +602,8 @@ domain, booleans, source names, counts, and status codes:
    `user.ext.eids`.
 5. Confirm a later request ingests the source into the configured
    `liveramp.com` EC partner.
-6. Repeat with opt-out or no consent and confirm no LiveRamp EID is forwarded.
+6. Repeat with denied consent and confirm the envelope endpoint is not called,
+   `idl_env` is not written, and no LiveRamp EID is forwarded.
 7. Repeat on an unapproved origin and confirm identity resolution degrades
    without blocking the auction.
 

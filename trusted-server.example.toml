@@ -59,7 +59,10 @@ adapters = ["rubicon"]
 
 # Optional managed LiveRamp RampID configuration. The external Prebid bundle
 # must contain identityLinkIdSystem. Obtain the Placement ID and approve the
-# publisher origin with LiveRamp before enabling.
+# publisher origin with LiveRamp before enabling. Persisting the resulting
+# envelope into the EC identity graph additionally needs a matching partner
+# under [[ec.partners]] with source_domain = "liveramp.com"; without one the
+# envelope still reaches the auction but is never written to KV.
 # [integrations.prebid.liveramp]
 # placement_id = "999"
 # not_use_3p = false

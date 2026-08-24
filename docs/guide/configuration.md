@@ -1271,7 +1271,10 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__LIVERAMP__PLACEMENT_ID=999
 
 The LiveRamp storage name is fixed to `idl_env`. The Placement ID and an
 approved publisher origin are operational prerequisites, and the external
-Prebid bundle must include `identityLinkIdSystem`. See
+Prebid bundle must include `identityLinkIdSystem`. The environment override
+above only replaces a `placement_id` that the published TOML already declares —
+it cannot introduce the subsection, so LiveRamp cannot be enabled from the
+environment alone. See
 [Managed LiveRamp RampID](/guide/integrations/prebid#managed-liveramp-rampid)
 for consent, timing, privacy, degraded behavior, and live validation guidance.
 
