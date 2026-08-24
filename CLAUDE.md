@@ -120,6 +120,12 @@ cargo clippy-cloudflare-wasm
 cargo clippy-spin-native
 cargo clippy-spin-wasm
 
+# The CLI and the OpenRTB codegen crate are host-target members that no adapter
+# alias covers. CI lints both with the Linux triple pinned; these aliases omit
+# `--target` so they reproduce it on any host.
+cargo clippy-cli
+cargo clippy-codegen
+
 # Check compilation (per-target aliases — bare `cargo check` fails at the workspace root)
 cargo check-fastly && cargo check-axum && cargo check-cloudflare
 
@@ -336,7 +342,7 @@ IntegrationRegistration::builder(ID)
 Every PR must pass:
 
 1. `cargo fmt --all -- --check`
-2. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare && cargo clippy-cloudflare-wasm && cargo clippy-spin-native && cargo clippy-spin-wasm`
+2. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare && cargo clippy-cloudflare-wasm && cargo clippy-spin-native && cargo clippy-spin-wasm && cargo clippy-cli && cargo clippy-codegen`
 3. `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin`
 4. `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`
 5. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)
