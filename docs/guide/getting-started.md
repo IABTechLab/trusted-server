@@ -65,18 +65,29 @@ The server will be available at `http://localhost:7676`.
 
 No Fastly account, CLI, or Viceroy needed. Runs natively on your machine.
 
-The Axum adapter reads configuration from environment variables — it does **not**
-auto-load `.env` files. You must export the variables into your shell before starting
-the server.
+The Axum adapter reads the EdgeZero config blob and secret store from
+environment variables — it does **not** auto-load `.env` files. You must export
+the variables into your shell before starting the server.
 
 ```bash
-# Copy and edit the environment file
+# Create the local app config and apply the non-secret development overlay.
+cp trusted-server.example.toml trusted-server.toml
 cp .env.dev .env
-
-# Export the variables into your current shell session
 set -a && source .env && set +a
 
-# Build and start the dev server
+# Create the local blob-backed config-store entry.
+ts config push --adapter axum --local --yes
+export TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG="$(
+  jq -r '.trusted_server_config' .edgezero/local-config-trusted_server_config.json
+)"
+
+# Populate the three secret references from the starter config for this shell.
+# Use stable values only if you need existing proxy URLs or EC IDs to remain valid.
+export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET="$(openssl rand -base64 32)"
+export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE="$(openssl rand -base64 32)"
+export TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD="$(openssl rand -base64 32)"
+
+# Build and start the dev server in the same shell.
 cargo run -p trusted-server-adapter-axum
 ```
 
@@ -85,12 +96,16 @@ The server will be available at `http://localhost:8787`. Set `PORT=<port>` befor
 
 **Environment variable conventions used by the Axum adapter:**
 
-| Purpose            | Pattern                               | Example                                                  |
-| ------------------ | ------------------------------------- | -------------------------------------------------------- |
-| Config store value | `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` | `TRUSTED_SERVER_CONFIG_SETTINGS_AD_SERVER_URL=https://…` |
-| Secret store value | `TRUSTED_SERVER_SECRET_{STORE}_{KEY}` | `TRUSTED_SERVER_SECRET_KEYS_SIGNING_KEY=abc123`          |
+| Purpose            | Pattern                               | Example                                                               |
+| ------------------ | ------------------------------------- | --------------------------------------------------------------------- |
+| Config store value | `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` | `TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG=…` |
+| Secret store value | `TRUSTED_SERVER_SECRET_{STORE}_{KEY}` | `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PROXY_KEY=…`            |
 
-Store names and key names are uppercased with hyphens and dots replaced by underscores.
+The config-store value is the verified app-config blob. Secret-store values are
+looked up by the key names in that blob. Store names and key names are uppercased
+with hyphens and dots replaced by underscores. The quick-start exports ephemeral
+secret-store values only into the current shell; do not put secret values in the
+TOML config, config-store blob, or a source-controlled environment file.
 
 > **Dev server limitations:** The Axum adapter does not support KV store,
 > geo lookup, config/secret-store writes, or admin key-management routes.
@@ -131,7 +146,8 @@ ts audit generate https://publisher.example
 ```
 
 The audit command writes `js-assets.toml` plus a draft `trusted-server.toml`.
-Review the draft, replace placeholders/secrets, then validate it.
+Review the draft, replace placeholders with stable secret key names, then
+validate it.
 
 Edit `trusted-server.toml` to configure:
 
@@ -139,14 +155,18 @@ Edit `trusted-server.toml` to configure:
 - KV store mappings
 - EC configuration
 - Consent settings (`[gdpr]`)
+- Stable key names for `trusted_server_secrets`
 
-Validate the config before pushing it to platform storage:
+Provision `trusted_server_secrets` with the existing credential values before
+pushing a migrated config. Then validate and push:
 
 ```bash
 ts config validate
+ts config push --adapter fastly
 ```
 
-See [Configuration](/guide/configuration) and [Trusted Server CLI](/guide/cli) for details.
+Restart or redeploy instances after secret rotation. See
+[Configuration](/guide/configuration) and [Trusted Server CLI](/guide/cli) for details.
 
 ## Deploy to Fastly
 

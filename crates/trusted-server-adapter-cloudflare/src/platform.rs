@@ -547,8 +547,8 @@ impl PlatformHttpClient for CloudflareHttpClient {
 /// Bridges [`worker::Env`] secrets to [`PlatformSecretStore`] by calling
 /// `env.secret(key)` synchronously. Writes and deletes return errors.
 #[cfg(target_arch = "wasm32")]
-struct CloudflareSecretStoreAdapter {
-    env: worker::Env,
+pub(crate) struct CloudflareSecretStoreAdapter {
+    pub(crate) env: worker::Env,
 }
 
 #[cfg(target_arch = "wasm32")]

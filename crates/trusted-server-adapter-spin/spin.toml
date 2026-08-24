@@ -25,6 +25,13 @@ version = "0.1.0"
 [variables]
 v_current_x2dkid = { default = "" }
 v_active_x2dkids = { default = "" }
+# Trusted Server app-config secret references. Replace the empty defaults with
+# values supplied by the deployment's secret provider; never commit values here.
+v_trusted_x5fserver_x5fsecrets_v_publisher_x5fproxy_x5fsecret = { default = "", secret = true }
+v_trusted_x5fserver_x5fsecrets_v_ec_x5fpassphrase = { default = "", secret = true }
+v_trusted_x5fserver_x5fsecrets_v_partner_x5fapi_x5ftoken = { default = "", secret = true }
+v_trusted_x5fserver_x5fsecrets_v_partner_x5fts_x5fpull_x5ftoken = { default = "", secret = true }
+v_trusted_x5fserver_x5fsecrets_v_handler_x5fpassword = { default = "", secret = true }
 
 [[trigger.http]]
 route = "/..."
@@ -43,6 +50,11 @@ key_value_stores = ["default"]
 [component.trusted-server.variables]
 v_current_x2dkid = "{{ v_current_x2dkid }}"
 v_active_x2dkids = "{{ v_active_x2dkids }}"
+v_trusted_x5fserver_x5fsecrets_v_publisher_x5fproxy_x5fsecret = "{{ v_trusted_x5fserver_x5fsecrets_v_publisher_x5fproxy_x5fsecret }}"
+v_trusted_x5fserver_x5fsecrets_v_ec_x5fpassphrase = "{{ v_trusted_x5fserver_x5fsecrets_v_ec_x5fpassphrase }}"
+v_trusted_x5fserver_x5fsecrets_v_partner_x5fapi_x5ftoken = "{{ v_trusted_x5fserver_x5fsecrets_v_partner_x5fapi_x5ftoken }}"
+v_trusted_x5fserver_x5fsecrets_v_partner_x5fts_x5fpull_x5ftoken = "{{ v_trusted_x5fserver_x5fsecrets_v_partner_x5fts_x5fpull_x5ftoken }}"
+v_trusted_x5fserver_x5fsecrets_v_handler_x5fpassword = "{{ v_trusted_x5fserver_x5fsecrets_v_handler_x5fpassword }}"
 
 [component.trusted-server.build]
 command = "cargo build --target wasm32-wasip1 --release -p trusted-server-adapter-spin --features spin"

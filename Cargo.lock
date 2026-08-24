@@ -1427,7 +1427,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=5f3d648c3c6c38fc6e6b22b5c65c66177363aad8#5f3d648c3c6c38fc6e6b22b5c65c66177363aad8"
+source = "git+https://github.com/stackpop/edgezero?rev=bb4411625856472b1279a3db49aeeac5e8b1507e#bb4411625856472b1279a3db49aeeac5e8b1507e"
 dependencies = [
  "toml",
 ]
@@ -1435,7 +1435,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-axum"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=5f3d648c3c6c38fc6e6b22b5c65c66177363aad8#5f3d648c3c6c38fc6e6b22b5c65c66177363aad8"
+source = "git+https://github.com/stackpop/edgezero?rev=bb4411625856472b1279a3db49aeeac5e8b1507e#bb4411625856472b1279a3db49aeeac5e8b1507e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1463,7 +1463,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=5f3d648c3c6c38fc6e6b22b5c65c66177363aad8#5f3d648c3c6c38fc6e6b22b5c65c66177363aad8"
+source = "git+https://github.com/stackpop/edgezero?rev=bb4411625856472b1279a3db49aeeac5e8b1507e#bb4411625856472b1279a3db49aeeac5e8b1507e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1486,7 +1486,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=5f3d648c3c6c38fc6e6b22b5c65c66177363aad8#5f3d648c3c6c38fc6e6b22b5c65c66177363aad8"
+source = "git+https://github.com/stackpop/edgezero?rev=bb4411625856472b1279a3db49aeeac5e8b1507e#bb4411625856472b1279a3db49aeeac5e8b1507e"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1515,7 +1515,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-spin"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=5f3d648c3c6c38fc6e6b22b5c65c66177363aad8#5f3d648c3c6c38fc6e6b22b5c65c66177363aad8"
+source = "git+https://github.com/stackpop/edgezero?rev=bb4411625856472b1279a3db49aeeac5e8b1507e#bb4411625856472b1279a3db49aeeac5e8b1507e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1542,7 +1542,7 @@ dependencies = [
 [[package]]
 name = "edgezero-cli"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=5f3d648c3c6c38fc6e6b22b5c65c66177363aad8#5f3d648c3c6c38fc6e6b22b5c65c66177363aad8"
+source = "git+https://github.com/stackpop/edgezero?rev=bb4411625856472b1279a3db49aeeac5e8b1507e#bb4411625856472b1279a3db49aeeac5e8b1507e"
 dependencies = [
  "chrono",
  "clap",
@@ -1567,7 +1567,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=5f3d648c3c6c38fc6e6b22b5c65c66177363aad8#5f3d648c3c6c38fc6e6b22b5c65c66177363aad8"
+source = "git+https://github.com/stackpop/edgezero?rev=bb4411625856472b1279a3db49aeeac5e8b1507e#bb4411625856472b1279a3db49aeeac5e8b1507e"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -1598,14 +1598,14 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=5f3d648c3c6c38fc6e6b22b5c65c66177363aad8#5f3d648c3c6c38fc6e6b22b5c65c66177363aad8"
+source = "git+https://github.com/stackpop/edgezero?rev=bb4411625856472b1279a3db49aeeac5e8b1507e#bb4411625856472b1279a3db49aeeac5e8b1507e"
 dependencies = [
  "log",
  "proc-macro2",
  "quote",
  "serde",
  "serde_json",
- "syn 3.0.3",
+ "syn 2.0.118",
  "toml",
  "validator",
 ]
@@ -4852,17 +4852,6 @@ name = "syn"
 version = "2.0.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b9ae57f904213ebb649ce6895b8a66c66f0203b9319718f69a5612a065b1422"
-dependencies = [
- "proc-macro2",
- "quote",
- "unicode-ident",
-]
-
-[[package]]
-name = "syn"
-version = "3.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
 dependencies = [
  "proc-macro2",
  "quote",

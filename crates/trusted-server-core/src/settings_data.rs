@@ -3,9 +3,10 @@ use error_stack::{Report, ResultExt};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
+use crate::config_payload::DEFAULT_SECRET_STORE_ID;
 use crate::config_payload::settings_from_config_blob;
 use crate::error::TrustedServerError;
-use crate::platform::{PlatformConfigStore, StoreName};
+use crate::platform::{PlatformConfigStore, PlatformSecretStore, StoreName};
 use crate::settings::Settings;
 
 const DEFAULT_CONFIG_STORE_ID: &str = "trusted_server_config";
@@ -40,21 +41,29 @@ pub fn default_config_key() -> String {
     EnvConfig::from_env().store_key("config", DEFAULT_CONFIG_STORE_ID)
 }
 
+/// Returns the default `EdgeZero` secret-store name for Trusted Server secrets.
+#[must_use]
+pub fn default_secret_store_name() -> StoreName {
+    StoreName::from(EnvConfig::from_env().store_name("secrets", DEFAULT_SECRET_STORE_ID))
+}
+
 /// Loads [`Settings`] from a platform config store and key.
 ///
 /// # Errors
 ///
 /// Returns [`TrustedServerError::Configuration`] when the config blob is
-/// missing, cannot be read, fails envelope verification, or fails Trusted
-/// Server settings validation.
+/// missing, cannot be read, fails envelope verification, secret resolution,
+/// or Trusted Server settings validation.
 pub fn get_settings_from_config_store(
     config_store: &dyn PlatformConfigStore,
+    secret_store: &dyn PlatformSecretStore,
     store_name: &StoreName,
     key: &str,
+    default_secret_store_name: &StoreName,
 ) -> Result<Settings, Report<TrustedServerError>> {
     let raw_value = read_config_entry(config_store, store_name, key)?;
     let envelope_json = resolve_fastly_chunk_pointer(config_store, store_name, &raw_value)?;
-    settings_from_config_blob(&envelope_json)
+    settings_from_config_blob(&envelope_json, secret_store, default_secret_store_name)
 }
 
 fn read_config_entry(
@@ -177,7 +186,7 @@ fn configuration_error<T>(message: String) -> Result<T, Report<TrustedServerErro
 mod tests {
     use super::*;
     use crate::config_payload::CONFIG_BLOB_KEY;
-    use crate::platform::PlatformError;
+    use crate::platform::{PlatformError, StoreId};
     use crate::settings::Settings;
     use crate::test_support::tests::crate_test_settings_str;
     use edgezero_core::blob_envelope::BlobEnvelope;
@@ -197,18 +206,43 @@ mod tests {
 
         fn put(
             &self,
-            _store_id: &crate::platform::StoreId,
+            _store_id: &StoreId,
             _key: &str,
             _value: &str,
         ) -> Result<(), Report<PlatformError>> {
             Ok(())
         }
 
-        fn delete(
+        fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+    }
+
+    struct EchoSecretStore;
+
+    impl PlatformSecretStore for EchoSecretStore {
+        fn get_bytes(
             &self,
-            _store_id: &crate::platform::StoreId,
-            _key: &str,
+            _store_name: &StoreName,
+            key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            let value = match key {
+                "unit-test-proxy-secret" => "unit-test-proxy-secret-32-bytes-ok",
+                _ => key,
+            };
+            Ok(value.as_bytes().to_vec())
+        }
+
+        fn create(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+            _value: &str,
         ) -> Result<(), Report<PlatformError>> {
+            Ok(())
+        }
+
+        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
             Ok(())
         }
     }
@@ -219,18 +253,32 @@ mod tests {
         serde_json::to_string(&envelope).expect("should serialize envelope")
     }
 
+    fn load_settings(
+        config_store: &dyn PlatformConfigStore,
+        store_name: &StoreName,
+        key: &str,
+    ) -> Result<Settings, Report<TrustedServerError>> {
+        get_settings_from_config_store(
+            config_store,
+            &EchoSecretStore,
+            store_name,
+            key,
+            &StoreName::from("trusted_server_secrets"),
+        )
+    }
+
     #[test]
     fn loads_settings_from_config_blob_entry() {
-        let settings =
+        let mut settings =
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
         let envelope_json = envelope_json(&settings);
         let store = MemoryConfigStore {
             entries: BTreeMap::from([(CONFIG_BLOB_KEY.to_string(), envelope_json)]),
         };
 
-        let loaded =
-            get_settings_from_config_store(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-                .expect("should load settings");
+        let loaded = load_settings(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
+            .expect("should load settings");
 
         assert_eq!(
             loaded.publisher.domain, settings.publisher.domain,
@@ -240,8 +288,9 @@ mod tests {
 
     #[test]
     fn loads_settings_from_fastly_chunk_pointer() {
-        let settings =
+        let mut settings =
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
         let envelope_json = envelope_json(&settings);
         let midpoint = envelope_json.len() / 2;
         let first_chunk = envelope_json[..midpoint].to_string();
@@ -275,9 +324,8 @@ mod tests {
             ]),
         };
 
-        let loaded =
-            get_settings_from_config_store(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-                .expect("should load settings");
+        let loaded = load_settings(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
+            .expect("should load settings");
 
         assert_eq!(
             loaded.publisher.domain, settings.publisher.domain,
@@ -306,9 +354,8 @@ mod tests {
             entries: BTreeMap::from([(CONFIG_BLOB_KEY.to_string(), pointer)]),
         };
 
-        let err =
-            get_settings_from_config_store(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-                .expect_err("should reject malformed chunk length metadata");
+        let err = load_settings(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
+            .expect_err("should reject malformed chunk length metadata");
 
         assert!(
             err.to_string().contains("chunk lengths total mismatch"),
@@ -322,9 +369,8 @@ mod tests {
             entries: BTreeMap::new(),
         };
 
-        let err =
-            get_settings_from_config_store(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-                .expect_err("should fail when blob is missing");
+        let err = load_settings(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
+            .expect_err("should fail when blob is missing");
 
         assert!(
             err.to_string().contains(CONFIG_BLOB_KEY),
