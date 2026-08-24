@@ -262,6 +262,9 @@ ts audit ad-templates generate https://publisher.example/ --max-sections 20 --ma
 # Audit exactly one page, as earlier releases did.
 ts audit ad-templates generate https://publisher.example/ --max-pages 1
 
+# Trigger lazy-loaded inventory on every crawled page.
+ts audit ad-templates generate https://publisher.example/ --scroll
+
 # Set the patterns yourself; this disables pattern inference entirely, and the
 # run fails outright if any slot's template had to borrow section_root.
 ts audit ad-templates generate https://publisher.example/ \
@@ -275,6 +278,17 @@ Re-running merges into the existing slots: a slot seen again keeps its
 hand-tuned fields and gains this run's patterns and newly observed formats, and a hand-written
 `gam_unit_path` template is preserved. `--replace` discards existing slots
 instead, which also discards any template you wrote by hand.
+
+`--scroll` performs the same deterministic stepped scroll on every page and
+device profile after the initial settle, then waits for the page to settle again
+before collecting evidence. It is opt-in because it increases crawl time, ad
+requests, and publisher-page side effects.
+
+During a normal merge, configured slots missing from the current crawl are
+preserved and named in a stderr note. Absence is not proof that a slot is stale:
+the crawl may have missed a page type, device target, or lazy-loaded placement.
+Review coverage and re-run with `--scroll` when appropriate. Only use
+`--replace` when intentionally pruning every slot the run did not rediscover.
 
 A slot that never appeared without a section segment can borrow a
 `section_root` witnessed by another slot only while its patterns are derived
