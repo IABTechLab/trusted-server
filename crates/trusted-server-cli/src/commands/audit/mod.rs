@@ -207,6 +207,9 @@ pub(crate) struct AuditAdTemplatesGenerateArgs {
     /// Preview the updated config on stdout instead of writing it.
     #[arg(long)]
     pub dry_run: bool,
+    /// Perform a deterministic scroll pass after each page initially settles.
+    #[arg(long)]
+    pub scroll: bool,
     /// Cookie to send with the page request, as `name=value`. Repeatable.
     /// Use to carry an existing session (e.g. a valid bot-protection clearance
     /// cookie) so the origin serves the real page instead of a challenge.
@@ -335,6 +338,7 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
                     generate::browser_collector::BrowserAuditCollector::with_profile(*profile)
                         .with_page_delay(std::time::Duration::from_millis(gen_args.page_delay_ms))
                         .with_browser_options(&gen_args.browser)
+                        .with_scroll(gen_args.scroll)
                 })
                 .collect();
             let selected: Vec<(&str, &dyn generate::collector::AuditCollector)> = profiles

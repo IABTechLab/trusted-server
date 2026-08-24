@@ -517,6 +517,33 @@ mod tests {
         };
         assert_eq!(generate.browser.settle_quiet_ms, 750);
         assert_eq!(generate.browser.settle_max_ms, 12_000);
+        assert!(!generate.scroll);
+    }
+
+    #[test]
+    fn audit_ad_templates_generate_parses_scroll() {
+        let args = parse(&[
+            "ts",
+            "audit",
+            "ad-templates",
+            "generate",
+            "https://www.example.com/",
+            "--scroll",
+        ]);
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        let Some(crate::commands::audit::AuditSubcommand::AdTemplates(
+            crate::commands::audit::AuditAdTemplatesCommand::Generate(generate),
+        )) = audit.command
+        else {
+            panic!("expected audit ad-templates generate command");
+        };
+
+        assert!(
+            generate.scroll,
+            "--scroll should enable generation scrolling"
+        );
     }
 
     #[test]

@@ -123,6 +123,8 @@ pub(crate) struct BrowserAuditCollector {
     profile: Option<DeviceProfile>,
     /// Pause between page loads during a crawl.
     page_delay: Duration,
+    /// Perform a deterministic scroll pass after the initial settle.
+    scroll: bool,
     /// Run a visible browser instead of a headless one.
     headful: bool,
     /// Answer the consent APIs as a consenting reader.
@@ -143,6 +145,7 @@ impl Default for BrowserAuditCollector {
         Self {
             profile: None,
             page_delay: Duration::ZERO,
+            scroll: false,
             headful: false,
             assume_consent: true,
             proxy: None,
@@ -188,6 +191,13 @@ impl BrowserAuditCollector {
         self.page_delay = delay;
         self
     }
+
+    /// Enables or disables the deterministic scroll pass for every page.
+    #[must_use]
+    pub(crate) fn with_scroll(mut self, scroll: bool) -> Self {
+        self.scroll = scroll;
+        self
+    }
 }
 
 /// The browser-session knobs one crawl runs under.
@@ -195,6 +205,7 @@ impl BrowserAuditCollector {
 struct SessionSettings {
     profile: Option<DeviceProfile>,
     page_delay: Duration,
+    scroll: bool,
     headful: bool,
     assume_consent: bool,
     proxy: Option<String>,
@@ -209,6 +220,7 @@ impl BrowserAuditCollector {
         SessionSettings {
             profile: self.profile,
             page_delay: self.page_delay,
+            scroll: self.scroll,
             headful: self.headful,
             assume_consent: self.assume_consent,
             proxy: self.proxy.clone(),
@@ -357,6 +369,7 @@ async fn with_browser(
     let SessionSettings {
         profile,
         page_delay,
+        scroll,
         headful,
         assume_consent,
         proxy,
@@ -423,6 +436,7 @@ async fn with_browser(
             cookies,
             index == 0,
             assume_consent,
+            scroll,
             settle_quiet,
             settle_max,
         )
@@ -506,6 +520,7 @@ async fn collect_page_from_browser(
     cookies: &[(String, String)],
     discover_sitemap: bool,
     assume_consent: bool,
+    scroll: bool,
     settle_quiet: Duration,
     settle_max: Duration,
 ) -> CliResult<CollectedPage> {
@@ -524,6 +539,7 @@ async fn collect_page_from_browser(
         target_url,
         discover_sitemap,
         assume_consent,
+        scroll,
         settle_quiet,
         settle_max,
     )
@@ -555,6 +571,7 @@ async fn collect_open_page(
     target_url: &Url,
     discover_sitemap: bool,
     assume_consent: bool,
+    _scroll: bool,
     settle_quiet: Duration,
     settle_max: Duration,
 ) -> CliResult<CollectedPage> {
