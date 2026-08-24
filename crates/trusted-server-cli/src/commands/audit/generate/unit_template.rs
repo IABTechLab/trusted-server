@@ -71,7 +71,7 @@ pub(super) struct InferenceOutcome {
     pub(super) decisions: Vec<(String, SlotDecision)>,
     /// Operator-facing notes about why inference went the way it did.
     pub(super) diagnostics: Vec<String>,
-    /// Slot stems whose templates rely on a root witnessed by another slot.
+    /// Div stems whose templates rely on a root witnessed by another slot.
     pub(super) borrowed_section_root: Vec<String>,
 }
 
@@ -179,6 +179,11 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
     };
 
     let Some((section_segment, section_root, analyses)) = chosen else {
+        // Only a crawl gap justifies rewriting the per-slot reasons. When
+        // inference stopped on segment ambiguity instead, that pushed its own
+        // diagnostic, and blaming the crawl here would send the operator to
+        // widen it when the remedy is pinning `section_segment`.
+        let root_gap = diagnostics.is_empty() && root_witness_missing;
         if diagnostics.is_empty() {
             diagnostics.push(if root_witness_missing {
                 "the ad-unit paths do track the page section, but no crawled page lacked a \
@@ -193,7 +198,7 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
             });
         }
         let mut decisions = literal_decisions(&slots);
-        if root_witness_missing {
+        if root_gap {
             for (stem, decision) in &mut decisions {
                 if root_unwitnessed_stems.contains(stem)
                     && let SlotDecision::Refuse { reasons } = decision
@@ -571,6 +576,25 @@ mod tests {
         table
     }
 
+    /// Folds pages carrying different slot sets into one table.
+    ///
+    /// Each entry is `(request path, [(div id, ad-unit path)])`.
+    fn table_for_pages(pages: &[(&str, &[(&str, &str)])]) -> EvidenceTable {
+        let mut table = EvidenceTable::default();
+        for (path, slots) in pages {
+            let registry: Vec<CollectedGptSlot> = slots
+                .iter()
+                .map(|(div_id, unit_path)| CollectedGptSlot {
+                    gam_unit_path: (*unit_path).to_string(),
+                    div_id: (*div_id).to_string(),
+                    sizes: vec![(728, 90)],
+                })
+                .collect();
+            table.fold_page(path, &discover_gpt_slots(&registry, &[], false));
+        }
+        table
+    }
+
     fn only_decision(outcome: &InferenceOutcome) -> &SlotDecision {
         assert_eq!(outcome.decisions.len(), 1, "fixture should have one slot");
         &outcome.decisions[0].1
@@ -815,6 +839,51 @@ mod tests {
                 .contains("`ad-sidebar` was never observed on a page without a section segment")),
             "the borrowed section_root should be stated; got {:?}",
             outcome.diagnostics
+        );
+    }
+
+    #[test]
+    fn segment_ambiguity_does_not_blame_the_crawl_for_an_unwitnessed_root() {
+        // `ad-header` fits section_segment 0 and `ad-locale` fits 1, so
+        // inference stops on ambiguity. `ad-deep` is separately
+        // `RootUnwitnessed` at segment 2. Its refusal must not tell the
+        // operator to widen the crawl when the remedy is pinning
+        // `section_segment`.
+        let table = table_for_pages(&[
+            ("/", &[("ad-header", "/99/site/home")]),
+            ("/news", &[("ad-header", "/99/site/news")]),
+            ("/en", &[("ad-locale", "/99/site/en-root")]),
+            ("/en/news", &[("ad-locale", "/99/site/news")]),
+            ("/a/b/news", &[("ad-deep", "/99/site/news")]),
+            ("/a/b/deals", &[("ad-deep", "/99/site/deals")]),
+        ]);
+
+        let outcome = infer_unit_templates(&table, "99");
+
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|note| note.contains("more than one section_segment")),
+            "the fixture should stop on ambiguity; got {:?}",
+            outcome.diagnostics
+        );
+        assert!(
+            !outcome
+                .diagnostics
+                .iter()
+                .any(|note| note.contains("include the site root in the crawl")),
+            "an ambiguous run must not also blame the crawl; got {:?}",
+            outcome.diagnostics
+        );
+        let Some(SlotDecision::Refuse { reasons }) = outcome.decision("ad-deep") else {
+            panic!("expected a refusal, got {:?}", outcome.decision("ad-deep"));
+        };
+        assert!(
+            reasons
+                .iter()
+                .all(|reason| !reason.contains("no crawled page lacked a section segment")),
+            "the crawl-gap reason belongs only to a run that stopped on the crawl gap; got {reasons:?}"
         );
     }
 

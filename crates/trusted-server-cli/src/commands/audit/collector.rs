@@ -14,6 +14,16 @@ use crate::ad_templates::compare::BrowserAdEvidence;
 pub(crate) const GENERATE_SETTLE_QUIET_MS: u64 = 750;
 /// Default maximum settle wait for generation's browser collector.
 pub(crate) const GENERATE_SETTLE_MAX_MS: u64 = 12_000;
+/// Default quiet window for `ts audit page` and `ts audit ad-templates verify`.
+///
+/// [`BrowserOpts`] and `BrowserCollector::new` must agree, or a collector built
+/// in code drifts from the parsed flags without anything failing.
+pub(crate) const PAGE_SETTLE_QUIET_MS: u64 = 750;
+/// Default maximum settle wait for `ts audit page` and
+/// `ts audit ad-templates verify`.
+///
+/// See [`PAGE_SETTLE_QUIET_MS`] for why this is shared rather than duplicated.
+pub(crate) const PAGE_SETTLE_MAX_MS: u64 = 10_000;
 
 /// Operator-tunable browser options shared by `ts audit page` and
 /// `ts audit ad-templates verify`.
@@ -40,10 +50,10 @@ pub struct BrowserOpts {
     pub browser_proxy: Option<String>,
     /// Quiet window in milliseconds (no new network resources) that marks the
     /// page settled.
-    #[arg(long, default_value_t = 750)]
+    #[arg(long, default_value_t = PAGE_SETTLE_QUIET_MS)]
     pub settle_quiet_ms: u64,
     /// Hard cap in milliseconds on waiting for the page to settle.
-    #[arg(long, default_value_t = 10_000)]
+    #[arg(long, default_value_t = PAGE_SETTLE_MAX_MS)]
     pub settle_max_ms: u64,
     /// Navigate to origins whose TLS certificate does not validate.
     ///

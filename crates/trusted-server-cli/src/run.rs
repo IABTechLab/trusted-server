@@ -356,6 +356,14 @@ mod tests {
     }
 
     #[test]
+    fn cli_definition_is_valid() {
+        // clap validates `requires` / `conflicts_with` argument-id references
+        // only from an explicit `debug_assert`. Without this, renaming or
+        // typoing an id compiles and ships.
+        <Args as clap::CommandFactory>::command().debug_assert();
+    }
+
+    #[test]
     fn bare_audit_namespace_displays_help_as_an_error() {
         let error = Args::try_parse_from(["ts", "audit"]).expect_err("should require audit mode");
 
@@ -427,32 +435,46 @@ mod tests {
             Args::try_parse_from(["ts", "audit", "--help"]).expect_err("should render audit help");
         let help = error.to_string();
 
-        assert!(!help.contains("--chrome"), "got {help}");
-        assert!(!help.contains("--settle-max-ms"), "got {help}");
-        assert!(
-            !help.contains("--danger-accept-invalid-certs"),
-            "got {help}"
-        );
+        for flag in [
+            "--chrome",
+            "--headful",
+            "--no-assume-consent",
+            "--browser-proxy",
+            "--settle-quiet-ms",
+            "--settle-max-ms",
+            "--danger-accept-invalid-certs",
+        ] {
+            assert!(
+                !help.contains(flag),
+                "`{flag}` is a legacy-only alias flag and must stay hidden; got {help}"
+            );
+        }
     }
 
     #[test]
     fn audit_rejects_parent_browser_flags_before_a_subcommand() {
-        assert!(
-            Args::try_parse_from([
-                "ts",
-                "audit",
-                "--chrome",
-                "/tmp/test-chrome",
-                "generate",
-                "https://www.example.com/",
-            ])
-            .is_err(),
-            "a parent-level browser flag must not be silently ignored"
+        // `is_err()` alone would also pass if `--chrome` were deleted from
+        // `LegacyBrowserOpts` (an `UnknownArgument`), which is the opposite of
+        // the invariant this pins: the flag exists but requires the legacy URL.
+        let error = Args::try_parse_from([
+            "ts",
+            "audit",
+            "--chrome",
+            "/tmp/test-chrome",
+            "generate",
+            "https://www.example.com/",
+        ])
+        .expect_err("a parent-level browser flag must not be silently ignored");
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "should reject the flag for lacking the legacy URL it requires"
         );
     }
 
     #[test]
-    fn audit_page_subcommand_parses() {
+    fn audit_page_subcommand_parses_with_page_settle_defaults() {
         let args = parse(&["ts", "audit", "page", "https://www.example.com/"]);
         let Command::Audit(audit) = args.command else {
             panic!("expected audit command");

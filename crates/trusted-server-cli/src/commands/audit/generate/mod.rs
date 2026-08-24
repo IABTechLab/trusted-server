@@ -1151,6 +1151,9 @@ fn build_render_slots(
     let explicit = !request.page_patterns.is_empty();
     if explicit {
         validate_page_patterns(request.page_patterns)?;
+        // Not filtered against `skip`: a borrowed root implies the slot's
+        // ad-unit path varied across pages, and `fragmented_slots` only groups
+        // slots pinned to exactly one unit path, so the two sets are disjoint.
         if let Some(outcome) = inference
             && !outcome.borrowed_section_root.is_empty()
         {
@@ -1161,9 +1164,9 @@ fn build_render_slots(
                 .collect::<Vec<_>>()
                 .join(", ");
             return cli_error(format!(
-                "cannot apply --page-pattern to slot(s) {affected} because their {{section}} \
-                 templates borrow section_root; remove --page-pattern so patterns can be \
-                 derived from the paths where each slot was observed"
+                "cannot apply --page-pattern to slot(s) with div id(s) {affected} because their \
+                 {{section}} templates borrow section_root; remove --page-pattern so patterns \
+                 can be derived from the paths where each slot was observed"
             ));
         }
     }
