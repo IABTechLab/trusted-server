@@ -1081,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_eids_by_consent_removes_liveramp_when_personalization_is_denied() {
+    fn gate_eids_by_consent_strips_every_eid_when_personalization_is_denied() {
         let context = ConsentContext {
             jurisdiction: Jurisdiction::Gdpr,
             gdpr_applies: true,
@@ -1094,14 +1094,19 @@ mod tests {
             ..ConsentContext::default()
         };
 
+        // Gating is all-or-nothing across sources; LiveRamp is included here as
+        // the case that motivated this coverage, not as a special case.
         let gated = gate_eids_by_consent(
-            Some(vec![("liveramp.com", "opaque-test-envelope")]),
+            Some(vec![
+                ("liveramp.com", "opaque-test-envelope"),
+                ("sharedid.org", "shared-test-id"),
+            ]),
             Some(&context),
         );
 
         assert!(
             gated.is_none(),
-            "should remove LiveRamp EIDs when personalization consent is denied"
+            "should remove every EID when personalization consent is denied"
         );
     }
 
