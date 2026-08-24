@@ -1117,7 +1117,7 @@ cd docs && npm run format
 
 Expected: all commands exit 0. Do not use bare `cargo test --workspace`.
 
-- [ ] **Step 3: Inspect the final branch**
+- [x] **Step 3: Inspect the final branch**
 
 ```bash
 git diff --check
@@ -1128,7 +1128,7 @@ git log origin/main..HEAD --oneline
 
 Expected: no uncommitted source changes and only intentional LiveRamp commits.
 
-- [ ] **Step 4: Request final code review**
+- [x] **Step 4: Request final code review**
 
 Review the entire `origin/main...HEAD` diff with special attention to the
 partial-`userSync` real-artifact case and the independent consent matrix. Fix
