@@ -686,15 +686,18 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * SSR bootstrap as current. For the same reason the initial bids payload is
  * passed in and applied here, generation-guarded — assigning it
  * unconditionally at body end would clobber the live bids a faster SPA
- * navigation already applied. When a navigation has committed since — or
- * commits while the deferred callback is pending — the SSR payload is
- * dropped and `adInit()` is not run: running anyway would re-run the newer
- * route's live slots/bids, destroying and redefining that route's TS slots
- * and double-refreshing it. The generation counter (not a URL comparison)
- * keeps this guard aligned with the SPA auction hook's own navigation
- * identity: a query-only history change the hook ignores must not cancel the
- * initial call, while an `/a → /b → /a` round trip — where the URL compares
- * equal again — must.
+ * navigation already applied.
+ *
+ * Shared-template seams pass `initialSlots`; inline documents omit them because
+ * their head script already installed the slots. An explicit empty array clears
+ * that state, while omission preserves it. The scheduler accepts only its first
+ * generation-0 call so duplicate public API calls cannot define and display the
+ * initial slots twice. The latch lives on `tsjs` so a bootstrap fallback that
+ * claims the initial pass keeps that claim when the bundle replaces its
+ * scheduler. If a navigation commits before scheduling or before the deferred
+ * callback, the SSR payload and `adInit()` are both dropped. The generation
+ * counter (not a URL comparison) keeps this aligned with the SPA auction hook's
+ * navigation identity.
  *
  * Hidden documents: browsers do not service `requestAnimationFrame` while a
  * document is hidden, so a background-tab load (Cmd+click, open-in-new-tab)
@@ -706,9 +709,14 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * holds whenever the request is actually issued.
  */
 function installScheduleInitialAdInit(ts: TsjsApi): void {
-  ts.scheduleInitialAdInit = function (initialBids?: Record<string, AuctionBidData>) {
-    if ((ts.navGeneration ?? 0) !== 0) return;
-    if (initialBids) ts.bids = initialBids;
+  ts.scheduleInitialAdInit = function (
+    initialBids?: Record<string, AuctionBidData>,
+    initialSlots?: AuctionSlot[]
+  ) {
+    if ((ts.navGeneration ?? 0) !== 0 || ts.initialAdInitScheduled) return;
+    ts.initialAdInitScheduled = true;
+    if (initialSlots !== undefined) ts.adSlots = initialSlots;
+    if (initialBids !== undefined) ts.bids = initialBids;
     const runUnlessNavigated = (): void => {
       if ((ts.navGeneration ?? 0) !== 0) return;
       ts.adInit?.();

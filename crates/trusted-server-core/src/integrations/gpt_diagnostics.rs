@@ -12,9 +12,9 @@ use validator::Validate;
 
 use edgezero_core::body::Body as EdgeBody;
 
-use crate::cache_policy::EDGE_CACHE_HEADER_NAMES;
 use crate::error::TrustedServerError;
 use crate::http_util::is_navigation_request;
+use crate::response_privacy::enforce_synthesized_html_cache_privacy;
 use crate::settings::{IntegrationConfig, Settings};
 use crate::tsjs;
 
@@ -111,6 +111,87 @@ impl GptDiagnosticsRequestDecision {
                 tsjs::tsjs_single_module_script_src(GPT_DIAGNOSTICS_INTEGRATION_ID)
             )
         })
+    }
+    /// An active decision, for tests in other modules that need one.
+    ///
+    /// The fields are private and built by `prepare_request` from a cookie or query
+    /// parameter; there is no other way to obtain an active decision across a module
+    /// boundary.
+    #[cfg(test)]
+    pub(crate) fn active_for_tests() -> Self {
+        Self {
+            active: true,
+            clean_browser_path_and_query: None,
+            cookie_action: GptDiagnosticsCookieAction::None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod head_seam_invariant_tests {
+    use super::*;
+
+    /// Every combination of the three fields the decision carries.
+    fn all_decisions() -> Vec<GptDiagnosticsRequestDecision> {
+        let mut out = Vec::new();
+        for active in [false, true] {
+            for clean in [None, Some("/clean".to_string())] {
+                for cookie_action in [
+                    GptDiagnosticsCookieAction::None,
+                    GptDiagnosticsCookieAction::SetSession,
+                    GptDiagnosticsCookieAction::ClearSession,
+                ] {
+                    out.push(GptDiagnosticsRequestDecision {
+                        active,
+                        clean_browser_path_and_query: clean.clone(),
+                        cookie_action,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn requires_private_no_store_is_a_superset_of_injection() {
+        // Load-bearing relationship, not an incidental one. Whenever this decision
+        // injects anything into `<head>`, the response must also be stamped
+        // `private, no-store` — which is what keeps request-scoped diagnostics out
+        // of a shared cache if the explicit assembly-mode gate in
+        // `create_html_stream_processor` is ever removed or bypassed.
+        //
+        // If a future change makes a script emit without also requiring the stamp,
+        // this fails here rather than silently in a cached template.
+        for decision in all_decisions() {
+            let injects =
+                decision.bootstrap_script().is_some() || decision.module_script_tag().is_some();
+            if injects {
+                assert!(
+                    decision.requires_private_no_store(),
+                    "decision injects into <head> but does not require private/no-store: \
+                     {decision:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_default_decision_injects_nothing() {
+        let decision = GptDiagnosticsRequestDecision::default();
+        assert_eq!(
+            decision.bootstrap_script(),
+            None,
+            "should not inject a bootstrap for an inert decision"
+        );
+        assert_eq!(
+            decision.module_script_tag(),
+            None,
+            "should not inject a module for an inert decision"
+        );
+        assert!(
+            !decision.requires_private_no_store(),
+            "an inert decision should not force the response private"
+        );
     }
 }
 
@@ -253,13 +334,12 @@ pub fn finalize_response(
     }
 
     if decision.requires_private_no_store() {
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, no-store"),
-        );
-        for name in EDGE_CACHE_HEADER_NAMES {
-            response.headers_mut().remove(*name);
-        }
+        // Marks the response terminal-private as well as stamping it. Stamping alone
+        // left the policy at the mercy of whatever ran later: a late
+        // `RequestFilterEffects` mutation such as `Cache-Control: public` replaced it,
+        // and the adapter's terminal guard had no marker to re-enforce from, so
+        // request-scoped diagnostics HTML became shared-cacheable.
+        enforce_synthesized_html_cache_privacy(response);
     }
 }
 
@@ -497,6 +577,8 @@ mod tests {
         let decision = prepare_request(&settings(true), &mut request).expect("should prepare");
         let mut response = Response::builder()
             .header(header::CACHE_CONTROL, "public, max-age=60")
+            .header(header::ETAG, "\"origin\"")
+            .header(header::LAST_MODIFIED, "Wed, 12 Aug 2026 00:00:00 GMT")
             .header("surrogate-control", "max-age=60")
             .header("fastly-surrogate-control", "max-age=60")
             .header("cloudflare-cdn-cache-control", "public, max-age=60")
@@ -507,7 +589,8 @@ mod tests {
 
         assert_eq!(
             response.headers()[header::CACHE_CONTROL],
-            "private, no-store"
+            "no-store, private",
+            "should stamp diagnostics responses non-storable"
         );
         assert_eq!(response.headers()[header::SET_COOKIE], SET_CONSOLE_COOKIE);
         assert!(!response.headers().contains_key("surrogate-control"));
@@ -516,6 +599,74 @@ mod tests {
             !response
                 .headers()
                 .contains_key("cloudflare-cdn-cache-control")
+        );
+        assert!(
+            !response.headers().contains_key(header::ETAG),
+            "should drop the origin validator with the shared-cache policy"
+        );
+        assert!(
+            !response.headers().contains_key(header::LAST_MODIFIED),
+            "should drop the origin validator with the shared-cache policy"
+        );
+    }
+
+    #[test]
+    fn an_active_no_cookie_action_response_is_marked_terminal_private() {
+        // The session-cookie activation path: active, but nothing new to set. Stamping
+        // `Cache-Control` alone left this response defenceless against a later mutation,
+        // because the adapter's terminal guard keys on the marker, not on the stamp, and
+        // the `Set-Cookie` privacy net never sees a response that sets no cookie.
+        let mut request = navigation("https://publisher.example/", Some("__Host-ts-console=1"));
+        let decision = prepare_request(&settings(true), &mut request).expect("should prepare");
+        assert!(decision.active(), "the session cookie should activate");
+        assert_eq!(
+            decision.cookie_action,
+            GptDiagnosticsCookieAction::None,
+            "an already-established session sets no new cookie"
+        );
+        let mut response = Response::builder()
+            .body(EdgeBody::empty())
+            .expect("should build response");
+
+        finalize_response(&decision, &mut response);
+
+        assert!(
+            !response.headers().contains_key(header::SET_COOKIE),
+            "should not set a cookie for an established session"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<crate::response_privacy::TerminalPrivateResponse>()
+                .is_some(),
+            "should mark request-scoped diagnostics HTML for terminal re-enforcement"
+        );
+    }
+
+    #[test]
+    fn an_inactive_decision_leaves_the_origin_cache_policy_alone() {
+        let mut request = navigation("https://publisher.example/", None);
+        let decision = prepare_request(&settings(true), &mut request).expect("should prepare");
+        assert!(!decision.requires_private_no_store());
+        let mut response = Response::builder()
+            .header(header::CACHE_CONTROL, "public, max-age=60")
+            .header(header::ETAG, "\"origin\"")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+
+        finalize_response(&decision, &mut response);
+
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=60",
+            "should not downgrade a response the integration did not touch"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<crate::response_privacy::TerminalPrivateResponse>()
+                .is_none(),
+            "should not mark an untouched response terminal-private"
         );
     }
 
