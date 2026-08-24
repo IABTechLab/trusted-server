@@ -51,9 +51,10 @@ pub fn default_config_store_name() -> StoreName {
 
 /// Returns the default config-store key containing the app-config blob.
 ///
-/// Process-environment overrides apply to native adapters such as Axum. Fastly
-/// has no process environment, so its custom entry point uses the manifest
-/// default key.
+/// Process-environment overrides apply to native adapters such as Axum. When
+/// using a key override, pass the same value to `ts config push --key`; the CLI
+/// otherwise writes at the logical store ID. Fastly has no process environment,
+/// so its custom entry point uses the manifest default key.
 #[must_use]
 pub fn default_config_key() -> String {
     config_key(&EnvConfig::from_env())

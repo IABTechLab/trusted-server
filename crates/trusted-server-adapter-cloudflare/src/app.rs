@@ -89,35 +89,21 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
 const LEGACY_CONFIG_BLOB_KEY: &str = "app_config";
 
 #[cfg(any(test, target_arch = "wasm32"))]
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, derive_more::Display)]
 enum CloudflareConfigEnvelopeError {
+    #[display(
+        "Cloudflare TRUSTED_SERVER_CONFIG missing string values at `{primary_key}` and legacy `{legacy_key}`"
+    )]
     Missing {
         primary_key: &'static str,
         legacy_key: &'static str,
     },
-    NonString {
-        key: &'static str,
-    },
+    #[display("Cloudflare TRUSTED_SERVER_CONFIG value at `{key}` must be a string")]
+    NonString { key: &'static str },
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
-impl CloudflareConfigEnvelopeError {
-    fn configuration_message(&self) -> String {
-        match self {
-            Self::Missing {
-                primary_key,
-                legacy_key,
-            } => {
-                format!(
-                    "Cloudflare TRUSTED_SERVER_CONFIG missing string values at `{primary_key}` and legacy `{legacy_key}`"
-                )
-            }
-            Self::NonString { key } => {
-                format!("Cloudflare TRUSTED_SERVER_CONFIG value at `{key}` must be a string")
-            }
-        }
-    }
-}
+impl core::error::Error for CloudflareConfigEnvelopeError {}
 
 #[cfg(target_arch = "wasm32")]
 fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServerError>> {
@@ -137,7 +123,7 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
     })?;
     let envelope = cloudflare_config_envelope(&value).map_err(|error| {
         Report::new(TrustedServerError::Configuration {
-            message: error.configuration_message(),
+            message: error.to_string(),
         })
     })?;
     settings_from_config_blob(envelope)
@@ -693,26 +679,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 mod tests {
     use super::*;
 
-    fn config_value(entries: &[(&str, &str)]) -> serde_json::Value {
-        serde_json::Value::Object(
-            entries
-                .iter()
-                .map(|(key, value)| {
-                    (
-                        (*key).to_string(),
-                        serde_json::Value::String((*value).to_string()),
-                    )
-                })
-                .collect(),
-        )
-    }
-
     #[test]
     fn cloudflare_config_prefers_manifest_default_key() {
-        let value = config_value(&[
-            (LEGACY_CONFIG_BLOB_KEY, "legacy-envelope"),
-            (CONFIG_BLOB_KEY, "manifest-envelope"),
-        ]);
+        let value = serde_json::json!({
+            LEGACY_CONFIG_BLOB_KEY: "legacy-envelope",
+            CONFIG_BLOB_KEY: "manifest-envelope",
+        });
 
         assert_eq!(
             cloudflare_config_envelope(&value),
@@ -723,7 +695,7 @@ mod tests {
 
     #[test]
     fn cloudflare_config_accepts_legacy_app_config_key() {
-        let value = config_value(&[(LEGACY_CONFIG_BLOB_KEY, "legacy-envelope")]);
+        let value = serde_json::json!({ LEGACY_CONFIG_BLOB_KEY: "legacy-envelope" });
 
         assert_eq!(
             cloudflare_config_envelope(&value),
@@ -748,8 +720,10 @@ mod tests {
 
     #[test]
     fn cloudflare_config_does_not_mask_malformed_manifest_value() {
-        let mut value = config_value(&[(LEGACY_CONFIG_BLOB_KEY, "legacy-envelope")]);
-        value[CONFIG_BLOB_KEY] = serde_json::Value::Bool(true);
+        let value = serde_json::json!({
+            LEGACY_CONFIG_BLOB_KEY: "legacy-envelope",
+            CONFIG_BLOB_KEY: true,
+        });
 
         assert_eq!(
             cloudflare_config_envelope(&value),
@@ -774,7 +748,7 @@ mod tests {
             "malformed legacy value should name the legacy key"
         );
         assert_eq!(
-            error.configuration_message(),
+            error.to_string(),
             "Cloudflare TRUSTED_SERVER_CONFIG value at `app_config` must be a string",
             "configuration error should name the malformed legacy key"
         );

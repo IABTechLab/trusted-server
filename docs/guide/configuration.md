@@ -1906,23 +1906,16 @@ ts config push --adapter fastly --dry-run
 ts config push --adapter fastly
 ```
 
-For the first deployment of a service in a shared account, select a
-service-specific physical store during both provisioning and config push. The
-first deployment applies the generated setup entry and links the physical store
-under the logical name:
+The pinned EdgeZero provisioner cannot create a service-specific physical store
+with a different logical resource-link name during first deployment. Its
+`__NAME` override becomes both the physical store name and the generated Fastly
+setup-table key, so the deployed service would link that physical name while the
+Trusted Server entry point opens `trusted_server_config`. Do not use
+`ts provision` with a `__NAME` override for this case.
 
-```bash
-EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<physical-store-name> \
-  ts provision --adapter fastly
-EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<physical-store-name> \
-  ts config push --adapter fastly --dry-run
-EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<physical-store-name> \
-  ts config push --adapter fastly
-```
-
-For an already-deployed service, Fastly does not reapply setup entries. Create
-and link the service-specific physical store explicitly, seed it, then activate
-the cloned service version:
+For a service in a shared account, create the service and a service version
+first. Then create and link the service-specific physical store explicitly,
+seed it, and activate the linked version before publishing traffic:
 
 ```bash
 fastly config-store create --name <physical-store-name>
