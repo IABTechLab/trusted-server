@@ -4,13 +4,11 @@ use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 pub use crate::config_payload::DEFAULT_CONFIG_STORE_ID;
-use crate::config_payload::{settings_from_config_blob, DEFAULT_SECRET_STORE_ID};
+use crate::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from_config_blob};
 use crate::error::TrustedServerError;
 use crate::platform::{PlatformConfigStore, PlatformSecretStore, StoreName};
 use crate::settings::Settings;
 
-/// Canonical logical config store used by Trusted Server app config.
-pub const DEFAULT_CONFIG_STORE_ID: &str = "trusted_server_config";
 const FASTLY_CHUNK_POINTER_KIND: &str = "fastly_config_chunks";
 const FASTLY_CONFIG_ENTRY_LIMIT: usize = 8_000;
 
@@ -54,9 +52,10 @@ pub fn default_config_store_name() -> StoreName {
 
 /// Returns the default config-store key containing the app-config blob.
 ///
-/// Process-environment overrides apply to native adapters such as Axum. Fastly
-/// has no process environment, so its custom entry point uses the manifest
-/// default key.
+/// Process-environment overrides apply to native adapters such as Axum. When
+/// using a key override, pass the same value to `ts config push --key`; the CLI
+/// otherwise writes at the logical store ID. Fastly has no process environment,
+/// so its custom entry point uses the manifest default key.
 #[must_use]
 pub fn default_config_key() -> String {
     config_key(&EnvConfig::from_env())
