@@ -940,3 +940,310 @@ git commit -m "fix: address LiveRamp verification findings"
 ```
 
 Do not create an empty verification commit.
+
+## Correction tasks added after PR #1054 review (2026-08-24)
+
+These tasks implement the reviewed correction in the specification. Complete
+them in order and preserve the red/green evidence for the managed-config bug.
+
+## Task 6: Preserve managed IDs across partial `userSync` replacement
+
+**Files:**
+
+- Modify: `crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts:985`
+- Modify: `crates/trusted-server-js/lib/test/prebid-artifact-integration.test.mjs:179`
+- Modify: `crates/trusted-server-js/lib/src/integrations/prebid/index.ts:228-273`
+- Modify: `crates/trusted-server-js/lib/src/integrations/prebid/index.ts:1169-1216`
+
+- [ ] **Step 1: Replace the unsafe pass-through unit test with failing ownership regressions**
+
+Change the current `passes unrelated publisher configuration through by
+reference` test so only a configuration without `userSync` must retain object
+identity. Add queued and late cases for both public APIs. Each case must arrange
+`pbjs.getConfig('userSync.userIds')` to return a publisher entry plus the
+managed entry, invoke a partial update such as:
+
+```ts
+mockPbjs.setConfig({
+  priceGranularity: 'medium',
+  userSync: { syncDelay: 50 },
+})
+```
+
+and assert that the captured call contains:
+
+```ts
+expect.objectContaining({
+  priceGranularity: 'medium',
+  userSync: {
+    syncDelay: 50,
+    userIds: [{ name: 'sharedId' }, EXPECTED_IDENTITY_LINK],
+  },
+})
+```
+
+For `mergeConfig`, assert the same invariant without depending on its current
+internal deep-merge implementation. Its late-call case must change the
+`mockGetConfig` result after installation—for example from `sharedId` to
+`id5Id`—before invoking the partial update, then assert that the newly effective
+`id5Id` survives. This proves the wrapper reads at call time instead of caching
+the installation-time list. Keep the existing explicit-`userIds`, idempotence,
+throwing-accessor, and missing-`getConfig` cases.
+
+- [ ] **Step 2: Add a failing real-artifact replacement regression**
+
+After the existing real `mergeConfig` assertions, call:
+
+```js
+pageWindow.pbjs.setConfig({ userSync: { syncDelay: 50 } })
+```
+
+Assert that `getConfig('userSync.userIds')` still contains `sharedId` and exactly
+one managed `identityLink`, and that `getConfig('userSync.syncDelay')` is `50`.
+This test must use the generated Prebid bundle and generated TSJS shim, not a
+mock of `setConfig`.
+
+- [ ] **Step 3: Run the focused tests and verify the ownership regression is red**
+
+Run:
+
+```bash
+cd crates/trusted-server-js/lib
+npx vitest run test/integrations/prebid/index.test.ts test/prebid-artifact-integration.test.mjs
+```
+
+Expected: the new partial-`userSync` assertions fail because the managed and
+publisher User ID entries disappear. Existing tests must continue to execute.
+
+- [ ] **Step 4: Implement the minimal normalization correction**
+
+Refactor the managed helper so it distinguishes these cases:
+
+```ts
+// No userSync object: return the publisher object unchanged.
+// Explicit userSync.userIds: normalize that supplied list.
+// userSync without userIds: read the effective list through bound getConfig,
+// carry it into the replacement object, then normalize it.
+```
+
+Read `getConfig('userSync.userIds')` at call time so late publisher changes are
+preserved. If `getConfig` is unavailable and `userIds` is omitted, retain the
+existing fail-open behavior rather than fabricating an empty publisher list.
+Build a fresh managed entry for every normalization and continue catching
+throwing page-owned accessors.
+
+- [ ] **Step 5: Re-run focused tests and verify green**
+
+Run the Step 3 command again.
+
+Expected: all focused unit and real-artifact tests pass with no unhandled
+errors.
+
+- [ ] **Step 6: Commit the ownership correction**
+
+```bash
+git add \
+  crates/trusted-server-js/lib/src/integrations/prebid/index.ts \
+  crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts \
+  crates/trusted-server-js/lib/test/prebid-artifact-integration.test.mjs
+git commit -m "Preserve managed LiveRamp IDs across userSync updates"
+```
+
+## Task 7: Characterize exact default TCF enforcement
+
+**Files:**
+
+- Modify: `crates/trusted-server-js/lib/test/prebid-consent-enforcement.test.mjs:103-225`
+- Modify: `docs/guide/integrations/prebid.md:134-141`
+- Modify: `docs/guide/integrations/prebid.md:518-524`
+- Modify: `docs/guide/integrations/prebid.md:578-588`
+
+- [ ] **Step 1: Replace the combined consent boolean with independent grants**
+
+Change the fixture API to accept explicit grants with safe defaults:
+
+```js
+function tcData({
+  purpose1 = true,
+  purpose3 = true,
+  purpose4 = true,
+  vendor97 = true,
+} = {}) {
+  return {
+    // existing CMP fields
+    purpose: {
+      consents: { 1: purpose1, 3: purpose3, 4: purpose4 },
+      legitimateInterests: {},
+    },
+    vendor: {
+      consents: { [LIVE_RAMP_GVL_VENDOR_ID]: vendor97 },
+      legitimateInterests: {},
+    },
+  }
+}
+```
+
+Pass this object through `runGdprPage` without combining the grants.
+
+- [ ] **Step 2: Add four independent artifact cases plus the granted baseline**
+
+Assert the exact pinned defaults:
+
+1. Purpose 1 denied alone: no LiveRamp request, no `idl_env`, no retry cookie.
+2. Vendor 97 denied alone: no LiveRamp request, no `idl_env`, no retry cookie.
+3. Purpose 3 denied alone: one LiveRamp request and `idl_env` written.
+4. Purpose 4 denied alone: one LiveRamp request and `idl_env` written.
+5. All relevant grants present: one LiveRamp request and `idl_env` written.
+
+- [ ] **Step 3: Run the consent artifact suite**
+
+Run:
+
+```bash
+cd crates/trusted-server-js/lib
+npx vitest run test/prebid-consent-enforcement.test.mjs
+```
+
+Expected: all five behavioral cases and the module-presence assertion pass
+against the real generated artifacts. If a case differs, inspect pinned Prebid
+before changing the expected policy.
+
+- [ ] **Step 4: Correct the operator-facing consent claims**
+
+Document that default client-side resolution/storage is blocked by Purpose 1
+and LiveRamp vendor consent. State that Purpose 3 has no standalone default
+rule, Purpose 4 controls UFPD, and default EID transmission accepts qualifying
+purpose/vendor basis from any Purpose 2–10 unless the publisher enables
+`eidsRequireP4Consent`. Preserve the existing explicit GPP/US-state limitation.
+
+- [ ] **Step 5: Format and verify the focused documentation**
+
+```bash
+cd docs
+npx prettier --write guide/integrations/prebid.md
+npm run format
+```
+
+Expected: the guide is formatted and makes no broader enforcement claim than
+the artifact matrix proves.
+
+- [ ] **Step 6: Commit the consent characterization**
+
+```bash
+git add \
+  crates/trusted-server-js/lib/test/prebid-consent-enforcement.test.mjs \
+  docs/guide/integrations/prebid.md
+git commit -m "Clarify LiveRamp TCF enforcement defaults"
+```
+
+## Task 8: Verify and refresh PR #1054
+
+**Files:**
+
+- Verify: all PR files
+- Update externally: PR #1054 description
+
+- [ ] **Step 1: Run TypeScript tests, build, and formatting**
+
+```bash
+cd crates/trusted-server-js/lib
+npx vitest run
+node build-all.mjs
+npm run lint
+npm run format
+```
+
+Expected: every command exits 0.
+
+- [ ] **Step 2: Run repository Rust and documentation gates**
+
+```bash
+cd /Users/prk-jr/Desktop/opensource/rust/trusted-server
+cargo fmt --all -- --check
+cargo clippy-fastly
+cargo clippy-axum
+cargo clippy-cloudflare
+cargo clippy-cloudflare-wasm
+cargo clippy-spin-native
+cargo clippy-spin-wasm
+cargo clippy-cli
+cargo clippy-codegen
+cargo test-fastly
+cargo test-axum
+cargo test-cloudflare
+cargo test-spin
+./scripts/test-cli.sh
+cd docs && npm run format
+```
+
+Expected: all commands exit 0. Do not use bare `cargo test --workspace`.
+
+- [ ] **Step 3: Inspect the final branch**
+
+```bash
+git diff --check
+git status --short
+git diff origin/main...HEAD --stat
+git log origin/main..HEAD --oneline
+```
+
+Expected: no uncommitted source changes and only intentional LiveRamp commits.
+
+- [ ] **Step 4: Request final code review**
+
+Review the entire `origin/main...HEAD` diff with special attention to the
+partial-`userSync` real-artifact case and the independent consent matrix. Fix
+all Critical or Important findings and repeat affected gates.
+
+- [ ] **Step 5: Push and update the draft PR description**
+
+Push without force. Create `/tmp/pr-1054-body.md` with the repository PR
+template and these exact sections:
+
+- Summary: managed RampID configuration, opaque `liveramp.com` EID transport,
+  exact TCF default behavior, and ATS Direct exclusion.
+- Closes: `Closes #355`.
+- Status: `Code complete; live LiveRamp validation pending
+IABTechLab/uid2-optout#385.`
+- Changes table containing every one of these final diff paths and no removed
+  `crates/trusted-server-core/src/auction/endpoints.rs` row:
+  - `.cargo/config.toml`
+  - `CLAUDE.md`
+  - `crates/trusted-server-cli/src/prebid_bundle.rs`
+  - `crates/trusted-server-core/src/consent/mod.rs`
+  - `crates/trusted-server-core/src/ec/prebid_eids.rs`
+  - `crates/trusted-server-core/src/integrations/prebid.rs`
+  - `crates/trusted-server-js/lib/build-prebid-external.mjs`
+  - `crates/trusted-server-js/lib/src/integrations/prebid/index.ts`
+  - `crates/trusted-server-js/lib/test/build-prebid-external.test.mjs`
+  - `crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts`
+  - `crates/trusted-server-js/lib/test/integrations/prebid/user_id_modules.test.ts`
+  - `crates/trusted-server-js/lib/test/prebid-artifact-integration.test.mjs`
+  - `crates/trusted-server-js/lib/test/prebid-consent-enforcement.test.mjs`
+  - `docs/guide/configuration.md`
+  - `docs/guide/integrations/prebid.md`
+  - `docs/superpowers/plans/2026-08-21-liveramp-integration.md`
+  - `docs/superpowers/specs/2026-08-21-liveramp-integration-design.md`
+  - `trusted-server.example.toml`
+- Test plan: check every command completed in Steps 1–2; leave only live
+  credential validation unchecked.
+- Hardening note: no config-derived regex or pattern compilation was added;
+  invalid enabled LiveRamp config fails typed validation.
+
+Verify the enumerated paths against
+`git diff --name-only origin/main...HEAD` before writing the file. Apply the
+body exactly with:
+
+```bash
+git push origin issue-355-liveramp-integration
+gh pr edit 1054 \
+  --repo IABTechLab/trusted-server \
+  --title "Add managed LiveRamp RampID integration" \
+  --body-file /tmp/pr-1054-body.md
+gh pr view 1054 \
+  --repo IABTechLab/trusted-server \
+  --json url,isDraft,headRefOid,body,statusCheckRollup
+```
+
+Do not mark the PR ready for review automatically; report the final readiness
+assessment to the user first.
