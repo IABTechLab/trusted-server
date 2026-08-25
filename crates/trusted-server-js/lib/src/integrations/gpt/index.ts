@@ -1118,8 +1118,8 @@ export function installTsAdInit(): void {
       ts.prevSlotTargetingKeys = nextSlotTargetingKeys;
 
       // Whether this call produced any TS slot to render. A gated page-bids
-      // response (auction kill switch or consent denial) returns no slots, so
-      // the loops above leave these empty.
+      // response (template switch, auction gate, or consent denial) returns no
+      // slots, so the loops above leave these empty.
       const hasRenderableWork = slotsToDisplay.length > 0 || slotsToRefresh.length > 0;
 
       // enableSingleRequest and enableServices must only be called once per page
@@ -1427,10 +1427,10 @@ export function installSpaAuctionHook(): void {
       // This route is now the committed, loaded state — a later failed
       // navigation rolls back here, and a return trip no-ops correctly.
       lastAppliedPath = path;
-      // An empty page-bids response (auction kill switch or consent gate) carries
-      // no TS slots. Only run adInit() when there are slots to apply or prior TS
-      // state to sweep — otherwise a consent-denied or kill-switched navigation
-      // must not enter the GPT command queue and risk activating services.
+      // An empty page-bids response (template switch, auction, or consent gate)
+      // carries no TS slots. Only run adInit() when there are slots to apply or
+      // prior TS state to sweep — otherwise a gated navigation must not enter
+      // the GPT command queue and risk activating services.
       const hasPriorTsState =
         (ts.prevGptSlots?.length ?? 0) > 0 ||
         Object.keys(ts.prevSlotTargetingKeys ?? {}).length > 0 ||

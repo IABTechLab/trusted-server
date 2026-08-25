@@ -226,6 +226,14 @@ verbosity = "redacted"
 format = "compact"
 
 [creative_opportunities]
+# Set to false to disable server-side ad templates while retaining slot definitions
+# and direct POST /auction callers. Structurally inactive templates use the
+# browser-only Cache-Control: private, max-age=60 policy; this setting is one cause.
+# Origin private/no-store policies and bot, prefetch, or consent-denied requests
+# retain their origin policy. CDN-specific cache headers remain unchanged.
+# Before rolling back to a binary that predates this setting, restore true, re-push
+# and finalize the config first.
+enabled = true
 gam_network_id = "123456789"
 # FCP is not affected by this value — body content above </body> has already
 # streamed and painted before the hold begins. What this caps is the slip on
