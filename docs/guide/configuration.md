@@ -77,6 +77,8 @@ fail and the service will return its startup-error response.
 | `[request_signing]` | Ed25519 request signing                      |
 | `[auction]`         | Auction orchestration                        |
 | `[integrations.*]`  | Partner integrations (Prebid, Next.js, etc.) |
+| `[observability]`   | Server-Timing header emission                |
+| `[tinybird]`        | Auction and access telemetry transport       |
 
 ## Example: Production Setup
 
@@ -1804,6 +1806,130 @@ fastly config-store create --name trusted_server_config
 Rollback to the legacy entry point is no longer controlled by runtime config
 keys. Use the normal deployment rollback path to restore a pre-cleanup service
 version if that is required.
+
+## Observability and Access Telemetry Configuration
+
+Settings for the `Server-Timing` response header and the sampled
+access-telemetry sink. Both are off by default and are independent switches:
+enabling one does not enable the other.
+
+### `[observability]`
+
+| Field                   | Type    | Required | Default | Description                                                         |
+| ----------------------- | ------- | -------- | ------- | ------------------------------------------------------------------- |
+| `server_timing_enabled` | Boolean | No       | `false` | Append request-phase timings to the `Server-Timing` response header |
+
+**Purpose**: Surfaces per-phase request timing (`ts-total` plus recorded
+phases such as `ts-appbuild`, `ts-filter`, `ts-geo`, `ts-kv`, `ts-origin`, and
+`ts-template-cache`) as a standard `Server-Timing` header, in milliseconds
+with one decimal place. An unrecorded phase is omitted from the header
+rather than rendered as zero.
+
+**Emission is conservative**: the header is appended only on responses that
+are conclusively private, meaning `Cache-Control` contains `private` or
+`no-store`. A response that is heuristically cacheable, carries a bare
+`max-age`, or has no cache header at all never receives the header, because a
+shared-cache object would otherwise replay one request's timings for its
+entire stored lifetime. The long-lived, shared-cacheable `tsjs` asset route is
+the concrete case this excludes. The header is appended, never inserted, so
+an origin-supplied `Server-Timing` value and any entries the fronting
+delivery layer adds are preserved alongside the TS entries.
+
+The Axum adapter applies the same private-response rule at its own terminal
+point before serializing the response, and emits the header only; it does not
+send access-telemetry rows.
+
+**Example**:
+
+```toml
+[observability]
+server_timing_enabled = true
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__OBSERVABILITY__SERVER_TIMING_ENABLED=true
+```
+
+::: tip Present-but-false by default
+`server_timing_enabled` ships as `false` in the base operator config rather
+than being left out, even though `false` is also its default. The
+environment-variable overlay can only override a leaf that already exists in
+the parsed TOML; it cannot create a missing one. Keeping the leaf present lets
+`TRUSTED_SERVER__OBSERVABILITY__SERVER_TIMING_ENABLED` take effect without an
+extra edit to add the table first.
+:::
+
+### `[tinybird]` access telemetry keys
+
+`[tinybird]` configures a shared Events API transport (`enabled`, `api_host`,
+`secret_store`, and per-sink dataset and token fields) used by two
+independent emitters: auction telemetry (`auction_dataset`,
+`auction_token_secret`) and access telemetry. The keys below cover the
+access-telemetry sink and the shared enable flags.
+
+| Field                | Type    | Required                             | Default | Description                                                                     |
+| -------------------- | ------- | ------------------------------------ | ------- | ------------------------------------------------------------------------------- |
+| `enabled`            | Boolean | Yes, when `access_enabled`           | `false` | Master switch for the shared Tinybird transport (host, store, credentials)      |
+| `auction_enabled`    | Boolean | No                                   | `true`  | Independently gates auction telemetry emission, decoupled from access telemetry |
+| `access_enabled`     | Boolean | No                                   | `false` | Enables the sampled access-telemetry row sent after each response is delivered  |
+| `access_sample_rate` | Float   | Yes (`> 0.0`), when `access_enabled` | `0.0`   | Fraction (`0.0`-`1.0`) of requests to emit an access-telemetry row for          |
+
+**Purpose**: `access_enabled` and `auction_enabled` gate the two Tinybird
+sinks separately so that turning on one does not silently turn on (or leave
+off) the other; a settings test locks this decoupling in both directions.
+Setting `access_enabled = true` with `access_sample_rate = 0.0` is rejected at
+config load as an armed-but-silent configuration; use `access_enabled` itself
+to turn the sink off, not the sample rate. Enabling `access_enabled` also
+requires the shared transport fields (`enabled`, non-empty `api_host`,
+`secret_store`, `access_dataset`, `access_token_secret`, and a positive
+`max_body_bytes`) to already be set.
+
+**Example**:
+
+```toml
+[tinybird]
+enabled = true
+api_host = "api.tinybird.example.com"
+secret_store = "ts_secrets"
+auction_enabled = true
+
+# Access-log telemetry, decoupled from auction emission.
+access_enabled = true
+access_dataset = "access_logs_raw"
+access_token_secret = "tinybird_access_append_token"
+access_sample_rate = 0.05
+max_body_bytes = 1048576
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__TINYBIRD__ACCESS_ENABLED=true
+TRUSTED_SERVER__TINYBIRD__ACCESS_SAMPLE_RATE=0.05
+TRUSTED_SERVER__TINYBIRD__AUCTION_ENABLED=true
+```
+
+A sampled request emits one access-telemetry row to `access_dataset` after
+the response has already been delivered to the client, so ingest never delays
+the response the reader sees.
+
+### Deploy and rollback ordering
+
+::: warning `Settings` rejects unknown fields; order matters
+Both `[observability].server_timing_enabled` and the new `[tinybird]` access
+keys are new fields on a config schema that uses `deny_unknown_fields`, so an
+older binary fails to load a config that carries them.
+
+**Deploying**: upgrade the binary first, then push a config containing the
+new fields second. Never push a config with these fields while a
+pre-observability binary can still receive it.
+
+**Rolling back**: reverse the order. Remove the `[observability]` table and
+any new `[tinybird]` access keys from the config and push that first, then
+roll back the binary second.
+:::
 
 ## Validation
 
