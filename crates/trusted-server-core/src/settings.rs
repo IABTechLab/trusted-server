@@ -3644,6 +3644,21 @@ mod tests {
     }
 
     #[test]
+    fn access_enabled_requires_tinybird_enabled() {
+        // access_enabled = true with tinybird.enabled omitted (defaults
+        // false) must be rejected: access telemetry cannot run without the
+        // master toggle on.
+        let err = settings_from_toml_with(
+            "[tinybird]\napi_host = \"api.example.com\"\naccess_enabled = true\naccess_sample_rate = 1.0\n",
+        )
+        .expect_err("should reject access telemetry without tinybird.enabled");
+        assert!(
+            format!("{err:?}").contains("tinybird.access_enabled"),
+            "should name the field: {err:?}"
+        );
+    }
+
+    #[test]
     fn access_enabled_requires_positive_sample_rate() {
         // access_enabled = true with access_sample_rate = 0 is armed-but-silent: an error.
         let err = settings_from_toml_with(
