@@ -6,9 +6,9 @@ Learn how to configure Trusted Server for your deployment.
 
 Trusted Server uses a flexible configuration system based on:
 
-1. **TOML Files** - `trusted-server.toml` for base configuration
+1. **TOML Files** - `trusted-server.toml` for ordinary configuration and secret key names
 2. **Environment Variables** - Typed CLI overrides with the `TRUSTED_SERVER__` prefix
-3. **Fastly Stores** - KV/Config/Secret stores for runtime data
+3. **EdgeZero Stores** - Config and secret stores for the pushed blob and runtime secret values
 
 ## Quick Start
 
@@ -21,10 +21,10 @@ Create `trusted-server.toml` in your project root:
 domain = "publisher.com"
 cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
-proxy_secret = "your-secure-secret-here"
+proxy_secret = "publisher_proxy_secret"
 
 [ec]
-passphrase = "replace-with-32-plus-byte-random-secret"
+passphrase = "ec_passphrase"
 ```
 
 ### Environment Variable Overrides
@@ -37,16 +37,89 @@ read by the deployed application at request time.
 # Format: TRUSTED_SERVER__SECTION__FIELD
 export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
-export TRUSTED_SERVER__EC__PASSPHRASE=replace-with-32-plus-byte-random-secret
+# Secret overrides, when needed, are key names—not secret values.
+export TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
+export TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
 
 ts config validate
 ts config push --adapter fastly
 ```
 
-### Generate Secure Secrets
+### Secret-store migration
+
+Static app-config credentials contain stable key names only. This includes
+publisher, EC, handler, Tinybird, DataDome, and S3 credential fields:
+
+- `publisher.proxy_secret`
+- `ec.passphrase`
+- `ec.partners[*].api_token`
+- `ec.partners[*].ts_pull_token`, when used
+- `handlers[*].password`
+- `tinybird.auction_token_secret`, when Tinybird auction telemetry is enabled
+- `integrations.datadome.server_side_key_secret_name`, when protection is enabled
+- `integrations.datadome.protection_test_bypass.credential_secret_name`, when the bypass is enabled
+- `proxy.asset_routes[*].auth.access_key_id`, `secret_access_key`, and optional `session_token`
+
+Their values belong in the logical `trusted_server_secrets` store and are
+resolved only while an instance builds runtime settings. An adapter can map the
+logical ID to a different physical name. For example, Fastly commonly maps
+`trusted_server_secrets` to physical store `ts_secrets`.
+
+Migrate an existing deployment in this order:
+
+1. Populate the physical store mapped from `trusted_server_secrets` with the
+   existing credential values without printing them in shell history, logs, or
+   CI output.
+2. Replace each active credential value with a stable key name and remove the
+   legacy Tinybird, DataDome, and S3 `secret_store` selectors.
+3. Run `ts config validate`, then `ts config push --adapter fastly --no-diff`.
+4. Restart/redeploy instances as needed to load the new values. Rotation is
+   startup-scoped; changing a store value does not alter already-built state.
+
+`--no-diff` prevents `config push` from rendering the previous plaintext
+configuration during this migration.
+
+Keep `publisher.proxy_secret` and `ec.passphrase` stable unless intentionally
+rotating signed URLs or EC identifiers. On Spin, the app-config blob is stored
+under the `trusted_server_config` key in Spin's built-in `default` key-value
+store. Set the corresponding CLI store mapping before pushing so the write
+matches the runtime lookup:
 
 ```bash
-# Generate cryptographically random secrets
+export EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=default
+ts config push --adapter spin
+```
+
+For local Spin development, add `--local` to the push command. Also declare a
+component variable for each chosen secret key name using the encoder documented
+in `spin.toml`. Missing stores, keys, invalid UTF-8, and empty values fail
+closed; inline plaintext fallback is not supported.
+
+### Tinybird auction telemetry
+
+Tinybird uses the same typed secret-reference path as the other static
+credentials. Do not configure a feature-specific store:
+
+```toml
+[tinybird]
+enabled = true
+api_host = "api.example.com"
+auction_dataset = "auction_events_raw"
+auction_token_secret = "tinybird_auction_append_token"
+```
+
+Store the APPEND token value under `tinybird_auction_append_token` in the
+physical store mapped from `trusted_server_secrets`. The token is resolved once
+at startup. Disabled Tinybird telemetry does not require or resolve the token.
+The legacy `tinybird.secret_store` field is accepted for one migration release,
+but it is ignored and omitted from newly pushed config.
+
+### Generate Secure Secrets
+
+Generate values locally and write them directly to the platform secret store;
+do not put the generated output in `trusted-server.toml` or the app-config blob.
+
+```bash
 openssl rand -base64 32
 ```
 
@@ -86,10 +159,10 @@ fail and the service will return its startup-error response.
 domain = "publisher.com"
 cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
-proxy_secret = "change-me-to-secure-value"
+proxy_secret = "publisher_proxy_secret"
 
 [ec]
-passphrase = "replace-with-32-plus-byte-random-secret"
+passphrase = "ec_passphrase"
 
 [request_signing]
 enabled = true
@@ -116,9 +189,10 @@ base TOML configuration by `ts config validate`, `ts config diff`, and
 stored in the app-config blob. Changing an environment variable requires
 rerunning validation and pushing the resolved config, not rebuilding the binary.
 
-EdgeZero's env overlay only overrides leaves that already exist in the parsed TOML; it
-does not create missing fields. Add newly introduced defaulted fields to an
-existing config before relying on their environment overrides. Pass `--no-env`
+The pinned EdgeZero loader only overrides leaves that already exist in the
+parsed TOML; it does not create missing fields. Add newly introduced defaulted
+fields to an existing config before relying on their environment overrides.
+Secret overlays still contain key names, never secret values. Pass `--no-env`
 to use file values without the overlay.
 
 ### Format
@@ -179,7 +253,7 @@ Core publisher settings for domain, origin, and proxy configuration.
 | `cookie_domain`               | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                      |
 | `origin_url`                  | String  | Yes      | Full URL of publisher origin server                                         |
 | `origin_host_header_override` | String  | No       | Outbound Host header to send while connecting to `origin_url`               |
-| `proxy_secret`                | String  | Yes      | Secret key for encrypting/signing proxy URLs                                |
+| `proxy_secret`                | String  | Yes      | Secret-store key name for the proxy URL secret                              |
 | `max_buffered_body_bytes`     | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB) |
 
 > **Note:** EC cookies (`ts-ec`) derive their domain automatically as `.{domain}` and
@@ -194,7 +268,7 @@ cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
 # Optional: connect to origin_url but send this outbound Host header.
 # origin_host_header_override = "www.publisher.com"
-proxy_secret = "change-me-to-secure-random-value"
+proxy_secret = "publisher_proxy_secret"
 ```
 
 **Environment Override**:
@@ -204,7 +278,7 @@ TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN=.publisher.com
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
 TRUSTED_SERVER__PUBLISHER__ORIGIN_HOST_HEADER_OVERRIDE=www.publisher.com
-TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
+TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 ```
 
@@ -283,21 +357,12 @@ connecting to the host in `origin_url`.
 
 #### `proxy_secret`
 
-**Purpose**: Secret key for HMAC-SHA256 signing of proxy URLs.
+**Purpose**: Secret-store key name for the HMAC-SHA256 value used to sign proxy URLs.
 
-**Security**:
-
-- Keep confidential and secure
-- Rotate periodically (90 days recommended)
-- Use cryptographically random values (32+ bytes)
-- Never commit to version control
-
-**Generation**:
-
-```bash
-# Generate secure random secret
-openssl rand -base64 32
-```
+The referenced value is resolved from `trusted_server_secrets` at startup. It
+must be at least 32 bytes, so generate it with a cryptographically secure random
+source. Keep that value confidential, rotate it only intentionally, and never
+put it in the TOML file or pushed app-config blob.
 
 **Usage**:
 
@@ -474,6 +539,9 @@ Settings for Edge Cookie identifier generation. The `ec_store` KV store is the o
 
 ### `[ec]`
 
+`passphrase` is a key name in `trusted_server_secrets`; the resolved value must
+be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
+
 | Field                     | Type           | Required | Description                                                             |
 | ------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
 | `passphrase`              | String         | Yes      | Publisher passphrase used as HMAC key                                   |
@@ -491,20 +559,21 @@ Settings for Edge Cookie identifier generation. The `ec_store` KV store is the o
 
 ```toml
 [ec]
-passphrase = "replace-with-32-plus-byte-random-secret"
+passphrase = "ec_passphrase"
 ec_store = "ec_identity_store"
 
 [[ec.partners]]
 name = "Mocktioneer SSP"
 source_domain = "mocktioneer.example"
-api_token = "partner-api-token-32-bytes-minimum"
+api_token = "partner_api_token"
 bidstream_enabled = true
+# ts_pull_token = "partner_ts_pull_token"  # only when pull sync is enabled
 ```
 
 **Environment Override**:
 
 ```bash
-TRUSTED_SERVER__EC__PASSPHRASE=your-secret
+TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
 TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
 ```
 
@@ -512,20 +581,13 @@ TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
 
 #### `passphrase`
 
-**Purpose**: Publisher passphrase used as HMAC key for EC ID generation.
+**Purpose**: Secret-store key name whose resolved value is the HMAC key for EC ID generation.
 
 **Security**:
 
-- Must be non-empty
-- Rotate periodically for security
-- Store securely (environment variable recommended)
-
-**Generation**:
-
-```bash
-# Generate secure random key
-openssl rand -hex 32
-```
+- The key name is stored in app config; the value is stored in `trusted_server_secrets`
+- Keep the value stable unless intentionally rotating EC identifiers
+- Do not place the value in environment overlays or the pushed blob
 
 **Validation**: Application startup fails if:
 
@@ -662,18 +724,18 @@ Path-based HTTP Basic Authentication.
 [[handlers]]
 path = "^/_ts/admin"
 username = "admin"
-password = "secure-password"
+password = "admin_password"
 
 # Multiple handlers
 [[handlers]]
 path = "^/secure"
 username = "user1"
-password = "pass1"
+password = "secure_handler_password"
 
 [[handlers]]
 path = "^/api/private"
 username = "api-user"
-password = "api-pass"
+password = "api_handler_password"
 ```
 
 **Environment Override**:
@@ -682,12 +744,12 @@ password = "api-pass"
 # Handler 0
 TRUSTED_SERVER__HANDLERS__0__PATH="^/_ts/admin"
 TRUSTED_SERVER__HANDLERS__0__USERNAME="admin"
-TRUSTED_SERVER__HANDLERS__0__PASSWORD="secure-password"
+TRUSTED_SERVER__HANDLERS__0__PASSWORD="admin_password"
 
 # Handler 1
 TRUSTED_SERVER__HANDLERS__1__PATH="^/api/private"
 TRUSTED_SERVER__HANDLERS__1__USERNAME="api-user"
-TRUSTED_SERVER__HANDLERS__1__PASSWORD="api-pass"
+TRUSTED_SERVER__HANDLERS__1__PASSWORD="api_handler_password"
 ```
 
 ### Path Patterns
@@ -761,10 +823,9 @@ scheduled for removal
 
 **Password Storage**:
 
-- Stored in plain text in config
-- Use environment variables in production
-- Rotate passwords regularly
-- Consider using Fastly Secret Store
+- `handlers[*].password` is a key name in `trusted_server_secrets`
+- Store the resolved password only in the platform secret store
+- Rotate passwords through the store and restart/redeploy instances
 
 **Limitations**:
 
@@ -774,12 +835,9 @@ scheduled for removal
 - No rate limiting (add at edge)
 
 ::: warning Production Use
-For production, store credentials in environment variables:
-
-```bash
-TRUSTED_SERVER__HANDLERS__0__PASSWORD=$(cat /run/secrets/admin_password)
-```
-
+Do not put handler passwords in `trusted-server.toml`, environment overlays, or
+app-config blobs. Provision the referenced key in `trusted_server_secrets`
+before pushing the config.
 :::
 
 ## URL Rewrite Configuration
@@ -999,15 +1057,14 @@ target_path = "/image/upload/$1.$2"
 
 The first supported origin auth type is `s3_sigv4`.
 
-| Field               | Type   | Required | Default             | Description                                     |
-| ------------------- | ------ | -------- | ------------------- | ----------------------------------------------- |
-| `type`              | String | Yes      | none                | Must be `s3_sigv4`                              |
-| `region`            | String | Yes      | none                | AWS region used in the SigV4 credential scope   |
-| `secret_store`      | String | No       | `s3-auth`           | Runtime secret store containing AWS credentials |
-| `access_key_id`     | String | No       | `access_key_id`     | Secret key containing the AWS access key ID     |
-| `secret_access_key` | String | No       | `secret_access_key` | Secret key containing the AWS secret access key |
-| `session_token`     | String | No       | unset               | Optional secret key containing a session token  |
-| `origin_query`      | String | No       | route default       | `preserve` or `strip`                           |
+| Field               | Type   | Required | Default             | Description                                                  |
+| ------------------- | ------ | -------- | ------------------- | ------------------------------------------------------------ |
+| `type`              | String | Yes      | none                | Must be `s3_sigv4`                                           |
+| `region`            | String | Yes      | none                | AWS region used in the SigV4 credential scope                |
+| `access_key_id`     | String | No       | `access_key_id`     | Default-store secret reference for the AWS access key ID     |
+| `secret_access_key` | String | No       | `secret_access_key` | Default-store secret reference for the AWS secret access key |
+| `session_token`     | String | No       | unset               | Optional secret key containing a session token               |
+| `origin_query`      | String | No       | route default       | `preserve` or `strip`                                        |
 
 **Example**:
 
@@ -1020,13 +1077,12 @@ origin_url = "https://bucket.s3.us-east-1.amazonaws.com"
 type = "s3_sigv4"
 region = "us-east-1"
 origin_query = "strip"
-secret_store = "s3-auth"
-access_key_id = "access_key_id"
-secret_access_key = "secret_access_key"
-# session_token = "session_token"
+access_key_id = "s3_access_key_id"
+secret_access_key = "s3_secret_access_key"
+# session_token = "s3_session_token"
 ```
 
-S3 auth uses header-based AWS SigV4 with `UNSIGNED-PAYLOAD`. It is scoped to read-only asset requests and expects `origin_url` to use the S3 host that AWS validates. Credentials are cached per process by configured secret names after the first successful read.
+S3 auth uses header-based AWS SigV4 with `UNSIGNED-PAYLOAD`. It is scoped to read-only asset requests and expects `origin_url` to use the S3 host that AWS validates. Credential references resolve from `trusted_server_secrets` at startup, and request signing performs no secret-store reads.
 
 Effective `origin_query` precedence is auth-level `origin_query`, then enabled Image Optimizer `origin_query`, then the route default.
 
@@ -1498,7 +1554,7 @@ remove that field's non-default value (and any environment override), run
 `ts config validate`, push the resulting default-compatible blob, and only then
 roll back the binary.
 
-**Environment overlays:** EdgeZero's env overlays cannot create missing TOML
+**Environment overlays:** The pinned EdgeZero loader cannot create missing TOML
 leaves. Existing configs must add **both** leaves under `[auction]`
 (`rewrite_creatives` and `sanitize_creatives`) before
 `TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES` /
@@ -1880,14 +1936,15 @@ Configuration is validated at startup:
 
 **EC Validation**:
 
-- `passphrase` ≥ 1 character
-- `passphrase` ≠ known placeholders (`"secret-key"`, `"secret_key"`, `"trusted-server"` — case-insensitive)
+- The `passphrase` key name is non-empty at push time
+- The resolved passphrase is at least 32 bytes at runtime
+- Known placeholder values are rejected after resolution
 
 **Handler Validation**:
 
 - `path` is valid regex
-- `username` non-empty
-- `password` non-empty
+- `username` is ordinary configuration and non-empty
+- The resolved `password` is non-empty and is checked for placeholders at runtime
 
 **Integration Validation**:
 
@@ -1922,37 +1979,29 @@ server_url: must not be empty
 [publisher]
 domain = "localhost"
 origin_url = "http://localhost:3000"
-proxy_secret = "dev-secret"
+proxy_secret = "publisher_proxy_secret"
 ```
 
-**Staging**:
+**Staging and production**:
 
-```bash
-# .env.staging
-TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://staging.publisher.com
-TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret_staging)
-```
-
-**Production**:
-
-```bash
-# All secrets from environment
-TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret)
-TRUSTED_SERVER__EC__PASSPHRASE=$(cat /run/secrets/ec_secret)
-TRUSTED_SERVER__HANDLERS__0__PASSWORD=$(cat /run/secrets/admin_password)
-```
+- Provision the same key names in the target `trusted_server_secrets` store.
+- Keep only the key names in `trusted-server.toml` and environment overlays.
+- Push the config after provisioning and restart/redeploy after rotation.
 
 ### Secret Management
 
 **Do**:
-✅ Use environment variables for secrets  
-✅ Rotate secrets periodically  
-✅ Generate cryptographically random values  
-✅ Store in secure secret management (Fastly Secret Store, Vault)  
-✅ Use different secrets per environment
+✅ Store values in the platform secret store
+✅ Rotate values deliberately and restart/redeploy instances
+✅ Generate values locally without printing them to logs
+✅ Use different values per environment when appropriate
+✅ Keep stable key names for rotation
 
 **Don't**:
-❌ Commit secrets to version control  
+❌ Commit secret values to version control
+❌ Put secret values in environment overlays
+❌ Put secret values in config diff output or app-config blobs
+❌ Treat missing secret-store keys as inline values
 ❌ Use default/placeholder values  
 ❌ Share secrets across environments  
 ❌ Log secret values  
@@ -1992,10 +2041,10 @@ trusted-server.dev.toml      # Development overrides
 
 **"Configuration field '...' is set to a known placeholder value"**:
 
-- `ec.passphrase` cannot be `"secret-key"`, `"secret_key"`, or `"trusted-server"` (case-insensitive)
-- `publisher.proxy_secret` cannot be `"change-me-proxy-secret"` (case-insensitive)
-- Must be non-empty
-- Change to a secure random value (see generation commands above)
+- Confirm the referenced key exists in `trusted_server_secrets`
+- Ensure the resolved value is non-empty and not a known placeholder
+- Do not replace the key name with a plaintext value in the app config
+- Rotate the value in the platform secret store, then restart/redeploy
 
 **"Invalid regex"**:
 
@@ -2012,7 +2061,7 @@ trusted-server.dev.toml      # Development overrides
 **Environment Variables Not Applied**:
 
 - Run the override through `ts config validate`, `ts config diff`, or `ts config push`
-- Verify the target leaf already exists in `trusted-server.toml`; the env overlay does not create missing fields
+- Verify the target leaf already exists in `trusted-server.toml`; the pinned EdgeZero loader does not create missing fields
 - Verify prefix: `TRUSTED_SERVER__`
 - Check separator: `__` (double underscore)
 - Confirm the variable is exported: `echo $VARIABLE_NAME`
