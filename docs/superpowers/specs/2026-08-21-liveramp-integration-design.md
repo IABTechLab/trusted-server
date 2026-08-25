@@ -213,8 +213,15 @@ implementation-ready because:
 
 ## 6. Proposed configuration
 
-LiveRamp configuration is optional and nested under the existing Prebid
-integration:
+> **Revision, 2026-08-25.** An earlier draft of this section specified a typed
+> `[integrations.prebid.liveramp]` subsection, which named a single identity
+> vendor inside `trusted-server-core`. It is superseded by the vendor-neutral
+> `managed_user_ids` surface below. RampID is now a configuration choice, not a
+> type in core.
+
+Managed Prebid User ID modules are optional and nested under the existing Prebid
+integration. Each entry is an opaque passthrough: core validates only what
+Prebid needs to address the module, and never interprets `params`.
 
 ```toml
 [integrations.prebid]
@@ -224,56 +231,74 @@ external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-<sha256>
 external_bundle_sha256 = "<sha256>"
 external_bundle_sri = "sha256-<base64>"
 
-[integrations.prebid.liveramp]
-placement_id = "999"
-not_use_3p = false
-storage_type = "cookie"
-expires_days = 15
+# RampID, expressed purely as operator configuration.
+[[integrations.prebid.managed_user_ids]]
+name = "identityLink"
+params = { pid = "999", notUse3P = false }
+
+[integrations.prebid.managed_user_ids.storage]
+type = "cookie"
+name = "idl_env"
+expires = 15
 refresh_in_seconds = 1800
 ```
 
-The Rust representation is an optional field on `PrebidIntegrationConfig`:
+The Rust representation names no vendor:
 
 ```rust
 pub struct PrebidIntegrationConfig {
     // Existing fields omitted.
-    pub liveramp: Option<PrebidLiveRampConfig>,
+    pub managed_user_ids: Vec<PrebidManagedUserIdConfig>,
 }
 
-pub struct PrebidLiveRampConfig {
-    pub placement_id: String,
-    pub not_use_3p: bool,
-    pub storage_type: PrebidLiveRampStorageType,
-    pub expires_days: u16,
-    pub refresh_in_seconds: u32,
+pub struct PrebidManagedUserIdConfig {
+    pub name: String,
+    pub params: serde_json::Map<String, serde_json::Value>,
+    pub storage: Option<PrebidManagedUserIdStorage>,
 }
 
-pub enum PrebidLiveRampStorageType {
+pub struct PrebidManagedUserIdStorage {
+    pub storage_type: PrebidUserIdStorageType,
+    pub name: String,
+    pub expires: Option<u16>,
+    pub refresh_in_seconds: Option<u32>,
+}
+
+pub enum PrebidUserIdStorageType {
     Cookie,
     Html5,
 }
 ```
 
-Defaults:
+Validation:
 
-| Field                | Default  | Reason                                                                                                     |
-| -------------------- | -------- | ---------------------------------------------------------------------------------------------------------- |
-| `not_use_3p`         | `false`  | Matches the documented Prebid/LiveRamp example and permits RTIS until authentication replaces it with ATS. |
-| `storage_type`       | `cookie` | Provides first-party browser persistence and matches the documented example.                               |
-| `expires_days`       | `15`     | LiveRamp's conservative recommendation for GDPR/CCPA traffic.                                              |
-| `refresh_in_seconds` | `1800`   | LiveRamp recommends refreshing rotating encrypted envelopes every 30 minutes.                              |
+| Field                        | Rule                                                                                                                                                                                                                |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                       | Required. Non-empty, untrimmed-free ASCII token of letters, digits, `_`, `-`, or `.`. Unique across entries: Prebid keys `userSync.userIds` by name, so a repeat gives one submodule two conflicting configurations |
+| `params`                     | Optional. Any TOML table; forwarded to Prebid without inspection                                                                                                                                                    |
+| `storage.type`               | Optional. `cookie` (default) or `html5`                                                                                                                                                                             |
+| `storage.name`               | Required when `storage` exists. Same token rule as `name`                                                                                                                                                           |
+| `storage.expires`            | Optional. At least 1 when present; omitted leaves Prebid's default. No upper bound — a ceiling is the module's                                                                                                      |
+| `storage.refresh_in_seconds` | Optional. At least 1 when present; omitted leaves Prebid's default                                                                                                                                                  |
 
-`placement_id` is required when the subsection exists. It must be non-empty,
-trimmed, and contain only ASCII digits. `expires_days` must be from 1 through 30. `refresh_in_seconds` must be non-zero. The storage name is deliberately not
-configurable: the LiveRamp/Prebid contract requires `idl_env`.
+Values that used to be typed defaults in core — `notUse3P = false`,
+`idl_env`, 15 days, 1800 seconds — are now operator-supplied, because each is a
+property of the module the operator selected rather than of Trusted Server.
 
-Omitting `[integrations.prebid.liveramp]` preserves current behavior and emits
-no LiveRamp configuration.
+Pairing a managed `name` with the bundle module that implements it is the
+operator's responsibility. Trusted Server does not validate it, and deliberately
+holds no name-to-module table: such a table is vendor knowledge, it would
+duplicate the registry the TypeScript bundle generator already reads, and it
+would go stale against newly released Prebid modules. A managed entry whose
+module is absent resolves nothing and the auction continues.
+
+An empty `managed_user_ids` preserves current behavior and emits no managed User
+ID configuration.
 
 ## 7. Browser configuration and ordering
 
 The Rust Prebid head injector extends `window.__tsjs_prebid` with a camel-cased
-`liveRamp` object containing the validated values. The Placement ID is an
+`managedUserIds` array containing the validated entries. A Placement ID is an
 operator identifier rather than a secret, but diagnostics must not copy
 envelope values.
 
@@ -345,7 +370,7 @@ boundary against adversarial same-origin JavaScript that retained an earlier
 function reference or mutates internal configuration objects directly.
 
 This policy gives the operator ownership of the single `identityLink` entry
-when `[integrations.prebid.liveramp]` exists. Publishers retain ownership of all
+when a managed `identityLink` entry exists. Publishers retain ownership of all
 other Prebid and User ID configuration. Omitting the subsection installs no
 wrapper and preserves current publisher behavior exactly.
 
@@ -365,7 +390,7 @@ sequenceDiagram
     participant PBS as Prebid Server
     participant KV as EC identity graph
 
-    O->>TS: Configure integrations.prebid.liveramp
+    O->>TS: Configure integrations.prebid.managed_user_ids
     TS-->>B: Inject liveRamp config and managed Prebid bundle
     B->>B: Guard setConfig/mergeConfig and synchronously merge identityLink
     B->>LR: Prebid identityLink module resolves/refreshes envelope
@@ -529,7 +554,7 @@ Run outside CI against a LiveRamp-approved non-production origin:
 
 1. Obtain a test Placement ID and confirm the origin is approved.
 2. Generate a Prebid bundle containing `identityLinkIdSystem`.
-3. Configure `[integrations.prebid.liveramp]` with the test Placement ID.
+3. Configure a managed `identityLink` entry with the test Placement ID.
 4. Load the publisher page with positive consent.
 5. Confirm `idl_env` is created or refreshed according to the selected storage.
 6. Confirm `pbjs.getUserIdsAsEids()` returns a `liveramp.com` entry without

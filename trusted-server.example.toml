@@ -57,18 +57,32 @@ client_side_bidders = []
 adapters = ["rubicon"]
 # user_id_modules = ["sharedIdSystem"]
 
-# Optional managed LiveRamp RampID configuration. The external Prebid bundle
-# must contain identityLinkIdSystem. Obtain the Placement ID and approve the
-# publisher origin with LiveRamp before enabling. Persisting the resulting
-# envelope into the EC identity graph additionally needs a matching partner
-# under [[ec.partners]] with source_domain = "liveramp.com"; without one the
-# envelope still reaches the auction but is never written to KV.
-# [integrations.prebid.liveramp]
-# placement_id = "999"
-# not_use_3p = false
-# storage_type = "cookie"
-# expires_days = 15
-# refresh_in_seconds = 1800
+# Prebid User ID modules that Trusted Server installs and keeps installed, so
+# operators can manage identity centrally without publisher JavaScript changes.
+# Each entry is forwarded to Prebid.js verbatim: `name` is a
+# `userSync.userIds` entry name, `params` and `storage` are whatever that module
+# documents. Trusted Server does not interpret them, so any Prebid User ID
+# module works here without a code change. Each `name` must appear only once.
+#
+# The module must be present in the built bundle: name it under
+# [integrations.prebid.bundle].user_id_modules, or omit that list to take the
+# generator's default preset. This pairing is not validated — a managed entry
+# whose module is missing from the bundle resolves nothing.
+#
+# Persisting a resolved ID into the EC identity graph additionally needs a
+# matching partner under [[ec.partners]] whose source_domain equals the module's
+# OpenRTB EID source; without one the ID still reaches the auction but is never
+# written to KV.
+#
+# [[integrations.prebid.managed_user_ids]]
+# name = "exampleId"
+# params = { pid = "999" }
+#
+# [integrations.prebid.managed_user_ids.storage]
+# type = "cookie"          # or "html5"
+# name = "example_env"
+# expires = 15             # days; omit to keep Prebid's default
+# refresh_in_seconds = 1800  # omit to keep Prebid's default
 
 [integrations.nextjs]
 enabled = false

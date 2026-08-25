@@ -11,12 +11,6 @@ pub(crate) type CliResult<T> = Result<T, String>;
 
 const NODE_MODULES_MISSING_HELP: &str = "Prebid bundling dependencies are missing. Run `cd crates/trusted-server-js/lib && npm ci`, then retry `ts prebid bundle`.";
 
-/// Prebid User ID module that backs `[integrations.prebid.liveramp]`.
-///
-/// Without it in the bundle the managed `identityLink` entry the server injects
-/// has no submodule to drive, so `LiveRamp` silently resolves nothing.
-const IDENTITY_LINK_USER_ID_MODULE: &str = "identityLinkIdSystem";
-
 #[derive(Debug, clap::Args)]
 pub(crate) struct PrebidBundleArgs {
     /// Trusted Server config path.
@@ -237,22 +231,6 @@ pub(crate) fn load_bundle_config(config_path: &Path) -> CliResult<PrebidBundleCo
     if matches!(user_id_modules.as_ref(), Some(modules) if modules.is_empty()) {
         return cli_error(format!(
             "{} integrations.prebid.bundle.user_id_modules must not be empty when present",
-            config_path.display()
-        ));
-    }
-
-    // A pinned module list that omits `identityLinkIdSystem` while LiveRamp is
-    // configured builds a bundle that cannot serve that configuration. The
-    // only runtime signal is a browser-side diagnostic, so fail here instead.
-    // An absent list uses the generator's default preset, which includes it.
-    if prebid.get("liveramp").is_some()
-        && let Some(modules) = user_id_modules.as_ref()
-        && !modules
-            .iter()
-            .any(|module| module == IDENTITY_LINK_USER_ID_MODULE)
-    {
-        return cli_error(format!(
-            "{} configures [integrations.prebid.liveramp] but integrations.prebid.bundle.user_id_modules omits {IDENTITY_LINK_USER_ID_MODULE}",
             config_path.display()
         ));
     }
@@ -627,82 +605,6 @@ adapters = ["rubicon"]
         let config = load_bundle_config(&path).expect("should load bundle config");
 
         assert_eq!(config.adapters, ["rubicon"]);
-        assert_eq!(config.user_id_modules, None);
-    }
-
-    #[test]
-    fn bundle_config_loader_rejects_liveramp_without_its_user_id_module() {
-        let (_temp, path) = write_config(
-            r#"
-[integrations.prebid]
-enabled = true
-server_url = "https://prebid.example.com/openrtb2/auction"
-
-[integrations.prebid.liveramp]
-placement_id = "999"
-
-[integrations.prebid.bundle]
-adapters = ["rubicon"]
-user_id_modules = ["sharedIdSystem"]
-"#,
-        );
-
-        let error = load_bundle_config(&path).expect_err("should reject the unusable combination");
-
-        assert!(
-            error.contains("omits identityLinkIdSystem"),
-            "should name the missing module: {error}"
-        );
-    }
-
-    #[test]
-    fn bundle_config_loader_accepts_liveramp_with_its_user_id_module() {
-        let (_temp, path) = write_config(
-            r#"
-[integrations.prebid]
-enabled = true
-server_url = "https://prebid.example.com/openrtb2/auction"
-
-[integrations.prebid.liveramp]
-placement_id = "999"
-
-[integrations.prebid.bundle]
-adapters = ["rubicon"]
-user_id_modules = ["sharedIdSystem", "identityLinkIdSystem"]
-"#,
-        );
-
-        let config = load_bundle_config(&path).expect("should load bundle config");
-
-        assert_eq!(
-            config.user_id_modules,
-            Some(vec![
-                "sharedIdSystem".to_string(),
-                "identityLinkIdSystem".to_string()
-            ])
-        );
-    }
-
-    #[test]
-    fn bundle_config_loader_allows_liveramp_with_the_default_module_preset() {
-        // An absent list means the generator's default preset, which already
-        // contains identityLinkIdSystem.
-        let (_temp, path) = write_config(
-            r#"
-[integrations.prebid]
-enabled = true
-server_url = "https://prebid.example.com/openrtb2/auction"
-
-[integrations.prebid.liveramp]
-placement_id = "999"
-
-[integrations.prebid.bundle]
-adapters = ["rubicon"]
-"#,
-        );
-
-        let config = load_bundle_config(&path).expect("should load bundle config");
-
         assert_eq!(config.user_id_modules, None);
     }
 

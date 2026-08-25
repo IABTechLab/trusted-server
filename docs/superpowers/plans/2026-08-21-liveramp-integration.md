@@ -2,9 +2,20 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Revision, 2026-08-25 — configuration surface superseded.** This plan was
+> written against a typed `[integrations.prebid.liveramp]` subsection, which put
+> a named identity vendor inside `trusted-server-core`. The delivered
+> implementation instead exposes a vendor-neutral
+> `[[integrations.prebid.managed_user_ids]]` array that core forwards to
+> Prebid.js verbatim, so RampID is enabled by configuration alone and core names
+> no vendor. Every task below that references `liveramp`, `placement_id`,
+> `PrebidLiveRampConfig`, or `PrebidLiveRampStorageType` is superseded by
+> section 6 of the design specification; the sequencing, test strategy, and
+> verification steps still apply unchanged.
+
 **Goal:** Make Trusted Server's existing Prebid RampID EID path first-class by adding validated operator configuration, deterministic `identityLink` setup, bundle diagnostics, tests, and documentation.
 
-**Architecture:** Add an optional typed `liveramp` subsection to `PrebidIntegrationConfig` and serialize it into the existing `window.__tsjs_prebid` bootstrap. The TSJS Prebid shim installs idempotent `pbjs.setConfig` and `pbjs.mergeConfig` normalizers before `processQueue()`, synchronously merges the operator-owned `identityLink` entry with effective publisher User ID entries, and preserves all unrelated configuration. Existing `/auction`, OpenRTB `user.ext.eids`, `ts-eids`, consent, and EC/KV paths remain unchanged.
+**Architecture:** Add a `managed_user_ids` array to `PrebidIntegrationConfig` and serialize it into the existing `window.__tsjs_prebid` bootstrap. Entries are opaque to core: it validates only what Prebid needs to address a module and forwards `params` uninspected. The TSJS Prebid shim installs idempotent `pbjs.setConfig` and `pbjs.mergeConfig` normalizers before `processQueue()`, synchronously merges the operator-owned entries with effective publisher User ID entries, and preserves all unrelated configuration. Existing `/auction`, OpenRTB `user.ext.eids`, `ts-eids`, consent, and EC/KV paths remain unchanged.
 
 **Tech Stack:** Rust 2024, Serde, validator, TypeScript, Prebid.js 10, Vitest, JSDOM, Vite, VitePress/Markdown, Cargo workspace aliases.
 
@@ -14,17 +25,17 @@
 
 ## File structure
 
-| File                                                                            | Responsibility                                                                                                                |
-| ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `crates/trusted-server-core/src/integrations/prebid.rs`                         | Define and validate LiveRamp operator settings; inject the browser-safe camel-cased config; host Rust unit tests.             |
-| `crates/trusted-server-js/lib/src/integrations/prebid/index.ts`                 | Validate the injected shape, install the managed `identityLink` configuration guard, and preserve publisher User ID settings. |
-| `crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts`           | Prove initial, queued, and late Prebid configuration behavior plus diagnostics and EID transport.                             |
-| `crates/trusted-server-js/lib/test/integrations/prebid/user_id_modules.test.ts` | Characterize the existing `liveramp.com` → `identityLinkIdSystem` registry mapping.                                           |
-| `crates/trusted-server-js/lib/test/build-prebid-external.test.mjs`              | Prove an external bundle can include and manifest `identityLinkIdSystem`.                                                     |
-| `crates/trusted-server-js/lib/test/prebid-artifact-integration.test.mjs`        | Exercise the real generated Prebid bundle and served shim together with LiveRamp config.                                      |
-| `trusted-server.example.toml`                                                   | Show safe, commented operator configuration.                                                                                  |
-| `docs/guide/integrations/prebid.md`                                             | Explain LiveRamp prerequisites, configuration, lifecycle, degraded behavior, and verification.                                |
-| `docs/guide/configuration.md`                                                   | Add the typed settings reference.                                                                                             |
+| File                                                                            | Responsibility                                                                                                                 |
+| ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `crates/trusted-server-core/src/integrations/prebid.rs`                         | Define and validate vendor-neutral managed User ID settings; inject the browser-safe camel-cased config; host Rust unit tests. |
+| `crates/trusted-server-js/lib/src/integrations/prebid/index.ts`                 | Validate the injected shape, install the managed User ID configuration guard, and preserve publisher User ID settings.         |
+| `crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts`           | Prove initial, queued, and late Prebid configuration behavior plus diagnostics and EID transport.                              |
+| `crates/trusted-server-js/lib/test/integrations/prebid/user_id_modules.test.ts` | Characterize the existing `liveramp.com` → `identityLinkIdSystem` registry mapping.                                            |
+| `crates/trusted-server-js/lib/test/build-prebid-external.test.mjs`              | Prove an external bundle can include and manifest `identityLinkIdSystem`.                                                      |
+| `crates/trusted-server-js/lib/test/prebid-artifact-integration.test.mjs`        | Exercise the real generated Prebid bundle and served shim together with LiveRamp config.                                       |
+| `trusted-server.example.toml`                                                   | Show safe, commented operator configuration.                                                                                   |
+| `docs/guide/integrations/prebid.md`                                             | Explain LiveRamp prerequisites, configuration, lifecycle, degraded behavior, and verification.                                 |
+| `docs/guide/configuration.md`                                                   | Add the typed settings reference.                                                                                              |
 
 No new integration module, route, storage schema, cookie format, or upstream HTTP client is created.
 

@@ -134,13 +134,18 @@ describe('external bundle + served shim evaluated together', () => {
     pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
     pageWindow.__tsjs_prebid = {
       clientSideBidders: [],
-      liveRamp: {
-        placementId: '999',
-        notUse3P: false,
-        storageType: 'cookie',
-        expiresDays: 15,
-        refreshInSeconds: 1800,
-      },
+      managedUserIds: [
+        {
+          name: 'identityLink',
+          params: { pid: '999', notUse3P: false },
+          storage: {
+            type: 'cookie',
+            name: 'idl_env',
+            expires: 15,
+            refreshInSeconds: 1800,
+          },
+        },
+      ],
     };
 
     pageWindow.eval(bundleCode);

@@ -27,15 +27,21 @@ const DEFAULT_BUNDLE_MANIFEST = {
   userIdModules: ['sharedIdSystem'],
 };
 
-const LIVE_RAMP_CONFIG = {
-  placementId: '999',
-  notUse3P: false,
-  storageType: 'cookie' as const,
-  expiresDays: 15,
-  refreshInSeconds: 1800,
+// A managed User ID entry is operator configuration, forwarded verbatim. The
+// module named here is sample data: nothing in the shim or the server knows
+// which identity vendor `identityLink` belongs to.
+const MANAGED_USER_ID = {
+  name: 'identityLink',
+  params: { pid: '999', notUse3P: false },
+  storage: {
+    type: 'cookie' as const,
+    name: 'idl_env',
+    expires: 15,
+    refreshInSeconds: 1800,
+  },
 };
 
-const EXPECTED_IDENTITY_LINK = {
+const EXPECTED_MANAGED_USER_ID = {
   name: 'identityLink',
   params: { pid: '999', notUse3P: false },
   storage: {
@@ -66,7 +72,7 @@ interface InjectedPrebidTestConfig {
   bidders?: string[];
   clientSideBidders?: string[];
   excludedGamAdUnitPathSuffixes?: unknown;
-  liveRamp?: typeof LIVE_RAMP_CONFIG;
+  managedUserIds?: Array<typeof MANAGED_USER_ID>;
 }
 
 interface TestGoogletag {
@@ -240,7 +246,7 @@ beforeEach(() => {
   mockPbjs.setConfig = mockSetConfig;
   mockPbjs.mergeConfig = mockMergeConfig;
   mockPbjs.processQueue = mockProcessQueue;
-  delete mockPbjs['__tsLiveRampSetConfigInstalled'];
+  delete mockPbjs['__tsManagedUserIdsSetConfigInstalled'];
 });
 
 describe('prebid/collectBidders', () => {
@@ -452,7 +458,7 @@ describe('prebid/installPrebidNpm', () => {
     delete testWindow.__tsjs_prebid_diagnostics;
     delete testWindow.tsjs;
     delete mockPbjs['__tsApsBidResponseListenerInstalled'];
-    delete mockPbjs['__tsLiveRampSetConfigInstalled'];
+    delete mockPbjs['__tsManagedUserIdsSetConfigInstalled'];
     delete mockPbjs.bidderSettings;
   });
 
@@ -824,7 +830,7 @@ describe('prebid/installPrebidNpm', () => {
     expect(mockProcessQueue).toHaveBeenCalledTimes(1);
   });
 
-  it('leaves the public config APIs unchanged when LiveRamp is not configured', () => {
+  it('leaves the public config APIs unchanged when no User IDs are managed', () => {
     const originalSetConfig = mockPbjs.setConfig;
     const originalMergeConfig = mockPbjs.mergeConfig;
 
@@ -845,14 +851,14 @@ describe('prebid/installPrebidNpm', () => {
           ]
         : {}
     );
-    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
 
     installPrebidNpm();
 
     const managedCall = mockSetConfig.mock.calls.find(([value]) => value?.userSync?.userIds);
     expect(managedCall?.[0]).toEqual({
       userSync: {
-        userIds: [{ name: 'sharedId', storage: { name: '_sharedid' } }, EXPECTED_IDENTITY_LINK],
+        userIds: [{ name: 'sharedId', storage: { name: '_sharedid' } }, EXPECTED_MANAGED_USER_ID],
       },
     });
     expect(
@@ -866,19 +872,19 @@ describe('prebid/installPrebidNpm', () => {
     mockGetConfig.mockImplementation((key?: string) =>
       key === 'userSync.userIds' ? [null, 'invalid', {}, { name: '' }, { name: 'sharedId' }] : {}
     );
-    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
 
     expect(() => installPrebidNpm()).not.toThrow();
 
     const managedCall = mockSetConfig.mock.calls.find(([value]) => value?.userSync?.userIds);
     expect(managedCall?.[0].userSync.userIds).toEqual([
       { name: 'sharedId' },
-      EXPECTED_IDENTITY_LINK,
+      EXPECTED_MANAGED_USER_ID,
     ]);
   });
 
   it('installs the managed entry before processing the publisher queue', () => {
-    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
 
     installPrebidNpm();
 
@@ -890,7 +896,7 @@ describe('prebid/installPrebidNpm', () => {
 
   it('normalizes queued User ID config before a queued auction observes it', () => {
     let observedUserIds: unknown;
-    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
     mockPbjs.que = [
       () =>
         mockPbjs.setConfig({
@@ -913,14 +919,14 @@ describe('prebid/installPrebidNpm', () => {
 
     installPrebidNpm();
 
-    expect(observedUserIds).toEqual([{ name: 'sharedId' }, EXPECTED_IDENTITY_LINK]);
+    expect(observedUserIds).toEqual([{ name: 'sharedId' }, EXPECTED_MANAGED_USER_ID]);
     const queuedConfig = mockSetConfig.mock.calls.at(-1)?.[0];
     expect(queuedConfig.userSync.syncDelay).toBe(50);
     expect(queuedConfig.auctionOptions).toEqual({ suppressStaleRender: true });
   });
 
   it('normalizes publisher identityLink updates after processQueue', () => {
-    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
     installPrebidNpm();
 
     mockPbjs.setConfig({
@@ -934,12 +940,12 @@ describe('prebid/installPrebidNpm', () => {
 
     expect(mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([
       { name: 'id5Id', params: { partner: 1 } },
-      EXPECTED_IDENTITY_LINK,
+      EXPECTED_MANAGED_USER_ID,
     ]);
   });
 
   it('normalizes queued identityLink updates made through mergeConfig', () => {
-    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
     mockPbjs.que = [
       () =>
         mockPbjs.mergeConfig({
@@ -959,12 +965,12 @@ describe('prebid/installPrebidNpm', () => {
 
     expect(mockMergeConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([
       { name: 'sharedId' },
-      EXPECTED_IDENTITY_LINK,
+      EXPECTED_MANAGED_USER_ID,
     ]);
   });
 
   it('normalizes late identityLink updates made through mergeConfig', () => {
-    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
     installPrebidNpm();
 
     mockPbjs.mergeConfig({
@@ -978,12 +984,12 @@ describe('prebid/installPrebidNpm', () => {
 
     expect(mockMergeConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([
       { name: 'id5Id', params: { partner: 1 } },
-      EXPECTED_IDENTITY_LINK,
+      EXPECTED_MANAGED_USER_ID,
     ]);
   });
 
   it('passes unrelated publisher configuration through by reference', () => {
-    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
     installPrebidNpm();
     const publisherConfig = { priceGranularity: 'medium', userSync: { syncDelay: 50 } };
 
@@ -992,8 +998,8 @@ describe('prebid/installPrebidNpm', () => {
     expect(mockSetConfig.mock.calls.at(-1)?.[0]).toBe(publisherConfig);
   });
 
-  it('does not stack the LiveRamp config wrappers across shim reinstallations', () => {
-    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+  it('does not stack the managed User ID config wrappers across shim reinstallations', () => {
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
     installPrebidNpm();
     const managedSetConfig = mockPbjs.setConfig;
     const managedMergeConfig = mockPbjs.mergeConfig;
@@ -1004,7 +1010,9 @@ describe('prebid/installPrebidNpm', () => {
     expect(mockPbjs.setConfig).toBe(managedSetConfig);
     expect(mockPbjs.mergeConfig).toBe(managedMergeConfig);
     mockPbjs.setConfig({ userSync: { userIds: [] } });
-    expect(mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([EXPECTED_IDENTITY_LINK]);
+    expect(mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([
+      EXPECTED_MANAGED_USER_ID,
+    ]);
   });
 
   it('skips seeding the managed entry when getConfig is unavailable', () => {
@@ -1012,14 +1020,14 @@ describe('prebid/installPrebidNpm', () => {
     // cannot be read, and installing the managed entry alone would silently
     // drop every publisher-configured module.
     const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
-    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
     delete (mockPbjs as { getConfig?: unknown }).getConfig;
 
     expect(() => installPrebidNpm()).not.toThrow();
 
     expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
     expect(errorSpy).toHaveBeenCalledWith(
-      '[tsjs-prebid] window.pbjs.getConfig is unavailable; managed LiveRamp entry not seeded'
+      '[tsjs-prebid] window.pbjs.getConfig is unavailable; managed User ID entries not seeded'
     );
 
     // The wrappers are still installed, so the next publisher userIds call
@@ -1027,13 +1035,13 @@ describe('prebid/installPrebidNpm', () => {
     mockPbjs.setConfig({ userSync: { userIds: [{ name: 'sharedId' }] } });
     expect(mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([
       { name: 'sharedId' },
-      EXPECTED_IDENTITY_LINK,
+      EXPECTED_MANAGED_USER_ID,
     ]);
   });
 
   it('passes the publisher config through when normalization throws', () => {
     const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
-    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
     installPrebidNpm();
     const hostileConfig = {
       userSync: {
@@ -1047,13 +1055,13 @@ describe('prebid/installPrebidNpm', () => {
 
     expect(mockSetConfig.mock.calls.at(-1)?.[0]).toBe(hostileConfig);
     expect(errorSpy).toHaveBeenCalledWith(
-      '[tsjs-prebid] LiveRamp configuration could not be normalized',
+      '[tsjs-prebid] managed User ID entries could not be normalized',
       expect.any(Error)
     );
   });
 
   it('hands Prebid a distinct managed entry object per normalization', () => {
-    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
     installPrebidNpm();
 
     mockPbjs.setConfig({ userSync: { userIds: [] } });
@@ -1061,16 +1069,39 @@ describe('prebid/installPrebidNpm', () => {
     mockPbjs.setConfig({ userSync: { userIds: [] } });
     const second = mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds[0];
 
-    expect(first).toEqual(EXPECTED_IDENTITY_LINK);
-    expect(second).toEqual(EXPECTED_IDENTITY_LINK);
+    expect(first).toEqual(EXPECTED_MANAGED_USER_ID);
+    expect(second).toEqual(EXPECTED_MANAGED_USER_ID);
     expect(second).not.toBe(first);
   });
 
+  it('isolates nested managed params from Prebid and from later normalizations', () => {
+    // Prebid keeps the entry it receives as `submodule.config` for the life of
+    // the page. A shallow copy would leave nested params shared with
+    // window.__tsjs_prebid and with every other entry built from it.
+    const nestedManagedUserId = {
+      name: 'exampleId',
+      params: { pid: '999', ext: { segments: ['a'] } },
+    };
+    testWindow.__tsjs_prebid = { managedUserIds: [nestedManagedUserId] };
+    installPrebidNpm();
+
+    mockPbjs.setConfig({ userSync: { userIds: [] } });
+    const first = mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds[0];
+    mockPbjs.setConfig({ userSync: { userIds: [] } });
+    const second = mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds[0];
+
+    // Simulate Prebid mutating the configuration it retained.
+    (first.params.ext as { segments: string[] }).segments.push('mutated');
+
+    expect(second.params.ext).toEqual({ segments: ['a'] });
+    expect(nestedManagedUserId.params.ext.segments).toEqual(['a']);
+  });
+
   it('reports identityLink missing when its bundle module is absent', () => {
-    testWindow.__tsjs_prebid = { liveRamp: LIVE_RAMP_CONFIG };
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
     testWindow.__tsjs_prebid_bundle = { userIdModules: [] };
     mockGetConfig.mockImplementation((key?: string) =>
-      key === 'userSync.userIds' ? [EXPECTED_IDENTITY_LINK] : {}
+      key === 'userSync.userIds' ? [EXPECTED_MANAGED_USER_ID] : {}
     );
 
     installPrebidNpm();

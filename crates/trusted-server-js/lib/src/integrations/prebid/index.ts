@@ -131,9 +131,7 @@ const TS_REFRESH_TARGETING_KEYS = [
 const MAX_PUBLISHER_AD_UNIT_SNAPSHOTS = 256;
 const MAX_PENDING_PUBLISHER_BIDS = 2048;
 const PENDING_PUBLISHER_DELIVERY_TTL_MS = 5000;
-const IDENTITY_LINK_CONFIG_NAME = 'identityLink';
-const IDENTITY_LINK_STORAGE_NAME = 'idl_env';
-const LIVE_RAMP_SET_CONFIG_SENTINEL = '__tsLiveRampSetConfigInstalled';
+const MANAGED_USER_IDS_SET_CONFIG_SENTINEL = '__tsManagedUserIdsSetConfigInstalled';
 
 /** Configuration options for the Prebid integration. */
 export interface PrebidNpmConfig {
@@ -158,16 +156,28 @@ interface InjectedPrebidConfig {
   clientSideBidders?: string[];
   /** GAM ad-unit-path suffixes excluded from refresh auctions. */
   excludedGamAdUnitPathSuffixes?: string[];
-  /** Operator-owned LiveRamp IdentityLink configuration. */
-  liveRamp?: InjectedLiveRampConfig;
+  /** Operator-owned Prebid User ID module entries, forwarded verbatim. */
+  managedUserIds?: InjectedManagedUserId[];
 }
 
-interface InjectedLiveRampConfig {
-  placementId: string;
-  notUse3P: boolean;
-  storageType: 'cookie' | 'html5';
-  expiresDays: number;
-  refreshInSeconds: number;
+/**
+ * One operator-owned Prebid `userSync.userIds` entry.
+ *
+ * The server does not interpret these: `name`, `params`, and `storage` are
+ * whatever the operator configured, passed straight to Prebid.js. Which
+ * identity vendor an entry selects is a configuration choice.
+ */
+interface InjectedManagedUserId {
+  name: string;
+  params?: Record<string, unknown>;
+  storage?: InjectedManagedUserIdStorage;
+}
+
+interface InjectedManagedUserIdStorage {
+  type: 'cookie' | 'html5';
+  name: string;
+  expires?: number;
+  refreshInSeconds?: number;
 }
 
 type PrebidUserIdConfigEntry = Record<string, unknown> & { name: string };
@@ -241,33 +251,48 @@ function configuredUserIdNamesFromConfig(config: unknown): string[] {
   return [...new Set(userIds.map((entry) => entry.name))].sort();
 }
 
-function liveRampUserId(config: InjectedLiveRampConfig): PrebidUserIdConfigEntry {
-  return {
-    name: IDENTITY_LINK_CONFIG_NAME,
-    params: { pid: config.placementId, notUse3P: config.notUse3P },
-    storage: {
-      type: config.storageType,
-      name: IDENTITY_LINK_STORAGE_NAME,
-      expires: config.expiresDays,
-      refreshInSeconds: config.refreshInSeconds,
-    },
-  };
+/**
+ * Deep-copies a value the server injected as JSON.
+ *
+ * A spread would copy only the top level, leaving nested objects shared with
+ * `window.__tsjs_prebid` and with every entry built from it. `params` accepts
+ * arbitrary operator-authored tables, so nesting is expected. The injected
+ * config is serialized JSON by construction, which makes a round-trip total
+ * here and avoids depending on `structuredClone` availability.
+ */
+function cloneInjectedJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
-function withManagedLiveRampUserId(
+function managedUserIdEntry(managed: InjectedManagedUserId): PrebidUserIdConfigEntry {
+  // Rebuild the entry per call rather than sharing one object. Prebid retains
+  // whatever it receives as `submodule.config` for the life of the page, so a
+  // shared instance would let any mutation there leak into later builds.
+  const entry: PrebidUserIdConfigEntry = { name: managed.name };
+  if (managed.params) {
+    entry.params = cloneInjectedJson(managed.params);
+  }
+  if (managed.storage) {
+    entry.storage = cloneInjectedJson(managed.storage);
+  }
+  return entry;
+}
+
+function withManagedUserIds(
   config: PbjsConfig,
-  managedEntry: PrebidUserIdConfigEntry
+  managedUserIds: InjectedManagedUserId[]
 ): PbjsConfig {
   if (!hasUserIdsPath(config)) return config;
 
+  const managedNames = new Set(managedUserIds.map((managed) => managed.name));
   const retained = configuredUserIdEntries(config.userSync.userIds).filter(
-    (entry) => entry.name !== IDENTITY_LINK_CONFIG_NAME
+    (entry) => !managedNames.has(entry.name)
   );
   return {
     ...config,
     userSync: {
       ...config.userSync,
-      userIds: [...retained, managedEntry],
+      userIds: [...retained, ...managedUserIds.map(managedUserIdEntry)],
     },
   } as PbjsConfig;
 }
@@ -1167,8 +1192,12 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   };
 
   const managedPbjs = pbjs as typeof pbjs & Record<string, unknown>;
-  const liveRampConfig = injected?.liveRamp;
-  if (liveRampConfig && managedPbjs[LIVE_RAMP_SET_CONFIG_SENTINEL] !== true) {
+  const managedUserIds = injected?.managedUserIds;
+  if (
+    managedUserIds &&
+    managedUserIds.length > 0 &&
+    managedPbjs[MANAGED_USER_IDS_SET_CONFIG_SENTINEL] !== true
+  ) {
     const originalSetConfig = pbjs.setConfig.bind(pbjs);
     const prebidConfigApi = pbjs as typeof pbjs & {
       mergeConfig?: typeof pbjs.setConfig;
@@ -1177,15 +1206,11 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
 
     const normalizePublisherConfig = (publisherConfig: PbjsConfig): PbjsConfig => {
       try {
-        // Build the managed entry per call rather than sharing one object.
-        // Prebid retains whatever it receives as `submodule.config` for the
-        // life of the page, so a shared instance would let any mutation there
-        // leak into every later normalization.
-        return withManagedLiveRampUserId(publisherConfig, liveRampUserId(liveRampConfig));
+        return withManagedUserIds(publisherConfig, managedUserIds);
       } catch (error) {
         // Publisher configuration is arbitrary page data: a throwing accessor
         // must not break the publisher's own setConfig call.
-        log.error('[tsjs-prebid] LiveRamp configuration could not be normalized', error);
+        log.error('[tsjs-prebid] managed User ID entries could not be normalized', error);
         return publisherConfig;
       }
     };
@@ -1198,7 +1223,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         return originalMergeConfig(normalizePublisherConfig(publisherConfig));
       }) as typeof pbjs.setConfig;
     }
-    managedPbjs[LIVE_RAMP_SET_CONFIG_SENTINEL] = true;
+    managedPbjs[MANAGED_USER_IDS_SET_CONFIG_SENTINEL] = true;
 
     const getConfig = (pbjs as unknown as { getConfig?: (key?: string) => unknown }).getConfig;
     if (typeof getConfig === 'function') {
@@ -1206,11 +1231,11 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       pbjs.setConfig({ userSync: { userIds: effectiveUserIds } } as PbjsConfig);
     } else {
       // Without getConfig the effective User ID entries cannot be read, and
-      // seeding the managed entry alone would silently drop every publisher
+      // seeding the managed entries alone would silently drop every publisher
       // module already configured. Leave the wrappers installed so the next
-      // publisher userIds call still gets the managed entry.
+      // publisher userIds call still gets the managed entries.
       log.error(
-        '[tsjs-prebid] window.pbjs.getConfig is unavailable; managed LiveRamp entry not seeded'
+        '[tsjs-prebid] window.pbjs.getConfig is unavailable; managed User ID entries not seeded'
       );
     }
   }
