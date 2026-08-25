@@ -8,6 +8,7 @@ use error_stack::Report;
 use http::{Method, Request, Response};
 use matchit::Router;
 
+use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::EcContext;
 use crate::ec::kv::KvIdentityGraph;
@@ -777,9 +778,21 @@ pub struct ProxyDispatchInput<'a> {
 #[derive(Clone, Default)]
 pub struct IntegrationRegistry {
     inner: Arc<IntegrationRegistryInner>,
+    plan: Option<Arc<AuctionPlan>>,
 }
 
 impl IntegrationRegistry {
+    /// Build a test registry from settings and a newly compiled auction plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when plan compilation or integration registration fails.
+    #[cfg(test)]
+    pub fn new(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
+        let plan = Arc::new(crate::auction::compile_auction_plan(settings)?);
+        Self::with_plan(settings, plan)
+    }
+
     /// Build a registry from the provided settings.
     ///
     /// # Errors
@@ -789,87 +802,112 @@ impl IntegrationRegistry {
     /// # Panics
     ///
     /// Panics if a route path ends with `/*` but `strip_suffix` unexpectedly fails (invariant violation).
-    pub fn new(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
+    pub fn with_plan(
+        settings: &Settings,
+        plan: Arc<AuctionPlan>,
+    ) -> Result<Self, Report<TrustedServerError>> {
         let mut inner = IntegrationRegistryInner::default();
-
+        let mut registrations = Vec::new();
+        if let Some(registration) = crate::integrations::prebid::register_for_plan(settings, &plan)?
+        {
+            registrations.push(registration);
+        }
+        if let Some(registration) = crate::integrations::aps::register_for_plan(settings, &plan)? {
+            registrations.push(registration);
+        }
         for builder in crate::integrations::builders() {
             if let Some(registration) = (builder.build)(settings)? {
-                debug_assert_eq!(
-                    registration.integration_id, builder.id,
-                    "integration builder ID should match registration ID"
-                );
-                inner
-                    .enabled_integration_ids
-                    .push(registration.integration_id);
+                debug_assert_eq!(registration.integration_id, builder.id);
+                registrations.push(registration);
+            }
+        }
 
-                for proxy in registration.proxies {
-                    for route in proxy.routes() {
-                        let value = (proxy.clone(), registration.integration_id);
+        for registration in registrations {
+            let builder_id = registration.integration_id;
+            debug_assert_eq!(
+                registration.integration_id, builder_id,
+                "integration builder ID should match registration ID"
+            );
+            inner
+                .enabled_integration_ids
+                .push(registration.integration_id);
 
-                        // Convert /* wildcard to matchit's {*rest} syntax
-                        let matchit_path = if route.path.ends_with("/*") {
-                            format!(
-                                "{}/{{*rest}}",
-                                route
-                                    .path
-                                    .strip_suffix("/*")
-                                    .expect("path should end with '/*'")
-                            )
-                        } else {
-                            route.path.clone()
-                        };
+            for proxy in registration.proxies {
+                for route in proxy.routes() {
+                    let value = (proxy.clone(), registration.integration_id);
 
-                        // Select appropriate router and insert
-                        let router = match route.method {
-                            Method::GET => &mut inner.get_router,
-                            Method::POST => &mut inner.post_router,
-                            Method::PUT => &mut inner.put_router,
-                            Method::DELETE => &mut inner.delete_router,
-                            Method::PATCH => &mut inner.patch_router,
-                            Method::HEAD => &mut inner.head_router,
-                            Method::OPTIONS => &mut inner.options_router,
-                            _ => {
-                                log::warn!(
-                                    "Unsupported HTTP method {} for route {}",
-                                    route.method,
-                                    route.path
-                                );
-                                continue;
-                            }
-                        };
+                    // Convert /* wildcard to matchit's {*rest} syntax
+                    let matchit_path = if route.path.ends_with("/*") {
+                        format!(
+                            "{}/{{*rest}}",
+                            route
+                                .path
+                                .strip_suffix("/*")
+                                .expect("path should end with '/*'")
+                        )
+                    } else {
+                        route.path.clone()
+                    };
 
-                        if let Err(e) = router.insert(&matchit_path, value) {
-                            return Err(Report::new(TrustedServerError::Configuration {
-                                message: format!(
-                                    "Integration route registration failed for {} {}: {:?}",
-                                    route.method, route.path, e
-                                ),
-                            }));
+                    // Select appropriate router and insert
+                    let router = match route.method {
+                        Method::GET => &mut inner.get_router,
+                        Method::POST => &mut inner.post_router,
+                        Method::PUT => &mut inner.put_router,
+                        Method::DELETE => &mut inner.delete_router,
+                        Method::PATCH => &mut inner.patch_router,
+                        Method::HEAD => &mut inner.head_router,
+                        Method::OPTIONS => &mut inner.options_router,
+                        _ => {
+                            log::warn!(
+                                "Unsupported HTTP method {} for route {}",
+                                route.method,
+                                route.path
+                            );
+                            continue;
                         }
+                    };
 
-                        inner.routes.push((route, registration.integration_id));
+                    if let Err(e) = router.insert(&matchit_path, value) {
+                        return Err(Report::new(TrustedServerError::Configuration {
+                            message: format!(
+                                "Integration route registration failed for {} {}: {:?}",
+                                route.method, route.path, e
+                            ),
+                        }));
                     }
+
+                    inner.routes.push((route, registration.integration_id));
                 }
-                inner
-                    .html_rewriters
-                    .extend(registration.attribute_rewriters);
-                inner.script_rewriters.extend(registration.script_rewriters);
-                inner
-                    .html_post_processors
-                    .extend(registration.html_post_processors);
-                inner.head_injectors.extend(registration.head_injectors);
-                inner.request_filters.extend(registration.request_filters);
-                if registration.js_disabled {
-                    inner.disabled_js_ids.push(registration.integration_id);
-                } else if registration.js_deferred {
-                    inner.deferred_js_ids.push(registration.integration_id);
-                }
+            }
+            inner
+                .html_rewriters
+                .extend(registration.attribute_rewriters);
+            inner.script_rewriters.extend(registration.script_rewriters);
+            inner
+                .html_post_processors
+                .extend(registration.html_post_processors);
+            inner.head_injectors.extend(registration.head_injectors);
+            inner.request_filters.extend(registration.request_filters);
+            if registration.js_disabled {
+                inner.disabled_js_ids.push(registration.integration_id);
+            } else if registration.js_deferred {
+                inner.deferred_js_ids.push(registration.integration_id);
             }
         }
 
         Ok(Self {
             inner: Arc::new(inner),
+            plan: Some(plan),
         })
+    }
+
+    /// Return whether this registry and another consumer share the same plan allocation.
+    #[must_use]
+    pub fn shares_plan(&self, plan: &Arc<AuctionPlan>) -> bool {
+        self.plan
+            .as_ref()
+            .is_some_and(|owned| Arc::ptr_eq(owned, plan))
     }
 
     fn find_route(&self, method: &Method, path: &str) -> Option<&RouteValue> {
@@ -1192,6 +1230,7 @@ impl IntegrationRegistry {
     pub fn empty_for_tests() -> Self {
         Self {
             inner: Arc::new(IntegrationRegistryInner::default()),
+            plan: None,
         }
     }
 
@@ -1220,6 +1259,7 @@ impl IntegrationRegistry {
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
+            plan: None,
         }
     }
 
@@ -1249,6 +1289,7 @@ impl IntegrationRegistry {
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
+            plan: None,
         }
     }
 
@@ -1274,6 +1315,7 @@ impl IntegrationRegistry {
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
+            plan: None,
         }
     }
 
@@ -1339,6 +1381,7 @@ impl IntegrationRegistry {
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
+            plan: None,
         }
     }
 }
@@ -2104,17 +2147,21 @@ mod tests {
                 "prebid",
                 &serde_json::json!({
                     "enabled": true,
-                    "server_url": "https://test-prebid.com/openrtb2/auction",
                     "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
                     "timeout_ms": 1000,
-                    "bidders": ["mocktioneer"],
                     "debug": false
                 }),
             )
             .expect("should insert prebid config");
 
-        let registry =
-            IntegrationRegistry::new(&settings_with_prebid).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings_with_prebid,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings_with_prebid)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
 
         let all = registry.js_module_ids();
         let immediate = registry.js_module_ids_immediate();
@@ -2150,7 +2197,14 @@ mod tests {
             .insert_config("nextjs", &serde_json::json!({ "enabled": true }))
             .expect("should insert nextjs config");
 
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
         let all = registry.js_module_ids();
 
         assert!(
@@ -2179,7 +2233,14 @@ mod tests {
             .insert_config("osano", &serde_json::json!({ "enabled": true }))
             .expect("should insert osano config");
 
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
         let immediate = registry.js_module_ids_immediate();
 
         assert!(
@@ -2207,13 +2268,19 @@ mod tests {
                 "prebid",
                 &serde_json::json!({
                     "enabled": false,
-                    "server_url": "https://test-prebid.com/openrtb2/auction",
                     "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
                 }),
             )
             .expect("should update prebid config");
 
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
 
         let deferred = registry.js_module_ids_deferred();
         assert!(
@@ -2231,13 +2298,19 @@ mod tests {
                 "prebid",
                 &serde_json::json!({
                     "enabled": true,
-                    "server_url": "https://test-prebid.com/openrtb2/auction",
                     "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
                 }),
             )
             .expect("should update prebid config");
 
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
 
         assert!(
             registry.js_module_ids().contains(&"prebid"),
@@ -2267,17 +2340,21 @@ mod tests {
                 "prebid",
                 &serde_json::json!({
                     "enabled": true,
-                    "server_url": "https://test-prebid.com/openrtb2/auction",
                     "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
                     "timeout_ms": 1000,
-                    "bidders": ["mocktioneer"],
                     "debug": false
                 }),
             )
             .expect("should insert prebid config");
 
-        let registry =
-            IntegrationRegistry::new(&settings_with_prebid).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings_with_prebid,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings_with_prebid)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
 
         let all = registry.js_module_ids();
         let mut recombined = registry.js_module_ids_immediate();

@@ -412,171 +412,116 @@ Manages the execution of an auction flow, coordinates providers, and collects re
 
 ## Auction Strategies
 
-### 1. Parallel + Mediation (Recommended)
-**Use case:** Header bidding with ad server mediation
+### 1. Parallel + Mediation
 
 ```toml
 [auction]
 enabled = true
-providers = ["prebid", "aps"]
-mediator = "adserver_mock"  # Setting mediator enables parallel mediation strategy
 timeout_ms = 2000
+mediator = "adserver_mock"
+
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+routing = "explicit"
+
+[auction.providers.aps-main]
+protocol = "openrtb-2.6"
+profile = "aps"
+endpoint = "https://aps.example.com/e/pb/bid"
+routing = "all_eligible"
+profile_config = { account_id = "example-aps-account" }
 ```
 
-**Flow:**
-1. Prebid and APS run in parallel
-2. Both return their bids simultaneously
-3. Bids are sent to the mediator for final decision
-4. Mediator competes house inventory and returns winning creative
+Providers run in parallel, then the separately registered mediator chooses from
+decoded-price bids.
 
 ### 2. Parallel Only
-**Use case:** Client-side auction, no mediation
 
-```toml
-[auction]
-enabled = true
-providers = ["prebid", "aps"]
-# No mediator = parallel only strategy (highest CPM wins)
-timeout_ms = 2000
-```
-
-**Flow:**
-1. All providers run in parallel
-2. Highest bid wins
-3. No mediation server involved
+Omit `mediator` from the same map-shaped configuration. The orchestrator selects
+the highest decoded CPM per slot and applies floors locally.
 
 ## Configuration
 
-### Configuration
-
-All auction settings are configured directly under `[auction]`:
+`[auction.providers.<provider-id>]` is the only bidder-provider inventory.
+`[auction.bidders.<bidder-id>]` maps a client-visible bidder to exactly one
+provider. The mediator is selected separately by `[auction].mediator`.
 
 ```toml
 [auction]
-enabled = true                      # Enable/disable auction orchestration
-providers = ["prebid", "aps"]        # List of bidder providers
-mediator = "adserver_mock"          # Optional: if set, uses mediation; if omitted, highest bid wins
-timeout_ms = 2000                   # Overall auction timeout
+enabled = true
+timeout_ms = 2000
+
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+timeout_ms = 900
+routing = "explicit"
+
+[auction.providers.pbs-main.profile_config]
+debug = false
+test_mode = false
+consent_forwarding = "both"
+
+[auction.providers.pbs-main.notifications]
+suppress_all = false
+suppress_seats = ["example-seat"]
+
+[auction.bidders.example-server]
+provider = "pbs-main"
 ```
 
-**Strategy Auto-Detection:**
-- When `mediator` is configured → Runs **parallel mediation** (providers in parallel, mediator decides winner)
-- When `mediator` is omitted → Runs **parallel only** (providers in parallel, highest CPM wins)
+Provider IDs own backend correlation and response identity. The configured
+profile supplies typed OpenRTB behavior. Common endpoint, timeout, routing, and
+notification policy do not belong to browser integration configuration.
 
-### Provider Configuration
+## Adding a Provider
 
-Each provider has its own configuration section:
+A standards-compatible OpenRTB 2.6 endpoint does not require a Rust provider
+implementation. Add an `[auction.providers.<id>]` table, select the `standard`
+profile, and route bidder codes through `[auction.bidders.<code>]`. Endpoint,
+timeout, routing, and notification behavior are compiled into the shared
+`AuctionPlan` at startup.
 
-```toml
-[integrations.prebid]
-enabled = true
-server_url = "https://prebid-server.example.com"
-timeout_ms = 1000
+Add Rust code only when an endpoint needs behavior that the existing
+`standard`, `prebid-server`, or `aps` profiles cannot express. New profile work
+belongs in `profile.rs` and `openrtb.rs`: define and validate typed profile
+configuration, register the profile with the central profile registry, and add
+request/response golden tests. Production provider registration is plan-backed;
+`AuctionOrchestrator::register_provider` exists only in the legacy test parity
+harness and is not an application extension API.
 
-[integrations.aps]
-enabled = true
-mock = true  # Set to false for real integration
-timeout_ms = 800
-
-[integrations.adserver_mock]
-enabled = true
-endpoint = "http://localhost:6767/adserver/mediate"
-timeout_ms = 500
-```
-
-## Adding a New Provider
-
-1. Create a new file in `src/auction/providers/your_provider.rs`
-
-```rust
-use async_trait::async_trait;
-use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
-use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse};
-use crate::platform::PlatformResponse;
-
-pub struct YourAuctionProvider {
-    config: YourConfig,
-}
-
-#[async_trait(?Send)]
-impl AuctionProvider for YourAuctionProvider {
-    fn provider_name(&self) -> &'static str {
-        "your_provider"
-    }
-
-    async fn request_bids(
-        &self,
-        request: &AuctionRequest,
-        _context: &AuctionContext<'_>,
-    ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-        // 1. Transform AuctionRequest to your provider's format
-        // 2. Launch through services.http_client().send_async(...)
-        // 3. Wrap the handle with ProviderRequestOutcome::pending(...)
-        todo!()
-    }
-
-    async fn parse_response(
-        &self,
-        response: PlatformResponse,
-        response_time_ms: u64,
-    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        // 4. Parse PlatformResponse into AuctionResponse
-        todo!()
-    }
-
-    fn timeout_ms(&self) -> u32 {
-        self.config.timeout_ms
-    }
-
-    fn is_enabled(&self) -> bool {
-        self.config.enabled
-    }
-}
-```
-
-2. Register the provider in `src/auction/providers/mod.rs`
-
-3. Configure it in `trusted-server.toml`
+See the maintained [auction orchestration guide](../../../../docs/guide/auction-orchestration.md)
+and [integration guide](../../../../docs/guide/integration-guide.md) for complete
+configuration and validation examples.
 
 ## Testing
 
-### Mock Providers
-
-APS and adserver_mock providers are used for testing the orchestration pattern:
-
-- **APS Mock**: Returns mock bids with Amazon branding
-- **AdServer Mock**: Acts as mediator by calling mocktioneer's mediation endpoint, selects winning bids based on highest CPM
-
-Set `mock = false` in APS config when real APS integration is ready.
-
-### Example Test Flow
-
-```rust
-let orchestrator = AuctionOrchestrator::new(config);
-orchestrator.register_provider(Arc::new(PrebidAuctionProvider::try_new(prebid_config)?));
-orchestrator.register_provider(Arc::new(ApsAuctionProvider::new(aps_config)));
-
-let result = orchestrator.run_auction(&request, &context, &services).await?;
-
-// Check results
-assert_eq!(result.winning_bids.len(), 2);
-assert!(result.total_time_ms < 2000);
-```
+Compile test settings with `compile_auction_plan`, construct the orchestrator and
+integration registry from the same `Arc<AuctionPlan>`, and exercise requests
+through the normal adapter or auction endpoint. Profile tests should cover typed
+configuration validation, exact OpenRTB request output, response admission,
+provider-local failures, routing, and target capability validation. Legacy
+provider constructors and manual registration are retained only for parity tests.
 
 ## Performance Considerations
 
 - **Parallel Execution**: Providers are launched concurrently via `select()` over `PendingRequest`s; responses are processed as they become ready within the auction deadline
 - **Timeouts**: Each provider has independent timeout; global timeout enforced at flow level
-- **Error Handling**: Provider failures don't fail entire auction; partial results returned
+- **Error Handling**: Provider failures don't fail the entire auction; partial results are returned
 
 ## Related Files
 
-- `src/auction/mod.rs` - Module exports
+- `src/auction/mod.rs` - Plan compilation and module exports
+- `src/auction/plan.rs` - Typed provider plan and target validation
+- `src/auction/profile.rs` - Typed OpenRTB profile registry
+- `src/auction/routing.rs` - Central bidder-to-provider routing
+- `src/auction/openrtb.rs` - Shared request construction and response parsing
+- `src/auction/provider.rs` - Plan-backed provider execution
+- `src/auction/orchestrator.rs` - Fan-out, deadline, and mediation flow
 - `src/auction/types.rs` - Core auction types
-- `src/auction/provider.rs` - Provider trait definition
-- `src/auction/orchestrator.rs` - Orchestration logic
-- `src/auction/config.rs` - Configuration types
-- `src/auction/providers/` - Provider implementations
 
 ## Questions?
 

@@ -55,13 +55,15 @@ Missing required field: publisher.domain
 
 **Cause:** Required configuration field not provided
 
-**Solution:** Add the missing field to `trusted-server.toml`:
+**Solution:** Add the missing field to `trusted-server.toml`. The secret below
+is an intentionally rejected placeholder; replace it with `openssl rand -base64 32`
+before validation.
 
 ```toml
 [publisher]
 domain = "your-publisher-domain.com"
 origin_url = "https://origin.your-publisher-domain.com"
-proxy_secret = "change-me-to-random-string"
+proxy_secret = "replace-with-random-proxy-secret"
 ```
 
 **Required Fields:**
@@ -78,21 +80,26 @@ proxy_secret = "change-me-to-random-string"
 **Error Message:**
 
 ```
-Invalid URL in integrations.prebid.server_url
+provider `pbs-main` endpoint must be an absolute HTTPS URL
 ```
 
-**Cause:** Malformed URL in configuration
+**Cause:** Malformed auction provider endpoint.
 
-**Solution:** Ensure URLs are well-formed with scheme:
+**Solution:** Configure an absolute HTTPS endpoint with a host and no embedded
+credentials or fragment:
 
 ```toml
 # ❌ Wrong
-[integrations.prebid]
-server_url = "prebid-server.example.com"
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "prebid.example.com/openrtb2/auction"
 
 # ✅ Correct
-[integrations.prebid]
-server_url = "https://prebid-server.example.com"
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
 ```
 
 ---
@@ -114,13 +121,13 @@ Failed to parse environment variable: TRUSTED_SERVER__PUBLISHER__DOMAIN
 TRUSTED_SERVER__PUBLISHER__DOMAIN="example.com"
 
 # For numbers
-TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=1000
+TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__TIMEOUT_MS=1000
 
 # For booleans
 TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true
 
-# For arrays (comma-separated)
-TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS="appnexus,rubicon"
+# For browser-side bidder arrays (comma-separated)
+TRUSTED_SERVER__INTEGRATIONS__PREBID__CLIENT_SIDE_BIDDERS="exampleBidder,exampleBrowserBidder"
 ```
 
 See [Configuration Reference](./configuration.md) for complete patterns.
@@ -141,17 +148,17 @@ Failed to generate EC ID: HMAC error
 
 **Solution:**
 
-1. Ensure `passphrase` is set in `trusted-server.toml`:
+1. Generate a passphrase with `openssl rand -base64 32`, then set it in `trusted-server.toml` (the value below is an intentionally rejected placeholder):
 
 ```toml
 [ec]
-passphrase = "replace-with-32-plus-byte-random-secret"
+passphrase = "replace-with-random-ec-passphrase"
 ```
 
-2. Or set via environment variable:
+2. Or set the generated value via environment variable; do not use the literal placeholder shown below:
 
 ```bash
-TRUSTED_SERVER__EC__PASSPHRASE=replace-with-32-plus-byte-random-secret
+TRUSTED_SERVER__EC__PASSPHRASE=replace-with-random-ec-passphrase
 ```
 
 ---
@@ -164,21 +171,16 @@ TRUSTED_SERVER__EC__PASSPHRASE=replace-with-32-plus-byte-random-secret
 Backend not found: prebid-server
 ```
 
-**Cause:** Dynamic backend creation failed or backend not configured
+**Cause:** Dynamic backend creation for a configured provider endpoint failed.
+Provider backends are derived from `[auction.providers.<id>]`; they are not
+manually named static Fastly backends.
 
 **Solution:**
 
-For integrations using dynamic backends (Prebid, Testlight):
-
-- Ensure the integration is enabled
-- Verify the URL is accessible from Fastly edge
-- Check Fastly service limits (backend count)
-
-For static backends, configure in Fastly dashboard:
-
-1. Go to Origins → Hosts
-2. Add backend with name matching configuration
-3. Redeploy service
+- Verify the provider endpoint is canonical HTTPS and reachable from the edge
+- Check the provider ID and target-specific backend-name validation error
+- Check platform backend-count limits
+- Run `ts config validate`, then verify target-aware startup validation on the selected adapter
 
 ---
 
@@ -220,12 +222,15 @@ Upstream request timeout after 1000ms
 
 **Solution:**
 
-1. Increase timeout in configuration:
+1. Increase the affected server provider timeout:
 
 ```toml
-[integrations.prebid]
-timeout_ms = 2000  # Increase from default 1000ms
+[auction.providers.pbs-main]
+timeout_ms = 2000
 ```
+
+Browser `[integrations.prebid].timeout_ms` is independent and does not control
+Prebid Server transport.
 
 2. Verify upstream service is responsive:
 
@@ -279,12 +284,14 @@ Prebid Server returned 400: Invalid OpenRTB request
 
 **Solution:**
 
-1. Enable debug mode:
+1. Enable debug mode on the Prebid Server profile:
 
 ```toml
-[integrations.prebid]
-debug = true
+[auction.providers.pbs-main]
+profile_config = { debug = true }
 ```
+
+`[integrations.prebid].debug` controls browser Prebid.js only.
 
 2. Check logs for request/response details
 3. Verify bidders are supported by your Prebid Server
@@ -630,14 +637,18 @@ cargo install viceroy --version 0.17.0 --locked --force
 
 ### Enable Debug Logging
 
-**In configuration:**
+Browser Prebid.js debug remains under `[integrations.prebid]`:
 
 ```toml
 [integrations.prebid]
 debug = true
+```
 
-# Or via environment variable
-TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=true
+For Prebid Server diagnostics, enable debug in that provider's profile:
+
+```toml
+[auction.providers.pbs-main]
+profile_config = { debug = true }
 ```
 
 **Check Fastly logs:**
@@ -654,8 +665,10 @@ fastly log-tail
 # Start local server
 fastly compute serve
 
-# Test endpoint
-curl http://localhost:7676/first-party/ad?slot=test&w=300&h=250
+# Test the auction endpoint
+curl -X POST http://localhost:7676/auction \
+  -H "Content-Type: application/json" \
+  -d '{"adUnits":[{"code":"test","mediaTypes":{"banner":{"sizes":[[300,250]]}}}]}'
 ```
 
 ---
@@ -663,10 +676,10 @@ curl http://localhost:7676/first-party/ad?slot=test&w=300&h=250
 ### Validate Configuration
 
 ```bash
-# Test configuration load
-cargo run --bin trusted-server-adapter-fastly -- --validate-config
+# Validate the resolved deployment configuration
+ts config validate
 
-# Or check startup logs
+# Then check startup logs when exercising the runtime
 fastly compute serve 2>&1 | grep -i "settings"
 ```
 

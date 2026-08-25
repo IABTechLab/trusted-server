@@ -19,7 +19,7 @@ Signatures use HMAC-SHA256 with the publisher's `proxy_secret`:
 
 ```toml
 [publisher]
-proxy_secret = "your-secret-key-here"  # Must be secure random string
+proxy_secret = "change-me-proxy-secret"  # Rejected placeholder; replace with a secure random string
 ```
 
 ## Signature Validation

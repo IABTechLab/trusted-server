@@ -50,33 +50,39 @@ curl -X POST http://localhost:7676/auction \
 - Optional mock-adserver mediation selecting winning bids
 - Final response with winning creatives
 
-**With Orchestrator Disabled** (`auction.enabled = false`):
-- Logs showing: `"Using legacy Prebid flow"`
-- Direct Prebid Server call (backward compatible)
+**With Auction Execution Disabled** (`auction.enabled = false`):
+- Logs showing: `"/auction: auction is disabled; returning no-bid response"`
+- Immediate no-bid response with no provider or mediator dispatch
 
-##Configuration
+## Configuration
 
 Edit `trusted-server.toml` to customize the auction:
 
 ```toml
-# Enable/disable orchestrator
 [auction]
 enabled = true
-providers = ["prebid", "aps"]
-mediator = "adserver_mock"  # If set: mediation, if omitted: highest bid wins
 timeout_ms = 2000
+mediator = "adserver_mock"
 
-# APS OpenRTB provider. The built-in production endpoint is used when
-# endpoint is omitted; use only an account authorized for test traffic.
-[integrations.aps]
-enabled = true
-account_id = "example-account"
-timeout_ms = 800
-debug = false
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+routing = "explicit"
+
+[auction.providers.aps-main]
+protocol = "openrtb-2.6"
+profile = "aps"
+endpoint = "https://aps.example.com/e/pb/bid"
+routing = "all_eligible"
+profile_config = { account_id = "example-aps-account", debug = false }
+
+[auction.bidders.example-server]
+provider = "pbs-main"
 
 [integrations.adserver_mock]
 enabled = true
-endpoint = "http://localhost:6767/adserver/mediate"
+endpoint = "https://mediator.example.com/mediate"
 timeout_ms = 500
 ```
 
@@ -87,8 +93,7 @@ timeout_ms = 500
 ```toml
 [auction]
 enabled = true
-providers = ["prebid", "aps"]
-mediator = "adserver_mock"  # Mediator configured = parallel mediation strategy
+mediator = "adserver_mock"  # Providers come from [auction.providers.*] maps
 ```
 
 **Expected Flow:**
@@ -102,8 +107,7 @@ mediator = "adserver_mock"  # Mediator configured = parallel mediation strategy
 ```toml
 [auction]
 enabled = true
-providers = ["prebid", "aps"]
-# No mediator = parallel only strategy
+# Configured [auction.providers.*] run without a mediator
 ```
 
 **Expected Flow:**
@@ -111,16 +115,16 @@ providers = ["prebid", "aps"]
 2. Highest bid wins automatically
 3. No mediation
 
-### Scenario 3: Legacy Mode (Backward Compatible)
+### Scenario 3: Auction Disabled
+
 **Config:**
+
 ```toml
 [auction]
 enabled = false
 ```
 
-**Expected Flow:**
-- Original Prebid-only behavior
-- No orchestration overhead
+**Expected Flow:** no auction provider dispatch.
 
 ## Debugging
 
@@ -149,10 +153,10 @@ INFO: Registering auction provider: adserver_mock
 ### Common Issues
 
 **Issue:** `"Provider 'aps' not registered"`
-**Fix:** Make sure `[integrations.aps]` is configured in `trusted-server.toml`
+**Fix:** Make sure an `[auction.providers.<id>]` entry selects `profile = "aps"`
 
 **Issue:** `"No providers configured"`
-**Fix:** Make sure `providers = ["prebid", "aps"]` is set in `[auction]`
+**Fix:** Make sure map-shaped `[auction.providers.<id>]` entries are configured
 
 **Issue:** Tests fail with WASM errors
 **Explanation:** Async tests don't work in WASM test environment. Integration tests via HTTP work fine!

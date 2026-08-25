@@ -53,11 +53,12 @@ mod tests {
     /// A minimal config that loads cleanly, used as the valid baseline.
     fn baseline() -> String {
         crate::commands::config::init::EXAMPLE_CONFIG
+            .replace("handler_password", "test-admin-password-32-bytes-minimum")
+            .replace("ec_passphrase", "test-ec-passphrase-32-bytes-minimum")
             .replace(
-                "replace-with-admin-password-32-bytes",
-                "test-admin-password-32-bytes-minimum",
+                "publisher_proxy_secret",
+                "test-proxy-secret-32-bytes-minimum",
             )
-            .to_string()
     }
 
     #[test]

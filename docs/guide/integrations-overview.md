@@ -18,7 +18,9 @@ Trusted Server provides built-in integrations with third-party services for firs
 
 ### Prebid
 
-**What it does:** Enables server-side header bidding through Prebid Server while maintaining first-party context.
+**What it does:** Supplies the browser Prebid.js bundle and `trustedServer`
+adapter while auction provider maps independently configure server-side Prebid
+Server demand.
 
 **Key Features:**
 
@@ -34,18 +36,29 @@ Trusted Server provides built-in integrations with third-party services for firs
 ```toml
 [integrations.prebid]
 enabled = true
-server_url = "https://prebid-server.example.com"
 timeout_ms = 1000
-bidders = ["appnexus", "rubicon"]
-auto_configure = true
 debug = false
+client_side_bidders = ["example-browser"]
+external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
+
+[proxy]
+allowed_domains = ["assets.example.com"]
+
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+routing = "explicit"
+
+[auction.bidders.example-server]
+provider = "pbs-main"
 ```
 
 **Endpoints:**
 
-- `GET /first-party/ad` - Server-side ad rendering
-- `POST /third-party/ad` - Client-side auction endpoint
-- `GET /prebid.js` - Optional empty script override
+- `POST /auction` - Browser and programmatic auction endpoint
+- `GET /integrations/prebid/bundle.js` - First-party external bundle proxy
+- `GET <script_patterns>` - Configured empty-script interception routes
 
 **When to use:** You want to monetize your site with programmatic advertising while maintaining first-party context.
 
@@ -325,9 +338,12 @@ All integrations can be configured via environment variables:
 ```bash
 # Pattern: TRUSTED_SERVER__INTEGRATIONS__{INTEGRATION}__{SETTING}
 
-# Prebid
-TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL="https://new-server.com"
+# Existing Prebid browser-map leaves
 TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=2000
+TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=true
+
+# Existing provider-map leaves use the validated provider ID segment
+TRUSTED_SERVER__AUCTION__PROVIDERS__PBS_MAIN__ENDPOINT="https://prebid.example.com/openrtb2/auction"
 
 # Next.js
 TRUSTED_SERVER__INTEGRATIONS__NEXTJS__ENABLED=true

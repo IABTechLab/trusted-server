@@ -2556,16 +2556,10 @@ mod tests {
     /// validation gate is live rather than downgraded by a broken baseline.
     fn loadable_config() -> String {
         EXAMPLE_CONFIG
+            .replace("handler_password", "test-admin-password-32-bytes-minimum")
+            .replace("ec_passphrase", "test-ec-passphrase-32-bytes-minimum")
             .replace(
-                "replace-with-admin-password-32-bytes",
-                "test-admin-password-32-bytes-minimum",
-            )
-            .replace(
-                "trusted-server-placeholder-secret",
-                "test-ec-passphrase-32-bytes-minimum",
-            )
-            .replace(
-                "change-me-proxy-secret",
+                "publisher_proxy_secret",
                 "test-proxy-secret-32-bytes-minimum",
             )
     }
@@ -2990,16 +2984,10 @@ mod tests {
         fs::write(&manifest_path, "[app]\nname = \"trusted-server\"\n")
             .expect("should write manifest");
         let config = EXAMPLE_CONFIG
+            .replace("handler_password", "test-admin-password-32-bytes-minimum")
+            .replace("ec_passphrase", "test-ec-passphrase-32-bytes-minimum")
             .replace(
-                "replace-with-admin-password-32-bytes",
-                "test-admin-password-32-bytes-minimum",
-            )
-            .replace(
-                "trusted-server-placeholder-secret",
-                "test-ec-passphrase-32-bytes-minimum",
-            )
-            .replace(
-                "change-me-proxy-secret",
+                "publisher_proxy_secret",
                 "test-proxy-secret-32-bytes-minimum",
             );
         let config = format!(

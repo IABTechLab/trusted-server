@@ -12,24 +12,26 @@ This guide covers:
 
 ## Prerequisites
 
-- Trusted Server deployed and reachable (example: `https://getpurpose.ai`)
+- Trusted Server deployed and reachable (example: `https://trusted-server.example.com`)
 - Access to update `trusted-server.toml` / deployment configuration
 - Fastly CLI authenticated (for store verification)
 - A valid TCF v2 format string (`euconsent-v2`) for consent-required requests
 
 ## 1) Required Configuration
 
-Set EC configuration in `trusted-server.toml`:
+Generate the passphrase and partner token independently with
+`openssl rand -base64 32`, then set EC configuration in `trusted-server.toml`.
+The `replace-with-*` values below are intentionally rejected placeholders:
 
 ```toml
 [ec]
-passphrase = "replace-with-32-plus-byte-random-secret"
+passphrase = "replace-with-random-ec-passphrase"
 ec_store = "ec_identity_store"
 
 [[ec.partners]]
 name = "Mocktioneer SSP"
-source_domain = "formally-vital-lion.edgecompute.app"
-api_token = "test-batch-sync-key-2026"
+source_domain = "ssp.example.com"
+api_token = "partner-api-token-32-bytes-minimum"
 bidstream_enabled = true
 ```
 
@@ -46,12 +48,12 @@ Required behavior assumptions:
 ## 2) Configure Demo Variables
 
 ```bash
-TS_BASE_URL="https://getpurpose.ai"
-MOCK_SSP_URL="https://formally-vital-lion.edgecompute.app"
+TS_BASE_URL="https://trusted-server.example.com"
+MOCK_SSP_URL="https://ssp.example.com"
 
-PARTNER_SOURCE_DOMAIN="formally-vital-lion.edgecompute.app"
+PARTNER_SOURCE_DOMAIN="ssp.example.com"
 PARTNER_NAME="Mocktioneer SSP"
-PARTNER_API_KEY="test-batch-sync-key-2026"
+PARTNER_API_KEY="partner-api-token-32-bytes-minimum"
 
 # Optional: use a real browser EC if already present
 EC_ID="<64hex.6chars>"
@@ -67,8 +69,8 @@ Partners are configured in `trusted-server.toml` and loaded at startup:
 ```toml
 [[ec.partners]]
 name = "Mocktioneer SSP"
-source_domain = "formally-vital-lion.edgecompute.app"
-api_token = "test-batch-sync-key-2026"
+source_domain = "ssp.example.com"
+api_token = "partner-api-token-32-bytes-minimum"
 bidstream_enabled = true
 ```
 
@@ -138,10 +140,10 @@ Expected shape:
   "ec": "<ec-id>",
   "consent": "ok",
   "degraded": false,
-  "source_domain": "formally-vital-lion.edgecompute.app",
+  "source_domain": "ssp.example.com",
   "uid": "mock-user-123",
   "eid": {
-    "source": "formally-vital-lion.edgecompute.app",
+    "source": "ssp.example.com",
     "uids": [{ "id": "mock-user-123", "atype": 3 }]
   },
   "cluster_size": 12
@@ -174,7 +176,7 @@ echo "<x-ts-eids-base64-value>" | base64 -d | python3 -m json.tool
 
 Expected decoded payload contains:
 
-- `source = formally-vital-lion.edgecompute.app`
+- `source = ssp.example.com`
 - `uids[0].id = <partner-uid>`
 
 ## 8) Fastly KV Operational Checks

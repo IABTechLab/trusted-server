@@ -439,7 +439,7 @@ Configure proxy behavior in `trusted-server.toml`:
 domain = "publisher.com"
 cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
-proxy_secret = "your-secure-random-secret"
+proxy_secret = "change-me-proxy-secret" # Rejected placeholder; replace before deploy
 ```
 
 ### Asset Routes

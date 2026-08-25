@@ -14,82 +14,124 @@ Prebid is the leading open-source header bidding solution that allows publishers
 
 ## Configuration
 
+Prebid configuration has two independent owners:
+
+- `[integrations.prebid]` owns browser Prebid.js behavior: bundle selection and
+  injection, browser timeout/debug, account injection, script interception,
+  client-side bidders, and refresh exclusions.
+- `[auction.providers.<id>]`, its `profile_config`, `notifications`, and
+  `[auction.bidders]` own every Prebid Server request.
+
 ```toml
 [integrations.prebid]
 enabled = true
-server_url = "https://prebid-server.example.com/openrtb2/auction"
-timeout_ms = 1200
-bidders = ["kargo", "appnexus", "openx"]
+timeout_ms = 1000
 debug = false
-# test_mode = false
+client_side_bidders = ["example-browser"]
+excluded_gam_ad_unit_path_suffixes = ["/example-tracking-only"]
+script_patterns = ["/prebid.js", "/prebid.min.js"]
+external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
+# external_bundle_sha256 = "<fictional sha256>"
+# external_bundle_sri = "sha384-<fictional digest>"
 
-# Generated external Prebid bundle served through /integrations/prebid/bundle.js.
-external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
-# external_bundle_sha256 = "..."
-# external_bundle_sri = "sha384-..."
-
-# Bidders that run client-side via native Prebid.js adapters instead of
-# being routed through the server-side auction.
-client_side_bidders = ["rubicon"]
-
-# Keep matching GAM inventory out of Trusted Server's Prebid refresh auctions.
-# GAM still refreshes these slots.
-excluded_gam_ad_unit_path_suffixes = ["/trackingonly"]
-
-# Script interception patterns (optional - defaults shown below)
-script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
-
-# Required when external_bundle_url is configured. Include the bundle host and
-# any HTTPS redirect targets used by that host.
-[proxy]
-allowed_domains = ["assets.example"]
-
-# External bundle generation inputs used by `ts prebid bundle`.
 [integrations.prebid.bundle]
-adapters = ["rubicon"]
+adapters = ["example-browser"]
 user_id_modules = ["sharedIdSystem"]
 
-# Optional static per-bidder param overrides (shallow merge)
-[integrations.prebid.bid_param_overrides.criteo]
-networkId = 99999
-pubid = "server-pub"
+[proxy]
+allowed_domains = ["assets.example.com"]
 
-# Optional per-bidder, per-zone param overrides (shallow merge)
-[integrations.prebid.bid_param_zone_overrides.kargo]
-header       = {placementId = "_s2sHeaderPlacement"}
-in_content   = {placementId = "_s2sContentPlacement"}
+[auction]
+enabled = true
+timeout_ms = 2000
 
-# Optional canonical ordered override rules
-[[integrations.prebid.bid_param_override_rules]]
-when.bidder = "kargo"
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+timeout_ms = 900
+routing = "explicit"
+
+[auction.providers.pbs-main.profile_config]
+debug = false
+test_mode = false
+debug_query_params = "example-debug=1"
+consent_forwarding = "both"
+bid_param_overrides = { example-server = { placement = "example-placement" } }
+bid_param_zone_overrides = { example-server = { header = { placement = "example-header" } } }
+
+[[auction.providers.pbs-main.profile_config.bid_param_override_rules]]
+when.bidder = "example-server"
 when.zone = "header"
-set = { placementId = "_s2sHeaderPlacement" }
+set = { placement = "example-rule-placement" }
+
+[auction.providers.pbs-main.notifications]
+suppress_all = false
+suppress_seats = ["example-seat"]
+
+[auction.bidders.example-server]
+provider = "pbs-main"
 ```
 
-### Configuration Options
+### Browser configuration options
 
-| Field                                | Type          | Default                                                                | Description                                                                                                                                                      |
-| ------------------------------------ | ------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enabled`                            | Boolean       | `true`                                                                 | Enable Prebid integration                                                                                                                                        |
-| `server_url`                         | String        | Required                                                               | Prebid Server endpoint URL                                                                                                                                       |
-| `timeout_ms`                         | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                                                                                  |
-| `bidders`                            | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                                                                          |
-| `external_bundle_url`                | String        | Required when enabled                                                  | Absolute HTTPS URL of the generated external Prebid bundle, proxied through `/integrations/prebid/bundle.js`; its host must be listed in `proxy.allowed_domains` |
-| `external_bundle_sha256`             | String        | `None`                                                                 | Optional 64-character hex SHA-256 used for versioned first-party URLs, immutable cache headers, and `sha256:` ETags                                              |
-| `external_bundle_sri`                | String        | `None`                                                                 | Optional Subresource Integrity metadata added to the same-origin bundle script tag when configured                                                               |
-| `bid_param_overrides`                | Table         | `{}`                                                                   | Static per-bidder param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                                      |
-| `bid_param_zone_overrides`           | Table         | `{}`                                                                   | Per-bidder, per-zone param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                                   |
-| `bid_param_override_rules`           | Array[Table]  | `[]`                                                                   | Canonical ordered override rules with `when` matchers and `set` objects; evaluated after compatibility fields so later rules win on conflicts                    |
-| `suppress_nurl`                      | Boolean       | `false`                                                                | Strip `nurl` and `burl` from every PBS bid when the PBS deployment fires win/billing notifications server-side                                                   |
-| `suppress_nurl_bidders`              | Array[String] | `[]`                                                                   | Bidder seats whose `nurl` and `burl` should be stripped while preserving client-side win/billing pixels for other bidders                                        |
-| `debug`                              | Boolean       | `false`                                                                | Enable Prebid debug mode (sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus`; surfaces debug metadata in auction responses)                             |
-| `test_mode`                          | Boolean       | `false`                                                                | Set the OpenRTB `test: 1` flag so bidders treat the auction as non-billable test traffic. Separate from `debug` to avoid suppressing real demand                 |
-| `debug_query_params`                 | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                                        |
-| `client_side_bidders`                | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side. See [Client-Side Bidders](#client-side-bidders)                               |
-| `excluded_gam_ad_unit_path_suffixes` | Array[String] | `[]`                                                                   | Exact, case-sensitive GAM ad-unit-path suffixes excluded from Trusted Server's Prebid refresh auction; matching slots still refresh through GAM                  |
-| `script_patterns`                    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                                      |
-| `bundle.adapters`                    | Array[String] | Required for `ts prebid bundle`                                        | Prebid.js bidder adapter modules imported into the generated external browser bundle                                                                             |
-| `bundle.user_id_modules`             | Array[String] | Generator default preset when omitted                                  | Prebid User ID modules imported into the generated external browser bundle                                                                                       |
+| Field                                | Default                                                                | Ownership and behavior                                                              |
+| ------------------------------------ | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `enabled`                            | `true`                                                                 | Enables browser bundle injection/interception; it does not create a server provider |
+| `account_id`                         | `None`                                                                 | Optional browser-injected account value                                             |
+| `timeout_ms`                         | `1000`                                                                 | Browser Prebid.js timeout only                                                      |
+| `debug`                              | `false`                                                                | Browser Prebid.js debug only                                                        |
+| `client_side_bidders`                | `[]`                                                                   | Native browser adapters that are not folded into `trustedServer`                    |
+| `excluded_gam_ad_unit_path_suffixes` | `[]`                                                                   | GAM suffixes omitted from Trusted Server refresh auctions                           |
+| `script_patterns`                    | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | Publisher Prebid scripts intercepted to prevent duplicate instances                 |
+| `external_bundle_url`                | Required when enabled                                                  | HTTPS generated bundle URL; host and redirects must be in `proxy.allowed_domains`   |
+| `external_bundle_sha256`             | `None`                                                                 | Optional content hash used for versioning, cache policy, and ETag                   |
+| `external_bundle_sri`                | `None`                                                                 | Optional SRI metadata                                                               |
+| `bundle.adapters`                    | Required for `ts prebid bundle`                                        | Browser bidder adapters compiled into the external bundle                           |
+| `bundle.user_id_modules`             | Generator preset                                                       | Browser User ID modules compiled into the external bundle                           |
+
+### Server provider options
+
+Common fields are `protocol`, `profile`, required HTTPS `endpoint`, optional
+`timeout_ms`, and `routing`. The `prebid-server` timeout defaults to 1000 ms;
+an explicit provider value overrides it, and the remaining auction budget caps
+runtime `tmax`.
+
+The typed `profile_config` fields are:
+
+| Field                      | Default | Behavior                                            |
+| -------------------------- | ------- | --------------------------------------------------- |
+| `debug`                    | `false` | PBS request/response diagnostics                    |
+| `test_mode`                | `false` | Top-level OpenRTB `test: 1`; independent of debug   |
+| `debug_query_params`       | `None`  | Optional page-URL debug query fragment              |
+| `bid_param_overrides`      | `{}`    | Static per-bidder shallow merges                    |
+| `bid_param_zone_overrides` | `{}`    | Per-bidder/per-zone shallow merges                  |
+| `bid_param_override_rules` | `[]`    | Ordered exact-match rules; later matching rules win |
+| `consent_forwarding`       | `both`  | `openrtb_only`, `cookies_only`, or `both`           |
+
+`notifications.suppress_all` replaces the old global notification switch.
+`notifications.suppress_seats` removes `nurl` and `burl` only for exact returned
+`seatbid.seat` values. It does not match bidder route IDs. See
+[Configuration](/guide/configuration#auction-configuration) for bounds.
+
+### Browser/server bidder ownership
+
+Every server-side bidder code comes from `[auction.bidders.<code>]`; the browser
+integration has no server bidder list. The validated route keys are injected as
+`serverSideBidders`. On initial and refresh auctions, only matching publisher
+bids are folded into the `trustedServer.bidderParams` envelope. Configured
+`client_side_bidders` and other unowned demand remain native browser bids. Both
+paths compete in the same Prebid.js auction.
+
+The reserved `trustedServer` envelope cannot select a provider or endpoint. Its
+nested bidder keys resolve through `[auction.bidders]`, and one envelope accepts
+at most 128 bidder entries. The optional `zone` fact is limited to 256 UTF-8
+bytes. Missing, `null`, or empty `bidderParams` invokes Prebid stored-request
+routing; malformed envelopes do not.
+
+Browser `timeout_ms`/`debug` never inherit a server provider timeout or profile
+debug value. Enabling the browser integration does not create a server provider,
+and a `prebid-server` provider can exist independently from browser injection.
 
 ## External Bundle Generation
 
@@ -255,15 +297,15 @@ Use `bid_param_overrides` for static per-bidder param overrides when the same ov
 **Example**:
 
 ```toml
-[integrations.prebid.bid_param_overrides.criteo]
+[auction.providers.pbs-main.profile_config.bid_param_overrides.example-server]
 networkId = 99999
-pubid = "server-pub"
+pubid = "example-server-pub"
 ```
 
 **Environment variable**:
 
 ```text
-TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_OVERRIDES='{"criteo":{"networkId":99999,"pubid":"server-pub"}}'
+TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__BID_PARAM_OVERRIDES='{"example-server":{"networkId":99999,"pubid":"example-server-pub"}}'
 ```
 
 ### Bid Param Zone Overrides
@@ -283,10 +325,10 @@ The JS adapter reads the zone from `mediaTypes.banner.name` on each Prebid ad un
 **Example**:
 
 ```toml
-[integrations.prebid.bid_param_zone_overrides.kargo]
-header       = {placementId = "_s2sHeaderPlacement"}
-in_content   = {placementId = "_s2sContentPlacement"}
-fixed_bottom = {placementId = "_s2sBottomPlacement"}
+[auction.providers.pbs-main.profile_config.bid_param_zone_overrides.example-server]
+header = { placementId = "example-header-placement" }
+in_content = { placementId = "example-content-placement" }
+fixed_bottom = { placementId = "example-bottom-placement" }
 ```
 
 If the incoming request for zone `header` has:
@@ -306,7 +348,7 @@ For an unrecognized zone (e.g., `sidebar`), the incoming params are left unchang
 **Environment variable**:
 
 ```text
-TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_ZONE_OVERRIDES='{"kargo":{"header":{"placementId":"_s2sHeaderPlacement"}}}'
+TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__BID_PARAM_ZONE_OVERRIDES='{"example-server":{"header":{"placementId":"example-header-placement"}}}'
 ```
 
 ### Bid Param Override Rules
@@ -326,16 +368,16 @@ Use `bid_param_override_rules` for the canonical ordered override format. Each r
 **Example**:
 
 ```toml
-[[integrations.prebid.bid_param_override_rules]]
-when.bidder = "kargo"
+[[auction.providers.pbs-main.profile_config.bid_param_override_rules]]
+when.bidder = "example-server"
 when.zone = "header"
-set = { placementId = "_s2sHeaderPlacement", keep = "server" }
+set = { placementId = "example-header-placement", keep = "example" }
 ```
 
 **Environment variable**:
 
 ```text
-TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_OVERRIDE_RULES='[{"when":{"bidder":"kargo","zone":"header"},"set":{"placementId":"_s2sHeaderPlacement","keep":"server"}}]'
+TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__BID_PARAM_OVERRIDE_RULES='[{"when":{"bidder":"example-server","zone":"header"},"set":{"placementId":"example-header-placement","keep":"example"}}]'
 ```
 
 ## Refresh Auction GAM-Path Opt-Out
@@ -378,25 +420,33 @@ external Prebid adapters or User ID modules.
 
 ## Client-Side Bidders
 
-Some Prebid.js bid adapters do not work well through Prebid Server (e.g. Magnite/Rubicon). The `client_side_bidders` config field lets you keep these bidders running natively in the browser while routing all other bidders through the server-side auction.
+The `client_side_bidders` config field keeps selected demand on native
+Prebid.js adapters while validated `[auction.bidders]` routes identify demand
+owned by Trusted Server.
 
 ### How it works
 
 1. The server injects the `clientSideBidders` list into the page via `window.__tsjs_prebid`.
 2. When `pbjs.requestBids()` is called, the TSJS shim checks each bid against the list.
 3. **Client-side bidders** are left as standalone bids — their native Prebid.js adapters handle them in the browser.
-4. **All other bidders** are absorbed into the `trustedServer` adapter and routed through the `/auction` orchestrator to Prebid Server.
+4. **Bidders present in `[auction.bidders]`** are absorbed into the
+   `trustedServer` adapter and routed through `/auction` to their configured
+   provider. Unowned bidders remain native browser demand.
 5. Both sets of bids compete in the same Prebid.js auction.
 
 ### Configuration
 
 ```toml
 [integrations.prebid]
-bidders = ["kargo", "appnexus", "openx"]    # server-side via PBS
-client_side_bidders = ["rubicon"]             # native browser adapters
+client_side_bidders = ["example-browser"]
+
+[auction.bidders.example-server]
+provider = "pbs-main"
 ```
 
-The two lists are independent — the operator manages both explicitly. If a bidder appears in both lists, a warning is logged at startup (the bidder will run in both paths, which is likely unintended).
+Do not route the same bidder through `[auction.bidders]` while also listing it in
+`client_side_bidders`; choose one owner. Include every client-side adapter in
+the generated external bundle.
 
 ### External bundle adapter selection
 
@@ -405,7 +455,7 @@ Client-side bidders need their Prebid.js adapter modules included in the generat
 ```bash
 cd crates/trusted-server-js/lib
 npm run build:prebid-external -- \
-  --adapters=rubicon,appnexus,openx \
+  --adapters=example-browser \
   --user-id-modules=sharedIdSystem,uid2IdSystem \
   --out=dist/prebid
 ```
@@ -514,24 +564,17 @@ In practice, this gives operators both:
 
 ## Endpoints
 
-### GET /first-party/ad
+### POST /auction
 
-Server-side ad rendering for single ad slot.
-
-**Query Parameters**:
-
-- `slot` - Ad unit code
-- `w` - Width in pixels
-- `h` - Height in pixels
-
-**Response**: Complete HTML creative with first-party proxying.
-
-### POST /third-party/ad
-
-Client-side auction endpoint for TSJS library.
+Browser and programmatic auction endpoint used by the Trusted Server Prebid adapter.
 
 **Request Body**: Ad units configuration
 **Response**: OpenRTB bid response with creatives
+
+### GET /integrations/prebid/bundle.js
+
+First-party proxy route for the configured `external_bundle_url`. An optional
+`?v=<external_bundle_sha256>` query enables content-addressed caching.
 
 ### GET `<script_patterns>` (Dynamic)
 

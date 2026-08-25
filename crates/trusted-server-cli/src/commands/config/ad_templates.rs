@@ -181,7 +181,17 @@ fn run_lint(args: &AdTemplatesLintArgs, out: &mut dyn Write) -> Result<(), Strin
         if loaded.settings.auction.providers.is_empty() {
             "(none)".to_string()
         } else {
-            escape_terminal_text(&loaded.settings.auction.providers.join(", ")).into_owned()
+            escape_terminal_text(
+                &loaded
+                    .settings
+                    .auction
+                    .providers
+                    .keys()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+            .into_owned()
         }
     )
     .map_err(output_error)?;
@@ -536,16 +546,10 @@ mod tests {
 
     fn config_with_slots() -> String {
         let base_config = EXAMPLE_CONFIG
+            .replace("handler_password", "test-admin-password-32-bytes-minimum")
+            .replace("ec_passphrase", "test-ec-passphrase-32-bytes-minimum")
             .replace(
-                "replace-with-admin-password-32-bytes",
-                "test-admin-password-32-bytes-minimum",
-            )
-            .replace(
-                "trusted-server-placeholder-secret",
-                "test-ec-passphrase-32-bytes-minimum",
-            )
-            .replace(
-                "change-me-proxy-secret",
+                "publisher_proxy_secret",
                 "test-proxy-secret-32-bytes-minimum",
             );
         format!(
@@ -640,9 +644,7 @@ mod tests {
 
     #[test]
     fn explain_keeps_provider_state_separate_from_runtime_verdict() {
-        let config_text =
-            config_with_slots().replace("[auction]\nenabled = false", "[auction]\nenabled = true");
-        let (_temp, config) = project_with_config(&config_text);
+        let (_temp, config) = project_with_config(&config_with_slots());
         let mut out = Vec::new();
 
         run_ad_templates_with_writer(
@@ -653,7 +655,7 @@ mod tests {
                 non_navigation: false,
                 prefetch: false,
                 bot: false,
-                consent_denied: false,
+                consent_denied: true,
             }),
             &mut out,
         )
@@ -661,11 +663,11 @@ mod tests {
 
         let output = String::from_utf8(out).expect("should be utf8");
         assert!(
-            output.contains("server-side ad stack: yes"),
+            output.contains("server-side ad stack: no"),
             "runtime verdict should not include provider configuration"
         );
         assert!(
-            output.contains("advisory auction providers configured: no"),
+            output.contains("advisory auction providers configured: yes"),
             "provider state should be a separate advisory"
         );
     }
