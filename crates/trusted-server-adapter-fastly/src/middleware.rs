@@ -24,8 +24,9 @@ use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
-use trusted_server_core::geo::GeoInfo;
+use trusted_server_core::geo::{GeoInfo, GeoLookupState};
 use trusted_server_core::platform::PlatformGeo;
+use trusted_server_core::request_timing::{Phase, RequestTimings};
 use trusted_server_core::settings::Settings;
 
 pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
@@ -68,6 +69,12 @@ impl FinalizeResponseMiddleware {
 impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         let client_ip = FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip);
+        let timings = ctx
+            .request()
+            .extensions()
+            .get::<RequestTimings>()
+            .cloned()
+            .unwrap_or_default();
 
         let mut response = match next.run(ctx).await {
             Ok(r) => r,
@@ -77,7 +84,13 @@ impl Middleware for FinalizeResponseMiddleware {
             }
         };
 
-        let geo_info = resolve_geo_for_response(&response, client_ip, |ip| {
+        let carried = response
+            .extensions()
+            .get::<GeoLookupState>()
+            .cloned()
+            .unwrap_or(GeoLookupState::NotAttempted);
+        let geo_info = resolve_geo_for_response(&response, &carried, client_ip, |ip| {
+            let _span = timings.span(Phase::Geo);
             self.geo.lookup(ip).unwrap_or_else(|e| {
                 log::warn!("geo lookup failed: {e}");
                 None
@@ -142,14 +155,20 @@ impl Middleware for AuthMiddleware {
 // Shared geo resolution helper
 // ---------------------------------------------------------------------------
 
-/// Resolves geo for a response, skipping the lookup for 401 responses.
+/// Resolves geo for a response, skipping the lookup for 401 responses and
+/// reusing a request-phase lookup when one was already carried.
 ///
-/// Returns `None` for authentication rejections (401) without calling `lookup_geo`
-/// to avoid unnecessary work and exposing geo data to unauthenticated callers.
-/// All other responses call `lookup_geo` and return its result.
+/// Returns `None` for authentication rejections (401) without consulting
+/// `carried` or calling `lookup_geo`, to avoid unnecessary work and exposing
+/// geo data to unauthenticated callers. Otherwise dispatches on `carried`:
+/// a [`GeoLookupState::Resolved`] value is reused as-is, a
+/// [`GeoLookupState::Attempted`] value is treated as no geo info without
+/// retrying the lookup, and [`GeoLookupState::NotAttempted`] falls back to
+/// calling `lookup_geo`.
 ///
 /// Used by both [`FinalizeResponseMiddleware`] and the entry-point finalization
-/// in `main.rs` so the 401-skip rule is defined in one place.
+/// in `main.rs` so the 401-skip rule and the dedupe rule are each defined in
+/// one place.
 ///
 /// # Parity note
 ///
@@ -161,6 +180,7 @@ impl Middleware for AuthMiddleware {
 /// server or the upstream origin.
 pub(crate) fn resolve_geo_for_response<F>(
     response: &Response,
+    carried: &GeoLookupState,
     client_ip: Option<IpAddr>,
     lookup_geo: F,
 ) -> Option<GeoInfo>
@@ -168,9 +188,12 @@ where
     F: FnOnce(Option<IpAddr>) -> Option<GeoInfo>,
 {
     if response.status() == StatusCode::UNAUTHORIZED {
-        None
-    } else {
-        lookup_geo(client_ip)
+        return None;
+    }
+    match carried {
+        GeoLookupState::Resolved(geo) => Some(geo.clone()),
+        GeoLookupState::Attempted => None,
+        GeoLookupState::NotAttempted => lookup_geo(client_ip),
     }
 }
 
@@ -275,6 +298,19 @@ mod tests {
             .body(Body::empty())
             .expect("should build test request");
         RequestContext::new(req, PathParams::new(HashMap::new()))
+    }
+
+    fn sample_geo_info() -> GeoInfo {
+        GeoInfo {
+            city: "Testville".to_string(),
+            country: "US".to_string(),
+            continent: "NorthAmerica".to_string(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: None,
+            asn: None,
+        }
     }
 
     struct FixedGeo(Option<GeoInfo>);
@@ -637,6 +673,30 @@ mod tests {
             Some("false"),
             "should set geo-unavailable header without calling geo for 401"
         );
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn geo_lookup_skipped_for_unauthorized_responses() {
+        // The 401 short-circuit in resolve_geo_for_response must win
+        // regardless of what state the request phase carried in, and must
+        // never invoke the fallback lookup closure.
+        let mut response = empty_response();
+        *response.status_mut() = StatusCode::UNAUTHORIZED;
+
+        for carried in [
+            GeoLookupState::NotAttempted,
+            GeoLookupState::Attempted,
+            GeoLookupState::Resolved(sample_geo_info()),
+        ] {
+            let geo_info = resolve_geo_for_response(&response, &carried, None, |_| {
+                panic!("401 responses must never trigger a geo lookup");
+            });
+            assert!(
+                geo_info.is_none(),
+                "401 responses should never resolve geo info, regardless of carried state"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ use trusted_server_core::ec::pull_sync::{
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::geo::GeoLookupState;
 use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
 use trusted_server_core::platform::RuntimeServices;
@@ -209,14 +210,30 @@ fn edgezero_main(mut req: FastlyRequest) {
     let ec_state = response.extensions_mut().remove::<EcFinalizeState>();
     let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
     let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
+    let geo_lookup_state = response
+        .extensions_mut()
+        .remove::<GeoLookupState>()
+        .unwrap_or(GeoLookupState::NotAttempted);
 
     if !take_finalize_sentinel(&mut response) {
         if let Some(settings) = settings_snapshot.as_deref() {
-            apply_entry_point_finalize_headers(settings, &mut response, client_ip);
+            apply_entry_point_finalize_headers(
+                settings,
+                &mut response,
+                client_ip,
+                &geo_lookup_state,
+                &timings,
+            );
         } else {
             match load_settings_from_config_store() {
                 Ok(settings) => {
-                    apply_entry_point_finalize_headers(&settings, &mut response, client_ip);
+                    apply_entry_point_finalize_headers(
+                        &settings,
+                        &mut response,
+                        client_ip,
+                        &geo_lookup_state,
+                        &timings,
+                    );
                 }
                 Err(e) => {
                     log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
@@ -319,8 +336,11 @@ fn apply_entry_point_finalize_headers(
     settings: &Settings,
     response: &mut HttpResponse,
     client_ip: Option<std::net::IpAddr>,
+    geo_state: &GeoLookupState,
+    timings: &RequestTimings,
 ) {
-    let geo_info = resolve_geo_for_response(response, client_ip, |client_ip| {
+    let geo_info = resolve_geo_for_response(response, geo_state, client_ip, |client_ip| {
+        let _span = timings.span(Phase::Geo);
         FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
             log::warn!("entry-point geo lookup failed: {e}");
             None
@@ -891,9 +911,10 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build response");
 
-        let geo_info = resolve_geo_for_response(&response, None, |_| {
-            panic!("should skip entry-point geo lookup for 401 responses");
-        });
+        let geo_info =
+            resolve_geo_for_response(&response, &GeoLookupState::NotAttempted, None, |_| {
+                panic!("should skip entry-point geo lookup for 401 responses");
+            });
         apply_finalize_headers(&settings, geo_info.as_ref(), &mut response);
 
         assert_eq!(

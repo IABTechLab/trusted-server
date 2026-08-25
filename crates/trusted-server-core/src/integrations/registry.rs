@@ -893,6 +893,17 @@ impl IntegrationRegistry {
         self.find_route(method, path).is_some()
     }
 
+    /// Return true when at least one integration request filter is
+    /// registered.
+    ///
+    /// Adapters use this to decide whether to record a request-filter phase
+    /// timing span, so unconfigured deployments (no request filters) omit
+    /// that entry from observability output entirely.
+    #[must_use]
+    pub fn has_request_filters(&self) -> bool {
+        !self.inner.request_filters.is_empty()
+    }
+
     /// Run pre-routing request filters.
     ///
     /// Request header mutations are applied immediately so later filters and

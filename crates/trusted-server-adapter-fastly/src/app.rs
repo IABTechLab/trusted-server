@@ -114,6 +114,7 @@ use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::geo::GeoLookupState;
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
@@ -133,6 +134,7 @@ use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
 };
+use trusted_server_core::request_timing::{Phase, RequestTimings};
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::{
     default_config_key, default_config_store_name, get_settings_from_config_store,
@@ -355,6 +357,17 @@ impl EcRequestState {
             services: self.services,
         }
     }
+
+    /// Derives the carried [`GeoLookupState`] from this request's geo lookup
+    /// outcome, so response-phase finalize can reuse it instead of repeating
+    /// the lookup. `build_ec_request_state` always attempts the lookup, so
+    /// `None` here means the lookup ran and failed, not that it was skipped.
+    fn geo_lookup_state(&self) -> GeoLookupState {
+        match &self.geo_info {
+            Some(info) => GeoLookupState::Resolved(info.clone()),
+            None => GeoLookupState::Attempted,
+        }
+    }
 }
 
 /// Derives device signals from the request's `User-Agent` header.
@@ -410,13 +423,21 @@ fn build_ec_request_state(
     let eids_cookie = crate::extract_cookie_value(req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(req, COOKIE_SHAREDID);
 
-    let geo_info = services
-        .geo()
-        .lookup(services.client_info().client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed during EC setup: {e}");
-            None
-        });
+    let timings = req
+        .extensions()
+        .get::<RequestTimings>()
+        .cloned()
+        .unwrap_or_default();
+    let geo_info = {
+        let _span = timings.span(Phase::Geo);
+        services
+            .geo()
+            .lookup(services.client_info().client_ip)
+            .unwrap_or_else(|e| {
+                log::warn!("geo lookup failed during EC setup: {e}");
+                None
+            })
+    };
 
     let (ec_context, setup_error) =
         match EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref()) {
@@ -482,6 +503,18 @@ async fn run_pre_route_filters(
     req: &mut Request,
     geo_info: Option<&GeoInfo>,
 ) -> PreRoute {
+    // Only recorded when a filter is actually registered, so unconfigured
+    // deployments omit ts-filter from the Server-Timing header entirely.
+    let timings = req
+        .extensions()
+        .get::<RequestTimings>()
+        .cloned()
+        .unwrap_or_default();
+    let _span = state
+        .registry
+        .has_request_filters()
+        .then(|| timings.span(Phase::Filter));
+
     match state
         .registry
         .filter_request(RequestFilterRegistryInput {
@@ -515,6 +548,7 @@ fn attach_dispatch_extensions(
     ec: EcRequestState,
     effects: RequestFilterEffects,
 ) -> Response {
+    response.extensions_mut().insert(ec.geo_lookup_state());
     response.extensions_mut().insert(ec.into_finalize_state());
     if !effects.response_headers.is_empty() {
         response.extensions_mut().insert(effects);
@@ -810,7 +844,15 @@ async fn dispatch_fallback(
             .then(|| state.settings.asset_route_for_path(&path))
             .flatten();
         if let Some(asset_route) = matched_asset_route {
-            return dispatch_asset_fallback(state, services, req, asset_route, &effects).await;
+            return dispatch_asset_fallback(
+                state,
+                services,
+                req,
+                asset_route,
+                &effects,
+                ec.geo_lookup_state(),
+            )
+            .await;
         }
 
         // Generate an EC ID if needed — mirrors the legacy catch-all arm.
@@ -900,7 +942,10 @@ fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
 /// [`AssetProxyCachePolicy`] out via response extensions so `edgezero_main`
 /// can reapply protected cache directives after finalization. EC finalization
 /// is intentionally skipped: no [`EcFinalizeState`] is attached, matching the
-/// legacy `should_finalize_ec = false` behavior for asset responses.
+/// legacy `should_finalize_ec = false` behavior for asset responses. The
+/// caller's [`GeoLookupState`] is still attached, since `build_ec_request_state`
+/// already attempted the lookup before the asset route was matched — this is
+/// the one exit path that carries geo state without an `EcFinalizeState`.
 ///
 /// Like legacy `route_request`, asset bodies are streamed straight to the client
 /// with no cap: the origin stream is attached to the response and `edgezero_main`
@@ -915,6 +960,7 @@ async fn dispatch_asset_fallback(
     req: Request,
     asset_route: &ProxyAssetRoute,
     effects: &RequestFilterEffects,
+    geo_state: GeoLookupState,
 ) -> Response {
     log::info!("No explicit route matched; proxying via configured asset route");
 
@@ -936,6 +982,7 @@ async fn dispatch_asset_fallback(
             }
 
             response.extensions_mut().insert(cache_policy);
+            response.extensions_mut().insert(geo_state);
             attach_request_filter_effects(&mut response, effects);
             response
         }
@@ -944,6 +991,7 @@ async fn dispatch_asset_fallback(
             response
                 .extensions_mut()
                 .insert(AssetProxyCachePolicy::NoStorePrivate);
+            response.extensions_mut().insert(geo_state);
             attach_request_filter_effects(&mut response, effects);
             response
         }
@@ -1319,21 +1367,23 @@ mod tests {
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use error_stack::Report;
     use futures::executor::block_on;
     use serde_json::json;
-    use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
+    use trusted_server_core::constants::{HEADER_X_GEO_COUNTRY, HEADER_X_GEO_INFO_AVAILABLE};
     use trusted_server_core::ec::device::DeviceSignals;
     use trusted_server_core::error::TrustedServerError;
+    use trusted_server_core::geo::GeoLookupState;
     use trusted_server_core::integrations::{
         HeaderMutation, IntegrationRegistry, IntegrationRequestFilter, RequestFilterDecision,
         RequestFilterEffects, RequestFilterInput,
     };
     use trusted_server_core::platform::{
-        ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, PlatformHttpClient,
-        PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
-        PlatformSelectResult, RuntimeServices,
+        ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformError, PlatformGeo,
+        PlatformHttpClient, PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest,
+        PlatformResponse, PlatformSelectResult, RuntimeServices,
     };
     use trusted_server_core::request_timing::RequestTimings;
     use trusted_server_core::settings::Settings;
@@ -1481,19 +1531,19 @@ mod tests {
         );
     }
 
-    /// Builds a router whose `AppState` uses a registry containing the given
-    /// request filters (and no routes), so dispatch-level request-filter
-    /// behavior can be exercised without a real integration.
-    fn router_with_request_filters(
+    /// Builds an `AppState` whose registry contains the given request
+    /// filters (and no routes), so dispatch-level request-filter behavior can
+    /// be exercised without a real integration.
+    fn state_with_request_filters(
         filters: Vec<Arc<dyn IntegrationRequestFilter>>,
-    ) -> RouterService {
+    ) -> Arc<AppState> {
         let settings = test_settings();
         let orchestrator = trusted_server_core::auction::build_orchestrator(&settings)
             .expect("should build orchestrator");
         let registry = IntegrationRegistry::from_request_filters(filters);
         let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
-        let state = Arc::new(super::AppState {
+        Arc::new(super::AppState {
             auction_telemetry_sink: Arc::new(
                 trusted_server_core::auction::NoopAuctionTelemetrySink,
             ),
@@ -1501,8 +1551,15 @@ mod tests {
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
             default_kv_store,
-        });
-        TrustedServerApp::routes_for_state(&state)
+        })
+    }
+
+    /// Builds a router on top of [`state_with_request_filters`] so
+    /// dispatch-level request-filter behavior can be exercised end-to-end.
+    fn router_with_request_filters(
+        filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    ) -> RouterService {
+        TrustedServerApp::routes_for_state(&state_with_request_filters(filters))
     }
 
     /// Continues routing while mutating the request and emitting a response
@@ -2532,6 +2589,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn asset_fallback_carries_geo_state_without_ec_finalize_state() {
+        // The asset-route fallback is the one exit path that skips
+        // EcFinalizeState but must still carry GeoLookupState, since
+        // build_ec_request_state (and its geo lookup) already ran before the
+        // asset route was matched. Without this, the finalize step would
+        // silently repeat the lookup for every asset request.
+        let settings = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.image/"
+            origin_url = "https://assets.example.com"
+            "#,
+        )
+        .expect("should parse asset-route settings");
+        let state = build_state_from_settings(settings).expect("should build state");
+        let router = TrustedServerApp::routes_for_state(&state);
+
+        let response = route(&router, empty_request(Method::GET, "/.image/banner.png"));
+
+        assert!(
+            response.extensions().get::<GeoLookupState>().is_some(),
+            "asset-route responses should still carry GeoLookupState even though \
+             EC finalization is skipped"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .is_none(),
+            "asset-route responses must skip EC finalization (no EcFinalizeState)"
+        );
+    }
+
     struct FixedBackend;
 
     impl PlatformBackend for FixedBackend {
@@ -2652,6 +2764,7 @@ mod tests {
             req,
             asset_route,
             &effects,
+            trusted_server_core::geo::GeoLookupState::NotAttempted,
         ));
 
         assert_eq!(
@@ -2692,6 +2805,193 @@ mod tests {
         assert!(
             !response.headers().contains_key(header::CONTENT_LENGTH),
             "processed streaming publisher responses must not carry a stale Content-Length"
+        );
+    }
+
+    /// A [`PlatformGeo`] stub that counts every `lookup` call and always
+    /// returns the same canned result, used to prove the request-phase geo
+    /// lookup is never repeated during finalize.
+    struct CountingGeo {
+        calls: Arc<AtomicUsize>,
+        result: Option<GeoInfo>,
+    }
+
+    impl PlatformGeo for CountingGeo {
+        fn lookup(&self, _: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.result.clone())
+        }
+    }
+
+    fn sample_geo_info() -> GeoInfo {
+        GeoInfo {
+            city: "Testville".to_string(),
+            country: "US".to_string(),
+            continent: "NorthAmerica".to_string(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: None,
+            asn: None,
+        }
+    }
+
+    fn runtime_services_with_geo(geo: Arc<dyn PlatformGeo>) -> RuntimeServices {
+        RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
+            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
+            .backend(Arc::new(FixedBackend))
+            .http_client(Arc::new(StreamingHttpClient))
+            .geo(geo)
+            .client_info(ClientInfo::default())
+            .build()
+    }
+
+    #[test]
+    fn finalize_reuses_request_phase_geo_without_second_lookup() {
+        // Dispatching a publisher route runs build_ec_request_state, which
+        // attempts the geo lookup once and carries the result via
+        // GeoLookupState. The finalize step (resolve_geo_for_response) must
+        // reuse that carried value instead of calling the geo backend again.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let geo = Arc::new(CountingGeo {
+            calls: Arc::clone(&calls),
+            result: Some(sample_geo_info()),
+        });
+        let state = app_state_for_settings(test_settings());
+        let services = runtime_services_with_geo(geo);
+        let req = empty_request(Method::GET, "/some-page");
+
+        let response = block_on(super::dispatch_fallback(&state, &services, req));
+
+        let carried = response
+            .extensions()
+            .get::<GeoLookupState>()
+            .cloned()
+            .expect("dispatch should attach GeoLookupState");
+        assert!(
+            matches!(carried, GeoLookupState::Resolved(_)),
+            "a successful lookup should carry Resolved"
+        );
+
+        let geo_info =
+            crate::middleware::resolve_geo_for_response(&response, &carried, None, |_| {
+                panic!("finalize must not repeat a resolved geo lookup");
+            });
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the request-phase lookup should have run"
+        );
+
+        let mut response = response;
+        geo_info
+            .expect("geo info should have resolved")
+            .set_response_headers(&mut response);
+        assert!(
+            response.headers().get(HEADER_X_GEO_COUNTRY).is_some(),
+            "x-geo-country should still be set on the response after reusing the carried geo"
+        );
+    }
+
+    #[test]
+    fn failed_lookup_is_not_retried() {
+        // When the request-phase lookup fails (returns None), dispatch must
+        // carry GeoLookupState::Attempted rather than NotAttempted, and
+        // finalize must not retry it.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let geo = Arc::new(CountingGeo {
+            calls: Arc::clone(&calls),
+            result: None,
+        });
+        let state = app_state_for_settings(test_settings());
+        let services = runtime_services_with_geo(geo);
+        let req = empty_request(Method::GET, "/some-page");
+
+        let response = block_on(super::dispatch_fallback(&state, &services, req));
+
+        let carried = response
+            .extensions()
+            .get::<GeoLookupState>()
+            .cloned()
+            .expect("dispatch should attach GeoLookupState even for a failed lookup");
+        assert!(
+            matches!(carried, GeoLookupState::Attempted),
+            "a failed lookup should carry Attempted, not Resolved or NotAttempted"
+        );
+
+        let geo_info =
+            crate::middleware::resolve_geo_for_response(&response, &carried, None, |_| {
+                panic!("finalize must not retry a failed geo lookup");
+            });
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the request-phase lookup should have run"
+        );
+        assert!(
+            geo_info.is_none(),
+            "no geo info should be available after a failed lookup"
+        );
+    }
+
+    #[test]
+    fn filter_span_recorded_when_request_filter_runs() {
+        // The Filter phase span should only be recorded when the registry
+        // actually has a request filter registered, so unconfigured
+        // deployments omit ts-filter from the Server-Timing header entirely.
+        let state = state_with_request_filters(vec![Arc::new(RecordingRequestFilter)]);
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
+            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
+            .backend(Arc::new(FixedBackend))
+            .http_client(Arc::new(StreamingHttpClient))
+            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .client_info(ClientInfo::default())
+            .build();
+        let mut req = empty_request(Method::GET, "/some-page");
+        let timings = RequestTimings::new();
+        req.extensions_mut().insert(timings.clone());
+
+        let _ = block_on(super::run_pre_route_filters(
+            &state, &services, &mut req, None,
+        ));
+
+        assert!(
+            timings.snapshot().filter_ms.is_some(),
+            "should record the Filter phase span when a request filter is registered and runs"
+        );
+    }
+
+    #[test]
+    fn filter_span_not_recorded_when_no_request_filters_registered() {
+        // Mirror test: an empty registry must never record the Filter span,
+        // even though run_pre_route_filters still runs (as a no-op loop).
+        let state = state_with_request_filters(Vec::new());
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
+            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
+            .backend(Arc::new(FixedBackend))
+            .http_client(Arc::new(StreamingHttpClient))
+            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .client_info(ClientInfo::default())
+            .build();
+        let mut req = empty_request(Method::GET, "/some-page");
+        let timings = RequestTimings::new();
+        req.extensions_mut().insert(timings.clone());
+
+        let _ = block_on(super::run_pre_route_filters(
+            &state, &services, &mut req, None,
+        ));
+
+        assert!(
+            timings.snapshot().filter_ms.is_none(),
+            "should omit the Filter phase span when no request filters are registered"
         );
     }
 
