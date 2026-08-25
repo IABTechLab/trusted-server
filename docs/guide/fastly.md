@@ -134,12 +134,22 @@ Create it:
 fastly kv-store create --name ec_identity_store
 ```
 
-Configure in `trusted-server.toml`:
+Configure the secret-store key name in `trusted-server.toml`:
 
 ```toml
 [ec]
-passphrase = "replace-with-32-plus-byte-random-secret"
+passphrase = "ec_passphrase"
 ec_store = "ec_identity_store"
+```
+
+Store the high-entropy passphrase under that key in `ts_secrets`. The resolved
+value, rather than the key name, must contain at least 32 characters:
+
+```bash
+fastly secret-store-entry create \
+  --store-id=<ts-secrets-store-id> \
+  --name=ec_passphrase \
+  --secret=<high-entropy-32-plus-character-value>
 ```
 
 Verify stores exist:
