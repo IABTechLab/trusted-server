@@ -19,8 +19,12 @@ Signatures use HMAC-SHA256 with the publisher's `proxy_secret`:
 
 ```toml
 [publisher]
-proxy_secret = "change-me-proxy-secret"  # Rejected placeholder; replace with a secure random string
+proxy_secret = "publisher_proxy_secret"
 ```
+
+The config value is a key in the Trusted Server secret store. Provision the
+secure random signing value under `publisher_proxy_secret`; the resolved value
+must contain at least 32 characters.
 
 ## Signature Validation
 
@@ -37,7 +41,7 @@ On incoming requests:
 
 ## Security Notes
 
-- Keep `proxy_secret` confidential and secure
-- Rotate secrets periodically
-- Never expose the secret in client-side code
-- Use strong random values (32+ bytes)
+- Keep the resolved signing value confidential
+- Rotate the stored value periodically
+- Never expose the resolved value in client-side code
+- Use a strong random value of at least 32 characters

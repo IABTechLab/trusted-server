@@ -19,25 +19,29 @@ This guide covers:
 
 ## 1) Required Configuration
 
-Generate the passphrase and partner token independently with
-`openssl rand -base64 32`, then set EC configuration in `trusted-server.toml`.
-The `replace-with-*` values below are intentionally rejected placeholders:
+Configure secret-store key names in `trusted-server.toml`, then provision the
+passphrase and partner token independently with `openssl rand -base64 32`:
 
 ```toml
 [ec]
-passphrase = "replace-with-random-ec-passphrase"
+passphrase = "ec_passphrase"
 ec_store = "ec_identity_store"
 
 [[ec.partners]]
 name = "Mocktioneer SSP"
 source_domain = "ssp.example.com"
-api_token = "partner-api-token-32-bytes-minimum"
+api_token = "partner_api_token"
 bidstream_enabled = true
 ```
 
+The `passphrase` and `api_token` fields contain keys in the Trusted Server
+secret store, not the credential values. Provision high-entropy values under
+`ec_passphrase` and `partner_api_token`; see
+[Configuration](/guide/configuration#secret-store-migration).
+
 Required behavior assumptions:
 
-- `passphrase` is long-lived HMAC-SHA256 keying material for EC ID derivation; use a high-entropy random value of at least 32 characters
+- The value stored under `ec_passphrase` is long-lived HMAC-SHA256 keying material for EC ID derivation; use a high-entropy random value of at least 32 characters
 - `ec_store` is linked to the active Fastly service version
 - `ec_store` is the only KV-backed EC lifecycle store; it contains identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones
 - Live consent is interpreted from request cookies, headers, geolocation, and policy defaults rather than a separate consent KV store
@@ -53,7 +57,8 @@ MOCK_SSP_URL="https://ssp.example.com"
 
 PARTNER_SOURCE_DOMAIN="ssp.example.com"
 PARTNER_NAME="Mocktioneer SSP"
-PARTNER_API_KEY="partner-api-token-32-bytes-minimum"
+# Use the value provisioned under the partner_api_token secret-store key.
+PARTNER_API_KEY="<resolved-partner-api-token>"
 
 # Optional: use a real browser EC if already present
 EC_ID="<64hex.6chars>"
@@ -70,11 +75,12 @@ Partners are configured in `trusted-server.toml` and loaded at startup:
 [[ec.partners]]
 name = "Mocktioneer SSP"
 source_domain = "ssp.example.com"
-api_token = "partner-api-token-32-bytes-minimum"
+api_token = "partner_api_token"
 bidstream_enabled = true
 ```
 
-Deploy/restart after changing partner configuration.
+Provision the bearer token value under `partner_api_token`, then deploy or
+restart after changing partner configuration.
 
 ## 4) Acquire or Reuse EC Cookie
 

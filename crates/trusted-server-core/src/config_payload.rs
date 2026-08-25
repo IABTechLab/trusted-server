@@ -73,6 +73,24 @@ fn remove_inactive_secret_references(data: &mut serde_json::Value) {
         tinybird.remove("access_token_secret");
     }
 
+    if let Some(partners) = data
+        .pointer_mut("/ec/partners")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for partner in partners {
+            let Some(partner) = partner.as_object_mut() else {
+                continue;
+            };
+            if partner
+                .get("pull_sync_enabled")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                partner.remove("ts_pull_token");
+            }
+        }
+    }
+
     let Some(datadome) = data
         .pointer_mut("/integrations/datadome")
         .and_then(serde_json::Value::as_object_mut)
@@ -114,7 +132,7 @@ mod tests {
     use crate::integrations::IntegrationRegistry;
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
-    use crate::settings::{AssetOriginAuth, ProxyAssetRoute, S3SigV4AuthConfig};
+    use crate::settings::{AssetOriginAuth, EcPartner, ProxyAssetRoute, S3SigV4AuthConfig};
     use crate::test_support::tests::crate_test_settings_str;
 
     fn test_settings() -> Settings {
@@ -170,9 +188,11 @@ mod tests {
                 "tinybird-token-key" => "resolved-tinybird-token",
                 "datadome-server-key" => "resolved-datadome-server-key",
                 "datadome-bypass-key" => "resolved-datadome-bypass-credential-32-bytes",
-                "s3-access-key" => "AKIAIOSFODNN7EXAMPLE",
-                "s3-secret-key" => "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                "access_key_id" | "s3-access-key" => "AKIAIOSFODNN7EXAMPLE",
+                "secret_access_key" | "s3-secret-key" => "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
                 "s3-session-key" => "resolved-session-token",
+                "partner-api-token-key" => "resolved-partner-api-token-32-bytes-ok",
+                "partner-pull-token-key" => "resolved-partner-pull-token-32-bytes-ok",
                 _ => key,
             };
             Ok(value.as_bytes().to_vec())
@@ -190,6 +210,22 @@ mod tests {
         fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
             Ok(())
         }
+    }
+
+    fn partner_with_pull_sync(enabled: bool, token_key: &str) -> EcPartner {
+        let mut value = serde_json::json!({
+            "name": "Example Partner",
+            "source_domain": "partner.example.com",
+            "api_token": "partner-api-token-key",
+            "pull_sync_enabled": enabled,
+            "ts_pull_token": token_key,
+        });
+        if enabled {
+            value["pull_sync_url"] =
+                serde_json::Value::String("https://partner.example.com/sync".to_string());
+            value["pull_sync_allowed_domains"] = serde_json::json!(["partner.example.com"]);
+        }
+        serde_json::from_value(value).expect("should build pull-sync partner")
     }
 
     fn envelope_json(settings: &Settings) -> String {
@@ -287,6 +323,10 @@ mod tests {
             origin_query: None,
         }));
         original.proxy.asset_routes.push(route);
+        original
+            .ec
+            .partners
+            .push(partner_with_pull_sync(true, "partner-pull-token-key"));
 
         let reconstructed = settings_from_config_blob(
             &envelope_json(&original),
@@ -346,6 +386,62 @@ mod tests {
             Some("resolved-session-token")
         );
         assert!(auth.secret_store.is_none());
+        assert_eq!(
+            reconstructed.ec.partners[0]
+                .ts_pull_token
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-partner-pull-token-32-bytes-ok")
+        );
+    }
+
+    #[test]
+    fn omitted_s3_secret_references_resolve_default_store_keys() {
+        let mut original = test_settings();
+        let mut route = ProxyAssetRoute::new(
+            "/default-s3/",
+            "https://examplebucket.s3.us-east-1.amazonaws.com",
+        );
+        route.auth = Some(AssetOriginAuth::S3SigV4(
+            toml::from_str("region = \"us-east-1\"").expect("should apply S3 secret defaults"),
+        ));
+        original.proxy.asset_routes.push(route);
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should resolve default S3 secret keys");
+
+        let AssetOriginAuth::S3SigV4(auth) = reconstructed.proxy.asset_routes[0]
+            .auth
+            .as_ref()
+            .expect("should preserve S3 auth");
+        assert_eq!(auth.access_key_id.expose(), "AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(
+            auth.secret_access_key.expose(),
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+        );
+    }
+
+    #[test]
+    fn active_partner_pull_sync_fails_when_its_token_is_missing() {
+        let mut original = test_settings();
+        original
+            .ec
+            .partners
+            .push(partner_with_pull_sync(true, "unused-partner-pull-token"));
+
+        let error = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect_err("should reject a missing active pull-sync token");
+
+        assert!(error.to_string().contains("ec.partners[0].ts_pull_token"));
     }
 
     #[test]
@@ -368,6 +464,10 @@ mod tests {
                 }),
             )
             .expect("should configure inactive references");
+        original
+            .ec
+            .partners
+            .push(partner_with_pull_sync(false, "unused-partner-pull-token"));
 
         let reconstructed = settings_from_config_blob(
             &envelope_json(&original),
@@ -377,6 +477,7 @@ mod tests {
         .expect("should skip inactive optional feature references");
 
         assert!(reconstructed.tinybird.auction_token_secret.is_none());
+        assert!(reconstructed.ec.partners[0].ts_pull_token.is_none());
         let datadome = reconstructed
             .integration_config::<crate::integrations::datadome::DataDomeConfig>("datadome")
             .expect("should parse inactive DataDome config")
