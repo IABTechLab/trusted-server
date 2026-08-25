@@ -14,8 +14,12 @@ use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
+use trusted_server_core::access_telemetry::{AccessTelemetrySnapshot, RouteClass, RouteMetadata};
 use trusted_server_core::cache_policy::{
     EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
+};
+use trusted_server_core::constants::{
+    ENV_FASTLY_IS_STAGING, ENV_FASTLY_POP, ENV_FASTLY_SERVICE_ID, ENV_FASTLY_SERVICE_VERSION,
 };
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
@@ -30,6 +34,7 @@ use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
 use trusted_server_core::platform::{RuntimeServices, TimedKvStore};
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
+use trusted_server_core::publisher::TemplateCacheResponseState;
 use trusted_server_core::request_timing::{Phase, RequestTimings};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
@@ -145,6 +150,18 @@ fn edgezero_main(mut req: FastlyRequest) {
     let server_timing_enabled = settings_snapshot
         .as_deref()
         .is_some_and(|settings| settings.observability.server_timing_enabled);
+    // Both read once here rather than at each `send_edgezero_response` call
+    // site: if `app_state` failed to build, there is no settings snapshot to
+    // read them from at all, so every call site would need the same
+    // degraded-mode fallback. `access_sample_rate` defaults to `0.0` (never
+    // sampled in) and `publisher_domain` to `"unknown"` in that case.
+    let access_sample_rate = settings_snapshot
+        .as_deref()
+        .map_or(0.0, |settings| settings.tinybird.access_sample_rate);
+    let publisher_domain = settings_snapshot.as_deref().map_or_else(
+        || "unknown".to_owned(),
+        |settings| settings.publisher.domain.clone(),
+    );
 
     // Strip client-spoofable forwarded headers before dispatch.
     compat::sanitize_fastly_forwarded_headers(&mut req);
@@ -159,8 +176,11 @@ fn edgezero_main(mut req: FastlyRequest) {
         req.set_header("fastly-ssl", "1");
     }
 
-    // Capture client IP before the request is consumed by dispatch.
+    // Capture client IP and method before the request is consumed by
+    // dispatch: nothing else survives to the freeze point in
+    // `send_edgezero_response`, which only receives the response.
     let client_ip = req.get_client_ip_addr();
+    let request_method = req.get_method_str().to_owned();
 
     // Strip any client-supplied x-ts-tls-* headers before injecting the trusted
     // values from the Fastly SDK. Must run after sanitize_fastly_forwarded_headers.
@@ -211,9 +231,13 @@ fn edgezero_main(mut req: FastlyRequest) {
     let ec_state = response.extensions_mut().remove::<EcFinalizeState>();
     let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
     let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
+    // Read rather than pop: the access-telemetry snapshot built later in
+    // `send_edgezero_response` reads this same extension, so it must still
+    // be attached to `response` at that point.
     let geo_lookup_state = response
-        .extensions_mut()
-        .remove::<GeoLookupState>()
+        .extensions()
+        .get::<GeoLookupState>()
+        .cloned()
         .unwrap_or(GeoLookupState::NotAttempted);
 
     if !take_finalize_sentinel(&mut response) {
@@ -257,6 +281,9 @@ fn edgezero_main(mut req: FastlyRequest) {
                         &SendContext {
                             timings: timings.clone(),
                             server_timing_enabled,
+                            method: request_method.clone(),
+                            publisher_domain: publisher_domain.clone(),
+                            access_sample_rate,
                         },
                     );
                     run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
@@ -280,6 +307,9 @@ fn edgezero_main(mut req: FastlyRequest) {
                                 &SendContext {
                                     timings: timings.clone(),
                                     server_timing_enabled,
+                                    method: request_method.clone(),
+                                    publisher_domain: publisher_domain.clone(),
+                                    access_sample_rate,
                                 },
                             );
                             run_edgezero_pull_sync_after_send(
@@ -309,6 +339,9 @@ fn edgezero_main(mut req: FastlyRequest) {
         &SendContext {
             timings,
             server_timing_enabled,
+            method: request_method,
+            publisher_domain,
+            access_sample_rate,
         },
     );
 }
@@ -349,6 +382,18 @@ fn apply_entry_point_finalize_headers(
         })
     });
     apply_finalize_headers(settings, geo_info.as_ref(), response);
+
+    // This path runs only when the middleware chain was bypassed (e.g. a
+    // router-level 404/405 for an unregistered method), so `geo_state` may
+    // still be `NotAttempted` even after a fresh lookup just ran above.
+    // Write the resolved outcome back so the access-telemetry snapshot built
+    // later in `send_edgezero_response` sees what was actually looked up,
+    // not the stale carried-in state.
+    let resolved_state = match &geo_info {
+        Some(info) => GeoLookupState::Resolved(info.clone()),
+        None => GeoLookupState::Attempted,
+    };
+    response.extensions_mut().insert(resolved_state);
 }
 
 fn apply_edgezero_ec_finalize(
@@ -394,6 +439,13 @@ struct SendContext {
     timings: RequestTimings,
     /// Whether `observability.server_timing_enabled` is set.
     server_timing_enabled: bool,
+    /// The request's HTTP method, captured before the request was consumed
+    /// by dispatch.
+    method: String,
+    /// The configured publisher domain.
+    publisher_domain: String,
+    /// The configured access-telemetry sample rate.
+    access_sample_rate: f64,
 }
 
 /// Outcome of handing a finalized response to the client.
@@ -403,6 +455,9 @@ pub(crate) struct DeliveryOutcome {
     pub bytes: u64,
     /// Whether delivery completed or failed partway.
     pub result: DeliveryResult,
+    /// Access-telemetry dimensions captured for this response at the
+    /// freeze point.
+    pub snapshot: AccessTelemetrySnapshot,
 }
 
 /// Whether [`send_edgezero_response`] completed delivery or failed partway.
@@ -558,6 +613,12 @@ fn send_edgezero_response(
         context.server_timing_enabled,
     );
 
+    // Built unconditionally, right after the freeze point and before
+    // `into_parts()` consumes `response`: nothing else survives to
+    // post-send on every path (the request was consumed by dispatch, and
+    // `EcFinalizeState` is absent on asset, admin, and error paths).
+    let snapshot = build_access_telemetry_snapshot(&response, context);
+
     let (parts, body) = response.into_parts();
 
     match body {
@@ -578,6 +639,7 @@ fn send_edgezero_response(
                     Ok(()) => DeliveryOutcome {
                         bytes,
                         result: DeliveryResult::Complete,
+                        snapshot,
                     },
                     Err(e) => {
                         // Every byte was handed to the transport (the drive
@@ -588,13 +650,18 @@ fn send_edgezero_response(
                         DeliveryOutcome {
                             bytes,
                             result: DeliveryResult::Partial,
+                            snapshot,
                         }
                     }
                 },
                 Err(e) => {
                     log::error!("EdgeZero streaming failed: {e:?}");
                     drop(streaming_body);
-                    DeliveryOutcome { bytes, result }
+                    DeliveryOutcome {
+                        bytes,
+                        result,
+                        snapshot,
+                    }
                 }
             }
         }
@@ -604,9 +671,87 @@ fn send_edgezero_response(
             DeliveryOutcome {
                 bytes,
                 result: DeliveryResult::Complete,
+                snapshot,
             }
         }
     }
+}
+
+/// Builds the [`AccessTelemetrySnapshot`] for `response` at the
+/// `Server-Timing` freeze point.
+///
+/// Reads route identity, geo country, and template-cache state from typed
+/// response extensions rather than the headers those extensions back —
+/// operator-configured response headers can override a managed header, so
+/// reading a header here could silently drift from what actually happened.
+/// Falls back to `"unknown"`/[`RouteClass::Other`] sentinels when an
+/// extension was never attached (router-generated, asset, and other
+/// responses that never passed through a `RouteMetadata`-attaching
+/// wrapper).
+fn build_access_telemetry_snapshot(
+    response: &HttpResponse,
+    context: &SendContext,
+) -> AccessTelemetrySnapshot {
+    let (route_class, route_template) = match response.extensions().get::<RouteMetadata>() {
+        Some(metadata) => (metadata.route_class, metadata.route_template.clone()),
+        None => (RouteClass::Other, "unknown".to_owned()),
+    };
+
+    let country = match response.extensions().get::<GeoLookupState>() {
+        Some(GeoLookupState::Resolved(info)) => info.country.clone(),
+        Some(GeoLookupState::Attempted | GeoLookupState::NotAttempted) | None => {
+            "unknown".to_owned()
+        }
+    };
+
+    let template_cache_state = response
+        .extensions()
+        .get::<TemplateCacheResponseState>()
+        .map_or_else(|| "unknown".to_owned(), |state| state.as_str().to_owned());
+
+    let body_mode = if matches!(response.body(), EdgeBody::Stream(_)) {
+        "streamed"
+    } else {
+        "buffered"
+    };
+
+    AccessTelemetrySnapshot {
+        method: context.method.clone(),
+        status: response.status().as_u16(),
+        route_class,
+        route_template,
+        publisher_domain: context.publisher_domain.clone(),
+        env: resolve_env_dimension(),
+        service_id: env_var_or_unknown(ENV_FASTLY_SERVICE_ID),
+        pop: env_var_or_unknown(ENV_FASTLY_POP),
+        ts_version: env_var_or_unknown(ENV_FASTLY_SERVICE_VERSION),
+        country,
+        template_cache_state,
+        body_mode,
+        sample_rate: context.access_sample_rate,
+    }
+}
+
+/// Derives the `env` access-telemetry dimension from the same
+/// `FASTLY_IS_STAGING` input that drives the `x-ts-env` response header
+/// (see [`apply_finalize_headers`]), never from [`Settings`] — `Settings`
+/// has no environment field and does not gain one for this.
+///
+/// `"unknown"` covers contexts where the variable is entirely absent (for
+/// example native unit tests run outside Fastly Compute); on the Fastly
+/// platform the variable is always present, as either `"1"` or not.
+fn resolve_env_dimension() -> String {
+    match std::env::var(ENV_FASTLY_IS_STAGING) {
+        Ok(value) if value == "1" => "staging".to_owned(),
+        Ok(_) => "production".to_owned(),
+        Err(_) => "unknown".to_owned(),
+    }
+}
+
+/// Reads a Fastly-provided environment variable, defaulting to `"unknown"`
+/// when unset.
+fn env_var_or_unknown(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| "unknown".to_owned())
 }
 
 /// Apply every late response mutation, then restore privacy invariants before headers commit.
@@ -818,6 +963,26 @@ mod tests {
             "#,
         )
         .expect("should parse test settings")
+    }
+
+    /// A minimal [`AccessTelemetrySnapshot`] fixture for tests that only
+    /// need a `DeliveryOutcome` to exist, not its telemetry content.
+    fn sample_access_snapshot() -> AccessTelemetrySnapshot {
+        AccessTelemetrySnapshot {
+            method: "GET".to_owned(),
+            status: 200,
+            route_class: RouteClass::Other,
+            route_template: "/other/*".to_owned(),
+            publisher_domain: "unknown".to_owned(),
+            env: "unknown".to_owned(),
+            service_id: "unknown".to_owned(),
+            pop: "unknown".to_owned(),
+            ts_version: "unknown".to_owned(),
+            country: "unknown".to_owned(),
+            template_cache_state: "unknown".to_owned(),
+            body_mode: "buffered",
+            sample_rate: 0.0,
+        }
     }
 
     #[test]
@@ -1264,6 +1429,7 @@ mod tests {
         let outcome = DeliveryOutcome {
             bytes,
             result: DeliveryResult::Complete,
+            snapshot: sample_access_snapshot(),
         };
 
         assert_eq!(
@@ -1310,6 +1476,115 @@ mod tests {
         assert!(
             snapshot.request_elapsed_ms.is_some(),
             "should stamp request_elapsed for the buffered path too"
+        );
+    }
+
+    fn send_context_fixture() -> SendContext {
+        SendContext {
+            timings: RequestTimings::new(),
+            server_timing_enabled: false,
+            method: "GET".to_owned(),
+            publisher_domain: "test-publisher.com".to_owned(),
+            access_sample_rate: 0.25,
+        }
+    }
+
+    #[test]
+    fn access_snapshot_defaults_when_no_extensions_are_attached() {
+        // Router-generated 404/405 responses and other paths that never pass
+        // through a RouteMetadata-attaching wrapper must still produce a
+        // usable snapshot: RouteClass::Other and "unknown" sentinels, never
+        // a missing/panicking build.
+        let response = response_builder()
+            .status(404)
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        let context = send_context_fixture();
+
+        let snapshot = build_access_telemetry_snapshot(&response, &context);
+
+        assert_eq!(snapshot.status, 404);
+        assert_eq!(snapshot.method, "GET");
+        assert!(matches!(snapshot.route_class, RouteClass::Other));
+        assert_eq!(snapshot.route_template, "unknown");
+        assert_eq!(snapshot.country, "unknown");
+        assert_eq!(snapshot.template_cache_state, "unknown");
+        assert_eq!(snapshot.body_mode, "buffered");
+        assert_eq!(snapshot.publisher_domain, "test-publisher.com");
+        assert_eq!(snapshot.sample_rate, 0.25);
+    }
+
+    #[test]
+    fn access_snapshot_reads_route_geo_and_template_cache_extensions() {
+        let mut response = response_builder()
+            .status(200)
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        response.extensions_mut().insert(RouteMetadata {
+            route_class: RouteClass::AuctionApi,
+            route_template: "/auction".to_owned(),
+        });
+        response.extensions_mut().insert(GeoLookupState::Resolved(
+            trusted_server_core::platform::GeoInfo {
+                city: String::new(),
+                country: "US".to_owned(),
+                continent: "NorthAmerica".to_owned(),
+                latitude: 0.0,
+                longitude: 0.0,
+                metro_code: 0,
+                region: None,
+                asn: None,
+            },
+        ));
+        response
+            .extensions_mut()
+            .insert(TemplateCacheResponseState::Hit);
+        let context = send_context_fixture();
+
+        let snapshot = build_access_telemetry_snapshot(&response, &context);
+
+        assert!(matches!(snapshot.route_class, RouteClass::AuctionApi));
+        assert_eq!(snapshot.route_template, "/auction");
+        assert_eq!(snapshot.country, "US");
+        assert_eq!(snapshot.template_cache_state, "hit");
+    }
+
+    #[test]
+    fn access_snapshot_treats_attempted_geo_lookup_as_unknown_country() {
+        let mut response = response_builder()
+            .status(200)
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        response.extensions_mut().insert(GeoLookupState::Attempted);
+        let context = send_context_fixture();
+
+        let snapshot = build_access_telemetry_snapshot(&response, &context);
+
+        assert_eq!(
+            snapshot.country, "unknown",
+            "an attempted-but-unresolved lookup must not surface a stale country"
+        );
+    }
+
+    #[test]
+    fn access_snapshot_body_mode_reflects_the_response_body_variant() {
+        let streamed = response_builder()
+            .status(200)
+            .body(EdgeBody::stream(futures::stream::empty()))
+            .expect("should build streaming response");
+        let buffered = response_builder()
+            .status(200)
+            .body(EdgeBody::from(b"hi".to_vec()))
+            .expect("should build buffered response");
+        let context = send_context_fixture();
+
+        assert_eq!(
+            build_access_telemetry_snapshot(&streamed, &context).body_mode,
+            "streamed"
+        );
+        assert_eq!(
+            build_access_telemetry_snapshot(&buffered, &context).body_mode,
+            "buffered"
         );
     }
 

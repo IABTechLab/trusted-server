@@ -34,6 +34,8 @@ pub const HEADER_X_TS_ENV: HeaderName = HeaderName::from_static("x-ts-env");
 // Fastly environment variables
 pub const ENV_FASTLY_SERVICE_VERSION: &str = "FASTLY_SERVICE_VERSION";
 pub const ENV_FASTLY_IS_STAGING: &str = "FASTLY_IS_STAGING";
+pub const ENV_FASTLY_SERVICE_ID: &str = "FASTLY_SERVICE_ID";
+pub const ENV_FASTLY_POP: &str = "FASTLY_POP";
 
 // Common standard header names used across modules
 pub const HEADER_USER_AGENT: HeaderName = HeaderName::from_static("user-agent");

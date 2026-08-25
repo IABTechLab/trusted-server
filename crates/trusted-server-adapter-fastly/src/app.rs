@@ -98,6 +98,7 @@ use edgezero_core::http::{
 };
 use edgezero_core::router::RouterService;
 use error_stack::Report;
+use trusted_server_core::access_telemetry::{RouteClass, RouteMetadata, publisher_route_template};
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
@@ -302,6 +303,12 @@ fn publisher_fallback_methods() -> [Method; 7] {
 fn uses_dynamic_tsjs_fallback(method: &Method, path: &str) -> bool {
     *method == Method::GET && path.starts_with("/static/tsjs=")
 }
+
+/// Coarse route template for every `tsjs` bundle request, used as the
+/// `route_template` in the [`RouteMetadata`] attached by the tsjs branch of
+/// [`dispatch_fallback`]. Actual filenames vary by module/hash; the prefix
+/// alone is the route identity that matters for access telemetry.
+const TSJS_ROUTE_TEMPLATE: &str = "/static/tsjs=*";
 
 // ---------------------------------------------------------------------------
 // EC request state
@@ -846,12 +853,28 @@ async fn dispatch_fallback(
         PreRoute::Continue { effects } => effects,
     };
 
+    // Assigned exactly once, per branch below, alongside the routing
+    // decision itself, so the access-telemetry route identity always
+    // reflects which branch actually dispatched the request — including
+    // when that branch's handler errors. The asset-route sub-branch is an
+    // early return handled separately by `dispatch_asset_fallback`, so it
+    // never reaches (or needs to assign) this binding.
+    let route_metadata: Option<RouteMetadata>;
+
     let result = if uses_dynamic_tsjs_fallback(&method, &path) {
+        route_metadata = Some(RouteMetadata {
+            route_class: RouteClass::Tsjs,
+            route_template: TSJS_ROUTE_TEMPLATE.to_owned(),
+        });
         handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SurrogateControl)
     } else if state.registry.has_route(&method, &path) {
         // Integration-proxy responses are not bounded by
         // publisher.max_buffered_body_bytes. Publisher fallback below uses the
         // publisher-specific streaming finalizer instead.
+        route_metadata = Some(RouteMetadata {
+            route_class: RouteClass::IntegrationProxy,
+            route_template: publisher_route_template(&path),
+        });
         state
             .registry
             .handle_proxy(ProxyDispatchInput {
@@ -889,6 +912,11 @@ async fn dispatch_fallback(
             )
             .await;
         }
+
+        route_metadata = Some(RouteMetadata {
+            route_class: RouteClass::PublisherHtml,
+            route_template: publisher_route_template(&path),
+        });
 
         // Generate an EC ID if needed — mirrors the legacy catch-all arm.
         // Only for document navigations by recognised browsers; subresource
@@ -958,7 +986,10 @@ async fn dispatch_fallback(
         }
     };
 
-    let response = result.unwrap_or_else(|e| http_error(&e));
+    let mut response = result.unwrap_or_else(|e| http_error(&e));
+    if let Some(metadata) = route_metadata {
+        response.extensions_mut().insert(metadata);
+    }
     attach_dispatch_extensions(response, ec, effects)
 }
 
@@ -1154,6 +1185,10 @@ struct NamedRoute {
     path: &'static str,
     primary_methods: &'static [Method],
     handler: NamedRouteHandler,
+    /// Access-telemetry traffic category for this row. Attached verbatim
+    /// alongside `path` (the route-table pattern) to every response this
+    /// route produces — see [`named_route_handler`].
+    route_class: RouteClass,
 }
 
 const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
@@ -1171,21 +1206,25 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/.well-known/trusted-server.json",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::TrustedServerDiscovery,
+        route_class: RouteClass::Other,
     },
     NamedRoute {
         path: "/verify-signature",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::VerifySignature,
+        route_class: RouteClass::Ec,
     },
     NamedRoute {
         path: "/_ts/admin/keys/rotate",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::RotateKey,
+        route_class: RouteClass::Ec,
     },
     NamedRoute {
         path: "/_ts/admin/keys/deactivate",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::DeactivateKey,
+        route_class: RouteClass::Ec,
     },
     // Admin EC lookup: the bare route reads the EC ID from the caller's
     // `ts-ec` cookie; the parameterized route takes an explicit EC ID.
@@ -1193,11 +1232,13 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/admin/ec",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::AdminEcLookup,
+        route_class: RouteClass::Ec,
     },
     NamedRoute {
         path: "/_ts/admin/ec/{id}",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::AdminEcLookup,
+        route_class: RouteClass::Ec,
     },
     // Admin EIDs echo: decodes the request's ts-eids/sharedId cookies with
     // an ingestion preview. Pure request inspection — no KV access.
@@ -1205,6 +1246,7 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/admin/eids",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::AdminEidsLookup,
+        route_class: RouteClass::Ec,
     },
     // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with a
     // 404 instead of executing key operations: the production basic-auth handler
@@ -1216,36 +1258,43 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/admin/keys/rotate",
         primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::LegacyAdminDenied,
+        route_class: RouteClass::Other,
     },
     NamedRoute {
         path: "/admin/keys/deactivate",
         primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::LegacyAdminDenied,
+        route_class: RouteClass::Other,
     },
     NamedRoute {
         path: "/_ts/api/v1/batch-sync",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::BatchSync,
+        route_class: RouteClass::Ec,
     },
     NamedRoute {
         path: "/_ts/api/v1/identify",
         primary_methods: &[Method::GET, Method::OPTIONS],
         handler: NamedRouteHandler::Identify,
+        route_class: RouteClass::Ec,
     },
     NamedRoute {
         path: "/_ts/set-tester",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::SetTester,
+        route_class: RouteClass::Other,
     },
     NamedRoute {
         path: "/_ts/clear-tester",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::ClearTester,
+        route_class: RouteClass::Other,
     },
     NamedRoute {
         path: "/auction",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::Auction,
+        route_class: RouteClass::AuctionApi,
     },
     // GET runs the SPA re-auction; OPTIONS is denied in-handler as a CORS
     // preflight guard for this side-effecting endpoint.
@@ -1253,6 +1302,7 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: PAGE_BIDS_PATH,
         primary_methods: &[Method::GET, Method::OPTIONS],
         handler: NamedRouteHandler::PageBids,
+        route_class: RouteClass::AuctionApi,
     },
     // Deprecated double-underscore alias. tsjs bundles served before the
     // `/_ts/page-bids` rename keep requesting this path from already-loaded
@@ -1263,21 +1313,29 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: PAGE_BIDS_LEGACY_PATH,
         primary_methods: &[Method::GET, Method::OPTIONS],
         handler: NamedRouteHandler::PageBids,
+        route_class: RouteClass::AuctionApi,
     },
+    // Classified `Other` rather than `IntegrationProxy`: that class is
+    // reserved for `state.registry.handle_proxy` (the js-integration proxy
+    // dispatch in `dispatch_fallback`), which these first-party proxy routes
+    // do not go through.
     NamedRoute {
         path: "/first-party/proxy",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::FirstPartyProxy,
+        route_class: RouteClass::Other,
     },
     NamedRoute {
         path: "/first-party/click",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::FirstPartyClick,
+        route_class: RouteClass::Other,
     },
     NamedRoute {
         path: "/first-party/sign",
         primary_methods: &[Method::GET, Method::POST],
         handler: NamedRouteHandler::FirstPartySign,
+        route_class: RouteClass::Other,
     },
     NamedRoute {
         path: "/first-party/proxy-rebuild",
@@ -1286,16 +1344,35 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         // POST is blocked by CORS and the guard navigates here for a 302 instead.
         primary_methods: &[Method::GET, Method::POST],
         handler: NamedRouteHandler::FirstPartyProxyRebuild,
+        route_class: RouteClass::Other,
     },
 ];
 
+/// Wraps [`execute_named`], attaching a [`RouteMetadata`] extension carrying
+/// `route_class` and the route-table pattern (`route_template`, verbatim,
+/// with parameters left as placeholders) to every response the handler
+/// produces — including its early-return diagnostic and setup-error arms,
+/// since the attachment happens once around the whole future rather than in
+/// each branch.
 fn named_route_handler(
     state: Arc<AppState>,
     handler: NamedRouteHandler,
+    route_class: RouteClass,
+    route_template: &'static str,
 ) -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
     move |ctx: RequestContext| {
         let state = Arc::clone(&state);
-        Box::pin(execute_named(state, ctx, handler))
+        Box::pin(async move {
+            execute_named(state, ctx, handler)
+                .await
+                .map(|mut response| {
+                    response.extensions_mut().insert(RouteMetadata {
+                        route_class,
+                        route_template: route_template.to_owned(),
+                    });
+                    response
+                })
+        })
     }
 }
 
@@ -1354,7 +1431,12 @@ impl TrustedServerApp {
                 router = router.route(
                     route.path,
                     method.clone(),
-                    named_route_handler(Arc::clone(state), route.handler),
+                    named_route_handler(
+                        Arc::clone(state),
+                        route.handler,
+                        route.route_class,
+                        route.path,
+                    ),
                 );
             }
 
@@ -1392,7 +1474,8 @@ mod tests {
 
     use super::{
         AppState, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
-        TrustedServerApp, build_per_request_services, build_state_from_settings,
+        RouteClass, RouteMetadata, TSJS_ROUTE_TEMPLATE, TrustedServerApp,
+        build_per_request_services, build_state_from_settings, publisher_route_template,
         startup_error_router,
     };
     use base64::Engine as _;
@@ -2221,6 +2304,111 @@ mod tests {
                 .is_some(),
             "publisher fallback responses should carry EcFinalizeState for entry-point EC finalization"
         );
+    }
+
+    /// `Authorization: Basic` header value for `test_settings()`'s
+    /// `^/_ts/admin` handler (`admin` / `admin-pass`).
+    fn admin_basic_auth_header() -> edgezero_core::http::HeaderValue {
+        let credentials = base64::engine::general_purpose::STANDARD.encode("admin:admin-pass");
+        format!("Basic {credentials}")
+            .parse()
+            .expect("should parse basic-auth header value")
+    }
+
+    #[test]
+    fn named_route_attaches_the_table_pattern_verbatim_even_with_a_real_id_in_the_path() {
+        // A named-route response must carry the route-TABLE pattern
+        // (`{id}` left as a placeholder), never the caller's actual matched
+        // path segment — this is what keeps a real EC identifier out of
+        // access telemetry, independent of anything the row-serialization
+        // layer does.
+        let router = test_router();
+        let ec_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test01";
+        let mut req = empty_request(Method::GET, &format!("/_ts/admin/ec/{ec_id}"));
+        req.headers_mut()
+            .insert(header::AUTHORIZATION, admin_basic_auth_header());
+        let response = route(&router, req);
+
+        let metadata = response
+            .extensions()
+            .get::<RouteMetadata>()
+            .expect("named-route responses should carry RouteMetadata");
+        assert_eq!(metadata.route_class, RouteClass::Ec);
+        assert_eq!(metadata.route_template, "/_ts/admin/ec/{id}");
+        assert!(
+            !metadata.route_template.contains(ec_id),
+            "the attached template must never contain the matched id"
+        );
+    }
+
+    #[test]
+    fn named_route_attaches_metadata_even_on_a_read_only_diagnostic_early_return() {
+        // AdminEidsLookup is handled by an early-return arm inside
+        // execute_named, before the normal EC lifecycle runs (see the
+        // "read-only diagnostics" comment there). named_route_handler wraps
+        // the whole future, so the attachment must still happen here too.
+        let router = test_router();
+        let mut req = empty_request(Method::GET, "/_ts/admin/eids");
+        req.headers_mut()
+            .insert(header::AUTHORIZATION, admin_basic_auth_header());
+        let response = route(&router, req);
+
+        let metadata = response
+            .extensions()
+            .get::<RouteMetadata>()
+            .expect("even a read-only diagnostic early-return response should carry RouteMetadata");
+        assert_eq!(metadata.route_class, RouteClass::Ec);
+        assert_eq!(metadata.route_template, "/_ts/admin/eids");
+    }
+
+    #[test]
+    fn tsjs_fallback_attaches_tsjs_route_metadata() {
+        let router = test_router();
+        let response = route(
+            &router,
+            empty_request(Method::GET, "/static/tsjs=tsjs-unified.min.js"),
+        );
+
+        let metadata = response
+            .extensions()
+            .get::<RouteMetadata>()
+            .expect("tsjs fallback responses should carry RouteMetadata");
+        assert_eq!(metadata.route_class, RouteClass::Tsjs);
+        assert_eq!(metadata.route_template, TSJS_ROUTE_TEMPLATE);
+    }
+
+    #[test]
+    fn integration_proxy_fallback_attaches_integration_proxy_route_metadata() {
+        // test_settings() enables the prebid integration, which registers a
+        // proxy route at /integrations/prebid/bundle.js.
+        let router = test_router();
+        let response = route(
+            &router,
+            empty_request(Method::GET, "/integrations/prebid/bundle.js"),
+        );
+
+        let metadata = response
+            .extensions()
+            .get::<RouteMetadata>()
+            .expect("integration-proxy fallback responses should carry RouteMetadata");
+        assert_eq!(metadata.route_class, RouteClass::IntegrationProxy);
+        assert_eq!(
+            metadata.route_template,
+            publisher_route_template("/integrations/prebid/bundle.js")
+        );
+    }
+
+    #[test]
+    fn publisher_fallback_attaches_publisher_html_route_metadata() {
+        let router = test_router();
+        let response = route(&router, empty_request(Method::GET, "/news/some-article"));
+
+        let metadata = response
+            .extensions()
+            .get::<RouteMetadata>()
+            .expect("publisher fallback responses should carry RouteMetadata");
+        assert_eq!(metadata.route_class, RouteClass::PublisherHtml);
+        assert_eq!(metadata.route_template, "/news/*");
     }
 
     #[test]
