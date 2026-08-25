@@ -11,10 +11,12 @@ origin_url = "https://origin.example.com"
 # origin_host_header_override = "www.example.com"
 proxy_secret = "change-me-proxy-secret"
 
-# Optional: trust a fronting CDN's reader IP only when it also supplies the
-# matching shared secret. The front door must overwrite both headers.
+# Optional: trust a fronting CDN's reader IP only when the same request also
+# supplies the matching shared secret. The front door must set both headers on
+# requests it sends here and remove client-supplied copies on its other routes.
+# Fastly-only; see docs/guide/fastly.md for the required front-door setup.
 # [trusted_client_ip]
-# ip_header = "fastly-client-ip"
+# ip_header = "x-ts-client-ip"
 # auth_header = "x-ts-client-ip-auth"
 # shared_secret = "replace-with-a-random-shared-secret"
 
