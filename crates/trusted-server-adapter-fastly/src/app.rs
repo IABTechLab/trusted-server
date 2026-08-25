@@ -1311,7 +1311,9 @@ mod tests {
     use bytes::Bytes;
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
-    use edgezero_core::http::{Method, Response, StatusCode, header, request_builder};
+    use edgezero_core::http::{
+        Method, Response, StatusCode, header, request_builder, response_builder,
+    };
     use edgezero_core::key_value_store::NoopKvStore;
     use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
@@ -1333,6 +1335,7 @@ mod tests {
         PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
         PlatformSelectResult, RuntimeServices,
     };
+    use trusted_server_core::request_timing::RequestTimings;
     use trusted_server_core::settings::Settings;
 
     fn settings_with_missing_consent_store() -> Settings {
@@ -2748,6 +2751,110 @@ mod tests {
                 .iter()
                 .any(|m| m.name == "x-challenge"),
             "the filter's response-header effect must be threaded out"
+        );
+    }
+
+    /// Joins every instance of a response header into one comma-separated
+    /// string (mirroring how a client sees repeated header fields), or
+    /// `None` if the header is absent.
+    fn response_header(response: &Response, name: &str) -> Option<String> {
+        let values: Vec<&str> = response
+            .headers()
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.join(", "))
+        }
+    }
+
+    #[test]
+    fn server_timing_emitted_on_private_response_when_enabled() {
+        let mut response = response_builder()
+            .header("cache-control", "private, no-store")
+            .body(Body::empty())
+            .expect("should build a private response fixture");
+        let timings = RequestTimings::new();
+
+        crate::apply_server_timing_header(&mut response, &timings, true);
+
+        let header = response_header(&response, "server-timing").expect("should emit header");
+        assert!(
+            header.contains("ts-total;dur="),
+            "should carry the stored total: {header}"
+        );
+        assert_eq!(
+            header.matches("ts-total").count(),
+            1,
+            "should emit exactly one TS-owned metric set"
+        );
+    }
+
+    #[test]
+    fn server_timing_absent_when_flag_off() {
+        let mut response = response_builder()
+            .header("cache-control", "private, no-store")
+            .body(Body::empty())
+            .expect("should build a private response fixture");
+        let timings = RequestTimings::new();
+
+        crate::apply_server_timing_header(&mut response, &timings, false);
+
+        assert!(
+            response_header(&response, "server-timing").is_none(),
+            "should not emit server-timing when the flag is off"
+        );
+    }
+
+    #[test]
+    fn server_timing_absent_on_cacheable_responses() {
+        // tsjs route policy: public, long max-age, immutable.
+        let mut tsjs_response = response_builder()
+            .header("cache-control", "public, max-age=31536000, immutable")
+            .body(Body::empty())
+            .expect("should build a tsjs-style response fixture");
+        // A bare shared-cacheable response with no private/no-store directive.
+        let mut public_response = response_builder()
+            .header("cache-control", "max-age=60")
+            .body(Body::empty())
+            .expect("should build a bare max-age response fixture");
+
+        crate::apply_server_timing_header(&mut tsjs_response, &RequestTimings::new(), true);
+        crate::apply_server_timing_header(&mut public_response, &RequestTimings::new(), true);
+
+        assert!(
+            response_header(&tsjs_response, "server-timing").is_none(),
+            "should not emit on the public immutable tsjs cache policy"
+        );
+        assert!(
+            response_header(&public_response, "server-timing").is_none(),
+            "should not emit on a bare shared-cacheable max-age response"
+        );
+    }
+
+    #[test]
+    fn preexisting_server_timing_values_survive() {
+        let mut response = response_builder()
+            .header("cache-control", "private, no-store")
+            .header("server-timing", "upstream;dur=1")
+            .body(Body::empty())
+            .expect("should build a private response fixture carrying an upstream Server-Timing");
+        let timings = RequestTimings::new();
+
+        crate::apply_server_timing_header(&mut response, &timings, true);
+
+        let header =
+            response_header(&response, "server-timing").expect("should still carry a header");
+        assert!(
+            header.contains("upstream;dur=1"),
+            "should preserve the pre-existing entry: {header}"
+        );
+        assert!(
+            header.contains("ts-total"),
+            "should append the TS-owned set: {header}"
         );
     }
 }

@@ -5,13 +5,17 @@ use edgezero_adapter_fastly::request::into_core_request;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{Request as HttpRequest, Response as HttpResponse};
+use edgezero_core::http::{
+    HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse,
+};
 use edgezero_core::response::IntoResponse;
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
-use trusted_server_core::cache_policy::EdgeCacheHeader;
+use trusted_server_core::cache_policy::{
+    EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
+};
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -24,6 +28,7 @@ use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
+use trusted_server_core::request_timing::{Phase, RequestTimings};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
 
@@ -47,6 +52,12 @@ use crate::platform::{FastlyPlatformGeo, client_info_from_request};
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
+
+/// `Server-Timing` header name. Not present in the `http` crate's `header`
+/// module (unlike `CACHE_CONTROL` etc.), so declared locally following the
+/// same `HeaderName::from_static` pattern used in
+/// `trusted_server_core::constants`.
+const HEADER_SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
 
 /// Opens the Fastly Config Store used by the `EdgeZero` dispatcher.
 ///
@@ -111,19 +122,27 @@ fn edgezero_main(mut req: FastlyRequest) {
         return;
     }
 
-    let config_store = match open_trusted_server_config_store() {
-        Ok(cs) => cs,
-        Err(e) => {
-            log::error!("failed to open config store: {e}");
-            FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
-                .with_body_text_plain("Internal Server Error")
-                .send_to_client();
-            return;
-        }
-    };
+    let timings = RequestTimings::new();
 
-    let (app, app_state) = TrustedServerApp::build_app_with_state();
+    let (config_store, app, app_state) = {
+        let _appbuild = timings.span(Phase::AppBuild);
+        let config_store = match open_trusted_server_config_store() {
+            Ok(cs) => cs,
+            Err(e) => {
+                log::error!("failed to open config store: {e}");
+                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_body_text_plain("Internal Server Error")
+                    .send_to_client();
+                return;
+            }
+        };
+        let (app, app_state) = TrustedServerApp::build_app_with_state();
+        (config_store, app, app_state)
+    };
     let settings_snapshot = app_state.as_ref().map(|state| Arc::clone(&state.settings));
+    let server_timing_enabled = settings_snapshot
+        .as_deref()
+        .is_some_and(|settings| settings.observability.server_timing_enabled);
 
     // Strip client-spoofable forwarded headers before dispatch.
     compat::sanitize_fastly_forwarded_headers(&mut req);
@@ -171,6 +190,7 @@ fn edgezero_main(mut req: FastlyRequest) {
             core_req.extensions_mut().insert(config_store);
             core_req.extensions_mut().insert(device_signals);
             core_req.extensions_mut().insert(client_info);
+            core_req.extensions_mut().insert(timings.clone());
             match futures::executor::block_on(app.router().oneshot(core_req)) {
                 Ok(response) => response,
                 Err(error) => edge_error_response(error),
@@ -213,7 +233,14 @@ fn edgezero_main(mut req: FastlyRequest) {
         if let Some(settings) = settings_snapshot.as_deref() {
             match apply_edgezero_ec_finalize(settings, &ec_state, &mut response) {
                 Ok(partner_registry) => {
-                    send_edgezero_response(response, request_filter_effects.as_ref());
+                    send_edgezero_response(
+                        response,
+                        request_filter_effects.as_ref(),
+                        &SendContext {
+                            timings: timings.clone(),
+                            server_timing_enabled,
+                        },
+                    );
                     run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
                     return;
                 }
@@ -228,7 +255,14 @@ fn edgezero_main(mut req: FastlyRequest) {
                 Ok(settings) => {
                     match apply_edgezero_ec_finalize(&settings, &ec_state, &mut response) {
                         Ok(partner_registry) => {
-                            send_edgezero_response(response, request_filter_effects.as_ref());
+                            send_edgezero_response(
+                                response,
+                                request_filter_effects.as_ref(),
+                                &SendContext {
+                                    timings: timings.clone(),
+                                    server_timing_enabled,
+                                },
+                            );
                             run_edgezero_pull_sync_after_send(
                                 &settings,
                                 &partner_registry,
@@ -250,7 +284,14 @@ fn edgezero_main(mut req: FastlyRequest) {
         }
     }
 
-    send_edgezero_response(response, request_filter_effects.as_ref());
+    send_edgezero_response(
+        response,
+        request_filter_effects.as_ref(),
+        &SendContext {
+            timings,
+            server_timing_enabled,
+        },
+    );
 }
 
 fn edge_error_response(error: EdgeError) -> HttpResponse {
@@ -323,6 +364,68 @@ fn run_edgezero_pull_sync_after_send(
     }
 }
 
+/// Per-response context threaded into [`send_edgezero_response`] so the
+/// function stays at or under seven parameters.
+struct SendContext {
+    /// The request's phase-timing collector.
+    timings: RequestTimings,
+    /// Whether `observability.server_timing_enabled` is set.
+    server_timing_enabled: bool,
+}
+
+/// Outcome of handing a finalized response to the client.
+#[allow(dead_code)]
+pub(crate) struct DeliveryOutcome {
+    /// Response body size in bytes.
+    pub bytes: u64,
+    /// Whether delivery completed or failed partway.
+    pub result: DeliveryResult,
+}
+
+/// Whether [`send_edgezero_response`] completed delivery or failed partway.
+pub(crate) enum DeliveryResult {
+    /// The response was handed to the client in full.
+    Complete,
+    /// Delivery failed partway through.
+    Error,
+}
+
+/// Stamps [`RequestTimings::mark_headers_ready`] and, when observability is
+/// enabled and the response is conclusively private, appends the rendered
+/// `Server-Timing` header.
+///
+/// Always stamps `mark_headers_ready` regardless of whether the header is
+/// rendered, so the collector's `ts-total` reflects the moment headers
+/// commit. Appends rather than overwrites so a pre-existing `Server-Timing`
+/// value set upstream survives alongside the TS-owned set. A response is
+/// never promoted to shared-cacheable just because the header would
+/// otherwise be omitted: this only gates emission, it does not touch
+/// `Cache-Control`.
+pub(crate) fn apply_server_timing_header(
+    response: &mut HttpResponse,
+    timings: &RequestTimings,
+    server_timing_enabled: bool,
+) {
+    timings.mark_headers_ready();
+
+    let conclusively_private = cache_control_headers_are_private_or_no_store(response.headers());
+    if !server_timing_enabled || !conclusively_private {
+        return;
+    }
+
+    let Some(value) = timings.server_timing_value() else {
+        return;
+    };
+    match HeaderValue::from_str(&value) {
+        Ok(header_value) => {
+            response
+                .headers_mut()
+                .append(HEADER_SERVER_TIMING, header_value);
+        }
+        Err(error) => log::warn!("skipping server-timing header: {error}"),
+    }
+}
+
 /// Sends a finalized `EdgeZero` response to the client.
 ///
 /// Streaming `EdgeZero` bodies commit headers first, then pipe chunks to Fastly's
@@ -331,8 +434,14 @@ fn run_edgezero_pull_sync_after_send(
 fn send_edgezero_response(
     mut response: HttpResponse,
     request_filter_effects: Option<&RequestFilterEffects>,
-) {
+    context: &SendContext,
+) -> DeliveryOutcome {
     apply_terminal_response_effects(&mut response, request_filter_effects);
+    apply_server_timing_header(
+        &mut response,
+        &context.timings,
+        context.server_timing_enabled,
+    );
 
     let (parts, body) = response.into_parts();
 
@@ -348,15 +457,29 @@ fn send_edgezero_response(
                     if let Err(e) = streaming_body.finish() {
                         log::error!("failed to finish EdgeZero streaming body: {e}");
                     }
+                    DeliveryOutcome {
+                        bytes: 0,
+                        result: DeliveryResult::Complete,
+                    }
                 }
                 Err(e) => {
                     log::error!("EdgeZero streaming failed: {e:?}");
                     drop(streaming_body);
+                    DeliveryOutcome {
+                        bytes: 0,
+                        result: DeliveryResult::Error,
+                    }
                 }
             }
         }
         once => {
+            let bytes =
+                u64::try_from(once.as_bytes().map(<[u8]>::len).unwrap_or(0)).unwrap_or(u64::MAX);
             compat::to_fastly_response(HttpResponse::from_parts(parts, once)).send_to_client();
+            DeliveryOutcome {
+                bytes,
+                result: DeliveryResult::Complete,
+            }
         }
     }
 }
