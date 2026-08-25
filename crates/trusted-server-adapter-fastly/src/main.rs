@@ -27,7 +27,7 @@ use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoLookupState;
 use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
-use trusted_server_core::platform::RuntimeServices;
+use trusted_server_core::platform::{RuntimeServices, TimedKvStore};
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::request_timing::{Phase, RequestTimings};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
@@ -248,7 +248,7 @@ fn edgezero_main(mut req: FastlyRequest) {
 
     if let Some(ec_state) = ec_state {
         if let Some(settings) = settings_snapshot.as_deref() {
-            match apply_edgezero_ec_finalize(settings, &ec_state, &mut response) {
+            match apply_edgezero_ec_finalize(settings, &ec_state, &mut response, &timings) {
                 Ok(partner_registry) => {
                     send_edgezero_response(
                         response,
@@ -270,7 +270,8 @@ fn edgezero_main(mut req: FastlyRequest) {
         } else {
             match load_settings_from_config_store() {
                 Ok(settings) => {
-                    match apply_edgezero_ec_finalize(&settings, &ec_state, &mut response) {
+                    match apply_edgezero_ec_finalize(&settings, &ec_state, &mut response, &timings)
+                    {
                         Ok(partner_registry) => {
                             send_edgezero_response(
                                 response,
@@ -353,10 +354,11 @@ fn apply_edgezero_ec_finalize(
     settings: &Settings,
     ec_state: &EcFinalizeState,
     response: &mut HttpResponse,
+    timings: &RequestTimings,
 ) -> Result<PartnerRegistry, Report<TrustedServerError>> {
     let partner_registry = PartnerRegistry::from_config(&settings.ec.partners)?;
     let finalize_kv_graph = if ec_state.use_finalize_kv {
-        maybe_identity_graph(settings)
+        identity_graph_with_timing(settings, timings)
     } else {
         None
     };
@@ -575,12 +577,21 @@ fn build_ja4_debug_response(req: &FastlyRequest) -> FastlyResponse {
         .with_body(body)
 }
 
-pub(crate) fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
-    settings
-        .ec
-        .ec_store
-        .as_ref()
-        .map(|store_name| KvIdentityGraph::new(FastlyEcKvStore::new(store_name)))
+/// Constructs a `KvIdentityGraph` wrapped in the [`Phase::EcKv`] timing
+/// decorator, for request-path callers with a `RequestTimings` handle.
+///
+/// Returns `None` when `ec.ec_store` is not configured, matching
+/// [`require_identity_graph_with_timing`]'s contract on every other axis.
+pub(crate) fn identity_graph_with_timing(
+    settings: &Settings,
+    timings: &RequestTimings,
+) -> Option<KvIdentityGraph> {
+    settings.ec.ec_store.as_ref().map(|store_name| {
+        KvIdentityGraph::new(TimedKvStore::new(
+            FastlyEcKvStore::new(store_name),
+            timings.clone(),
+        ))
+    })
 }
 
 fn run_pull_sync_after_send(
@@ -603,6 +614,12 @@ fn run_pull_sync_after_send(
 
 /// Constructs a `KvIdentityGraph` from settings, or returns an error if the
 /// `ec_store` config is not set.
+///
+/// Deliberately untimed: pull-sync (this function's only caller) runs after
+/// `send_edgezero_response`'s Server-Timing freeze point, so a decorated
+/// store here would record into a handle nothing ever renders.
+/// Request-path callers with a `RequestTimings` handle use
+/// [`require_identity_graph_with_timing`] instead.
 pub(crate) fn require_identity_graph(
     settings: &Settings,
 ) -> Result<KvIdentityGraph, Report<TrustedServerError>> {
@@ -613,6 +630,27 @@ pub(crate) fn require_identity_graph(
         })
     })?;
     Ok(KvIdentityGraph::new(FastlyEcKvStore::new(store_name)))
+}
+
+/// Constructs a `KvIdentityGraph` wrapped in the [`Phase::EcKv`] timing
+/// decorator, or returns an error if the `ec_store` config is not set.
+///
+/// Request-path sibling of [`require_identity_graph`], which pull-sync uses
+/// unwrapped because pull-sync runs after the Server-Timing freeze point.
+pub(crate) fn require_identity_graph_with_timing(
+    settings: &Settings,
+    timings: &RequestTimings,
+) -> Result<KvIdentityGraph, Report<TrustedServerError>> {
+    let store_name = settings.ec.ec_store.as_deref().ok_or_else(|| {
+        Report::new(TrustedServerError::KvStore {
+            store_name: "ec.ec_store".to_owned(),
+            message: "ec.ec_store is not configured".to_owned(),
+        })
+    })?;
+    Ok(KvIdentityGraph::new(TimedKvStore::new(
+        FastlyEcKvStore::new(store_name),
+        timings.clone(),
+    )))
 }
 
 /// Extracts a named cookie value from the request's `Cookie` header.
@@ -644,6 +682,7 @@ pub(crate) fn derive_device_signals(req: &FastlyRequest) -> DeviceSignals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::HeaderValue;
     use edgezero_core::http::response_builder;
@@ -978,6 +1017,131 @@ mod tests {
         assert!(
             body.contains("ch-platform: not sent"),
             "should include sec-ch-ua-platform fallback"
+        );
+    }
+
+    fn ec_finalize_settings() -> Settings {
+        Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+            ec_store = "ec_identity_store"
+
+            [[ec.partners]]
+            name = "Example Partner"
+            source_domain = "example.com"
+            api_token = "test-vendor-token-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+            "#,
+        )
+        .expect("should parse EC finalize test settings")
+    }
+
+    /// Minimal `RuntimeServices` for `EcFinalizeState.services`. Real
+    /// `FastlyPlatform*` handles are used as inert placeholders: EC
+    /// finalization never calls through them, it only satisfies the field.
+    fn inert_runtime_services() -> RuntimeServices {
+        RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
+            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore)
+                as Arc<dyn trusted_server_core::platform::PlatformKvStore>)
+            .backend(Arc::new(crate::platform::FastlyPlatformBackend))
+            .http_client(Arc::new(crate::platform::FastlyPlatformHttpClient))
+            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .client_info(trusted_server_core::platform::ClientInfo::default())
+            .build()
+    }
+
+    #[test]
+    fn ec_finalize_kv_lands_before_freeze() {
+        // A pre-seeded EC entry (see fastly.toml's ec_identity_store fixture)
+        // for a returning user carrying an eids cookie that matches the
+        // configured partner. This drives ec_finalize_response into
+        // ingest_eid_cookies, which reads and writes the KV identity graph.
+        let settings = ec_finalize_settings();
+        let ec_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test01";
+        let eids = serde_json::json!([{
+            "source": "example.com",
+            "uids": [{ "id": "example-uid", "atype": 1 }]
+        }]);
+        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(eids.to_string());
+        let request = edgezero_core::http::request_builder()
+            .method(fastly::http::Method::GET)
+            .uri("https://test-publisher.com/article")
+            .header("cookie", format!("ts-ec={ec_id}; ts-eids={eids_cookie}"))
+            .body(EdgeBody::empty())
+            .expect("should build EC finalize test request");
+
+        let services = inert_runtime_services();
+        let geo_info = trusted_server_core::platform::GeoInfo {
+            city: String::new(),
+            country: "US".to_owned(),
+            continent: "NorthAmerica".to_owned(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: None,
+            asn: None,
+        };
+        let ec_context = trusted_server_core::ec::EcContext::read_from_request_with_geo(
+            &settings,
+            &request,
+            &services,
+            Some(&geo_info),
+        )
+        .expect("should read EC context from a non-regulated request");
+        assert!(
+            ec_context.ec_was_present(),
+            "the pre-seeded ts-ec cookie should be recognized"
+        );
+
+        let ec_state = EcFinalizeState {
+            ec_context,
+            use_finalize_kv: true,
+            eids_cookie: Some(eids_cookie),
+            sharedid_cookie: None,
+            is_real_browser: true,
+            services,
+        };
+        let mut response = response_builder()
+            .header("cache-control", "private, no-store")
+            .body(EdgeBody::empty())
+            .expect("should build EC finalize response fixture");
+        let timings = RequestTimings::new();
+
+        // Mirrors edgezero_main's ordering: EC finalize runs, then the freeze
+        // point (apply_server_timing_header, called just before
+        // response.into_parts() inside send_edgezero_response) renders the
+        // header. Calling both directly exercises exactly this order without
+        // requiring a live Fastly client connection.
+        apply_edgezero_ec_finalize(&settings, &ec_state, &mut response, &timings)
+            .expect("should finalize EC response");
+        apply_server_timing_header(&mut response, &timings, true);
+
+        let header = response
+            .headers()
+            .get("server-timing")
+            .and_then(|v| v.to_str().ok())
+            .expect("should emit a Server-Timing header");
+        assert!(
+            header.contains("ts-kv"),
+            "the freeze point must run after EC finalization recorded KV time: {header}"
         );
     }
 }

@@ -70,6 +70,7 @@ use crate::platform::{
     contains_publisher_esi_directive,
 };
 use crate::price_bucket::{PriceGranularity, price_bucket};
+use crate::request_timing::{Phase, RequestTimings};
 use crate::response_privacy::{
     apply_inactive_ad_stack_browser_cache_policy, cache_control_forbids_shared_storage,
     enforce_synthesized_html_cache_privacy, enforce_terminal_private_cache_privacy,
@@ -4044,6 +4045,14 @@ pub async fn handle_publisher_request(
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
 
+    // A defaulted handle records into nothing that ever renders, so tests
+    // that don't populate the request extension are unaffected.
+    let timings = req
+        .extensions()
+        .get::<RequestTimings>()
+        .cloned()
+        .unwrap_or_default();
+
     // Adapter fallbacks prepare this before EC/cookie handling. Keep this
     // idempotent call as a direct-handler safety net and for focused tests.
     let gpt_diagnostics =
@@ -4476,7 +4485,10 @@ pub async fn handle_publisher_request(
     // not be served a shared template even if that template is perfectly cacheable.
     let mut template_cache_reservation = None;
     if let Some(key) = template_cache_key.as_ref() {
-        match services.template_cache().lookup_or_reserve(key).await {
+        let template_cache_span = timings.span(Phase::TemplateCacheLookup);
+        let template_cache_lookup = services.template_cache().lookup_or_reserve(key).await;
+        drop(template_cache_span);
+        match template_cache_lookup {
             Ok(crate::platform::TemplateCacheLookup::Hit(entry)) => {
                 log::debug!("template_cache hit: {} bytes", entry.body.len());
 
@@ -4577,6 +4589,7 @@ pub async fn handle_publisher_request(
         platform_request = platform_request.with_cache_bypass();
     }
 
+    let origin_span = timings.span(Phase::Origin);
     let mut response = match services.http_client().send(platform_request).await {
         Ok(platform_response) => platform_response.response,
         Err(err) => {
@@ -4594,6 +4607,7 @@ pub async fn handle_publisher_request(
             }));
         }
     };
+    drop(origin_span);
 
     log::debug!(
         "Publisher origin response received: status={}, header_count={}",
@@ -7737,6 +7751,35 @@ mod tests {
         .expect("should proxy publisher request")
     }
 
+    #[tokio::test]
+    async fn origin_span_covers_the_publisher_fetch() {
+        let settings = create_test_settings();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"<html><head></head><body>origin</body></html>".to_vec(),
+            vec![(header::CONTENT_TYPE.as_str(), "text/html; charset=utf-8")],
+        );
+        let services =
+            build_services_with_http_client(stub as Arc<dyn crate::platform::PlatformHttpClient>);
+        let mut request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/some-page")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let timings = RequestTimings::new();
+        request.extensions_mut().insert(timings.clone());
+
+        let _response = run_publisher_proxy(&settings, &services, request).await;
+
+        timings.mark_headers_ready();
+        assert!(
+            timings.snapshot().origin_ms.is_some(),
+            "should record the Origin phase span around the publisher fetch"
+        );
+    }
+
     mod rendered_template_identity_tests {
         //! The gate the plan's Task 3 Step 2 actually asks for.
         //!
@@ -8970,6 +9013,60 @@ mod tests {
             assert_eq!(
                 second, first,
                 "the cached template must be byte-identical to what was stored"
+            );
+        }
+
+        #[tokio::test]
+        async fn template_cache_span_recorded_only_when_lookup_runs() {
+            // Inline mode: no shared-cache key is ever computed, so the lookup
+            // never runs and the span is never recorded.
+            let inline_settings = create_test_settings();
+            let inline_stub = Arc::new(StubHttpClient::new());
+            inline_stub.push_response_with_headers(
+                200,
+                b"<html><head></head><body>origin</body></html>".to_vec(),
+                vec![(header::CONTENT_TYPE.as_str(), "text/html; charset=utf-8")],
+            );
+            let inline_services = build_services_with_http_client(
+                inline_stub as Arc<dyn crate::platform::PlatformHttpClient>,
+            );
+            let mut inline_request = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/some-page")
+                .header(header::HOST, "publisher.example")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            let inline_timings = RequestTimings::new();
+            inline_request
+                .extensions_mut()
+                .insert(inline_timings.clone());
+
+            let _inline_response =
+                run_publisher_proxy(&inline_settings, &inline_services, inline_request).await;
+
+            inline_timings.mark_headers_ready();
+            assert!(
+                inline_timings.snapshot().template_cache_ms.is_none(),
+                "inline mode should never run the template-cache lookup"
+            );
+
+            // Shared-mode eligible: a matched slot plus a template-cache-eligible
+            // assembly mode compute a cache key, so the lookup runs and is timed.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+            let mut request = navigation_request();
+            let timings = RequestTimings::new();
+            request.extensions_mut().insert(timings.clone());
+
+            let _response = run(&settings, &services, request).await;
+
+            timings.mark_headers_ready();
+            assert!(
+                timings.snapshot().template_cache_ms.is_some(),
+                "a shared-cache-eligible request should record the TemplateCacheLookup span"
             );
         }
 

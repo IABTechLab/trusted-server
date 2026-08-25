@@ -120,7 +120,9 @@ use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
 };
-use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
+use trusted_server_core::platform::{
+    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, TimedKvStore,
+};
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
@@ -222,13 +224,18 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
 pub(crate) fn runtime_services_for_consent_route(
     settings: &Settings,
     runtime_services: &RuntimeServices,
+    timings: &RequestTimings,
 ) -> Result<RuntimeServices, Report<TrustedServerError>> {
     let Some(store_name) = settings.consent.consent_store.as_deref() else {
         return Ok(runtime_services.clone());
     };
 
     open_kv_store(store_name)
-        .map(|store| runtime_services.clone().with_kv_store(store))
+        .map(|store| {
+            let timed_store =
+                Arc::new(TimedKvStore::new(store, timings.clone())) as Arc<dyn PlatformKvStore>;
+            runtime_services.clone().with_kv_store(timed_store)
+        })
         .map_err(|e| {
             Report::new(TrustedServerError::KvStore {
                 store_name: store_name.to_string(),
@@ -451,7 +458,7 @@ fn build_ec_request_state(
     // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
     // consent withdrawals. Revocations keep the write path so tombstones stay
     // authoritative even for privacy-extension-heavy clients.
-    let kv_graph = crate::maybe_identity_graph(settings);
+    let kv_graph = crate::identity_graph_with_timing(settings, &timings);
     let finalize_kv_graph = if setup_error.is_none()
         && (is_real_browser || ec_consent_withdrawn(ec_context.consent()))
     {
@@ -585,7 +592,12 @@ async fn execute_named(
                     // Deliberately do not use an EC request-state graph: that
                     // copy is bot-gated, while operators use curl for this
                     // authenticated diagnostic.
-                    let kv = crate::maybe_identity_graph(&state.settings);
+                    let timings = req
+                        .extensions()
+                        .get::<RequestTimings>()
+                        .cloned()
+                        .unwrap_or_default();
+                    let kv = crate::identity_graph_with_timing(&state.settings, &timings);
                     handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
                 }
                 NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
@@ -656,7 +668,12 @@ async fn run_named_route(
             if req.method() == Method::OPTIONS {
                 cors_preflight_identify(&state.settings, &req)
             } else {
-                let kv = crate::require_identity_graph(&state.settings)?;
+                let timings = req
+                    .extensions()
+                    .get::<RequestTimings>()
+                    .cloned()
+                    .unwrap_or_default();
+                let kv = crate::require_identity_graph_with_timing(&state.settings, &timings)?;
                 let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
                 handle_identify(
                     &state.settings,
@@ -673,7 +690,13 @@ async fn run_named_route(
             // The auction reads consent data, so the consent KV store must be
             // available — fail closed with 503 when it is configured but
             // cannot be opened, matching legacy behavior.
-            let consent_services = runtime_services_for_consent_route(&state.settings, services)?;
+            let timings = req
+                .extensions()
+                .get::<RequestTimings>()
+                .cloned()
+                .unwrap_or_default();
+            let consent_services =
+                runtime_services_for_consent_route(&state.settings, services, &timings)?;
             let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
             let registry_ref = if partner_registry.is_empty() {
                 None
@@ -701,7 +724,13 @@ async fn run_named_route(
             // Like the auction, page-bids reads consent data, so the consent KV
             // store must be available — fail closed with 503 when configured but
             // unopenable, matching legacy.
-            let consent_services = runtime_services_for_consent_route(&state.settings, services)?;
+            let timings = req
+                .extensions()
+                .get::<RequestTimings>()
+                .cloned()
+                .unwrap_or_default();
+            let consent_services =
+                runtime_services_for_consent_route(&state.settings, services, &timings)?;
             let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
             let registry_ref = if partner_registry.is_empty() {
                 None
@@ -746,12 +775,18 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
     let is_real_browser = device_signals.looks_like_browser();
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
+    let timings = req
+        .extensions()
+        .get::<RequestTimings>()
+        .cloned()
+        .unwrap_or_default();
 
-    let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
-        let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
-        let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-        handle_batch_sync(&kv, &partner_registry, &limiter, req)
-    });
+    let result =
+        crate::require_identity_graph_with_timing(&state.settings, &timings).and_then(|kv| {
+            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+            let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
+            handle_batch_sync(&kv, &partner_registry, &limiter, req)
+        });
 
     let mut response = result.unwrap_or_else(|e| http_error(&e));
     // Legacy parity: batch-sync responses still pass through
@@ -870,7 +905,12 @@ async fn dispatch_fallback(
         // Publisher pages read consent data, so the consent KV store must be
         // available — fail closed with 503 when it is configured but cannot
         // be opened, matching legacy behavior.
-        match runtime_services_for_consent_route(&state.settings, services) {
+        let timings = req
+            .extensions()
+            .get::<RequestTimings>()
+            .cloned()
+            .unwrap_or_default();
+        match runtime_services_for_consent_route(&state.settings, services, &timings) {
             Ok(publisher_services) => {
                 // Run the server-side auction with the configured creative-
                 // opportunity slots and collect dispatched bids from the lazy
@@ -2992,6 +3032,72 @@ mod tests {
         assert!(
             timings.snapshot().filter_ms.is_none(),
             "should omit the Filter phase span when no request filters are registered"
+        );
+    }
+
+    fn settings_with_consent_and_ec_store() -> Settings {
+        Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+            ec_store = "ec_identity_store"
+
+            [consent]
+            consent_store = "consent_store"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+            "#,
+        )
+        .expect("should parse settings with consent and EC KV stores configured")
+    }
+
+    #[test]
+    fn consent_store_reads_are_timed_and_pull_sync_is_not() {
+        // Consent-store access threaded through RuntimeServices uses the same
+        // TimedKvStore decorator as request-path KvIdentityGraph
+        // construction, so a read through it records Phase::EcKv.
+        let settings = settings_with_consent_and_ec_store();
+        let services = streaming_runtime_services();
+        let timings = RequestTimings::new();
+
+        let consent_services =
+            super::runtime_services_for_consent_route(&settings, &services, &timings)
+                .expect("should open the configured consent store");
+        let _ = block_on(consent_services.kv_store().get_bytes("consent-read-key"));
+
+        timings.mark_headers_ready();
+        assert!(
+            timings.snapshot().kv_ms.is_some(),
+            "a consent-store read through the decorated RuntimeServices store should record Phase::EcKv"
+        );
+
+        // Pull-sync's identity graph is built by `require_identity_graph`,
+        // which takes no `timings` parameter at all — the untimed store it
+        // constructs cannot record into any handle, including a fresh one.
+        let graph = crate::require_identity_graph(&settings)
+            .expect("should construct the pull-sync identity graph");
+        let ec_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test01";
+        let _ = graph.get(ec_id);
+
+        let pull_sync_timings = RequestTimings::new();
+        pull_sync_timings.mark_headers_ready();
+        assert!(
+            pull_sync_timings.snapshot().kv_ms.is_none(),
+            "pull-sync's untimed graph construction has no timings handle to record into"
         );
     }
 
