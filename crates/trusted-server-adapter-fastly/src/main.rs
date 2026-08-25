@@ -6,9 +6,7 @@ use edgezero_adapter_fastly::request::into_core_request;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{
-    HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse,
-};
+use edgezero_core::http::{Request as HttpRequest, Response as HttpResponse};
 use edgezero_core::response::IntoResponse;
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
@@ -17,9 +15,7 @@ use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 use trusted_server_core::access_telemetry::{
     AccessTelemetrySnapshot, RouteClass, RouteMetadata, access_event_row,
 };
-use trusted_server_core::cache_policy::{
-    EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
-};
+use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_POP, ENV_FASTLY_SERVICE_ID, ENV_FASTLY_SERVICE_VERSION,
 };
@@ -37,7 +33,7 @@ use trusted_server_core::platform::PlatformGeo as _;
 use trusted_server_core::platform::{RuntimeServices, TimedKvStore};
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::publisher::TemplateCacheResponseState;
-use trusted_server_core::request_timing::{Phase, RequestTimings};
+use trusted_server_core::request_timing::{Phase, RequestTimings, append_server_timing_if_private};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
 
@@ -61,12 +57,6 @@ use crate::platform::{FastlyPlatformGeo, client_info_from_request};
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
-
-/// `Server-Timing` header name. Not present in the `http` crate's `header`
-/// module (unlike `CACHE_CONTROL` etc.), so declared locally following the
-/// same `HeaderName::from_static` pattern used in
-/// `trusted_server_core::constants`.
-const HEADER_SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
 
 /// Opens the Fastly Config Store used by the `EdgeZero` dispatcher.
 ///
@@ -544,40 +534,17 @@ pub(crate) enum DeliveryResult {
     Error,
 }
 
-/// Stamps [`RequestTimings::mark_headers_ready`] and, when observability is
-/// enabled and the response is conclusively private, appends the rendered
-/// `Server-Timing` header.
-///
-/// Always stamps `mark_headers_ready` regardless of whether the header is
-/// rendered, so the collector's `ts-total` reflects the moment headers
-/// commit. Appends rather than overwrites so a pre-existing `Server-Timing`
-/// value set upstream survives alongside the TS-owned set. A response is
-/// never promoted to shared-cacheable just because the header would
-/// otherwise be omitted: this only gates emission, it does not touch
-/// `Cache-Control`.
+/// Thin Fastly-adapter wrapper around
+/// [`append_server_timing_if_private`], the freeze point shared with the
+/// Axum adapter's terminal timing layer. See that function's doc for the
+/// emission rules (always stamps `mark_headers_ready`; appends rather than
+/// overwrites; never promotes a response to shared-cacheable).
 pub(crate) fn apply_server_timing_header(
     response: &mut HttpResponse,
     timings: &RequestTimings,
     server_timing_enabled: bool,
 ) {
-    timings.mark_headers_ready();
-
-    let conclusively_private = cache_control_headers_are_private_or_no_store(response.headers());
-    if !server_timing_enabled || !conclusively_private {
-        return;
-    }
-
-    let Some(value) = timings.server_timing_value() else {
-        return;
-    };
-    match HeaderValue::from_str(&value) {
-        Ok(header_value) => {
-            response
-                .headers_mut()
-                .append(HEADER_SERVER_TIMING, header_value);
-        }
-        Err(error) => log::warn!("skipping server-timing header: {error}"),
-    }
+    append_server_timing_if_private(response, timings, server_timing_enabled);
 }
 
 /// A [`Write`](std::io::Write) wrapper that tallies bytes successfully written

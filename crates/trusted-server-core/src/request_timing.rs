@@ -7,6 +7,16 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use http::{HeaderName, HeaderValue, Response};
+
+use crate::cache_policy::cache_control_headers_are_private_or_no_store;
+
+/// `Server-Timing` header name. Not present in the `http` crate's `header`
+/// module (unlike `CACHE_CONTROL` etc.), so declared locally following the
+/// same `HeaderName::from_static` pattern used in
+/// `trusted_server_core::constants`.
+const HEADER_SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
+
 /// Number of [`Phase`] variants; sizes the fixed-slot duration array in
 /// [`Inner`].
 const PHASE_COUNT: usize = 8;
@@ -253,6 +263,46 @@ impl Default for RequestTimings {
     }
 }
 
+/// Stamps [`RequestTimings::mark_headers_ready`] and, when `enabled` and the
+/// response is conclusively private, appends the rendered `Server-Timing`
+/// header.
+///
+/// Always stamps `mark_headers_ready` regardless of whether the header is
+/// rendered, so the collector's `ts-total` reflects the moment headers
+/// commit. Appends rather than overwrites so a pre-existing `Server-Timing`
+/// value set upstream survives alongside the TS-owned set. A response is
+/// never promoted to shared-cacheable just because the header would
+/// otherwise be omitted: this only gates emission, it does not touch
+/// `Cache-Control`.
+///
+/// Generic over the response body type so every adapter's terminal layer can
+/// call the same emission logic regardless of which body type its HTTP stack
+/// uses.
+pub fn append_server_timing_if_private<B>(
+    response: &mut Response<B>,
+    timings: &RequestTimings,
+    enabled: bool,
+) {
+    timings.mark_headers_ready();
+
+    let conclusively_private = cache_control_headers_are_private_or_no_store(response.headers());
+    if !enabled || !conclusively_private {
+        return;
+    }
+
+    let Some(value) = timings.server_timing_value() else {
+        return;
+    };
+    match HeaderValue::from_str(&value) {
+        Ok(header_value) => {
+            response
+                .headers_mut()
+                .append(HEADER_SERVER_TIMING, header_value);
+        }
+        Err(error) => log::warn!("skipping server-timing header: {error}"),
+    }
+}
+
 /// The header-bearing phases (see [`Phase::header_name`]), in the enum
 /// declaration order [`RequestTimings::server_timing_value`] renders them in.
 const HEADER_PHASES: [Phase; 6] = [
@@ -432,6 +482,47 @@ mod tests {
         assert!(
             !value.to_ascii_lowercase().contains("datadome"),
             "should mask vendors"
+        );
+    }
+
+    #[test]
+    fn append_server_timing_emits_on_private_response_when_enabled() {
+        let mut response = Response::builder()
+            .header("cache-control", "private, no-store")
+            .body(())
+            .expect("should build a private response fixture");
+        let timings = RequestTimings::new();
+
+        append_server_timing_if_private(&mut response, &timings, true);
+
+        let header = response
+            .headers()
+            .get("server-timing")
+            .and_then(|value| value.to_str().ok())
+            .expect("should emit a Server-Timing header");
+        assert!(
+            header.starts_with("ts-total;dur="),
+            "should lead with the stored total: {header}"
+        );
+    }
+
+    #[test]
+    fn append_server_timing_marks_headers_ready_even_when_not_emitted() {
+        let mut response = Response::builder()
+            .header("cache-control", "max-age=60")
+            .body(())
+            .expect("should build a shared-cacheable response fixture");
+        let timings = RequestTimings::new();
+
+        append_server_timing_if_private(&mut response, &timings, true);
+
+        assert!(
+            response.headers().get("server-timing").is_none(),
+            "should not emit on a shared-cacheable response"
+        );
+        assert!(
+            timings.server_timing_value().is_some(),
+            "should still stamp mark_headers_ready so ts-total reflects the freeze point"
         );
     }
 }
