@@ -22,9 +22,14 @@ const TINYBIRD_BETWEEN_BYTES_TIMEOUT: Duration = Duration::from_secs(2);
 const TINYBIRD_MAX_ROWS_PER_AUCTION_BATCH: usize = 512;
 
 /// Build the configured auction telemetry sink.
+///
+/// Auction emission requires both the Tinybird master toggle
+/// (`tinybird.enabled`) and the auction-specific toggle
+/// (`tinybird.auction_enabled`), so access-log telemetry can be enabled
+/// independently without also emitting auction events.
 #[must_use]
 pub(crate) fn auction_sink_from_settings(settings: &Settings) -> Arc<dyn AuctionTelemetrySink> {
-    if settings.tinybird.enabled {
+    if settings.tinybird.enabled && settings.tinybird.auction_enabled {
         Arc::new(FastlyTinybirdAuctionTelemetrySink::new(
             settings.tinybird.clone(),
         ))
@@ -443,6 +448,7 @@ mod tests {
     fn enabled_config() -> TinybirdSettings {
         TinybirdSettings {
             enabled: true,
+            auction_enabled: true,
             api_host: "api.us-east.aws.tinybird.co".to_owned(),
             secret_store: "ts_secrets".to_owned(),
             auction_dataset: "auction_events_raw".to_owned(),
@@ -453,6 +459,39 @@ mod tests {
             access_sample_rate: 0.0,
             max_body_bytes: 1024 * 1024,
         }
+    }
+
+    #[test]
+    fn sink_from_settings_disables_when_auction_enabled_is_false() {
+        let settings = Settings {
+            tinybird: TinybirdSettings {
+                auction_enabled: false,
+                ..enabled_config()
+            },
+            ..Settings::default()
+        };
+
+        let sink = auction_sink_from_settings(&settings);
+
+        assert!(
+            !sink.is_enabled(),
+            "auction telemetry should stay off when auction_enabled is false, even if tinybird.enabled is true"
+        );
+    }
+
+    #[test]
+    fn sink_from_settings_enables_when_both_toggles_are_true() {
+        let settings = Settings {
+            tinybird: enabled_config(),
+            ..Settings::default()
+        };
+
+        let sink = auction_sink_from_settings(&settings);
+
+        assert!(
+            sink.is_enabled(),
+            "auction telemetry should be on when both tinybird.enabled and tinybird.auction_enabled are true"
+        );
     }
 
     #[test]

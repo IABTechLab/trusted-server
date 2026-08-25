@@ -222,6 +222,35 @@ verbosity = "redacted"
 # JSON request/response bodies remain strings exactly as captured.
 format = "compact"
 
+[tinybird]
+enabled = false
+# Regional Tinybird API host, no scheme/port/path, e.g. "api.us-east.aws.tinybird.co".
+api_host = ""
+secret_store = "ts_secrets"
+auction_dataset = "auction_events_raw"
+auction_token_secret = "tinybird_auction_append_token"
+# Defaults to true: existing configs keep emitting auction telemetry once
+# `enabled` is turned on. Set false to silence auction events while keeping
+# `enabled` on for other Tinybird telemetry (e.g. `access_enabled`).
+auction_enabled = true
+# Access-log telemetry, decoupled from auction emission. `true` requires
+# `enabled`, non-empty api_host/secret_store/access_dataset/access_token_secret,
+# max_body_bytes > 0, and access_sample_rate > 0.0; an armed-but-silent sampler
+# (access_enabled = true with access_sample_rate = 0) fails config load.
+access_enabled = false
+access_dataset = "access_logs_raw"
+access_token_secret = "tinybird_access_append_token"
+# Fraction (0.0-1.0) of requests to emit for access telemetry when access_enabled.
+access_sample_rate = 0.0
+# Defensive maximum NDJSON body size, in bytes, for one Events API request.
+max_body_bytes = 1048576
+
+[observability]
+# Keep this leaf present so the environment override can apply; the overlay
+# cannot create a missing configuration leaf. The Server-Timing header stays
+# off until enabled.
+server_timing_enabled = false
+
 [creative_opportunities]
 # Set to false to disable server-side ad templates while retaining slot definitions
 # and direct POST /auction callers. Structurally inactive templates use the
