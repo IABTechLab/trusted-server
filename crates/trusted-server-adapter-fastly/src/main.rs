@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
 use edgezero_adapter_fastly::request::into_core_request;
@@ -14,7 +14,9 @@ use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
-use trusted_server_core::access_telemetry::{AccessTelemetrySnapshot, RouteClass, RouteMetadata};
+use trusted_server_core::access_telemetry::{
+    AccessTelemetrySnapshot, RouteClass, RouteMetadata, access_event_row,
+};
 use trusted_server_core::cache_policy::{
     EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
 };
@@ -275,7 +277,7 @@ fn edgezero_main(mut req: FastlyRequest) {
         if let Some(settings) = settings_snapshot.as_deref() {
             match apply_edgezero_ec_finalize(settings, &ec_state, &mut response, &timings) {
                 Ok(partner_registry) => {
-                    send_edgezero_response(
+                    let outcome = send_edgezero_response(
                         response,
                         request_filter_effects.as_ref(),
                         &SendContext {
@@ -287,6 +289,7 @@ fn edgezero_main(mut req: FastlyRequest) {
                         },
                     );
                     run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
+                    emit_access_telemetry_after_send(settings, &outcome, &timings);
                     return;
                 }
                 Err(e) => {
@@ -301,7 +304,7 @@ fn edgezero_main(mut req: FastlyRequest) {
                     match apply_edgezero_ec_finalize(&settings, &ec_state, &mut response, &timings)
                     {
                         Ok(partner_registry) => {
-                            send_edgezero_response(
+                            let outcome = send_edgezero_response(
                                 response,
                                 request_filter_effects.as_ref(),
                                 &SendContext {
@@ -317,6 +320,7 @@ fn edgezero_main(mut req: FastlyRequest) {
                                 &partner_registry,
                                 &ec_state,
                             );
+                            emit_access_telemetry_after_send(&settings, &outcome, &timings);
                             return;
                         }
                         Err(e) => {
@@ -333,17 +337,31 @@ fn edgezero_main(mut req: FastlyRequest) {
         }
     }
 
-    send_edgezero_response(
+    let outcome = send_edgezero_response(
         response,
         request_filter_effects.as_ref(),
         &SendContext {
-            timings,
+            timings: timings.clone(),
             server_timing_enabled,
             method: request_method,
             publisher_domain,
             access_sample_rate,
         },
     );
+    // The asset/admin/error fallback path: no `EcFinalizeState` (or the ec
+    // finalize branch above failed), so there is no pull-sync dispatch here
+    // at all — telemetry is the only post-send step. Reload settings when
+    // `app_state` never built, matching the fallback used earlier in this
+    // function for entry-point finalize headers.
+    match settings_snapshot.as_deref() {
+        Some(settings) => emit_access_telemetry_after_send(settings, &outcome, &timings),
+        None => match load_settings_from_config_store() {
+            Ok(settings) => emit_access_telemetry_after_send(&settings, &outcome, &timings),
+            Err(e) => {
+                log::warn!("access telemetry emission skipped: failed to reload settings: {e:?}");
+            }
+        },
+    }
 }
 
 fn edge_error_response(error: EdgeError) -> HttpResponse {
@@ -429,6 +447,59 @@ fn run_edgezero_pull_sync_after_send(
         && let Some(context) = build_pull_sync_context(&ec_state.ec_context)
     {
         run_pull_sync_after_send(settings, partner_registry, &context, &ec_state.services);
+    }
+}
+
+/// Builds and emits the access-telemetry row for one delivered response,
+/// when access telemetry is enabled and this request is sampled in.
+///
+/// Called last at every `send_edgezero_response` call site in
+/// [`edgezero_main`] — after `run_edgezero_pull_sync_after_send` on the two
+/// EC-finalized paths, and directly after send on the asset/admin/error
+/// fallback path, which never builds an [`EcFinalizeState`] or route-scoped
+/// `RuntimeServices` at all. The Tinybird transport context is therefore
+/// constructed fresh from `settings` here rather than threaded through
+/// either of those per-route types, so every response class can emit.
+///
+/// Sampled-out requests return silently — that is the expected, high-volume
+/// case and not worth a log line. Every other drop (row build, token load,
+/// send, or non-2xx status — all folded into `emit_access_event`'s `Result`)
+/// logs exactly one warning naming the reason.
+fn emit_access_telemetry_after_send(
+    settings: &Settings,
+    outcome: &DeliveryOutcome,
+    timings: &RequestTimings,
+) {
+    if !settings.tinybird.enabled || !settings.tinybird.access_enabled {
+        return;
+    }
+
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let epoch_ms = u64::try_from(since_epoch.as_millis()).unwrap_or(u64::MAX);
+    // Entropy for the sampling decision: the timestamp's nanosecond
+    // resolution XORed with a per-request value already on hand
+    // (`outcome.bytes`), so two requests handled in the same instance never
+    // collide on sampling decisions purely because they read the same
+    // millisecond. There is no `rand` crate dependency here — see
+    // `tinybird::sampled_in`.
+    let entropy_nanos = u64::try_from(since_epoch.as_nanos()).unwrap_or(u64::MAX);
+    let entropy = entropy_nanos ^ outcome.bytes;
+
+    if !tinybird::sampled_in(settings.tinybird.access_sample_rate, entropy) {
+        return;
+    }
+
+    let row = access_event_row(&outcome.snapshot, &timings.snapshot(), epoch_ms);
+    let target = tinybird::TinybirdEventsTarget::from_access_config(settings.tinybird.clone());
+    let result = futures::executor::block_on(tinybird::emit_access_event(
+        &platform::FastlyPlatformHttpClient,
+        &target,
+        row,
+    ));
+    if let Err(error) = result {
+        log::warn!("access telemetry emission dropped: {error:?}");
     }
 }
 
@@ -935,6 +1006,7 @@ mod tests {
     use edgezero_core::http::HeaderValue;
     use edgezero_core::http::response_builder;
     use fastly::mime;
+    use std::sync::Mutex;
     use std::time::Duration;
     use trusted_server_core::integrations::HeaderMutation;
     use trusted_server_core::request_timing::AuctionWaitPlacement;
@@ -1654,6 +1726,129 @@ mod tests {
         assert_eq!(
             classify_stream_delivery(&Ok(()), 123),
             DeliveryResult::Complete
+        );
+    }
+
+    /// Records `"telemetry"` into a shared order log instead of sending a
+    /// real request, standing in for the adapter's platform HTTP client in
+    /// [`post_send_order_is_elapsed_then_pull_sync_then_telemetry`].
+    struct OrderingHttpClient {
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl trusted_server_core::platform::PlatformHttpClient for OrderingHttpClient {
+        async fn send(
+            &self,
+            _request: trusted_server_core::platform::PlatformHttpRequest,
+        ) -> Result<
+            trusted_server_core::platform::PlatformResponse,
+            Report<trusted_server_core::platform::PlatformError>,
+        > {
+            self.log
+                .lock()
+                .expect("should lock order log")
+                .push("telemetry");
+            let response = response_builder()
+                .status(edgezero_core::http::StatusCode::ACCEPTED)
+                .body(EdgeBody::empty())
+                .expect("should build ordering test response");
+            Ok(trusted_server_core::platform::PlatformResponse::new(
+                response,
+            ))
+        }
+
+        async fn send_async(
+            &self,
+            _request: trusted_server_core::platform::PlatformHttpRequest,
+        ) -> Result<
+            trusted_server_core::platform::PlatformPendingRequest,
+            Report<trusted_server_core::platform::PlatformError>,
+        > {
+            Err(Report::new(
+                trusted_server_core::platform::PlatformError::Unsupported,
+            ))
+        }
+
+        async fn select(
+            &self,
+            _pending_requests: Vec<trusted_server_core::platform::PlatformPendingRequest>,
+        ) -> Result<
+            trusted_server_core::platform::PlatformSelectResult,
+            Report<trusted_server_core::platform::PlatformError>,
+        > {
+            Err(Report::new(
+                trusted_server_core::platform::PlatformError::Unsupported,
+            ))
+        }
+    }
+
+    #[test]
+    fn post_send_order_is_elapsed_then_pull_sync_then_telemetry() {
+        // `edgezero_main` cannot be driven directly in a unit test (it
+        // consumes a live `fastly::Request::from_client()`), and
+        // `run_edgezero_pull_sync_after_send` has no injectable seam of its
+        // own — it dispatches through the real identity-graph pull-sync
+        // path, which needs a configured EC KV store, partner registry, and
+        // rate limiter wired together. This test instead exercises the two
+        // REAL functions `edgezero_main` calls that DO have a testable seam
+        // — `send_edgezero_response` (which stamps `request_elapsed` before
+        // returning, per Task 6/7) and `tinybird::emit_access_event` (the
+        // telemetry send added by this task) — around an instrumented
+        // stand-in for the pull-sync dispatch call, in the exact order
+        // `edgezero_main` places them.
+        //
+        // This proves the elapsed-before-telemetry leg from real production
+        // code (the assertion below reads the real `timings` snapshot
+        // between the two calls). The pull-sync-before-telemetry leg is a
+        // source-order invariant in `edgezero_main`'s three call sites
+        // (verified by code review, not by this test) because
+        // `run_edgezero_pull_sync_after_send` itself has no seam to
+        // instrument — see task-8-report.md for this residual.
+        let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let timings = RequestTimings::new();
+        let response = response_builder()
+            .body(EdgeBody::from("ok"))
+            .expect("should build response");
+
+        let outcome = send_edgezero_response(
+            response,
+            None,
+            &SendContext {
+                timings: timings.clone(),
+                server_timing_enabled: false,
+                method: "GET".to_owned(),
+                publisher_domain: "test-publisher.com".to_owned(),
+                access_sample_rate: 1.0,
+            },
+        );
+        assert!(
+            timings.snapshot().request_elapsed_ms.is_some(),
+            "request_elapsed should already be stamped before pull-sync/telemetry run"
+        );
+
+        // Stand-in for `run_edgezero_pull_sync_after_send`, which has no
+        // injectable seam (see the test doc comment above).
+        log.lock().expect("should lock order log").push("pull_sync");
+
+        let http_client = OrderingHttpClient {
+            log: Arc::clone(&log),
+        };
+        let target = tinybird::TinybirdEventsTarget::from_access_config(
+            trusted_server_core::settings::TinybirdSettings {
+                api_host: "api.us-east.aws.tinybird.co".to_owned(),
+                ..trusted_server_core::settings::TinybirdSettings::default()
+            },
+        );
+        let row = access_event_row(&outcome.snapshot, &timings.snapshot(), 0);
+
+        futures::executor::block_on(tinybird::emit_access_event(&http_client, &target, row))
+            .expect("should send access telemetry");
+
+        assert_eq!(
+            *log.lock().expect("should lock order log"),
+            vec!["pull_sync", "telemetry"],
+            "pull-sync must dispatch before telemetry emits"
         );
     }
 }
