@@ -7,7 +7,6 @@
 //! `EdgeZero`'s typed config push path.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
 
 use edgezero_core::app_config::{SecretField, SecretKind, SecretPathSegment};
 use error_stack::Report;
@@ -235,8 +234,8 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     structural_settings.prepare_runtime()?;
     structural_settings.validate_admin_coverage()?;
 
-    let enabled_auction_providers = validate_enabled_integrations(settings, false)?;
-    validate_auction_provider_names(settings, &enabled_auction_providers)?;
+    let plan = crate::auction::compile_auction_plan(settings)?;
+    validate_enabled_integrations(settings, &plan, false)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
     Ok(())
 }
@@ -253,27 +252,20 @@ pub fn validate_settings_for_runtime(
     settings.reject_placeholder_secrets()?;
     validate_proxy_secret_strength(settings)?;
     settings.validate_admin_handler_passwords()?;
-    let enabled_auction_providers = validate_enabled_integrations(settings, true)?;
-    validate_auction_provider_names(settings, &enabled_auction_providers)?;
+    let plan = crate::auction::compile_auction_plan(settings)?;
+    validate_enabled_integrations(settings, &plan, true)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
     Ok(())
 }
 
 fn validate_enabled_integrations(
     settings: &Settings,
+    plan: &crate::auction::AuctionPlan,
     resolved_secrets: bool,
-) -> Result<HashSet<&'static str>, Report<TrustedServerError>> {
-    let mut enabled_auction_providers = HashSet::new();
-
-    if validate_prebid(settings)? {
-        enabled_auction_providers.insert("prebid");
-    }
-    if validate_integration::<ApsConfig>(settings, "aps")? {
-        enabled_auction_providers.insert("aps");
-    }
-    if validate_integration::<AdServerMockConfig>(settings, "adserver_mock")? {
-        enabled_auction_providers.insert("adserver_mock");
-    }
+) -> Result<(), Report<TrustedServerError>> {
+    validate_prebid(settings, plan)?;
+    validate_integration::<ApsConfig>(settings, "aps")?;
+    validate_integration::<AdServerMockConfig>(settings, "adserver_mock")?;
     validate_integration::<TestlightConfig>(settings, "testlight")?;
     validate_integration::<NextJsIntegrationConfig>(settings, "nextjs")?;
     validate_integration::<PermutiveConfig>(settings, "permutive")?;
@@ -294,11 +286,19 @@ fn validate_enabled_integrations(
     validate_integration::<GptConfig>(settings, "gpt")?;
     validate_integration::<GptDiagnosticsConfig>(settings, "gpt_diagnostics")?;
 
-    Ok(enabled_auction_providers)
+    Ok(())
 }
 
-fn validate_prebid(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
-    prebid::validate_config_for_startup(settings).map(|config| config.is_some())
+fn validate_prebid(
+    settings: &Settings,
+    plan: &crate::auction::AuctionPlan,
+) -> Result<(), Report<TrustedServerError>> {
+    let Some(config) = settings.integration_config::<prebid::PrebidIntegrationConfig>("prebid")?
+    else {
+        return Ok(());
+    };
+    prebid::validate_browser_config_for_startup(&config, &settings.proxy.allowed_domains)?;
+    prebid::validate_browser_bidder_ownership(&config, plan)
 }
 
 fn validate_integration<T>(
@@ -431,32 +431,6 @@ fn validate_proxy_secret_strength(settings: &Settings) -> Result<(), Report<Trus
     Ok(())
 }
 
-fn validate_auction_provider_names(
-    settings: &Settings,
-    enabled_auction_providers: &HashSet<&'static str>,
-) -> Result<(), Report<TrustedServerError>> {
-    if !settings.auction.enabled {
-        return Ok(());
-    }
-
-    for provider_name in settings
-        .auction
-        .providers
-        .iter()
-        .chain(settings.auction.mediator.iter())
-    {
-        if !enabled_auction_providers.contains(provider_name.as_str()) {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "auction provider `{provider_name}` is listed in [auction] but no enabled integration provides it"
-                ),
-            }));
-        }
-    }
-
-    Ok(())
-}
-
 fn report_to_validation_error(
     report: &Report<TrustedServerError>,
     code: &'static str,
@@ -468,6 +442,8 @@ fn report_to_validation_error(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::redacted::Redacted;
     use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig};
@@ -841,6 +817,93 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
+    fn deploy_validation_requires_external_bundle_url_for_enabled_prebid() {
+        let mut settings = valid_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": true,
+                    "bundle": { "adapters": ["exampleBidder"] }
+                }),
+            )
+            .expect("should insert enabled Prebid config");
+
+        let error = validate_settings_for_deploy(&settings)
+            .expect_err("should require enabled Prebid external bundle URL");
+        assert!(error.to_string().contains("external_bundle_url"));
+    }
+
+    #[test]
+    fn deploy_validation_rejects_conflicting_prebid_browser_bidder_ownership() {
+        let mut settings = valid_settings();
+        settings.auction.enabled = true;
+        settings.auction.providers = crate::auction::AuctionConfig::legacy_provider_map(&["pbs"]);
+        settings.auction.bidders.insert(
+            "exampleBidder"
+                .parse()
+                .expect("should parse server-side bidder"),
+            crate::auction::BidderRouteConfig {
+                provider: "pbs".parse().expect("should parse provider"),
+            },
+        );
+        let mut prebid = settings
+            .integration_config::<prebid::PrebidIntegrationConfig>("prebid")
+            .expect("should parse Prebid config")
+            .expect("should have enabled Prebid config");
+        prebid.client_side_bidders = vec!["exampleBidder".to_string()];
+        settings
+            .integrations
+            .insert_config("prebid", &prebid)
+            .expect("should replace Prebid config");
+
+        let error = validate_settings_for_deploy(&settings)
+            .expect_err("should reject conflicting browser bidder ownership");
+        assert!(error.to_string().contains("exampleBidder"));
+        assert!(
+            error
+                .to_string()
+                .contains("both client-side and server-side")
+        );
+    }
+
+    #[test]
+    fn deploy_validation_accepts_dormant_prebid_browser_bidder_overlap() {
+        let mut settings = valid_settings();
+        settings.auction.enabled = false;
+        settings.auction.providers = crate::auction::AuctionConfig::legacy_provider_map(&["pbs"]);
+        settings.auction.bidders.insert(
+            "exampleBidder"
+                .parse()
+                .expect("should parse server-side bidder"),
+            crate::auction::BidderRouteConfig {
+                provider: "pbs".parse().expect("should parse provider"),
+            },
+        );
+        let mut prebid = settings
+            .integration_config::<prebid::PrebidIntegrationConfig>("prebid")
+            .expect("should parse Prebid config")
+            .expect("should have enabled Prebid config");
+        prebid.client_side_bidders = vec!["exampleBidder".to_string()];
+        settings
+            .integrations
+            .insert_config("prebid", &prebid)
+            .expect("should replace Prebid config");
+
+        validate_settings_for_deploy(&settings)
+            .expect("disabled plan overlap should remain deployable");
+    }
+
+    #[test]
+    fn deploy_validation_accepts_typed_prebid_bundle_build_table() {
+        let settings = valid_settings();
+
+        validate_settings_for_deploy(&settings)
+            .expect("test config with typed Prebid bundle build table should validate");
+    }
+
+    #[test]
     fn deploy_validation_covers_registered_integration_builders() {
         let validated_ids: HashSet<&'static str> =
             DEPLOY_VALIDATED_INTEGRATION_IDS.iter().copied().collect();
@@ -911,7 +974,15 @@ password = "production-admin-password-32-bytes"
     fn validate_trait_reports_deploy_errors() {
         let mut settings = valid_settings();
         settings.auction.enabled = true;
-        settings.auction.providers = vec!["missing-provider".to_string()];
+        settings.auction.providers =
+            crate::auction::AuctionConfig::legacy_provider_map(&["missing-provider"]);
+        settings
+            .auction
+            .providers
+            .values_mut()
+            .next()
+            .expect("should have provider")
+            .protocol = "unsupported".to_string();
         let app_config = TrustedServerAppConfig { settings };
 
         let err = app_config

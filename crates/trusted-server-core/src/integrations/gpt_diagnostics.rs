@@ -467,7 +467,12 @@ mod tests {
 
     #[test]
     fn register_excludes_diagnostics_from_unified_and_deferred_bundles() {
-        let registry = IntegrationRegistry::new(&settings(true)).expect("should build registry");
+        let settings = settings(true);
+        let plan = std::sync::Arc::new(
+            crate::auction::compile_auction_plan(&settings).expect("should compile auction plan"),
+        );
+        let registry =
+            IntegrationRegistry::with_plan(&settings, plan).expect("should build registry");
 
         assert!(registry.integration_enabled(GPT_DIAGNOSTICS_INTEGRATION_ID));
         assert!(

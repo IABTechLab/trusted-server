@@ -559,7 +559,6 @@ mod tests {
         r#"
 [integrations.prebid]
 enabled = true
-server_url = "https://prebid.example.com/openrtb2/auction"
 external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-old.js"
 
 [integrations.prebid.bundle]
@@ -595,7 +594,6 @@ user_id_modules = ["sharedIdSystem", "uid2IdSystem"]
             r#"
 [integrations.prebid]
 enabled = true
-server_url = "https://prebid.example.com/openrtb2/auction"
 
 [integrations.prebid.bundle]
 adapters = ["rubicon"]
@@ -626,7 +624,6 @@ adapters = ["rubicon"]
             r#"
 [integrations.prebid]
 enabled = true
-server_url = "https://prebid.example.com/openrtb2/auction"
 "#,
         );
 
@@ -646,7 +643,6 @@ server_url = "https://prebid.example.com/openrtb2/auction"
             r#"
 [integrations.prebid]
 enabled = true
-server_url = "https://prebid.example.com/openrtb2/auction"
 
 [integrations.prebid.bundle]
 adapters = []
@@ -667,7 +663,6 @@ adapters = []
             r#"
 [integrations.prebid]
 enabled = true
-server_url = "https://prebid.example.com/openrtb2/auction"
 
 [integrations.prebid.bundle]
 adapters = ["rubicon", 123]

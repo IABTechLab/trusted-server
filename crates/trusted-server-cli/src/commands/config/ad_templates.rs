@@ -181,7 +181,17 @@ fn run_lint(args: &AdTemplatesLintArgs, out: &mut dyn Write) -> Result<(), Strin
         if loaded.settings.auction.providers.is_empty() {
             "(none)".to_string()
         } else {
-            escape_terminal_text(&loaded.settings.auction.providers.join(", ")).into_owned()
+            escape_terminal_text(
+                &loaded
+                    .settings
+                    .auction
+                    .providers
+                    .keys()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+            .into_owned()
         }
     )
     .map_err(output_error)?;

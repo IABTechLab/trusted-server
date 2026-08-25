@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose};
 use ed25519_dalek::SigningKey;
@@ -132,6 +133,10 @@ impl PlatformSecretStore for HashMapSecretStore {
 pub(crate) struct NoopBackend;
 
 impl PlatformBackend for NoopBackend {
+    fn naming_policy(&self) -> super::BackendNamingPolicy {
+        super::BackendNamingPolicy::Axum
+    }
+
     fn predict_name(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
         Err(Report::new(PlatformError::Unsupported))
     }
@@ -178,6 +183,10 @@ impl PlatformHttpClient for NoopHttpClient {
 pub(crate) struct StubBackend;
 
 impl PlatformBackend for StubBackend {
+    fn naming_policy(&self) -> super::BackendNamingPolicy {
+        super::BackendNamingPolicy::Axum
+    }
+
     fn predict_name(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
         Ok("stub-backend".to_owned())
     }
@@ -213,17 +222,28 @@ struct StubPendingResponse {
 /// sites.
 /// Upper bound on the request body bytes captured per `send` call.
 const MAX_RECORDED_BODY_BYTES: usize = 64 * 1024 * 1024;
+type RecordedHeaderBytes = Vec<Vec<(String, Vec<u8>)>>;
 
 pub(crate) struct StubHttpClient {
     calls: Mutex<Vec<String>>,
     responses: Mutex<VecDeque<StubHttpResponse>>,
     // Headers captured per send call, stored as (name, value) string pairs.
     request_headers: Mutex<Vec<Vec<(String, String)>>>,
-    // Queued select() errors — each pop makes the next select() return ready: Err.
-    select_errors: Mutex<VecDeque<()>>,
+    // Raw header values, including invalid UTF-8 values that cannot be represented
+    // by `recorded_request_headers`.
+    request_header_bytes: Mutex<RecordedHeaderBytes>,
+    // Queued select() outcomes; true makes that select return ready: Err.
+    select_errors: Mutex<VecDeque<bool>>,
+    // Test-only overrides for backend metadata on returned pending handles.
+    pending_backend_name_overrides: Mutex<VecDeque<Option<String>>>,
+    // Test-only wall-clock delays applied before each select result is returned.
+    select_delays: Mutex<VecDeque<Duration>>,
     // Reported by supports_concurrent_fanout(); set false to emulate
     // platforms whose send_async executes eagerly (e.g. Cloudflare Workers).
     concurrent_fanout: std::sync::atomic::AtomicBool,
+    // Reported by has_enforceable_total_request_deadline(); set true to emulate
+    // a future adapter with a hard total request deadline.
+    enforceable_total_request_deadline: std::sync::atomic::AtomicBool,
     // Reported by supports_streaming_responses(); set true to emulate Fastly's
     // streaming response support.
     streaming_responses_supported: std::sync::atomic::AtomicBool,
@@ -248,8 +268,12 @@ impl StubHttpClient {
             calls: Mutex::new(Vec::new()),
             responses: Mutex::new(VecDeque::new()),
             request_headers: Mutex::new(Vec::new()),
+            request_header_bytes: Mutex::new(Vec::new()),
             select_errors: Mutex::new(VecDeque::new()),
+            pending_backend_name_overrides: Mutex::new(VecDeque::new()),
+            select_delays: Mutex::new(VecDeque::new()),
             concurrent_fanout: std::sync::atomic::AtomicBool::new(true),
+            enforceable_total_request_deadline: std::sync::atomic::AtomicBool::new(false),
             streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
             image_optimizer_options: Mutex::new(Vec::new()),
             cache_bypass_flags: Mutex::new(Vec::new()),
@@ -263,6 +287,12 @@ impl StubHttpClient {
     /// Make `supports_concurrent_fanout()` report the given value.
     pub fn set_concurrent_fanout(&self, supported: bool) {
         self.concurrent_fanout
+            .store(supported, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Make `has_enforceable_total_request_deadline()` report the given value.
+    pub(crate) fn set_enforceable_total_request_deadline(&self, supported: bool) {
+        self.enforceable_total_request_deadline
             .store(supported, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -305,7 +335,36 @@ impl StubHttpClient {
         self.select_errors
             .lock()
             .expect("should lock select_errors")
-            .push_back(());
+            .push_back(true);
+    }
+
+    /// Make the next `select()` complete successfully before a later queued error.
+    pub(crate) fn push_select_success(&self) {
+        self.select_errors
+            .lock()
+            .expect("should lock select_errors")
+            .push_back(false);
+    }
+
+    /// Override backend metadata on the next pending handle returned by
+    /// [`Self::send_async`]. `None` removes the metadata entirely.
+    pub(crate) fn push_pending_backend_name_override(&self, backend_name: Option<&str>) {
+        self.pending_backend_name_overrides
+            .lock()
+            .expect("should lock pending backend name overrides")
+            .push_back(backend_name.map(str::to_string));
+    }
+
+    /// Queue a wall-clock delay before the next [`Self::select`] result.
+    ///
+    /// This is test-only timing control for deadline behavior. It deliberately
+    /// uses a caller-selected, generous contrast with the tested budget rather
+    /// than relying on scheduler races.
+    pub(crate) fn push_select_delay(&self, delay: Duration) {
+        self.select_delays
+            .lock()
+            .expect("should lock select_delays")
+            .push_back(delay);
     }
 
     /// Return backend names recorded across all `send` calls, in order.
@@ -320,6 +379,16 @@ impl StubHttpClient {
         self.request_headers
             .lock()
             .expect("should lock request_headers")
+            .clone()
+    }
+
+    /// Return raw request header values captured per request, in order.
+    ///
+    /// Unlike [`Self::recorded_request_headers`], this includes malformed bytes.
+    pub(crate) fn recorded_request_header_bytes(&self) -> Vec<Vec<(String, Vec<u8>)>> {
+        self.request_header_bytes
+            .lock()
+            .expect("should lock request_header_bytes")
             .clone()
     }
 
@@ -383,6 +452,11 @@ impl PlatformHttpClient for StubHttpClient {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn has_enforceable_total_request_deadline(&self) -> bool {
+        self.enforceable_total_request_deadline
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn supports_streaming_responses(&self) -> bool {
         self.streaming_responses_supported
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -433,6 +507,16 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock request_headers")
             .push(headers);
+        let header_bytes = request
+            .request
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+            .collect();
+        self.request_header_bytes
+            .lock()
+            .expect("should lock request_header_bytes")
+            .push(header_bytes);
 
         // Capture the outgoing request body so tests can assert it is forwarded.
         // Propagate collection failures instead of recording an empty body, so
@@ -505,6 +589,16 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock request_headers")
             .push(headers);
+        let header_bytes = request
+            .request
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+            .collect();
+        self.request_header_bytes
+            .lock()
+            .expect("should lock request_header_bytes")
+            .push(header_bytes);
 
         // Capture the outgoing request body, mirroring `send()`, so tests
         // exercising the async fan-out path (`request_bids` providers) can
@@ -533,7 +627,17 @@ impl PlatformHttpClient for StubHttpClient {
             status: response.status,
             body: response.body,
         };
-        Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
+        let override_name = self
+            .pending_backend_name_overrides
+            .lock()
+            .expect("should lock pending backend name overrides")
+            .pop_front();
+        let pending = PlatformPendingRequest::new(pending);
+        Ok(match override_name {
+            Some(Some(name)) => pending.with_backend_name(name),
+            Some(None) => pending,
+            None => pending.with_backend_name(backend_name),
+        })
     }
 
     /// Always marks the first pending request in the input as ready (FIFO order).
@@ -549,6 +653,15 @@ impl PlatformHttpClient for StubHttpClient {
         if pending_requests.is_empty() {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("select called with empty pending_requests list"));
+        }
+
+        let delay = self
+            .select_delays
+            .lock()
+            .expect("should lock select_delays")
+            .pop_front();
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
         }
 
         let ready_platform = pending_requests.remove(0);
@@ -577,7 +690,7 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock select_errors")
             .pop_front()
-            .is_some();
+            .unwrap_or(false);
 
         if should_error {
             return Ok(PlatformSelectResult {
@@ -719,6 +832,25 @@ pub(crate) fn build_services_with_http_client(
     build_services_with_secret_and_http_client(NoopSecretStore, http_client)
 }
 
+/// Build test services that dispatch HTTP requests with an attested client IP.
+pub(crate) fn build_services_with_http_client_and_client_ip(
+    http_client: Arc<dyn PlatformHttpClient>,
+    client_ip: IpAddr,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(StubBackend))
+        .http_client(http_client)
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip: Some(client_ip),
+            ..ClientInfo::default()
+        })
+        .build()
+}
+
 pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
     RuntimeServices::builder()
         .config_store(Arc::new(NoopConfigStore))
@@ -766,11 +898,20 @@ pub(crate) fn build_services_with_backend_and_http_client(
 }
 
 /// Build a [`RuntimeServices`] with a custom secret store, [`StubBackend`], and HTTP client.
-pub(crate) fn build_services_with_secret_and_http_client(
+pub(crate) fn build_services_with_config_secret_and_http_client(
+    config_store: impl PlatformConfigStore + 'static,
     secret_store: impl PlatformSecretStore + 'static,
     http_client: Arc<dyn PlatformHttpClient>,
 ) -> RuntimeServices {
-    build_services_with_secret_http_client_and_client_ip(secret_store, http_client, None)
+    RuntimeServices::builder()
+        .config_store(Arc::new(config_store))
+        .secret_store(Arc::new(secret_store))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(StubBackend))
+        .http_client(http_client)
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo::default())
+        .build()
 }
 
 pub(crate) fn build_services_with_secret_http_client_and_client_ip(
@@ -792,6 +933,14 @@ pub(crate) fn build_services_with_secret_http_client_and_client_ip(
             ..ClientInfo::default()
         })
         .build()
+}
+
+/// Build test services with a custom secret store and the standard test config store.
+pub(crate) fn build_services_with_secret_and_http_client(
+    secret_store: impl PlatformSecretStore + 'static,
+    http_client: Arc<dyn PlatformHttpClient>,
+) -> RuntimeServices {
+    build_services_with_config_secret_and_http_client(NoopConfigStore, secret_store, http_client)
 }
 
 #[cfg(test)]

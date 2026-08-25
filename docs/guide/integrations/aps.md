@@ -10,7 +10,7 @@ Trusted Server can request banner bids from Amazon Publisher Services (APS) thro
 The integration supports:
 
 - banner impressions;
-- APS OpenRTB requests to the integration's built-in production endpoint;
+- APS OpenRTB requests to the provider's configured HTTPS endpoint;
 - decoded-CPM winner selection with or without a mediator;
 - direct `/auction` rendering;
 - client-side `trustedServer` Prebid adapter auctions through GAM; and
@@ -25,33 +25,32 @@ The integration does not implement:
 
 ## Configuration
 
+APS server ownership is entirely under an auction provider. The optional
+`[integrations.aps]` table controls browser renderer ownership only. It does not
+own the APS account, endpoint, timeout, debug behavior, or script policy. APS
+renderer support is registered whenever the compiled auction plan contains an
+`aps` profile, even if `[integrations.aps]` is absent or disabled.
+
 ```toml
 [integrations.aps]
 enabled = true
-account_id = "example-aps-account-id"
-timeout_ms = 800
-# Include raw APS request/response data in /auction metadata on test sites only.
-debug = false
-# Set both when the deployment hostname differs from APS-authorized inventory.
-# inventory_domain = "publisher.example"
-# inventory_page_origin = "https://www.publisher.example"
-allow_script_creatives = false
-# Default. Set publisher_native only for the controlled friendly-frame experiment below.
+# Default. Use publisher_native only for the controlled experiment below.
 rendering_mode = "trusted_server"
+```
 
+```toml
 [auction]
 enabled = true
-providers = ["aps", "prebid"]
 timeout_ms = 2000
 ```
 
-`account_id` is the canonical field. `pub_id` remains a compatibility alias for migration, including integer values, but new configuration should not use it. Supplying both names is an error.
+`profile_config.account_id` is the canonical field. The config-first schema does not accept the legacy `pub_id` alias.
 
 `debug` defaults to `false`. Enable it only on controlled test sites because it includes the raw APS request and response, including identity, consent, device, page, account, bid, and creative data, in the client-visible `/auction` response.
 
 `allow_script_creatives` defaults to `false`. While disabled, APS script bids are rejected before per-impression reduction, floors, mediation, and winner selection. Enable it only for a controlled cohort after the browser-security checks in [Rollout](#rollout) pass.
 
-`rendering_mode` is a strict enum: `trusted_server` (the default) retains the opaque static renderer route, and `publisher_native` disables that route and adds `data-ts-aps-rendering-mode="publisher_native"` to the server-generated TSJS bundle tag. TSJS captures this server-owned attribute when the bundle executes, so markup added later cannot change the mode. The attribute works under a publisher CSP that blocks inline scripts. Unknown values fail configuration deserialization.
+`integrations.aps.rendering_mode` is a strict enum. `trusted_server` is the default and retains the opaque static renderer route. `publisher_native` disables that route and adds `data-ts-aps-rendering-mode="publisher_native"` to the server-generated TSJS bundle tag. TSJS captures this server-owned attribute when the bundle executes, so markup added later cannot change the mode. The attribute works under a publisher CSP that blocks inline scripts. Unknown values fail configuration deserialization.
 
 ### Publisher-native runner experiment
 
@@ -82,10 +81,75 @@ The APS provider may also participate through a configured mediator:
 ```toml
 [auction]
 enabled = true
-providers = ["aps", "prebid"]
 mediator = "adserver_mock"
-timeout_ms = 2000
+
+[auction.providers.aps-main]
+protocol = "openrtb-2.6"
+profile = "aps"
+endpoint = "https://aps.example.com/e/pb/bid"
+routing = "all_eligible"
+
+[auction.providers.aps-main.profile_config]
+account_id = "example-aps-account"
+debug = false
+allow_script_creatives = false
+# Configure both only when authorized inventory differs from the deployment host.
+# inventory_domain = "inventory.example.com"
+# inventory_page_origin = "https://www.inventory.example.com"
+
+[integrations.adserver_mock]
+enabled = true
+endpoint = "https://mediator.example.com/mediate"
+timeout_ms = 500
 ```
+
+The common provider `endpoint` is required and must be an absolute HTTPS URL
+with a host and no credentials or fragment. The legacy `/e/dtb/bid` path is
+rejected. `timeout_ms` belongs beside `endpoint`; when omitted, the `aps`
+profile default is 800 ms. Runtime caps it by the remaining auction budget.
+
+`profile_config.account_id` is required, nonempty, and at most 1024 bytes. It is
+the canonical field; integration-owned `account_id`, `pub_id`, endpoint, and
+timeout fields are not part of the public schema. `debug` and
+`allow_script_creatives` both default to `false`.
+
+Enable `debug` only on controlled test sites because it includes the raw APS
+request and response—including identity, consent, device, page, account, bid,
+and creative data—in client-visible `/auction` metadata.
+
+Set `inventory_domain` and `inventory_page_origin` together only when the public
+deployment hostname differs from APS-authorized inventory. The domain becomes
+`site.domain`. The HTTPS page origin replaces the current page's scheme and host
+while preserving its path; query and fragment are removed. The origin must be
+the inventory domain or a subdomain and cannot contain credentials, a port,
+path, query, or fragment.
+
+`routing = "all_eligible"` is the usual APS configuration: every
+banner-compatible slot is eligible without a synthetic APS bidder entry. It
+does not expose bidder parameters routed to another provider. Use
+`routing = "explicit"` only when APS participation should require a central
+bidder route:
+
+```toml
+[auction.providers.aps-main]
+protocol = "openrtb-2.6"
+profile = "aps"
+endpoint = "https://aps.example.com/e/pb/bid"
+routing = "explicit"
+
+[auction.providers.aps-main.profile_config]
+account_id = "example-aps-account"
+
+[auction.bidders.aps]
+provider = "aps-main"
+```
+
+The optional mediator stays separate under `[auction].mediator`; never declare
+it under `[auction.providers]` or `[auction.bidders]`.
+
+APS uses ordinary auction slot IDs and banner formats. Legacy creative-
+opportunity APS `slot_id` values are ignored, and `bidders.aps.slotID` is not
+required.
 
 ## OpenRTB request
 
@@ -103,7 +167,9 @@ Raw outbound and inbound payloads are logged only at TRACE level. With debug dis
 
 ## Debug mode
 
-Set `debug = true` under `[integrations.aps]` to include the direct APS HTTP exchange in the APS provider summary returned by `POST /auction`:
+Set `debug = true` under
+`[auction.providers.<id>.profile_config]` to include the direct APS HTTP
+exchange in that provider's summary returned by `POST /auction`:
 
 ```json
 {
@@ -126,7 +192,7 @@ Set `debug = true` under `[integrations.aps]` to include the direct APS HTTP exc
 }
 ```
 
-This follows the Prebid Server `metadata.debug.httpcalls` representation. APS makes one direct HTTP call per auction, so the map uses the provider key `aps` with one entry. Request and captured response bodies are strings, and header values are arrays so repeated headers are preserved. If a non-success response body cannot be read within the existing 2 MiB upstream limit, `responsebody` is omitted rather than reported as an empty body. APS does not add PBS-only `resolvedrequest` or `bidstatus` fields.
+This follows the Prebid Server `metadata.debug.httpcalls` representation. APS makes one direct HTTP call per provider per auction, and the map preserves the legacy `aps` key with one entry. Request and captured response bodies are strings, and header values are arrays so repeated headers are preserved. If a non-success response body cannot be read within the existing 2 MiB upstream limit, `responsebody` is omitted rather than reported as an empty body. APS does not add PBS-only `resolvedrequest` or `bidstatus` fields.
 
 The debug exchange is emitted for successful responses, `204 No Content`, malformed response bodies, and non-success HTTP statuses. Transport failures and auction timeouts happen before an HTTP response reaches the parser and continue to use the orchestrator's normal error metadata.
 
@@ -225,15 +291,22 @@ If script rendering requires weakening the outer sandbox, leave `allow_script_cr
 
 ## Migration from the legacy APS integration
 
-This release is a direct protocol cutover:
+This release is a direct configuration and protocol cutover:
 
-1. Replace the legacy `/e/dtb/bid` endpoint with `/e/pb/bid`.
-2. Rename `pub_id` to `account_id`.
-3. Remove APS-specific slot ID configuration and remove `aps` from Prebid Server bidder lists. Trusted Server also filters APS from PBS requests for this path.
-4. Prepare GAM line items and Universal Creative for `hb_bidder=aps` and the selected APS `hb_adid`.
+1. Move `endpoint` and `timeout_ms` to `[auction.providers.<id>]` and use
+   `/e/pb/bid`; `/e/dtb/bid` remains rejected.
+2. Move `account_id`, `debug`, `allow_script_creatives`, and inventory overrides
+   to the provider's `profile_config`; `pub_id` is not part of the new schema.
+3. Remove APS-specific slot ID configuration and any APS entry from old Prebid
+   Server bidder lists. Use `routing = "all_eligible"` or an explicit
+   `[auction.bidders.aps]` route.
+4. Prepare GAM line items and Universal Creative for `hb_bidder=aps` and the
+   selected APS `hb_adid`.
 5. Disable publisher-native APS demand for the Trusted Server test cohort.
 
-There is no legacy runtime switch. Roll back by disabling `[integrations.aps]`, restoring native APS for the cohort, or deploying the prior binary.
+There is no legacy runtime switch. Roll back by disabling `[auction]` or
+removing the APS provider, restoring native APS for the cohort, or deploying
+the prior binary.
 
 Changing `rendering_mode` does not update pages that are already loaded or stored in an HTML cache. A cached `trusted_server` page can continue requesting `/integrations/aps/renderer` after a native-mode deployment removes that route. A cached `publisher_native` page continues using its captured native mode after rollback. Coordinate the mode change with HTML cache expiry or purge and reload active test sessions before judging the result.
 
@@ -257,10 +330,12 @@ Use fictional values in source-controlled configuration and fixtures. Supply con
 - Confirm `account_id` and account eligibility with APS.
 - Confirm the endpoint is `/e/pb/bid` and uses HTTPS without credentials.
 - If the deployment hostname differs from APS-authorized inventory, configure both `inventory_domain` and `inventory_page_origin` with the APS-approved identity.
-- Ensure `aps` appears in `auction.providers`.
+- Ensure an `[auction.providers.<id>]` entry selects `profile = "aps"`.
 - Check aggregate APS drop reasons for currency, dimensions, render source, URL, tag type, or script-gate rejection.
 - Confirm the provider timeout fits inside the auction timeout.
-- On a controlled test site, set `debug = true` and inspect `ext.orchestrator.provider_details[].metadata.debug.httpcalls.aps` in the `/auction` response.
+- On a controlled test site, set profile `debug = true` and inspect
+  `ext.orchestrator.provider_details[].metadata.debug.httpcalls.aps` in the
+  `/auction` response.
 
 ### Winner targets but does not render
 

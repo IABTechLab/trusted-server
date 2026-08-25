@@ -179,6 +179,32 @@ pub async fn handle_auction(
     };
     let consent_context = ec_context.consent().clone();
 
+    if !orchestrator.is_enabled() {
+        log::info!("/auction: auction is disabled; returning no-bid response");
+        let auction_request = convert_tsjs_to_auction_request(
+            &body,
+            settings,
+            services,
+            &http_req,
+            consent_context,
+            ec_id,
+            None,
+        )?;
+        let empty_result = OrchestrationResult {
+            provider_responses: Vec::new(),
+            mediator_response: None,
+            winning_bids: HashMap::new(),
+            total_time_ms: 0,
+            metadata: HashMap::new(),
+        };
+        return convert_to_openrtb_response(
+            &empty_result,
+            settings,
+            &auction_request,
+            ec_context.ec_allowed(),
+        );
+    }
+
     // Server-side auction consent gate. The publisher-navigation and
     // `/_ts/page-bids` paths fail closed for GDPR/unknown jurisdictions that
     // lack effective TCF Purpose 1. `/auction` is the programmatic entry point
@@ -293,6 +319,7 @@ pub async fn handle_auction(
         settings,
         request: &http_req,
         timeout_ms: settings.auction.timeout_ms,
+        transport_timeout_ms: settings.auction.timeout_ms,
         provider_responses: None,
         services,
     };
@@ -632,7 +659,7 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl AuctionProvider for PanicOnBidProvider {
-        fn provider_name(&self) -> &'static str {
+        fn provider_name(&self) -> &str {
             "panic_provider"
         }
 
@@ -722,11 +749,13 @@ mod tests {
     #[tokio::test]
     async fn direct_auction_remains_available_when_templates_are_disabled() {
         let settings_toml = format!(
-            "{}\n[auction]\nenabled = true\nproviders = [\"template_switch_probe\"]\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
+            "{}\n[auction]\nenabled = true\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
             crate_test_settings_str()
         );
-        let settings = Settings::from_toml(&settings_toml)
+        let mut settings = Settings::from_toml(&settings_toml)
             .expect("should parse settings with disabled templates");
+        settings.auction.providers =
+            crate::auction::AuctionConfig::legacy_provider_map(&["template_switch_probe"]);
         let calls = Arc::new(Mutex::new(0));
         let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
         orchestrator.register_provider(Arc::new(TemplateSwitchProbeProvider {
@@ -788,7 +817,7 @@ mod tests {
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: true,
-            providers: vec!["panic_provider".to_string()],
+            providers: AuctionConfig::legacy_provider_map(&["panic_provider"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
@@ -872,7 +901,7 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl AuctionProvider for EidCapturingProvider {
-        fn provider_name(&self) -> &'static str {
+        fn provider_name(&self) -> &str {
             "eid_capturing_provider"
         }
 
@@ -916,7 +945,7 @@ mod tests {
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: true,
-            providers: vec!["eid_capturing_provider".to_string()],
+            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()

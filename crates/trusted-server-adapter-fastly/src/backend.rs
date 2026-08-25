@@ -1,13 +1,16 @@
-use core::fmt::Write as _;
 use std::time::Duration;
 
 use error_stack::{Report, ResultExt as _};
 use fastly::backend::Backend;
-use sha2::{Digest as _, Sha256};
 use url::Url;
 
 use trusted_server_core::error::TrustedServerError;
-use trusted_server_core::host_header::validate_host_header_override_value;
+use trusted_server_core::platform::{BackendNamingPolicy, PlatformBackendSpec, PredictedBackend};
+
+#[cfg(test)]
+const MAX_BACKEND_NAME_LEN: usize = 255;
+#[cfg(test)]
+const SPEC_DIGEST_HEX_LEN: usize = 32;
 
 /// Returns the default port for the given scheme (443 for HTTPS, 80 for HTTP).
 #[inline]
@@ -16,6 +19,44 @@ fn default_port_for_scheme(scheme: &str) -> u16 {
         443
     } else {
         80
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct NormalizedBackendHost {
+    identity: String,
+    authority: String,
+    is_ip_literal: bool,
+}
+
+/// Normalize URL-derived and direct hosts for transport and TLS use.
+///
+/// `url::Url::host_str()` preserves brackets around IPv6 literals. Fastly's
+/// backend target and HTTP authority require those brackets, while certificate
+/// identity matching requires the bare address and SNI must not be sent for IP
+/// literals.
+#[inline]
+fn normalize_backend_host(host: &str) -> NormalizedBackendHost {
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    match unbracketed.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) => NormalizedBackendHost {
+            identity: unbracketed.to_owned(),
+            authority: format!("[{unbracketed}]"),
+            is_ip_literal: true,
+        },
+        Ok(std::net::IpAddr::V4(_)) => NormalizedBackendHost {
+            identity: unbracketed.to_owned(),
+            authority: unbracketed.to_owned(),
+            is_ip_literal: true,
+        },
+        Err(_) => NormalizedBackendHost {
+            identity: host.to_owned(),
+            authority: host.to_owned(),
+            is_ip_literal: false,
+        },
     }
 }
 
@@ -29,52 +70,12 @@ fn default_port_for_scheme(scheme: &str) -> u16 {
 /// would generate URLs without the port when the Host header didn't include it.
 #[inline]
 fn compute_host_header(scheme: &str, host: &str, port: u16) -> String {
+    let host = normalize_backend_host(host).authority;
     if port == default_port_for_scheme(scheme) {
-        host.to_owned()
+        host
     } else {
         format!("{host}:{port}")
     }
-}
-
-fn sanitize_backend_name_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// Fastly's documented maximum length for a dynamic backend name.
-const MAX_BACKEND_NAME_LEN: usize = 255;
-/// Maximum length of the human-readable prefix folded into a backend name.
-///
-/// Bounds the name so that `backend_<prefix>_<digest>` can never exceed
-/// [`MAX_BACKEND_NAME_LEN`]: 8 (`backend_`) + 200 + 1 (`_`) +
-/// [`SPEC_DIGEST_HEX_LEN`] = 241 ≤ 255.
-const MAX_READABLE_PREFIX_LEN: usize = 200;
-/// Width of the hex digest suffix — the first 128 bits of a SHA-256 over the
-/// full backend spec, which is collision-resistant at the handful-of-hundreds
-/// scale of a service's dynamic backends.
-const SPEC_DIGEST_HEX_LEN: usize = 32;
-
-/// Hex-encode the first 128 bits of a SHA-256 digest of `canonical`.
-///
-/// Used to make a backend name a collision-resistant function of the complete
-/// backend spec (see [`BackendConfig::canonical_spec_string`]).
-fn spec_digest_hex(canonical: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(canonical.as_bytes());
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(SPEC_DIGEST_HEX_LEN);
-    for byte in digest.iter().take(SPEC_DIGEST_HEX_LEN / 2) {
-        write!(hex, "{byte:02x}").expect("should write hex digit to string");
-    }
-    hex
 }
 
 /// Default first-byte timeout for backends (15 seconds).
@@ -173,163 +174,47 @@ impl<'a> BackendConfig<'a> {
         self
     }
 
-    /// Build an unambiguous, length-prefixed encoding of the complete backend
-    /// spec for digesting.
-    ///
-    /// Every field is prefixed with its byte length so that no two distinct
-    /// specs can encode to the same string (a lossy substitution like
-    /// `sanitize_backend_name_component` cannot guarantee this). `Option` fields
-    /// are presence-tagged so a `None` never aliases a `Some("")`. The result is
-    /// fed to [`spec_digest_hex`]; it is never parsed, only hashed.
-    fn canonical_spec_string(&self, target_port: u16) -> String {
-        fn push_field(buf: &mut String, field: &str) {
-            buf.push_str(&field.len().to_string());
-            buf.push(':');
-            buf.push_str(field);
+    fn platform_spec(&self) -> PlatformBackendSpec {
+        PlatformBackendSpec {
+            scheme: self.scheme.to_owned(),
+            host: normalize_backend_host(self.host).identity,
+            port: self.port,
+            host_header_override: self.host_header_override.map(str::to_owned),
+            certificate_check: self.certificate_check,
+            first_byte_timeout: self.first_byte_timeout,
+            between_bytes_timeout: self.between_bytes_timeout,
+            discriminator: self.discriminator.map(str::to_owned),
         }
-
-        let mut buf = String::new();
-        push_field(&mut buf, self.scheme);
-        push_field(&mut buf, self.host);
-        push_field(&mut buf, &target_port.to_string());
-        push_field(&mut buf, if self.certificate_check { "1" } else { "0" });
-        match self.host_header_override {
-            Some(value) => {
-                buf.push('s');
-                push_field(&mut buf, value);
-            }
-            None => buf.push('n'),
-        }
-        match self.discriminator {
-            Some(value) => {
-                buf.push('s');
-                push_field(&mut buf, value);
-            }
-            None => buf.push('n'),
-        }
-        push_field(&mut buf, &self.first_byte_timeout.as_millis().to_string());
-        push_field(
-            &mut buf,
-            &self.between_bytes_timeout.as_millis().to_string(),
-        );
-        buf
     }
 
     /// Compute the deterministic backend name and resolved port without
     /// registering anything.
-    ///
-    /// The name is `backend_<readable>_<digest>`, where `<digest>` is a
-    /// collision-resistant SHA-256 over an unambiguous encoding of the
-    /// *complete* backend spec — scheme, host, port, certificate setting, Host
-    /// override, provider discriminator, and the first-byte/between-bytes
-    /// timeouts (see [`canonical_spec_string`](Self::canonical_spec_string)).
-    /// Because distinct specs yield distinct digests, name equality implies spec
-    /// equality: that is what makes reusing a `NameInUse` backend provably safe,
-    /// and it prevents "first-registration-wins" poisoning where a later request
-    /// with a tighter timeout would inherit an earlier registration's value. The
-    /// `<readable>` half is a lossy, bounded slug carried only for logs — any
-    /// collision there is harmless because uniqueness comes from the digest. The
-    /// whole name is bounded to [`MAX_BACKEND_NAME_LEN`] so a long host or
-    /// discriminator can never produce a name Fastly rejects at registration.
-    fn compute_name(&self) -> Result<(String, u16), Report<TrustedServerError>> {
-        if self.host.is_empty() {
-            return Err(Report::new(TrustedServerError::Proxy {
-                message: "missing host".to_owned(),
-            }));
-        }
-        if self.host.chars().any(char::is_control) {
-            return Err(Report::new(TrustedServerError::Proxy {
-                message: "host contains control characters".to_owned(),
-            }));
-        }
-        if self.scheme.chars().any(char::is_control) {
-            return Err(Report::new(TrustedServerError::Proxy {
-                message: "scheme contains control characters".to_owned(),
-            }));
-        }
-        if let Some(host_header_override) = self.host_header_override {
-            validate_host_header_override_value(host_header_override).map_err(|reason| {
-                Report::new(TrustedServerError::Proxy {
-                    message: format!("host header override {reason}"),
-                })
-            })?;
-        }
-
-        let target_port = self
-            .port
-            .unwrap_or_else(|| default_port_for_scheme(self.scheme));
-
-        let name_base = format!("{}_{}_{}", self.scheme, self.host, target_port);
-        let host_override_suffix = self
-            .host_header_override
-            .map(|host| format!("_oh_{}", sanitize_backend_name_component(host)))
-            .unwrap_or_default();
-        let cert_suffix = if self.certificate_check {
-            ""
-        } else {
-            "_nocert"
-        };
-        let discriminator_suffix = self
-            .discriminator
-            .map(|d| format!("_p_{}", sanitize_backend_name_component(d)))
-            .unwrap_or_default();
-        let first_byte_timeout_ms = self.first_byte_timeout.as_millis();
-        let between_bytes_timeout_ms = self.between_bytes_timeout.as_millis();
-
-        // Lossy, human-readable slug for logs. Correctness does not depend on
-        // it — uniqueness comes from the digest below — so it is bounded to a
-        // fixed length. Sanitization only emits ASCII, so a char-boundary take
-        // is byte-exact.
-        let readable_full = format!(
-            "{}{}{}{}_fb{}_bb{}",
-            sanitize_backend_name_component(&name_base),
-            host_override_suffix,
-            cert_suffix,
-            discriminator_suffix,
-            first_byte_timeout_ms,
-            between_bytes_timeout_ms
-        );
-        let readable: String = readable_full
-            .chars()
-            .take(MAX_READABLE_PREFIX_LEN)
-            .collect();
-
-        // Collision-resistant over the *complete* spec, so name equality implies
-        // spec equality and `NameInUse` reuse is safe.
-        let digest = spec_digest_hex(&self.canonical_spec_string(target_port));
-        let backend_name = format!("backend_{readable}_{digest}");
-
-        // Bounded by construction; assert it so any future format change fails
-        // attributably during prediction rather than at Fastly registration.
-        if backend_name.len() > MAX_BACKEND_NAME_LEN {
-            return Err(Report::new(TrustedServerError::Proxy {
-                message: format!(
-                    "backend name exceeds {MAX_BACKEND_NAME_LEN}-char limit ({} chars)",
-                    backend_name.len()
-                ),
-            }));
-        }
-
-        Ok((backend_name, target_port))
+    fn predict_backend(&self) -> Result<PredictedBackend, Report<TrustedServerError>> {
+        BackendNamingPolicy::Fastly
+            .predict(&self.platform_spec())
+            .change_context(TrustedServerError::Proxy {
+                message: "backend name prediction failed".to_owned(),
+            })
     }
 
     /// Return the deterministic backend name without registering anything.
     ///
-    /// Convenience wrapper over `Self::compute_name` that discards the
+    /// Convenience wrapper over `Self::predict_backend` that discards the
     /// resolved port, used by [`crate::platform::PlatformBackend`]
     /// implementations that only need the name for correlation.
     ///
     /// # Errors
     ///
     /// Returns an error if the host is empty.
+    #[allow(dead_code, reason = "retained for backend-name parity tests")]
     pub fn predict_name(self) -> Result<String, Report<TrustedServerError>> {
-        self.compute_name().map(|(name, _)| name)
+        self.predict_backend().map(|prediction| prediction.name)
     }
 
     /// Ensure a dynamic backend exists for this configuration and return its name.
     ///
     /// The name is a collision-resistant function of the complete backend spec
-    /// (see `Self::compute_name`), so different specs — for example, different
+    /// (see `Self::predict_backend`), so different specs — for example, different
     /// timeout values — always produce different backend registrations and a
     /// tight deadline cannot be silently widened by an earlier registration.
     ///
@@ -338,12 +223,15 @@ impl<'a> BackendConfig<'a> {
     /// Returns an error if the host is empty or if backend creation fails
     /// (except for `NameInUse` which reuses the existing backend).
     pub fn ensure(self) -> Result<String, Report<TrustedServerError>> {
-        let (backend_name, target_port) = self.compute_name()?;
+        let prediction = self.predict_backend()?;
+        let backend_name = prediction.name;
+        let target_port = prediction.port;
+        let host = normalize_backend_host(self.host);
 
-        let host_with_port = format!("{}:{}", self.host, target_port);
+        let host_with_port = format!("{}:{target_port}", host.authority);
 
         let host_header = self.host_header_override.map_or_else(
-            || compute_host_header(self.scheme, self.host, target_port),
+            || compute_host_header(self.scheme, &host.identity, target_port),
             str::to_owned,
         );
 
@@ -354,9 +242,12 @@ impl<'a> BackendConfig<'a> {
             .first_byte_timeout(self.first_byte_timeout)
             .between_bytes_timeout(self.between_bytes_timeout);
         if self.scheme.eq_ignore_ascii_case("https") {
-            builder = builder.enable_ssl().sni_hostname(self.host);
+            builder = builder.enable_ssl();
+            if !host.is_ip_literal {
+                builder = builder.sni_hostname(&host.identity);
+            }
             if self.certificate_check {
-                builder = builder.check_certificate(self.host);
+                builder = builder.check_certificate(&host.identity);
             } else {
                 log::warn!("INSECURE: certificate check disabled for backend: {backend_name}");
             }
@@ -474,7 +365,12 @@ impl<'a> BackendConfig<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendConfig, MAX_BACKEND_NAME_LEN, SPEC_DIGEST_HEX_LEN, compute_host_header};
+    use trusted_server_core::platform::BackendNamingError;
+
+    use super::{
+        BackendConfig, MAX_BACKEND_NAME_LEN, SPEC_DIGEST_HEX_LEN, compute_host_header,
+        normalize_backend_host,
+    };
 
     /// Assert a computed name is `backend_<body>_<hex digest>` and stays within
     /// Fastly's length limit. The digest is what makes the name injective, so
@@ -503,6 +399,63 @@ mod tests {
     }
 
     // Tests for compute_host_header - the fix for port preservation in Host header
+    #[test]
+    fn ipv6_hosts_are_bracketed_only_for_authority_values() {
+        let bare = normalize_backend_host("2001:db8::1");
+        let bracketed = normalize_backend_host("[2001:db8::1]");
+        assert_eq!(bare, bracketed);
+        assert_eq!(bare.identity, "2001:db8::1");
+        assert_eq!(bare.authority, "[2001:db8::1]");
+        assert!(bare.is_ip_literal, "IPv6 must not be sent as TLS SNI");
+        assert_eq!(
+            normalize_backend_host("cdn.example.com"),
+            super::NormalizedBackendHost {
+                identity: "cdn.example.com".to_string(),
+                authority: "cdn.example.com".to_string(),
+                is_ip_literal: false,
+            }
+        );
+        assert_eq!(
+            compute_host_header("https", "[2001:db8::1]", 443),
+            "[2001:db8::1]"
+        );
+        assert_eq!(
+            compute_host_header("https", "[2001:db8::1]", 8443),
+            "[2001:db8::1]:8443"
+        );
+    }
+
+    #[test]
+    fn url_derived_ipv6_host_uses_bare_tls_identity_without_sni() {
+        let (scheme, url_host, port) =
+            BackendConfig::parse_origin("https://[2001:db8::7]:8443/openrtb")
+                .expect("should parse IPv6 provider URL");
+        assert_eq!(scheme, "https");
+        assert_eq!(url_host, "[2001:db8::7]");
+        assert_eq!(port, Some(8443));
+
+        let normalized = normalize_backend_host(&url_host);
+        assert_eq!(normalized.identity, "2001:db8::7");
+        assert_eq!(normalized.authority, "[2001:db8::7]");
+        assert!(
+            normalized.is_ip_literal,
+            "IP literals must omit TLS SNI while retaining a bare certificate identity"
+        );
+
+        let from_url_name = BackendConfig::new(&scheme, &url_host)
+            .port(port)
+            .predict_name()
+            .expect("should predict URL-derived IPv6 backend name");
+        let from_bare_name = BackendConfig::new(&scheme, "2001:db8::7")
+            .port(port)
+            .predict_name()
+            .expect("should predict bare IPv6 backend name");
+        assert_eq!(
+            from_url_name, from_bare_name,
+            "URL and direct IPv6 paths must preserve backend naming parity"
+        );
+    }
+
     #[test]
     fn host_header_includes_port_for_non_standard_https() {
         assert_eq!(
@@ -584,8 +537,8 @@ mod tests {
             .predict_name()
             .expect_err("should reject host containing newline");
         assert!(
-            err.to_string().contains("control characters"),
-            "should report control characters in error message"
+            err.contains::<BackendNamingError>(),
+            "should preserve the backend naming error report context"
         );
     }
 
@@ -594,10 +547,9 @@ mod tests {
         let err = BackendConfig::new("https", "")
             .ensure()
             .expect_err("should reject empty host");
-        let msg = err.to_string();
         assert!(
-            msg.contains("missing host"),
-            "should report missing host in error message"
+            err.contains::<BackendNamingError>(),
+            "should preserve the original backend naming error report context"
         );
     }
 
@@ -617,13 +569,13 @@ mod tests {
 
     #[test]
     fn host_header_overrides_produce_different_names() {
-        let (name_a, _) = BackendConfig::new("https", "origin.example.com")
+        let name_a = BackendConfig::new("https", "origin.example.com")
             .host_header_override(Some("www.example.com"))
-            .compute_name()
+            .predict_name()
             .expect("should compute name with host header override");
-        let (name_b, _) = BackendConfig::new("https", "origin.example.com")
+        let name_b = BackendConfig::new("https", "origin.example.com")
             .host_header_override(Some("m.example.com"))
-            .compute_name()
+            .predict_name()
             .expect("should compute name with different host header override");
 
         assert_ne!(
@@ -648,8 +600,8 @@ mod tests {
             .expect_err("should reject host header override containing newline");
 
         assert!(
-            err.to_string().contains("control characters"),
-            "should report control characters in error message"
+            err.contains::<BackendNamingError>(),
+            "should preserve the backend naming error report context"
         );
     }
 
@@ -668,8 +620,8 @@ mod tests {
                 .expect_err("should reject invalid host header override");
 
             assert!(
-                err.to_string().contains("host header override"),
-                "should report host header override error for {host_header_override:?}"
+                err.contains::<BackendNamingError>(),
+                "should preserve the backend naming error report context for {host_header_override:?}"
             );
         }
     }
@@ -678,13 +630,13 @@ mod tests {
     fn different_timeouts_produce_different_names() {
         use std::time::Duration;
 
-        let (name_a, _) = BackendConfig::new("https", "origin.example.com")
+        let name_a = BackendConfig::new("https", "origin.example.com")
             .first_byte_timeout(Duration::from_secs(2))
-            .compute_name()
+            .predict_name()
             .expect("should compute name with 2000ms timeout");
-        let (name_b, _) = BackendConfig::new("https", "origin.example.com")
+        let name_b = BackendConfig::new("https", "origin.example.com")
             .first_byte_timeout(Duration::from_millis(500))
-            .compute_name()
+            .predict_name()
             .expect("should compute name with 500ms timeout");
         assert_ne!(
             name_a, name_b,
@@ -704,13 +656,13 @@ mod tests {
     fn different_between_bytes_timeouts_produce_different_names() {
         use std::time::Duration;
 
-        let (name_a, _) = BackendConfig::new("https", "origin.example.com")
+        let name_a = BackendConfig::new("https", "origin.example.com")
             .between_bytes_timeout(Duration::from_secs(2))
-            .compute_name()
+            .predict_name()
             .expect("should compute name with 2000ms between-bytes timeout");
-        let (name_b, _) = BackendConfig::new("https", "origin.example.com")
+        let name_b = BackendConfig::new("https", "origin.example.com")
             .between_bytes_timeout(Duration::from_millis(500))
-            .compute_name()
+            .predict_name()
             .expect("should compute name with 500ms between-bytes timeout");
 
         assert_ne!(
