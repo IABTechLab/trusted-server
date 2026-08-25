@@ -1,19 +1,37 @@
 DESCRIPTION >
-  Optional sampled Trusted Server access telemetry rows. Disabled by default in Fastly config.
+  Per-request phase-timing telemetry rows, sampled and emitted post-send by the edge service.
 
 SCHEMA >
   `event_ts` DateTime64(3),
   `method` LowCardinality(String),
-  `path` String,
   `status` UInt16,
   `time_elapsed_ms` UInt32,
-  `cache_state` LowCardinality(Nullable(String)),
-  `country` LowCardinality(String),
   `sample_rate` Float64,
+  `service_id` LowCardinality(String),
+  `publisher_domain` LowCardinality(String),
+  `env` LowCardinality(String),
+  `route_class` LowCardinality(String),
+  `route_template` String,
+  `body_mode` LowCardinality(String),
+  `auction_wait_placement` LowCardinality(String),
+  `appbuild_ms` Nullable(UInt32),
+  `filter_ms` Nullable(UInt32),
+  `geo_ms` Nullable(UInt32),
+  `kv_ms` Nullable(UInt32),
+  `origin_ms` Nullable(UInt32),
+  `template_cache_ms` Nullable(UInt32),
+  `auction_wait_ms` Nullable(UInt32),
+  `stream_ms` Nullable(UInt32),
+  `request_elapsed_ms` Nullable(UInt32),
+  `resp_bytes` Nullable(UInt64),
+  `template_cache_state` LowCardinality(String),
+  `country` LowCardinality(String),
+  `ts_version` LowCardinality(String),
+  `pop` LowCardinality(String),
   `event_date` Date DEFAULT toDate(event_ts)
 
 ENGINE "MergeTree"
-ENGINE_SORTING_KEY "event_date, path, status, method"
+ENGINE_SORTING_KEY "event_date, service_id, publisher_domain, env, route_class, pop, status"
 TTL "event_date + INTERVAL 30 DAY"
 
 TOKEN ts_access_ingest APPEND
