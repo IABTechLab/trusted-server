@@ -619,10 +619,10 @@ The auction preview validates the stored record and partner configuration, but c
 | `5xx`  | Unexpected configuration or KV failure (plaintext)          |
 
 ```bash
-curl -u admin:secure-password \
+curl -u 'admin:<resolved-admin-password>' \
   "https://edge.example.com/_ts/admin/ec/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.abc123"
 
-curl -u admin:secure-password \
+curl -u 'admin:<resolved-admin-password>' \
   --cookie "ts-ec=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.abc123" \
   "https://edge.example.com/_ts/admin/ec"
 ```
@@ -653,7 +653,7 @@ After successful authentication this endpoint always returns `200 OK`; missing o
 ```
 
 ```bash
-curl -u admin:secure-password \
+curl -u 'admin:<resolved-admin-password>' \
   --cookie "sharedId=fictional-shared-id" \
   "https://edge.example.com/_ts/admin/eids"
 ```
@@ -837,13 +837,16 @@ Endpoints under protected paths require HTTP Basic Authentication:
 [[handlers]]
 path = "^/_ts/admin"
 username = "admin"
-password = "secure-password"
+password = "admin_password"
 ```
+
+`password` is a key in the Trusted Server secret store. Provision the actual
+Basic Authentication password under `admin_password`.
 
 **Usage:**
 
 ```bash
-curl -u admin:secure-password https://edge.example.com/_ts/admin/keys/rotate
+curl -u 'admin:<resolved-admin-password>' https://edge.example.com/_ts/admin/keys/rotate
 ```
 
 **Protected Endpoints:**

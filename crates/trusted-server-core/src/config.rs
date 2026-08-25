@@ -191,7 +191,7 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                     optional_object("auth"),
                     object("access_key_id"),
                 ],
-                false,
+                true,
             ),
             field(
                 vec![
@@ -201,7 +201,7 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                     optional_object("auth"),
                     object("secret_access_key"),
                 ],
-                false,
+                true,
             ),
             field(
                 vec![
@@ -600,10 +600,10 @@ formats = [{ width = 300, height = 250 }]
                         .to_owned(),
                     true,
                 ),
-                ("proxy.asset_routes[*].auth.access_key_id".to_owned(), false),
+                ("proxy.asset_routes[*].auth.access_key_id".to_owned(), true),
                 (
                     "proxy.asset_routes[*].auth.secret_access_key".to_owned(),
-                    false,
+                    true,
                 ),
                 ("proxy.asset_routes[*].auth.session_token".to_owned(), true),
             ],
@@ -616,6 +616,19 @@ formats = [{ width = 300, height = 250 }]
             )),
             "all Trusted Server app secrets should use the default secret store"
         );
+    }
+
+    #[test]
+    fn omitted_s3_secret_references_materialize_as_defaults() {
+        let auth: S3SigV4AuthConfig =
+            toml::from_str("region = \"us-east-1\"").expect("should apply S3 secret defaults");
+
+        assert_eq!(auth.access_key_id.expose(), "access_key_id");
+        assert_eq!(auth.secret_access_key.expose(), "secret_access_key");
+
+        let serialized = serde_json::to_value(auth).expect("should serialize S3 auth");
+        assert_eq!(serialized["access_key_id"], "access_key_id");
+        assert_eq!(serialized["secret_access_key"], "secret_access_key");
     }
 
     #[test]
