@@ -5,7 +5,7 @@ SCHEMA >
   `event_ts` DateTime64(3),
   `method` LowCardinality(String),
   `status` UInt16,
-  `time_elapsed_ms` UInt32,
+  `time_elapsed_ms` Nullable(UInt32),
   `sample_rate` Float64,
   `service_id` LowCardinality(String),
   `publisher_domain` LowCardinality(String),

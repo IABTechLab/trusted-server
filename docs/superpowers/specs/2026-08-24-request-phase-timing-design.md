@@ -275,7 +275,8 @@ Cloudflare and Spin: collection compiles, no emission wiring in v1 (unchanged).
 Extends the reserved `tinybird/datasources/access_logs_raw.datasource`.
 
 Kept columns: `event_ts`, `method`, `status`, `time_elapsed_ms` (defined as the
-`mark_headers_ready()` snapshot), `sample_rate`, `event_date`, 30-day TTL.
+`mark_headers_ready()` snapshot; nullable because a contended lock drop can lose the
+snapshot), `sample_rate`, `event_date`, 30-day TTL.
 
 Removed: raw `path`. Route identifiers like `/_ts/admin/ec/{id}` would otherwise put
 EC identifiers into a 30-day dataset, and publisher paths carry unbounded cardinality
