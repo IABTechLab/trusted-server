@@ -70,7 +70,7 @@ use crate::platform::{
     contains_publisher_esi_directive,
 };
 use crate::price_bucket::{PriceGranularity, price_bucket};
-use crate::request_timing::{Phase, RequestTimings};
+use crate::request_timing::{AuctionWaitPlacement, Phase, RequestTimings};
 use crate::response_privacy::{
     apply_inactive_ad_stack_browser_cache_policy, cache_control_forbids_shared_storage,
     enforce_synthesized_html_cache_privacy, enforce_terminal_private_cache_privacy,
@@ -1617,6 +1617,12 @@ pub struct OwnedProcessResponseParams {
     /// rescanned from the output, which cannot tell a `nonce` attribute from the same
     /// word inside a script.
     pub(crate) csp_nonce_observed: Option<Arc<AtomicBool>>,
+    /// Per-request phase-timing handle, carried into the streaming/buffered
+    /// finalizers so the `</body>` seam wait can be recorded with the right
+    /// [`AuctionWaitPlacement`]. Cheap to clone (an `Arc` handle); a request that
+    /// never attached one to its extensions gets a fresh, unattached collector
+    /// that nothing ever renders.
+    pub(crate) timings: RequestTimings,
 }
 
 /// Response-authorized template cache insert inputs. The key is built before origin lookup; the
@@ -1860,6 +1866,8 @@ pub async fn buffer_publisher_response_async(
                             &params.request_scheme,
                             &params.request_host,
                         ),
+                        timings: params.timings.clone(),
+                        placement: AuctionWaitPlacement::PreHeader,
                     },
                 )
                 .await;
@@ -2019,6 +2027,7 @@ fn build_template_assembly_params(
     request_scheme: &str,
     price_granularity: PriceGranularity,
     ad_bids_state: AdBidsState,
+    timings: RequestTimings,
 ) -> OwnedProcessResponseParams {
     OwnedProcessResponseParams {
         csp_nonce_observed: None,
@@ -2041,6 +2050,7 @@ fn build_template_assembly_params(
         price_granularity,
         gpt_diagnostics: None,
         suppress_datadome_client_side_tag: false,
+        timings,
     }
 }
 
@@ -2383,6 +2393,8 @@ pub async fn publisher_response_into_streaming_response(
                                 &params.request_scheme,
                                 &params.request_host,
                             ),
+                            timings: params.timings.clone(),
+                            placement: AuctionWaitPlacement::InStream,
                         },
                     )
                     .await;
@@ -2501,6 +2513,7 @@ pub async fn publisher_response_into_streaming_response(
                             &orchestrator,
                             &services,
                             &settings,
+                            AuctionWaitPlacement::InStream,
                         )
                         .await;
                         // Collection reached a terminal result; disarm only now
@@ -2522,6 +2535,8 @@ pub async fn publisher_response_into_streaming_response(
                             &params.request_scheme,
                             &params.request_host,
                         ),
+                        timings: params.timings.clone(),
+                        placement: AuctionWaitPlacement::InStream,
                     };
 
                     while let Some(step) = hold_step_next_chunk(
@@ -2857,6 +2872,7 @@ pub async fn stream_publisher_body_async<W: Write>(
             orchestrator,
             services,
             settings,
+            AuctionWaitPlacement::PreHeader,
         )
         .await;
         if body.is_stream() {
@@ -2923,6 +2939,8 @@ pub async fn stream_publisher_body_async<W: Write>(
                 services,
                 settings,
                 request_origin: request_origin(&params.request_scheme, &params.request_host),
+                timings: params.timings.clone(),
+                placement: AuctionWaitPlacement::PreHeader,
             },
         },
     )
@@ -3490,6 +3508,12 @@ struct AuctionCollectDeps<'a> {
     settings: &'a Settings,
     /// Trusted request origin (`scheme://host`) for absolute inline creative URLs.
     request_origin: String,
+    /// Phase-timing handle the collect step records the auction wait into.
+    timings: RequestTimings,
+    /// Where this collect call sits relative to response headers: streaming
+    /// callers await inside the body already handed to the client, buffered
+    /// callers await before anything has been sent.
+    placement: AuctionWaitPlacement,
 }
 
 /// Run the close-body hold loop for HTML bodies, collecting the auction before
@@ -3870,6 +3894,11 @@ async fn emit_abandoned_auction(
 /// Collect a dispatched auction before a non-HTML body streams: there is no
 /// `</body>` to inject into, so bids are written to state up front and the
 /// auction telemetry completes immediately.
+///
+/// `placement` records where this wait sits relative to response headers — the
+/// caller decides, since this collector runs from both the buffered finalizer
+/// (headers not yet committed) and the true streaming path (headers already
+/// sent, this body only just started being polled).
 async fn collect_non_html_auction(
     dispatched: DispatchedAuction,
     telemetry: AuctionTelemetryCarry,
@@ -3877,12 +3906,14 @@ async fn collect_non_html_auction(
     orchestrator: &AuctionOrchestrator,
     services: &RuntimeServices,
     settings: &Settings,
+    placement: AuctionWaitPlacement,
 ) {
     let auction_id = telemetry
         .auction_request
         .as_ref()
         .and_then(|_| diagnostics_auction_id(settings));
     let placeholder = mediator_placeholder_request();
+    let wait_started = Instant::now();
     let result = orchestrator
         .collect_dispatched_auction(
             dispatched,
@@ -3890,6 +3921,9 @@ async fn collect_non_html_auction(
             &make_collect_context(settings, services, &placeholder),
         )
         .await;
+    params
+        .timings
+        .record_auction_wait(placement, wait_started.elapsed());
     let delivered_winner_slots = write_bids_to_state(
         &result.winning_bids,
         params.price_granularity,
@@ -3931,6 +3965,8 @@ async fn collect_stream_auction(
         services,
         settings,
         request_origin,
+        timings,
+        placement,
     } = deps;
     let auction_id = telemetry
         .auction_request
@@ -3939,9 +3975,11 @@ async fn collect_stream_auction(
     log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
     let placeholder = mediator_placeholder_request();
     let collect_ctx = make_collect_context(settings, services, &placeholder);
+    let wait_started = Instant::now();
     let result = orchestrator
         .collect_dispatched_auction(dispatched, services, &collect_ctx)
         .await;
+    timings.record_auction_wait(*placement, wait_started.elapsed());
     log::info!(
         "body_close_hold_loop: collect complete - {} winning bid(s)",
         result.winning_bids.len()
@@ -4538,6 +4576,7 @@ pub async fn handle_publisher_request(
                         request_scheme,
                         price_granularity,
                         ad_bids_state.clone(),
+                        timings.clone(),
                     );
                     params.seam_ad_slots = seam_ad_slots.clone();
                     params.dispatched_auction = dispatched_auction.take();
@@ -4910,6 +4949,7 @@ pub async fn handle_publisher_request(
                     dispatched_auction,
                     price_granularity,
                     gpt_diagnostics: Some(gpt_diagnostics),
+                    timings: timings.clone(),
                 }),
             })
         }
@@ -7546,6 +7586,7 @@ mod tests {
             price_granularity: Default::default(),
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            timings: RequestTimings::new(),
         }
     }
 
@@ -14592,6 +14633,8 @@ mod tests {
                 services: &services,
                 settings: &settings,
                 request_origin: String::new(),
+                timings: RequestTimings::new(),
+                placement: AuctionWaitPlacement::PreHeader,
             },
         };
         let mut output = Vec::new();
@@ -14641,6 +14684,8 @@ mod tests {
             services: &services,
             settings: &settings,
             request_origin: String::new(),
+            timings: RequestTimings::new(),
+            placement: AuctionWaitPlacement::PreHeader,
         };
         // Passthrough processor: the ordering contract is about collection, not
         // HTML rewriting, so keep the emitted bytes verbatim.
@@ -15517,6 +15562,7 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            timings: RequestTimings::new(),
         };
 
         let mut output = Vec::new();
@@ -15570,6 +15616,7 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            timings: RequestTimings::new(),
         };
 
         let mut output = Vec::new();
@@ -15612,6 +15659,7 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            timings: RequestTimings::new(),
         };
         let body = EdgeBody::from_stream(futures::stream::iter(vec![Ok::<_, io::Error>(
             bytes::Bytes::from_static(b"<html><body>live</body></html>"),
@@ -15732,6 +15780,7 @@ mod tests {
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
                 suppress_datadome_client_side_tag: false,
+                timings: RequestTimings::new(),
             };
             let body = EdgeBody::stream(futures::stream::iter(vec![
                 bytes::Bytes::from_static(b"body{background:url('https://origin.example.com/"),
@@ -15790,6 +15839,7 @@ mod tests {
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
                 suppress_datadome_client_side_tag: false,
+                timings: RequestTimings::new(),
             };
             let compressed =
                 gzip_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -15851,6 +15901,7 @@ mod tests {
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
                 suppress_datadome_client_side_tag: false,
+                timings: RequestTimings::new(),
             };
             let compressed =
                 deflate_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -15912,6 +15963,7 @@ mod tests {
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
                 suppress_datadome_client_side_tag: false,
+                timings: RequestTimings::new(),
             };
             let compressed =
                 brotli_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -15973,6 +16025,7 @@ mod tests {
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
                 suppress_datadome_client_side_tag: false,
+                timings: RequestTimings::new(),
             };
             let compressed =
                 brotli_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -16022,6 +16075,7 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            timings: RequestTimings::new(),
         }
     }
 
@@ -16221,6 +16275,7 @@ mod tests {
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
                 suppress_datadome_client_side_tag: false,
+                timings: RequestTimings::new(),
             };
             let body = EdgeBody::stream(futures::stream::iter(vec![
                 bytes::Bytes::from_static(b"<html><head></head><body>hello"),
@@ -16290,6 +16345,7 @@ mod tests {
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
                 suppress_datadome_client_side_tag: false,
+                timings: RequestTimings::new(),
             };
             // The `</body>` that triggers bid injection lives in the SECOND gzip
             // member. `flate2::read::GzDecoder` decodes only the first member, so
@@ -16358,6 +16414,7 @@ mod tests {
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
                 suppress_datadome_client_side_tag: false,
+                timings: RequestTimings::new(),
             };
             let body = EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
                 b"body{background:url('https://origin.example.com/asset.png')}",
@@ -16419,6 +16476,7 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            timings: RequestTimings::new(),
         };
         let publisher_response = PublisherResponse::Stream {
             response,
@@ -16568,6 +16626,7 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            timings: RequestTimings::new(),
         }
     }
 
@@ -16958,6 +17017,7 @@ mod tests {
                 price_granularity: PriceGranularity::default(),
                 gpt_diagnostics: None,
                 suppress_datadome_client_side_tag: false,
+                timings: RequestTimings::new(),
             }
         };
         let make_stream_response = || PublisherResponse::Stream {
@@ -17018,6 +17078,149 @@ mod tests {
         .expect("buffered finalize should succeed");
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
         assert_bodiless_abandoned(&buffered_sink);
+    }
+
+    #[test]
+    fn streaming_seam_wait_records_in_stream_placement() {
+        // The true Fastly streaming path: `publisher_response_into_streaming_response`
+        // hands back a lazy body after headers have already been committed by
+        // `stream_to_client()`. The `</body>` seam wait polled from inside that body
+        // must therefore be attributed `InStream`, never `PreHeader`.
+        let settings = Arc::new(create_test_settings());
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let timings = RequestTimings::new();
+
+        let mut params = make_stream_params(&settings, "");
+        params.content_type = "text/html; charset=utf-8".to_string();
+        params.dispatched_auction = Some(DispatchedAuction::empty_for_test(
+            test_auction_request(),
+            500,
+        ));
+        params.auction_request = Some(test_auction_request());
+        params.timings = timings.clone();
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        let body = EdgeBody::stream(futures::stream::iter(vec![
+            bytes::Bytes::from_static(b"<html><head></head><body>hello"),
+            bytes::Bytes::from_static(b"</body></html>"),
+        ]));
+
+        let response = futures::executor::block_on(publisher_response_into_streaming_response(
+            PublisherResponse::Stream {
+                response,
+                body,
+                params: Box::new(params),
+            },
+            &Method::GET,
+            Arc::clone(&settings),
+            &registry,
+            Arc::clone(&orchestrator),
+            noop_services(),
+        ))
+        .expect("streaming finalize should succeed");
+
+        // The wait is only recorded once the lazy body is actually polled — the
+        // finalizer call above only constructs it.
+        let drained = futures::executor::block_on(
+            response
+                .into_body()
+                .into_bytes_bounded(settings.publisher.max_buffered_body_bytes),
+        )
+        .expect("body should drain");
+        assert!(
+            String::from_utf8_lossy(&drained).contains("hello"),
+            "should still stream the document"
+        );
+
+        let snapshot = timings.snapshot();
+        assert_eq!(
+            snapshot.auction_wait_placement,
+            Some(AuctionWaitPlacement::InStream),
+            "the streaming seam wait must be attributed InStream"
+        );
+        assert!(
+            snapshot.auction_wait_ms.is_some(),
+            "should record an auction wait duration"
+        );
+    }
+
+    #[test]
+    fn buffered_template_miss_records_pre_header_placement() {
+        // The buffered finalizer materializes the entire response — headers and
+        // body — before any of it reaches the client. Even though the wait runs
+        // through the same `</body>` seam code path as the streaming finalizer
+        // above, headers have not committed here, so it must be attributed
+        // `PreHeader`. (This exercises the same collect step a shared-template
+        // authorized miss rides through: `template_cache_key`'s presence only
+        // changes what happens *after* collection — whether the transformed bytes
+        // are stored — not where the wait itself is measured.)
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let services = noop_services();
+        let timings = RequestTimings::new();
+
+        let mut params = make_stream_params(&settings, "");
+        params.content_type = "text/html; charset=utf-8".to_string();
+        params.dispatched_auction = Some(DispatchedAuction::empty_for_test(
+            test_auction_request(),
+            500,
+        ));
+        params.auction_request = Some(test_auction_request());
+        params.timings = timings.clone();
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        let body = EdgeBody::stream(futures::stream::iter(vec![
+            bytes::Bytes::from_static(b"<html><head></head><body>hello"),
+            bytes::Bytes::from_static(b"</body></html>"),
+        ]));
+
+        let response = futures::executor::block_on(buffer_publisher_response_async(
+            PublisherResponse::Stream {
+                response,
+                body,
+                params: Box::new(params),
+            },
+            &Method::GET,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        ))
+        .expect("buffered finalize should succeed");
+
+        let html = String::from_utf8(
+            response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_default()
+                .to_vec(),
+        )
+        .expect("should be valid UTF-8");
+        assert!(html.contains("hello"), "should still assemble the document");
+
+        let snapshot = timings.snapshot();
+        assert_eq!(
+            snapshot.auction_wait_placement,
+            Some(AuctionWaitPlacement::PreHeader),
+            "the buffered finalizer's wait must be attributed PreHeader even though \
+             it shares the </body> seam code path with the streaming finalizer"
+        );
+        assert!(
+            snapshot.auction_wait_ms.is_some(),
+            "should record an auction wait duration"
+        );
     }
 
     #[test]
@@ -17142,6 +17345,7 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            timings: RequestTimings::new(),
         };
         let publisher_response = PublisherResponse::Stream {
             response,
@@ -17214,6 +17418,7 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            timings: RequestTimings::new(),
         };
         let mut output = Vec::new();
 
@@ -17269,6 +17474,7 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            timings: RequestTimings::new(),
         };
 
         let bogus_body = EdgeBody::from(b"<html>not gzip</html>".to_vec());
@@ -17382,6 +17588,7 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            timings: RequestTimings::new(),
         };
         let mut output = Vec::new();
         stream_publisher_body(body, &mut output, &params, &settings, &registry)
@@ -17444,6 +17651,7 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            timings: RequestTimings::new(),
         };
 
         let mut output = Vec::new();

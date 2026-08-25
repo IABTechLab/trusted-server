@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
 use edgezero_adapter_fastly::request::into_core_request;
@@ -405,10 +406,15 @@ pub(crate) struct DeliveryOutcome {
 }
 
 /// Whether [`send_edgezero_response`] completed delivery or failed partway.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DeliveryResult {
     /// The response was handed to the client in full.
     Complete,
-    /// Delivery failed partway through.
+    /// Delivery started but did not finish cleanly: some bytes reached the
+    /// client's transport before a stream error, or the transport could not
+    /// be closed cleanly after every byte was written.
+    Partial,
+    /// Delivery failed before any bytes reached the client.
     Error,
 }
 
@@ -448,6 +454,93 @@ pub(crate) fn apply_server_timing_header(
     }
 }
 
+/// A [`Write`](std::io::Write) wrapper that tallies bytes successfully written
+/// to the inner writer.
+///
+/// Wraps the client transport during a streaming drive so a truncated or
+/// failed drive still reports how many bytes actually reached it, instead of
+/// the placeholder `0` a failed/aborted drive would otherwise report.
+struct CountingWriter<W> {
+    inner: W,
+    bytes: u64,
+}
+
+impl<W> CountingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, bytes: 0 }
+    }
+
+    /// Bytes successfully written to the inner writer so far.
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.bytes = self.bytes.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Drives a streaming `EdgeZero` body through `output`, tallying bytes written
+/// and timing the drive into `timings`.
+///
+/// Stamps `resp_bytes` and `request_elapsed` immediately once the drive
+/// returns — before the caller does anything transport-specific (finishing
+/// the streaming body, logging) — so `request_elapsed` never includes that
+/// work. Returns the counting writer (so the caller can recover both the
+/// tallied byte count and the wrapped transport) alongside the drive's
+/// result.
+fn drive_streaming_body<W: std::io::Write>(
+    body: EdgeBody,
+    output: W,
+    timings: &RequestTimings,
+) -> (CountingWriter<W>, Result<(), Report<TrustedServerError>>) {
+    let mut counting = CountingWriter::new(output);
+    let drive_started = Instant::now();
+    let result = futures::executor::block_on(stream_asset_body(body, &mut counting));
+    timings.record(Phase::Stream, drive_started.elapsed());
+    timings.set_resp_bytes(counting.bytes());
+    timings.mark_request_elapsed();
+    (counting, result)
+}
+
+/// Classifies a completed streaming drive into a [`DeliveryResult`].
+///
+/// A drive that failed after writing at least one byte delivered a truncated
+/// response rather than nothing at all, so it is [`DeliveryResult::Partial`],
+/// not [`DeliveryResult::Error`].
+fn classify_stream_delivery(
+    drive_result: &Result<(), Report<TrustedServerError>>,
+    bytes: u64,
+) -> DeliveryResult {
+    match drive_result {
+        Ok(()) => DeliveryResult::Complete,
+        Err(_) if bytes > 0 => DeliveryResult::Partial,
+        Err(_) => DeliveryResult::Error,
+    }
+}
+
+/// Stamps `resp_bytes`/`request_elapsed` for an already-materialized body,
+/// immediately before it is handed to the Fastly client transport, and
+/// returns its byte length.
+fn record_buffered_delivery(body: &EdgeBody, timings: &RequestTimings) -> u64 {
+    let bytes = u64::try_from(body.as_bytes().map(<[u8]>::len).unwrap_or(0)).unwrap_or(u64::MAX);
+    timings.set_resp_bytes(bytes);
+    timings.mark_request_elapsed();
+    bytes
+}
+
 /// Sends a finalized `EdgeZero` response to the client.
 ///
 /// Streaming `EdgeZero` bodies commit headers first, then pipe chunks to Fastly's
@@ -473,30 +566,40 @@ fn send_edgezero_response(
                 parts,
                 EdgeBody::empty(),
             ));
-            let mut streaming_body = skeleton.stream_to_client();
-            match futures::executor::block_on(stream_asset_body(body, &mut streaming_body)) {
-                Ok(()) => {
-                    if let Err(e) = streaming_body.finish() {
-                        log::error!("failed to finish EdgeZero streaming body: {e}");
-                    }
-                    DeliveryOutcome {
-                        bytes: 0,
+            let (counting, drive_result) =
+                drive_streaming_body(body, skeleton.stream_to_client(), &context.timings);
+            let bytes = counting.bytes();
+            let streaming_body = counting.into_inner();
+            // Computed before `drive_result` is matched by value below, since
+            // the `Err` arm there moves its `Report` out.
+            let result = classify_stream_delivery(&drive_result, bytes);
+            match drive_result {
+                Ok(()) => match streaming_body.finish() {
+                    Ok(()) => DeliveryOutcome {
+                        bytes,
                         result: DeliveryResult::Complete,
+                    },
+                    Err(e) => {
+                        // Every byte was handed to the transport (the drive
+                        // above returned Ok), but the transport itself could
+                        // not close cleanly — the client may still see a
+                        // truncated response.
+                        log::error!("failed to finish EdgeZero streaming body: {e}");
+                        DeliveryOutcome {
+                            bytes,
+                            result: DeliveryResult::Partial,
+                        }
                     }
-                }
+                },
                 Err(e) => {
                     log::error!("EdgeZero streaming failed: {e:?}");
                     drop(streaming_body);
-                    DeliveryOutcome {
-                        bytes: 0,
-                        result: DeliveryResult::Error,
-                    }
+                    DeliveryOutcome { bytes, result }
                 }
             }
         }
         once => {
-            let bytes =
-                u64::try_from(once.as_bytes().map(<[u8]>::len).unwrap_or(0)).unwrap_or(u64::MAX);
+            let bytes = record_buffered_delivery(&once, &context.timings);
             compat::to_fastly_response(HttpResponse::from_parts(parts, once)).send_to_client();
             DeliveryOutcome {
                 bytes,
@@ -687,7 +790,9 @@ mod tests {
     use edgezero_core::http::HeaderValue;
     use edgezero_core::http::response_builder;
     use fastly::mime;
+    use std::time::Duration;
     use trusted_server_core::integrations::HeaderMutation;
+    use trusted_server_core::request_timing::AuctionWaitPlacement;
 
     fn test_settings() -> Settings {
         Settings::from_toml(
@@ -1142,6 +1247,138 @@ mod tests {
         assert!(
             header.contains("ts-kv"),
             "the freeze point must run after EC finalization recorded KV time: {header}"
+        );
+    }
+
+    #[test]
+    fn delivery_outcome_reports_bytes_and_request_elapsed_set() {
+        let timings = RequestTimings::new();
+        let body = EdgeBody::stream(futures::stream::iter(vec![
+            bytes::Bytes::from_static(b"hello "),
+            bytes::Bytes::from_static(b"world"),
+        ]));
+
+        let (counting, drive_result) = drive_streaming_body(body, Vec::new(), &timings);
+        drive_result.expect("streaming a well-formed body should not fail");
+        let bytes = counting.bytes();
+        let outcome = DeliveryOutcome {
+            bytes,
+            result: DeliveryResult::Complete,
+        };
+
+        assert_eq!(
+            counting.into_inner(),
+            b"hello world",
+            "should write every byte to the underlying transport"
+        );
+        assert_eq!(
+            outcome.bytes,
+            "hello world".len() as u64,
+            "DeliveryOutcome.bytes should equal the streamed body length"
+        );
+
+        let snapshot = timings.snapshot();
+        assert_eq!(
+            snapshot.resp_bytes,
+            Some("hello world".len() as u64),
+            "should stamp resp_bytes to the tallied byte count"
+        );
+        assert!(
+            snapshot.request_elapsed_ms.is_some(),
+            "should stamp request_elapsed once the drive returns"
+        );
+    }
+
+    #[test]
+    fn buffered_delivery_stamps_bytes_and_request_elapsed() {
+        let timings = RequestTimings::new();
+        let body = EdgeBody::from(b"a buffered body".to_vec());
+
+        let bytes = record_buffered_delivery(&body, &timings);
+
+        assert_eq!(
+            bytes,
+            "a buffered body".len() as u64,
+            "should report the buffered body length"
+        );
+        let snapshot = timings.snapshot();
+        assert_eq!(
+            snapshot.resp_bytes,
+            Some("a buffered body".len() as u64),
+            "should stamp resp_bytes for the buffered path too"
+        );
+        assert!(
+            snapshot.request_elapsed_ms.is_some(),
+            "should stamp request_elapsed for the buffered path too"
+        );
+    }
+
+    #[test]
+    fn stream_drive_records_stream_ms_covering_the_in_stream_auction_wait() {
+        // A streaming seam wait (Task 6, publisher.rs) records into the same
+        // `RequestTimings` handle the adapter drives with. `Phase::Stream`
+        // wraps the entire drive, so it must cover — and therefore be at
+        // least as large as — any `AuctionWait` recorded while the body was
+        // being polled.
+        let timings = RequestTimings::new();
+        let wait_timings = timings.clone();
+        let stream = futures::stream::once(async move {
+            let waited = Duration::from_millis(5);
+            std::thread::sleep(waited);
+            wait_timings.record_auction_wait(AuctionWaitPlacement::InStream, waited);
+            bytes::Bytes::from_static(b"<html></html>")
+        });
+        let body = EdgeBody::stream(stream);
+
+        let (_counting, drive_result) = drive_streaming_body(body, Vec::new(), &timings);
+        drive_result.expect("streaming a well-formed body should not fail");
+
+        let snapshot = timings.snapshot();
+        assert_eq!(
+            snapshot.auction_wait_placement,
+            Some(AuctionWaitPlacement::InStream),
+            "should preserve the placement recorded from inside the polled body"
+        );
+        let auction_wait_ms = snapshot
+            .auction_wait_ms
+            .expect("should record the auction wait");
+        let stream_ms = snapshot.stream_ms.expect("should record the stream drive");
+        assert!(
+            stream_ms >= auction_wait_ms,
+            "the drive's Phase::Stream span must cover the in-stream auction wait: \
+             stream_ms={stream_ms} auction_wait_ms={auction_wait_ms}"
+        );
+    }
+
+    #[test]
+    fn classify_stream_delivery_treats_bytes_written_before_an_error_as_partial() {
+        let err = Report::new(TrustedServerError::Proxy {
+            message: "boom".to_string(),
+        });
+        assert_eq!(
+            classify_stream_delivery(&Err(err), 42),
+            DeliveryResult::Partial,
+            "bytes already on the wire before a stream error is a truncated delivery"
+        );
+    }
+
+    #[test]
+    fn classify_stream_delivery_treats_an_error_with_no_bytes_as_error() {
+        let err = Report::new(TrustedServerError::Proxy {
+            message: "boom".to_string(),
+        });
+        assert_eq!(
+            classify_stream_delivery(&Err(err), 0),
+            DeliveryResult::Error,
+            "a failure before any byte reached the client is a clean failure, not a truncation"
+        );
+    }
+
+    #[test]
+    fn classify_stream_delivery_treats_ok_as_complete() {
+        assert_eq!(
+            classify_stream_delivery(&Ok(()), 123),
+            DeliveryResult::Complete
         );
     }
 }
