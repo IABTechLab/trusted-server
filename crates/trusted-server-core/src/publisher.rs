@@ -7972,9 +7972,8 @@ mod tests {
                 "prebid".to_string(),
                 serde_json::json!({
                     "enabled": enabled,
-                    "server_url": "https://prebid.example.com/openrtb2/auction",
                     "external_bundle_url": "https://assets.example.com/prebid/bundle.js",
-                    "timeout": timeout_ms,
+                    "timeout_ms": timeout_ms,
                 }),
             );
             settings
@@ -8758,6 +8757,7 @@ mod tests {
                         creative: None,
                         adomain: None,
                         bidder: STUB_BIDDER.to_string(),
+                        returned_seat: None,
                         width: 728,
                         height: 90,
                         nurl: None,
@@ -8791,7 +8791,8 @@ mod tests {
         /// [`settings_with_mode`], with an auction provider that actually bids.
         fn settings_with_bidder(mode: &str) -> Settings {
             let mut settings = settings_with_mode(mode);
-            settings.auction.providers = vec![STUB_BIDDER.to_string()];
+            settings.auction.providers =
+                crate::auction_config_types::AuctionConfig::legacy_provider_map(&[STUB_BIDDER]);
             settings
         }
 
@@ -10438,9 +10439,8 @@ mod tests {
                 "prebid".to_string(),
                 serde_json::json!({
                     "enabled": true,
-                    "server_url": "https://prebid.example.com/openrtb2/auction",
                     "external_bundle_url": "https://assets.example.com/prebid/bundle.js",
-                    "timeout": timeout_ms,
+                    "timeout_ms": timeout_ms,
                 }),
             );
             settings
@@ -12981,7 +12981,7 @@ mod tests {
             let orchestrator = crate::auction::build_orchestrator_with_plan(plan, &settings)
                 .expect("should build signed plan-backed orchestrator");
             let stub = Arc::new(StubHttpClient::new());
-            queue_cacheable_html_response(&stub);
+            queue_html_response_with_cache_control(&stub, "public, max-age=300");
             let services = services_with_telemetry(
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
                 Arc::new(RecordingTelemetrySink::default()),
@@ -18299,6 +18299,7 @@ mod tests {
                 creative: Some(creative.to_string()),
                 adomain: None,
                 bidder: "prebid".to_string(),
+                returned_seat: None,
                 width: 300,
                 height: 250,
                 nurl: None,

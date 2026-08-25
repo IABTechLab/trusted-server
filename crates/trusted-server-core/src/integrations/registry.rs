@@ -782,6 +782,19 @@ pub struct IntegrationRegistry {
 }
 
 impl IntegrationRegistry {
+    /// Build a registry and auction plan from the provided settings for tests.
+    ///
+    /// Runtime adapters should compile one plan and pass it to [`Self::with_plan`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the auction plan or integration registry is invalid.
+    #[cfg(test)]
+    pub fn new(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
+        let plan = Arc::new(crate::auction::compile_auction_plan(settings)?);
+        Self::with_plan(settings, plan)
+    }
+
     /// Build a registry from the provided settings.
     ///
     /// # Errors
@@ -801,7 +814,7 @@ impl IntegrationRegistry {
         {
             registrations.push(registration);
         }
-        if let Some(registration) = crate::integrations::aps::register_for_plan(&plan) {
+        if let Some(registration) = crate::integrations::aps::register_for_plan(settings, &plan)? {
             registrations.push(registration);
         }
         for builder in crate::integrations::builders() {

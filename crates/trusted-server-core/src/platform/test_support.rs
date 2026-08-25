@@ -903,7 +903,15 @@ pub(crate) fn build_services_with_config_secret_and_http_client(
     secret_store: impl PlatformSecretStore + 'static,
     http_client: Arc<dyn PlatformHttpClient>,
 ) -> RuntimeServices {
-    build_services_with_secret_http_client_and_client_ip(secret_store, http_client, None)
+    RuntimeServices::builder()
+        .config_store(Arc::new(config_store))
+        .secret_store(Arc::new(secret_store))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(StubBackend))
+        .http_client(http_client)
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo::default())
+        .build()
 }
 
 pub(crate) fn build_services_with_secret_http_client_and_client_ip(
@@ -912,7 +920,7 @@ pub(crate) fn build_services_with_secret_http_client_and_client_ip(
     client_ip: Option<IpAddr>,
 ) -> RuntimeServices {
     RuntimeServices::builder()
-        .config_store(Arc::new(config_store))
+        .config_store(Arc::new(NoopConfigStore))
         .secret_store(Arc::new(secret_store))
         .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
         .backend(Arc::new(StubBackend))
