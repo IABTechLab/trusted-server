@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lol_html::{
-    EndTagHandler, Settings as RewriterSettings, element,
+    EndTagHandler, Settings as RewriterSettings, element, end,
     html_content::{ContentType, EndTag},
     text,
 };
@@ -156,6 +156,29 @@ impl StreamProcessor for HtmlWithPostProcessing {
     fn reset(&mut self) {}
 }
 
+/// What the `</body>` seam injects.
+///
+/// This is a decision, not a side effect of whether the `<head>` script exists.
+/// An earlier shape gated body-close injection on `ad_slots_script.is_some()`,
+/// which coupled two independent choices: once a shared-template mode stopped
+/// emitting the head script, body-close injection silently stopped too.
+///
+/// See `docs/superpowers/archive/2026-08-08-esi-cacheable-root-validation-design.md`
+/// §6.7.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum BodyCloseInjection {
+    /// Emit nothing because no slots matched under the inline path.
+    #[default]
+    None,
+    /// Read the auction result from `ad_bids_state` and inject it, falling back to
+    /// an empty payload. Today's shipped behaviour.
+    InlineBids,
+    /// Emit this markup verbatim — an inert marker the assembly step splits on.
+    /// Must be identical for every request that reaches the transform, or the
+    /// cached template is not shared-safe.
+    Marker(String),
+}
+
 /// Configuration for HTML processing
 #[derive(Clone)]
 pub struct HtmlProcessorConfig {
@@ -176,8 +199,16 @@ pub struct HtmlProcessorConfig {
     pub max_buffered_body_bytes: usize,
     /// Request-scoped conditional diagnostics delivery decision.
     pub gpt_diagnostics: Option<GptDiagnosticsRequestDecision>,
+    /// What the `</body>` seam injects. Decided by the caller rather than inferred
+    /// from [`Self::ad_slots_script`].
+    pub body_close: BodyCloseInjection,
     /// Whether to omit Trusted Server's automatic `DataDome` client-side tag.
     pub suppress_datadome_client_side_tag: bool,
+    /// Set when the document delivers a response-bound CSP nonce in its own markup.
+    ///
+    /// `None` on every path that cannot store a shared template, so an ordinary inline
+    /// request does not pay for handlers whose only consumer is the template-cache gate.
+    pub csp_nonce_observed: Option<Arc<AtomicBool>>,
 }
 
 impl HtmlProcessorConfig {
@@ -199,7 +230,9 @@ impl HtmlProcessorConfig {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: settings.publisher.max_buffered_body_bytes,
             gpt_diagnostics: None,
+            body_close: BodyCloseInjection::None,
             suppress_datadome_client_side_tag: false,
+            csp_nonce_observed: None,
         }
     }
 
@@ -221,10 +254,31 @@ impl HtmlProcessorConfig {
         self
     }
 
+    /// Set what the `</body>` seam injects.
+    ///
+    /// Separate from [`with_ad_state`](Self::with_ad_state) because the two are
+    /// independent decisions: a shared-template mode emits no head script and
+    /// still needs a body-close marker.
+    #[must_use]
+    pub fn with_body_close(mut self, body_close: BodyCloseInjection) -> Self {
+        self.body_close = body_close;
+        self
+    }
+
     /// Attach the request-scoped conditional diagnostics decision.
     #[must_use]
     pub fn with_gpt_diagnostics(mut self, decision: Option<GptDiagnosticsRequestDecision>) -> Self {
         self.gpt_diagnostics = decision;
+        self
+    }
+
+    /// Watch the document for a response-bound CSP nonce delivered in its own markup.
+    ///
+    /// Pass `Some` only when the completed transform may be stored as a shared template;
+    /// nothing else reads the observation.
+    #[must_use]
+    pub fn with_csp_nonce_observer(mut self, observed: Option<Arc<AtomicBool>>) -> Self {
+        self.csp_nonce_observed = observed;
         self
     }
 
@@ -318,8 +372,29 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let integration_registry = config.integrations.clone();
     let script_rewriters = integration_registry.script_rewriters();
     let ad_slots_script = config.ad_slots_script.clone();
+    let body_close = config.body_close.clone();
     let ad_bids_state = config.ad_bids_state.clone();
     let gpt_diagnostics = config.gpt_diagnostics.clone();
+
+    // No source-comment neutralization here: rewriting a publisher comment that happens
+    // to match the reserved marker would change publisher content bytes. Collisions are
+    // detected on the completed transform instead, where the response can be refused
+    // outright rather than silently edited.
+    let mut document_content_handlers = Vec::new();
+    if let BodyCloseInjection::Marker(marker) = &body_close {
+        let marker = marker.clone();
+        let injected_bids = Arc::clone(&injected_bids);
+        document_content_handlers.push(end!(move |document_end| {
+            // HTML fragments and malformed-but-renderable documents may never expose a
+            // body end tag. Always mint a transform-owned terminal seam in that case;
+            // otherwise source bytes equal to the reserved marker could be mistaken for
+            // ownership by the post-transform exact-count validator.
+            if !injected_bids.swap(true, Ordering::SeqCst) {
+                document_end.append(&marker, ContentType::Html);
+            }
+            Ok(())
+        }));
+    }
 
     let mut element_content_handlers = vec![
         // Inject unified tsjs bundle once at the start of <head>
@@ -356,7 +431,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     }
                     // Main bundle: core + non-deferred integrations (synchronous).
                     let immediate_ids = integrations.js_module_ids_immediate();
-                    snippet.push_str(&tsjs::tsjs_script_tag(&immediate_ids));
+                    let script_attributes = integrations.tsjs_script_tag_attributes();
+                    snippet.push_str(&tsjs::tsjs_script_tag_with_attributes(
+                        &immediate_ids,
+                        &script_attributes,
+                    ));
                     // Active diagnostics loads synchronously after core so its
                     // GPT listeners precede publisher scripts in the origin head.
                     if let Some(module_tag) = gpt_diagnostics
@@ -385,29 +464,42 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         element!("body", {
             let state = ad_bids_state.clone();
             let injected_bids = injected_bids.clone();
-            let has_slots = ad_slots_script.is_some();
+            let body_close = body_close.clone();
             move |el| {
-                if !has_slots {
+                if matches!(body_close, BodyCloseInjection::None) {
                     return Ok(());
                 }
                 let state = state.clone();
                 let injected_bids = injected_bids.clone();
+                let body_close = body_close.clone();
                 if let Some(handlers) = el.end_tag_handlers() {
                     let handler: EndTagHandler<'static> =
                         Box::new(move |end_tag: &mut EndTag<'_>| {
                             if injected_bids.swap(true, Ordering::SeqCst) {
                                 return Ok(());
                             }
-                            let script_guard = state.lock().expect("should lock bid state");
-                            let bids_script = match &*script_guard {
-                                Some(s) => s.clone(),
-                                None => build_empty_bids_script(),
+                            let markup = match &body_close {
+                                // Verbatim, and identical on every request that
+                                // reaches the transform — that is what makes the
+                                // cached template shared-safe.
+                                BodyCloseInjection::Marker(marker) => marker.clone(),
+                                BodyCloseInjection::InlineBids => {
+                                    let script_guard = state.lock().expect("should lock bid state");
+                                    match &*script_guard {
+                                        Some(s) => s.clone(),
+                                        None => build_empty_bids_script(),
+                                    }
+                                }
+                                // Unreachable: the element handler returned early
+                                // above. Kept exhaustive rather than using `_` so a
+                                // new variant is a compile error here.
+                                BodyCloseInjection::None => return Ok(()),
                             };
-                            end_tag.before(&bids_script, ContentType::Html);
+                            end_tag.before(&markup, ContentType::Html);
                             Ok(())
                         });
                     handlers.push(handler);
-                } else {
+                } else if matches!(body_close, BodyCloseInjection::InlineBids) {
                     // No end tag (implicitly closed or EOF `<body>`): lol_html
                     // cannot attach an end-tag handler, so tsjs.bids/adInit() are
                     // never injected even though adSlots was injected at `<head>`.
@@ -626,6 +718,37 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         }),
     ];
 
+    // A response-bound nonce is only safe for the response that carried it, and the
+    // response-header gate cannot see one the origin delivered in the markup instead.
+    // Observed structurally rather than by scanning the output bytes, which cannot tell a
+    // `nonce` attribute from the same word inside a script.
+    if let Some(observed) = config.csp_nonce_observed.clone() {
+        let meta_observed = Arc::clone(&observed);
+        element_content_handlers.push(element!("meta[http-equiv][content]", move |el| {
+            let delivers_csp = el.get_attribute("http-equiv").is_some_and(|equiv| {
+                matches!(
+                    equiv.trim().to_ascii_lowercase().as_str(),
+                    "content-security-policy" | "content-security-policy-report-only"
+                )
+            });
+            if delivers_csp
+                && el
+                    .get_attribute("content")
+                    .is_some_and(|policy| policy.to_ascii_lowercase().contains("'nonce-"))
+            {
+                meta_observed.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }));
+        // `lol_html` does not entity-decode quoted meta CSP content for the check above.
+        // Reject nonce attributes independently so an entity-encoded meta policy cannot
+        // hide executable nonce-bound content from the template-cache safety scan.
+        element_content_handlers.push(element!("[nonce]", move |_el| {
+            observed.store(true, Ordering::SeqCst);
+            Ok(())
+        }));
+    }
+
     for script_rewriter in script_rewriters {
         let selector = script_rewriter.selector();
         let rewriter = script_rewriter.clone();
@@ -659,6 +782,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     }
 
     let rewriter_settings = RewriterSettings {
+        document_content_handlers,
         element_content_handlers,
         ..RewriterSettings::default()
     };
@@ -698,6 +822,8 @@ mod tests {
 
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
+            csp_nonce_observed: None,
+            body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_owned(),
             request_host: "test.example.com".to_owned(),
             request_scheme: "https".to_owned(),
@@ -832,6 +958,76 @@ mod tests {
         assert!(
             tsjs_index < title_index,
             "should prepend all injected content before existing head content"
+        );
+    }
+
+    #[test]
+    fn integration_head_injector_marks_only_attribution_enabled_gpt_bundle() {
+        fn process(gpt_config: Option<(bool, bool)>) -> String {
+            let integrations = if let Some((enabled, gam_attribution_enabled)) = gpt_config {
+                let mut settings = create_test_settings();
+                settings
+                    .integrations
+                    .insert_config(
+                        "gpt",
+                        &json!({
+                            "enabled": enabled,
+                            "gam_attribution_enabled": gam_attribution_enabled
+                        }),
+                    )
+                    .expect("should insert GPT config");
+                IntegrationRegistry::new(&settings).expect("should build GPT registry")
+            } else {
+                IntegrationRegistry::empty_for_tests()
+            };
+            let mut config = create_test_config();
+            config.integrations = integrations;
+            let mut processor = create_html_processor(config);
+            let output = processor
+                .process_chunk(b"<html><head></head><body></body></html>", true)
+                .expect("should process HTML");
+
+            String::from_utf8(output).expect("should produce valid UTF-8")
+        }
+
+        let attributed = process(Some((true, true)));
+        let unattributed = process(Some((true, false)));
+        let disabled_gpt = process(Some((false, true)));
+        let without_gpt = process(None);
+
+        for html in [&attributed, &unattributed, &disabled_gpt, &without_gpt] {
+            assert_eq!(
+                html.matches("id=\"trustedserver-js\"").count(),
+                1,
+                "should emit exactly one publisher bundle tag: {html}"
+            );
+        }
+        assert!(
+            attributed.contains("data-ts-gam-attribution=\"true\""),
+            "should mark only an attribution-enabled GPT publisher bundle"
+        );
+        assert!(
+            !unattributed.contains("data-ts-gam-attribution"),
+            "should leave an attribution-disabled GPT publisher bundle unmarked"
+        );
+        assert!(
+            !disabled_gpt.contains("data-ts-gam-attribution"),
+            "should let the GPT master switch suppress attribution metadata"
+        );
+        assert!(
+            !without_gpt.contains("data-ts-gam-attribution"),
+            "should leave a non-GPT publisher bundle unmarked"
+        );
+
+        let head_insert_index = attributed
+            .find("window.__tsjs_installGptShim")
+            .expect("should include the GPT head insert");
+        let publisher_bundle_index = attributed
+            .find("id=\"trustedserver-js\"")
+            .expect("should include the publisher bundle");
+        assert!(
+            head_insert_index < publisher_bundle_index,
+            "should keep integration head inserts before the publisher bundle"
         );
     }
 
@@ -1599,6 +1795,8 @@ mod tests {
     #[test]
     fn injects_ad_slots_at_head_open() {
         let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
+            body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
@@ -1675,6 +1873,8 @@ mod tests {
         let bids_script = r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
+            body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
@@ -1712,6 +1912,8 @@ mod tests {
         let bids_script = r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
+            body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
@@ -1750,6 +1952,8 @@ mod tests {
 
         let request_host = "proxy.test-publisher.example.com";
         let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
+            body_close: BodyCloseInjection::None,
             origin_host: "origin.test-publisher.example.com".to_string(),
             request_host: request_host.to_string(),
             request_scheme: "https".to_string(),
@@ -1802,6 +2006,8 @@ mod tests {
         // (state is None) — e.g. auction timed out with zero bids. Fallback to {}.
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
+            body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
@@ -1832,6 +2038,8 @@ mod tests {
         // unmodified (spec §8: "Existing client-side Prebid/GPT flow runs unmodified").
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
+            body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
@@ -1850,6 +2058,176 @@ mod tests {
         assert!(
             !html.contains("JSON.parse"),
             "should NOT inject tsjs.bids when no slots matched"
+        );
+    }
+
+    fn marker_mode_config(marker: &str, observer: Option<Arc<AtomicBool>>) -> HtmlProcessorConfig {
+        HtmlProcessorConfig {
+            csp_nonce_observed: observer,
+            body_close: BodyCloseInjection::Marker(marker.to_string()),
+            origin_host: "origin.example.com".to_string(),
+            request_host: "example.com".to_string(),
+            request_scheme: "https".to_string(),
+            integrations: IntegrationRegistry::empty_for_tests(),
+            ad_slots_script: None,
+            ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
+            gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
+        }
+    }
+
+    fn render_marker_mode(marker: &str, source: &str) -> String {
+        let mut processor = create_html_processor(marker_mode_config(marker, None));
+        let output = processor
+            .process_chunk(source.as_bytes(), true)
+            .expect("should process the document");
+        String::from_utf8(output).expect("output should be utf8")
+    }
+
+    #[test]
+    fn marker_mode_ignores_a_body_close_written_in_script_data() {
+        // A reverse byte search for `</body>` picks this string literal, because the
+        // document has no structural close at all. Splicing a `<script>` payload there
+        // emits a `</script>` inside the publisher's script and corrupts the document —
+        // and, once stored, every warm reader of it. Only the parser can tell the
+        // difference, so the parser places the marker.
+        const MARKER: &str = "<!--ts-seam-slot-->";
+        let source =
+            r#"<html><head></head><script>const marker = "</body>";</script><p>a</p></html>"#;
+
+        let html = render_marker_mode(MARKER, source);
+
+        assert!(
+            html.contains(r#"const marker = "</body>";"#),
+            "should leave the publisher's script data byte for byte: {html}"
+        );
+        assert_eq!(
+            html.matches(MARKER).count(),
+            1,
+            "should emit exactly one transform-owned marker: {html}"
+        );
+        assert!(
+            html.ends_with(MARKER),
+            "a document with no structural body close takes the terminal marker: {html}"
+        );
+    }
+
+    #[test]
+    fn marker_mode_prefers_the_structural_body_close_over_trailing_comment_data() {
+        // A reverse byte search takes the *last* `</body>` sequence, which here lives in
+        // trailing comment data, so the marker landed after the document's real end.
+        const MARKER: &str = "<!--ts-seam-slot-->";
+        let source = "<html><body><p>a</p></body><!-- </body> --></html>";
+
+        let html = render_marker_mode(MARKER, source);
+
+        assert!(
+            html.contains(&format!("<p>a</p>{MARKER}</body>")),
+            "should place the marker at the structural body close: {html}"
+        );
+        assert!(
+            html.contains("<!-- </body> -->"),
+            "should leave the publisher's trailing comment untouched: {html}"
+        );
+        assert_eq!(
+            html.matches(MARKER).count(),
+            1,
+            "should emit exactly one transform-owned marker: {html}"
+        );
+    }
+
+    #[test]
+    fn a_nonce_bearing_meta_policy_is_observed() {
+        let observed = Arc::new(AtomicBool::new(false));
+        let mut processor =
+            create_html_processor(marker_mode_config("<!--m-->", Some(Arc::clone(&observed))));
+
+        processor
+            .process_chunk(
+                br#"<html><head><meta http-equiv="Content-Security-Policy" content="script-src 'nonce-abc123'"></head><body>a</body></html>"#,
+                true,
+            )
+            .expect("should process the document");
+
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "a policy delivered in markup is invisible to the response-header gate"
+        );
+    }
+
+    #[test]
+    fn a_nonce_attribute_is_observed() {
+        let observed = Arc::new(AtomicBool::new(false));
+        let mut processor =
+            create_html_processor(marker_mode_config("<!--m-->", Some(Arc::clone(&observed))));
+
+        processor
+            .process_chunk(
+                b"<html><head><script nonce=\"abc123\"></script></head><body>a</body></html>",
+                true,
+            )
+            .expect("should process the document");
+
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "a document written for a per-response nonce must not be shared"
+        );
+    }
+
+    #[test]
+    fn the_word_nonce_in_script_text_is_not_observed() {
+        // The reason this is structural rather than a byte scan over the output.
+        let observed = Arc::new(AtomicBool::new(false));
+        let mut processor =
+            create_html_processor(marker_mode_config("<!--m-->", Some(Arc::clone(&observed))));
+
+        processor
+            .process_chunk(
+                br#"<html><head><script>var nonce = "not-a-policy";</script><meta http-equiv="refresh" content="0"></head><body>a</body></html>"#,
+                true,
+            )
+            .expect("should process the document");
+
+        assert!(
+            !observed.load(Ordering::SeqCst),
+            "ordinary script text must not cost a cacheable page its shared template"
+        );
+    }
+
+    #[test]
+    fn bodyless_marker_mode_emits_an_owned_terminal_seam_even_after_source_bytes() {
+        const MARKER: &str = "<!--reserved-template-cache-seam-->";
+        let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
+            body_close: BodyCloseInjection::Marker(MARKER.to_string()),
+            origin_host: "origin.example.com".to_string(),
+            request_host: "example.com".to_string(),
+            request_scheme: "https".to_string(),
+            integrations: IntegrationRegistry::empty_for_tests(),
+            ad_slots_script: None,
+            ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
+            gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
+        };
+        let source =
+            format!(r#"<html><head></head><script>var collision="{MARKER}";</script></html>"#);
+
+        let mut processor = create_html_processor(config);
+        let output = processor
+            .process_chunk(source.as_bytes(), true)
+            .expect("should process bodyless HTML");
+        let html = std::str::from_utf8(&output).expect("should be utf8");
+
+        assert_eq!(
+            html.matches(MARKER).count(),
+            2,
+            "one source occurrence plus the transform-owned terminal seam must survive processing; repeated markers are rejected before template caching"
+        );
+        assert!(
+            html.ends_with(MARKER),
+            "the transform-owned template-cache fallback must be unambiguously terminal"
         );
     }
 

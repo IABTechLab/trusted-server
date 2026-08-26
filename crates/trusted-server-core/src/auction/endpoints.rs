@@ -11,6 +11,7 @@ use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::COOKIE_TS_EIDS;
+use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
 use crate::ec::EcKvSnapshot;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
@@ -418,22 +419,6 @@ pub(crate) fn resolve_auction_eids(
     Some(to_eids(&resolved))
 }
 
-fn extract_cookie_value(req: &Request<EdgeBody>, name: &str) -> Option<String> {
-    let cookie_header = req
-        .headers()
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())?;
-    for pair in cookie_header.split(';') {
-        let pair = pair.trim();
-        if let Some((key, value)) = pair.split_once('=')
-            && key.trim() == name
-        {
-            return Some(value.trim().to_owned());
-        }
-    }
-    None
-}
-
 pub(crate) fn resolve_client_auction_eids(
     raw: Option<&JsonValue>,
     cookie_value: Option<&str>,
@@ -597,10 +582,11 @@ mod tests {
     use crate::consent::types::ConsentContext;
     use crate::openrtb::Uid;
     use crate::platform::test_support::{
-        NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, noop_services,
+        NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, StubHttpClient,
+        noop_services,
     };
-    use crate::platform::{ClientInfo, PlatformResponse};
-    use crate::test_support::tests::create_test_settings;
+    use crate::platform::{ClientInfo, PlatformHttpClient, PlatformHttpRequest, PlatformResponse};
+    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use serde_json::json;
@@ -798,6 +784,124 @@ mod tests {
         fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
             Some("panic-backend".to_string())
         }
+    }
+
+    /// Provider used to prove that direct `/auction` remains available when
+    /// publisher server-side ad templates are disabled.
+    struct TemplateSwitchProbeProvider {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for TemplateSwitchProbeProvider {
+        fn provider_name(&self) -> &'static str {
+            "template_switch_probe"
+        }
+
+        async fn request_bids(
+            &self,
+            _request: &AuctionRequest,
+            context: &AuctionContext<'_>,
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+            *self.calls.lock().expect("should lock provider call count") += 1;
+            let request = Request::builder()
+                .method("POST")
+                .uri("https://bidder.example/auction")
+                .body(EdgeBody::empty())
+                .expect("should build probe provider request");
+            context
+                .services
+                .http_client()
+                .send_async(PlatformHttpRequest::new(
+                    request,
+                    "template-switch-probe-backend",
+                ))
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: "probe provider launch failed".to_string(),
+                })
+                .map(ProviderRequestOutcome::pending)
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            _response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            Ok(AuctionResponse::success(
+                self.provider_name(),
+                Vec::new(),
+                0,
+            ))
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            100
+        }
+
+        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
+            Some("template-switch-probe-backend".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_auction_remains_available_when_templates_are_disabled() {
+        let settings_toml = format!(
+            "{}\n[auction]\nenabled = true\nproviders = [\"template_switch_probe\"]\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&settings_toml)
+            .expect("should parse settings with disabled templates");
+        let calls = Arc::new(Mutex::new(0));
+        let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        orchestrator.register_provider(Arc::new(TemplateSwitchProbeProvider {
+            calls: Arc::clone(&calls),
+        }));
+
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"probe response".to_vec());
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(NoopConfigStore))
+            .secret_store(Arc::new(NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(Arc::new(NoopBackend))
+            .http_client(Arc::clone(&stub) as Arc<dyn PlatformHttpClient>)
+            .geo(Arc::new(NoopGeo))
+            .client_info(ClientInfo::default())
+            .build();
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let body = json!({
+            "adUnits": [{
+                "code": "div-gpt-ad-1",
+                "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+            }]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &mut ec_context,
+            &services,
+            req,
+        )
+        .await
+        .expect("direct auction should remain available");
+
+        assert_eq!(
+            *calls.lock().expect("should lock provider call count"),
+            1,
+            "disabling publisher templates must not disable direct /auction"
+        );
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

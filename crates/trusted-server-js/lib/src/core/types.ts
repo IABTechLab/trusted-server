@@ -207,7 +207,15 @@ export interface GptDiagnosticsRequestCycle {
   viewableAtMs?: number;
   durations: GptDiagnosticsDurations;
   isEmpty?: boolean;
+  /** Configured sizes Trusted Server supplied to GPT for this request. */
+  requestedSlotSizes?: ReadonlyArray<Size>;
+  /** Exact fill size fact GPT reported in its `slotRenderEnded` callback. */
   size?: Size;
+  /**
+   * Outer CSS box observed on the uniquely bound, connected slot element after
+   * a filled GPT render. This is not an assertion about internal creative pixels.
+   */
+  observedSlotSize?: Size;
   isBackfill?: boolean;
   slotContentChanged?: boolean;
   incompleteSequence: boolean;
@@ -318,12 +326,13 @@ export interface GptDiagnosticsApi {
  * and stops the writers from becoming part of the public contract.
  */
 export interface GptDiagnosticsRecorder {
-  /** Record Trusted Server's creative opportunity for an associated GPT slot. */
+  /** Record Trusted Server's creative opportunity and configured sizes for an associated GPT slot. */
   recordTrustedServerOpportunity(
     slot: GptDiagnosticsSlotHandle,
     auctionSlotId: string,
     opportunity: GptDiagnosticsTrustedServerOpportunity,
-    trustedServerAuctionId?: string
+    trustedServerAuctionId?: string,
+    requestedSlotSizes?: ReadonlyArray<Size>
   ): void;
   /** Mark slots whose next observed GPT request follows the Prebid refresh path. */
   recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
@@ -429,6 +438,8 @@ export interface TsjsApi {
   gptSlotHandoffInternal?: boolean;
   /** Guards SPA pushState hook installation. */
   spaHookInstalled?: boolean;
+  /** Internal one-shot state shared by bootstrap and bundle scheduler installs. */
+  initialAdInitScheduled?: boolean;
   /**
    * Monotonic count of committed SPA navigations, incremented synchronously by
    * the SPA auction hook the moment it accepts a route change. The deferred
@@ -452,8 +463,18 @@ export interface TsjsApi {
    * Lives in the bundle so the lifecycle is executable under test and shares
    * [`navGeneration`] with the SPA auction hook; `gpt_bootstrap.js` installs
    * a minimal fallback for pages where the bundle fails to load.
+   *
+   * `initialSlots` exists for the shared-template `</body>` seam, which is the
+   * only place slot definitions arrive with the bids rather than from the head
+   * script. Passing them here rather than assigning `tsjs.adSlots` before the
+   * call puts them behind the same generation guard: an assignment made ahead
+   * of the guard would clobber a committed SPA navigation's slots with the SSR
+   * document's, and then be read by that route's `adInit()`.
    */
-  scheduleInitialAdInit?: (initialBids?: Record<string, AuctionBidData>) => void;
+  scheduleInitialAdInit?: (
+    initialBids?: Record<string, AuctionBidData>,
+    initialSlots?: AuctionSlot[]
+  ) => void;
   /** Read-only GPT lifecycle diagnostics API, present only in an activated tab. */
   gptDiagnostics?: GptDiagnosticsApi;
   /**
