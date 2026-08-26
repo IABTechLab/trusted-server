@@ -21,9 +21,10 @@ A fix must keep both implementations in sync.
 
 1. A configured placement has at most one initial GPT slot and ad request when TS
    runs before a publisher defines its inner div.
-2. Apply TS targeting and the `ts_initial=1` marker before that single initial
-   request.
-3. Continue reusing a slot that the publisher has already defined.
+2. Apply TS targeting and the `ts_initial=1` marker only when TS owns that single
+   initial request.
+3. Continue reusing a slot that the publisher has already defined without changing
+   its targeting after a publisher auction, GPT request, or GPT render claims it.
 4. Keep the TS-only fallback: if the publisher never defines the placement, TS still
    displays it and makes exactly one initial request.
 5. Preserve `disableInitialLoad()`, SPA targeting cleanup, and the rule that TS does
@@ -35,10 +36,32 @@ A fix must keep both implementations in sync.
 - Deduplicating by GAM ad-unit path. Multiple visible placements may validly share a
   path.
 - Changing publisher GAM configuration, line items, or refresh policy.
-- Delaying the initial TS request while waiting an arbitrary amount of time for
-  framework hydration. A time-based grace period cannot distinguish a slow
-  publisher-owned slot from a placement that the publisher will never define.
+- Delaying the initial TS request while waiting for a publisher that has not made a
+  concrete claim. A time-based grace period cannot distinguish a slow publisher-owned
+  slot from a placement that the publisher will never define. An actual publisher
+  `requestBids()` call receives a bounded lease instead.
 - General interception of unrelated GPT slots.
+
+## Decision: first claimant owns delivery
+
+The first valid claimant owns each physical slot's first impression for the current
+navigation. A real publisher `requestBids()` call claims before native Prebid starts.
+A GPT `slotRequested` or `slotRenderEnded` event also claims for the publisher when TS
+has not claimed first. `adInit()` may write `ts_initial=1`, apply `hb_*` targeting, and
+request an existing slot only after it atomically claims an untouched slot.
+
+Publisher auction claims use unique, expiring registration tokens. The matching
+callback moves only its token to delivery-pending and attaches returned ad IDs.
+Overlapping auctions cannot clear each other's tokens. If TS claimed first, the GPT
+refresh wrapper filters one correlated losing publisher delivery and restores the TS
+targeting snapshot. It forwards every unaffected slot and the original refresh options
+exactly once. The one-shot state is then consumed, so later publisher refresh auctions
+remain eligible.
+
+If a publisher claim expires without a GPT request, `adInit()` retries only that slot
+after checking the navigation generation, DOM element identity, and ownership again.
+It never reruns whole-page initialization. Strict TS-first delivery is outside this
+design because it would require holding publisher delivery while page-bids settles.
 
 ## Decision: one inner-div slot with late-definition handoff
 

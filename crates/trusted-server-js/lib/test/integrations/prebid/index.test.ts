@@ -201,7 +201,9 @@ import {
   installRefreshHandler,
 } from '../../../src/integrations/prebid/index';
 import type { AuctionBid } from '../../../src/core/auction';
+import { claimFirstImpressionForTrustedServer } from '../../../src/core/first_impression';
 import { log } from '../../../src/core/log';
+import type { TsjsApi } from '../../../src/core/types';
 import { GptDiagnosticsObserver } from '../../../src/integrations/gpt_diagnostics/observer';
 import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
 import envelope from '../../fixtures/aps-renderer-v1.json';
@@ -2559,6 +2561,60 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     testWindow.tsjs = { gptDiagnosticsRecorder: { recordPrebidRefresh } };
     return recordPrebidRefresh;
   }
+
+  it('suppresses one publisher delivery after TS claims first and allows a later refresh', () => {
+    const code = 'example-ts-first-slot';
+    const element = document.createElement('div');
+    element.id = code;
+    document.body.appendChild(element);
+    try {
+      const targeting = new Map<string, string | string[]>([
+        ['ts_initial', '1'],
+        ['hb_adid', 'example-ts-ad-id'],
+        ['hb_pb', '1.25'],
+      ]);
+      const slot = {
+        getSlotElementId: () => code,
+        getTargeting: (key: string) => {
+          const value = targeting.get(key);
+          return value === undefined ? [] : Array.isArray(value) ? value : [value];
+        },
+        setTargeting: vi.fn((key: string, value: string | string[]) => {
+          targeting.set(key, value);
+          return slot;
+        }),
+        clearTargeting: vi.fn((key: string) => {
+          targeting.delete(key);
+          return slot;
+        }),
+        getSizes: () => [[300, 250]],
+      };
+      const ts = (testWindow.tsjs = {} as TsjsApi) as TsjsApi;
+      const claim = claimFirstImpressionForTrustedServer(ts, element)!;
+      claim.targeting = Object.fromEntries(targeting);
+      const { originalRefresh, pubads } = installGpt([slot]);
+      mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
+      const pbjs = installPrebidNpm();
+
+      pbjs.requestBids({
+        adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+        bidsBackHandler: () => pubads.refresh([slot], { changeCorrelator: false }),
+      } as unknown as RequestBidsArg);
+
+      expect(originalRefresh).not.toHaveBeenCalled();
+      expect(slot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
+      expect(slot.setTargeting).toHaveBeenCalledWith('hb_adid', 'example-ts-ad-id');
+      expect(ts.firstImpression?.slots[code]?.suppressionConsumed).toBe(true);
+
+      pubads.refresh([slot], { changeCorrelator: false });
+
+      expect(mockRequestBids).toHaveBeenCalledTimes(2);
+      expect(originalRefresh).toHaveBeenCalledOnce();
+      expect(originalRefresh).toHaveBeenCalledWith([slot], { changeCorrelator: false });
+    } finally {
+      element.remove();
+    }
+  });
 
   it('records a publisher delivery refresh immediately before its GPT request', () => {
     const slot = {

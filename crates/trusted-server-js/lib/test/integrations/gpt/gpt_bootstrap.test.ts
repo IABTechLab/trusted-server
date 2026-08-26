@@ -432,6 +432,65 @@ describe('gpt_bootstrap.js fallback', () => {
     expect(ts.servicesEnabled).toBe(true);
   });
 
+  it('fallback adInit leaves a publisher-rendered slot untouched', () => {
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+    };
+    const mockPubads = {
+      addEventListener: vi.fn(),
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([mockSlot]),
+      refresh: vi.fn(),
+    };
+    const nativeRefresh = mockPubads.refresh;
+    const defineSlot = vi.fn();
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot,
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      display: vi.fn(),
+    };
+    document.body.innerHTML = '<div id="div-atf-sidebar"></div>';
+    runBootstrap();
+    const ts = (window as TestWindow).tsjs!;
+    const element = document.getElementById('div-atf-sidebar')!;
+    ts.firstImpression = {
+      generation: 0,
+      nextToken: 0,
+      fallbackSlots: {},
+      slots: {
+        'div-atf-sidebar': {
+          generation: 0,
+          slotElementId: 'div-atf-sidebar',
+          element,
+          owner: 'publisher',
+          phase: 'rendered',
+          expiresAt: Number.POSITIVE_INFINITY,
+          publisherAuctions: {},
+        },
+      },
+    };
+    ts.adSlots = [
+      {
+        id: 'atf_sidebar_ad',
+        gam_unit_path: '/123/atf',
+        div_id: 'div-atf-sidebar',
+        formats: [[300, 250]],
+      },
+    ];
+    ts.bids = { atf_sidebar_ad: { hb_pb: '1.00' } };
+
+    ts.adInit!();
+
+    expect(mockSlot.setTargeting).not.toHaveBeenCalled();
+    expect(nativeRefresh).not.toHaveBeenCalled();
+    expect(defineSlot).not.toHaveBeenCalled();
+    expect(ts.servicesEnabled).not.toBe(true);
+  });
+
   it('fallback adInit cancels queued work when the generation advances before the queue drains', () => {
     const commandQueue: Array<() => void> = [];
     const nativeRefresh = vi.fn();
