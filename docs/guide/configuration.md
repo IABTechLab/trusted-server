@@ -1808,6 +1808,13 @@ CLI)](#environment-variable-overrides-typed-cli) for the general overlay rules.
 TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED=false
 ```
 
+> [!WARNING]
+> Setting `enabled = false` writes this field into the pushed configuration blob.
+> Binaries released before this setting reject the unknown field and fail to load
+> settings, which makes every request fail. Before rolling back to an older binary,
+> restore `enabled` to its default, re-push and finalize the configuration, then
+> roll back the binary.
+
 ### Shared template assembly (`assembly_mode = "esi"`)
 
 This configuration is an experimental validation spike scoped to

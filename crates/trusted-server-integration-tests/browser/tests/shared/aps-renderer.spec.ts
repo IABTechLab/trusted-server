@@ -4,8 +4,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { runtimeUrl } from "../../helpers/state.js";
 
 const RUNNER_URL = "https://client.aps.amazon-adsystem.com/prebid-creative.js";
-const PUBLISHER_CORE_URL =
-    "https://client.aps.amazon-adsystem.com/trusted-server-core.js";
+const PUBLISHER_CORE_URL = "https://tsjs.example/trusted-server-core.js";
 const IFRAME_CREATIVE_URL = "https://creative.example/iframe";
 const SCRIPT_CREATIVE_URL = "https://creative.example/script.js";
 const SANDBOX =
@@ -971,6 +970,8 @@ parent.postMessage(JSON.stringify({
         const renderer = descriptor("iframe");
         const coreBundle = readFileSync(clientAuctionBundlePaths().core, "utf8");
         let runnerRequests = 0;
+        let runnerReferrer: string | undefined;
+        let creativeReferrer: string | undefined;
 
         await page.route(PUBLISHER_CORE_URL, async (route) => {
             await route.fulfill({
@@ -981,6 +982,7 @@ parent.postMessage(JSON.stringify({
         });
         await page.route(RUNNER_URL, async (route) => {
             runnerRequests += 1;
+            runnerReferrer = route.request().headers()["referer"];
             await route.fulfill({
                 status: 200,
                 contentType: "application/javascript",
@@ -988,6 +990,7 @@ parent.postMessage(JSON.stringify({
             });
         });
         await page.route(IFRAME_CREATIVE_URL, async (route) => {
+            creativeReferrer = route.request().headers()["referer"];
             await route.fulfill({
                 status: 200,
                 contentType: "text/html",
@@ -1025,7 +1028,7 @@ parent.postMessage(JSON.stringify({
                 contentType: "text/html",
                 headers: {
                     "Content-Security-Policy":
-                        "default-src 'none'; script-src https://client.aps.amazon-adsystem.com https://creative.example; connect-src 'self'; frame-src https://creative.example",
+                        "default-src 'none'; script-src https://tsjs.example https://client.aps.amazon-adsystem.com https://creative.example; connect-src 'self'; frame-src https://creative.example",
                 },
                 body: `<!doctype html>
 <div id="publisher-native-slot"><span class="existing">existing publisher content</span></div>`,
@@ -1084,6 +1087,8 @@ parent.postMessage(JSON.stringify({
         await expect(
             page.locator("#publisher-native-slot .existing"),
         ).toHaveCount(0);
+        expect(runnerReferrer).toBeUndefined();
+        expect(creativeReferrer).toBeUndefined();
         expect(
             await frame.evaluate((element: HTMLIFrameElement) => {
                 const document = element.contentDocument!;

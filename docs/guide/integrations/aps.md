@@ -66,7 +66,7 @@ No publisher JavaScript change is required. After validating and freezing the ex
 
 The existing publisher content remains visible until the runner script loads. A runner error, a blocked script, a missing slot, a superseding dispatch, or a load taking longer than 10 seconds removes the pending frame and visibly declines the bid. It never falls back to `/integrations/aps/renderer` or sends a Universal Creative renderer response. Trusted Server treats runner load as successful handoff; the runner owns subsequent creative completion and resource loading.
 
-Unlike `trusted_server` mode, this friendly frame deliberately has no opaque-origin sandbox. The fixed APS runner and its creative execute with the behavior of a publisher-origin integration, so `publisher_native` has a larger security surface—especially when `allow_script_creatives = true`. Use only a controlled cohort, and ensure publisher CSP permits the APS runner and required creative resources.
+Unlike `trusted_server` mode, this friendly frame deliberately has no opaque-origin sandbox. Its initial document inherits the publisher CSP, so the publisher policy controls whether the APS runner and required creative resources can load. Trusted Server sets the frame document's referrer policy to `no-referrer`, matching the static renderer's existing protection. The fixed APS runner and its creative otherwise execute with publisher-origin privileges, so `publisher_native` has a larger security surface, especially when `allow_script_creatives = true`. Use only a controlled cohort.
 
 For a client-side Prebid APS capability, Trusted Server consumes the one-shot capability before starting the runner and calls `markWinningBidAsUsed` only after the runner loads. For server/GPT ownership, it similarly claims the slot/ad ID first. This prevents native and Trusted Server rendering from both owning the same response.
 
@@ -340,7 +340,7 @@ Use fictional values in source-controlled configuration and fixtures. Supply con
 ### Winner targets but does not render
 
 - In `trusted_server` mode, confirm `GET /integrations/aps/renderer` returns HTML with its CSP and `Referrer-Policy: no-referrer`, and that publisher CSP permits `frame-src 'self'`.
-- In `publisher_native` mode, confirm the mode `<meta>` marker is present, the slot receives a hidden friendly iframe, and `https://client.aps.amazon-adsystem.com/prebid-creative.js` is not blocked by CSP. The static renderer route is intentionally absent in this mode.
+- In `publisher_native` mode, confirm the `#trustedserver-js` bundle tag carries `data-ts-aps-rendering-mode="publisher_native"`, the slot receives a hidden friendly iframe, and publisher CSP does not block `https://client.aps.amazon-adsystem.com/prebid-creative.js` or the selected creative's resources. The static renderer route is intentionally absent in this mode. Runner script load is the handoff signal, not proof that the creative painted.
 - Confirm the GAM creative uses the supported Prebid Universal Creative bridge and the winning `hb_adid`.
 - For client-side `trustedServer` adapter auctions, confirm Prebid's `bidResponse` contains a generated `adId` and that the corresponding capability appears briefly in `window.tsjs.apsPrebidRenderers` before rendering.
 - Ensure no publisher APS auction is trying to handle the same cohort.

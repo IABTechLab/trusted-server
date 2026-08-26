@@ -388,9 +388,10 @@ export function dispatchApsRendering({
   source,
   trustedServer,
 }: DispatchApsRenderingOptions): boolean | Promise<boolean> {
-  // Every attempt supersedes a pending frame for this slot, including an invalid
-  // replacement that fails before a new frame can be created.
-  cancelPendingApsRendering(slotId, source);
+  // Every native attempt supersedes a pending frame for this slot, including an
+  // invalid replacement. Default mode preserves a valid in-flight frame until a
+  // validated replacement reaches renderApsCreative.
+  if (publisherNativeRendering) cancelPendingApsRendering(slotId, source);
   const dispatch = Symbol(slotId);
   nativeDispatches.set(slotId, dispatch);
 
@@ -539,7 +540,8 @@ function renderApsPublisherNative({
 
       frameDocument.open();
       frameDocument.write(
-        '<!doctype html><html><head><meta charset="utf-8"></head><body></body></html>'
+        '<!doctype html><html><head><meta charset="utf-8">' +
+          '<meta name="referrer" content="no-referrer"></head><body></body></html>'
       );
       frameDocument.close();
       prepareApsRunnerDocument(frameWindow, frameDocument);

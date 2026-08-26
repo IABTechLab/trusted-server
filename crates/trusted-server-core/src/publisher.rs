@@ -4134,17 +4134,13 @@ pub async fn handle_publisher_request(
     let is_prefetch = is_prefetch_request(&req);
     let is_bot = is_bot_user_agent(&req);
 
-    let ad_templates_enabled = settings
-        .creative_opportunities
-        .as_ref()
-        .is_some_and(|co_config| co_config.enabled);
+    let creative_opportunities = settings.creative_opportunities.as_ref();
+    let ad_templates_enabled = creative_opportunities.is_some_and(|co_config| co_config.enabled);
+    let ad_templates_disabled = creative_opportunities.is_some_and(|co_config| !co_config.enabled);
     let matched_slots = if is_get && ad_templates_enabled {
-        settings
-            .creative_opportunities
-            .as_ref()
-            .map_or_else(Vec::new, |co_config| {
-                match_renderable_slots(auction.slots, co_config, &request_path)
-            })
+        creative_opportunities.map_or_else(Vec::new, |co_config| {
+            match_renderable_slots(auction.slots, co_config, &request_path)
+        })
     } else {
         Vec::new()
     };
@@ -4172,14 +4168,16 @@ pub async fn handle_publisher_request(
     // when `consent_allows_auction=false`.
     log::debug!(
         "server-side ad-stack gate: is_get={is_get} is_navigation={is_navigation} \
-         is_prefetch={is_prefetch} is_bot={is_bot} matched_slots={} \
-         consent_allows_auction={consent_allows_auction} orchestrator_enabled={} \
-         -> should_run_auction={should_run_auction}",
+         is_prefetch={is_prefetch} is_bot={is_bot} ad_templates_enabled={ad_templates_enabled} \
+         matched_slots={} consent_allows_auction={consent_allows_auction} \
+         orchestrator_enabled={} -> should_run_auction={should_run_auction}",
         matched_slots.len(),
         auction.orchestrator.is_enabled(),
     );
 
-    if matched_slots.is_empty() && settings.creative_opportunities.is_some() {
+    if ad_templates_disabled {
+        log::debug!("Server-side ad templates are disabled by configuration");
+    } else if matched_slots.is_empty() && settings.creative_opportunities.is_some() {
         log::debug!(
             "No creative opportunity slots matched path '{}' — skipping auction and injection",
             request_path
@@ -4317,7 +4315,9 @@ pub async fn handle_publisher_request(
                 }
             }
         } else {
-            let skip_reason = if !auction.orchestrator.is_enabled() {
+            let skip_reason = if ad_templates_disabled {
+                "ad_templates_disabled"
+            } else if !auction.orchestrator.is_enabled() {
                 "auction_disabled"
             } else if !consent_allows_auction {
                 "consent_denied"
@@ -4651,8 +4651,6 @@ pub async fn handle_publisher_request(
         return Ok(PublisherResponse::Buffered(response));
     }
 
-    crate::integrations::gpt_diagnostics::finalize_response(&gpt_diagnostics, &mut response);
-
     let template_cache_policy = TemplateCachePolicy::from_settings(settings);
     let gate_content_type = response
         .headers()
@@ -4748,11 +4746,10 @@ pub async fn handle_publisher_request(
     // stamp.
     // Gate on `should_run_ad_stack` rather than content-type alone: when no slot
     // matched, the feature is disabled, or this is not an ad-eligible navigation,
-    // no per-user `tsjs.adSlots`/`tsjs.bids` are injected, so forcing private
-    // here would needlessly strip shared cacheability from ordinary publisher
-    // HTML. Applies regardless of the auction *outcome* (empty bids still inject
-    // per-user slot state). The separate EC-cookie cache net in the adapter's
-    // `finalize_response` keeps first-visit identity responses private.
+    // no per-user `tsjs.adSlots`/`tsjs.bids` are injected. Applies regardless of
+    // the auction *outcome* (empty bids still inject per-user slot state). The
+    // separate EC-cookie cache net in the adapter's `finalize_response` keeps
+    // first-visit identity responses private.
     let origin_content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -6465,7 +6462,10 @@ pub async fn handle_page_bids(
     let is_bot = is_bot_user_agent(&req);
 
     let auction_enabled = auction.orchestrator.is_enabled();
-    if !auction_enabled {
+    let ad_templates_enabled = co_config.enabled;
+    if !ad_templates_enabled {
+        log::debug!("page-bids: [creative_opportunities].enabled is false — skipping templates");
+    } else if !auction_enabled {
         log::debug!("page-bids: [auction].enabled is false — skipping auction");
     } else if matched_slots.is_empty() {
         log::debug!(
@@ -6481,14 +6481,14 @@ pub async fn handle_page_bids(
         );
     }
 
-    // The [auction].enabled kill switch and a consent denial disable the entire
-    // server-side ad stack. In those states the endpoint must return no slots,
-    // so the SPA hook does not assign `ts.adSlots` and call `adInit()` —
-    // otherwise the kill switch/consent gate would stop SSP calls but still let
-    // the client create/refresh GPT slots. Bot/prefetch requests, by contrast,
-    // keep their slot definitions (the placement structure is unchanged) but
-    // skip the live auction, matching the existing bot/prefetch behaviour.
-    let ad_stack_enabled = auction_enabled && consent_allows_auction;
+    // The dedicated template switch, [auction].enabled, and a consent denial
+    // disable the entire server-side ad stack. In those states the endpoint must
+    // return no slots, so the SPA hook does not assign `ts.adSlots` and call
+    // `adInit()` — otherwise the gate would stop SSP calls but still let the
+    // client create/refresh GPT slots client-side. Bot/prefetch requests, by
+    // contrast, keep their slot definitions (the placement structure is
+    // unchanged) but skip the live auction, matching the existing behavior.
+    let ad_stack_enabled = ad_templates_enabled && auction_enabled && consent_allows_auction;
 
     let (winning_bids, prebuilt_bid_map) = if matched_slots.is_empty() {
         (std::collections::HashMap::new(), None)
@@ -6590,7 +6590,9 @@ pub async fn handle_page_bids(
                 }
             }
         } else {
-            let skip_reason = if !auction_enabled {
+            let skip_reason = if !ad_templates_enabled {
+                "ad_templates_disabled"
+            } else if !auction_enabled {
                 "auction_disabled"
             } else if !consent_allows_auction {
                 "consent_denied"
@@ -19517,6 +19519,14 @@ mod tests {
             Settings::from_toml(&toml).expect("should parse settings with creative_opportunities")
         }
 
+        fn settings_with_co_templates_disabled() -> Settings {
+            let toml = format!(
+                "{}\n[auction]\nenabled = true\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
+                crate_test_settings_str()
+            );
+            Settings::from_toml(&toml).expect("should parse settings with disabled templates")
+        }
+
         async fn run_page_bids(
             settings: &Settings,
             orchestrator: &AuctionOrchestrator,
@@ -20317,6 +20327,35 @@ mod tests {
                     .len(),
                 0,
                 "disabled auction must not produce bids"
+            );
+        }
+
+        #[tokio::test]
+        async fn disabled_server_side_ad_templates_return_no_slots_or_bids() {
+            // The dedicated template switch must suppress publisher/page-bids
+            // delivery without using the global auction switch.
+            let settings = settings_with_co_templates_disabled();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let slots = article_slot();
+            let req = make_page_bids_request("/2024/01/my-article/");
+
+            let body = run_page_bids_consent_allowed(&settings, &orchestrator, &slots, req).await;
+
+            assert_eq!(
+                body["slots"]
+                    .as_array()
+                    .expect("slots should be array")
+                    .len(),
+                0,
+                "disabled server-side ad templates must not return slot definitions"
+            );
+            assert_eq!(
+                body["bids"]
+                    .as_object()
+                    .expect("bids should be object")
+                    .len(),
+                0,
+                "disabled server-side ad templates must not produce bids"
             );
         }
 

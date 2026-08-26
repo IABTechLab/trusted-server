@@ -352,7 +352,7 @@ pub struct CreativeOpportunitiesConfig {
     /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_is_cookie_independent: Option<bool>,
-    /// Slot templates. Empty vec = feature disabled (no auction fired, no globals injected).
+    /// Slot templates. An empty vec or `enabled = false` disables template delivery.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub slot: Vec<CreativeOpportunitySlot>,
 }
