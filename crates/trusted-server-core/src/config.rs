@@ -139,7 +139,7 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
             field(
                 vec![
                     object("ec"),
-                    object("partners"),
+                    optional_object("partners"),
                     SecretPathSegment::ArrayEach,
                     object("api_token"),
                 ],
@@ -148,7 +148,7 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
             field(
                 vec![
                     object("ec"),
-                    object("partners"),
+                    optional_object("partners"),
                     SecretPathSegment::ArrayEach,
                     object("ts_pull_token"),
                 ],
@@ -616,6 +616,23 @@ formats = [{ width = 300, height = 250 }]
             )),
             "all Trusted Server app secrets should use the default secret store"
         );
+    }
+
+    #[test]
+    fn partner_secret_metadata_makes_the_defaulted_array_optional() {
+        let fields = TrustedServerAppConfig::secret_fields();
+
+        for field in fields.iter().filter(|field| {
+            matches!(
+                field.dotted_path().as_str(),
+                "ec.partners[*].api_token" | "ec.partners[*].ts_pull_token"
+            )
+        }) {
+            assert!(matches!(
+                &field.path[1],
+                SecretPathSegment::OptionalField(name) if name == "partners"
+            ));
+        }
     }
 
     #[test]

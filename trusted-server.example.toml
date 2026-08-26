@@ -15,9 +15,6 @@ proxy_secret = "publisher_proxy_secret"
 passphrase = "ec_passphrase"
 ec_store = "ec_identity_store"
 pull_sync_concurrency = 3
-# Keep this empty when no partners are configured. Replace this line with
-# `[[ec.partners]]` entries when adding partners.
-partners = []
 # cluster_trust_threshold = 10
 # cluster_recheck_secs = 3600
 
