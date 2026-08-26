@@ -25,8 +25,10 @@ version = "0.1.0"
 [variables]
 v_current_x2dkid = { default = "" }
 v_active_x2dkids = { default = "" }
-# Trusted Server app-config secret references. Replace the empty defaults with
-# values supplied by the deployment's secret provider; never commit values here.
+# These declared variables match the example config's secret key names. Regenerate
+# or extend them for deployment-specific keys, including handler key names such as
+# `admin_password` or `api_handler_password`. Replace the empty defaults with values
+# supplied by the deployment's secret provider; never commit values here.
 v_trusted_x5fserver_x5fsecrets_v_publisher_x5fproxy_x5fsecret = { default = "", secret = true }
 v_trusted_x5fserver_x5fsecrets_v_ec_x5fpassphrase = { default = "", secret = true }
 v_trusted_x5fserver_x5fsecrets_v_partner_x5fapi_x5ftoken = { default = "", secret = true }

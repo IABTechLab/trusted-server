@@ -75,6 +75,7 @@ impl PartnerRegistry {
         partners: &[EcPartner],
     ) -> Result<(), Report<TrustedServerError>> {
         let mut source_domains = HashMap::with_capacity(partners.len());
+        let mut api_token_key_references = HashMap::with_capacity(partners.len());
 
         for partner in partners {
             let normalized_source = normalize_partner_source_domain(&partner.source_domain)
@@ -90,6 +91,17 @@ impl PartnerRegistry {
             {
                 return Err(Report::new(TrustedServerError::Configuration {
                     message: format!("ec.partners: duplicate source_domain '{normalized_source}'"),
+                }));
+            }
+
+            if let Some(previous_source) = api_token_key_references
+                .insert(partner.api_token.expose(), normalized_source.clone())
+            {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "ec.partners: API token key reference is shared by source_domain \
+                         '{previous_source}' and '{normalized_source}'"
+                    ),
                 }));
             }
 
@@ -485,6 +497,40 @@ mod tests {
         ];
         let result = PartnerRegistry::from_config(&partners);
         assert!(result.is_err(), "should reject duplicate source domain");
+    }
+
+    #[test]
+    fn deploy_validation_rejects_duplicate_api_token_key_references() {
+        let shared_key = "partner_api_token";
+        let partners = vec![
+            make_partner("first.example.com", shared_key),
+            make_partner("second.example.com", shared_key),
+        ];
+
+        let error = PartnerRegistry::validate_config_for_deploy(&partners)
+            .expect_err("should reject duplicate API token key references");
+        let message = error.to_string();
+
+        assert!(message.contains("first.example.com"));
+        assert!(message.contains("second.example.com"));
+    }
+
+    #[test]
+    fn deploy_validation_allows_distinct_api_tokens_and_shared_pull_token_references() {
+        let mut first = make_partner("first.example.com", "first_partner_api_token");
+        first.pull_sync_enabled = true;
+        first.pull_sync_url = Some("https://first.example.com/sync".to_owned());
+        first.pull_sync_allowed_domains = vec!["first.example.com".to_owned()];
+        first.ts_pull_token = Some(Redacted::new("shared_pull_token".to_owned()));
+
+        let mut second = make_partner("second.example.com", "second_partner_api_token");
+        second.pull_sync_enabled = true;
+        second.pull_sync_url = Some("https://second.example.com/sync".to_owned());
+        second.pull_sync_allowed_domains = vec!["second.example.com".to_owned()];
+        second.ts_pull_token = Some(Redacted::new("shared_pull_token".to_owned()));
+
+        PartnerRegistry::validate_config_for_deploy(&[first, second])
+            .expect("should allow distinct API token and shared pull-token key references");
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! in-memory value used to build runtime [`crate::settings::Settings`].
 
 use edgezero_core::app_config::{AppConfigMeta, SecretField, SecretKind, SecretPathSegment};
-use error_stack::Report;
+use error_stack::{Report, ResultExt as _};
 use serde_json::Value;
 
 use crate::error::TrustedServerError;
@@ -163,10 +163,11 @@ fn resolve_leaf(
 
     let resolved = secret_store
         .get_string(default_store_name, &key_name)
-        .map_err(|_| {
-            configuration_error(format!(
-                "failed to resolve secret reference at `{leaf_path}`"
-            ))
+        .change_context(TrustedServerError::Configuration {
+            message: format!(
+                "failed to resolve secret reference at `{leaf_path}` from secret store \
+                 `{default_store_name}` key `{key_name}`"
+            ),
         })?;
     if resolved.is_empty() {
         return Err(configuration_error(format!(
@@ -318,6 +319,28 @@ mod tests {
 
         assert!(err.to_string().contains("outer[0].token"));
         assert!(!err.to_string().contains("resolved-a"));
+    }
+
+    #[test]
+    fn failed_lookup_reports_safe_reference_context_without_secret_values() {
+        let mut data = serde_json::json!({"outer": [{"token": "missing-secret-key"}]});
+        let store = MemorySecretStore {
+            values: BTreeMap::from([(
+                "fixture-secret-key".to_owned(),
+                b"fixture-secret-value".to_vec(),
+            )]),
+        };
+
+        let err =
+            resolve_secret_references::<Fixture>(&mut data, &store, &StoreName::from("secrets"))
+                .expect_err("should reject a missing secret key");
+        let diagnostic = format!("{err:?}");
+
+        assert!(diagnostic.contains("outer[0].token"));
+        assert!(diagnostic.contains("secrets"));
+        assert!(diagnostic.contains("missing-secret-key"));
+        assert!(diagnostic.contains("missing test secret"));
+        assert!(!diagnostic.contains("fixture-secret-value"));
     }
 
     #[test]
