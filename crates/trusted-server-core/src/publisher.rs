@@ -4354,7 +4354,22 @@ pub async fn handle_publisher_request(
     // Recorded before the request is consumed by the origin send: the template cache gate
     // below needs it, and an authorized response must never become a shared
     // template.
-    let request_had_authorization = req.headers().contains_key(header::AUTHORIZATION);
+    //
+    // A credential this edge already terminated is exempt. Basic auth runs as
+    // middleware ahead of routing, so reaching here on a gated path means the same
+    // handler already validated the request; every reader that can look the template
+    // up has satisfied that same credential. Without the marker the credential is
+    // pass-through to the origin and still disqualifies. See
+    // [`crate::auth::EdgeTerminatedAuthorization`].
+    let authorization_value_count = req.headers().get_all(header::AUTHORIZATION).iter().count();
+    let request_had_authorization = match authorization_value_count {
+        0 => false,
+        1 => req
+            .extensions()
+            .get::<crate::auth::EdgeTerminatedAuthorization>()
+            .is_none(),
+        _ => true,
+    };
     let request_had_cookie = req.headers().contains_key(header::COOKIE);
     // Whether carrying a cookie is itself disqualifying. Computed once and used for both
     // the lookup and the store, so the two cannot drift apart.
@@ -9025,6 +9040,127 @@ mod tests {
             assert_eq!(
                 second, first,
                 "the cached template must be byte-identical to what was stored"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_pass_through_authorization_never_reaches_the_shared_template() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            let mut request = navigation_request();
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+            );
+
+            let response = run(&settings, &services, request).await;
+            assert_eq!(
+                response
+                    .headers()
+                    .get(HEADER_X_TS_TEMPLATE_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("bypass-request"),
+                "a credential TS did not terminate is bound for the origin, so its response must never be shared"
+            );
+            assert_eq!(
+                cache.lookups.lock().expect("should lock lookups").len(),
+                0,
+                "an unterminated authorization must bypass before the lookup, not after it"
+            );
+        }
+
+        #[tokio::test]
+        async fn repeated_authorization_never_reaches_the_shared_template() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            let mut request = navigation_request();
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+            );
+            request.headers_mut().append(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer publisher-origin-credential"),
+            );
+            request
+                .extensions_mut()
+                .insert(crate::auth::EdgeTerminatedAuthorization::for_test());
+
+            let response = run(&settings, &services, request).await;
+            assert_eq!(
+                response
+                    .headers()
+                    .get(HEADER_X_TS_TEMPLATE_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("bypass-request"),
+                "an ambiguous authorization must remain bound for the origin even if a marker is present"
+            );
+            assert_eq!(
+                cache.lookups.lock().expect("should lock lookups").len(),
+                0,
+                "repeated authorization must bypass before the shared template lookup"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_edge_terminated_authorization_still_shares_its_template() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+
+            // One origin response for two requests: the warm read is asserted by the
+            // fixture running dry, exactly as in the unauthenticated case.
+            queue_shareable_html(&stub);
+
+            let authorized_navigation = || {
+                let mut request = navigation_request();
+                request.headers_mut().insert(
+                    header::AUTHORIZATION,
+                    HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+                );
+                request
+                    .extensions_mut()
+                    .insert(crate::auth::EdgeTerminatedAuthorization::for_test());
+                request
+            };
+
+            let cold = run(&settings, &services, authorized_navigation()).await;
+            assert_eq!(
+                cold.headers()
+                    .get(HEADER_X_TS_TEMPLATE_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("miss-stored"),
+                "a credential this edge terminated must be allowed to fill the shared template"
+            );
+            let first = body_of(cold).await;
+
+            let warm = run(&settings, &services, authorized_navigation()).await;
+            assert_eq!(
+                warm.headers()
+                    .get(HEADER_X_TS_TEMPLATE_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("hit"),
+                "the second gated request must read the template the first one stored"
+            );
+            let second = body_of(warm).await;
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "the warm gated request must not fetch the origin"
+            );
+            assert_eq!(
+                second, first,
+                "the gated warm response must be byte-identical to the stored template"
             );
         }
 

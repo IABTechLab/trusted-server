@@ -73,8 +73,11 @@ impl AuthMiddleware {
 
 #[async_trait(?Send)]
 impl Middleware for AuthMiddleware {
-    async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        match enforce_basic_auth(&self.settings, ctx.request()) {
+    async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+        // Takes the request mutably because `enforce_basic_auth` marks requests
+        // whose credential it consumed itself; the shared template cache gate
+        // reads that marker later.
+        match enforce_basic_auth(&self.settings, ctx.request_mut()) {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
             Err(report) => {
