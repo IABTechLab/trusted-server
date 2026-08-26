@@ -97,6 +97,18 @@ impl Middleware for FinalizeResponseMiddleware {
             })
         });
 
+        // Write the resolved outcome back so a downstream access-telemetry
+        // snapshot (built from response extensions after finalize) sees
+        // what was actually looked up here rather than the stale carried-in
+        // state — mirrors the entry-point finalize site in `main.rs`
+        // (`apply_entry_point_finalize_headers`), which writes back for the
+        // same reason.
+        let resolved_state = match &geo_info {
+            Some(geo) => GeoLookupState::Resolved(geo.clone()),
+            None => GeoLookupState::Attempted,
+        };
+        response.extensions_mut().insert(resolved_state);
+
         apply_finalize_headers(&self.settings, geo_info.as_ref(), &mut response);
         response
             .headers_mut()
@@ -591,6 +603,67 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("false"),
             "should set X-Geo-Info-Available: false when geo returns None"
+        );
+    }
+
+    #[test]
+    fn finalize_handle_writes_back_resolved_geo_state_after_fallback_lookup() {
+        // The request phase never attempted a geo lookup (no GeoLookupState
+        // extension on the handler's response), so the middleware resolves
+        // one via the fallback closure. That resolved outcome must be
+        // written back into response extensions -- mirroring
+        // apply_entry_point_finalize_headers in main.rs -- so a downstream
+        // access-telemetry snapshot sees the freshly resolved country
+        // instead of a stale/missing GeoLookupState.
+        let settings = settings_with_response_headers(vec![]);
+        let middleware = FinalizeResponseMiddleware::new(
+            Arc::new(settings),
+            Arc::new(FixedGeo(Some(sample_geo_info()))),
+        );
+        let handler =
+            Arc::new(
+                |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
+            );
+
+        let response = block_on(middleware.handle(empty_ctx(), Next::new(&[], &*handler)))
+            .expect("should succeed");
+
+        match response.extensions().get::<GeoLookupState>() {
+            Some(GeoLookupState::Resolved(info)) => {
+                assert_eq!(
+                    info.country, "US",
+                    "should carry the fallback-resolved geo info"
+                );
+            }
+            other => {
+                panic!("expected GeoLookupState::Resolved after a fallback lookup, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn finalize_handle_writes_back_attempted_geo_state_when_fallback_finds_nothing() {
+        // The fallback lookup ran but resolved no geo info. The middleware
+        // must still record that the lookup was attempted, so a later
+        // consumer of the extension does not mistake this for
+        // GeoLookupState::NotAttempted and retry the lookup.
+        let settings = settings_with_response_headers(vec![]);
+        let middleware =
+            FinalizeResponseMiddleware::new(Arc::new(settings), Arc::new(FixedGeo(None)));
+        let handler =
+            Arc::new(
+                |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
+            );
+
+        let response = block_on(middleware.handle(empty_ctx(), Next::new(&[], &*handler)))
+            .expect("should succeed");
+
+        assert!(
+            matches!(
+                response.extensions().get::<GeoLookupState>(),
+                Some(GeoLookupState::Attempted)
+            ),
+            "should write back Attempted when the fallback lookup finds no geo info"
         );
     }
 

@@ -16,6 +16,42 @@ use crate::request_timing::{AuctionWaitPlacement, TimingSnapshot};
 /// by [`publisher_route_template`].
 const MAX_SEGMENT_LEN: usize = 32;
 
+/// Normalizes an HTTP method token into the bounded set of values stored in
+/// the `method` `LowCardinality` column.
+///
+/// HTTP permits arbitrary extension-method tokens (`PROPFIND`, `MKCOL`, or
+/// any client-supplied garbage), and the token on an inbound request is
+/// entirely client controlled. Capturing one verbatim into a 30-day
+/// `LowCardinality(String)` column would let a single caller inflate that
+/// column's cardinality without bound and would violate this dataset's
+/// bounded-dimension privacy rule (see the module doc). Every standard
+/// method maps to its uppercase form; anything else maps to `"other"`. Runs
+/// inside [`access_event_row`] rather than at each capture site, so every
+/// row-building path is covered regardless of how `method` was populated.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::access_telemetry::normalize_method;
+///
+/// assert_eq!(normalize_method("get"), "GET");
+/// assert_eq!(normalize_method("PROPFIND"), "other");
+/// assert_eq!(normalize_method("<script>"), "other");
+/// ```
+#[must_use]
+pub fn normalize_method(method: &str) -> &'static str {
+    match method.to_ascii_uppercase().as_str() {
+        "GET" => "GET",
+        "HEAD" => "HEAD",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "DELETE" => "DELETE",
+        "PATCH" => "PATCH",
+        "OPTIONS" => "OPTIONS",
+        _ => "other",
+    }
+}
+
 /// Coarse traffic category for one response, used as a `LowCardinality`
 /// dimension in the access telemetry row.
 ///
@@ -200,7 +236,7 @@ pub fn access_event_row(
 
     let row = json!({
         "event_ts": format_event_timestamp(event_ts_epoch_ms),
-        "method": snapshot.method,
+        "method": normalize_method(&snapshot.method),
         "status": snapshot.status,
         "time_elapsed_ms": timings.time_elapsed_ms,
         "sample_rate": snapshot.sample_rate,
@@ -414,5 +450,46 @@ mod tests {
         // 2023-11-14T22:13:20.000Z
         let rendered = format_event_timestamp(1_700_000_000_000);
         assert_eq!(rendered, "2023-11-14 22:13:20.000");
+    }
+
+    #[test]
+    fn normalize_method_uppercases_allowlisted_methods() {
+        assert_eq!(normalize_method("get"), "GET");
+        assert_eq!(normalize_method("Get"), "GET");
+        assert_eq!(normalize_method("POST"), "POST");
+        assert_eq!(normalize_method("head"), "HEAD");
+        assert_eq!(normalize_method("PUT"), "PUT");
+        assert_eq!(normalize_method("delete"), "DELETE");
+        assert_eq!(normalize_method("Patch"), "PATCH");
+        assert_eq!(normalize_method("options"), "OPTIONS");
+    }
+
+    #[test]
+    fn normalize_method_maps_extension_and_garbage_tokens_to_other() {
+        assert_eq!(
+            normalize_method("PROPFIND"),
+            "other",
+            "an HTTP extension method must not reach the row verbatim"
+        );
+        assert_eq!(
+            normalize_method("<script>alert(1)</script>"),
+            "other",
+            "an unbounded client-controlled token must not reach the row verbatim"
+        );
+    }
+
+    #[test]
+    fn row_normalizes_method_even_when_snapshot_carries_a_raw_token() {
+        // The normalizer runs inside `access_event_row` so every row-building
+        // path is covered, regardless of what the snapshot's `method` field
+        // holds — a caller-controlled extension method must never leak into
+        // the row unnormalized.
+        let mut snapshot = unknown_snapshot(RouteClass::Other, "/other/*");
+        snapshot.method = "PROPFIND".to_owned();
+        let row = access_event_row(&snapshot, &TimingSnapshot::default(), 0);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&row).expect("should serialize valid JSON");
+
+        assert_eq!(parsed["method"], "other");
     }
 }

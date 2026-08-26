@@ -452,9 +452,12 @@ fn run_edgezero_pull_sync_after_send(
 /// either of those per-route types, so every response class can emit.
 ///
 /// Sampled-out requests return silently — that is the expected, high-volume
-/// case and not worth a log line. Every other drop (row build, token load,
-/// send, or non-2xx status — all folded into `emit_access_event`'s `Result`)
-/// logs exactly one warning naming the reason.
+/// case and not worth a log line. A snapshot carrying a degraded
+/// `sample_rate` (see [`should_sample_access_row`]) also returns silently,
+/// since it only occurs on an already-degraded path. Every other drop (row
+/// build, token load, send, or non-2xx status — all folded into
+/// `emit_access_event`'s `Result`) logs exactly one warning naming the
+/// reason.
 fn emit_access_telemetry_after_send(
     settings: &Settings,
     outcome: &DeliveryOutcome,
@@ -477,7 +480,11 @@ fn emit_access_telemetry_after_send(
     let entropy_nanos = u64::try_from(since_epoch.as_nanos()).unwrap_or(u64::MAX);
     let entropy = entropy_nanos ^ outcome.bytes;
 
-    if !tinybird::sampled_in(settings.tinybird.access_sample_rate, entropy) {
+    if !should_sample_access_row(
+        outcome.snapshot.sample_rate,
+        settings.tinybird.access_sample_rate,
+        entropy,
+    ) {
         return;
     }
 
@@ -491,6 +498,39 @@ fn emit_access_telemetry_after_send(
     if let Err(error) = result {
         log::warn!("access telemetry emission dropped: {error:?}");
     }
+}
+
+/// Whether one response's access-telemetry row should be emitted, combining
+/// the degraded-snapshot guard with the sampling roll.
+///
+/// `snapshot_sample_rate` is the rate recorded on the [`AccessTelemetrySnapshot`]
+/// itself (the value serialized into the row's `sample_rate` column, which
+/// the documented volume estimator divides by as `1.0 / sample_rate`).
+/// `settings_sample_rate` is the rate used for the sampling decision at
+/// call time. The two can diverge: when `app_state` fails to build,
+/// [`edgezero_main`] captures a snapshot with `sample_rate` defaulted to
+/// `0.0` before any settings ever load, but the two settings-reload
+/// emission sites still gate and sample using the *reloaded* settings'
+/// (nonzero) rate. Without this guard, such a row could be sampled in and
+/// emitted while carrying `sample_rate: 0.0`, corrupting the volume
+/// estimator. Dropping these rows is acceptable: they only occur on an
+/// already-degraded path, consistent with this pipeline's fail-quiet
+/// telemetry policy. Split out of [`emit_access_telemetry_after_send`] so
+/// the guard is unit-testable without a network seam.
+///
+/// Callers must already have applied the coarse
+/// `tinybird.enabled`/`access_enabled` gate.
+#[must_use]
+fn should_sample_access_row(
+    snapshot_sample_rate: f64,
+    settings_sample_rate: f64,
+    entropy: u64,
+) -> bool {
+    if snapshot_sample_rate <= 0.0 {
+        return false;
+    }
+
+    tinybird::sampled_in(settings_sample_rate, entropy)
 }
 
 /// Per-response context threaded into [`send_edgezero_response`] so the
@@ -1816,6 +1856,46 @@ mod tests {
             *log.lock().expect("should lock order log"),
             vec!["pull_sync", "telemetry"],
             "pull-sync must dispatch before telemetry emits"
+        );
+    }
+
+    #[test]
+    fn should_sample_access_row_rejects_a_degraded_zero_sample_rate() {
+        // A snapshot captured on the app-state-build-failure fallback path
+        // carries `sample_rate: 0.0`. Even when the reloaded settings' rate
+        // would sample every request in (1.0), the row must not emit —
+        // otherwise it would claim `sample_rate: 0.0` and corrupt the
+        // `sum(1.0 / sample_rate)` volume estimator.
+        assert!(
+            !should_sample_access_row(0.0, 1.0, 0),
+            "a snapshot with sample_rate 0.0 must never emit, regardless of entropy or settings' rate"
+        );
+        assert!(
+            !should_sample_access_row(0.0, 1.0, u64::MAX),
+            "the degraded-rate guard must not depend on the entropy value"
+        );
+    }
+
+    #[test]
+    fn should_sample_access_row_rejects_a_negative_sample_rate() {
+        assert!(
+            !should_sample_access_row(-1.0, 1.0, 0),
+            "a negative snapshot sample_rate is equally degraded and must not emit"
+        );
+    }
+
+    #[test]
+    fn should_sample_access_row_defers_to_the_settings_sampling_roll_when_not_degraded() {
+        // With a healthy (nonzero) snapshot sample_rate, the outcome should
+        // match `tinybird::sampled_in` exactly, since that is the only
+        // remaining decision.
+        assert!(
+            should_sample_access_row(0.25, 1.0, 0),
+            "a settings rate of 1.0 always samples in, independent of entropy"
+        );
+        assert!(
+            !should_sample_access_row(0.25, 0.0, 0),
+            "a settings rate of 0.0 always samples out, independent of the snapshot's rate"
         );
     }
 }
