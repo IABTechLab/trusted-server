@@ -116,7 +116,7 @@ enabled = false
 
 [proxy]
 # certificate_check = true
-# Required for integrations.prebid.external_bundle_url and first-party proxy redirects.
+# Permits first-party proxy signing, initial fetch targets, and redirect targets.
 # allowed_domains = ["ads.example.com", "assets.example.com", "*.cdn.example.com"]
 
 # Static/rehosted asset cache policies are operator-controlled. Disabled rules

@@ -76,8 +76,8 @@ pub enum TrustedServerError {
     #[display("Forbidden: {message}")]
     Forbidden { message: String },
 
-    /// A redirect destination was blocked by the proxy allowlist.
-    #[display("Redirect to `{host}` blocked: host not in proxy allowed_domains")]
+    /// A proxy host was blocked by `proxy.allowed_domains`.
+    #[display("Proxy host `{host}` blocked: host not in proxy.allowed_domains")]
     AllowlistViolation { host: String },
 
     /// Settings parsing or validation failed.

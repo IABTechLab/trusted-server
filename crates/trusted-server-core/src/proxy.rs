@@ -1280,11 +1280,11 @@ fn append_ec_id(req: &Request<EdgeBody>, target_url_parsed: &mut url::Url) {
     }
 }
 
-/// Returns `true` when a redirect to `host` should be followed.
+/// Returns `true` when `host` is permitted by the proxy host policy.
 ///
 /// When `allowed_domains` is empty every host is permitted (open mode).
 /// When non-empty the host must match at least one pattern via [`is_host_allowed`].
-fn redirect_is_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
+fn is_host_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bool {
     allowed_domains.is_empty()
         || allowed_domains
             .iter()
@@ -1352,7 +1352,7 @@ async fn proxy_with_redirects(
             }));
         }
 
-        if !redirect_is_permitted(redirect_policy.allowed_domains, host) {
+        if !is_host_permitted(redirect_policy.allowed_domains, host) {
             log::warn!(
                 "request to `{}` blocked: host not in proxy allowed_domains",
                 host
@@ -1513,7 +1513,7 @@ async fn proxy_with_redirects(
                 }));
             }
         };
-        if !redirect_is_permitted(redirect_policy.allowed_domains, next_host) {
+        if !is_host_permitted(redirect_policy.allowed_domains, next_host) {
             log::warn!(
                 "redirect to `{}` blocked: host not in proxy allowed_domains",
                 next_host
@@ -1673,7 +1673,8 @@ pub async fn handle_first_party_click(
 ///
 /// # Errors
 ///
-/// Returns an error if JSON parsing fails, the URL cannot be parsed, or the URL uses an unsupported scheme.
+/// Returns an error if JSON parsing fails, the URL cannot be parsed, the URL uses an
+/// unsupported scheme, the URL lacks a host, or the host violates `proxy.allowed_domains`.
 pub async fn handle_first_party_proxy_sign(
     settings: &Settings,
     _services: &RuntimeServices,
@@ -1745,6 +1746,21 @@ pub async fn handle_first_party_proxy_sign(
     if scheme != "http" && scheme != "https" {
         return Err(Report::new(TrustedServerError::Proxy {
             message: "unsupported scheme".to_string(),
+        }));
+    }
+
+    let host = parsed.host_str().ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
+            message: "missing host".to_string(),
+        })
+    })?;
+    if !is_host_permitted(&settings.proxy.allowed_domains, host) {
+        log::warn!(
+            "sign request for `{}` blocked: host not in proxy.allowed_domains",
+            host
+        );
+        return Err(Report::new(TrustedServerError::AllowlistViolation {
+            host: host.to_string(),
         }));
     }
 
@@ -2208,8 +2224,8 @@ mod tests {
         build_asset_proxy_target_url, clear_s3_credentials_cache_for_tests,
         handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
         handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, is_host_allowed,
-        proxy_request, rebuild_response_with_body, reconstruct_and_validate_signed_target,
-        redirect_is_permitted, stream_asset_body,
+        is_host_permitted, proxy_request, rebuild_response_with_body,
+        reconstruct_and_validate_signed_target, stream_asset_body,
     };
     use crate::cache_policy::{CachePolicy, EdgeCacheHeader};
     use crate::constants::{HEADER_ACCEPT, HEADER_X_FORWARDED_FOR};
@@ -2287,6 +2303,16 @@ mod tests {
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(EdgeBody::from(body.to_string()))
             .expect("should build http post request")
+    }
+
+    fn build_proxy_sign_request(method: &Method, uri: &str, target: &str) -> HttpRequest<EdgeBody> {
+        if method == Method::GET {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            serializer.append_pair("url", target);
+            return build_http_request(method.clone(), format!("{uri}?{}", serializer.finish()));
+        }
+
+        build_http_post_json_request(uri, &serde_json::json!({ "url": target }))
     }
 
     fn build_http_post_streaming_request(uri: impl AsRef<str>) -> HttpRequest<EdgeBody> {
@@ -2547,6 +2573,152 @@ mod tests {
                 "{}",
                 json
             );
+        });
+    }
+
+    #[test]
+    fn proxy_sign_enforces_allowed_domains_for_get_and_post() {
+        struct Case {
+            name: &'static str,
+            allowed_domains: &'static [&'static str],
+            target: &'static str,
+            signing_uri: &'static str,
+            expected_base: Option<&'static str>,
+            permitted: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "exact match",
+                allowed_domains: &["cdn.example.com"],
+                target: "https://cdn.example.com/asset.js",
+                signing_uri: "https://edge.example.com/first-party/sign",
+                expected_base: None,
+                permitted: true,
+            },
+            Case {
+                name: "rejected host",
+                allowed_domains: &["allowed.example.com"],
+                target: "https://blocked.example.com/asset.js",
+                signing_uri: "https://edge.example.com/first-party/sign",
+                expected_base: None,
+                permitted: false,
+            },
+            Case {
+                name: "wildcard match",
+                allowed_domains: &["*.example.com"],
+                target: "https://static.cdn.example.com/asset.js",
+                signing_uri: "https://edge.example.com/first-party/sign",
+                expected_base: None,
+                permitted: true,
+            },
+            Case {
+                name: "protocol-relative match",
+                allowed_domains: &["cdn.example.com"],
+                target: "//cdn.example.com/asset.js",
+                signing_uri: "http://edge.example.com/first-party/sign",
+                expected_base: Some("http://cdn.example.com/asset.js"),
+                permitted: true,
+            },
+            Case {
+                name: "open mode",
+                allowed_domains: &[],
+                target: "https://unlisted.example.com/asset.js",
+                signing_uri: "https://edge.example.com/first-party/sign",
+                expected_base: None,
+                permitted: true,
+            },
+            Case {
+                name: "user information cannot bypass",
+                allowed_domains: &["allowed.example.com"],
+                target: "https://allowed.example.com@blocked.example.com:9443/path",
+                signing_uri: "https://edge.example.com/first-party/sign",
+                expected_base: None,
+                permitted: false,
+            },
+            Case {
+                name: "non-host URL parts are ignored",
+                allowed_domains: &["allowed.example.com"],
+                target: "https://user@allowed.example.com:9443/path?cache=1#section",
+                signing_uri: "https://edge.example.com/first-party/sign",
+                expected_base: None,
+                permitted: true,
+            },
+        ];
+
+        futures::executor::block_on(async {
+            for case in cases {
+                for method in [&Method::GET, &Method::POST] {
+                    let label = format!("{} {}", method.as_str(), case.name);
+                    let mut settings = create_test_settings();
+                    settings.proxy.allowed_domains = case
+                        .allowed_domains
+                        .iter()
+                        .map(|domain| (*domain).to_string())
+                        .collect();
+                    let req = build_proxy_sign_request(method, case.signing_uri, case.target);
+                    let result =
+                        handle_first_party_proxy_sign(&settings, &noop_services(), req).await;
+
+                    if case.permitted {
+                        let response = result.unwrap_or_else(|error| {
+                            panic!("{label} should sign target: {error:?}")
+                        });
+                        assert_eq!(
+                            response.status(),
+                            StatusCode::OK,
+                            "{label} should return 200"
+                        );
+                        let body: serde_json::Value =
+                            serde_json::from_str(&response_body_string(response))
+                                .expect("should parse sign response JSON");
+                        let href = body["href"]
+                            .as_str()
+                            .expect("should include string href in sign response");
+                        let signed_url =
+                            url::Url::parse(&format!("https://edge.example.com{href}"))
+                                .expect("should parse signed proxy URL");
+                        assert_eq!(
+                            signed_url.path(),
+                            "/first-party/proxy",
+                            "{label} should return a first-party proxy href"
+                        );
+                        let signed_params: HashMap<_, _> = signed_url.query_pairs().collect();
+                        for parameter in ["tsurl", "tstoken", "tsexp"] {
+                            assert!(
+                                signed_params.contains_key(parameter),
+                                "{label} should include {parameter} in signed href"
+                            );
+                        }
+                        if let Some(expected_base) = case.expected_base {
+                            assert_eq!(
+                                body["base"].as_str(),
+                                Some(expected_base),
+                                "{label} should inherit the signing request scheme"
+                            );
+                        }
+                    } else {
+                        let error = match result {
+                            Ok(response) => {
+                                panic!("{label} should reject target, got {response:?}")
+                            }
+                            Err(error) => error,
+                        };
+                        assert!(
+                            matches!(
+                                error.current_context(),
+                                TrustedServerError::AllowlistViolation { .. }
+                            ),
+                            "{label} should return AllowlistViolation, got {error:?}"
+                        );
+                        assert_eq!(
+                            error.current_context().status_code(),
+                            StatusCode::FORBIDDEN,
+                            "{label} should map allowlist rejection to 403"
+                        );
+                    }
+                }
+            }
         });
     }
 
@@ -5408,11 +5580,11 @@ mod tests {
     }
 
     #[test]
-    fn redirect_empty_allowlist_permits_any() {
+    fn empty_allowlist_permits_any_host() {
         let allowed: [String; 0] = [];
         assert!(
-            redirect_is_permitted(&allowed, "evil.com"),
-            "empty allowlist should not block any redirect host"
+            is_host_permitted(&allowed, "evil.com"),
+            "empty allowlist should not block any host"
         );
     }
 
@@ -5427,72 +5599,72 @@ mod tests {
         );
     }
 
-    // --- redirect_is_permitted (full guard: empty-list bypass + is_host_allowed) ---
+    // --- is_host_permitted (full guard: empty-list bypass + is_host_allowed) ---
 
     #[test]
-    fn redirect_chain_allowed_when_host_matches_allowlist() {
+    fn host_is_permitted_when_it_matches_allowlist() {
         let allowed = vec!["ad.example.com".to_string(), "cdn.example.com".to_string()];
         assert!(
-            redirect_is_permitted(&allowed, "ad.example.com"),
-            "should permit redirect to exact-match host"
+            is_host_permitted(&allowed, "ad.example.com"),
+            "should permit exact-match host"
         );
         assert!(
-            redirect_is_permitted(&allowed, "cdn.example.com"),
-            "should permit redirect to second allowed host"
+            is_host_permitted(&allowed, "cdn.example.com"),
+            "should permit second allowed host"
         );
     }
 
     #[test]
-    fn redirect_chain_allowed_when_host_matches_wildcard() {
+    fn host_is_permitted_when_it_matches_wildcard() {
         let allowed = vec!["*.example.com".to_string()];
         assert!(
-            redirect_is_permitted(&allowed, "sub.example.com"),
-            "should permit redirect to wildcard-matched subdomain"
+            is_host_permitted(&allowed, "sub.example.com"),
+            "should permit wildcard-matched subdomain"
         );
     }
 
     #[test]
-    fn redirect_chain_blocked_when_host_not_in_allowlist() {
+    fn host_is_blocked_when_not_in_allowlist() {
         let allowed = vec!["ad.example.com".to_string()];
         assert!(
-            !redirect_is_permitted(&allowed, "evil.com"),
-            "should block redirect to host not in allowlist"
+            !is_host_permitted(&allowed, "evil.com"),
+            "should block host not in allowlist"
         );
     }
 
     #[test]
-    fn redirect_chain_allowed_when_allowlist_is_empty() {
+    fn any_host_is_permitted_when_allowlist_is_empty() {
         let allowed: Vec<String> = vec![];
         assert!(
-            redirect_is_permitted(&allowed, "any-host.com"),
-            "should allow any redirect when allowlist is empty (open mode)"
+            is_host_permitted(&allowed, "any-host.com"),
+            "should allow any host when allowlist is empty (open mode)"
         );
     }
 
     #[test]
-    fn redirect_chain_blocked_when_host_is_empty() {
+    fn empty_host_is_blocked_when_allowlist_is_non_empty() {
         let allowed = vec!["example.com".to_string()];
         assert!(
-            !redirect_is_permitted(&allowed, ""),
-            "should block redirect with empty host when allowlist is non-empty"
+            !is_host_permitted(&allowed, ""),
+            "should block empty host when allowlist is non-empty"
         );
     }
 
     #[test]
-    fn redirect_is_permitted_accepts_str_slices() {
+    fn is_host_permitted_accepts_str_slices() {
         // Verifies the &[impl AsRef<str>] bound works with &str literals,
         // not just Vec<String>.
         let allowed: &[&str] = &["example.com", "*.cdn.example.com"];
         assert!(
-            redirect_is_permitted(allowed, "example.com"),
+            is_host_permitted(allowed, "example.com"),
             "should permit exact match via &str slice"
         );
         assert!(
-            redirect_is_permitted(allowed, "static.cdn.example.com"),
+            is_host_permitted(allowed, "static.cdn.example.com"),
             "should permit wildcard match via &str slice"
         );
         assert!(
-            !redirect_is_permitted(allowed, "evil.com"),
+            !is_host_permitted(allowed, "evil.com"),
             "should block host not in &str slice allowlist"
         );
     }
@@ -5501,19 +5673,19 @@ mod tests {
     fn ip_literal_blocked_by_domain_allowlist() {
         let allowed = vec!["*.example.com".to_string()];
         assert!(
-            !redirect_is_permitted(&allowed, "169.254.169.254"),
+            !is_host_permitted(&allowed, "169.254.169.254"),
             "should block cloud metadata IP"
         );
         assert!(
-            !redirect_is_permitted(&allowed, "127.0.0.1"),
+            !is_host_permitted(&allowed, "127.0.0.1"),
             "should block loopback IPv4"
         );
         assert!(
-            !redirect_is_permitted(&allowed, "[::1]"),
+            !is_host_permitted(&allowed, "[::1]"),
             "should block loopback IPv6"
         );
         assert!(
-            !redirect_is_permitted(&allowed, "::1"),
+            !is_host_permitted(&allowed, "::1"),
             "should block bare loopback IPv6"
         );
     }

@@ -809,20 +809,19 @@ Controls first-party proxy security settings and path-based asset routes.
 
 ### `[proxy]`
 
-| Field               | Type          | Required             | Description                                            |
-| ------------------- | ------------- | -------------------- | ------------------------------------------------------ |
-| `allowed_domains`   | Array[String] | No (default: `[]`)   | Redirect destinations the proxy is permitted to follow |
-| `certificate_check` | Boolean       | No (default: `true`) | Verify TLS certificates when proxying HTTPS origins    |
-| `asset_routes`      | Array[Table]  | No (default: `[]`)   | Path prefixes proxied directly to configured origins   |
+| Field               | Type          | Required             | Description                                                 |
+| ------------------- | ------------- | -------------------- | ----------------------------------------------------------- |
+| `allowed_domains`   | Array[String] | No (default: `[]`)   | Hosts permitted for signing, initial fetches, and redirects |
+| `certificate_check` | Boolean       | No (default: `true`) | Verify TLS certificates when proxying HTTPS origins         |
+| `asset_routes`      | Array[Table]  | No (default: `[]`)   | Path prefixes proxied directly to configured origins        |
 
 **Example**:
 
 ```toml
 [proxy]
 allowed_domains = [
-  "tracker.com",         # Exact match
-  "*.adserver.com",      # Wildcard: adserver.com and all subdomains
-  "*.trusted-cdn.net",
+  "assets.example.com",  # Exact match
+  "*.cdn.example.com",   # Wildcard: cdn.example.com and all subdomains
 ]
 ```
 
@@ -830,32 +829,32 @@ allowed_domains = [
 
 ```bash
 # JSON array
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS='["tracker.com","*.adserver.com"]'
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS='["assets.example.com","*.cdn.example.com"]'
 
 # Indexed
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__0="tracker.com"
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__1="*.adserver.com"
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__0="assets.example.com"
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__1="*.cdn.example.com"
 
 # Comma-separated
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS="tracker.com,*.adserver.com"
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS="assets.example.com,*.cdn.example.com"
 ```
 
 ### Field Details
 
 #### `allowed_domains`
 
-**Purpose**: Allowlist of redirect destinations the proxy is permitted to follow.
+**Purpose**: Allowlist of target hosts permitted for `/first-party/sign` and `/first-party/proxy`.
 
-**Behavior**: When the proxy receives an HTTP redirect (301/302/303/307/308) during a request to `/first-party/proxy`, the redirect target host is checked against this list. A redirect whose host is not matched is blocked with a 403 error.
+**Behavior**: Trusted Server checks the parsed host before signing a target, before fetching the initial proxy target, and before following each HTTP redirect (301/302/303/307/308). A host that does not match the list is blocked with a 403 error.
 
-**Default — open mode**: When `allowed_domains` is absent or empty, every redirect destination is allowed. This default is intentional for zero-config development but should not be used in production.
+**Default - open mode**: When `allowed_domains` is absent or empty, every valid host is allowed for signing, initial fetches, and redirects. This default supports zero-config development but should not be used in production.
 
 **Pattern Matching**:
 
-| Pattern         | Matches                                             | Does not match     |
-| --------------- | --------------------------------------------------- | ------------------ |
-| `tracker.com`   | `tracker.com`                                       | `sub.tracker.com`  |
-| `*.tracker.com` | `tracker.com`, `sub.tracker.com`, `a.b.tracker.com` | `evil-tracker.com` |
+| Pattern              | Matches                                                            | Does not match           |
+| -------------------- | ------------------------------------------------------------------ | ------------------------ |
+| `assets.example.com` | `assets.example.com`                                               | `sub.assets.example.com` |
+| `*.cdn.example.com`  | `cdn.example.com`, `static.cdn.example.com`, `a.b.cdn.example.com` | `evil-cdn.example.com`   |
 
 - `"example.com"` — exact match only.
 - `"*.example.com"` — matches the base domain and any subdomain at any depth.
@@ -864,13 +863,13 @@ TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS="tracker.com,*.adserver.com"
 - The `*` wildcard requires a dot boundary: `*.example.com` does **not** match `evil-example.com`.
 
 ::: danger Production Recommendation
-Always configure `allowed_domains` in production. Without an explicit allowlist, a signed proxy URL can be used to follow redirects to arbitrary hosts, creating an SSRF risk.
+Always configure `allowed_domains` in production. Without an explicit allowlist, clients can sign and fetch valid URLs for arbitrary hosts, including redirect targets.
 
 ```toml
 [proxy]
 allowed_domains = [
-  "*.your-ad-network.com",
-  "tracker.your-partner.com",
+  "assets.example.com",
+  "*.cdn.example.com",
 ]
 ```
 

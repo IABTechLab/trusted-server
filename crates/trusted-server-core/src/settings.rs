@@ -1573,15 +1573,15 @@ pub struct Proxy {
     /// Set to false for local development with self-signed certificates.
     #[serde(default = "default_certificate_check")]
     pub certificate_check: bool,
-    /// Permitted redirect target domains for the first-party proxy.
+    /// Permitted signing, initial fetch, and redirect target domains for the
+    /// first-party proxy.
     ///
     /// Supports exact hostname match (`"example.com"`) and subdomain wildcard
     /// prefix (`"*.example.com"`, which also matches the apex `example.com`).
     /// Matching is case-insensitive.
     ///
-    /// When empty (the default), redirect destinations are not restricted.
-    /// Configure this in production to prevent SSRF via redirect chains
-    /// initiated by signed first-party proxy URLs.
+    /// When empty (the default), proxy hosts are not restricted. Configure this
+    /// in production to constrain signed and fetched first-party proxy targets.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub allowed_domains: Vec<String>,
     /// Path-prefix-based asset proxy routes evaluated before publisher fallback.
@@ -1638,7 +1638,7 @@ impl Proxy {
 
         if self.allowed_domains.is_empty() {
             log::debug!(
-                "proxy.allowed_domains is empty: all redirect destinations are permitted (open mode)"
+                "proxy.allowed_domains is empty: all signing, initial fetch, and redirect hosts are permitted (open mode)"
             );
         }
 

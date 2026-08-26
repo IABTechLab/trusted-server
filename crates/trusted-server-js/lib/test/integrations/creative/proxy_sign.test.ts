@@ -43,16 +43,50 @@ describe('creative/proxy_sign.ts', () => {
         credentials: 'same-origin',
       })
     );
-    expect(result).toBe(signed);
+    expect(result).toEqual({ outcome: 'signed', href: signed });
   });
 
-  it('returns null when fetch is unavailable', async () => {
+  it('returns fallback when fetch is unavailable', async () => {
     global.fetch = undefined as unknown as typeof fetch;
     const result = await signProxyUrl('https://cdn.example/asset.js');
-    expect(result).toBeNull();
+    expect(result).toEqual({ outcome: 'fallback' });
   });
 
-  it('skips the doomed POST in an opaque origin and returns null', async () => {
+  it('returns blocked for a signing policy rejection', async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 403,
+    }) as unknown as typeof fetch;
+
+    const result = await signProxyUrl('https://blocked.example.com/asset.js');
+
+    expect(result).toEqual({ outcome: 'blocked' });
+  });
+
+  it('returns fallback for a non-policy HTTP failure', async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+    }) as unknown as typeof fetch;
+
+    const result = await signProxyUrl('https://cdn.example/asset.js');
+
+    expect(result).toEqual({ outcome: 'fallback' });
+  });
+
+  it('returns fallback when a successful response lacks an href', async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({}),
+    }) as unknown as typeof fetch;
+
+    const result = await signProxyUrl('https://cdn.example/asset.js');
+
+    expect(result).toEqual({ outcome: 'fallback' });
+  });
+
+  it('skips the doomed POST in an opaque origin and returns fallback', async () => {
     // A sandboxed srcdoc creative without `allow-same-origin` has origin
     // "null": the JSON POST would preflight and fail, so signing bails out
     // without issuing the request.
@@ -63,7 +97,7 @@ describe('creative/proxy_sign.ts', () => {
 
     try {
       const result = await signProxyUrl('https://cdn.example/asset.js');
-      expect(result).toBeNull();
+      expect(result).toEqual({ outcome: 'fallback' });
       expect(fetchMock).not.toHaveBeenCalled();
     } finally {
       if (originDescriptor) {

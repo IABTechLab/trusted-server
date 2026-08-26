@@ -138,7 +138,7 @@ Use `/first-party/click` for navigational links (anchors) since it avoids downlo
 
 ### `/first-party/sign` - URL Signing
 
-Generates signed proxy URLs for dynamic use cases.
+Generates signed proxy URLs for dynamic use cases. Before signing, Trusted Server checks the parsed target host against `proxy.allowed_domains`. Protocol-relative targets inherit the signing request's scheme before this check.
 
 **Request (GET)**:
 
@@ -169,6 +169,8 @@ POST /first-party/sign
 |-------|-------------|
 | `href` | Complete signed proxy URL ready to use |
 | `base` | Original base URL (without query parameters) |
+
+A valid host outside a non-empty allowlist returns `403 Forbidden`. The creative runtime treats this response as a policy rejection and does not assign the attempted raw image or iframe URL. Network failures, malformed success responses, and non-403 errors keep the existing direct-load fallback. An empty allowlist permits every valid host.
 
 **Expiration**:
 
@@ -456,45 +458,44 @@ Asset routes are intended for publisher-owned paths, not third-party creative UR
 
 ### Proxy Allowlist
 
-Restrict which domains the proxy may redirect to via the `[proxy]` section:
+Restrict target hosts for signing and proxy fetching via the `[proxy]` section:
 
 ```toml
 [proxy]
 allowed_domains = [
-  "tracker.com",           # Exact match
-  "*.adserver.com",        # Wildcard: adserver.com and all subdomains
-  "*.trusted-cdn.net",
+  "assets.example.com",  # Exact match
+  "*.cdn.example.com",   # Wildcard: cdn.example.com and all subdomains
 ]
 ```
 
-**Semantics**: When a proxied request receives an HTTP redirect (301/302/303/307/308), the redirect target host is checked against `allowed_domains`. If the host does not match any pattern the redirect is blocked and a 403 error is returned.
+**Semantics**: Trusted Server checks `allowed_domains` before `/first-party/sign` mints a token, before `/first-party/proxy` fetches the initial target, and before it follows each HTTP redirect (301/302/303/307/308). If the parsed target host does not match a pattern, Trusted Server blocks the operation with a 403 error.
 
 **Wildcard matching**:
 
-| Pattern         | Matches                                             | Does not match     |
-| --------------- | --------------------------------------------------- | ------------------ |
-| `tracker.com`   | `tracker.com`                                       | `sub.tracker.com`  |
-| `*.tracker.com` | `tracker.com`, `sub.tracker.com`, `a.b.tracker.com` | `evil-tracker.com` |
+| Pattern              | Matches                                                            | Does not match           |
+| -------------------- | ------------------------------------------------------------------ | ------------------------ |
+| `assets.example.com` | `assets.example.com`                                               | `sub.assets.example.com` |
+| `*.cdn.example.com`  | `cdn.example.com`, `static.cdn.example.com`, `a.b.cdn.example.com` | `evil-cdn.example.com`   |
 
 - The `*` prefix matches the base domain and any subdomain at any depth.
 - Matching is case-insensitive; entries are normalized to lowercase on startup.
-- The wildcard requires a dot boundary — `*.example.com` will **not** match `evil-example.com`.
+- The wildcard requires a dot boundary. `*.example.com` does **not** match `evil-example.com`.
 - A bare `"*"` entry is **not** valid and will be removed at startup with a warning. Use an empty list for open mode.
 
 :::note Unicode / Internationalized Domain Names
-Matching uses ASCII case-folding (`to_ascii_lowercase`). Internationalized domain names (IDNs) in Punycode form (e.g., `xn--nxasmq6b.com`) are matched literally — the Unicode label and its Punycode equivalent are treated as different strings. If your ad network uses IDN domains, add the Punycode form to `allowed_domains`.
+Matching uses ASCII case-folding (`to_ascii_lowercase`). Internationalized domain names in Punycode form, such as `xn--bcher-kva.example.com`, are matched literally. The Unicode label and its Punycode equivalent are different strings, so add the Punycode form to `allowed_domains` when needed.
 :::
 
-**Default behavior**: When `allowed_domains` is omitted (or set to an empty list) every redirect destination is permitted. This default exists solely for development convenience and **must be overridden in production**.
+**Default behavior**: When `allowed_domains` is omitted or empty, every valid host is permitted for signing, the initial fetch, and redirects. This default exists for development convenience and **must be overridden in production**.
 
 ::: danger Production Recommendation
-Always set `allowed_domains` explicitly in production deployments. Without an allowlist, a signed proxy URL that follows redirects could be used to reach internal or unintended hosts (SSRF).
+Always set `allowed_domains` explicitly in production deployments. Without an allowlist, clients can sign and fetch valid URLs for arbitrary hosts, including redirect targets.
 
 ```toml
 [proxy]
 allowed_domains = [
-  "*.your-ad-network.com",
-  "tracker.your-partner.com",
+  "assets.example.com",
+  "*.cdn.example.com",
 ]
 ```
 

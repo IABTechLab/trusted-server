@@ -38,6 +38,26 @@ describe('creative/image.ts', () => {
     });
   });
 
+  it('keeps the previous image src when signing is blocked by policy', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 403,
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    await importCreativeModule({ renderGuard: true });
+
+    const img = new Image();
+    img.src = '/existing.png';
+    img.src = 'https://blocked.example.com/rejected.png';
+
+    await waitForExpect(() => {
+      expect(fetchMock).toHaveBeenCalled();
+      expect(img.src).toBe(`${location.origin}/existing.png`);
+      expect(img.src).not.toContain('blocked.example.com');
+    });
+  });
+
   it('falls back to raw image src when signing fails', async () => {
     const fetchMock = vi.fn().mockRejectedValue(new Error('network'));
     global.fetch = fetchMock as unknown as typeof fetch;
