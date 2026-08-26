@@ -365,6 +365,40 @@ export interface GptSlotHandoff {
   suppressPublisherRefresh: boolean;
 }
 
+export type FirstImpressionOwner = 'publisher' | 'trusted_server';
+export type FirstImpressionPhase = 'auctioning' | 'delivery_pending' | 'requested' | 'rendered';
+
+/** One publisher auction participating in the current navigation's first impression. */
+export interface FirstImpressionPublisherAuction {
+  token: string;
+  adUnitCode: string;
+  phase: 'auctioning' | 'delivery_pending';
+  expiresAt: number;
+  adIds: string[];
+  suppressDelivery: boolean;
+}
+
+/** First-impression ownership for one exact physical slot element. */
+export interface FirstImpressionSlotClaim {
+  generation: number;
+  slotElementId: string;
+  element: HTMLElement;
+  owner: FirstImpressionOwner;
+  phase: FirstImpressionPhase;
+  expiresAt: number;
+  publisherAuctions: Record<string, FirstImpressionPublisherAuction>;
+  suppressionConsumed?: boolean;
+  targeting?: Record<string, string | string[]>;
+}
+
+/** Bounded first-impression state shared by the GPT bootstrap, GPT, and Prebid bundles. */
+export interface FirstImpressionState {
+  generation: number;
+  nextToken: number;
+  slots: Record<string, FirstImpressionSlotClaim>;
+  fallbackSlots: Record<string, HTMLElement>;
+}
+
 export interface TsjsApi {
   version: string;
   que: Array<() => void>;
@@ -436,6 +470,10 @@ export interface TsjsApi {
   gptSlotHandoffs?: Record<string, GptSlotHandoff>;
   /** True only while TS calls a GPT function that the handoff wrappers observe. */
   gptSlotHandoffInternal?: boolean;
+  /** Per-navigation first-impression ownership shared by GPT and Prebid. */
+  firstImpression?: FirstImpressionState;
+  /** Guards the shared production GPT lifecycle listener installation. */
+  firstImpressionListenersInstalled?: boolean;
   /** Guards SPA pushState hook installation. */
   spaHookInstalled?: boolean;
   /** Internal one-shot state shared by bootstrap and bundle scheduler installs. */
