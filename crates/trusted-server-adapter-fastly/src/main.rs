@@ -150,6 +150,9 @@ fn edgezero_main(mut req: FastlyRequest) {
     let access_sample_rate = settings_snapshot
         .as_deref()
         .map_or(0.0, |settings| settings.tinybird.access_sample_rate);
+    let access_telemetry_enabled = settings_snapshot
+        .as_deref()
+        .is_some_and(|settings| settings.tinybird.enabled && settings.tinybird.access_enabled);
     let publisher_domain = settings_snapshot.as_deref().map_or_else(
         || "unknown".to_owned(),
         |settings| settings.publisher.domain.clone(),
@@ -276,6 +279,7 @@ fn edgezero_main(mut req: FastlyRequest) {
                             method: request_method.clone(),
                             publisher_domain: publisher_domain.clone(),
                             access_sample_rate,
+                            access_telemetry_enabled,
                         },
                     );
                     run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
@@ -303,6 +307,7 @@ fn edgezero_main(mut req: FastlyRequest) {
                                     method: request_method.clone(),
                                     publisher_domain: publisher_domain.clone(),
                                     access_sample_rate,
+                                    access_telemetry_enabled,
                                 },
                             );
                             run_edgezero_pull_sync_after_send(
@@ -336,6 +341,7 @@ fn edgezero_main(mut req: FastlyRequest) {
             method: request_method,
             publisher_domain,
             access_sample_rate,
+            access_telemetry_enabled,
         },
     );
     // The asset/admin/error fallback path: no `EcFinalizeState` (or the ec
@@ -467,6 +473,12 @@ fn emit_access_telemetry_after_send(
         return;
     }
 
+    // No snapshot means access telemetry was disabled when the response
+    // was sent (the flag is read once, before dispatch); nothing to emit.
+    let Some(snapshot) = &outcome.snapshot else {
+        return;
+    };
+
     let since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -481,14 +493,14 @@ fn emit_access_telemetry_after_send(
     let entropy = entropy_nanos ^ outcome.bytes;
 
     if !should_sample_access_row(
-        outcome.snapshot.sample_rate,
+        snapshot.sample_rate,
         settings.tinybird.access_sample_rate,
         entropy,
     ) {
         return;
     }
 
-    let row = access_event_row(&outcome.snapshot, &timings.snapshot(), epoch_ms);
+    let row = access_event_row(snapshot, &timings.snapshot(), epoch_ms);
     let target = tinybird::TinybirdEventsTarget::from_access_config(settings.tinybird.clone());
     let result = futures::executor::block_on(tinybird::emit_access_event(
         &platform::FastlyPlatformHttpClient,
@@ -547,6 +559,12 @@ struct SendContext {
     publisher_domain: String,
     /// The configured access-telemetry sample rate.
     access_sample_rate: f64,
+    /// Whether `tinybird.enabled` and `tinybird.access_enabled` were both
+    /// set when settings were first read. Gates building the
+    /// [`AccessTelemetrySnapshot`] at all: the snapshot costs env reads and
+    /// `String` allocations on the pre-send path, which a disabled
+    /// deployment (the default) should not pay.
+    access_telemetry_enabled: bool,
 }
 
 /// Outcome of handing a finalized response to the client.
@@ -557,8 +575,9 @@ pub(crate) struct DeliveryOutcome {
     /// Whether delivery completed or failed partway.
     pub result: DeliveryResult,
     /// Access-telemetry dimensions captured for this response at the
-    /// freeze point.
-    pub snapshot: AccessTelemetrySnapshot,
+    /// freeze point. `None` when access telemetry was disabled at snapshot
+    /// time; the emitter treats that as nothing to send.
+    pub snapshot: Option<AccessTelemetrySnapshot>,
 }
 
 /// Whether [`send_edgezero_response`] completed delivery or failed partway.
@@ -691,11 +710,15 @@ fn send_edgezero_response(
         context.server_timing_enabled,
     );
 
-    // Built unconditionally, right after the freeze point and before
-    // `into_parts()` consumes `response`: nothing else survives to
-    // post-send on every path (the request was consumed by dispatch, and
-    // `EcFinalizeState` is absent on asset, admin, and error paths).
-    let snapshot = build_access_telemetry_snapshot(&response, context);
+    // Built right after the freeze point and before `into_parts()`
+    // consumes `response`: nothing else survives to post-send on every
+    // path (the request was consumed by dispatch, and `EcFinalizeState`
+    // is absent on asset, admin, and error paths). Skipped entirely when
+    // access telemetry is disabled, so the default configuration pays no
+    // env reads or allocations here.
+    let snapshot = context
+        .access_telemetry_enabled
+        .then(|| build_access_telemetry_snapshot(&response, context));
 
     let (parts, body) = response.into_parts();
 
@@ -1508,7 +1531,7 @@ mod tests {
         let outcome = DeliveryOutcome {
             bytes,
             result: DeliveryResult::Complete,
-            snapshot: sample_access_snapshot(),
+            snapshot: Some(sample_access_snapshot()),
         };
 
         assert_eq!(
@@ -1565,6 +1588,7 @@ mod tests {
             method: "GET".to_owned(),
             publisher_domain: "test-publisher.com".to_owned(),
             access_sample_rate: 0.25,
+            access_telemetry_enabled: true,
         }
     }
 
@@ -1827,6 +1851,7 @@ mod tests {
                 method: "GET".to_owned(),
                 publisher_domain: "test-publisher.com".to_owned(),
                 access_sample_rate: 1.0,
+                access_telemetry_enabled: true,
             },
         );
         assert!(
@@ -1847,7 +1872,11 @@ mod tests {
                 ..trusted_server_core::settings::TinybirdSettings::default()
             },
         );
-        let row = access_event_row(&outcome.snapshot, &timings.snapshot(), 0);
+        let snapshot = outcome
+            .snapshot
+            .as_ref()
+            .expect("should build a snapshot when access telemetry is enabled");
+        let row = access_event_row(snapshot, &timings.snapshot(), 0);
 
         futures::executor::block_on(tinybird::emit_access_event(&http_client, &target, row))
             .expect("should send access telemetry");

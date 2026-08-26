@@ -386,6 +386,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_phase_index_is_unique_and_in_bounds() {
+        // `PHASE_COUNT` and `Phase::index()` are hand-synced; nothing at
+        // compile time ties them together. A new variant whose `index()`
+        // returns `PHASE_COUNT` would panic at runtime on first `record`,
+        // contradicting the module's no-panics claim, so this test fails
+        // first instead. (A variant missing from this list is a compile
+        // error via the exhaustive `match` in `index()` once added there.)
+        let phases = [
+            Phase::AppBuild,
+            Phase::Filter,
+            Phase::Geo,
+            Phase::EcKv,
+            Phase::Origin,
+            Phase::TemplateCacheLookup,
+            Phase::AuctionWait,
+            Phase::Stream,
+        ];
+        let mut seen = [false; PHASE_COUNT];
+        for phase in phases {
+            let index = phase.index();
+            assert!(
+                index < PHASE_COUNT,
+                "should be in bounds: {phase:?} -> {index}"
+            );
+            assert!(!seen[index], "should be unique: {phase:?} -> {index}");
+            seen[index] = true;
+        }
+        assert!(
+            seen.iter().all(|slot| *slot),
+            "should cover every phases-array slot"
+        );
+    }
+
+    #[test]
     fn render_omits_unrecorded_phases_and_orders_total_first() {
         let timings = RequestTimings::new();
         timings.record(Phase::Filter, Duration::from_micros(9_100));

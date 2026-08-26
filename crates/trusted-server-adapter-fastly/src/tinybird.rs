@@ -961,34 +961,6 @@ mod tests {
     }
 
     #[test]
-    fn sampled_out_requests_emit_nothing() {
-        // Mirrors main.rs's post-send gate exactly (`if sampled_in(rate,
-        // entropy) { emit_access_event(...) }`): `emit_access_event` is only
-        // reached when `sampled_in` returns `true`. With a `0.0` rate it
-        // never does, for any entropy, so the http client should never see
-        // a request.
-        let http_client = RecordingHttpClient::respond_with(202);
-        let target = TinybirdEventsTarget::from_access_config(enabled_config());
-        let rate = 0.0;
-        let entropy = 123_456_789_u64;
-
-        if sampled_in(rate, entropy) {
-            futures::executor::block_on(emit_access_event(&http_client, &target, "{}".to_owned()))
-                .expect("should send when sampled in");
-        }
-
-        assert_eq!(
-            http_client
-                .requests
-                .lock()
-                .expect("should lock recorded requests")
-                .len(),
-            0,
-            "sampled-out requests must never reach emit_access_event"
-        );
-    }
-
-    #[test]
     fn sampled_in_boundary_rates_are_unconditional() {
         assert!(
             sampled_in(1.0, 0),

@@ -3,8 +3,11 @@
 //! Reads `trusted-server.example.toml`, replaces the placeholder secrets with
 //! random values, flips the flags a local smoke test needs, validates the
 //! result through [`trusted_server_core::settings::Settings::from_toml`], and
-//! prints the blob envelope JSON that
-//! `TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG` expects.
+//! prints the blob envelope JSON that the Axum adapter's
+//! `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` environment variable expects. With
+//! the default store and key both named `trusted_server_config`, the
+//! concrete variable resolves (not a typo) to
+//! `TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG`.
 //!
 //! The random values are time-and-pid seeded, not cryptographic. This tool
 //! exists for throwaway local test instances only; never use its output for a

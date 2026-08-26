@@ -902,7 +902,14 @@ async fn dispatch_fallback(
             .then(|| state.settings.asset_route_for_path(&path))
             .flatten();
         if let Some(asset_route) = matched_asset_route {
-            return dispatch_asset_fallback(
+            // The template is the operator-configured route prefix, so it
+            // is bounded and content-free by construction (unlike request
+            // paths, which need `publisher_route_template`).
+            let asset_metadata = RouteMetadata {
+                route_class: RouteClass::Asset,
+                route_template: format!("{}/*", asset_route.prefix.trim_end_matches('/')),
+            };
+            let mut response = dispatch_asset_fallback(
                 state,
                 services,
                 req,
@@ -911,6 +918,8 @@ async fn dispatch_fallback(
                 ec.geo_lookup_state(),
             )
             .await;
+            response.extensions_mut().insert(asset_metadata);
+            return response;
         }
 
         route_metadata = Some(RouteMetadata {

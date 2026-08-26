@@ -81,6 +81,9 @@ pub enum RouteClass {
     Ec,
     /// The server-side auction or SPA re-auction (`page-bids`) endpoint.
     AuctionApi,
+    /// A response proxied through a configured asset route (the
+    /// non-document fallback for scripts, styles, images, and fonts).
+    Asset,
     /// Everything else: discovery, tester-cookie toggles, denied legacy
     /// aliases, and any response with no attached [`RouteMetadata`].
     Other,
@@ -97,6 +100,7 @@ impl RouteClass {
             Self::IntegrationProxy => "integration_proxy",
             Self::Ec => "ec",
             Self::AuctionApi => "auction_api",
+            Self::Asset => "asset",
             Self::Other => "other",
         }
     }
