@@ -102,6 +102,137 @@
     pubads.__tsInitialLoadHooked = true;
   });
 
+  var FIRST_IMPRESSION_LEASE_MS = 5000;
+
+  function firstImpressionState(now) {
+    var generation = ts.navGeneration || 0;
+    if (
+      !ts.firstImpression ||
+      ts.firstImpression.generation !== generation
+    ) {
+      ts.firstImpression = {
+        generation: generation,
+        nextToken: 0,
+        slots: {},
+        fallbackSlots: {},
+      };
+    }
+    var state = ts.firstImpression;
+    state.slots = state.slots || {};
+    state.fallbackSlots = state.fallbackSlots || {};
+    Object.keys(state.slots).forEach(function (elementId) {
+      var claim = state.slots[elementId];
+      if (
+        claim.generation !== generation ||
+        claim.slotElementId !== elementId ||
+        claim.element !== document.getElementById(elementId) ||
+        !claim.element.isConnected
+      ) {
+        delete state.slots[elementId];
+        return;
+      }
+      Object.keys(claim.publisherAuctions || {}).forEach(function (token) {
+        if (claim.publisherAuctions[token].expiresAt <= now) {
+          delete claim.publisherAuctions[token];
+        }
+      });
+      if (
+        claim.owner === "publisher" &&
+        (claim.phase === "auctioning" || claim.phase === "delivery_pending") &&
+        Object.keys(claim.publisherAuctions || {}).length === 0 &&
+        claim.expiresAt <= now
+      ) {
+        delete state.slots[elementId];
+      }
+    });
+    Object.keys(state.fallbackSlots).forEach(function (elementId) {
+      var element = state.fallbackSlots[elementId];
+      if (
+        !element.isConnected ||
+        element.id !== elementId ||
+        document.getElementById(elementId) !== element
+      ) {
+        delete state.fallbackSlots[elementId];
+      }
+    });
+    return state;
+  }
+
+  function firstImpressionClaim(element) {
+    return firstImpressionState(Date.now()).slots[element.id];
+  }
+
+  function claimFirstImpressionForTrustedServer(element) {
+    var now = Date.now();
+    var state = firstImpressionState(now);
+    if (state.slots[element.id]) return null;
+    var claim = {
+      generation: state.generation,
+      slotElementId: element.id,
+      element: element,
+      owner: "trusted_server",
+      phase: "delivery_pending",
+      expiresAt: now + FIRST_IMPRESSION_LEASE_MS,
+      publisherAuctions: {},
+    };
+    state.slots[element.id] = claim;
+    return claim;
+  }
+
+  function releaseTrustedServerFirstImpressionClaim(element, claim) {
+    var state = firstImpressionState(Date.now());
+    if (
+      state.slots[element.id] === claim &&
+      claim.owner === "trusted_server" &&
+      claim.phase === "delivery_pending" &&
+      Object.keys(claim.publisherAuctions || {}).length === 0
+    ) {
+      delete state.slots[element.id];
+    }
+  }
+
+  function installFirstImpressionListeners() {
+    if (ts.firstImpressionListenersInstalled) return;
+    tag.cmd.push(function () {
+      if (ts.firstImpressionListenersInstalled) return;
+      var pubads = window.googletag.pubads();
+      if (!pubads || typeof pubads.addEventListener !== "function") return;
+      var observe = function (phase) {
+        return function (event) {
+          var elementId =
+            event.slot && event.slot.getSlotElementId
+              ? event.slot.getSlotElementId()
+              : "";
+          var element = elementId && document.getElementById(elementId);
+          if (!element) return;
+          var state = firstImpressionState(Date.now());
+          var claim = state.slots[elementId];
+          if (!claim) {
+            claim = state.slots[elementId] = {
+              generation: state.generation,
+              slotElementId: elementId,
+              element: element,
+              owner: "publisher",
+              phase: phase,
+              expiresAt: Number.POSITIVE_INFINITY,
+              publisherAuctions: {},
+            };
+          } else {
+            claim.phase = phase;
+            if (claim.owner === "publisher") {
+              claim.expiresAt = Number.POSITIVE_INFINITY;
+            }
+          }
+        };
+      };
+      pubads.addEventListener("slotRequested", observe("requested"));
+      pubads.addEventListener("slotRenderEnded", observe("rendered"));
+      ts.firstImpressionListenersInstalled = true;
+    });
+  }
+
+  installFirstImpressionListeners();
+
   // Minimal fallback for tsjs.scheduleInitialAdInit, mirroring the bundle's
   // hydration-safe scheduler in
   // crates/trusted-server-js/lib/src/integrations/gpt/index.ts: the </body>
@@ -412,6 +543,129 @@
 
   installSlotHandoff();
 
+  function bootstrapTargeting(slot, bid) {
+    var targeting = Object.assign({}, slot.targeting || {});
+    ["hb_pb", "hb_bidder", "hb_adid", "hb_cache_host", "hb_cache_path"].forEach(
+      function (key) {
+        if (bid[key]) targeting[key] = String(bid[key]);
+      },
+    );
+    targeting.ts_initial = "1";
+    return targeting;
+  }
+
+  function scheduleFirstImpressionFallback(slot, bid, element, generation) {
+    var state = firstImpressionState(Date.now());
+    if (state.fallbackSlots[element.id]) return;
+    state.fallbackSlots[element.id] = element;
+
+    var retry = function () {
+      if (
+        (ts.navGeneration || 0) !== generation ||
+        !element.isConnected ||
+        document.getElementById(element.id) !== element
+      ) {
+        return;
+      }
+      var claim = firstImpressionClaim(element);
+      if (claim) {
+        if (
+          claim.owner !== "publisher" ||
+          claim.phase === "requested" ||
+          claim.phase === "rendered"
+        ) {
+          return;
+        }
+        var delay = Math.max(0, claim.expiresAt - Date.now());
+        if (delay > 0) {
+          window.setTimeout(retry, delay + 1);
+          return;
+        }
+      }
+
+      tag.cmd.push(function () {
+        if (
+          (ts.navGeneration || 0) !== generation ||
+          !element.isConnected ||
+          document.getElementById(element.id) !== element
+        ) {
+          return;
+        }
+        var fallbackClaim = claimFirstImpressionForTrustedServer(element);
+        if (!fallbackClaim) return;
+        var pubads = window.googletag.pubads();
+        var existingSlots = pubads.getSlots ? pubads.getSlots() : [];
+        var gptSlot =
+          existingSlots.find(function (candidate) {
+            return candidate.getSlotElementId() === element.id;
+          }) || null;
+        var tsOwned = false;
+        if (!gptSlot) {
+          gptSlot = runHandoffInternal(function () {
+            return window.googletag.defineSlot(
+              slot.gam_unit_path,
+              slot.formats,
+              element.id,
+            );
+          });
+          if (!gptSlot) {
+            releaseTrustedServerFirstImpressionClaim(element, fallbackClaim);
+            return;
+          }
+          gptSlot.addService(pubads);
+          tsOwned = true;
+          ts.gptSlotHandoffs = ts.gptSlotHandoffs || {};
+          ts.gptSlotHandoffs[element.id] = {
+            gamUnitPath: slot.gam_unit_path,
+            formats: slot.formats,
+            divIdPrefix: slot.div_id,
+            slotElementId: element.id,
+            publisherClaimed: false,
+            suppressPublisherDisplay: false,
+            suppressPublisherRefresh: false,
+          };
+        }
+
+        var targeting = bootstrapTargeting(slot, bid);
+        Object.entries(targeting).forEach(function (entry) {
+          gptSlot.setTargeting(entry[0], entry[1]);
+        });
+        fallbackClaim.targeting = targeting;
+        var slotElementId = gptSlot.getSlotElementId() || element.id;
+        ts.divToSlotId = ts.divToSlotId || {};
+        ts.divToSlotId[element.id] = slot.id;
+        ts.divToSlotId[slotElementId] = slot.id;
+        if (tsOwned) {
+          ts.prevGptSlots = ts.prevGptSlots || [];
+          ts.prevGptSlots.push(gptSlot);
+        }
+        if (!ts.servicesEnabled) {
+          pubads.enableSingleRequest();
+          window.googletag.enableServices();
+          ts.servicesEnabled = true;
+        }
+        if (tsOwned) {
+          runHandoffInternal(function () {
+            window.googletag.display(slotElementId);
+          });
+        }
+        syncInitialLoadDisabled(window.googletag);
+        if (!tsOwned || ts.gptInitialLoadDisabled) {
+          ts.adInitRefreshInProgress = true;
+          try {
+            runHandoffInternal(function () {
+              pubads.refresh([gptSlot]);
+            });
+          } finally {
+            ts.adInitRefreshInProgress = false;
+          }
+        }
+      });
+    };
+
+    retry();
+  }
+
   ts.adInit = function () {
     var slots = ts.adSlots || [];
     var bids = ts.bids || {};
@@ -476,6 +730,14 @@
         }
         var actualDivId = el.id;
         var b = bids[slot.id] || {};
+        var tsClaim = claimFirstImpressionForTrustedServer(el);
+        if (!tsClaim) {
+          var currentClaim = firstImpressionClaim(el);
+          if (currentClaim && currentClaim.owner === "publisher") {
+            scheduleFirstImpressionFallback(slot, b, el, generation);
+          }
+          return;
+        }
 
         var existingSlots = googletag.pubads().getSlots();
         var s =
@@ -493,7 +755,10 @@
               actualDivId,
             );
           });
-          if (!s) return;
+          if (!s) {
+            releaseTrustedServerFirstImpressionClaim(el, tsClaim);
+            return;
+          }
           s.addService(googletag.pubads());
           tsOwned = true;
           ts.gptSlotHandoffs = ts.gptSlotHandoffs || {};
@@ -508,20 +773,11 @@
           };
         }
 
-        Object.entries(slot.targeting || {}).forEach(function (e) {
-          s.setTargeting(e[0], e[1]);
+        var targeting = bootstrapTargeting(slot, b);
+        Object.entries(targeting).forEach(function (entry) {
+          s.setTargeting(entry[0], entry[1]);
         });
-        [
-          "hb_pb",
-          "hb_bidder",
-          "hb_adid",
-          "hb_cache_host",
-          "hb_cache_path",
-        ].forEach(function (k) {
-          if (b[k]) s.setTargeting(k, b[k]);
-        });
-        // Keep in sync with TS_INITIAL_TARGETING_KEY in index.ts
-        s.setTargeting("ts_initial", "1");
+        tsClaim.targeting = targeting;
         // Map the resolved inner div to the slot ID. This bootstrap fires no
         // beacons and registers no slotRenderEnded listener; the map is consumed
         // by the bundle's render bridge (index.ts) once it loads.
@@ -540,7 +796,9 @@
       });
       ts.prevGptSlots = newSlots;
       ts.divToSlotId = divToSlotId;
-      if (!ts.servicesEnabled) {
+      var hasRenderableWork =
+        slotsToDisplay.length > 0 || slotsToRefresh.length > 0;
+      if (!ts.servicesEnabled && hasRenderableWork) {
         googletag.pubads().enableSingleRequest();
         googletag.enableServices();
         ts.servicesEnabled = true;
