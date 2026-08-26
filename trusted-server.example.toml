@@ -95,8 +95,9 @@ pull_sync_concurrency = 3
 # openrtb_atype = 3
 # include this partner's UIDs in auction user.eids
 # bidstream_enabled = true
+# Only for inbound identify or batch-sync API access:
 # api_token = "partner_api_token"
-# Optional when pull sync is enabled:
+# Required when pull sync is enabled:
 # ts_pull_token = "partner_ts_pull_token"
 # batch_rate_limit = 60      # max batch-sync requests/min (default 60)
 # pull_sync_enabled = false  # default false
