@@ -18,6 +18,7 @@ use validator::{Validate, ValidationError};
 use crate::auction_config_types::AuctionConfig;
 use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
+use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
@@ -2722,7 +2723,7 @@ fn validate_trusted_client_ip(config: &TrustedClientIpConfig) -> Result<(), Vali
     }
 
     for header in [&ip_header, &auth_header] {
-        if matches!(header.as_str(), "x-ts-tls-protocol" | "x-ts-tls-cipher") {
+        if INTERNAL_HEADERS.contains(&header.as_str()) {
             return Err(ValidationError::new("reserved_trusted_client_ip_header"));
         }
     }
@@ -2760,7 +2761,14 @@ pub struct Settings {
     #[serde(default)]
     pub tester_cookie: TesterCookieConfig,
     /// Optional authenticated trusted client IP forwarding configuration.
-    #[serde(default)]
+    ///
+    /// `None` must stay omitted from serialized config blobs: `Settings`
+    /// schemas that predate this field reject unknown keys, so emitting
+    /// `trusted_client_ip: null` would make an unchanged `ts config push`
+    /// break older instances during rollout or rollback. A configured value
+    /// remains serialized and requires restoring a compatible blob before
+    /// rolling back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(nested)]
     pub trusted_client_ip: Option<TrustedClientIpConfig>,
     #[serde(default)]
@@ -3597,6 +3605,76 @@ mod tests {
         );
     }
 
+    /// Mirrors the `Settings` schema of the revision that predates
+    /// `trusted_client_ip`: every key that revision knew, and
+    /// `deny_unknown_fields` so an extra key fails deserialization exactly as an
+    /// older binary would reject a pushed config blob.
+    // The fields exist to model the accepted key set, never to be read.
+    #[allow(dead_code)]
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BaseRevisionSettings {
+        #[serde(default)]
+        publisher: serde::de::IgnoredAny,
+        #[serde(default)]
+        tester_cookie: serde::de::IgnoredAny,
+        #[serde(default)]
+        ec: serde::de::IgnoredAny,
+        #[serde(default)]
+        integrations: serde::de::IgnoredAny,
+        #[serde(default)]
+        handlers: serde::de::IgnoredAny,
+        #[serde(default)]
+        response_headers: serde::de::IgnoredAny,
+        #[serde(default)]
+        request_signing: serde::de::IgnoredAny,
+        #[serde(default)]
+        rewrite: serde::de::IgnoredAny,
+        #[serde(default)]
+        auction: serde::de::IgnoredAny,
+        #[serde(default)]
+        consent: serde::de::IgnoredAny,
+        #[serde(default)]
+        cache: serde::de::IgnoredAny,
+        #[serde(default)]
+        proxy: serde::de::IgnoredAny,
+        #[serde(default)]
+        creative_opportunities: serde::de::IgnoredAny,
+        #[serde(default)]
+        image_optimizer: serde::de::IgnoredAny,
+        #[serde(default)]
+        tinybird: serde::de::IgnoredAny,
+        #[serde(default)]
+        debug: serde::de::IgnoredAny,
+    }
+
+    #[test]
+    fn trusted_client_ip_is_omitted_from_serialized_config_when_unset() {
+        // `ts config push` serializes `Settings` verbatim. Emitting the key —
+        // even as `null` — makes a `deny_unknown_fields` binary from the base
+        // revision reject the blob during rollout or rollback.
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without trusted client IP configuration");
+
+        let value = serde_json::to_value(&settings).expect("should serialize settings");
+
+        assert!(
+            value.get("trusted_client_ip").is_none(),
+            "unset trusted_client_ip should not be serialized, got {value}"
+        );
+    }
+
+    #[test]
+    fn serialized_default_config_stays_readable_by_the_base_revision_schema() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without trusted client IP configuration");
+
+        let value = serde_json::to_value(&settings).expect("should serialize settings");
+
+        serde_json::from_value::<BaseRevisionSettings>(value)
+            .expect("base revision schema should accept a config blob with no trusted client IP");
+    }
+
     #[test]
     fn trusted_client_ip_parses_and_redacts_shared_secret_in_debug_output() {
         let settings = Settings::from_toml(&trusted_client_ip_toml(
@@ -3724,23 +3802,26 @@ mod tests {
     }
 
     #[test]
-    fn trusted_client_ip_rejects_reserved_tls_bridge_headers() {
+    fn trusted_client_ip_rejects_reserved_internal_headers() {
         for (ip_header, auth_header) in [
             ("x-ts-tls-protocol", "x-trusted-client-auth"),
             ("x-ts-tls-cipher", "x-trusted-client-auth"),
             ("fastly-client-ip", "x-ts-tls-protocol"),
             ("fastly-client-ip", "x-ts-tls-cipher"),
+            ("x-forwarded-for", "x-trusted-client-auth"),
+            ("x-geo-info-available", "x-trusted-client-auth"),
+            ("fastly-client-ip", "x-ts-ec"),
         ] {
             let error = Settings::from_toml(&trusted_client_ip_toml(
                 ip_header,
                 auth_header,
                 "fictional-shared-secret-0123456789",
             ))
-            .expect_err("should reject reserved TLS bridge headers");
+            .expect_err("should reject reserved internal headers");
 
             assert!(
                 format!("{error:?}").contains("reserved_trusted_client_ip_header"),
-                "should identify reserved TLS bridge headers"
+                "should identify reserved internal headers"
             );
         }
     }

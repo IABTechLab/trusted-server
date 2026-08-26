@@ -460,29 +460,51 @@ it but keep using their own runtime client address.
 | `shared_secret` | String | Yes      | Secret shared with the trusted front door, 32+ ASCII graphic bytes, no whitespace |
 
 All three fields are required when the section exists. When the section is
-absent, Trusted Server continues to use the immediate peer address.
+absent, Trusted Server continues to use the immediate peer address, and
+`ts config push` omits the section from the published config blob so instances
+running an older binary keep accepting the blob.
+
+::: warning Deploy the code before pushing the config
+Once the section is configured, the pushed blob carries it, and `Settings`
+rejects unknown fields. A binary that predates trusted client-IP support fails
+to load a blob containing this section and returns its startup-error response.
+Upgrade every instance before pushing a config that enables the section, and
+restore a config without the section before rolling instances back. Getting
+this order wrong takes the service down rather than degrading it.
+:::
 
 ```toml
 [trusted_client_ip]
-ip_header = "fastly-client-ip"
+ip_header = "x-ts-client-ip"
 auth_header = "x-ts-client-ip-auth"
 shared_secret = "replace-with-a-random-shared-secret"
 ```
 
-The front door must overwrite both headers on every request. Trusted Server
-accepts the forwarded address only when the request has exactly one
-`auth_header` value that matches `shared_secret` byte-for-byte and exactly one
-`ip_header` value that parses directly as IPv4 or IPv6. Values are not trimmed
-or normalized. Missing, empty, duplicate, non-UTF-8, mismatched, or malformed
+Prefer a dedicated `x-` name for `ip_header`, as shown. `fastly-client-ip` is
+also accepted and suits a fronting service dedicated to Trusted Server, but on
+a service carrying other traffic a dedicated name means the front door never
+modifies `Fastly-Client-IP`, so other consumers of that header keep working
+unchanged. See [Fastly Setup](/guide/fastly#cdn-fronted-client-ip) for the
+front-door configuration this section depends on.
+
+The front door must overwrite both headers on every request it forwards to
+Trusted Server, and must remove client-supplied copies on its other routes.
+Trusted Server accepts the forwarded address only when the request has exactly
+one `auth_header` value that matches `shared_secret` byte-for-byte and exactly
+one `ip_header` value that parses directly as IPv4 or IPv6. Values are not
+trimmed or normalized. Missing, empty, duplicate, non-UTF-8, mismatched, or malformed
 values do not reject the request; Trusted Server safely falls back to the
 immediate peer address. Both configured headers are removed before routing.
 
 Header names are validated case-insensitively. `ip_header` must be
 `fastly-client-ip` or start with `x-`, while `auth_header` must start with `x-`.
-The names must differ. Neither field may use the reserved
-`x-ts-tls-protocol` or `x-ts-tls-cipher` header. These restrictions exclude
-standard sensitive headers such as `Host`, `Content-Length`, `Cookie`, and
-`Authorization`, as well as Trusted Server's TLS bridge headers. Choose
+The names must differ. Neither field may use a header name reserved for
+Trusted Server's own internal signals (for example `x-forwarded-for`,
+`x-geo-info-available`, `x-ts-ec`, `x-ts-tls-protocol`, or `x-ts-tls-cipher`);
+the full reserved set is the internal-header list that Trusted Server strips
+before forwarding to third parties. These restrictions exclude standard
+sensitive headers such as `Host`, `Content-Length`, `Cookie`, and
+`Authorization`, as well as every Trusted Server internal header. Choose
 dedicated `x-` names that no other application or routing logic uses, because
 Trusted Server removes the configured headers before routing.
 
@@ -493,6 +515,12 @@ configuration debug output. Configuration requires at least 32 ASCII graphic
 bytes (`!` through `~`) with no whitespace, controls, DEL, or non-ASCII bytes,
 and startup fails when the value is still the documented placeholder.
 
+Independently of this section, the Fastly adapter treats `fastly-client-ip` as
+client-spoofable and strips it at request entry, so Trusted Server no longer
+forwards an inbound `Fastly-Client-IP` to the publisher origin. This applies
+even when `[trusted_client_ip]` is absent. Check whether the origin reads that
+header before deploying.
+
 Redaction protects debug output and validation errors; it does not move the
 value into a platform secret store. `ts config push` serializes the value in the
 Trusted Server application-config blob, so restrict access to that configuration
@@ -502,7 +530,7 @@ routing, although only Fastly uses them for client-IP resolution.
 **Environment Overrides**:
 
 ```bash
-TRUSTED_SERVER__TRUSTED_CLIENT_IP__IP_HEADER=fastly-client-ip
+TRUSTED_SERVER__TRUSTED_CLIENT_IP__IP_HEADER=x-ts-client-ip
 TRUSTED_SERVER__TRUSTED_CLIENT_IP__AUTH_HEADER=x-ts-client-ip-auth
 TRUSTED_SERVER__TRUSTED_CLIENT_IP__SHARED_SECRET=replace-with-a-random-shared-secret
 ```

@@ -11,17 +11,54 @@ use trusted_server_core::http_util::sanitize_trusted_client_ip_headers;
 use trusted_server_core::settings::Settings;
 
 // ---------------------------------------------------------------------------
+// SanitizeRequestMiddleware
+// ---------------------------------------------------------------------------
+
+/// Outermost middleware: strips the configured client-IP trust headers from the
+/// request before any inner middleware or handler observes them.
+///
+/// Must stay the first middleware registered in [`crate::app`]. Registering
+/// another middleware ahead of it would re-expose the shared-secret
+/// authentication header to request handling. Only the Fastly adapter consumes
+/// these headers for client-IP resolution; every other adapter removes them so
+/// a shared configuration cannot leak the secret into publisher or integration
+/// request handling.
+pub struct SanitizeRequestMiddleware {
+    settings: Arc<Settings>,
+}
+
+impl SanitizeRequestMiddleware {
+    /// Creates a new [`SanitizeRequestMiddleware`] with the given settings.
+    #[must_use]
+    pub fn new(settings: Arc<Settings>) -> Self {
+        Self { settings }
+    }
+}
+
+#[async_trait(?Send)]
+impl Middleware for SanitizeRequestMiddleware {
+    async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+        sanitize_trusted_client_ip_headers(
+            ctx.request_mut(),
+            self.settings.trusted_client_ip.as_ref(),
+        );
+        next.run(ctx).await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FinalizeResponseMiddleware
 // ---------------------------------------------------------------------------
 
-/// Outermost middleware: injects all standard TS response headers.
+/// Response-finalization middleware: injects all standard TS response headers.
 ///
 /// Geo availability is determined by the presence of the `cf-ipcountry` header
 /// (injected by the Cloudflare Workers runtime). On the native host target the
 /// header is absent, so `X-Geo-Info-Available: false` is emitted.
 ///
-/// Registered first in the middleware chain so that every outgoing response —
-/// including auth-rejected ones — carries a consistent set of headers.
+/// Registered directly inside [`SanitizeRequestMiddleware`] and ahead of
+/// [`AuthMiddleware`] so that every outgoing response — including auth-rejected
+/// ones — carries a consistent set of headers.
 pub struct FinalizeResponseMiddleware {
     settings: Arc<Settings>,
 }
@@ -36,7 +73,7 @@ impl FinalizeResponseMiddleware {
 
 #[async_trait(?Send)]
 impl Middleware for FinalizeResponseMiddleware {
-    async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+    async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         let geo_available = ctx
             .request()
             .headers()
@@ -44,11 +81,6 @@ impl Middleware for FinalizeResponseMiddleware {
             .and_then(|v| v.to_str().ok())
             .filter(|s| !s.is_empty() && *s != "XX")
             .is_some();
-
-        sanitize_trusted_client_ip_headers(
-            ctx.request_mut(),
-            self.settings.trusted_client_ip.as_ref(),
-        );
 
         let mut response = next.run(ctx).await?;
         apply_finalize_headers(&self.settings, geo_available, &mut response);
@@ -261,14 +293,14 @@ mod tests {
     }
 
     #[test]
-    fn finalize_middleware_strips_configured_trust_headers_before_routing() {
+    fn sanitize_middleware_strips_configured_trust_headers_before_routing() {
         let mut settings = settings_with_response_headers(vec![]);
         settings.trusted_client_ip = Some(TrustedClientIpConfig {
             ip_header: "x-reader-ip".to_owned(),
             auth_header: "x-reader-ip-auth".to_owned(),
             shared_secret: Redacted::new("fictional-shared-secret-0123456789".to_owned()),
         });
-        let middleware = FinalizeResponseMiddleware::new(Arc::new(settings));
+        let middleware = SanitizeRequestMiddleware::new(Arc::new(settings));
         let observed = Arc::new(Mutex::new(None));
         let handler_observed = Arc::clone(&observed);
         let handler = Arc::new(move |ctx: RequestContext| {
