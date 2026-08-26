@@ -536,13 +536,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 // Build the geo-aware EC context so the auction consent gate sees
                 // the caller's jurisdiction — `EcContext::default()` fails it
                 // closed for consented users.
-                let ec_context = build_ec_context(&s.settings, &services, &req);
+                let mut ec_context = build_ec_context(&s.settings, &services, &req);
                 Ok(handle_auction(
                     &s.settings,
                     &s.orchestrator,
                     None,
                     None,
-                    &ec_context,
+                    &mut ec_context,
                     &services,
                     req,
                 )
@@ -566,14 +566,14 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 {
                     return Ok(http_error(&error));
                 }
-                let ec_context = build_ec_context(&s.settings, &services, &req);
+                let mut ec_context = build_ec_context(&s.settings, &services, &req);
                 let auction = AuctionDispatch {
                     orchestrator: &s.orchestrator,
                     slots: s.settings.creative_opportunity_slots(),
                     registry: None,
                 };
                 Ok(
-                    handle_page_bids(&s.settings, &services, None, auction, &ec_context, req)
+                    handle_page_bids(&s.settings, &services, None, auction, &mut ec_context, req)
                         .await
                         .unwrap_or_else(|e| http_error(&e)),
                 )

@@ -480,13 +480,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     // Build the geo-aware EC context so the auction consent gate
                     // sees the caller's jurisdiction — `EcContext::default()`
                     // fails it closed for consented users.
-                    let ec_context = build_ec_context(&s.settings, &services, &req);
+                    let mut ec_context = build_ec_context(&s.settings, &services, &req);
                     handle_auction(
                         &s.settings,
                         &s.orchestrator,
                         None,
                         None,
-                        &ec_context,
+                        &mut ec_context,
                         &services,
                         req,
                     )
@@ -544,13 +544,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         // preflight fall through to a permissive origin would reopen exactly
         // the cross-site hole the canonical path closes.
         let page_bids = make_handler(Arc::clone(&state), |s, services, req| async move {
-            let ec_context = build_ec_context(&s.settings, &services, &req);
+            let mut ec_context = build_ec_context(&s.settings, &services, &req);
             let auction = AuctionDispatch {
                 orchestrator: &s.orchestrator,
                 slots: s.settings.creative_opportunity_slots(),
                 registry: None,
             };
-            handle_page_bids(&s.settings, &services, None, auction, &ec_context, req).await
+            handle_page_bids(&s.settings, &services, None, auction, &mut ec_context, req).await
         });
         let page_bids_preflight =
             make_handler(Arc::clone(&state), |_s, _services, _req| async move {

@@ -412,13 +412,13 @@ fn named_route_handler(
                         // Build the geo-aware EC context so the auction consent
                         // gate sees the caller's jurisdiction — `EcContext::default()`
                         // fails it closed for consented users.
-                        let ec_context = build_ec_context(&state, &services, &req);
+                        let mut ec_context = build_ec_context(&state, &services, &req);
                         handle_auction(
                             &state.settings,
                             &state.orchestrator,
                             None,
                             None,
-                            &ec_context,
+                            &mut ec_context,
                             &services,
                             req,
                         )
@@ -431,7 +431,7 @@ fn named_route_handler(
                         if req.method() == Method::OPTIONS {
                             Ok(page_bids_preflight_denied())
                         } else {
-                            let ec_context = build_ec_context(&state, &services, &req);
+                            let mut ec_context = build_ec_context(&state, &services, &req);
                             let auction = AuctionDispatch {
                                 orchestrator: &state.orchestrator,
                                 slots: state.settings.creative_opportunity_slots(),
@@ -442,7 +442,7 @@ fn named_route_handler(
                                 &services,
                                 None,
                                 auction,
-                                &ec_context,
+                                &mut ec_context,
                                 req,
                             )
                             .await

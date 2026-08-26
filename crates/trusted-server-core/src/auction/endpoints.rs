@@ -118,7 +118,7 @@ pub async fn handle_auction(
     orchestrator: &AuctionOrchestrator,
     kv: Option<&KvIdentityGraph>,
     registry: Option<&PartnerRegistry>,
-    ec_context: &EcContext,
+    ec_context: &mut EcContext,
     services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
@@ -171,8 +171,10 @@ pub async fn handle_auction(
     // Story 5 middleware contract: auction is a read-only EC route.
     // It must not generate EC IDs; it only consumes pre-routed context.
     // Only forward the EC ID to auction partners when consent allows it.
+    // Owned so the identity-graph snapshot can be stored back on `ec_context`
+    // below without holding a borrow of it across the mutation.
     let ec_id = if ec_context.ec_allowed() {
-        ec_context.ec_value()
+        ec_context.ec_value().map(str::to_owned)
     } else {
         None
     };
@@ -197,7 +199,7 @@ pub async fn handle_auction(
             services,
             &http_req,
             consent_context,
-            ec_id,
+            ec_id.as_deref(),
             None,
         )?;
         let observation = AuctionObservationContext::from_auction_request(
@@ -257,10 +259,17 @@ pub async fn handle_auction(
     // EC and both KV and partner stores are available. Gate the read on a
     // present registry: without one, `resolve_auction_eids` yields no
     // server-side EIDs, so the snapshot would be an unused billable KV read.
-    let auction_kv_snapshot = match (kv, ec_id, registry) {
+    let auction_kv_snapshot = match (kv, ec_id.as_deref(), registry) {
         (Some(graph), Some(ec_id), Some(_)) => graph.load_snapshot(ec_id),
         _ => EcKvSnapshot::NotRead,
     };
+    // Hand the loaded row to the request context so response finalization —
+    // which runs on an EC context the adapter owns, after this handler returns
+    // — ingests `ts-eids`/`sharedId` updates from this read instead of paying
+    // for a second lookup.
+    if !matches!(auction_kv_snapshot, EcKvSnapshot::NotRead) {
+        ec_context.set_kv_snapshot(auction_kv_snapshot.clone());
+    }
     let eids = resolve_auction_eids(&auction_kv_snapshot, registry, ec_context);
 
     // Look up geo for device info.
@@ -279,7 +288,7 @@ pub async fn handle_auction(
         services,
         &http_req,
         consent_context,
-        ec_id,
+        ec_id.as_deref(),
         geo,
     )?;
 
@@ -641,6 +650,121 @@ mod tests {
         )
     }
 
+    fn counting_test_partner(source_domain: &str) -> crate::settings::EcPartner {
+        crate::settings::EcPartner {
+            name: format!("Partner {source_domain}"),
+            source_domain: source_domain.to_owned(),
+            openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
+            bidstream_enabled: true,
+            api_token: crate::redacted::Redacted::new(format!(
+                "token-{source_domain}-32-bytes-minimum-value"
+            )),
+            batch_rate_limit: crate::settings::EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: false,
+            pull_sync_url: None,
+            pull_sync_allowed_domains: vec![],
+            pull_sync_ttl_sec: crate::settings::EcPartner::default_pull_sync_ttl_sec(),
+            pull_sync_rate_limit: crate::settings::EcPartner::default_pull_sync_rate_limit(),
+            ts_pull_token: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn auction_endpoint_snapshot_is_reused_by_response_finalization() {
+        // `/auction` loads the identity-graph row to resolve server-side EIDs.
+        // Finalization runs afterwards on the same EC context and ingests
+        // `ts-eids`/`sharedId` updates. Both must be served by a single billable
+        // read: before the snapshot was shared, finalization saw `NotRead` and
+        // paid for a second lookup.
+        let settings = create_test_settings();
+        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: true,
+            providers: vec!["eid_capturing_provider".to_string()],
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        });
+        orchestrator.register_provider(Arc::new(EidCapturingProvider {
+            had_eids: Arc::new(std::sync::Mutex::new(None)),
+        }));
+        let registry = PartnerRegistry::from_config(&[counting_test_partner("sharedid.org")])
+            .expect("should build partner registry");
+
+        let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let graph = KvIdentityGraph::counting("counting-store", Arc::clone(&lookups));
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
+        live.consent.ok = true;
+        graph.create(&ec_id, &live).expect("should seed live row");
+        lookups.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&json!({
+                    "adUnits": [
+                        {
+                            "code": "div-gpt-ad-1",
+                            "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                        }
+                    ]
+                }))
+                .expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        // The capturing provider deliberately fails its launch; identity
+        // resolution — the subject of this test — completes before dispatch.
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(&graph),
+            Some(&registry),
+            &mut ec_context,
+            &noop_services(),
+            req,
+        )
+        .await;
+
+        assert_eq!(
+            lookups.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the endpoint should read the identity row exactly once"
+        );
+        assert!(
+            ec_context.kv_snapshot().entry_for(&ec_id).is_some(),
+            "the endpoint must hand its snapshot to the request context"
+        );
+
+        let mut response = http::Response::new(EdgeBody::empty());
+        crate::ec::finalize::ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            Some("shared-cookie-id"),
+            &mut response,
+        );
+
+        assert_eq!(
+            lookups.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "finalization must reuse the endpoint snapshot instead of reading again"
+        );
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("row should exist");
+        assert_eq!(
+            stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
+            Some("shared-cookie-id"),
+            "the sharedId update must still be ingested from the shared snapshot"
+        );
+    }
+
     /// Provider that fails the test if it is ever contacted. Used to prove the
     /// `/auction` consent gate short-circuits before any outbound bid request.
     struct PanicOnBidProvider;
@@ -695,7 +819,7 @@ mod tests {
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
         let services = services_with_telemetry(Arc::clone(&telemetry_sink));
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
+        let mut ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
 
         let body = json!({
             "adUnits": [
@@ -718,7 +842,7 @@ mod tests {
             &orchestrator,
             None,
             None,
-            &ec_context,
+            &mut ec_context,
             &services,
             req,
         )
@@ -827,7 +951,7 @@ mod tests {
 
         // US-state jurisdiction with an explicit GPC opt-out: auction allowed,
         // EC identity denied.
-        let ec_context = EcContext::new_for_test(
+        let mut ec_context = EcContext::new_for_test(
             None,
             ConsentContext {
                 jurisdiction: Jurisdiction::UsState("CA".to_owned()),
@@ -875,7 +999,7 @@ mod tests {
             &orchestrator,
             None,
             None,
-            &ec_context,
+            &mut ec_context,
             &services,
             req,
         )
@@ -1274,7 +1398,7 @@ mod tests {
             let settings = create_test_settings();
             let orchestrator = build_orchestrator(&settings).expect("should build orchestrator");
             let services = noop_services();
-            let ec_context = EcContext::new_for_test(None, ConsentContext::default());
+            let mut ec_context = EcContext::new_for_test(None, ConsentContext::default());
             let oversized = vec![b'x'; MAX_AUCTION_BODY_SIZE + 1];
             let req = HttpRequest::builder()
                 .method(Method::POST)
@@ -1286,7 +1410,7 @@ mod tests {
                 &orchestrator,
                 None,
                 None,
-                &ec_context,
+                &mut ec_context,
                 &services,
                 req,
             )
@@ -1317,7 +1441,7 @@ mod tests {
             let settings = create_test_settings();
             let orchestrator = build_orchestrator(&settings).expect("should build orchestrator");
             let services = noop_services();
-            let ec_context = EcContext::new_for_test(None, ConsentContext::default());
+            let mut ec_context = EcContext::new_for_test(None, ConsentContext::default());
             let stream = futures::stream::iter([Bytes::from_static(br#"{}"#)]);
             let req = HttpRequest::builder()
                 .method(Method::POST)
@@ -1330,7 +1454,7 @@ mod tests {
                 &orchestrator,
                 None,
                 None,
-                &ec_context,
+                &mut ec_context,
                 &services,
                 req,
             )

@@ -619,7 +619,7 @@ async fn run_named_route(
                 &state.orchestrator,
                 ec.kv_graph.as_ref(),
                 registry_ref,
-                &ec.ec_context,
+                &mut ec.ec_context,
                 &consent_services,
                 req,
             )
@@ -652,7 +652,7 @@ async fn run_named_route(
                 &consent_services,
                 ec.kv_graph.as_ref(),
                 auction,
-                &ec.ec_context,
+                &mut ec.ec_context,
                 req,
             )
             .await

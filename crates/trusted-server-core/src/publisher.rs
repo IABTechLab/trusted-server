@@ -3967,7 +3967,7 @@ pub async fn handle_page_bids(
     services: &RuntimeServices,
     kv: Option<&KvIdentityGraph>,
     auction: AuctionDispatch<'_>,
-    ec_context: &EcContext,
+    ec_context: &mut EcContext,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // CSRF-style gate: refuse cross-site invocations before any other work —
@@ -4051,14 +4051,19 @@ pub async fn handle_page_bids(
     let matched_slots = match_renderable_slots(auction.slots, co_config, &path_param);
 
     let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
-    let ec_id = ec_context.ec_value().filter(|_| ec_context.ec_allowed());
-    let consent_context = ec_context.consent();
+    // Owned so the identity-graph snapshot can be stored back on `ec_context`
+    // below without holding a borrow of it across the mutation.
+    let ec_id = ec_context
+        .ec_value()
+        .filter(|_| ec_context.ec_allowed())
+        .map(str::to_owned);
+    let consent_context = ec_context.consent().clone();
     let geo = ec_context.geo_info().cloned();
     let cookie_jar = handle_request_cookies(&req)?;
 
     // Same fail-closed jurisdiction-aware gate the publisher navigation path
     // uses — relies on the adapter's geo-aware EC context.
-    let consent_allows_auction = consent_allows_server_side_auction(consent_context);
+    let consent_allows_auction = consent_allows_server_side_auction(&consent_context);
 
     // Same bot / prefetch guards the publisher path uses — without them this
     // endpoint would fire real SSP auctions on Sec-Purpose=prefetch warm-up
@@ -4114,14 +4119,21 @@ pub async fn handle_page_bids(
             // bot/prefetch) and a partner registry exists to consume server-side
             // EIDs. Kill-switch, no-slot, bot/prefetch, and no-registry requests
             // never reach here, so they incur no billable KV read.
-            let page_bids_kv_snapshot = match (kv, ec_id, auction.registry) {
+            let page_bids_kv_snapshot = match (kv, ec_id.as_deref(), auction.registry) {
                 (Some(graph), Some(ec_id), Some(_)) => graph.load_snapshot(ec_id),
                 _ => crate::ec::EcKvSnapshot::NotRead,
             };
+            // Hand the loaded row to the request context so response
+            // finalization — which runs on an EC context the adapter owns,
+            // after this handler returns — ingests `ts-eids`/`sharedId` updates
+            // from this read instead of paying for a second lookup.
+            if !matches!(page_bids_kv_snapshot, crate::ec::EcKvSnapshot::NotRead) {
+                ec_context.set_kv_snapshot(page_bids_kv_snapshot.clone());
+            }
             let mut auction_request = build_auction_request(
                 &slots_ctx,
-                ec_id,
-                consent_context,
+                ec_id.as_deref(),
+                &consent_context,
                 &request_info,
                 &settings.publisher.domain,
                 req.headers()
@@ -4132,7 +4144,7 @@ pub async fn handle_page_bids(
                 &mut auction_request,
                 &AuctionEidTargeting {
                     cookie_jar: cookie_jar.as_ref(),
-                    ec_id,
+                    ec_id: ec_id.as_deref(),
                     kv_snapshot: &page_bids_kv_snapshot,
                     partner_registry: auction.registry,
                     ec_context,
@@ -11101,9 +11113,9 @@ mod tests {
             slots: &[CreativeOpportunitySlot],
             req: Request<EdgeBody>,
         ) -> serde_json::Value {
-            let ec_context = consent_allowing_ec_context();
+            let mut ec_context = consent_allowing_ec_context();
             let response =
-                run_page_bids_response_with_ec(settings, orchestrator, slots, &ec_context, req)
+                run_page_bids_response_with_ec(settings, orchestrator, slots, &mut ec_context, req)
                     .await;
             serde_json::from_slice(&response.into_body().into_bytes().unwrap_or_default())
                 .expect("should be json")
@@ -11169,16 +11181,17 @@ mod tests {
             slots: &[CreativeOpportunitySlot],
             req: Request<EdgeBody>,
         ) -> Response<EdgeBody> {
-            let ec_context = EcContext::read_from_request(settings, &req, &noop_services())
+            let mut ec_context = EcContext::read_from_request(settings, &req, &noop_services())
                 .expect("should read EC context");
-            run_page_bids_response_with_ec(settings, orchestrator, slots, &ec_context, req).await
+            run_page_bids_response_with_ec(settings, orchestrator, slots, &mut ec_context, req)
+                .await
         }
 
         async fn run_page_bids_response_with_ec(
             settings: &Settings,
             orchestrator: &AuctionOrchestrator,
             slots: &[CreativeOpportunitySlot],
-            ec_context: &EcContext,
+            ec_context: &mut EcContext,
             req: Request<EdgeBody>,
         ) -> Response<EdgeBody> {
             let services = noop_services();
@@ -11228,7 +11241,7 @@ mod tests {
             let winning_request = Arc::new(Mutex::new(None));
             let winning_orchestrator =
                 auction_id_test_orchestrator(&settings, Arc::clone(&winning_request), true);
-            let ec_context = EcContext::new_for_test(
+            let mut ec_context = EcContext::new_for_test(
                 Some("page-auction-example-123".to_string()),
                 crate::consent::ConsentContext {
                     jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
@@ -11245,7 +11258,7 @@ mod tests {
                     slots: &slots,
                     registry: None,
                 },
-                &ec_context,
+                &mut ec_context,
                 make_page_bids_request("/2024/01/my-article/"),
             )
             .await
@@ -11300,7 +11313,7 @@ mod tests {
                     slots: &slots,
                     registry: None,
                 },
-                &ec_context,
+                &mut ec_context,
                 make_page_bids_request("/2024/01/my-article/"),
             )
             .await
@@ -11336,7 +11349,7 @@ mod tests {
                 );
                 let orchestrator =
                     auction_id_test_orchestrator(settings, Arc::new(Mutex::new(None)), true);
-                let ec_context = EcContext::new_for_test(
+                let mut ec_context = EcContext::new_for_test(
                     Some("page-auction-example-123".to_string()),
                     crate::consent::ConsentContext {
                         jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
@@ -11352,7 +11365,7 @@ mod tests {
                         slots: &slots,
                         registry: None,
                     },
-                    &ec_context,
+                    &mut ec_context,
                     make_page_bids_request("/2024/01/my-article/"),
                 )
                 .await
@@ -12196,7 +12209,7 @@ mod tests {
                 Arc::new(crate::platform::test_support::NoopHttpClient),
                 Arc::clone(&telemetry_sink),
             );
-            let ec_context = consent_allowing_ec_context();
+            let mut ec_context = consent_allowing_ec_context();
             let mut req = HttpRequest::builder()
                 .method(Method::GET)
                 .uri(format!(
@@ -12219,7 +12232,7 @@ mod tests {
                     slots: &article_slot(),
                     registry: None,
                 },
-                &ec_context,
+                &mut ec_context,
                 req,
             )
             .await
@@ -12279,7 +12292,7 @@ mod tests {
                 Arc::new(crate::platform::test_support::NoopHttpClient),
                 telemetry_sink,
             );
-            let ec_context = consent_allowing_ec_context();
+            let mut ec_context = consent_allowing_ec_context();
             let request_path = format!("/{}", "a".repeat(60));
             let mut req = HttpRequest::builder()
                 .method(Method::GET)
@@ -12304,7 +12317,7 @@ mod tests {
                     slots: &slots,
                     registry: None,
                 },
-                &ec_context,
+                &mut ec_context,
                 req,
             )
             .await
