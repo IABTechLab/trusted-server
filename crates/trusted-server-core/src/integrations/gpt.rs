@@ -1246,12 +1246,16 @@ mod tests {
             "should set ts_initial sentinel"
         );
         assert!(
-            !combined.contains("addEventListener(\"slotRenderEnded\""),
-            "inline bootstrap cannot prove TS creative rendering from GPT slotRenderEnded"
+            combined.contains("addEventListener(\"slotRequested\""),
+            "should observe publisher GPT requests before delayed adInit"
+        );
+        assert!(
+            combined.contains("addEventListener(\"slotRenderEnded\""),
+            "should observe publisher GPT renders before delayed adInit"
         );
         assert!(
             !combined.contains("sendBeacon"),
-            "inline bootstrap must not fire win/billing beacons from GPT slotRenderEnded"
+            "inline bootstrap lifecycle ownership must not fire win/billing beacons"
         );
         assert!(
             !combined.contains("getTargeting(\"hb_adid\")"),
