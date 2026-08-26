@@ -203,19 +203,24 @@ fn recover_orphaned_ec(
     });
 }
 
-/// Confirms an orphaned cookie is genuinely absent before rotating it.
+/// Proves an orphaned cookie is genuinely absent before rotating it.
 ///
-/// The origin-overlapped preload reads the identity-graph row while the
-/// publisher origin is still in flight. Fastly edge data stores are eventually
-/// consistent, so a recently created live key can transiently read `Missing` at
-/// one POP. Before rotating a year-lived identity, this performs one more
-/// authoritative read — separated from the preload by the full origin round
-/// trip, which gives replication time to converge:
+/// Rotation abandons a year-lived identity graph and its accumulated EIDs, so
+/// it must never run on a stale read. The origin-overlapped preload reads the
+/// row while the publisher origin is still in flight, and edge data stores are
+/// eventually consistent: a recently created live key can read `Missing` at a
+/// POP that has not converged. Two point reads do not fix that — both can be
+/// stale — so absence has to be *proved*, not observed twice:
 ///
-/// - a now-visible row is adopted, with any pending updates merged, and is
-///   never rotated;
-/// - a confirmed authoritative miss rotates through [`recover_orphaned_ec`];
-/// - a read failure is not a miss and never rotates.
+/// - a row that became visible after the origin round trip is adopted, with any
+///   pending updates merged, and is never rotated;
+/// - a second miss is escalated to
+///   [`key_exists_confirmed`](KvIdentityGraph::key_exists_confirmed), which
+///   reads the primary data source. Only a proven-absent key rotates;
+/// - a key the store still lists is left alone: the point reads were stale, so
+///   the identity stays intact and recovery is retried on a later navigation;
+/// - neither a read failure nor a failed existence check is a miss, and neither
+///   rotates.
 fn confirm_then_recover_orphaned_ec(
     settings: &Settings,
     ec_context: &mut EcContext,
@@ -232,9 +237,18 @@ fn confirm_then_recover_orphaned_ec(
             let merged = graph.upsert_partner_ids_from_snapshot(ec_id, updates, confirmed);
             ec_context.set_kv_snapshot(merged);
         }
-        EcKvSnapshot::Missing { .. } => {
-            recover_orphaned_ec(settings, ec_context, graph, updates, response);
-        }
+        EcKvSnapshot::Missing { .. } => match graph.key_exists_confirmed(ec_id) {
+            Ok(false) => recover_orphaned_ec(settings, ec_context, graph, updates, response),
+            Ok(true) => {
+                log::warn!(
+                    "Orphan EC recovery skipped: both point reads missed a row the store still \
+                     lists; leaving the identity intact for a later navigation"
+                );
+            }
+            Err(err) => {
+                log::warn!("Orphan EC recovery skipped: existence check failed: {err:?}");
+            }
+        },
         // A failed or not-read confirmation is not an authoritative miss: leave
         // the existing snapshot in place and do not rotate an unconfirmed miss.
         EcKvSnapshot::Failed { .. } | EcKvSnapshot::NotRead => {}
@@ -773,6 +787,86 @@ mod tests {
             matches!(ec_context.kv_snapshot(), EcKvSnapshot::Present { .. }),
             "confirming read must adopt the now-visible row rather than rotating"
         );
+    }
+
+    #[test]
+    fn finalize_two_missing_reads_do_not_rotate_a_row_the_store_still_lists() {
+        // Both the origin-overlapped preload and the confirming re-read missed,
+        // but the row is live — the point reads were stale. Two stale reads are
+        // not an absence proof, so the identity graph must be left intact and
+        // recovery retried on a later navigation rather than fragmented behind
+        // a replacement ID.
+        let settings = create_test_settings();
+        let orphan = sample_ec_id("stale1");
+        // One stale read: the preload miss is the `Missing` snapshot below, and
+        // this makes the confirming re-read miss too.
+        let graph = KvIdentityGraph::stale_lookup("test_store", 1);
+        let live = KvEntry::new(
+            &granting_consent(),
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&orphan, &live)
+            .expect("should seed the live row both point reads miss");
+        let mut ec_context = returning_user_context(
+            &orphan,
+            EcKvSnapshot::Missing {
+                ec_id: orphan.clone(),
+            },
+            true,
+        );
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        assert_did_not_rotate(&ec_context, &orphan, &response);
+        assert_eq!(
+            graph
+                .get(&orphan)
+                .expect("should read store")
+                .map(|(entry, _)| entry.consent.ok),
+            Some(true),
+            "the original identity row must survive two stale point reads"
+        );
+    }
+
+    #[test]
+    fn finalize_does_not_rotate_when_the_existence_check_fails() {
+        // Absence is unprovable when the list itself errors. Rotation abandons a
+        // year-lived identity, so it must not run on an unproven miss.
+        let settings = create_test_settings();
+        let orphan = sample_ec_id("nolist");
+        let graph = KvIdentityGraph::unprovable_absence("test_store");
+        let mut ec_context = returning_user_context(
+            &orphan,
+            EcKvSnapshot::Missing {
+                ec_id: orphan.clone(),
+            },
+            true,
+        );
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        assert_did_not_rotate(&ec_context, &orphan, &response);
     }
 
     #[test]

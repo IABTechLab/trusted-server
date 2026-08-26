@@ -496,6 +496,17 @@ impl KvIdentityGraph {
     }
 
     /// Merges partner IDs using request-scoped persisted state as the first CAS input.
+    ///
+    /// A caller-supplied `Present` snapshot is *proof* that the row exists —
+    /// either an `Add`-confirmed create from [`generate_if_needed`] or an
+    /// earlier authoritative read in the same request. Partner-ID enrichment is
+    /// best effort, so a refresh that reads absent or unreadable never
+    /// downgrades that proof: the update is skipped and logged, and the proven
+    /// snapshot is returned so cookie issuance continues from the confirmed
+    /// write. A failed *write* still reports [`EcKvSnapshot::Failed`] — that is
+    /// an operation failure, not an ambiguous read.
+    ///
+    /// [`generate_if_needed`]: super::generate_if_needed
     pub(crate) fn upsert_partner_ids_from_snapshot(
         &self,
         ec_id: &str,
@@ -505,6 +516,16 @@ impl KvIdentityGraph {
         if updates.is_empty() {
             return snapshot;
         }
+
+        // Existence proof carried by the incoming snapshot. Retained across
+        // every refresh so a best-effort enrichment read can never retract it.
+        let proven = match snapshot {
+            EcKvSnapshot::Present {
+                ec_id: ref snapshot_id,
+                ..
+            } if snapshot_id == ec_id => Some(snapshot.clone()),
+            _ => None,
+        };
 
         // Resolve the initial usable snapshot without spending a CAS attempt. A
         // not-read, generation-unavailable, or foreign-ID snapshot is refreshed
@@ -534,8 +555,12 @@ impl KvIdentityGraph {
                     generation: Some(generation),
                 } if snapshot_id == ec_id => (entry.as_ref().clone(), generation),
                 // A refreshed read that is absent or unreadable is authoritative
-                // for this write: never create or overwrite a missing root.
-                EcKvSnapshot::Missing { .. } | EcKvSnapshot::Failed { .. } => return current,
+                // for this write: never create or overwrite a missing root. It
+                // is not authoritative for *existence* though, so a snapshot
+                // that already proved the row exists survives the refresh.
+                EcKvSnapshot::Missing { .. } | EcKvSnapshot::Failed { .. } => {
+                    return Self::keep_proven(ec_id, current, proven.as_ref());
+                }
                 // `load_snapshot` never yields `NotRead` or a generation-less
                 // `Present`; fail closed if that invariant is ever violated.
                 EcKvSnapshot::Present { .. } | EcKvSnapshot::NotRead => {
@@ -587,6 +612,33 @@ impl KvIdentityGraph {
 
         EcKvSnapshot::Failed {
             ec_id: ec_id.to_owned(),
+        }
+    }
+
+    /// Returns `proven` instead of a read outcome that cannot disprove it.
+    ///
+    /// Partner-ID enrichment is best effort. When the caller already held proof
+    /// that the row exists — an `Add`-confirmed create or an earlier
+    /// authoritative read in the same request — a refresh that misses or fails
+    /// says nothing about existence, so the proof is kept and the skipped
+    /// update is logged. Write failures are *not* routed here: they are real
+    /// operation failures and stay [`EcKvSnapshot::Failed`] so callers can
+    /// report them.
+    fn keep_proven(
+        ec_id: &str,
+        downgraded: EcKvSnapshot,
+        proven: Option<&EcKvSnapshot>,
+    ) -> EcKvSnapshot {
+        match proven {
+            Some(proven) => {
+                log::warn!(
+                    "snapshot partner upsert skipped for '{}': refresh was not authoritative; \
+                     keeping the confirmed row",
+                    log_id(ec_id)
+                );
+                proven.clone()
+            }
+            None => downgraded,
         }
     }
 
@@ -783,31 +835,105 @@ impl KvIdentityGraph {
         }
     }
 
-    /// Writes a tombstone only when an authoritative row already exists.
+    /// Reports whether a row exists for `ec_id`, reading the primary data source.
     ///
-    /// An authoritative `Missing` snapshot is a no-op (nothing to withdraw). A
-    /// non-authoritative snapshot — a prior read that `Failed`, or one lacking a
-    /// usable generation — is re-read so a transient read error never silently
-    /// drops a consent withdrawal.
+    /// Point lookups on edge data stores are eventually consistent: a recently
+    /// created key can read absent at a POP that has not converged yet, so
+    /// `Ok(None)` from [`get`](Self::get) is *not* an absence proof. The list
+    /// API is the consistency-safe alternative — Fastly's KV list reads the
+    /// primary data source unless `eventual_consistency()` is requested — so an
+    /// empty prefix page proves absence where a stale point read cannot.
+    ///
+    /// EC IDs are fixed-width (`{64hex}.{6alnum}`), so listing with the full ID
+    /// as the prefix matches at most the key itself. A limit of 1 is enough:
+    /// only existence is in question, not the count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] on store open or list failure.
+    /// Callers must treat an error as "existence unknown" and fail closed —
+    /// never as absence.
+    pub fn key_exists_confirmed(&self, ec_id: &str) -> Result<bool, Report<TrustedServerError>> {
+        Ok(self.store.count_keys_with_prefix(ec_id, 1)? > 0)
+    }
+
+    /// Resolves a tombstone attempt whose point read reported the row absent.
+    ///
+    /// A proven-absent key is a no-op: there is nothing to withdraw, and a
+    /// forged cookie must not mint a row. A key that provably exists is
+    /// tombstoned unconditionally — no CAS generation is available after a
+    /// missed read, and a withdrawal must win over any concurrent write. An
+    /// existence check that itself fails leaves the withdrawal unresolved
+    /// rather than silently dropped.
+    fn tombstone_unproven_missing(&self, ec_id: &str, missing: EcKvSnapshot) -> EcKvSnapshot {
+        match self.key_exists_confirmed(ec_id) {
+            Ok(false) => missing,
+            Ok(true) => {
+                log::warn!(
+                    "withdrawal tombstone for '{}': point read missed a row the store still \
+                     lists; writing an unconditional tombstone",
+                    log_id(ec_id)
+                );
+                let tombstone = KvEntry::tombstone(current_timestamp());
+                match self.write_withdrawal_tombstone(ec_id) {
+                    Ok(()) => EcKvSnapshot::Present {
+                        ec_id: ec_id.to_owned(),
+                        entry: Box::new(tombstone),
+                        generation: None,
+                    },
+                    Err(err) => {
+                        log::warn!(
+                            "unconditional withdrawal tombstone failed for '{}': {err:?}",
+                            log_id(ec_id)
+                        );
+                        EcKvSnapshot::Failed {
+                            ec_id: ec_id.to_owned(),
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                log::warn!(
+                    "withdrawal tombstone for '{}': existence check failed, cannot confirm \
+                     absence: {err:?}",
+                    log_id(ec_id)
+                );
+                EcKvSnapshot::Failed {
+                    ec_id: ec_id.to_owned(),
+                }
+            }
+        }
+    }
+
+    /// Writes a tombstone only when an existing row can be confirmed.
+    ///
+    /// Existing-key-only behavior is deliberate: a forged or expired `ts-ec`
+    /// cookie must not mint a row. But a *point read* cannot prove absence on
+    /// an eventually-consistent store, and dropping a withdrawal is worse than
+    /// a redundant read, so absence is established in two stages:
+    ///
+    /// 1. Any snapshot that is not a usable `Present` for this EC ID — a
+    ///    publisher preload that read `Missing`, a read that `Failed`, or one
+    ///    lacking a CAS generation — is re-read. On the publisher path that
+    ///    re-read is separated from the preload by the full origin round trip,
+    ///    which gives replication time to converge.
+    /// 2. A re-read that still reports the row absent is checked against
+    ///    [`key_exists_confirmed`](Self::key_exists_confirmed), which reads the
+    ///    primary data source.
+    ///
+    /// Resolving the initial snapshot happens outside the retry counter, so all
+    /// [`MAX_CAS_RETRIES`] iterations stay available for the tombstone write.
     pub(crate) fn tombstone_existing_from_snapshot(
         &self,
         ec_id: &str,
         snapshot: EcKvSnapshot,
     ) -> EcKvSnapshot {
-        // Resolve the initial usable snapshot without spending a CAS attempt. An
-        // authoritative missing row is a no-op; any non-authoritative state — a
-        // failed read or a snapshot lacking a usable generation — is re-read once
-        // so a transient error never silently drops a withdrawal, and all
-        // `MAX_CAS_RETRIES` iterations stay available for the tombstone write.
         let mut current = match snapshot {
             EcKvSnapshot::Present {
                 ec_id: ref snapshot_id,
                 generation: Some(_),
                 ..
             } if snapshot_id == ec_id => snapshot,
-            EcKvSnapshot::Missing {
-                ec_id: ref snapshot_id,
-            } if snapshot_id == ec_id => return snapshot,
             _ => self.load_snapshot(ec_id),
         };
 
@@ -818,11 +944,14 @@ impl KvIdentityGraph {
                     generation: Some(generation),
                     ..
                 } if snapshot_id == ec_id => generation,
-                // An authoritative missing row (including one that disappeared
-                // mid-retry) is a no-op.
+                // A missing row (including one that disappeared mid-retry) is
+                // only a no-op once absence is proven against the primary data
+                // source.
                 EcKvSnapshot::Missing {
                     ec_id: ref snapshot_id,
-                } if snapshot_id == ec_id => return current,
+                } if snapshot_id == ec_id => {
+                    return self.tombstone_unproven_missing(ec_id, current);
+                }
                 // A refreshed read that failed (or any other unusable state)
                 // fails closed rather than silently dropping the withdrawal.
                 _ => {
@@ -1001,6 +1130,38 @@ impl KvIdentityGraph {
     pub(crate) fn in_memory(store_name: impl Into<String>) -> Self {
         Self::new(super::kv_backend::test_support::InMemoryEcKv::new(
             store_name,
+        ))
+    }
+
+    /// Test helper: a graph whose first `stale_lookups` point reads report the
+    /// key absent while the list API still sees it, mimicking an
+    /// eventually-consistent edge data store.
+    pub(crate) fn stale_lookup(store_name: impl Into<String>, stale_lookups: u32) -> Self {
+        Self::new(super::kv_backend::test_support::StaleLookupEcKv::new(
+            store_name,
+            stale_lookups,
+            false,
+        ))
+    }
+
+    /// Test helper: a graph that counts every point read through a shared
+    /// counter so tests can prove exactly how many reads a flow performs.
+    pub(crate) fn counting(
+        store_name: impl Into<String>,
+        lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        Self::new(super::kv_backend::test_support::CountingEcKv::new(
+            store_name, lookups,
+        ))
+    }
+
+    /// Test helper: a graph whose point reads always miss and whose list API
+    /// errors, so absence can neither be observed nor proved.
+    pub(crate) fn unprovable_absence(store_name: impl Into<String>) -> Self {
+        Self::new(super::kv_backend::test_support::StaleLookupEcKv::new(
+            store_name,
+            u32::MAX,
+            true,
         ))
     }
 }
@@ -1600,50 +1761,6 @@ mod tests {
     // Snapshot-aware mutation stores and tests
     // -----------------------------------------------------------------------
 
-    /// [`EcKvStore`] wrapper that counts `lookup` calls through a shared counter
-    /// so tests can prove exactly how many reads a mutation performs.
-    struct CountingEcKv {
-        inner: InMemoryEcKv,
-        lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl CountingEcKv {
-        fn new(lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
-            Self {
-                inner: InMemoryEcKv::new("counting-store"),
-                lookups,
-            }
-        }
-    }
-
-    impl EcKvStore for CountingEcKv {
-        fn store_name(&self) -> &str {
-            self.inner.store_name()
-        }
-        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
-            self.lookups
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.inner.lookup(key)
-        }
-        fn insert(
-            &self,
-            key: &str,
-            write: EcKvWrite<'_>,
-        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
-            self.inner.insert(key, write)
-        }
-        fn count_keys_with_prefix(
-            &self,
-            prefix: &str,
-            limit: u32,
-        ) -> Result<u32, Report<TrustedServerError>> {
-            self.inner.count_keys_with_prefix(prefix, limit)
-        }
-        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
-            self.inner.delete(key)
-        }
-    }
-
     /// [`EcKvStore`] whose reads succeed but every write fails, simulating a
     /// store that becomes unwritable mid-request.
     struct WriteFailingEcKv {
@@ -1764,7 +1881,7 @@ mod tests {
     #[test]
     fn snapshot_upsert_with_generation_writes_without_reading() {
         let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let graph = KvIdentityGraph::new(CountingEcKv::new(lookups.clone()));
+        let graph = KvIdentityGraph::counting("counting-store", lookups.clone());
         let ec_id = snapshot_ec_id();
         graph.create(&ec_id, &live_entry()).expect("should seed");
         let snapshot = EcKvSnapshot::Present {
@@ -1817,7 +1934,7 @@ mod tests {
     #[test]
     fn snapshot_upsert_refreshes_unavailable_generation_exactly_once() {
         let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let graph = KvIdentityGraph::new(CountingEcKv::new(lookups.clone()));
+        let graph = KvIdentityGraph::counting("counting-store", lookups.clone());
         let ec_id = snapshot_ec_id();
         graph.create(&ec_id, &live_entry()).expect("should seed");
         // Finalize-written style snapshot: entry known, generation unavailable.
@@ -2037,5 +2154,181 @@ mod tests {
             .expect("should read store")
             .expect("should preserve existing key");
         assert!(!stored.consent.ok, "withdrawal must reach the store");
+    }
+    // -----------------------------------------------------------------------
+    // Eventual-consistency guards
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn key_exists_confirmed_distinguishes_absence_from_a_stale_point_read() {
+        let graph = KvIdentityGraph::stale_lookup("stale-store", 1);
+        let ec_id = snapshot_ec_id();
+        graph
+            .create(&ec_id, &live_entry())
+            .expect("should seed live");
+
+        assert!(
+            graph.get(&ec_id).expect("should read store").is_none(),
+            "the first point read is stale by construction"
+        );
+        assert!(
+            graph
+                .key_exists_confirmed(&ec_id)
+                .expect("should list the store"),
+            "the list API must still see a row the point read missed"
+        );
+
+        let absent = KvIdentityGraph::in_memory("empty-store");
+        assert!(
+            !absent
+                .key_exists_confirmed(&ec_id)
+                .expect("should list the store"),
+            "an empty store must prove absence"
+        );
+    }
+
+    #[test]
+    fn snapshot_upsert_keeps_add_confirmed_present_when_refresh_misses() {
+        // `generate_if_needed` records a successful `Add` as `Present` without a
+        // generation. EID ingestion refreshes that snapshot to obtain one; on an
+        // eventually-consistent store the refresh can miss. Enrichment is best
+        // effort, so the miss must not retract the confirmed create — otherwise
+        // finalization suppresses the `ts-ec` cookie for a root that was written.
+        let graph = KvIdentityGraph::in_memory("empty-store");
+        let ec_id = snapshot_ec_id();
+        let add_confirmed = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(live_entry()),
+            generation: None,
+        };
+        let updates = [PartnerIdUpdate::new("ssp_x", "uid-1")];
+
+        let outcome = graph.upsert_partner_ids_from_snapshot(&ec_id, &updates, add_confirmed);
+
+        assert!(
+            outcome.entry_for(&ec_id).is_some(),
+            "an Add-confirmed row must survive a non-authoritative refresh miss"
+        );
+        assert!(
+            graph.get(&ec_id).expect("should read store").is_none(),
+            "a missed refresh must not create or overwrite a root"
+        );
+    }
+
+    #[test]
+    fn snapshot_upsert_keeps_add_confirmed_present_when_refresh_fails() {
+        let graph = KvIdentityGraph::failing("failing-store");
+        let ec_id = snapshot_ec_id();
+        let add_confirmed = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(live_entry()),
+            generation: None,
+        };
+        let updates = [PartnerIdUpdate::new("ssp_x", "uid-1")];
+
+        let outcome = graph.upsert_partner_ids_from_snapshot(&ec_id, &updates, add_confirmed);
+
+        assert!(
+            outcome.entry_for(&ec_id).is_some(),
+            "a read failure is not evidence of absence and must not retract the create"
+        );
+    }
+
+    #[test]
+    fn snapshot_upsert_without_proof_still_reports_a_refresh_miss() {
+        // No prior proof of existence: a `NotRead` snapshot that refreshes into
+        // a miss must stay `Missing` so finalization can run orphan recovery.
+        let graph = KvIdentityGraph::in_memory("empty-store");
+        let ec_id = snapshot_ec_id();
+        let updates = [PartnerIdUpdate::new("ssp_x", "uid-1")];
+
+        let outcome =
+            graph.upsert_partner_ids_from_snapshot(&ec_id, &updates, EcKvSnapshot::NotRead);
+
+        assert!(
+            matches!(outcome, EcKvSnapshot::Missing { .. }),
+            "an unproven refresh miss must remain a miss"
+        );
+    }
+
+    #[test]
+    fn tombstone_revalidates_preloaded_missing_and_writes_when_row_is_present() {
+        // The publisher preload read `Missing` at a POP that had not converged.
+        // Finalization runs after the origin round trip, so the re-read sees the
+        // row and the withdrawal must reach the store.
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = snapshot_ec_id();
+        kv.create(&ec_id, &live_entry()).expect("should seed live");
+
+        let outcome = kv.tombstone_existing_from_snapshot(
+            &ec_id,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+        );
+
+        assert!(
+            outcome
+                .entry_for(&ec_id)
+                .is_some_and(|entry| !entry.consent.ok),
+            "a stale preloaded miss must not drop the withdrawal"
+        );
+        let (stored, _) = kv
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("should preserve existing key");
+        assert!(!stored.consent.ok, "withdrawal must reach the store");
+    }
+
+    #[test]
+    fn tombstone_writes_unconditionally_when_both_point_reads_miss_a_listed_row() {
+        // Both the preload and the confirming re-read are stale. A point read
+        // cannot prove absence, so the list API decides: the row exists, and a
+        // withdrawal must win even without a CAS generation.
+        let kv = KvIdentityGraph::stale_lookup("stale-store", 1);
+        let ec_id = snapshot_ec_id();
+        kv.create(&ec_id, &live_entry()).expect("should seed live");
+
+        let outcome = kv.tombstone_existing_from_snapshot(
+            &ec_id,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+        );
+
+        assert!(
+            outcome
+                .entry_for(&ec_id)
+                .is_some_and(|entry| !entry.consent.ok),
+            "a listed row must be tombstoned even when point reads miss it"
+        );
+        let (stored, _) = kv
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("should preserve existing key");
+        assert!(
+            !stored.consent.ok,
+            "the live row must not keep consent.ok after an explicit withdrawal"
+        );
+    }
+
+    #[test]
+    fn tombstone_fails_closed_when_the_existence_check_fails() {
+        // A forged-cookie no-op requires proof of absence. When the list itself
+        // fails, the withdrawal is left unresolved rather than silently dropped.
+        let kv = KvIdentityGraph::failing("failing-store");
+        let ec_id = snapshot_ec_id();
+
+        let outcome = kv.tombstone_existing_from_snapshot(
+            &ec_id,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+        );
+
+        assert!(
+            matches!(outcome, EcKvSnapshot::Failed { .. }),
+            "an unprovable absence must not report a completed withdrawal"
+        );
     }
 }

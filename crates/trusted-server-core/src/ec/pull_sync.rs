@@ -79,6 +79,18 @@ pub fn build_pull_sync_context(ec_context: &EcContext) -> Option<PullSyncContext
 ///
 /// This function is best-effort: all errors are logged and swallowed.
 ///
+/// # Consent revalidation
+///
+/// Pull sync runs *after* the page response has been flushed to the browser and
+/// discloses the raw `ec_id` to partners, so it cannot be authorized by the
+/// request snapshot alone: a concurrent CMP withdrawal can tombstone the row in
+/// the window between snapshot capture and dispatch. The live row is re-read
+/// immediately before the first partner request and anything short of a live,
+/// consenting entry cancels the dispatch. The read is deferred until after the
+/// snapshot-based eligibility filter, so a request with nothing to pull still
+/// costs no KV operation, and the fresh snapshot is reused for the write-back
+/// instead of the stale one.
+///
 /// # Panics
 ///
 /// Panics if the HTTP request builder produces an invalid request, which
@@ -92,10 +104,10 @@ pub fn dispatch_pull_sync(
     services: &RuntimeServices,
 ) {
     let now = current_timestamp();
-    let Some(kv_entry) = context.snapshot.entry_for(context.ec_id()) else {
+    let Some(request_entry) = context.snapshot.entry_for(context.ec_id()) else {
         return;
     };
-    if !kv_entry.consent.ok {
+    if !request_entry.consent.ok {
         return;
     }
 
@@ -120,12 +132,40 @@ pub fn dispatch_pull_sync(
     let offset = (now / 3600) as usize % pull_partners.len();
     pull_partners.rotate_left(offset);
 
+    // Drop partners the request snapshot already has a UID for before paying
+    // for the revalidation read: a dispatch with nothing to pull must not add a
+    // KV operation.
+    pull_partners.retain(|partner| is_partner_pull_eligible(partner, Some(request_entry)));
+    if pull_partners.is_empty() {
+        return;
+    }
+
+    let live_snapshot = kv.load_snapshot(context.ec_id());
+    let Some(live_entry) = live_snapshot.entry_for(context.ec_id()) else {
+        log::warn!(
+            "Pull sync: skipping dispatch for '{}' because the live identity row could not be \
+             confirmed",
+            super::log_id(context.ec_id())
+        );
+        return;
+    };
+    if !live_entry.consent.ok {
+        log::info!(
+            "Pull sync: skipping dispatch for '{}' because consent was withdrawn after the \
+             request snapshot was captured",
+            super::log_id(context.ec_id())
+        );
+        return;
+    }
+
     let max_concurrency = settings.ec.pull_sync_concurrency.max(1);
     let mut in_flight: Vec<InFlightPull> = Vec::new();
     let mut updates = Vec::new();
 
     for partner in pull_partners {
-        if !is_partner_pull_eligible(partner, Some(kv_entry)) {
+        // Re-checked against the live row: a concurrent request may have filled
+        // this partner's UID since the request snapshot was captured.
+        if !is_partner_pull_eligible(partner, Some(live_entry)) {
             continue;
         }
 
@@ -220,11 +260,11 @@ pub fn dispatch_pull_sync(
 
     drain_pull_batch(&mut in_flight, services, &mut updates);
     if !updates.is_empty() {
-        let outcome = kv.upsert_partner_ids_from_snapshot(
-            context.ec_id(),
-            &updates,
-            context.snapshot.clone(),
-        );
+        // Write back from the revalidated snapshot, not the request one: its
+        // generation is current, so the first CAS attempt is not spent losing a
+        // conflict against the read that authorized this dispatch.
+        let outcome =
+            kv.upsert_partner_ids_from_snapshot(context.ec_id(), &updates, live_snapshot.clone());
         if matches!(outcome, EcKvSnapshot::Failed { .. }) {
             log::warn!(
                 "Pull sync: failed to persist partner updates for '{}'",
@@ -901,6 +941,109 @@ mod tests {
         assert!(
             stub.recorded_backend_names().is_empty(),
             "a tombstone snapshot must not dispatch pull sync"
+        );
+    }
+    #[test]
+    fn dispatch_pull_sync_skips_dispatch_when_ec_is_tombstoned_after_snapshot_capture() {
+        // The request snapshot authorized pull sync, then a concurrent request
+        // completed a CMP withdrawal while the page response was in flight.
+        // Pull sync runs post-send and discloses the raw `ec_id` to partners, so
+        // it must revalidate the live row and cancel rather than leak an
+        // identity the user just withdrew.
+        let mut settings = create_test_settings();
+        settings.ec.pull_sync_concurrency = 4;
+        let registry =
+            PartnerRegistry::from_config(&[pull_enabled_ec_partner("alpha.example.com")])
+                .expect("should build registry");
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        let ec_id = snapshot_ec_id();
+        let snapshot = seed_present_snapshot(&graph, &ec_id);
+
+        // Concurrent withdrawal lands after the snapshot was captured.
+        graph
+            .write_withdrawal_tombstone(&ec_id)
+            .expect("should tombstone the row");
+
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, br#"{"uid":"leaked-uid"}"#.to_vec());
+        let services = build_services_with_http_client(stub.clone());
+
+        let context = PullSyncContext {
+            ec_id: ec_id.clone(),
+            snapshot,
+        };
+        dispatch_pull_sync(
+            &settings,
+            &graph,
+            &registry,
+            &AllowAllRateLimiter,
+            &context,
+            &services,
+        );
+
+        assert!(
+            stub.recorded_backend_names().is_empty(),
+            "a withdrawal that lands after snapshot capture must cancel post-send pull sync"
+        );
+        let (entry, _) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("tombstone should remain");
+        assert!(
+            entry.ids.is_empty(),
+            "no partner UID may be written back onto a tombstoned row"
+        );
+    }
+
+    #[test]
+    fn dispatch_pull_sync_skips_revalidation_read_when_no_partner_is_eligible() {
+        // Every pull-enabled partner already has a UID in the request snapshot,
+        // so there is nothing to dispatch. The revalidation read exists to
+        // authorize outbound calls; with no calls to authorize it must not cost
+        // a KV operation.
+        let mut settings = create_test_settings();
+        settings.ec.pull_sync_concurrency = 4;
+        let registry =
+            PartnerRegistry::from_config(&[pull_enabled_ec_partner("alpha.example.com")])
+                .expect("should build registry");
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        let ec_id = snapshot_ec_id();
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry.ids.insert(
+            "alpha.example.com".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                uid: "already-known".to_owned(),
+            },
+        );
+        graph
+            .create(&ec_id, &entry)
+            .expect("should seed live entry");
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(entry),
+            generation: Some(1),
+        };
+
+        let stub = Arc::new(StubHttpClient::new());
+        let services = build_services_with_http_client(stub.clone());
+
+        let context = PullSyncContext {
+            ec_id: ec_id.clone(),
+            snapshot,
+        };
+        dispatch_pull_sync(
+            &settings,
+            &graph,
+            &registry,
+            &AllowAllRateLimiter,
+            &context,
+            &services,
+        );
+
+        assert!(
+            stub.recorded_backend_names().is_empty(),
+            "a fully synced entry must not dispatch pull sync"
         );
     }
 }
