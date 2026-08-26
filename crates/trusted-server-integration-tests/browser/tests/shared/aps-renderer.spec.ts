@@ -10,6 +10,13 @@ const SCRIPT_CREATIVE_URL = "https://creative.example/script.js";
 const SANDBOX =
     "allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation";
 const TSJS_CRATE = resolve(__dirname, "../../../../trusted-server-js");
+const PUC_BANNER = readFileSync(
+    resolve(
+        __dirname,
+        "../../node_modules/prebid-universal-creative/dist/banner.js",
+    ),
+    "utf8",
+);
 
 function clientAuctionBundlePaths() {
     const manifestPath = resolve(TSJS_CRATE, "dist/prebid/manifest.json");
@@ -197,6 +204,145 @@ const SCRIPT_CREATIVE = `(function(){
 })();`;
 
 test.describe("APS rendering", () => {
+    test("renders through real PUC and expands only its authenticated 1x1 shell", async ({
+        page,
+    }) => {
+        const adId = "fictional-inline-ad-id";
+        const publisherOrigin = new URL(runtimeUrl("/")).origin;
+        const outerCreativeUrl = runtimeUrl("/fictional-puc-shell");
+        let creativeRequests = 0;
+
+        await page.route(runtimeUrl("/aps-puc-topology-test"), (route) =>
+            route.fulfill({
+                status: 200,
+                contentType: "text/html",
+                body: '<!doctype html><div id="div-aps"></div><div id="div-other"></div>',
+            }),
+        );
+        await page.route(outerCreativeUrl, (route) =>
+            route.fulfill({
+                status: 200,
+                contentType: "text/html",
+                body: `<!doctype html><script>${PUC_BANNER}</script><script>
+window.ucTag.renderAd(document, { adId: ${JSON.stringify(adId)}, pubUrl: ${JSON.stringify(publisherOrigin)} });
+</script>`,
+            }),
+        );
+        await page.route(IFRAME_CREATIVE_URL, (route) => {
+            creativeRequests += 1;
+            return route.fulfill({
+                status: 200,
+                contentType: "text/html",
+                body: IFRAME_CREATIVE,
+            });
+        });
+
+        await page.goto(runtimeUrl("/aps-puc-topology-test"));
+        await page.addScriptTag({ path: clientAuctionBundlePaths().gpt });
+        await page.evaluate(
+            ({ creativeUrl, outerUrl, selectedAdId }) => {
+                const typedWindow = window as unknown as {
+                    tsjs: Record<string, unknown>;
+                    pucEvents: Array<Record<string, unknown>>;
+                };
+                typedWindow.tsjs = {
+                    bids: {
+                        "aps-slot": {
+                            hb_adid: selectedAdId,
+                            hb_bidder: "fictional",
+                            hb_pb: "1.23",
+                            adm: `<iframe src="${creativeUrl}" width="300" height="250"></iframe>`,
+                            w: 300,
+                            h: 250,
+                        },
+                    },
+                    adSlots: [
+                        {
+                            id: "aps-slot",
+                            div_id: "div-aps",
+                            gam_unit_path: "/fictional/aps",
+                            formats: [[300, 250]],
+                        },
+                    ],
+                };
+                typedWindow.pucEvents = [];
+                const locator = document.createElement("iframe");
+                locator.name = "__pb_locator__";
+                document.body.appendChild(locator);
+                window.addEventListener("message", (event) => {
+                    try {
+                        const message = JSON.parse(
+                            String(event.data),
+                        ) as Record<string, unknown>;
+                        if (message.message === "Prebid Event") {
+                            typedWindow.pucEvents.push(message);
+                        }
+                    } catch {
+                        // Ignore unrelated publisher messages.
+                    }
+                });
+
+                const slot = document.getElementById("div-aps")!;
+                slot.style.width = "1px";
+                slot.style.height = "1px";
+                const frame = document.createElement("iframe");
+                frame.id = "google_ads_iframe_fictional_0";
+                frame.width = "1";
+                frame.height = "1";
+                frame.style.width = "1px";
+                frame.style.height = "1px";
+                frame.src = outerUrl;
+                slot.appendChild(frame);
+
+                const other = document.getElementById("div-other")!;
+                const otherFrame = document.createElement("iframe");
+                otherFrame.width = "1";
+                otherFrame.height = "1";
+                otherFrame.style.width = "1px";
+                otherFrame.style.height = "1px";
+                other.appendChild(otherFrame);
+            },
+            {
+                creativeUrl: IFRAME_CREATIVE_URL,
+                outerUrl: outerCreativeUrl,
+                selectedAdId: adId,
+            },
+        );
+
+        await expect.poll(() => creativeRequests).toBe(1);
+        await expect
+            .poll(() =>
+                page.evaluate(() =>
+                    (
+                        window as unknown as {
+                            pucEvents: Array<Record<string, unknown>>;
+                        }
+                    ).pucEvents.some(
+                        (event) => event.event === "adRenderSucceeded",
+                    ),
+                ),
+            )
+            .toBe(true);
+        await expect(page.locator("#google_ads_iframe_fictional_0")).toHaveCSS(
+            "width",
+            "300px",
+        );
+        await expect(page.locator("#google_ads_iframe_fictional_0")).toHaveCSS(
+            "height",
+            "250px",
+        );
+        await expect(page.locator("#div-aps")).toHaveCSS("width", "300px");
+        await expect(page.locator("#div-aps")).toHaveCSS("height", "250px");
+        await expect(page.locator("#div-other iframe")).toHaveCSS(
+            "width",
+            "1px",
+        );
+        await expect(page.locator("#div-other iframe")).toHaveCSS(
+            "height",
+            "1px",
+        );
+    });
+
     test("renders a trustedServer adapter bid using Prebid's generated GAM ad ID", async ({
         page,
     }) => {
