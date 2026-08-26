@@ -562,3 +562,108 @@ streamed. No allocation in the hot path beyond the one `Arc` at entry, the
 - The stall window itself remains unattributed until this ships. If it recurs first,
   the bisection runbook from 2026-08-21 (cookie-free curl UA request, static-asset
   path versus HTML path) is the fallback.
+
+## 18. Auction timeline offsets (follow-up increment)
+
+Status: spec amendment for a follow-up PR; not part of the initial implementation
+(#1074). Builds only on machinery that spec sections 5, 9, and 10 already define.
+
+### Problem
+
+The pipeline has two clocks that never meet. The auction dataset
+(`auction_events_raw`, PR #813) measures the auction internally: `total_time_ms`
+from auction start to terminal, `provider_response_time_ms` per bidder call. Its
+clock starts when the auction observation is created, so nothing places those
+numbers on the request timeline. The access row is T0-anchored but records only
+`auction_wait_ms`: time the handler was blocked at collect, deliberately not the
+auction's own timeline.
+
+That leaves three questions unanswerable today:
+
+1. At what request-relative time did the auction start (dispatch leave the edge)?
+2. At what request-relative time did the auction resolve (final bid or timeout)?
+3. At what request-relative time were the results committed toward GAM?
+
+These are the overlap-proof questions. A client-side wrapper cannot dispatch until
+the browser boots (t≈3000ms on measured prospect pages); the server-side auction
+dispatches while the origin fetch is in flight. Proving that requires all
+milestones on one clock.
+
+### Design
+
+Three first-call-wins marks on `RequestTimings`, in the style of
+`mark_headers_ready()`, each storing `Option<Duration>` since T0:
+
+| Mark                        | Recorded at                                                                                                     | Meaning                                                            |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `mark_auction_dispatched()` | immediately before `orchestrator.dispatch_auction` returns control to the caller (`publisher.rs` dispatch site) | bid requests have left the edge                                    |
+| `mark_auction_resolved()`   | immediately after `collect_dispatched_auction` returns, both collect sites                                      | final bid returned or auction timed out; terminal either way       |
+| `mark_auction_committed()`  | immediately after `write_bids_to_state` returns, both call sites                                                | winning bids are in page state, available to the response pipeline |
+
+Notes on the definitions:
+
+- "Committed toward GAM" is defined as `write_bids_to_state` returning: the common
+  point in buffered and streaming modes where targeting becomes part of the
+  response. TS never calls GAM server-side; the browser's GPT call carries the
+  targeting, and that half of the timeline belongs to client-side measurement.
+  The edge proves when targeting was available; the client proves when GAM saw it.
+- First-call-wins on all three marks. A request produces at most one publisher-path
+  auction today; if a second auction ever occurs in one request, the row describes
+  the first and the auction dataset still carries both in full.
+- Same locking and failure model as every other `RequestTimings` write: `try_lock`,
+  drop on contention, saturating conversion at serialization.
+
+### Row changes
+
+Four additive columns on `access_logs_raw`, all populated from the
+`TimingSnapshot` at the existing freeze/emission points (no new emission path):
+
+```
+`auction_dispatched_ms`  Nullable(UInt32),  `json:$.auction_dispatched_ms`
+`auction_resolved_ms`    Nullable(UInt32),  `json:$.auction_resolved_ms`
+`auction_committed_ms`   Nullable(UInt32),  `json:$.auction_committed_ms`
+`auction_id`             String,            `json:$.auction_id`
+```
+
+- The three offsets are null when no auction ran (the common case: assets, EC
+  endpoints, auction-disabled deployments). Null means "no auction", never "zero".
+- `auction_id` is the telemetry auction UUID already present on every
+  `auction_events_raw` row, carried onto the access row as the join key between
+  the T0 timeline and per-bidder detail. Sentinel `none` when no auction ran,
+  matching the non-nullable-dimension convention of section 9. It is a random
+  UUID, not identity-bearing; unbounded cardinality is accepted for the same
+  reason it is accepted in the auction dataset.
+- Schema evolution is additive with JSONPaths on every new column and
+  `FORWARD_QUERY` carrying the existing columns, per the deployed datasource's
+  established evolution path. Verified with `tb --cloud deploy --check` before
+  deploy.
+
+### Interpretation model
+
+Combined with existing columns, one access row now reads as a timeline:
+
+```
+t=0 ......... request entry
+t=D ......... auction_dispatched_ms      (bids out; origin fetch typically in flight)
+t=R ......... auction_resolved_ms        (R - D ~ auction duration; join auction_id
+                                          for the per-bidder long pole)
+t=C ......... auction_committed_ms       (targeting in page state)
+t=H ......... time_elapsed_ms            (headers committed)
+```
+
+Derivations the dashboard can add without schema help: auction duration on the
+request clock (`R - D`), commit latency (`C - R`), and overlap ratio (share of
+`R - D` that ran concurrently with `ts-origin`). `auction_wait_ms` keeps its
+existing meaning (blocked time only) and is now interpretable next to the
+timeline: `R - D` minus `auction_wait_ms` approximates how much of the auction
+was absorbed by work the request needed anyway.
+
+### Scope
+
+- Fastly emits; Axum, Cloudflare, and Spin collect the marks but do not emit,
+  matching section 8a adapter semantics.
+- No header emission for any of these values: they are post-hoc analysis fields,
+  and two of the three are typically unknown at the header freeze point in
+  streaming mode.
+- No config surface: the marks are always-on collection like every other phase,
+  gated at emission by the existing `tinybird.access_enabled`.
