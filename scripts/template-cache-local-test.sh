@@ -24,6 +24,7 @@ esac
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 ORIGIN_PORT="${ORIGIN_PORT:-9099}"
+BID_PORT="${BID_PORT:-9100}"
 TS_PORT="${TS_PORT:-7788}"
 HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
 
@@ -31,6 +32,7 @@ HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
 # observable in the timings: with an instant auction, buffered and streaming
 # assembly are indistinguishable.
 BID_DELAY="${BID_DELAY:-1.5}"
+REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-30}"
 
 PASS=0
 FAIL=0
@@ -45,8 +47,16 @@ check() { # check <description> <actual> <expected>
 
 cleanup() {
   local status=$?
-  [ -n "${VICEROY_PID:-}" ] && kill "$VICEROY_PID" 2>/dev/null || true
-  [ -n "${ORIGIN_PID:-}" ] && kill "$ORIGIN_PID" 2>/dev/null || true
+  if [ -n "${VICEROY_PID:-}" ]; then
+    kill "$VICEROY_PID" 2>/dev/null || true
+    wait "$VICEROY_PID" 2>/dev/null || true
+  fi
+  if [ -n "${ORIGIN_PID:-}" ]; then
+    # macOS may launch the framework Python process as a child of the shim.
+    pkill -TERM -P "$ORIGIN_PID" 2>/dev/null || true
+    kill "$ORIGIN_PID" 2>/dev/null || true
+    wait "$ORIGIN_PID" 2>/dev/null || true
+  fi
   rm -rf "$WORK"
   exit $status
 }
@@ -60,13 +70,17 @@ command -v node >/dev/null || {
   echo "node not found. The harness executes the real GPT bundle to verify slot setup." >&2
   exit 1
 }
+command -v openssl >/dev/null || {
+  echo "openssl not found. The harness needs it for the local HTTPS bid endpoint." >&2
+  exit 1
+}
 
 # A port already in use means requests would go to something else entirely — most
 # likely a leftover run, whose warm cache and stale config would read as a result.
-for port in "$ORIGIN_PORT" "$TS_PORT"; do
+for port in "$ORIGIN_PORT" "$BID_PORT" "$TS_PORT"; do
   if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
     echo "Port $port is already in use. Stop the process, or set" >&2
-    echo "ORIGIN_PORT / TS_PORT to something free." >&2
+    echo "ORIGIN_PORT / BID_PORT / TS_PORT to something free." >&2
     lsof -nP -iTCP:"$port" -sTCP:LISTEN >&2
     exit 1
   fi
@@ -78,19 +92,35 @@ cargo build -p trusted-server-cli --target "$HOST_TRIPLE" >/dev/null
 WASM="$REPO_ROOT/target/wasm32-wasip1/debug/trusted-server-adapter-fastly.wasm"
 TS="$REPO_ROOT/target/$HOST_TRIPLE/debug/ts"
 
-info "Starting stub origin on :$ORIGIN_PORT"
+info "Generating a local CA and HTTPS bid certificate"
+openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
+  -subj "/CN=Trusted Server local harness CA" \
+  -keyout "$WORK/ca-key.pem" -out "$WORK/ca-cert.pem" >/dev/null 2>&1
+openssl req -newkey rsa:2048 -sha256 -nodes -subj "/CN=localhost" \
+  -keyout "$WORK/server-key.pem" -out "$WORK/server.csr" >/dev/null 2>&1
+cat > "$WORK/server.ext" <<'EOF'
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:localhost,IP:127.0.0.1
+EOF
+openssl x509 -req -sha256 -days 1 -in "$WORK/server.csr" \
+  -CA "$WORK/ca-cert.pem" -CAkey "$WORK/ca-key.pem" -CAcreateserial \
+  -extfile "$WORK/server.ext" -out "$WORK/server-cert.pem" >/dev/null 2>&1
+
+info "Starting stub origin on :$ORIGIN_PORT and HTTPS bidder on :$BID_PORT"
 cat > "$WORK/origin.py" <<PYEOF
-"""Stub publisher origin: one shareable page, plus a deliberately slow bid endpoint.
+"""Stub publisher origin and deliberately slow HTTPS bid endpoint.
 
 The page uses the real Fastly policy that exposed #1009's response-side bypass: no
 Set-Cookie, a public Cache-Control, Surrogate-Control with stale windows, and a Vary the
 cache key covers. A bypass therefore means a real bug rather than a fixture problem.
 
 The bid endpoint returns a real winning bid. It used to return an empty seatbid, which made
-every assertion below measure a page with no ads on it — and that is how a seam that
-silently discarded every non-empty bid map passed this harness for weeks.
+every assertion below measure a page with no ads on it. That is how a seam that silently
+discarded every non-empty bid map passed this harness for weeks.
 """
-import gzip, json, time
+import gzip, json, ssl, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # The impid must be the configured slot id: that is what the auction request sends and
@@ -168,28 +198,87 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print("origin: " + fmt % args, flush=True)
 
-ThreadingHTTPServer(("127.0.0.1", $ORIGIN_PORT), H).serve_forever()
+
+class BidH(H):
+    def do_GET(self):
+        print(f"bidder: received health check {self.path}", flush=True)
+        self._send(b"ok", "text/plain")
+
+
+origin = ThreadingHTTPServer(("127.0.0.1", $ORIGIN_PORT), H)
+threading.Thread(target=origin.serve_forever, daemon=True).start()
+
+bidder = ThreadingHTTPServer(("127.0.0.1", $BID_PORT), BidH)
+tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+tls.load_cert_chain("$WORK/server-cert.pem", "$WORK/server-key.pem")
+bidder.socket = tls.wrap_socket(bidder.socket, server_side=True)
+bidder.serve_forever()
 PYEOF
 python3 "$WORK/origin.py" > "$WORK/origin.log" 2>&1 &
 ORIGIN_PID=$!
 sleep 1
 
 info "Generating stub config (mode: $MODE)"
-python3 - "$REPO_ROOT/trusted-server.example.toml" "$WORK/app.toml" "$MODE" "$ORIGIN_PORT" <<'PYEOF'
+python3 - "$REPO_ROOT/trusted-server.example.toml" "$WORK/app.toml" "$MODE" \
+  "$ORIGIN_PORT" "$BID_PORT" <<'PYEOF'
 import sys
-src, out, mode, port = sys.argv[1:5]
+
+src, out, mode, origin_port, bid_port = sys.argv[1:6]
 s = open(src).read()
 
-s = s.replace('origin_url = "https://origin.example.com"', f'origin_url = "http://127.0.0.1:{port}"', 1)
-# A real auction, pointed at the stub's slow endpoint, so the timings mean something.
-s = s.replace('[integrations.prebid]\nenabled = false\nserver_url = "https://prebid.example.com/openrtb2/auction"',
-              f'[integrations.prebid]\nenabled = true\nserver_url = "http://127.0.0.1:{port}/bid"\n'
-              'external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-stub.js"', 1)
-s = s.replace('providers = []', 'providers = ["prebid"]', 1)
-s = s.replace('\n[proxy]\n', '\n[proxy]\nallowed_domains = ["assets.example.com", "127.0.0.1"]\n', 1)
-s = s.replace('[auction]\nenabled = false', '[auction]\nenabled = true', 1)
-s = s.replace('auction_timeout_ms = 500', 'auction_timeout_ms = 3000', 1)
-s = s.replace('timeout_ms = 2000', 'timeout_ms = 3000', 1)
+
+def replace_once(content, old, new, description):
+    if content.count(old) != 1:
+        raise SystemExit(f"expected one {description} replacement target")
+    return content.replace(old, new, 1)
+
+
+s = replace_once(
+    s,
+    'origin_url = "https://origin.example.com"',
+    f'origin_url = "http://127.0.0.1:{origin_port}"',
+    "publisher origin",
+)
+# A real auction points at the slow HTTPS stub so the timings mean something.
+s = replace_once(
+    s,
+    '[integrations.prebid]\nenabled = false',
+    '[integrations.prebid]\nenabled = true\n'
+    'external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-stub.js"',
+    "Prebid integration",
+)
+s = replace_once(
+    s,
+    'endpoint = "https://prebid.example.com/openrtb2/auction"',
+    f'endpoint = "https://localhost:{bid_port}/bid"\ntimeout_ms = 5000',
+    "Prebid provider endpoint",
+)
+s = replace_once(
+    s,
+    '\n[proxy]\n',
+    '\n[proxy]\nallowed_domains = ["assets.example.com", "127.0.0.1"]\n',
+    "proxy table",
+)
+s = replace_once(
+    s,
+    '[auction]\n# Keep disabled until provider endpoints, routes, and profile values below are\n'
+    '# replaced with deployment-specific settings.\nenabled = false',
+    '[auction]\n# Keep disabled until provider endpoints, routes, and profile values below are\n'
+    '# replaced with deployment-specific settings.\nenabled = true',
+    "auction enablement",
+)
+s = replace_once(
+    s,
+    'sanitize_creatives = false\ntimeout_ms = 2000',
+    'sanitize_creatives = false\ntimeout_ms = 10000',
+    "auction timeout",
+)
+s = replace_once(
+    s,
+    'auction_timeout_ms = 500  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS',
+    'auction_timeout_ms = 10000  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS',
+    "creative opportunity auction timeout",
+)
 
 # The template-cache keys go directly under the table header. The slot is a table of its own
 # and must go at the end: inserted here it would swallow every scalar key that
@@ -219,6 +308,51 @@ info "Seeding an isolated config store (tracked fastly.toml remains untouched)"
 # pointed at this checkout without copying the workspace.
 cp "$REPO_ROOT/edgezero.toml" "$WORK/edgezero.toml"
 cp "$REPO_ROOT/fastly.toml" "$WORK/fastly.toml"
+
+# The application registers provider backends dynamically. Pre-register the exact
+# deterministic name so Viceroy reuses a local backend that trusts the temporary CA.
+python3 - "$WORK/fastly.toml" "$WORK/ca-cert.pem" "$BID_PORT" <<'PYEOF'
+import hashlib
+import json
+import sys
+
+manifest, ca_certificate, port = sys.argv[1:4]
+provider_id = "pbs-main"
+timeout_ms = "5000"
+
+
+def field(value):
+    return f"{len(value)}:{value}"
+
+
+canonical = "".join([
+    field("https"),
+    field("localhost"),
+    field(port),
+    field("1"),
+    "n",
+    "s",
+    field(provider_id),
+    field(timeout_ms),
+    field(timeout_ms),
+])
+digest = hashlib.sha256(canonical.encode()).hexdigest()[:32]
+readable = f"https_localhost_{port}_p_{provider_id}_fb{timeout_ms}_bb{timeout_ms}"
+backend_name = f"backend_{readable}_{digest}"
+backend = f'''[local_server.backends.{backend_name}]
+url = "https://localhost:{port}"
+cert_host = "localhost"
+ca_certificate.file = {json.dumps(ca_certificate)}
+'''
+
+content = open(manifest).read()
+marker = "[local_server.backends]\n\n"
+if content.count(marker) != 1:
+    raise SystemExit("expected one local backend insertion target")
+content = content.replace(marker, f"{marker}{backend}\n", 1)
+open(manifest, "w").write(content)
+PYEOF
+
 python3 - "$WORK/fastly.toml" <<'PYEOF'
 import sys
 
@@ -237,6 +371,7 @@ key = "handler_password"
 data = "fictional-local-handler-password-secret-value"
 ''')
 PYEOF
+
 ln -s "$REPO_ROOT/crates" "$WORK/crates"
 (cd "$WORK" && "$TS" config push --adapter fastly --local \
   --manifest "$WORK/edgezero.toml" --app-config "$WORK/app.toml" \
@@ -263,7 +398,7 @@ fi
 
 req() { # req <output-file> [extra curl args...]
   local out="$1"; shift
-  curl -sS -D "$out.headers" -o "$out" \
+  curl -sS --max-time "$REQUEST_TIMEOUT_SECONDS" -D "$out.headers" -o "$out" \
     -w '%{time_starttransfer} %{time_total} %{http_code}' \
     -H "Host: ts.example.com" \
     -H "Accept-Encoding: gzip" \
@@ -333,18 +468,20 @@ assembly_state() {
 # Shared by the ESI assertions below.
 check_hit_is_private() {
   local hdrs
-  hdrs=$(curl -s -D- -o /dev/null -H "Host: ts.example.com" \
+  hdrs=$(curl -sS --max-time "$REQUEST_TIMEOUT_SECONDS" -D- -o /dev/null \
+    -H "Host: ts.example.com" \
     -H "Accept-Encoding: gzip" \
     -H "sec-fetch-dest: document" -H "sec-fetch-mode: navigate" \
     "http://127.0.0.1:$TS_PORT/article")
   check "cache hit is not shared-cacheable" \
-    "$(echo "$hdrs" | grep -ci 'cache-control: private, no-store' || true)" "1"
+    "$(echo "$hdrs" | grep -ci 'cache-control: no-store, private' || true)" "1"
 }
 
 check_post_reaches_origin() {
   local before
   before=$(grep -cF "origin: received POST /article" "$WORK/origin.log" || true)
-  curl -s -o /dev/null -X POST -d 'x=1' -H "Host: ts.example.com" \
+  curl -sS --max-time "$REQUEST_TIMEOUT_SECONDS" -o /dev/null \
+    -X POST -d 'x=1' -H "Host: ts.example.com" \
     -H "Accept-Encoding: gzip" \
     "http://127.0.0.1:$TS_PORT/article"
   check "a POST still reaches the origin" \
@@ -530,16 +667,17 @@ first chunk looks identical to one that does not.
 import socket, sys, time
 
 host, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-extra = sys.argv[4] if len(sys.argv) > 4 else ""
+timeout = float(sys.argv[4])
 
 req = (
     f"GET {path} HTTP/1.1\r\nHost: ts.example.com\r\n"
     "sec-fetch-dest: document\r\nsec-fetch-mode: navigate\r\n"
     "accept-encoding: gzip\r\n"
-    f"{extra}Connection: close\r\n\r\n"
+    "Connection: close\r\n\r\n"
 ).encode()
 
-s = socket.create_connection((host, port))
+s = socket.create_connection((host, port), timeout=timeout)
+s.settimeout(timeout)
 t0 = time.time()
 s.sendall(req)
 
@@ -576,7 +714,9 @@ cat <<'EOF'
   one that does not.
 EOF
 echo
-probe_body_ms() { python3 "$WORK/probe.py" 127.0.0.1 "$TS_PORT" /article; }
+probe_body_ms() {
+  python3 "$WORK/probe.py" 127.0.0.1 "$TS_PORT" /article "$REQUEST_TIMEOUT_SECONDS"
+}
 echo "  request A: $(probe_body_ms)"
 B_LINE="$(probe_body_ms)"
 echo "  request B: $B_LINE"

@@ -458,6 +458,65 @@ fn pbs_routed_overrides_are_ordered_and_stored_request_is_trusted_fallback() {
 }
 
 #[test]
+fn pbs_pairs_each_impression_with_its_routed_slot_params() {
+    let mut raw = config("prebid-server", json!({}));
+    raw.providers
+        .get_mut(&ProviderId::from_str("fictional-provider").expect("should parse provider"))
+        .expect("should find provider")
+        .routing = RoutingMode::Explicit;
+    raw.bidders.insert(
+        crate::auction::plan::BidderId::from_str("exampleBidder").expect("should parse bidder"),
+        BidderRouteConfig {
+            provider: ProviderId::from_str("fictional-provider").expect("should parse provider"),
+        },
+    );
+    let plan = AuctionPlan::compile(raw).expect("should compile PBS plan");
+    let mut request = canonical_parity_auction_request();
+    request.slots[0].id = "first-slot".to_string();
+    request.slots[0].bidders = HashMap::from([(
+        "trustedServer".to_string(),
+        json!({"bidderParams":{"exampleBidder":{"placement":"first"}}}),
+    )]);
+    let mut second_slot = request.slots[0].clone();
+    second_slot.id = "second-slot".to_string();
+    second_slot.bidders = HashMap::from([(
+        "trustedServer".to_string(),
+        json!({"bidderParams":{"exampleBidder":{"placement":"second"}}}),
+    )]);
+    request.slots.push(second_slot);
+    let inbound = Request::builder()
+        .uri("https://publisher.example/auction")
+        .body(EdgeBody::empty())
+        .expect("should build inbound request");
+    let routed = route_auction(request, &inbound, &plan, None);
+
+    let built = match build_request(
+        &routed.inputs()[0],
+        &routed,
+        &plan.providers()[0],
+        321,
+        &finalization(None),
+    )
+    .expect("should build request")
+    {
+        OpenRtbBuildOutcome::Ready(request) => request,
+        OpenRtbBuildOutcome::NoImpressions => panic!("should retain impressions"),
+    };
+    let value = serde_json::to_value(built).expect("should serialize request");
+
+    assert_eq!(value["imp"][0]["id"], "first-slot");
+    assert_eq!(
+        value["imp"][0]["ext"]["prebid"]["bidder"]["exampleBidder"],
+        json!({"placement":"first"})
+    );
+    assert_eq!(value["imp"][1]["id"], "second-slot");
+    assert_eq!(
+        value["imp"][1]["ext"]["prebid"]["bidder"]["exampleBidder"],
+        json!({"placement":"second"})
+    );
+}
+
+#[test]
 fn pbs_empty_params_without_matching_override_fall_back_to_stored_request() {
     let mut raw = config("prebid-server", json!({}));
     raw.providers

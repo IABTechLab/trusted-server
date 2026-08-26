@@ -1634,6 +1634,33 @@ a missing leaf is silently ignored.
 
 ### Provider map
 
+::: danger Breaking migration from the provider list
+The former `[auction].providers = ["prebid", ...]` list and server-owned fields
+under `[integrations.prebid]` and `[integrations.aps]` are no longer accepted,
+even when an integration is disabled. Replace them with provider instances and
+bidder routes before deployment.
+
+For Prebid Server, move `server_url` to provider `endpoint`, server timeout to
+provider `timeout_ms`, request controls and bidder-parameter overrides to the
+`prebid-server` `profile_config`, notification suppression to `notifications`,
+and each server bidder to `[auction.bidders.<id>]`. Browser timeout, debug,
+bundle, script interception, refresh exclusions, and `client_side_bidders`
+remain under `[integrations.prebid]`. Configure timeout or debug under both
+owners when both browser and server behavior should retain the old value.
+
+For APS, move endpoint and timeout to the provider, then move account,
+inventory, debug, and creative controls to the `aps` `profile_config`.
+
+Only bidder codes listed in `[auction.bidders]` are folded into Trusted Server
+requests. Unlisted publisher bids remain native browser demand. All provider
+endpoints must be absolute HTTPS URLs.
+
+The old and new blobs are mutually incompatible. Activate the new binary and
+map-shaped config together. A binary-first or config-first rolling deployment
+will put one version on a schema it rejects. Roll back by restoring the old
+binary and old-schema blob together.
+:::
+
 Each table name is the provider ID used for configuration, backend correlation,
 health, response metadata, and telemetry. Provider IDs must match
 `^[a-z][a-z0-9-]{0,62}$`. Multiple instances may select the same profile and
