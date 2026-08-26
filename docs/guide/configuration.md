@@ -52,8 +52,8 @@ publisher, EC, handler, Tinybird, DataDome, and S3 credential fields:
 
 - `publisher.proxy_secret`
 - `ec.passphrase`
-- `ec.partners[*].api_token`
-- `ec.partners[*].ts_pull_token`, when used
+- `ec.partners[*].api_token`, when inbound identify or batch sync is used
+- `ec.partners[*].ts_pull_token`, when pull sync is enabled
 - `handlers[*].password`
 - `tinybird.auction_token_secret`, when Tinybird auction telemetry is enabled
 - `integrations.datadome.server_side_key_secret_name`, when protection is enabled
@@ -486,6 +486,11 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
 :::
 
+`api_token` is optional. Set it to a key in `trusted_server_secrets` only when
+the partner calls the inbound identify or batch-sync APIs. A partner without
+`api_token` remains available for source-domain lookup, bidstream EIDs, and
+outbound pull sync, but cannot authenticate to those inbound APIs.
+
 **Example**:
 
 ```toml
@@ -496,9 +501,9 @@ ec_store = "ec_identity_store"
 [[ec.partners]]
 name = "Mocktioneer SSP"
 source_domain = "mocktioneer.example"
-api_token = "partner_api_token"
 bidstream_enabled = true
-# ts_pull_token = "partner_ts_pull_token"  # only when pull sync is enabled
+# api_token = "partner_api_token"  # only for inbound identify or batch sync
+# ts_pull_token = "partner_ts_pull_token"  # required when pull sync is enabled
 ```
 
 **Environment Override**:

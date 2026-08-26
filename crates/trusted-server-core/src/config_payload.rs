@@ -380,8 +380,12 @@ mod tests {
         );
         assert!(auth.secret_store.is_none());
         assert_eq!(
-            reconstructed.ec.partners[0].api_token.expose(),
-            "resolved-partner-api-token-32-bytes-ok"
+            reconstructed.ec.partners[0]
+                .api_token
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-partner-api-token-32-bytes-ok")
         );
         assert_eq!(
             reconstructed.ec.partners[0]
@@ -420,6 +424,30 @@ mod tests {
         assert_eq!(
             auth.secret_access_key.expose(),
             "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+        );
+    }
+
+    #[test]
+    fn partner_without_api_token_loads_without_secret_resolution() {
+        let mut original = test_settings();
+        let partner = serde_json::from_value(serde_json::json!({
+            "name": "Example Partner",
+            "source_domain": "partner.example.com",
+            "bidstream_enabled": true,
+        }))
+        .expect("should build partner without API token");
+        original.ec.partners.push(partner);
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should load partner without resolving an API token");
+
+        assert!(
+            reconstructed.ec.partners[0].api_token.is_none(),
+            "should preserve omitted API token"
         );
     }
 

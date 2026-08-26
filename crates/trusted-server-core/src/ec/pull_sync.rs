@@ -467,7 +467,7 @@ mod tests {
     fn pull_partner(ttl_sec: u64) -> PartnerConfig {
         PartnerConfig {
             name: "SSP X".to_owned(),
-            api_key_hash: "deadbeef".to_owned(),
+            api_key_hash: Some("deadbeef".to_owned()),
             bidstream_enabled: true,
             source_domain: "ssp.example.com".to_owned(),
             openrtb_atype: 3,
