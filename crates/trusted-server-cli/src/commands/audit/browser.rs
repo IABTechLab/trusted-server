@@ -19,6 +19,7 @@ use crate::ad_templates::compare::BrowserAdEvidence;
 use crate::ad_templates::output::Warning;
 use crate::commands::audit::collector::{
     AuditCollector, BrowserCollectRequest, BrowserOpts, BrowserProfile, CollectedPage,
+    PAGE_SETTLE_MAX_MS, PAGE_SETTLE_QUIET_MS,
 };
 
 /// Candidate Chrome/Chromium executable names searched on `PATH`.
@@ -50,10 +51,6 @@ const MAX_EVIDENCE_ENTRIES: usize = 128;
 const MAX_EVIDENCE_PAYLOAD_BYTES: usize = 1024 * 1024;
 /// Hard cap on browser teardown so a wedged Chrome cannot hang the audit.
 const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Default quiet window (no new resources) marking the page settled.
-const DEFAULT_SETTLE_QUIET_MS: u64 = 750;
-/// Default hard cap on settling so slow/ad-heavy pages still terminate.
-const DEFAULT_SETTLE_MAX_MS: u64 = 10_000;
 
 /// Page-settle timing thresholds.
 #[derive(Debug, Clone, Copy)]
@@ -109,8 +106,8 @@ impl BrowserCollector {
     pub fn new() -> Self {
         Self {
             chrome: None,
-            settle_quiet: Duration::from_millis(DEFAULT_SETTLE_QUIET_MS),
-            settle_max: Duration::from_millis(DEFAULT_SETTLE_MAX_MS),
+            settle_quiet: Duration::from_millis(PAGE_SETTLE_QUIET_MS),
+            settle_max: Duration::from_millis(PAGE_SETTLE_MAX_MS),
             accept_invalid_certs: false,
             headful: false,
             assume_consent: true,
@@ -934,11 +931,16 @@ mod tests {
 
     #[test]
     fn rust_and_javascript_evidence_entry_caps_match() {
-        let expected_declaration = format!("const __ts_max_entries = {MAX_EVIDENCE_ENTRIES}");
-        assert!(
-            AD_TEMPLATE_COLLECTOR_JS
-                .lines()
-                .any(|line| line.trim() == expected_declaration),
+        // Parse the declared value rather than matching the whole line, so JS
+        // punctuation or spacing cannot false-alarm on a still-correct cap.
+        let declared = AD_TEMPLATE_COLLECTOR_JS
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("const __ts_max_entries ="))
+            .and_then(|value| value.trim().trim_end_matches(';').parse::<usize>().ok())
+            .expect("should declare __ts_max_entries in the collector script");
+
+        assert_eq!(
+            declared, MAX_EVIDENCE_ENTRIES,
             "should keep the JS cap equal to MAX_EVIDENCE_ENTRIES"
         );
     }

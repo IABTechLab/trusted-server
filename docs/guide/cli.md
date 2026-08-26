@@ -285,8 +285,8 @@ ts audit ad-templates generate https://publisher.example/ --max-sections 20 --ma
 # Audit exactly one page, as earlier releases did.
 ts audit ad-templates generate https://publisher.example/ --max-pages 1
 
-# Set the patterns yourself; this disables pattern inference entirely unless a
-# slot's template had to borrow section_root from another slot.
+# Set the patterns yourself; this disables pattern inference entirely, and the
+# run fails outright if any slot's template had to borrow section_root.
 ts audit ad-templates generate https://publisher.example/ \
   --page-pattern '/' --page-pattern '/news' --page-pattern '/news/*'
 
@@ -302,7 +302,7 @@ instead, which also discards any template you wrote by hand.
 A slot that never appeared without a section segment can borrow a
 `section_root` witnessed by another slot only while its patterns are derived
 from the paths where it was observed. If `--page-pattern` would override those
-patterns, generation fails and names the affected slots; remove the explicit
+patterns, generation fails and names the affected div ids; remove the explicit
 patterns so the safe per-slot patterns can be derived.
 
 A merge refuses to change the section policy that preserved `{section}` slots

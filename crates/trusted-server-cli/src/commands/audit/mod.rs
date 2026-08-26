@@ -16,7 +16,7 @@ use clap::{Args, Subcommand};
 use crate::app_config::AppConfigArgs;
 use crate::commands::audit::collector::{BrowserOpts, GenerateBrowserOpts};
 use crate::commands::audit::page::PageAuditArgs;
-use crate::error::{CliResult, cli_error, report_error};
+use crate::error::{CliResult, cli_error};
 use crate::run::RunOutcome;
 
 /// Parses and validates an `http`/`https` URL, rejecting all other schemes.
@@ -59,7 +59,13 @@ pub(crate) struct AuditArgs {
     #[command(subcommand)]
     pub(crate) command: Option<AuditSubcommand>,
     /// Hidden compatibility alias: `ts audit <url>` behaves like `ts audit generate <url>`.
-    #[arg(value_parser = parse_http_url, hide = true)]
+    ///
+    /// The hidden flags below all `requires` this positional, so putting one
+    /// before a subcommand (`ts audit --chrome X generate <url>`) is rejected
+    /// rather than silently dropped. `value_name` keeps that rejection from
+    /// naming the field: an operator told to supply `<LEGACY_URL>` cannot find
+    /// it in `--help`, because the alias is deliberately undocumented.
+    #[arg(value_parser = parse_http_url, hide = true, value_name = "URL")]
     pub(crate) legacy_url: Option<url::Url>,
     #[command(flatten)]
     pub(crate) legacy_generate: LegacyGenerateArgs,
@@ -233,6 +239,7 @@ pub(crate) struct AuditAdTemplatesGenerateArgs {
     /// empties the rest of the run.
     #[arg(long, default_value_t = 750)]
     pub page_delay_ms: u64,
+    /// Browser and consent options shared with `ts audit generate`.
     #[command(flatten)]
     pub browser: GenerateBrowserOpts,
 }
@@ -320,7 +327,7 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
             let raw_config = std::fs::read_to_string(&app_config_path).map_err(|error| {
                 format!("failed to read {}: {error}", app_config_path.display())
             })?;
-            let existing_creative = creative_config(&raw_config)?;
+            let existing_creative = creative_config(&raw_config, &app_config_path)?;
             let profiles = gen_args.profiles()?;
             let collectors: Vec<generate::browser_collector::BrowserAuditCollector> = profiles
                 .iter()
@@ -409,12 +416,17 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
 /// present but cannot be deserialized.
 fn creative_config(
     document: &str,
+    path: &std::path::Path,
 ) -> CliResult<Option<trusted_server_core::creative_opportunities::CreativeOpportunitiesConfig>> {
+    // Plain `format!`, not `report_error`: the top-level `[ts]` printer already
+    // logs whatever is returned here, and this message embeds a multi-line
+    // `toml::de::Error`, so logging it here too would print the whole block
+    // twice. The guidance leads so the parse error can trail unbroken.
     let value = toml::from_str::<toml::Value>(document).map_err(|error| {
-        report_error(format!(
-            "failed to parse the existing config before generating slots: {error}. Fix the \
-             TOML syntax and re-run"
-        ))
+        format!(
+            "failed to parse {} before generating slots; fix the TOML syntax and re-run:\n{error}",
+            path.display()
+        )
     })?;
     let Some(section) = value.get("creative_opportunities").cloned() else {
         return Ok(None);
@@ -468,7 +480,7 @@ mod tests {
         let document = "unknown_runtime_key = true\n\
             [creative_opportunities]\ngam_network_id = \"123\"\n";
 
-        let creative = creative_config(document)
+        let creative = creative_config(document, std::path::Path::new("trusted-server.toml"))
             .expect("an unrelated invalid setting must not hide creative config")
             .expect("the section is present");
 
@@ -477,8 +489,11 @@ mod tests {
 
     #[test]
     fn absent_section_reads_as_absent() {
-        let creative =
-            creative_config("[auction]\nenabled = true\n").expect("should read the document");
+        let creative = creative_config(
+            "[auction]\nenabled = true\n",
+            std::path::Path::new("trusted-server.toml"),
+        )
+        .expect("should read the document");
 
         assert!(
             creative.is_none(),
@@ -488,12 +503,19 @@ mod tests {
 
     #[test]
     fn malformed_document_is_rejected_before_creative_config_extraction() {
-        let error = creative_config("[creative_opportunities\ngam_network_id = \"123\"\n")
-            .expect_err("should reject malformed TOML");
+        let error = creative_config(
+            "[creative_opportunities\ngam_network_id = \"123\"\n",
+            std::path::Path::new("/tmp/example/trusted-server.toml"),
+        )
+        .expect_err("should reject malformed TOML");
 
         assert!(
-            format!("{error:?}").contains("failed to parse the existing config"),
-            "error should identify the document parse failure, got {error:?}"
+            error.contains("failed to parse /tmp/example/trusted-server.toml"),
+            "error should name the config file it could not parse, got {error}"
+        );
+        assert!(
+            error.contains("fix the TOML syntax and re-run:\n"),
+            "the guidance should lead so the multi-line parse error trails it, got {error}"
         );
     }
 
@@ -511,7 +533,8 @@ mod tests {
             page_patterns = [\"/\"]\n\
             formats = [{ width = 728, height = 90 }]\n";
 
-        let error = creative_config(document).expect_err("should refuse an unreadable section");
+        let error = creative_config(document, std::path::Path::new("trusted-server.toml"))
+            .expect_err("should refuse an unreadable section");
 
         assert!(
             error.contains("would discard the configured ones"),

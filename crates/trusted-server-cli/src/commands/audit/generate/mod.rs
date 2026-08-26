@@ -585,6 +585,18 @@ pub(crate) fn run_update_slots(
                 match collected {
                     Ok(page) => {
                         let final_url = page.final_url().unwrap_or_else(|_| url.clone());
+                        // The requested origin is the trust boundary for every
+                        // page, not just the root: a section page that redirects
+                        // away would otherwise contribute foreign slots, formats
+                        // and ad-unit paths to the generated config.
+                        if origin_changed(&target_url, &final_url) {
+                            notes.push(format!(
+                                "skipped `{}` on {first_label}: it left the audited origin for {}",
+                                url.path(),
+                                final_url.origin().ascii_serialization()
+                            ));
+                            return Ok(collector::ControlFlow::Continue);
+                        }
                         if let Err(error) =
                             fold_collected(
                                 &mut table,
@@ -1035,8 +1047,20 @@ fn crawl_sections(
             &mut |url, collected| {
                 match collected {
                     Ok(page) => {
-                        successful_pages += 1;
                         let final_url = page.final_url().unwrap_or_else(|_| url.clone());
+                        // Same boundary as the first profile, and it covers this
+                        // profile's root page too: a cross-origin redirect is not
+                        // a page this run may learn inventory from, so it must
+                        // not count towards profile coverage either.
+                        if origin_changed(root_url, &final_url) {
+                            notes.push(format!(
+                                "skipped `{}` on {profile_label}: it left the audited origin for {}",
+                                url.path(),
+                                final_url.origin().ascii_serialization()
+                            ));
+                            return Ok(collector::ControlFlow::Continue);
+                        }
+                        successful_pages += 1;
                         if let Err(error) =
                             fold_collected(table, &final_url, &page, profile_label, notes)
                         {
@@ -1151,6 +1175,9 @@ fn build_render_slots(
     let explicit = !request.page_patterns.is_empty();
     if explicit {
         validate_page_patterns(request.page_patterns)?;
+        // Not filtered against `skip`: a borrowed root implies the slot's
+        // ad-unit path varied across pages, and `fragmented_slots` only groups
+        // slots pinned to exactly one unit path, so the two sets are disjoint.
         if let Some(outcome) = inference
             && !outcome.borrowed_section_root.is_empty()
         {
@@ -1161,9 +1188,9 @@ fn build_render_slots(
                 .collect::<Vec<_>>()
                 .join(", ");
             return cli_error(format!(
-                "cannot apply --page-pattern to slot(s) {affected} because their {{section}} \
-                 templates borrow section_root; remove --page-pattern so patterns can be \
-                 derived from the paths where each slot was observed"
+                "cannot apply --page-pattern to slot(s) with div id(s) {affected} because their \
+                 {{section}} templates borrow section_root; remove --page-pattern so patterns \
+                 can be derived from the paths where each slot was observed"
             ));
         }
     }
@@ -2237,6 +2264,156 @@ mod tests {
             fs::read_to_string(&config_path).expect("should read config"),
             original,
             "foreign evidence must not rewrite the config"
+        );
+    }
+
+    #[test]
+    fn update_slots_skips_a_section_page_that_redirects_off_origin() {
+        // Only the root navigation was origin-checked before planning. A section
+        // page that redirects away must not contribute its slots, unit paths or
+        // page patterns to the generated config either.
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        fs::write(
+            &config_path,
+            "[creative_opportunities]\ngam_network_id = \"123456789\"\n",
+        )
+        .expect("should write config");
+        let nav = ["/news"];
+        let mut root_page = site_page(
+            "https://publisher.example/",
+            "/123456789/site/homepage",
+            &nav,
+        );
+        root_page.gpt_slots[0].div_id = "ad-root".to_string();
+        let mut redirected = site_page(
+            "https://publisher.example/news",
+            "/999888777/foreign/news",
+            &nav,
+        );
+        redirected.final_url = "https://foreign.example/news".to_string();
+        redirected.gpt_slots[0].div_id = "ad-foreign".to_string();
+        let collector = SiteCollector::new(vec![
+            ("https://publisher.example/", root_page),
+            ("https://publisher.example/news", redirected),
+        ]);
+        let mut err = Vec::new();
+
+        run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &collector)],
+            &mut std::io::sink(),
+            &mut err,
+        )
+        .expect("should generate from the same-origin evidence alone");
+
+        let written = fs::read_to_string(&config_path).expect("should read config");
+        assert!(
+            written.contains("ad-root"),
+            "same-origin evidence should still be written, got:\n{written}"
+        );
+        assert!(
+            !written.contains("ad-foreign") && !written.contains("999888777"),
+            "the redirect destination must not reach the config, got:\n{written}"
+        );
+        let progress = String::from_utf8_lossy(&err);
+        assert!(
+            progress.contains(
+                "skipped `/news` on desktop: it left the audited origin for https://foreign.example"
+            ),
+            "the skipped section page should be reported, got:\n{progress}"
+        );
+    }
+
+    #[test]
+    fn update_slots_skips_a_later_profile_root_that_redirects_off_origin() {
+        // The later profiles re-walk the plan without a fresh root origin check.
+        // A mobile root that redirects away carries a foreign ad unit for the
+        // same div the desktop profile saw; folding it would both write foreign
+        // inventory and fake a device disagreement on the real slot.
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        fs::write(
+            &config_path,
+            "[creative_opportunities]\ngam_network_id = \"123456789\"\n",
+        )
+        .expect("should write config");
+        let nav = ["/news"];
+        let section_page = |unit_path: &str| {
+            let mut page = site_page("https://publisher.example/news", unit_path, &nav);
+            page.gpt_slots[0].div_id = "ad-news".to_string();
+            page
+        };
+        let mut desktop_root = site_page(
+            "https://publisher.example/",
+            "/123456789/site/homepage",
+            &nav,
+        );
+        desktop_root.gpt_slots[0].div_id = "ad-root".to_string();
+        let mut mobile_root = site_page(
+            "https://publisher.example/",
+            "/999888777/foreign/homepage",
+            &nav,
+        );
+        mobile_root.gpt_slots[0].div_id = "ad-root".to_string();
+        mobile_root.final_url = "https://foreign.example/".to_string();
+        let desktop = SiteCollector::new(vec![
+            ("https://publisher.example/", desktop_root),
+            (
+                "https://publisher.example/news",
+                section_page("/123456789/site/news"),
+            ),
+        ]);
+        let mobile = SiteCollector::new(vec![
+            ("https://publisher.example/", mobile_root),
+            (
+                "https://publisher.example/news",
+                section_page("/123456789/site/news"),
+            ),
+        ]);
+        let mut err = Vec::new();
+
+        run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &desktop), ("mobile", &mobile)],
+            &mut std::io::sink(),
+            &mut err,
+        )
+        .expect("the same-origin pages of both profiles agree");
+
+        let written = fs::read_to_string(&config_path).expect("should read config");
+        assert!(
+            written.contains("/123456789/site/homepage"),
+            "the same-origin root unit path should be written, got:\n{written}"
+        );
+        assert!(
+            !written.contains("999888777"),
+            "the redirect destination must not reach the config, got:\n{written}"
+        );
+        let progress = String::from_utf8_lossy(&err);
+        assert!(
+            progress.contains(
+                "skipped `/` on mobile: it left the audited origin for https://foreign.example"
+            ),
+            "the skipped profile root should be reported, got:\n{progress}"
         );
     }
 
