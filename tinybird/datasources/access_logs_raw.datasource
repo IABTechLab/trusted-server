@@ -27,13 +27,17 @@ SCHEMA >
   `template_cache_state` LowCardinality(String) `json:$.template_cache_state`,
   `country` LowCardinality(String) `json:$.country`,
   `ts_version` LowCardinality(String) `json:$.ts_version`,
-  `pop` LowCardinality(String) `json:$.pop`
+  `pop` LowCardinality(String) `json:$.pop`,
+  `auction_dispatched_ms` Nullable(UInt32) `json:$.auction_dispatched_ms`,
+  `auction_resolved_ms` Nullable(UInt32) `json:$.auction_resolved_ms`,
+  `auction_committed_ms` Nullable(UInt32) `json:$.auction_committed_ms`,
+  `auction_id` String `json:$.auction_id`
 
 ENGINE "MergeTree"
 ENGINE_SORTING_KEY "toDate(event_ts), service_id, publisher_domain, env, route_class, pop, status"
 TTL "toDate(event_ts) + INTERVAL 30 DAY"
 
 FORWARD_QUERY >
-  SELECT event_ts, method, status, time_elapsed_ms, sample_rate, service_id, publisher_domain, env, route_class, route_template, body_mode, auction_wait_placement, appbuild_ms, filter_ms, geo_ms, kv_ms, origin_ms, template_cache_ms, auction_wait_ms, stream_ms, request_elapsed_ms, resp_bytes, template_cache_state, country, ts_version, pop
+  SELECT event_ts, method, status, time_elapsed_ms, sample_rate, service_id, publisher_domain, env, route_class, route_template, body_mode, auction_wait_placement, appbuild_ms, filter_ms, geo_ms, kv_ms, origin_ms, template_cache_ms, auction_wait_ms, stream_ms, request_elapsed_ms, resp_bytes, template_cache_state, country, ts_version, pop, CAST(NULL AS Nullable(UInt32)) AS auction_dispatched_ms, CAST(NULL AS Nullable(UInt32)) AS auction_resolved_ms, CAST(NULL AS Nullable(UInt32)) AS auction_committed_ms, 'none' AS auction_id
 
 TOKEN ts_access_ingest APPEND

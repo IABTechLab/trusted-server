@@ -106,6 +106,19 @@ struct Inner {
     /// Response body size in bytes, set via
     /// [`RequestTimings::set_resp_bytes`].
     resp_bytes: Option<u64>,
+    /// Elapsed time at the first
+    /// [`RequestTimings::mark_auction_dispatched`] call.
+    auction_dispatched: Option<Duration>,
+    /// Elapsed time at the first
+    /// [`RequestTimings::mark_auction_resolved`] call.
+    auction_resolved: Option<Duration>,
+    /// Elapsed time at the first
+    /// [`RequestTimings::mark_auction_committed`] call.
+    auction_committed: Option<Duration>,
+    /// Telemetry auction UUID recorded by the first
+    /// [`RequestTimings::mark_auction_dispatched`] call; joins the access
+    /// row to the per-bidder auction dataset.
+    auction_id: Option<String>,
 }
 
 /// Per-request phase timing collector.
@@ -128,6 +141,10 @@ impl RequestTimings {
             request_elapsed: None,
             auction_wait_placement: None,
             resp_bytes: None,
+            auction_dispatched: None,
+            auction_resolved: None,
+            auction_committed: None,
+            auction_id: None,
         })))
     }
 
@@ -200,6 +217,53 @@ impl RequestTimings {
         }
     }
 
+    /// Stamps the elapsed time since `t0` as the auction dispatch offset and
+    /// records the telemetry auction id, the first time this is called.
+    ///
+    /// Called when `dispatch_auction` reports the bid requests dispatched;
+    /// a failed dispatch never records, so all three auction offsets stay
+    /// `None` for it. Subsequent calls are no-ops (first call wins). Drops
+    /// the sample silently on lock contention or poisoning.
+    pub fn mark_auction_dispatched(&self, auction_id: String) {
+        let Ok(mut inner) = self.0.try_lock() else {
+            return;
+        };
+        if inner.auction_dispatched.is_none() {
+            inner.auction_dispatched = Some(inner.t0.elapsed());
+            inner.auction_id = Some(auction_id);
+        }
+    }
+
+    /// Stamps the elapsed time since `t0` as the auction resolve offset (the
+    /// final bid returned or the auction timed out), the first time this is
+    /// called.
+    ///
+    /// Subsequent calls are no-ops (first call wins). Drops the sample
+    /// silently on lock contention or poisoning.
+    pub fn mark_auction_resolved(&self) {
+        let Ok(mut inner) = self.0.try_lock() else {
+            return;
+        };
+        if inner.auction_resolved.is_none() {
+            inner.auction_resolved = Some(inner.t0.elapsed());
+        }
+    }
+
+    /// Stamps the elapsed time since `t0` as the auction commit offset
+    /// (winning bids written into page state), the first time this is
+    /// called.
+    ///
+    /// Subsequent calls are no-ops (first call wins). Drops the sample
+    /// silently on lock contention or poisoning.
+    pub fn mark_auction_committed(&self) {
+        let Ok(mut inner) = self.0.try_lock() else {
+            return;
+        };
+        if inner.auction_committed.is_none() {
+            inner.auction_committed = Some(inner.t0.elapsed());
+        }
+    }
+
     /// Records the response body size in bytes.
     ///
     /// Drops the sample silently on lock contention or poisoning.
@@ -257,6 +321,10 @@ impl RequestTimings {
             stream_ms: duration_ms(inner.phases[Phase::Stream.index()]),
             auction_wait_placement: inner.auction_wait_placement,
             resp_bytes: inner.resp_bytes,
+            auction_dispatched_ms: duration_ms(inner.auction_dispatched),
+            auction_resolved_ms: duration_ms(inner.auction_resolved),
+            auction_committed_ms: duration_ms(inner.auction_committed),
+            auction_id: inner.auction_id.clone(),
         }
     }
 }
@@ -379,6 +447,18 @@ pub struct TimingSnapshot {
     /// Response body size in bytes, set via
     /// [`RequestTimings::set_resp_bytes`].
     pub resp_bytes: Option<u64>,
+    /// T0 offset at which the auction dispatched (bid requests left the
+    /// edge), or `None` when no auction ran.
+    pub auction_dispatched_ms: Option<u32>,
+    /// T0 offset at which the auction resolved (final bid or timeout), or
+    /// `None` when no auction ran.
+    pub auction_resolved_ms: Option<u32>,
+    /// T0 offset at which winning bids were committed into page state, or
+    /// `None` when no auction ran.
+    pub auction_committed_ms: Option<u32>,
+    /// Telemetry auction UUID joining this row to the auction dataset, or
+    /// `None` when no auction ran.
+    pub auction_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -416,6 +496,60 @@ mod tests {
         assert!(
             seen.iter().all(|slot| *slot),
             "should cover every phases-array slot"
+        );
+    }
+
+    #[test]
+    fn auction_marks_are_first_call_wins_and_snapshot_maps_them() {
+        let timings = RequestTimings::new();
+        timings.mark_auction_dispatched("11111111-1111-1111-1111-111111111111".to_owned());
+        timings.mark_auction_resolved();
+        timings.mark_auction_committed();
+        // Second calls must not overwrite the first-recorded values.
+        timings.mark_auction_dispatched("22222222-2222-2222-2222-222222222222".to_owned());
+        timings.mark_auction_resolved();
+        timings.mark_auction_committed();
+
+        let snapshot = timings.snapshot();
+        assert!(
+            snapshot.auction_dispatched_ms.is_some(),
+            "should record the dispatch offset"
+        );
+        assert!(
+            snapshot.auction_resolved_ms.is_some(),
+            "should record the resolve offset"
+        );
+        assert!(
+            snapshot.auction_committed_ms.is_some(),
+            "should record the commit offset"
+        );
+        assert_eq!(
+            snapshot.auction_id.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111"),
+            "should keep the first-recorded auction id"
+        );
+    }
+
+    #[test]
+    fn snapshot_without_auction_marks_yields_none_for_all_offsets() {
+        let timings = RequestTimings::new();
+        timings.mark_headers_ready();
+        let snapshot = timings.snapshot();
+        assert_eq!(
+            snapshot.auction_dispatched_ms, None,
+            "should stay None when no auction dispatched"
+        );
+        assert_eq!(
+            snapshot.auction_resolved_ms, None,
+            "should stay None when no auction resolved"
+        );
+        assert_eq!(
+            snapshot.auction_committed_ms, None,
+            "should stay None when no auction committed"
+        );
+        assert_eq!(
+            snapshot.auction_id, None,
+            "should carry no auction id when no auction ran"
         );
     }
 
