@@ -340,8 +340,11 @@ guest-visible cache behavior is already carried by `template_cache_state` and
 `origin_ms`. Rows exist only for guest-handled requests; fronting-cache hits are
 invisible by construction and the dashboard documentation says so.
 
-Sorting key: `(event_date, service_id, publisher_domain, env, route_class, pop,
-status)`. Grafana time filtering uses `$__timeFilter(event_ts)` and every panel query
+Sorting key: `(toDate(event_ts), service_id, publisher_domain, env, route_class,
+pop, status)`. Every column carries a `json:$.<name>` path (the Events API rejects
+NDJSON into a datasource without JSONPaths, discovered live); `event_date` was
+dropped in favor of the sorting-key expression because a DEFAULT column cannot
+carry a JSONPath the producer never sends. Grafana time filtering uses `$__timeFilter(event_ts)` and every panel query
 also carries an `event_date` predicate so the primary index prunes; rollout validates
 the panel queries with `EXPLAIN` before the dashboard is committed. This replaces the
 reserved key `(event_date, path, status, method)`. Rollout step 4 verifies whether the
