@@ -1929,21 +1929,23 @@ proxy_secret = "publisher_proxy_secret"
 ### Secret Management
 
 **Do**:
-✅ Store values in the platform secret store
-✅ Rotate values deliberately and restart/redeploy instances
-✅ Generate values locally without printing them to logs
-✅ Use different values per environment when appropriate
-✅ Keep stable key names for rotation
+
+- ✅ Store values in the platform secret store
+- ✅ Rotate values deliberately and restart/redeploy instances
+- ✅ Generate values locally without printing them to logs
+- ✅ Use different values per environment when appropriate
+- ✅ Keep stable key names for rotation
 
 **Don't**:
-❌ Commit secret values to version control
-❌ Put secret values in environment overlays
-❌ Put secret values in config diff output or app-config blobs
-❌ Treat missing secret-store keys as inline values
-❌ Use default/placeholder values  
-❌ Share secrets across environments  
-❌ Log secret values  
-❌ Expose in error messages
+
+- ❌ Commit secret values to version control
+- ❌ Put secret values in environment overlays
+- ❌ Put secret values in config diff output or app-config blobs
+- ❌ Treat missing secret-store keys as inline values
+- ❌ Use default/placeholder values
+- ❌ Share secrets across environments
+- ❌ Log secret values
+- ❌ Expose in error messages
 
 ### File Organization
 

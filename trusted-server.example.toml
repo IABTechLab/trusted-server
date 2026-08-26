@@ -81,9 +81,6 @@ passphrase = "ec_passphrase"
 ec_store = "ec_identity_store"
 # Max concurrent partner pull-sync requests.
 pull_sync_concurrency = 3
-# Keep this empty when no partners are configured. Replace this line with
-# `[[ec.partners]]` entries when adding partners.
-partners = []
 # Optional cluster-heuristic tuning (defaults shown):
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
