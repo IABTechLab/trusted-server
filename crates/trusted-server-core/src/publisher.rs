@@ -3937,7 +3937,10 @@ async fn collect_non_html_auction(
         .as_ref()
         .and_then(|_| diagnostics_auction_id(settings));
     let placeholder = mediator_placeholder_request();
-    let wait_started = Instant::now();
+    // Qualified: `std::time::Instant::now()` panics on Cloudflare's
+    // `wasm32-unknown-unknown` target; this module's `Instant` import stays
+    // std for the pre-existing template-cache sites.
+    let wait_started = web_time::Instant::now();
     let result = orchestrator
         .collect_dispatched_auction(
             dispatched,
@@ -3999,7 +4002,10 @@ async fn collect_stream_auction(
     log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
     let placeholder = mediator_placeholder_request();
     let collect_ctx = make_collect_context(settings, services, &placeholder);
-    let wait_started = Instant::now();
+    // Qualified: `std::time::Instant::now()` panics on Cloudflare's
+    // `wasm32-unknown-unknown` target; this module's `Instant` import stays
+    // std for the pre-existing template-cache sites.
+    let wait_started = web_time::Instant::now();
     let result = orchestrator
         .collect_dispatched_auction(dispatched, services, &collect_ctx)
         .await;

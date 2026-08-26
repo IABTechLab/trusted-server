@@ -5,9 +5,13 @@
 //! `docs/superpowers/specs/2026-08-24-request-phase-timing-design.md`.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use http::{HeaderName, HeaderValue, Response};
+// `std::time::Instant::now()` panics on `wasm32-unknown-unknown` (the
+// Cloudflare adapter's target); `web_time` re-exports std's `Instant` on
+// every other target.
+use web_time::Instant;
 
 use crate::cache_policy::cache_control_headers_are_private_or_no_store;
 
