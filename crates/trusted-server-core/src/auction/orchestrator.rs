@@ -832,6 +832,47 @@ impl AuctionOrchestrator {
         self.planned_providers.len()
     }
 
+    async fn run_planned_auction(
+        &self,
+        request: &AuctionRequest,
+        context: &AuctionContext<'_>,
+    ) -> Result<OrchestrationResult, Report<TrustedServerError>> {
+        match self.dispatch_auction(request, context).await {
+            DispatchAuctionOutcome::Dispatched(dispatched) => Ok(self
+                .collect_dispatched_auction(dispatched, context.services, context)
+                .await),
+            DispatchAuctionOutcome::DispatchFailed {
+                provider_responses,
+                fatal_admission_error,
+                metadata,
+                elapsed_ms,
+                ..
+            } => {
+                if let Some(error) = fatal_admission_error {
+                    return Err(error.change_context(TrustedServerError::Auction {
+                        message: "Planned auction admission failed".to_string(),
+                    }));
+                }
+                Ok(OrchestrationResult {
+                    provider_responses,
+                    mediator_response: None,
+                    winning_bids: HashMap::new(),
+                    total_time_ms: elapsed_ms,
+                    metadata,
+                })
+            }
+            DispatchAuctionOutcome::NotStarted => {
+                if self.planned_providers.is_empty() {
+                    Ok(OrchestrationResult::no_bid())
+                } else {
+                    Err(Report::new(TrustedServerError::Auction {
+                        message: "No planned provider request was started".to_string(),
+                    }))
+                }
+            }
+        }
+    }
+
     /// Execute an auction through the compiled plan.
     ///
     /// # Errors
@@ -847,78 +888,10 @@ impl AuctionOrchestrator {
             return Ok(OrchestrationResult::no_bid());
         }
         #[cfg(not(test))]
-        {
-            return match self.dispatch_auction(request, context).await {
-                DispatchAuctionOutcome::Dispatched(dispatched) => Ok(self
-                    .collect_dispatched_auction(dispatched, context.services, context)
-                    .await),
-                DispatchAuctionOutcome::DispatchFailed {
-                    provider_responses,
-                    fatal_admission_error,
-                    metadata,
-                    elapsed_ms,
-                    ..
-                } => {
-                    if let Some(error) = fatal_admission_error {
-                        return Err(error.change_context(TrustedServerError::Auction {
-                            message: "Planned auction admission failed".to_string(),
-                        }));
-                    }
-                    Ok(OrchestrationResult {
-                        provider_responses,
-                        mediator_response: None,
-                        winning_bids: HashMap::new(),
-                        total_time_ms: elapsed_ms,
-                        metadata,
-                    })
-                }
-                DispatchAuctionOutcome::NotStarted => {
-                    if self.planned_providers.is_empty() {
-                        Ok(OrchestrationResult::no_bid())
-                    } else {
-                        Err(Report::new(TrustedServerError::Auction {
-                            message: "No planned provider request was started".to_string(),
-                        }))
-                    }
-                }
-            };
-        }
+        return self.run_planned_auction(request, context).await;
         #[cfg(test)]
         if self.plan_backed {
-            return match self.dispatch_auction(request, context).await {
-                DispatchAuctionOutcome::Dispatched(dispatched) => Ok(self
-                    .collect_dispatched_auction(dispatched, context.services, context)
-                    .await),
-                DispatchAuctionOutcome::DispatchFailed {
-                    provider_responses,
-                    fatal_admission_error,
-                    metadata,
-                    elapsed_ms,
-                    ..
-                } => {
-                    if let Some(error) = fatal_admission_error {
-                        return Err(error.change_context(TrustedServerError::Auction {
-                            message: "Planned auction admission failed".to_string(),
-                        }));
-                    }
-                    Ok(OrchestrationResult {
-                        provider_responses,
-                        mediator_response: None,
-                        winning_bids: HashMap::new(),
-                        total_time_ms: elapsed_ms,
-                        metadata,
-                    })
-                }
-                DispatchAuctionOutcome::NotStarted => {
-                    if self.planned_providers.is_empty() {
-                        Ok(OrchestrationResult::no_bid())
-                    } else {
-                        Err(Report::new(TrustedServerError::Auction {
-                            message: "No planned provider request was started".to_string(),
-                        }))
-                    }
-                }
-            };
+            return self.run_planned_auction(request, context).await;
         }
         #[cfg(test)]
         let start_time = Instant::now();

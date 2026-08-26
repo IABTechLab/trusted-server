@@ -825,11 +825,6 @@ impl IntegrationRegistry {
         }
 
         for registration in registrations {
-            let builder_id = registration.integration_id;
-            debug_assert_eq!(
-                registration.integration_id, builder_id,
-                "integration builder ID should match registration ID"
-            );
             inner
                 .enabled_integration_ids
                 .push(registration.integration_id);

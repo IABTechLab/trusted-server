@@ -277,6 +277,11 @@ fn apply_prebid(
     _routed: &RoutedAuction,
     plan: &PrebidProfilePlan,
 ) -> Result<(), Report<TrustedServerError>> {
+    debug_assert_eq!(
+        request.imp.len(),
+        input.slots().len(),
+        "should keep one impression per routed slot"
+    );
     for (imp, slot) in request.imp.iter_mut().zip(input.slots()) {
         let bidder = slot
             .bidder_params()
