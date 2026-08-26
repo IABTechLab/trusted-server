@@ -12,9 +12,19 @@ use serde_json::json;
 
 use crate::request_timing::{AuctionWaitPlacement, TimingSnapshot};
 
-/// Maximum number of characters kept from a publisher path's first segment
-/// by [`publisher_route_template`].
+/// Maximum length of a publisher path's first segment before
+/// [`publisher_route_template`] rejects it to `/other/*`. Longer segments
+/// are opaque-identifier or slug shaped (a UUID is 36 characters), and a
+/// truncated prefix of either would still be identifying, so the segment
+/// is rejected whole rather than truncated.
 const MAX_SEGMENT_LEN: usize = 32;
+
+/// Maximum number of ASCII digits in a publisher path's first segment
+/// before [`publisher_route_template`] rejects it to `/other/*`. Hex ids,
+/// base36 ids, and reset tokens are digit-heavy; real section names carry
+/// at most a year (`2026`) or a small version number, so a segment with
+/// more digits than this is treated as an identifier, not a name.
+const MAX_SEGMENT_DIGITS: usize = 7;
 
 /// Normalizes an HTTP method token into the bounded set of values stored in
 /// the `method` `LowCardinality` column.
@@ -116,18 +126,27 @@ pub struct RouteMetadata {
 /// content-free route template.
 ///
 /// Returns `/` plus the first path segment, lowercased and restricted to
-/// `[a-z0-9_-]`, truncated to [`MAX_SEGMENT_LEN`] characters, with a
-/// trailing `/*` appended when the path has additional segments beyond the
-/// first. The root path `/` maps to itself. An empty first segment, or one
-/// containing any character outside the allowlist (after lowercasing),
-/// maps to `/other/*` — the segment is rejected outright rather than
-/// filtered, so no fragment of a disallowed segment (an email address, a
-/// search phrase) ever reaches the row.
+/// `[a-z0-9_-]`, with a trailing `/*` appended when the path has
+/// additional segments beyond the first. The root path `/` maps to itself.
+/// A first segment is rejected to `/other/*` — outright, never filtered or
+/// truncated, so no fragment of it ever reaches the row — when it:
+///
+/// - is empty, or contains any character outside the allowlist after
+///   lowercasing (an email address, a search phrase);
+/// - is longer than [`MAX_SEGMENT_LEN`] characters (UUIDs, long hex
+///   tokens, and full article slugs all exceed it — a truncated prefix of
+///   any of these would still be identifying); or
+/// - contains more than [`MAX_SEGMENT_DIGITS`] ASCII digits. Opaque
+///   identifiers (hex ids, base36 ids, reset tokens) are digit-heavy;
+///   publisher section names are words, at most a year or a version
+///   number.
 ///
 /// This is deliberately coarser than the auction-telemetry path
 /// normalizer, which redacts long tokens but preserves short identifiers
 /// and arbitrary slugs; that normalizer is not sufficient for a dataset
-/// this broad.
+/// this broad. Short all-alpha slugs on single-segment paths are
+/// indistinguishable from section names and still pass; the bound here is
+/// shape-based, not semantic.
 ///
 /// # Examples
 ///
@@ -137,6 +156,10 @@ pub struct RouteMetadata {
 /// assert_eq!(publisher_route_template("/news/some-article-slug"), "/news/*");
 /// assert_eq!(publisher_route_template("/"), "/");
 /// assert_eq!(publisher_route_template("/user@example.com/profile"), "/other/*");
+/// assert_eq!(
+///     publisher_route_template("/550e8400-e29b-41d4-a716-446655440000"),
+///     "/other/*"
+/// );
 /// ```
 #[must_use]
 pub fn publisher_route_template(path: &str) -> String {
@@ -156,16 +179,17 @@ pub fn publisher_route_template(path: &str) -> String {
         && lowered
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    let within_length = lowered.chars().count() <= MAX_SEGMENT_LEN;
+    let digit_count = lowered.chars().filter(char::is_ascii_digit).count();
 
-    if !is_allowlisted {
+    if !is_allowlisted || !within_length || digit_count > MAX_SEGMENT_DIGITS {
         return "/other/*".to_owned();
     }
 
-    let truncated: String = lowered.chars().take(MAX_SEGMENT_LEN).collect();
     if has_more_depth {
-        format!("/{truncated}/*")
+        format!("/{lowered}/*")
     } else {
-        format!("/{truncated}")
+        format!("/{lowered}")
     }
 }
 
@@ -220,8 +244,9 @@ pub struct AccessTelemetrySnapshot {
 /// `timings` and serialize as JSON `null` for phases that were never
 /// recorded; every dimension column comes from `snapshot` and is a
 /// non-nullable string (callers are expected to substitute an `unknown`
-/// sentinel rather than leave a dimension empty). `event_date` is omitted:
-/// the datasource derives it from `event_ts` by default.
+/// sentinel rather than leave a dimension empty). There is no `event_date`
+/// column: the datasource's sorting key derives the date via
+/// `toDate(event_ts)`.
 #[must_use]
 pub fn access_event_row(
     snapshot: &AccessTelemetrySnapshot,
@@ -338,10 +363,63 @@ mod tests {
         );
         assert_eq!(
             publisher_route_template(&format!("/{}", "a".repeat(500))),
-            format!("/{}", "a".repeat(32)),
-            "should bound segment length"
+            "/other/*",
+            "should reject overlong segments whole rather than truncate"
         );
         assert_eq!(publisher_route_template("/search terms here"), "/other/*");
+    }
+
+    #[test]
+    fn publisher_route_template_rejects_opaque_identifier_segments() {
+        // Every row here passes the character allowlist (`[a-z0-9_-]` is
+        // exactly what UUIDs, hex ids, and tokens are built from) and must
+        // be caught by the length and digit-count bounds instead. A
+        // truncated prefix of any of these would still be identifying, so
+        // rejection must be whole-segment.
+        assert_eq!(
+            publisher_route_template("/550e8400-e29b-41d4-a716-446655440000"),
+            "/other/*",
+            "should reject a UUID (36 chars) by length"
+        );
+        assert_eq!(
+            publisher_route_template("/550e8400-e29b-41d4-a716-446655440000/profile"),
+            "/other/*",
+            "should reject a UUID first segment on deeper paths too"
+        );
+        assert_eq!(
+            publisher_route_template("/8f3a9c2b1d4e5f6a7b8c9d0e1f2a3b4c"),
+            "/other/*",
+            "should reject a 32-char hex id by digit count"
+        );
+        assert_eq!(
+            publisher_route_template(&format!("/{}", "a1".repeat(32))),
+            "/other/*",
+            "should reject a 64-char token by length"
+        );
+        assert_eq!(
+            publisher_route_template("/reset-password-token-9f2b1c7d4e8a"),
+            "/other/*",
+            "should reject a reset token by length"
+        );
+        assert_eq!(
+            publisher_route_template("/how-to-treat-my-recent-hiv-diagnosis"),
+            "/other/*",
+            "should reject a full article slug by length"
+        );
+    }
+
+    #[test]
+    fn publisher_route_template_keeps_digit_light_section_names() {
+        assert_eq!(
+            publisher_route_template("/2026/08/some-article"),
+            "/2026/*",
+            "a year archive segment should pass the digit bound"
+        );
+        assert_eq!(
+            publisher_route_template("/wp-content/themes/site/app.css"),
+            "/wp-content/*",
+            "a hyphenated section name should pass"
+        );
     }
 
     #[test]

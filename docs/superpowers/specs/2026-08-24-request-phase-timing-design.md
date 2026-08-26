@@ -289,9 +289,16 @@ and user-generated content (search terms, usernames, emails in slugs). Replaced 
   restricted to a bounded allowlisted charset, plus `/*` when deeper (for example
   `/news/*`). The auction-telemetry normalizer is explicitly not sufficient here: it
   redacts long tokens but preserves short identifiers and arbitrary slugs.
+- Rejection is whole-segment, never truncation: a segment is dropped to `/other/*`
+  when it fails the charset allowlist, exceeds 32 characters, or carries more than 7
+  ASCII digits. The character allowlist alone does not bound identity (`[a-z0-9_-]`
+  is exactly the alphabet of UUIDs, hex ids, and reset tokens), and a truncated
+  prefix of any of those is still identifying, so the length and digit bounds reject
+  the segment outright.
 - Tests are adversarial, not just the happy path: a literal EC identifier on the admin
-  route, an email address in a path segment, search-term-shaped segments, and
-  overlong segments must all normalize to bounded, content-free templates.
+  route, an email address in a path segment, search-term-shaped segments, overlong
+  segments, UUIDs, hex ids, reset tokens, and full article slugs must all normalize
+  to bounded, content-free templates.
 
 Added columns (all dimension columns non-nullable with an `unknown` sentinel, because
 ClickHouse sorting keys cannot contain nullable columns):
