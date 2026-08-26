@@ -143,7 +143,7 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                     SecretPathSegment::ArrayEach,
                     object("api_token"),
                 ],
-                false,
+                true,
             ),
             field(
                 vec![
@@ -354,10 +354,12 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
     validate_secret_key_reference("ec.passphrase", settings.ec.passphrase.expose())?;
 
     for (index, partner) in settings.ec.partners.iter().enumerate() {
-        validate_secret_key_reference(
-            &format!("ec.partners[{index}].api_token"),
-            partner.api_token.expose(),
-        )?;
+        if let Some(token) = &partner.api_token {
+            validate_secret_key_reference(
+                &format!("ec.partners[{index}].api_token"),
+                token.expose(),
+            )?;
+        }
         if let Some(token) = &partner.ts_pull_token {
             validate_secret_key_reference(
                 &format!("ec.partners[{index}].ts_pull_token"),
@@ -731,7 +733,7 @@ formats = [{ width = 300, height = 250 }]
             vec![
                 ("publisher.proxy_secret".to_owned(), false),
                 ("ec.passphrase".to_owned(), false),
-                ("ec.partners[*].api_token".to_owned(), false),
+                ("ec.partners[*].api_token".to_owned(), true),
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
                 ("handlers[*].password".to_owned(), false),
                 ("tinybird.auction_token_secret".to_owned(), true),

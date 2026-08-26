@@ -451,7 +451,9 @@ mod tests {
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
-            api_token: Redacted::new(format!("token-{source_domain}-32-bytes-minimum-value")),
+            api_token: Some(Redacted::new(format!(
+                "token-{source_domain}-32-bytes-minimum-value"
+            ))),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
             pull_sync_url: None,
