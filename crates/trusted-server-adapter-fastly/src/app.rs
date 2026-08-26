@@ -90,6 +90,7 @@ use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
+use edgezero_adapter_fastly::env_config_from_runtime_dictionary;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::env_config::EnvConfig;
@@ -1327,7 +1328,8 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        let stores = RuntimeStoreConfig::from_env(&EnvConfig::from_env());
+        let runtime_env = env_config_from_runtime_dictionary(Self::stores());
+        let stores = RuntimeStoreConfig::from_env(&runtime_env);
         Self::router_with_state(&stores).0
     }
 

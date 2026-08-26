@@ -98,7 +98,7 @@ fn remove_inactive_secret_references(data: &mut serde_json::Value) {
         return;
     };
     let integration_enabled =
-        datadome.get("enabled").and_then(serde_json::Value::as_bool) != Some(false);
+        datadome.get("enabled").and_then(serde_json::Value::as_bool) == Some(true);
     let protection_enabled = integration_enabled
         && datadome
             .get("enable_protection")
@@ -387,6 +387,10 @@ mod tests {
         );
         assert!(auth.secret_store.is_none());
         assert_eq!(
+            reconstructed.ec.partners[0].api_token.expose(),
+            "resolved-partner-api-token-32-bytes-ok"
+        );
+        assert_eq!(
             reconstructed.ec.partners[0]
                 .ts_pull_token
                 .as_ref()
@@ -488,6 +492,39 @@ mod tests {
                 .protection_test_bypass
                 .as_ref()
                 .is_some_and(|bypass| bypass.credential_secret_name.is_none())
+        );
+    }
+
+    #[test]
+    fn omitted_datadome_enabled_does_not_resolve_stale_protection_references() {
+        let mut original = test_settings();
+        original
+            .integrations
+            .insert_config(
+                "datadome",
+                &serde_json::json!({
+                    "enable_protection": true,
+                    "server_side_key_secret_name": "unused-datadome-key",
+                    "protection_test_bypass": {
+                        "enabled": true,
+                        "credential_secret_name": "unused-bypass-key",
+                    },
+                }),
+            )
+            .expect("should configure disabled DataDome references");
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should skip stale DataDome protection references");
+
+        assert!(
+            reconstructed
+                .integration_config::<crate::integrations::datadome::DataDomeConfig>("datadome")
+                .expect("should parse disabled DataDome config")
+                .is_none()
         );
     }
 
