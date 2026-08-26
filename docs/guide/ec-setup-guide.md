@@ -35,7 +35,9 @@ bidstream_enabled = true
 ```
 
 The `passphrase` and `api_token` fields contain keys in the Trusted Server
-secret store, not the credential values. Provision high-entropy values under
+secret store, not the credential values. This workflow calls the inbound
+identify and batch-sync APIs, so its partner needs `api_token`. Partners that
+do not call either API may omit it. Provision high-entropy values under
 `ec_passphrase` and `partner_api_token`; see
 [Configuration](/guide/configuration#secret-store-migration).
 
@@ -80,7 +82,8 @@ bidstream_enabled = true
 ```
 
 Provision the bearer token value under `partner_api_token`, then deploy or
-restart after changing partner configuration.
+restart after changing partner configuration. The token is required for this
+demo because it exercises the inbound partner APIs.
 
 ## 4) Acquire or Reuse EC Cookie
 

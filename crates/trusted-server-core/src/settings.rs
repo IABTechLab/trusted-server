@@ -327,7 +327,7 @@ impl DerefMut for IntegrationSettings {
 /// A partner (SSP, DSP, identity vendor) configured in `[[ec.partners]]`.
 ///
 /// Partners are defined statically in `trusted-server.toml` rather than
-/// registered via API. At startup, each partner's `api_token` is hashed
+/// registered via API. At startup, each configured `api_token` is hashed
 /// (SHA-256) for O(1) auth lookups; the plaintext is never stored at runtime.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -349,9 +349,12 @@ pub struct EcPartner {
     /// Whether this partner's UIDs appear in auction `user.eids`.
     #[serde(default, deserialize_with = "from_value_or_str")]
     pub bidstream_enabled: bool,
-    /// Plaintext API token. Hashed at startup for auth lookups.
-    /// Used by batch sync (inbound) and identify (inbound).
-    pub api_token: Redacted<String>,
+    /// Plaintext API token used by inbound batch sync and identify requests.
+    ///
+    /// When present, the token is hashed at startup for auth lookups. Omitting
+    /// it disables inbound partner API authentication for this partner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token: Option<Redacted<String>>,
     /// Max batch sync API requests per partner per minute.
     #[serde(
         default = "EcPartner::default_batch_rate_limit",
@@ -2990,7 +2993,11 @@ impl Settings {
             insecure_fields.push("trusted_client_ip.shared_secret".to_owned());
         }
         for partner in &self.ec.partners {
-            if EcPartner::is_placeholder_api_token(partner.api_token.expose()) {
+            if partner
+                .api_token
+                .as_ref()
+                .is_some_and(|token| EcPartner::is_placeholder_api_token(token.expose()))
+            {
                 insecure_fields.push(format!("ec.partners[{}].api_token", partner.source_domain));
             }
         }
@@ -5009,6 +5016,24 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
+    fn ec_partner_api_token_can_be_omitted() {
+        let partner: EcPartner = toml::from_str(
+            r#"
+name = "Example Partner"
+source_domain = "partner.example.com"
+"#,
+        )
+        .expect("should deserialize partner without API token");
+
+        assert!(partner.api_token.is_none(), "should omit API token");
+        let serialized = serde_json::to_value(partner).expect("should serialize partner");
+        assert!(
+            serialized.get("api_token").is_none(),
+            "should not serialize an omitted API token"
+        );
+    }
+
+    #[test]
     fn validate_passphrase_rejects_under_32_characters() {
         let passphrase = Redacted::new("a".repeat(31));
 
@@ -5302,7 +5327,14 @@ origin_host_header_overide = "www.example.com""#,
                 );
                 assert_eq!(settings.ec.partners[0].openrtb_atype, 571187);
                 assert!(settings.ec.partners[0].bidstream_enabled);
-                assert_eq!(settings.ec.partners[0].api_token.expose(), "env-token-0");
+                assert_eq!(
+                    settings.ec.partners[0]
+                        .api_token
+                        .as_ref()
+                        .map(Redacted::expose)
+                        .map(String::as_str),
+                    Some("env-token-0")
+                );
                 assert_eq!(settings.ec.partners[1].name, "Env Partner 1");
                 assert_eq!(
                     settings.ec.partners[1].source_domain,
@@ -5310,7 +5342,14 @@ origin_host_header_overide = "www.example.com""#,
                 );
                 assert_eq!(settings.ec.partners[1].openrtb_atype, 3);
                 assert!(!settings.ec.partners[1].bidstream_enabled);
-                assert_eq!(settings.ec.partners[1].api_token.expose(), "env-token-1");
+                assert_eq!(
+                    settings.ec.partners[1]
+                        .api_token
+                        .as_ref()
+                        .map(Redacted::expose)
+                        .map(String::as_str),
+                    Some("env-token-1")
+                );
             },
         );
     }
