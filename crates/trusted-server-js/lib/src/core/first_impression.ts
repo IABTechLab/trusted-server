@@ -341,7 +341,14 @@ export function observeFirstImpressionGptLifecycle(
   }
 
   claim.phase = phase;
-  if (claim.owner === 'publisher') claim.expiresAt = Number.POSITIVE_INFINITY;
+  if (claim.owner === 'publisher') {
+    claim.expiresAt = Number.POSITIVE_INFINITY;
+  } else {
+    // Once TS has committed a GPT request, only publisher auctions that were
+    // already registered can still represent an overlapping first impression.
+    // New publisher refreshes are ordinary later impressions and must proceed.
+    claim.publisherRegistrationClosed = true;
+  }
 }
 
 /** Reserve the only Trusted Server fallback allowed for this physical slot and generation. */
