@@ -239,6 +239,38 @@ s = replace_once(
     f'origin_url = "http://127.0.0.1:{origin_port}"',
     "publisher origin",
 )
+# The example config ships placeholders that validation rejects outright,
+# including the reserved publisher domain/cookie_domain.
+s = replace_once(
+    s,
+    'domain = "example.com"',
+    'domain = "local-harness.example"',
+    "publisher domain",
+)
+s = replace_once(
+    s,
+    'cookie_domain = ".example.com"',
+    'cookie_domain = ".local-harness.example"',
+    "publisher cookie domain",
+)
+s = replace_once(
+    s,
+    'password = "replace-with-admin-password-32-bytes"',
+    'password = "local-harness-admin-password-not-a-real-one"',
+    "admin password",
+)
+s = replace_once(
+    s,
+    'proxy_secret = "change-me-proxy-secret"',
+    'proxy_secret = "local-harness-proxy-secret-not-a-real-one"',
+    "proxy secret",
+)
+s = replace_once(
+    s,
+    'passphrase = "trusted-server-placeholder-secret"',
+    'passphrase = "local-harness-ec-passphrase-not-a-real-one"',
+    "ec passphrase",
+)
 # A real auction points at the slow HTTPS stub so the timings mean something.
 s = replace_once(
     s,
@@ -275,8 +307,8 @@ s = replace_once(
 )
 s = replace_once(
     s,
-    'auction_timeout_ms = 500  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS',
-    'auction_timeout_ms = 10000  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS',
+    'auction_timeout_ms = 500',
+    'auction_timeout_ms = 10000',
     "creative opportunity auction timeout",
 )
 

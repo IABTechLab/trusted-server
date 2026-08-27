@@ -130,6 +130,51 @@ impl Publisher {
             .any(|p| p.eq_ignore_ascii_case(proxy_secret))
     }
 
+    /// Reserved example publisher values copied verbatim from the config
+    /// template. They deserialize fine but must be replaced before deploying.
+    const PLACEHOLDER_DOMAINS: &[&str] = &["example.com"];
+    const PLACEHOLDER_COOKIE_DOMAINS: &[&str] = &[".example.com"];
+    /// Reserved example origin hosts. Matched against the parsed URL host so a
+    /// spelling that resolves to the same host (an explicit `:443`, a trailing
+    /// slash, a different scheme) cannot slip past the placeholder check.
+    const PLACEHOLDER_ORIGIN_HOSTS: &[&str] = &["origin.example.com"];
+
+    /// Returns `true` if `domain` is the unedited template placeholder
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_domain(domain: &str) -> bool {
+        Self::PLACEHOLDER_DOMAINS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(domain.trim()))
+    }
+
+    /// Returns `true` if `cookie_domain` is the unedited template placeholder
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_cookie_domain(cookie_domain: &str) -> bool {
+        Self::PLACEHOLDER_COOKIE_DOMAINS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(cookie_domain.trim()))
+    }
+
+    /// Returns `true` if `origin_url` resolves to an unedited template
+    /// placeholder host (case-insensitive).
+    ///
+    /// The comparison is on the parsed URL host, not the raw string, so
+    /// equivalent spellings of the reserved host - an explicit default port, a
+    /// trailing slash, or a different scheme - are all rejected.
+    #[must_use]
+    pub fn is_placeholder_origin_url(origin_url: &str) -> bool {
+        Url::parse(origin_url.trim())
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .is_some_and(|host| {
+                Self::PLACEHOLDER_ORIGIN_HOSTS
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(&host))
+            })
+    }
+
     /// Extracts the host (including port if present) from the `origin_url`.
     ///
     /// # Examples
@@ -295,6 +340,11 @@ impl IntegrationSettings {
             },
         )?;
 
+        // Field validation runs only for integrations that resolve to enabled.
+        // An integration whose `enabled` flag is omitted falls back to its
+        // serde default, which the explicit-`false` fast path above cannot
+        // observe. Validating before this check would reject documented
+        // template placeholders in sections that are not actually turned on.
         if !config.is_enabled() {
             return Ok(None);
         }
@@ -692,6 +742,34 @@ pub struct RequestSigning {
     pub enabled: bool,
     pub config_store_id: String,
     pub secret_store_id: String,
+}
+
+impl RequestSigning {
+    /// Reserved example store-id values from the config template, plus the
+    /// empty string, that must not be deployed while request signing is enabled.
+    pub const STORE_ID_PLACEHOLDERS: &[&str] = &[
+        "<management-config-store-id>",
+        "<management-secret-store-id>",
+    ];
+
+    /// Returns `true` if `store_id` is empty or a known template placeholder
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_store_id(store_id: &str) -> bool {
+        let store_id = store_id.trim();
+        store_id.is_empty()
+            || Self::STORE_ID_PLACEHOLDERS
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(store_id))
+    }
+
+    /// Returns `true` if `store_id` cannot be deployed as-is: a placeholder, or
+    /// a value with surrounding whitespace that the key-management routes would
+    /// forward to the management API verbatim.
+    #[must_use]
+    pub fn is_unusable_store_id(store_id: &str) -> bool {
+        Self::is_placeholder_store_id(store_id) || store_id != store_id.trim()
+    }
 }
 
 fn default_request_signing_enabled() -> bool {
@@ -2786,6 +2864,7 @@ pub struct Settings {
     #[validate(nested)]
     pub rewrite: Rewrite,
     #[serde(default)]
+    #[validate(nested)]
     pub auction: AuctionConfig,
     #[serde(default)]
     pub consent: ConsentConfig,
@@ -3012,6 +3091,31 @@ impl Settings {
         for handler in &self.handlers {
             if Handler::is_placeholder_password(handler.password.expose()) {
                 insecure_fields.push(format!("handlers[{}].password", handler.path));
+            }
+        }
+        if Publisher::is_placeholder_domain(&self.publisher.domain) {
+            insecure_fields.push("publisher.domain".to_owned());
+        }
+        if Publisher::is_placeholder_cookie_domain(&self.publisher.cookie_domain) {
+            insecure_fields.push("publisher.cookie_domain".to_owned());
+        }
+        if Publisher::is_placeholder_origin_url(&self.publisher.origin_url) {
+            insecure_fields.push("publisher.origin_url".to_owned());
+        }
+        // Checked whenever the block is present, not just when it is enabled:
+        // the key rotate/deactivate admin routes are registered unconditionally
+        // and read these store IDs without consulting `enabled`, so placeholder
+        // IDs behind a disabled block would still reach key management at
+        // runtime. Surrounding whitespace is rejected too: the placeholder check
+        // trims for comparison but the raw value is what `signing_store_ids`
+        // forwards to `KeyRotationManager`, so a padded id would validate yet
+        // reach the management API unusable.
+        if let Some(request_signing) = &self.request_signing {
+            if RequestSigning::is_unusable_store_id(&request_signing.config_store_id) {
+                insecure_fields.push("request_signing.config_store_id".to_owned());
+            }
+            if RequestSigning::is_unusable_store_id(&request_signing.secret_store_id) {
+                insecure_fields.push("request_signing.secret_store_id".to_owned());
             }
         }
 
@@ -5161,6 +5265,79 @@ source_domain = "partner.example.com"
     }
 
     #[test]
+    fn is_placeholder_domain_rejects_known_placeholders_case_insensitively() {
+        for placeholder in Publisher::PLACEHOLDER_DOMAINS {
+            assert!(
+                Publisher::is_placeholder_domain(placeholder),
+                "should detect placeholder domain '{placeholder}'"
+            );
+        }
+        assert!(
+            Publisher::is_placeholder_domain(" Example.COM "),
+            "should detect trimmed, mixed-case placeholder domain"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_domain_accepts_non_placeholder() {
+        assert!(
+            !Publisher::is_placeholder_domain("publisher.test"),
+            "should accept a real publisher domain"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_cookie_domain_rejects_known_placeholders_case_insensitively() {
+        for placeholder in Publisher::PLACEHOLDER_COOKIE_DOMAINS {
+            assert!(
+                Publisher::is_placeholder_cookie_domain(placeholder),
+                "should detect placeholder cookie_domain '{placeholder}'"
+            );
+        }
+        assert!(
+            Publisher::is_placeholder_cookie_domain(" .Example.COM "),
+            "should detect trimmed, mixed-case placeholder cookie_domain"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_cookie_domain_accepts_non_placeholder() {
+        assert!(
+            !Publisher::is_placeholder_cookie_domain(".publisher.test"),
+            "should accept a real cookie domain"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_origin_url_rejects_equivalent_spellings_of_reserved_host() {
+        for reserved in [
+            "https://origin.example.com",
+            "https://origin.example.com/",
+            "https://origin.example.com:443",
+            "http://origin.example.com",
+            "https://Origin.Example.com",
+            " https://origin.example.com ",
+        ] {
+            assert!(
+                Publisher::is_placeholder_origin_url(reserved),
+                "should reject origin_url resolving to the reserved host: '{reserved}'"
+            );
+        }
+    }
+
+    #[test]
+    fn is_placeholder_origin_url_accepts_non_placeholder() {
+        assert!(
+            !Publisher::is_placeholder_origin_url("https://origin.publisher.test"),
+            "should accept a real origin url"
+        );
+        assert!(
+            !Publisher::is_placeholder_origin_url("https://cdn.example.com"),
+            "should accept a different host under the same example domain"
+        );
+    }
+
+    #[test]
     fn is_placeholder_handler_password_rejects_known_template_value() {
         assert!(
             Handler::is_placeholder_password("replace-with-admin-password-32-bytes"),
@@ -5183,6 +5360,26 @@ source_domain = "partner.example.com"
         assert!(
             format!("{err:?}").contains("handlers"),
             "error should mention handler password field"
+        );
+    }
+
+    #[test]
+    fn is_unusable_store_id_rejects_placeholders_empty_and_padded_values() {
+        for placeholder in RequestSigning::STORE_ID_PLACEHOLDERS {
+            assert!(
+                RequestSigning::is_unusable_store_id(placeholder),
+                "should reject placeholder store id '{placeholder}'"
+            );
+        }
+        for bad in ["", "   ", " 01GCFG ", "01GCFG "] {
+            assert!(
+                RequestSigning::is_unusable_store_id(bad),
+                "should reject unusable store id '{bad}'"
+            );
+        }
+        assert!(
+            !RequestSigning::is_unusable_store_id("01GCFG"),
+            "should accept a clean store id"
         );
     }
 

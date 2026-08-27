@@ -228,6 +228,7 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
 /// Returns [`TrustedServerError`] when non-secret configuration or a secret key
 /// reference is invalid.
 pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    settings.reject_placeholder_secrets()?;
     validate_secret_key_references(settings)?;
 
     let mut structural_settings = settings.clone();
@@ -505,6 +506,108 @@ formats = [{ width = 300, height = 250 }]
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
         settings
+    }
+
+    /// Source-controlled operator-facing config template.
+    const EXAMPLE_TEMPLATE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../trusted-server.example.toml"
+    ));
+
+    /// Returns the template with its deliberately-invalid placeholder admin
+    /// password swapped for a valid one, so parse-time validation succeeds and
+    /// the test can exercise the optional blocks it uncomments.
+    fn template_with_valid_admin_password() -> String {
+        EXAMPLE_TEMPLATE.replace(
+            "password = \"replace-with-admin-password-32-bytes\"",
+            "password = \"unit-test-admin-password-that-is-long-enough\"",
+        )
+    }
+
+    /// Uncomments the contiguous `#`-prefixed block that begins at the line
+    /// `# {header}`, leaving the rest of the template untouched. Stops at the
+    /// first line that is not a comment (a blank line ends the block).
+    fn uncomment_block(template: &str, header: &str) -> String {
+        let header_line = format!("# {header}");
+        let mut out = Vec::new();
+        let mut uncommenting = false;
+
+        for line in template.lines() {
+            if line == header_line {
+                uncommenting = true;
+            } else if uncommenting && !line.trim_start().starts_with('#') {
+                uncommenting = false;
+            }
+
+            if uncommenting {
+                let bare = line
+                    .strip_prefix("# ")
+                    .or_else(|| line.strip_prefix('#'))
+                    .unwrap_or(line);
+                out.push(bare.to_owned());
+            } else {
+                out.push(line.to_owned());
+            }
+        }
+
+        out.join("\n")
+    }
+
+    /// Every documented block should be push-ready: uncommenting it and setting
+    /// the shown values must parse and pass field validation. Blocks that ship
+    /// a deliberately-invalid placeholder (admin password, `ec.passphrase`, GTM
+    /// `container_id`, `request_signing` store ids) are excluded.
+    #[test]
+    fn documented_integration_blocks_validate_when_uncommented() {
+        let base = template_with_valid_admin_password();
+
+        for (header, id) in [
+            ("[integrations.permutive]", "permutive"),
+            ("[integrations.lockr]", "lockr"),
+            ("[integrations.sourcepoint]", "sourcepoint"),
+        ] {
+            let toml = uncomment_block(&base, header);
+            let settings = Settings::from_toml(&toml)
+                .unwrap_or_else(|err| panic!("uncommented {header} should parse: {err:?}"));
+
+            match id {
+                "permutive" => assert!(
+                    settings
+                        .integration_config::<PermutiveConfig>(id)
+                        .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
+                        .is_some(),
+                    "{header} should resolve to an enabled, valid config"
+                ),
+                "lockr" => assert!(
+                    settings
+                        .integration_config::<LockrConfig>(id)
+                        .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
+                        .is_some(),
+                    "{header} should resolve to an enabled, valid config"
+                ),
+                "sourcepoint" => assert!(
+                    settings
+                        .integration_config::<SourcepointConfig>(id)
+                        .unwrap_or_else(|err| panic!("{header} should validate: {err:?}"))
+                        .is_some(),
+                    "{header} should resolve to an enabled, valid config"
+                ),
+                other => panic!("unhandled integration id {other}"),
+            }
+        }
+    }
+
+    /// The `[tinybird]` block is top-level and validated at parse time, so
+    /// uncommenting it with the documented `api_host` must parse cleanly.
+    #[test]
+    fn documented_tinybird_block_validates_when_uncommented() {
+        let toml = uncomment_block(&template_with_valid_admin_password(), "[tinybird]");
+        let settings = Settings::from_toml(&toml)
+            .expect("uncommented [tinybird] with documented api_host should parse and validate");
+        assert!(
+            settings.tinybird.enabled && !settings.tinybird.api_host.is_empty(),
+            "tinybird should be enabled with a non-empty api_host"
+        );
     }
 
     #[test]
@@ -831,6 +934,132 @@ password = "production-admin-password-32-bytes"
         assert!(
             err.to_string().contains("Insecure default"),
             "error should mention insecure default"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_example_publisher_hosts() {
+        let mut settings = valid_settings();
+        settings.publisher.domain = "example.com".to_string();
+        settings.publisher.cookie_domain = ".example.com".to_string();
+        settings.publisher.origin_url = "https://origin.example.com".to_string();
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject unedited example publisher hosts");
+        let text = format!("{err:?}");
+
+        assert!(
+            text.contains("publisher.domain")
+                && text.contains("publisher.cookie_domain")
+                && text.contains("publisher.origin_url"),
+            "should flag all three example publisher placeholders: {err:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_placeholder_request_signing_store_ids() {
+        let mut settings = valid_settings();
+        settings.request_signing = Some(crate::settings::RequestSigning {
+            enabled: true,
+            config_store_id: "<management-config-store-id>".to_string(),
+            secret_store_id: "<management-secret-store-id>".to_string(),
+        });
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject placeholder request-signing store ids when enabled");
+        let text = format!("{err:?}");
+
+        assert!(
+            text.contains("request_signing.config_store_id")
+                && text.contains("request_signing.secret_store_id"),
+            "should flag both request-signing store ids: {err:?}"
+        );
+    }
+
+    /// The rotate/deactivate admin routes are registered unconditionally and
+    /// read the store IDs without consulting `enabled`, so a disabled block with
+    /// placeholder IDs would still reach key management at runtime.
+    #[test]
+    fn deploy_validation_rejects_placeholder_store_ids_while_request_signing_is_disabled() {
+        let mut settings = valid_settings();
+        settings.request_signing = Some(crate::settings::RequestSigning {
+            enabled: false,
+            config_store_id: "<management-config-store-id>".to_string(),
+            secret_store_id: "<management-secret-store-id>".to_string(),
+        });
+
+        let err = validate_settings_for_deploy(&settings).expect_err(
+            "should reject placeholder store ids even while request signing is disabled",
+        );
+        let text = format!("{err:?}");
+
+        assert!(
+            text.contains("request_signing.config_store_id")
+                && text.contains("request_signing.secret_store_id"),
+            "should flag both request-signing store ids: {err:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_empty_request_signing_store_ids() {
+        let mut settings = valid_settings();
+        settings.request_signing = Some(crate::settings::RequestSigning {
+            enabled: true,
+            config_store_id: String::new(),
+            secret_store_id: "   ".to_string(),
+        });
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject empty and whitespace-only store ids");
+        let text = format!("{err:?}");
+
+        assert!(
+            text.contains("request_signing.config_store_id")
+                && text.contains("request_signing.secret_store_id"),
+            "should flag both request-signing store ids: {err:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_padded_request_signing_store_ids() {
+        let mut settings = valid_settings();
+        settings.request_signing = Some(crate::settings::RequestSigning {
+            enabled: false,
+            config_store_id: " management-config-store ".to_string(),
+            secret_store_id: "management-secret-store ".to_string(),
+        });
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject store ids with surrounding whitespace");
+        let text = format!("{err:?}");
+
+        assert!(
+            text.contains("request_signing.config_store_id")
+                && text.contains("request_signing.secret_store_id"),
+            "should flag both padded store ids: {err:?}"
+        );
+    }
+
+    /// `enabled` defaults to `false` for `adserver_mock`, so a section that omits
+    /// the flag resolves to disabled and must not have its fields validated —
+    /// otherwise a documented template placeholder breaks existing configs on
+    /// upgrade.
+    #[test]
+    fn deploy_validation_skips_field_validation_for_integrations_with_omitted_enabled() {
+        let mut settings = valid_settings();
+        // `endpoint` parses as a plain string but would fail the `url`
+        // validator, so this section only survives if validation is skipped for
+        // integrations that resolve to disabled.
+        settings
+            .integrations
+            .insert_config(
+                "adserver_mock",
+                &serde_json::json!({ "endpoint": "not-a-valid-url" }),
+            )
+            .expect("should insert adserver_mock config");
+
+        validate_settings_for_deploy(&settings).expect(
+            "should skip field validation for integrations that resolve to disabled via default",
         );
     }
 
