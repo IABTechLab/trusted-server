@@ -55,8 +55,9 @@ const MAX_BODY_SIZE: usize = 64 * 1024;
 /// carries a different identity (a resolve must not silently replace one), and
 /// `503` when the identity-graph write fails. When the permission gate is
 /// closed, no provider is configured, no graph is available, or the provider
-/// mints nothing, the response is `204` with no cookie. Every response carries
-/// `Cache-Control: no-store`.
+/// mints nothing, the response is `204` with no cookie. Every response this
+/// handler builds carries `Cache-Control: no-store`; a provider or
+/// configuration error propagates to the adapter's error response instead.
 ///
 /// # Errors
 ///
