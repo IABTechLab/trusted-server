@@ -167,6 +167,12 @@ fn run_lint(args: &AdTemplatesLintArgs, out: &mut dyn Write) -> Result<(), Strin
     .map_err(output_error)?;
     writeln!(
         out,
+        "creative_opportunities.enabled: {}",
+        if config.enabled { "true" } else { "false" }
+    )
+    .map_err(output_error)?;
+    writeln!(
+        out,
         "auction.enabled: {}",
         if loaded.settings.auction.enabled {
             "true"
@@ -188,6 +194,12 @@ fn run_lint(args: &AdTemplatesLintArgs, out: &mut dyn Write) -> Result<(), Strin
 
     if config.slot.is_empty() {
         writeln!(out, "status: disabled because no slots are configured").map_err(output_error)?;
+    } else if !config.enabled {
+        writeln!(
+            out,
+            "status: slots are configured, but [creative_opportunities].enabled is false"
+        )
+        .map_err(output_error)?;
     } else if !loaded.settings.auction.enabled {
         writeln!(
             out,
@@ -327,6 +339,11 @@ fn run_explain(args: &AdTemplatesExplainArgs, out: &mut dyn Write) -> Result<(),
     let navigation_pass = !args.non_navigation;
     let consent_pass = !args.consent_denied;
     let auction_enabled = loaded.settings.auction.enabled;
+    let ad_templates_enabled = loaded
+        .settings
+        .creative_opportunities
+        .as_ref()
+        .is_some_and(|config| config.enabled);
     let providers_configured = !loaded.settings.auction.providers.is_empty();
 
     let gate = evaluate_ad_stack_gate(AdStackGateInput {
@@ -337,6 +354,7 @@ fn run_explain(args: &AdTemplatesExplainArgs, out: &mut dyn Write) -> Result<(),
         matched_slots: has_matches,
         consent_allows_auction: Some(consent_pass),
         auction_enabled,
+        ad_templates_enabled,
     });
     let blocked: Vec<AdStackGateName> = gate.blocking_gates().collect();
     write_gate(
@@ -364,6 +382,11 @@ fn run_explain(args: &AdTemplatesExplainArgs, out: &mut dyn Write) -> Result<(),
         out,
         "auction.enabled",
         !blocked.contains(&AdStackGateName::AuctionEnabled),
+    )?;
+    write_gate(
+        out,
+        "creative_opportunities.enabled",
+        !blocked.contains(&AdStackGateName::AdTemplatesEnabled),
     )?;
     write_gate(
         out,
@@ -691,6 +714,61 @@ mod tests {
             "should report the auction kill-switch state"
         );
         assert!(!output.contains("legacy fallback"));
+    }
+
+    #[test]
+    fn lint_and_explain_report_the_disabled_template_switch() {
+        // `[creative_opportunities].enabled = false` is a runtime kill switch:
+        // the publisher path matches no slots at all while it is off, so the
+        // diagnostics must not claim the ad stack would run.
+        let config_text = config_with_slots().replace("enabled = true", "enabled = false");
+        let (_temp, config) = project_with_config(&config_text);
+        let mut out = Vec::new();
+
+        run_ad_templates_with_writer(
+            &AdTemplatesCommand::Lint(AdTemplatesLintArgs {
+                config: config.clone(),
+            }),
+            &mut out,
+        )
+        .expect("should lint a disabled template switch");
+        let lint_output = String::from_utf8(out).expect("should be utf8");
+
+        assert!(
+            lint_output.contains("creative_opportunities.enabled: false"),
+            "lint should report the template switch state: {lint_output}"
+        );
+        assert!(
+            lint_output.contains(
+                "status: slots are configured, but [creative_opportunities].enabled is false"
+            ),
+            "lint status should name the template switch: {lint_output}"
+        );
+
+        let mut out = Vec::new();
+        run_ad_templates_with_writer(
+            &AdTemplatesCommand::Explain(AdTemplatesExplainArgs {
+                config,
+                path_or_url: "/news/story".to_string(),
+                method: Method::GET,
+                non_navigation: false,
+                prefetch: false,
+                bot: false,
+                consent_denied: false,
+            }),
+            &mut out,
+        )
+        .expect("should explain a disabled template switch");
+        let explain_output = String::from_utf8(out).expect("should be utf8");
+
+        assert!(
+            explain_output.contains("gate creative_opportunities.enabled: block"),
+            "explain should fail the template-switch gate: {explain_output}"
+        );
+        assert!(
+            explain_output.contains("server-side ad stack: no"),
+            "explain verdict should follow the switch: {explain_output}"
+        );
     }
 
     #[test]
