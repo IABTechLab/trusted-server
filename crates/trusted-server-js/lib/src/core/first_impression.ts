@@ -61,7 +61,15 @@ function pruneFirstImpressionState(ts: TsjsApi, now = Date.now()): FirstImpressi
       continue;
     }
     for (const [token, auction] of Object.entries(claim.publisherAuctions)) {
-      if (auction.expiresAt <= now) removePublisherAuction(state, claim, token, now);
+      // A TS-owned losing publisher auction remains a fail-closed tombstone for
+      // this physical element and navigation. Its callback can arrive long after
+      // the nominal auction lease and must never become an unrelated refresh.
+      if (
+        auction.expiresAt <= now &&
+        !(claim.owner === 'trusted_server' && auction.suppressDelivery)
+      ) {
+        removePublisherAuction(state, claim, token, now);
+      }
     }
     if (
       claim.owner === 'publisher' &&
@@ -155,10 +163,11 @@ export function claimFirstImpressionForTrustedServer(
 }
 
 function schedulePublisherAuctionExpiry(ts: TsjsApi, token: string): void {
-  window.setTimeout(
-    () => releasePublisherFirstImpressionAuction(ts, token),
-    FIRST_IMPRESSION_LEASE_MS
-  );
+  window.setTimeout(() => {
+    // Pruning releases ordinary publisher claims. TS-owned suppression tokens
+    // deliberately survive as bounded tombstones until navigation/element change.
+    findPublisherAuction(ts, token);
+  }, FIRST_IMPRESSION_LEASE_MS);
 }
 
 /** Release a TS claim when slot setup failed before any request could start. */
@@ -211,7 +220,10 @@ export function registerPublisherFirstImpressionAuctions(
     ) {
       continue;
     }
-    if (claim.owner === 'trusted_server' && (claim.suppressionConsumed || claim.expiresAt <= now)) {
+    if (
+      claim.owner === 'trusted_server' &&
+      (claim.publisherRegistrationClosed || claim.expiresAt <= now)
+    ) {
       continue;
     }
     if (Object.keys(claim.publisherAuctions).length >= MAX_PUBLISHER_AUCTIONS_PER_SLOT) continue;
@@ -275,6 +287,10 @@ export function releasePublisherFirstImpressionAuction(
 ): void {
   const found = findPublisherAuction(ts, token, now);
   if (!found) return;
+  if (found.claim.owner === 'trusted_server' && found.auction.suppressDelivery) {
+    found.claim.publisherRegistrationClosed = true;
+    return;
+  }
   found.auction.expiresAt = Math.min(found.auction.expiresAt, now);
   if (
     found.claim.owner === 'publisher' &&
@@ -295,13 +311,9 @@ export function consumePublisherFirstImpressionDelivery(
   const found = findPublisherAuction(ts, token, now);
   if (!found) return false;
 
-  const suppress =
-    found.claim.owner === 'trusted_server' &&
-    found.auction.suppressDelivery &&
-    !found.claim.suppressionConsumed &&
-    found.claim.expiresAt > now;
+  const suppress = found.claim.owner === 'trusted_server' && found.auction.suppressDelivery;
   delete found.claim.publisherAuctions[token];
-  if (suppress) found.claim.suppressionConsumed = true;
+  if (suppress) found.claim.publisherRegistrationClosed = true;
   return suppress;
 }
 

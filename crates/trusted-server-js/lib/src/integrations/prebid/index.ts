@@ -19,6 +19,7 @@ import {
   markPublisherFirstImpressionDeliveryPending,
   registerPublisherFirstImpressionAuctions,
   releasePublisherFirstImpressionAuction,
+  resolveFirstImpressionElement,
 } from '../../core/first_impression';
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
@@ -382,12 +383,18 @@ type PendingPublisherBid = {
   adUnitCode: string;
   expiresAt: number;
   registrationId: number;
+  generation: number;
+  element: HTMLElement;
+  retainUntilContextChange: boolean;
   firstImpressionToken?: string;
 };
 type PendingPublisherCode = {
   adUnitCode: string;
   expiresAt: number;
   registrationId: number;
+  generation: number;
+  element: HTMLElement;
+  retainUntilContextChange: boolean;
   firstImpressionToken?: string;
 };
 type RemoveAdUnit = (adUnitCode?: string | string[]) => unknown;
@@ -874,7 +881,8 @@ function removePendingPublisherBidsForCode(adUnitCode: string, registrationId?: 
     if (registrationId === undefined) {
       pendingPublisherCodes.delete(adUnitCode);
     } else {
-      registrations.delete(registrationId);
+      const pending = registrations.get(registrationId);
+      if (!pending?.retainUntilContextChange) registrations.delete(registrationId);
       if (registrations.size === 0) pendingPublisherCodes.delete(adUnitCode);
     }
   }
@@ -882,7 +890,8 @@ function removePendingPublisherBidsForCode(adUnitCode: string, registrationId?: 
   for (const [adId, pendingBid] of pendingPublisherBids) {
     if (
       pendingBid.adUnitCode === adUnitCode &&
-      (registrationId === undefined || pendingBid.registrationId === registrationId)
+      (registrationId === undefined || pendingBid.registrationId === registrationId) &&
+      (registrationId === undefined || !pendingBid.retainUntilContextChange)
     ) {
       pendingPublisherBids.delete(adId);
       if (pendingBid.firstImpressionToken) {
@@ -892,17 +901,78 @@ function removePendingPublisherBidsForCode(adUnitCode: string, registrationId?: 
   }
 }
 
+function pendingPublisherContextIsCurrent(
+  pending: PendingPublisherBid | PendingPublisherCode
+): boolean {
+  return (
+    pending.generation === (window.tsjs?.navGeneration ?? 0) &&
+    pending.element.isConnected &&
+    document.getElementById(pending.element.id) === pending.element &&
+    resolvePublisherDeliveryElement(pending.adUnitCode) === pending.element
+  );
+}
+
+function resolvePublisherDeliveryElement(adUnitCode: string): HTMLElement | undefined {
+  const direct = resolveFirstImpressionElement(adUnitCode);
+  if (direct) return direct;
+
+  const gpt = (
+    window as unknown as {
+      googletag?: { pubads?(): { getSlots?(): RefreshGptSlot[] } };
+    }
+  ).googletag;
+  const matches = (gpt?.pubads?.().getSlots?.() ?? [])
+    .filter((slot) => {
+      const injectedSlot = findInjectedSlotForRefresh(slot);
+      return refreshSlotElementId(slot) === adUnitCode || injectedSlot?.div_id === adUnitCode;
+    })
+    .map((slot) => {
+      const elementId = refreshSlotElementId(slot);
+      return elementId ? document.getElementById(elementId) : null;
+    })
+    .filter((element): element is HTMLElement => Boolean(element?.isConnected));
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function pendingPublisherContextMatchesSlot(
+  pending: PendingPublisherBid | PendingPublisherCode,
+  slot: RefreshGptSlot
+): boolean {
+  if (!pendingPublisherContextIsCurrent(pending)) return false;
+  const injectedSlot = findInjectedSlotForRefresh(slot);
+  return [refreshSlotElementId(slot), injectedSlot?.div_id]
+    .filter((code): code is string => typeof code === 'string' && code.length > 0)
+    .some((code) => {
+      const exact = document.getElementById(code);
+      return (
+        exact === pending.element ||
+        Boolean(exact && (pending.element.contains(exact) || exact.contains(pending.element))) ||
+        resolvePublisherDeliveryElement(code) === pending.element
+      );
+    });
+}
+
 /** Discard delivery state that outlived the publisher auction which created it. */
 function prunePendingPublisherBids(now = Date.now()): void {
   for (const [adUnitCode, registrations] of pendingPublisherCodes) {
     for (const [registrationId, pendingCode] of registrations) {
-      if (pendingCode.expiresAt <= now) registrations.delete(registrationId);
+      if (
+        !pendingPublisherContextIsCurrent(pendingCode) ||
+        (pendingCode.expiresAt <= now && !pendingCode.retainUntilContextChange)
+      ) {
+        registrations.delete(registrationId);
+      }
     }
     if (registrations.size === 0) pendingPublisherCodes.delete(adUnitCode);
   }
 
   for (const [adId, pendingBid] of pendingPublisherBids) {
-    if (pendingBid.expiresAt <= now) pendingPublisherBids.delete(adId);
+    if (
+      !pendingPublisherContextIsCurrent(pendingBid) ||
+      (pendingBid.expiresAt <= now && !pendingBid.retainUntilContextChange)
+    ) {
+      pendingPublisherBids.delete(adId);
+    }
   }
 }
 
@@ -915,8 +985,14 @@ function storePendingPublisherCode(pendingCode: PendingPublisherCode): void {
   let registrationCount = 0;
   for (const pending of pendingPublisherCodes.values()) registrationCount += pending.size;
   if (registrationCount > MAX_PENDING_PUBLISHER_BIDS) {
-    const oldestCode = pendingPublisherCodes.keys().next().value;
-    if (oldestCode !== undefined) removePendingPublisherBidsForCode(oldestCode);
+    for (const [adUnitCode, pendingRegistrations] of pendingPublisherCodes) {
+      const evictable = [...pendingRegistrations.values()].find(
+        (pending) => !pending.retainUntilContextChange
+      );
+      if (!evictable) continue;
+      removePendingPublisherBidsForCode(adUnitCode, evictable.registrationId);
+      break;
+    }
   }
 }
 
@@ -968,11 +1044,21 @@ function registerPendingPublisherBids(
   const responseAdIds = publisherResponseAdIds(publisherAdUnitCodes, bidResponses);
 
   for (const adUnitCode of publisherAdUnitCodes) {
+    const element = resolvePublisherDeliveryElement(adUnitCode);
+    if (!element) continue;
     const firstImpressionToken = firstImpressionTokens.get(adUnitCode);
+    const retainUntilContextChange = Boolean(
+      firstImpressionToken &&
+      window.tsjs &&
+      firstImpressionClaim(window.tsjs, element)?.owner === 'trusted_server'
+    );
     storePendingPublisherCode({
       adUnitCode,
       expiresAt,
       registrationId,
+      generation: window.tsjs?.navGeneration ?? 0,
+      element,
+      retainUntilContextChange,
       firstImpressionToken,
     });
     if (firstImpressionToken && window.tsjs) {
@@ -985,12 +1071,22 @@ function registerPendingPublisherBids(
   }
 
   for (const [adUnitCode, adIds] of responseAdIds) {
+    const element = resolvePublisherDeliveryElement(adUnitCode);
+    if (!element) continue;
     const firstImpressionToken = firstImpressionTokens.get(adUnitCode);
+    const retainUntilContextChange = Boolean(
+      firstImpressionToken &&
+      window.tsjs &&
+      firstImpressionClaim(window.tsjs, element)?.owner === 'trusted_server'
+    );
     for (const adId of adIds) {
       storePendingPublisherBid(adId, {
         adUnitCode,
         expiresAt,
         registrationId,
+        generation: window.tsjs?.navGeneration ?? 0,
+        element,
+        retainUntilContextChange,
         firstImpressionToken,
       });
     }
@@ -1016,17 +1112,23 @@ function publisherDeliverySlots(targetSlots: RefreshGptSlot[]): PublisherDeliver
       ? adIds
           .filter((adId): adId is string => typeof adId === 'string' && adId.length > 0)
           .map((adId) => pendingPublisherBids.get(adId))
-          .find((bid): bid is PendingPublisherBid => bid !== undefined)
+          .find(
+            (bid): bid is PendingPublisherBid =>
+              bid !== undefined && pendingPublisherContextMatchesSlot(bid, slot)
+          )
       : undefined;
     const hasAdId =
       Array.isArray(adIds) && adIds.some((adId) => typeof adId === 'string' && adId.length > 0);
     const injectedSlot = findInjectedSlotForRefresh(slot);
-    const pendingCode = hasAdId
-      ? undefined
-      : [refreshSlotElementId(slot), injectedSlot?.div_id]
-          .filter((code): code is string => typeof code === 'string' && code.length > 0)
-          .flatMap((code) => [...(pendingPublisherCodes.get(code)?.values() ?? [])])
-          .sort((left, right) => left.registrationId - right.registrationId)[0];
+    const pendingCode = [refreshSlotElementId(slot), injectedSlot?.div_id]
+      .filter((code): code is string => typeof code === 'string' && code.length > 0)
+      .flatMap((code) => [...(pendingPublisherCodes.get(code)?.values() ?? [])])
+      .filter(
+        (pending) =>
+          pendingPublisherContextMatchesSlot(pending, slot) &&
+          (!hasAdId || pending.retainUntilContextChange)
+      )
+      .sort((left, right) => left.registrationId - right.registrationId)[0];
     const pending = pendingBid ?? pendingCode;
     if (!pending) continue;
 
@@ -1276,7 +1378,22 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
 
     const opts = { ...(requestObj ?? {}) };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const adUnits = ((opts as any).adUnits || pbjs.adUnits || []) as TrustedServerAdUnit[];
+    const explicitAdUnits = (opts as any).adUnits as TrustedServerAdUnit[] | undefined;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const requestedAdUnitCodes = Array.isArray((opts as any).adUnitCodes)
+      ? new Set(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          ((opts as any).adUnitCodes as unknown[]).filter(
+            (code): code is string => typeof code === 'string'
+          )
+        )
+      : undefined;
+    const adUnits = (explicitAdUnits ?? (pbjs.adUnits as TrustedServerAdUnit[]) ?? []).filter(
+      (unit) =>
+        explicitAdUnits !== undefined ||
+        requestedAdUnitCodes === undefined ||
+        requestedAdUnitCodes.has(unit.code ?? '')
+    );
     const isSyntheticRefresh =
       adUnits.length > 0 && adUnits.every((unit) => syntheticRefreshAdUnits.has(unit));
     const publisherAdUnitCodes = new Set(
@@ -1530,7 +1647,12 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       }
 
       const { deliverySlots, suppressedSlots } = publisherDeliverySlots(targetSlots);
-      suppressedSlots.forEach(restoreTrustedServerFirstImpressionTargeting);
+      suppressedSlots.forEach((slot) => {
+        restoreTrustedServerFirstImpressionTargeting(slot);
+        const elementId = refreshSlotElementId(slot);
+        const handoff = elementId ? window.tsjs?.gptSlotHandoffs?.[elementId] : undefined;
+        if (handoff?.suppressPublisherRefresh) handoff.suppressPublisherRefresh = false;
+      });
       const remainingSlots = targetSlots.filter((slot) => !suppressedSlots.has(slot));
       if (remainingSlots.length === 0) return;
       const forwardedSlots = suppressedSlots.size > 0 ? remainingSlots : slots;
@@ -1551,7 +1673,7 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         (slot) => !isExcludedFromRefreshAuction(slot, excludedGamAdUnitPathSuffixes)
       );
       if (!auctionSlots.length) {
-        return originalRefresh(slots, opts);
+        return originalRefresh(forwardedSlots, opts);
       }
 
       const adUnits = auctionSlots.map((slot) => {
