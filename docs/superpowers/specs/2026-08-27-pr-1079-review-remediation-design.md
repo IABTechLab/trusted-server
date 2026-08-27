@@ -31,8 +31,24 @@ claim, and correlate only those requested global ad units.
 The Prebid delivery wrapper is the owner of first-impression delivery suppression.
 When it suppresses a GPT slot, it also consumes any equivalent late-handoff
 one-shot flag so the inner GPT wrapper cannot suppress the next legitimate
-refresh. Mixed refresh calls always forward the already-filtered slot list,
-including the path where every remaining slot is excluded from a Prebid auction.
+refresh. When it delegates a permitted GPT request, it consumes that flag at the
+delegation boundary so the inner wrapper cannot silently drop the request. Mixed
+refresh calls always forward the already-filtered slot list, including the path
+where every remaining slot is excluded from a Prebid auction. That all-excluded
+path performs the same ownership registration and consumption synchronously
+before delegating. A bare refresh delayed by an auction becomes an explicit list
+at callback time, preventing slots added after the snapshot from joining it.
+
+A publisher-triggered GPT refresh that starts a synthetic Prebid auction registers
+its own per-slot first-impression tokens before waiting for the asynchronous
+callback. A publisher-first token reserves the slot so TS cannot claim it while
+the auction is pending. A token registered against an earlier TS claim is consumed
+at callback time, filtering that slot from the eventual GPT request. When TS emits
+its first GPT request, registration closes for new losing publisher tokens so
+ordinary later publisher refreshes continue normally. Mixed callbacks forward
+only their unsuppressed slots and scope Prebid targeting to the same filtered set.
+The callback also revalidates the captured navigation generation and exact
+physical element, dropping stale work rather than refreshing a replacement slot.
 
 ## Creative bridge
 

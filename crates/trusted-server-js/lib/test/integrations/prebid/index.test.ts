@@ -204,6 +204,7 @@ import type { AuctionBid } from '../../../src/core/auction';
 import {
   claimFirstImpressionForTrustedServer,
   consumePublisherFirstImpressionDelivery,
+  observeFirstImpressionGptLifecycle,
   registerPublisherFirstImpressionAuctions,
 } from '../../../src/core/first_impression';
 import { log } from '../../../src/core/log';
@@ -2250,7 +2251,7 @@ describe('prebid/installRefreshHandler', () => {
       })
     );
     expect(setTargetingForGPTAsync).toHaveBeenCalledWith(['div-ad-display']);
-    expect(originalRefresh).toHaveBeenCalledWith(undefined, undefined);
+    expect(originalRefresh).toHaveBeenCalledWith(targetSlots, undefined);
 
     mockPbjs.setTargetingForGPTAsync = undefined;
   });
@@ -2756,6 +2757,375 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     expect(consumePublisherFirstImpressionDelivery(ts, token, 5_102)).toBe(true);
 
     element.remove();
+  });
+
+  it('reserves first impression while a publisher refresh auction is pending', () => {
+    const code = 'pending-publisher-refresh-slot';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    let completeRefresh: (() => void) | undefined;
+    mockRequestBids.mockImplementation((opts) => {
+      completeRefresh = opts.bidsBackHandler;
+    });
+    installPrebidNpm();
+
+    pubads.refresh([slot]);
+
+    const ts = (testWindow.tsjs ??= {}) as unknown as TsjsApi;
+    expect(
+      claimFirstImpressionForTrustedServer(ts, document.getElementById(code)!)
+    ).toBeUndefined();
+    expect(originalRefresh).not.toHaveBeenCalled();
+
+    completeRefresh?.();
+
+    expect(originalRefresh).toHaveBeenCalledOnce();
+    expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
+  });
+
+  it('suppresses a delayed publisher refresh when TS already owns first impression', () => {
+    const code = 'pending-ts-owned-refresh-slot';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+      setTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    const ts = (testWindow.tsjs ??= {}) as unknown as TsjsApi;
+    claimFirstImpressionForTrustedServer(ts, document.getElementById(code)!);
+    let completeRefresh: (() => void) | undefined;
+    mockRequestBids.mockImplementation((opts) => {
+      completeRefresh = opts.bidsBackHandler;
+    });
+    installPrebidNpm();
+
+    pubads.refresh([slot]);
+    expect(originalRefresh).not.toHaveBeenCalled();
+
+    completeRefresh?.();
+
+    expect(originalRefresh).not.toHaveBeenCalled();
+  });
+
+  it('filters only the TS-owned slot from a delayed mixed publisher refresh', () => {
+    const tsCode = 'pending-mixed-ts-slot';
+    const publisherCode = 'pending-mixed-publisher-slot';
+    const tsSlot = {
+      getSlotElementId: () => tsCode,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+      setTargeting: vi.fn(),
+    };
+    const publisherSlot = {
+      getSlotElementId: () => publisherCode,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([tsSlot, publisherSlot]);
+    const ts = (testWindow.tsjs ??= {}) as unknown as TsjsApi;
+    claimFirstImpressionForTrustedServer(ts, document.getElementById(tsCode)!);
+    let completeRefresh: (() => void) | undefined;
+    mockRequestBids.mockImplementation((opts) => {
+      completeRefresh = opts.bidsBackHandler;
+    });
+    installPrebidNpm();
+
+    pubads.refresh([tsSlot, publisherSlot]);
+    completeRefresh?.();
+
+    expect(originalRefresh).toHaveBeenCalledOnce();
+    expect(originalRefresh).toHaveBeenCalledWith([publisherSlot], undefined);
+  });
+
+  it('filters a TS-owned excluded slot from a delayed mixed publisher refresh', () => {
+    const eligibleCode = 'pending-mixed-eligible-slot';
+    const excludedCode = 'pending-mixed-excluded-slot';
+    const eligibleSlot = {
+      getSlotElementId: () => eligibleCode,
+      getAdUnitPath: () => '/123/content',
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const excludedSlot = {
+      getSlotElementId: () => excludedCode,
+      getAdUnitPath: () => '/123/trackingonly',
+      getTargeting: () => [],
+      getSizes: () => [[1, 1]],
+      clearTargeting: vi.fn(),
+      setTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([eligibleSlot, excludedSlot]);
+    const ts = (testWindow.tsjs ??= {}) as unknown as TsjsApi;
+    claimFirstImpressionForTrustedServer(ts, document.getElementById(excludedCode)!);
+    testWindow.__tsjs_prebid = { excludedGamAdUnitPathSuffixes: ['/trackingonly'] };
+    let completeRefresh: (() => void) | undefined;
+    mockRequestBids.mockImplementation((opts) => {
+      completeRefresh = opts.bidsBackHandler;
+    });
+    installPrebidNpm();
+
+    pubads.refresh([eligibleSlot, excludedSlot]);
+    completeRefresh?.();
+
+    expect(originalRefresh).toHaveBeenCalledOnce();
+    expect(originalRefresh).toHaveBeenCalledWith([eligibleSlot], undefined);
+  });
+
+  it('drops delayed delivery and auction slots together after SPA navigation', () => {
+    const deliveryCode = 'pending-navigation-delivery-slot';
+    const auctionCode = 'pending-navigation-auction-slot';
+    const deliverySlot = {
+      getSlotElementId: () => deliveryCode,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const auctionSlot = {
+      getSlotElementId: () => auctionCode,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([deliverySlot, auctionSlot]);
+    let completeRefresh: (() => void) | undefined;
+    mockRequestBids.mockImplementation((opts) => {
+      if (opts?.adUnits?.[0]?.code === deliveryCode) {
+        completePublisherAuction(opts);
+      } else {
+        completeRefresh = opts.bidsBackHandler;
+      }
+    });
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: [{ code: deliveryCode, bids: [{ bidder: 'exampleServer', params: {} }] }],
+      bidsBackHandler: () => pubads.refresh([deliverySlot, auctionSlot]),
+    } as unknown as RequestBidsArg);
+    ((testWindow.tsjs ??= {}) as unknown as TsjsApi).navGeneration = 1;
+    completeRefresh?.();
+
+    expect(originalRefresh).not.toHaveBeenCalled();
+  });
+
+  it('drops a delayed publisher refresh after SPA navigation', () => {
+    const code = 'pending-previous-navigation-refresh-slot';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    let completeRefresh: (() => void) | undefined;
+    mockRequestBids.mockImplementation((opts) => {
+      completeRefresh = opts.bidsBackHandler;
+    });
+    installPrebidNpm();
+
+    pubads.refresh([slot]);
+    ((testWindow.tsjs ??= {}) as unknown as TsjsApi).navGeneration = 1;
+    completeRefresh?.();
+
+    expect(originalRefresh).not.toHaveBeenCalled();
+  });
+
+  it('drops a delayed publisher refresh after physical element replacement', () => {
+    const code = 'pending-replaced-refresh-slot';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    let completeRefresh: (() => void) | undefined;
+    mockRequestBids.mockImplementation((opts) => {
+      completeRefresh = opts.bidsBackHandler;
+    });
+    installPrebidNpm();
+
+    pubads.refresh([slot]);
+    document.getElementById(code)?.remove();
+    const replacement = document.createElement('div');
+    replacement.id = code;
+    document.body.appendChild(replacement);
+    completeRefresh?.();
+
+    expect(originalRefresh).not.toHaveBeenCalled();
+  });
+
+  it('keeps a delayed bare refresh scoped to its captured slot list', () => {
+    const firstCode = 'pending-bare-first-slot';
+    const laterCode = 'pending-bare-later-slot';
+    const firstSlot = {
+      getSlotElementId: () => firstCode,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const laterSlot = {
+      getSlotElementId: () => laterCode,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const slots = [firstSlot];
+    const { originalRefresh, pubads } = installGpt(slots);
+    let completeRefresh: (() => void) | undefined;
+    mockRequestBids.mockImplementation((opts) => {
+      completeRefresh = opts.bidsBackHandler;
+    });
+    installPrebidNpm();
+
+    pubads.refresh();
+    slots.push(laterSlot);
+    completeRefresh?.();
+
+    expect(originalRefresh).toHaveBeenCalledOnce();
+    expect(originalRefresh).toHaveBeenCalledWith([firstSlot], undefined);
+  });
+
+  it('allows publisher refreshes that start after the TS first impression request', () => {
+    const code = 'requested-ts-owned-refresh-slot';
+    const element = document.createElement('div');
+    element.id = code;
+    document.body.appendChild(element);
+    const ts = {} as TsjsApi;
+    claimFirstImpressionForTrustedServer(ts, element);
+    observeFirstImpressionGptLifecycle(ts, element, 'requested');
+
+    expect(registerPublisherFirstImpressionAuctions(ts, [code])).toEqual(new Map());
+    expect(ts.firstImpression?.slots[code]?.publisherRegistrationClosed).toBe(true);
+  });
+
+  it('clears a stale GPT handoff when delegating a post-request publisher refresh', () => {
+    const code = 'post-request-handoff-slot';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    installedGptSlots = [slot];
+    const nativeRefresh = vi.fn();
+    const ts = (testWindow.tsjs = {} as unknown as PrebidTestWindow['tsjs']) as unknown as TsjsApi;
+    const handoff = {
+      gamUnitPath: '/123/post-request',
+      formats: [[300, 250] as [number, number]],
+      divIdPrefix: code,
+      slotElementId: code,
+      publisherClaimed: true,
+      suppressPublisherDisplay: false,
+      suppressPublisherRefresh: true,
+    };
+    ts.gptSlotHandoffs = { [code]: handoff };
+    const innerRefresh = vi.fn((slots?: (typeof slot)[]) => {
+      if (handoff.suppressPublisherRefresh) {
+        handoff.suppressPublisherRefresh = false;
+        return;
+      }
+      nativeRefresh(slots);
+    });
+    const pubads = { refresh: innerRefresh, getSlots: () => [slot] };
+    testWindow.googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    const element = document.createElement('div');
+    element.id = code;
+    document.body.appendChild(element);
+    claimFirstImpressionForTrustedServer(ts, element);
+    observeFirstImpressionGptLifecycle(ts, element, 'requested');
+    installRefreshHandler(640);
+    mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
+    installPrebidNpm();
+
+    pubads.refresh([slot]);
+
+    expect(handoff.suppressPublisherRefresh).toBe(false);
+    expect(nativeRefresh).toHaveBeenCalledWith([slot]);
+  });
+
+  it('suppresses an all-excluded refresh while the TS first impression is pending', () => {
+    const code = 'pending-all-excluded-slot';
+    const slot = {
+      getSlotElementId: () => code,
+      getAdUnitPath: () => '/123/trackingonly',
+      getTargeting: () => [],
+      getSizes: () => [[1, 1]],
+      clearTargeting: vi.fn(),
+      setTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    const ts = (testWindow.tsjs ??= {}) as unknown as TsjsApi;
+    claimFirstImpressionForTrustedServer(ts, document.getElementById(code)!);
+    testWindow.__tsjs_prebid = { excludedGamAdUnitPathSuffixes: ['/trackingonly'] };
+    installPrebidNpm();
+
+    pubads.refresh([slot]);
+
+    expect(mockRequestBids).not.toHaveBeenCalled();
+    expect(originalRefresh).not.toHaveBeenCalled();
+  });
+
+  it('delegates an all-excluded refresh after the TS first impression request', () => {
+    const code = 'requested-all-excluded-slot';
+    const slot = {
+      getSlotElementId: () => code,
+      getAdUnitPath: () => '/123/trackingonly',
+      getTargeting: () => [],
+      getSizes: () => [[1, 1]],
+      clearTargeting: vi.fn(),
+    };
+    installedGptSlots = [slot];
+    const nativeRefresh = vi.fn();
+    const ts = (testWindow.tsjs = {} as unknown as PrebidTestWindow['tsjs']) as unknown as TsjsApi;
+    const handoff = {
+      gamUnitPath: '/123/trackingonly',
+      formats: [[1, 1] as [number, number]],
+      divIdPrefix: code,
+      slotElementId: code,
+      publisherClaimed: true,
+      suppressPublisherDisplay: false,
+      suppressPublisherRefresh: true,
+    };
+    ts.gptSlotHandoffs = { [code]: handoff };
+    const innerRefresh = vi.fn((slots?: (typeof slot)[]) => {
+      if (handoff.suppressPublisherRefresh) {
+        handoff.suppressPublisherRefresh = false;
+        return;
+      }
+      nativeRefresh(slots);
+    });
+    const pubads = { refresh: innerRefresh, getSlots: () => [slot] };
+    testWindow.googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    const element = document.createElement('div');
+    element.id = code;
+    document.body.appendChild(element);
+    claimFirstImpressionForTrustedServer(ts, element);
+    observeFirstImpressionGptLifecycle(ts, element, 'requested');
+    testWindow.__tsjs_prebid = { excludedGamAdUnitPathSuffixes: ['/trackingonly'] };
+    installRefreshHandler(640);
+    installPrebidNpm();
+
+    pubads.refresh([slot]);
+
+    expect(mockRequestBids).not.toHaveBeenCalled();
+    expect(handoff.suppressPublisherRefresh).toBe(false);
+    expect(nativeRefresh).toHaveBeenCalledWith([slot]);
   });
 
   it('consumes late-handoff suppression when Prebid suppresses the same delivery', () => {
@@ -3784,7 +4154,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     expect(coveredSlot.clearTargeting).not.toHaveBeenCalled();
     expect(gamOnlySlot.clearTargeting).toHaveBeenCalledWith('hb_adid');
     expect(originalRefresh).toHaveBeenCalledTimes(1);
-    expect(originalRefresh).toHaveBeenCalledWith(undefined, undefined);
+    expect(originalRefresh).toHaveBeenCalledWith([coveredSlot, gamOnlySlot], undefined);
   });
 
   it('keeps explicit unrelated lists synthetic and partitions mixed delivery lists', () => {
