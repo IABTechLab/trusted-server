@@ -192,11 +192,11 @@ Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. 
 
 Resolve endpoint for client-side Edge Cookie providers. The page posts a value that the provider verifies and creates the Edge Cookie value. Used only when a client-side provider is selected (for example the `client-fixed` demo). Server-side providers such as HMAC do not use it.
 
-**Auth:** None. This is a first-party POST from the page. The provider is responsible for verifying the posted value before trusting it.
+**Auth:** None, but the request must carry an `Origin` on the publisher's own domain (a foreign or missing `Origin` answers `403`). This is a first-party POST from the page. The provider is responsible for verifying the posted value before trusting it.
 
 **Request Body:** the provider's value, opaque to the core. For the `client-fixed` demo this is the fixed known word sent as `text/plain`.
 
-**Behavior:** gated by the [permission model](/guide/permission-model) exactly like organic generation. On success the EC cookie is set on this response (`HttpOnly`, `Secure`, `SameSite=Lax`) and the status is `200`. When the gate is closed, no client-side provider is configured, or the provider produces no identifier, the response is `204` with no cookie. An oversized body is rejected with `413`.
+**Behavior:** gated by the [permission model](/guide/permission-model) exactly like organic generation. On success the identifier is written to the identity graph first, then the EC cookie is set on this response (`HttpOnly`, `Secure`, `SameSite=Lax`) together with the `ts-ecr` marker cookie the page script can read, and the status is `200`. When the gate is closed, no client-side provider is configured, no identity graph is available, or the provider produces no identifier, the response is `204` with no cookie. Rejections: `403` for a missing or foreign `Origin`, `415` for a content type other than `text/plain` or `application/json`, `413` for an oversized body, `400` when the minted identifier is outside the identifier bounds, `409` when the request already carries a different identity, and `503` when the identity-graph write fails. Every response the handler builds carries `Cache-Control: no-store`.
 
 ---
 
@@ -610,7 +610,7 @@ The examples below use fictional IDs and values only.
 
 ### GET /\_ts/admin/ec/`{id}`
 
-Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID in `{64 lowercase hex}.{6 alphanumeric}` format. The bare route uses the request's `ts-ec` cookie.
+Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID in `{64 lowercase hex}.{6 alphanumeric}` format, with or without the `hmac~` provider-code prefix a minted identifier carries. The bare route uses the request's `ts-ec` cookie.
 
 This lookup is implemented only by the Fastly adapter because the identity graph is stored in Fastly KV. Other adapters return `501 Not Implemented`.
 

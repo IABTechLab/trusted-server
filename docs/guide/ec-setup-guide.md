@@ -91,13 +91,13 @@ curl -si "${TS_BASE_URL}/" \
 
 Look for:
 
-- `Set-Cookie: ts-ec=<64hex.6chars>`
+- `Set-Cookie: ts-ec=hmac~<64hex.6chars>` (the `hmac~` prefix is the provider code; pre-series cookies without it still resolve)
 
 ## 5) Batch Sync (S2S)
 
 Endpoint: `POST /_ts/api/v1/batch-sync`
 
-Important: request field is `ec_id` (full `{64hex}.{6alnum}` value). The `timestamp` field remains required for API compatibility, but it no longer orders writes because EC identity entries do not store per-partner sync timestamps. Valid mappings are idempotent last-write-wins: unchanged UIDs are accepted without a write, and different UIDs replace the stored value.
+Important: request field is `ec_id` (the full value as issued, `hmac~{64hex}.{6alnum}`; the bare pre-series form is also accepted). The `timestamp` field remains required for API compatibility, but it no longer orders writes because EC identity entries do not store per-partner sync timestamps. Valid mappings are idempotent last-write-wins: unchanged UIDs are accepted without a write, and different UIDs replace the stored value.
 
 ```bash
 BATCH_UID="${PARTNER_UID}-batch"

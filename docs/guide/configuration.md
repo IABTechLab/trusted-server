@@ -512,14 +512,14 @@ Settings for Edge Cookie identifier generation. The `ec_store` KV store is the o
 
 ### `[ec]`
 
-| Field                     | Type           | Required | Description                                                                                               |
-| ------------------------- | -------------- | -------- | --------------------------------------------------------------------------------------------------------- |
-| `provider`                | String or null | No       | Key of the active Edge Cookie provider, for example `"hmac"`. Omit to run statelessly with no Edge Cookie |
-| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                           |
-| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response                                                |
-| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                                                       |
-| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps                                   |
-| `partners`                | Array          | No       | Static partner registry entries                                                                           |
+| Field                     | Type           | Required | Description                                                                                                                                                                                                                                    |
+| ------------------------- | -------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `provider`                | String or null | No       | Key of the active Edge Cookie provider: `"hmac"` (built-in), `"host-signals"` (opt-in), or `"none"` (explicitly stateless). Omit to run statelessly with no Edge Cookie. The `"client-fixed"` demo needs the `client-fixed-demo` build feature |
+| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                                                                                                                                                                |
+| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response                                                                                                                                                                                     |
+| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                                                                                                                                                                                            |
+| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps                                                                                                                                                                        |
+| `partners`                | Array          | No       | Static partner registry entries                                                                                                                                                                                                                |
 
 The selected `provider` must have a matching `[ec.providers.<key>]` block. Selecting a provider with no configured block, or an unknown key, fails at startup.
 
@@ -625,7 +625,7 @@ Selects how a client IP is resolved into geolocation (country, region, coordinat
 
 | Field                        | Type           | Required        | Description                                                                                                                                                                                                                                                                                                                    |
 | ---------------------------- | -------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `provider`                   | String or null | No              | Key of the geo provider. Omit to resolve no location and make no host geo call. Set `platform` to use the host's own geo lookup.                                                                                                                                                                                               |
+| `provider`                   | String or null | No              | Key of the geo provider. Omit, or set `none`, to resolve no location and make no host geo call. Set `platform` to use the host's own geo lookup.                                                                                                                                                                               |
 | `default_country`            | String         | Yes             | Country (`US`) or country/region (`US/CA`) whose `permissions.yaml` rule applies when geo returns no country, or a country/region with no rule. Required, so there is always a default permission set and startup fails when unset. Validated at startup.                                                                      |
 | `assume_single_jurisdiction` | Boolean        | See description | With no geo provider, every request is treated as `default_country`. A deployment that runs an Edge Cookie provider without a geo provider must set this to `true`, acknowledging single-jurisdiction operation; startup fails otherwise. Not needed when a geo provider is selected or no Edge Cookie provider is configured. |
 
@@ -843,7 +843,7 @@ Startup fails when no handler covers an admin route. The dynamic
 `/_ts/admin/ec/{id}` route accepts any segment after `/_ts/admin/ec/`, and
 Basic Auth runs on the raw path before routing, so coverage cannot be inferred
 from ID-shaped samples: a pattern such as
-`^/_ts/admin/ec/[a-f0-9]{64}[.][A-Za-z0-9]{6}$` is rejected. Use a prefix-level
+`^/_ts/admin/ec/hmac~[a-f0-9]{64}[.][A-Za-z0-9]{6}$` is rejected. Use a prefix-level
 matcher (`^/_ts/admin`, or `^/_ts/admin/ec/` alongside the other admin
 patterns).
 
