@@ -8,14 +8,23 @@ const SCROLL_STEP_DELAY: Duration = Duration::from_millis(250);
 const SCROLL_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A best-effort browser scroll operation that could not be completed.
-#[derive(Debug, derive_more::Display)]
+#[derive(Debug)]
 pub(crate) enum ScrollFailure {
     /// Chrome rejected the page evaluation.
-    #[display("browser page evaluation failed: {_0}")]
     Evaluation(String),
     /// Chrome did not complete the page evaluation within the operation bound.
-    #[display("browser page evaluation timed out")]
     Timeout,
+}
+
+impl std::fmt::Display for ScrollFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Evaluation(message) => {
+                write!(formatter, "browser page evaluation failed: {message}")
+            }
+            Self::Timeout => formatter.write_str("browser page evaluation timed out"),
+        }
+    }
 }
 
 impl ScrollFailure {
@@ -48,5 +57,22 @@ async fn evaluate(page: &Page, expression: String, failures: &mut Vec<ScrollFail
         Ok(Ok(_)) => {}
         Ok(Err(error)) => failures.push(ScrollFailure::Evaluation(error.to_string())),
         Err(_) => failures.push(ScrollFailure::Timeout),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ScrollFailure;
+
+    #[test]
+    fn scroll_failures_have_stable_messages() {
+        assert_eq!(
+            ScrollFailure::Evaluation("execution context was destroyed".to_string()).to_string(),
+            "browser page evaluation failed: execution context was destroyed"
+        );
+        assert_eq!(
+            ScrollFailure::Timeout.to_string(),
+            "browser page evaluation timed out"
+        );
     }
 }
