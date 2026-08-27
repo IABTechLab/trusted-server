@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::str::FromStr as _;
 use std::sync::Arc;
 
@@ -13,18 +13,28 @@ use crate::auction::plan::{
     AuctionPlan, AuctionPlanConfig, BidderRouteConfig, NotificationConfig, ProviderConfig,
     ProviderId, RoutingMode,
 };
+use crate::auction::provider::{GenericOpenRtbProvider, ProviderRequestOutcome};
 use crate::auction::routing::route_auction;
 use crate::auction::test_support::canonical_parity_auction_request;
 use crate::auction::types::{AdFormat, AdSlot, BidStatus, MediaType};
 use crate::consent::jurisdiction::Jurisdiction;
 use crate::consent::{ConsentContext, ConsentSource};
+use crate::platform::PlatformHttpClient;
 use crate::platform::test_support::{
     HashMapConfigStore, HashMapSecretStore, NoopHttpClient, StubBackend, StubHttpClient,
-    build_services_with_config_secret_and_http_client,
+    build_services_with_backend_and_http_client, build_services_with_config_secret_and_http_client,
 };
 use crate::request_signing::RequestSigner;
 
 fn config(profile: &str, profile_config: Value) -> AuctionPlanConfig {
+    config_with_endpoint(
+        profile,
+        profile_config,
+        "https://exchange.example.test/openrtb",
+    )
+}
+
+fn config_with_endpoint(profile: &str, profile_config: Value, endpoint: &str) -> AuctionPlanConfig {
     AuctionPlanConfig {
         timeout_ms: 321,
         providers: BTreeMap::from([(
@@ -32,7 +42,7 @@ fn config(profile: &str, profile_config: Value) -> AuctionPlanConfig {
             ProviderConfig {
                 protocol: "openrtb-2.6".to_string(),
                 profile: profile.to_string(),
-                endpoint: "https://exchange.example.test/openrtb".to_string(),
+                endpoint: endpoint.to_string(),
                 timeout_ms: Some(321),
                 routing: RoutingMode::AllEligible,
                 notifications: NotificationConfig::default(),
@@ -1057,6 +1067,78 @@ fn fictional_standard_executor_covers_bid_no_bid_malformed_unused_and_redirect()
         let spec = provider.backend_spec();
         assert_eq!(spec.host, "exchange.example.test");
         assert_eq!(spec.discriminator.as_deref(), Some("fictional-provider"));
+    });
+}
+
+#[test]
+fn prebid_endpoint_normalization_reaches_generic_execution_and_preserves_custom_paths() {
+    futures::executor::block_on(async {
+        for (configured_endpoint, expected_endpoint) in [
+            (
+                "https://pbs.example",
+                "https://pbs.example/openrtb2/auction",
+            ),
+            ("https://pbs.example/bid", "https://pbs.example/bid"),
+        ] {
+            let plan = AuctionPlan::compile(config_with_endpoint(
+                "prebid-server",
+                json!({}),
+                configured_endpoint,
+            ))
+            .expect("should compile Prebid Server endpoint");
+            let inbound = Request::builder()
+                .uri("https://publisher.example/auction")
+                .body(EdgeBody::empty())
+                .expect("should build inbound request");
+            let routed = route_auction(canonical_parity_auction_request(), &inbound, &plan, None);
+            let provider_plan = plan.providers()[0].clone();
+            let provider = GenericOpenRtbProvider::new(provider_plan.clone());
+            let client = Arc::new(StubHttpClient::new());
+            client.push_response(204, Vec::new());
+            let services = build_services_with_backend_and_http_client(
+                Arc::new(StubBackend),
+                Arc::clone(&client) as Arc<dyn PlatformHttpClient>,
+            );
+            let mut reserved_backend_names = HashSet::new();
+
+            let outcome = provider
+                .request_bids_routed(
+                    &routed.inputs()[0],
+                    &routed,
+                    321,
+                    321,
+                    None,
+                    &services,
+                    &mut reserved_backend_names,
+                )
+                .await
+                .expect("should launch one Prebid Server request");
+            let ProviderRequestOutcome::Pending { request, .. } = outcome else {
+                panic!("should launch a pending Prebid Server request");
+            };
+            let selected = services
+                .http_client()
+                .select(vec![request])
+                .await
+                .expect("should select one Prebid Server response");
+            let response = selected
+                .ready
+                .expect("should receive the Prebid Server response");
+
+            assert_eq!(response.response.status(), http::StatusCode::NO_CONTENT);
+            assert_eq!(client.recorded_backend_names(), vec!["stub-backend"]);
+            assert_eq!(client.recorded_request_methods(), vec!["POST"]);
+            assert_eq!(client.recorded_request_uris(), vec![expected_endpoint]);
+            assert_eq!(provider_plan.backend_spec().host, "pbs.example");
+            let body: Value = serde_json::from_slice(&client.recorded_request_bodies()[0])
+                .expect("should parse recorded Prebid Server body");
+            assert!(
+                !body
+                    .as_object()
+                    .expect("should serialize an object")
+                    .is_empty()
+            );
+        }
     });
 }
 

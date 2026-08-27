@@ -587,8 +587,19 @@ fn canonicalize_endpoint(
             "provider `{provider_id}` uses unsupported legacy APS endpoint `/e/dtb/bid`"
         )));
     }
+    if profile_id == "prebid-server" {
+        normalize_prebid_server_endpoint(&mut endpoint);
+    }
     endpoint.set_fragment(None);
     Ok(CanonicalProviderEndpoint(endpoint))
+}
+
+fn normalize_prebid_server_endpoint(endpoint: &mut Url) {
+    match endpoint.path() {
+        "" | "/" => endpoint.set_path("/openrtb2/auction"),
+        "/openrtb2/auction/" => endpoint.set_path("/openrtb2/auction"),
+        _ => {}
+    }
 }
 
 fn compile_notifications(
@@ -1082,6 +1093,66 @@ mod tests {
         aps.endpoint = "https://aps.example/e/dtb/bid".to_string();
         aps.profile_config = serde_json::json!({"account_id": "example-account"});
         assert!(AuctionPlan::compile(config(BTreeMap::from([(id("aps"), aps)]))).is_err());
+    }
+
+    #[test]
+    fn compiler_normalizes_only_prebid_server_origin_and_canonical_paths() {
+        for (configured, expected) in [
+            (
+                "https://pbs.example",
+                "https://pbs.example/openrtb2/auction",
+            ),
+            (
+                "https://pbs.example/",
+                "https://pbs.example/openrtb2/auction",
+            ),
+            (
+                "https://pbs.example/openrtb2/auction",
+                "https://pbs.example/openrtb2/auction",
+            ),
+            (
+                "https://pbs.example/openrtb2/auction/",
+                "https://pbs.example/openrtb2/auction",
+            ),
+            (
+                "https://pbs.example?region=example",
+                "https://pbs.example/openrtb2/auction?region=example",
+            ),
+            ("https://pbs.example/bid", "https://pbs.example/bid"),
+            (
+                "https://pbs.example/custom/pbs",
+                "https://pbs.example/custom/pbs",
+            ),
+        ] {
+            let mut pbs = provider("prebid-server");
+            pbs.endpoint = configured.to_string();
+            let plan = AuctionPlan::compile(config(BTreeMap::from([(id("pbs"), pbs)])))
+                .expect("should compile Prebid Server endpoint");
+            assert_eq!(
+                plan.providers()[0].endpoint.as_str(),
+                expected,
+                "{configured}"
+            );
+        }
+
+        let mut standard = provider("standard");
+        standard.endpoint = "https://bid.example/".to_string();
+        let plan = AuctionPlan::compile(config(BTreeMap::from([(id("standard"), standard)])))
+            .expect("should compile standard root endpoint");
+        assert_eq!(
+            plan.providers()[0].endpoint.as_str(),
+            "https://bid.example/"
+        );
+
+        let mut aps = provider("aps");
+        aps.endpoint = "https://aps.example/e/pb/bid".to_string();
+        aps.profile_config = serde_json::json!({"account_id": "example-account"});
+        let plan = AuctionPlan::compile(config(BTreeMap::from([(id("aps"), aps)])))
+            .expect("should compile APS endpoint");
+        assert_eq!(
+            plan.providers()[0].endpoint.as_str(),
+            "https://aps.example/e/pb/bid"
+        );
     }
 
     #[test]

@@ -97,6 +97,11 @@ Common fields are `protocol`, `profile`, required HTTPS `endpoint`, optional
 an explicit provider value overrides it, and the remaining auction budget caps
 runtime `tmax`.
 
+When migrating an origin-only legacy `server_url`, use that origin as the
+provider `endpoint`. The compiler adds `/openrtb2/auction` and preserves query
+parameters. A configured non-root path, such as `/bid` or `/custom/pbs`, stays
+exact. `/openrtb2/auction/` is normalized to `/openrtb2/auction`.
+
 The typed `profile_config` fields are:
 
 | Field                      | Default | Behavior                                            |
