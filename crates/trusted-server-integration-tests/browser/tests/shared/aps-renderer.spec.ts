@@ -285,6 +285,14 @@ window.ucTag.renderAd(document, { adId: ${JSON.stringify(adId)}, pubUrl: ${JSON.
                 const slot = document.getElementById("div-aps")!;
                 slot.style.width = "1px";
                 slot.style.height = "1px";
+                const outerShell = document.createElement("div");
+                outerShell.id = "aps-outer-shell";
+                outerShell.style.width = "1px";
+                outerShell.style.height = "1px";
+                const innerShell = document.createElement("div");
+                innerShell.id = "aps-inner-shell";
+                innerShell.style.width = "1px";
+                innerShell.style.height = "1px";
                 const frame = document.createElement("iframe");
                 frame.id = "google_ads_iframe_fictional_0";
                 frame.width = "1";
@@ -292,7 +300,9 @@ window.ucTag.renderAd(document, { adId: ${JSON.stringify(adId)}, pubUrl: ${JSON.
                 frame.style.width = "1px";
                 frame.style.height = "1px";
                 frame.src = outerUrl;
-                slot.appendChild(frame);
+                innerShell.appendChild(frame);
+                outerShell.appendChild(innerShell);
+                slot.appendChild(outerShell);
 
                 const other = document.getElementById("div-other")!;
                 const otherFrame = document.createElement("iframe");
@@ -333,6 +343,22 @@ window.ucTag.renderAd(document, { adId: ${JSON.stringify(adId)}, pubUrl: ${JSON.
         );
         await expect(page.locator("#div-aps")).toHaveCSS("width", "300px");
         await expect(page.locator("#div-aps")).toHaveCSS("height", "250px");
+        await expect(page.locator("#aps-outer-shell")).toHaveCSS(
+            "width",
+            "300px",
+        );
+        await expect(page.locator("#aps-outer-shell")).toHaveCSS(
+            "height",
+            "250px",
+        );
+        await expect(page.locator("#aps-inner-shell")).toHaveCSS(
+            "width",
+            "300px",
+        );
+        await expect(page.locator("#aps-inner-shell")).toHaveCSS(
+            "height",
+            "250px",
+        );
         await expect(page.locator("#div-other iframe")).toHaveCSS(
             "width",
             "1px",
