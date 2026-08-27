@@ -1,3 +1,4 @@
+import { resolveSlotElementByDivId } from './slot_element';
 import type {
   FirstImpressionPhase,
   FirstImpressionPublisherAuction,
@@ -25,7 +26,9 @@ function claimMatchesElement(
     claim.generation === generation &&
     claim.slotElementId === element.id &&
     claim.element === element &&
-    element.isConnected
+    element.ownerDocument === document &&
+    element.isConnected &&
+    document.getElementById(element.id) === element
   );
 }
 
@@ -56,16 +59,25 @@ function pruneFirstImpressionState(ts: TsjsApi, now = Date.now()): FirstImpressi
   state.slots ??= {};
   state.fallbackSlots ??= {};
   for (const [elementId, claim] of Object.entries(state.slots)) {
-    if (!claimMatchesElement(claim, claim.element, generation)) {
+    if (
+      claim.slotElementId !== elementId ||
+      !claimMatchesElement(claim, claim.element, generation)
+    ) {
       delete state.slots[elementId];
       continue;
     }
+    const hasReservedFallback =
+      claim.owner === 'publisher' &&
+      (claim.phase === 'auctioning' || claim.phase === 'delivery_pending') &&
+      state.fallbackSlots[elementId] === claim.element;
     for (const [token, auction] of Object.entries(claim.publisherAuctions)) {
       // A TS-owned losing publisher auction remains a fail-closed tombstone for
-      // this physical element and navigation. Its callback can arrive long after
-      // the nominal auction lease and must never become an unrelated refresh.
+      // this physical element and navigation. Publisher registrations also stay
+      // intact while an expired claim is waiting to transition to its reserved
+      // TS fallback, so an overlapping late callback cannot escape suppression.
       if (
         auction.expiresAt <= now &&
+        !hasReservedFallback &&
         !(claim.owner === 'trusted_server' && auction.suppressDelivery)
       ) {
         removePublisherAuction(state, claim, token, now);
@@ -75,7 +87,8 @@ function pruneFirstImpressionState(ts: TsjsApi, now = Date.now()): FirstImpressi
       claim.owner === 'publisher' &&
       (claim.phase === 'auctioning' || claim.phase === 'delivery_pending') &&
       Object.keys(claim.publisherAuctions).length === 0 &&
-      claim.expiresAt <= now
+      claim.expiresAt <= now &&
+      !hasReservedFallback
     ) {
       delete state.slots[elementId];
     }
@@ -92,31 +105,9 @@ function pruneFirstImpressionState(ts: TsjsApi, now = Date.now()): FirstImpressi
   return state;
 }
 
-function activePhysicalElement(element: HTMLElement | null): HTMLElement | undefined {
-  return element?.isConnected && element.id ? element : undefined;
-}
-
-function visibleThroughAncestors(element: HTMLElement): boolean {
-  for (let current: HTMLElement | null = element; current; current = current.parentElement) {
-    const style = window.getComputedStyle(current);
-    if (style.display === 'none' || style.visibility === 'hidden') return false;
-  }
-  return true;
-}
-
-/** Resolve a publisher ad-unit code to one exact active physical slot element. */
+/** Resolve a publisher ad-unit code with the same contract GPT uses. */
 export function resolveFirstImpressionElement(adUnitCode: string): HTMLElement | undefined {
-  if (!adUnitCode) return undefined;
-  const exact = activePhysicalElement(document.getElementById(adUnitCode));
-  if (exact) return exact;
-
-  const matches = Array.from(document.querySelectorAll<HTMLElement>('[id]')).filter(
-    (element) =>
-      element.id.startsWith(adUnitCode) &&
-      !element.id.endsWith('-container') &&
-      visibleThroughAncestors(element)
-  );
-  return matches.length === 1 ? matches[0] : undefined;
+  return resolveSlotElementByDivId(adUnitCode).element ?? undefined;
 }
 
 /** Return the live ownership claim for an exact slot element. */
@@ -148,7 +139,23 @@ export function claimFirstImpressionForTrustedServer(
 ): FirstImpressionSlotClaim | undefined {
   const state = pruneFirstImpressionState(ts, now);
   const existing = state.slots[element.id];
-  if (existing && claimMatchesElement(existing, element, state.generation)) return undefined;
+  if (existing && claimMatchesElement(existing, element, state.generation)) {
+    const canTransitionPublisherFallback =
+      existing.owner === 'publisher' &&
+      existing.phase !== 'requested' &&
+      existing.phase !== 'rendered' &&
+      existing.expiresAt <= now &&
+      state.fallbackSlots[element.id] === element;
+    if (!canTransitionPublisherFallback) return undefined;
+
+    existing.owner = 'trusted_server';
+    existing.phase = 'delivery_pending';
+    existing.expiresAt = now + FIRST_IMPRESSION_LEASE_MS;
+    for (const auction of Object.values(existing.publisherAuctions)) {
+      auction.suppressDelivery = true;
+    }
+    return existing;
+  }
 
   const claim: FirstImpressionSlotClaim = {
     generation: state.generation,
@@ -180,10 +187,12 @@ export function releaseTrustedServerFirstImpressionClaim(
   if (
     state.slots[element.id] === claim &&
     claim.owner === 'trusted_server' &&
-    claim.phase === 'delivery_pending' &&
-    Object.keys(claim.publisherAuctions).length === 0
+    claim.phase === 'delivery_pending'
   ) {
     delete state.slots[element.id];
+    if (state.fallbackSlots[element.id] === element) {
+      delete state.fallbackSlots[element.id];
+    }
   }
 }
 

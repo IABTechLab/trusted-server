@@ -70,8 +70,7 @@ function sourceMatchedCandidates(
   source?: MessageEventSource | null
 ): HTMLElement[] {
   if (!source) return candidates;
-  const sourceMatches = candidates.filter((element) => sourceBelongsToElement(source, element));
-  return sourceMatches.length > 0 ? sourceMatches : candidates;
+  return candidates.filter((element) => sourceBelongsToElement(source, element));
 }
 
 function dynamicSlotCandidates(
@@ -103,23 +102,26 @@ function findApsContainer(slotId: string, source?: MessageEventSource | null): H
 
     if (slotId.endsWith('-container')) {
       const inner = findSlot(slotId.slice(0, -'-container'.length));
-      if (inner) return inner;
+      if (inner) return source && !sourceBelongsToElement(source, inner) ? null : inner;
     }
 
     const direct = findSlot(slotId);
-    if (direct && !direct.id.endsWith('-container')) return direct;
+    if (direct && !direct.id.endsWith('-container')) {
+      return source && !sourceBelongsToElement(source, direct) ? null : direct;
+    }
 
     const configuredDivId = window.tsjs?.adSlots?.find((slot) => slot.id === slotId)?.div_id;
     if (configuredDivId) {
       const configured = findSlot(configuredDivId);
-      if (configured) return configured;
+      if (configured) {
+        return source && !sourceBelongsToElement(source, configured) ? null : configured;
+      }
 
       const dynamic = uniqueSlotCandidate(dynamicSlotCandidates(configuredDivId, source));
       if (dynamic) return dynamic;
     }
 
-    const dynamic = uniqueSlotCandidate(dynamicSlotCandidates(slotId, source));
-    return dynamic ?? direct;
+    return uniqueSlotCandidate(dynamicSlotCandidates(slotId, source));
   } catch {
     return null;
   }

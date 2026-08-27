@@ -3,7 +3,8 @@ import path from 'node:path';
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-import type { TsjsApi } from '../../../src/core/types';
+import { FIRST_IMPRESSION_LEASE_MS } from '../../../src/core/first_impression';
+import type { FirstImpressionSlotClaim, TsjsApi } from '../../../src/core/types';
 
 /**
  * Executable coverage for the edge-injected `gpt_bootstrap.js` — the
@@ -233,6 +234,278 @@ describe('gpt_bootstrap.js fallback', () => {
     expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
   });
 
+  it('keeps the bootstrap lease synchronized with the bundle contract', () => {
+    const bootstrapLease = /var FIRST_IMPRESSION_LEASE_MS = (\d+);/.exec(BOOTSTRAP_SOURCE);
+
+    expect(Number(bootstrapLease?.[1])).toBe(FIRST_IMPRESSION_LEASE_MS);
+  });
+
+  it('clears the bootstrap fallback reservation when transitioned slot setup fails', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100);
+    try {
+      const pubads = {
+        getSlots: vi.fn(() => []),
+        refresh: vi.fn(),
+      };
+      (window as TestWindow).googletag = makeGoogleTag({
+        cmd: { push: (command) => command() },
+        defineSlot: vi.fn(() => null),
+        pubads: vi.fn(() => pubads),
+      });
+      document.body.innerHTML = '<div id="failed-bootstrap-fallback"></div>';
+
+      runBootstrap();
+      const ts = (window as TestWindow).tsjs!;
+      const element = document.getElementById('failed-bootstrap-fallback')!;
+      const publisherClaim: FirstImpressionSlotClaim = {
+        generation: 0,
+        slotElementId: element.id,
+        element,
+        owner: 'publisher',
+        phase: 'auctioning',
+        expiresAt: 5_100,
+        publisherAuctions: {
+          original: {
+            token: 'original',
+            adUnitCode: element.id,
+            phase: 'auctioning',
+            expiresAt: 5_100,
+            adIds: [],
+            suppressDelivery: false,
+          },
+        },
+      };
+      ts.firstImpression = {
+        generation: 0,
+        nextToken: 1,
+        slots: { [element.id]: publisherClaim },
+        fallbackSlots: {},
+      };
+      ts.adSlots = [
+        {
+          id: 'failed-bootstrap-fallback-ad',
+          gam_unit_path: '/123/failed-bootstrap-fallback',
+          div_id: element.id,
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ];
+      ts.bids = { 'failed-bootstrap-fallback-ad': { hb_pb: '1.00' } };
+
+      ts.adInit!();
+      expect(ts.firstImpression.fallbackSlots[element.id]).toBe(element);
+
+      vi.advanceTimersByTime(5_001);
+
+      expect(ts.firstImpression.slots[element.id]).toBeUndefined();
+      expect(ts.firstImpression.fallbackSlots[element.id]).toBeUndefined();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('retains an expired TS suppression tombstone in the persistent bootstrap listener', () => {
+    const queue: Array<() => void> = [];
+    const listeners = new Map<string, (event: { slot: { getSlotElementId(): string } }) => void>();
+    const pubads = {
+      addEventListener: vi.fn((name: string, listener: (event: never) => void) => {
+        listeners.set(name, listener as (event: { slot: { getSlotElementId(): string } }) => void);
+      }),
+      getSlots: vi.fn(() => []),
+      refresh: vi.fn(),
+    };
+    (window as TestWindow).googletag = makeGoogleTag({
+      cmd: queue,
+      pubads: vi.fn(() => pubads),
+    });
+    document.body.innerHTML = '<div id="persistent-slot"></div>';
+
+    runBootstrap();
+    [...queue].forEach((command) => command());
+    const element = document.getElementById('persistent-slot')!;
+    const claim: FirstImpressionSlotClaim = {
+      generation: 0,
+      slotElementId: element.id,
+      element,
+      owner: 'trusted_server',
+      phase: 'delivery_pending',
+      expiresAt: 0,
+      publisherAuctions: {
+        late: {
+          token: 'late',
+          adUnitCode: element.id,
+          phase: 'delivery_pending',
+          expiresAt: 0,
+          adIds: ['late-ad'],
+          suppressDelivery: true,
+        },
+      },
+    };
+    (window as TestWindow).tsjs!.firstImpression = {
+      generation: 0,
+      nextToken: 1,
+      slots: { [element.id]: claim },
+      fallbackSlots: {},
+    };
+
+    listeners.get('slotRequested')!({ slot: { getSlotElementId: () => element.id } });
+
+    expect(claim.publisherAuctions.late).toBeDefined();
+    expect(claim.publisherRegistrationClosed).toBe(true);
+  });
+
+  it('prunes a malformed bootstrap registry key before recording the main-document slot', () => {
+    const queue: Array<() => void> = [];
+    const listeners = new Map<string, (event: { slot: { getSlotElementId(): string } }) => void>();
+    const pubads = {
+      addEventListener: vi.fn((name: string, listener: (event: never) => void) => {
+        listeners.set(name, listener as (event: { slot: { getSlotElementId(): string } }) => void);
+      }),
+      getSlots: vi.fn(() => []),
+      refresh: vi.fn(),
+    };
+    (window as TestWindow).googletag = makeGoogleTag({
+      cmd: queue,
+      pubads: vi.fn(() => pubads),
+    });
+    document.body.innerHTML = '<div id="malformed-bootstrap-slot"></div>';
+
+    runBootstrap();
+    [...queue].forEach((command) => command());
+    const element = document.getElementById('malformed-bootstrap-slot')!;
+    const malformedClaim: FirstImpressionSlotClaim = {
+      generation: 0,
+      slotElementId: element.id,
+      element,
+      owner: 'trusted_server',
+      phase: 'delivery_pending',
+      expiresAt: Number.POSITIVE_INFINITY,
+      publisherAuctions: {},
+    };
+    (window as TestWindow).tsjs!.firstImpression = {
+      generation: 0,
+      nextToken: 0,
+      slots: { 'wrong-registry-key': malformedClaim },
+      fallbackSlots: {},
+    };
+
+    listeners.get('slotRequested')!({ slot: { getSlotElementId: () => element.id } });
+
+    const slots = (window as TestWindow).tsjs!.firstImpression!.slots;
+    expect(slots['wrong-registry-key']).toBeUndefined();
+    expect(slots[element.id]).toEqual(
+      expect.objectContaining({ element, owner: 'publisher', phase: 'requested' })
+    );
+  });
+
+  it('rejects a connected same-ID bootstrap claim from a foreign document', () => {
+    const queue: Array<() => void> = [];
+    const listeners = new Map<string, (event: { slot: { getSlotElementId(): string } }) => void>();
+    const pubads = {
+      addEventListener: vi.fn((name: string, listener: (event: never) => void) => {
+        listeners.set(name, listener as (event: { slot: { getSlotElementId(): string } }) => void);
+      }),
+      getSlots: vi.fn(() => []),
+      refresh: vi.fn(),
+    };
+    (window as TestWindow).googletag = makeGoogleTag({
+      cmd: queue,
+      pubads: vi.fn(() => pubads),
+    });
+    document.body.innerHTML = '<div id="foreign-bootstrap-slot"></div>';
+
+    runBootstrap();
+    [...queue].forEach((command) => command());
+    const element = document.getElementById('foreign-bootstrap-slot')!;
+    const foreignDocument = document.implementation.createHTMLDocument('foreign');
+    const foreignElement = foreignDocument.createElement('div');
+    foreignElement.id = element.id;
+    foreignDocument.body.appendChild(foreignElement);
+    const foreignClaim: FirstImpressionSlotClaim = {
+      generation: 0,
+      slotElementId: element.id,
+      element: foreignElement,
+      owner: 'trusted_server',
+      phase: 'delivery_pending',
+      expiresAt: 0,
+      publisherAuctions: {
+        foreign: {
+          token: 'foreign',
+          adUnitCode: element.id,
+          phase: 'delivery_pending',
+          expiresAt: 0,
+          adIds: ['foreign-ad'],
+          suppressDelivery: true,
+        },
+      },
+    };
+    (window as TestWindow).tsjs!.firstImpression = {
+      generation: 0,
+      nextToken: 1,
+      slots: { [element.id]: foreignClaim },
+      fallbackSlots: {},
+    };
+
+    expect(foreignElement.isConnected).toBe(true);
+    listeners.get('slotRequested')!({ slot: { getSlotElementId: () => element.id } });
+
+    const currentClaim = (window as TestWindow).tsjs!.firstImpression!.slots[element.id];
+    expect(currentClaim).toEqual(
+      expect.objectContaining({ element, owner: 'publisher', phase: 'requested' })
+    );
+    expect(currentClaim!.publisherAuctions).toEqual({});
+  });
+
+  it('refuses a 257th bootstrap lifecycle claim without evicting live claims', () => {
+    const queue: Array<() => void> = [];
+    const listeners = new Map<string, (event: { slot: { getSlotElementId(): string } }) => void>();
+    const pubads = {
+      addEventListener: vi.fn((name: string, listener: (event: never) => void) => {
+        listeners.set(name, listener as (event: { slot: { getSlotElementId(): string } }) => void);
+      }),
+      getSlots: vi.fn(() => []),
+      refresh: vi.fn(),
+    };
+    (window as TestWindow).googletag = makeGoogleTag({
+      cmd: queue,
+      pubads: vi.fn(() => pubads),
+    });
+
+    runBootstrap();
+    [...queue].forEach((command) => command());
+    const slots: Record<string, FirstImpressionSlotClaim> = {};
+    for (let index = 0; index < 256; index += 1) {
+      const element = document.createElement('div');
+      element.id = `bounded-slot-${index}`;
+      document.body.appendChild(element);
+      slots[element.id] = {
+        generation: 0,
+        slotElementId: element.id,
+        element,
+        owner: 'publisher',
+        phase: 'rendered',
+        expiresAt: Number.POSITIVE_INFINITY,
+        publisherAuctions: {},
+      };
+    }
+    (window as TestWindow).tsjs!.firstImpression = {
+      generation: 0,
+      nextToken: 0,
+      slots,
+      fallbackSlots: {},
+    };
+    const overflow = document.createElement('div');
+    overflow.id = 'bounded-slot-overflow';
+    document.body.appendChild(overflow);
+
+    listeners.get('slotRequested')!({ slot: { getSlotElementId: () => overflow.id } });
+
+    expect(Object.keys(slots)).toHaveLength(256);
+    expect(slots[overflow.id]).toBeUndefined();
+  });
+
   it('installs fallback adInit and scheduleInitialAdInit when the bundle is absent', () => {
     runBootstrap();
     const ts = (window as TestWindow).tsjs!;
@@ -419,6 +692,7 @@ describe('gpt_bootstrap.js fallback', () => {
         gam_unit_path: '/123/atf',
         div_id: 'div-atf-sidebar',
         formats: [[300, 250]],
+        targeting: { ts_route: 'home' },
       },
     ];
     ts.bids = { atf_sidebar_ad: { hb_pb: '1.00' } };
@@ -428,6 +702,8 @@ describe('gpt_bootstrap.js fallback', () => {
     expect(defineSlot).toHaveBeenCalledWith('/123/atf', [[300, 250]], 'div-atf-sidebar');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
+    expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_route', 'home');
+    expect(ts.prevSlotTargetingKeys).toEqual({ 'div-atf-sidebar': ['ts_route'] });
     expect(display).toHaveBeenCalledWith('div-atf-sidebar');
     expect(ts.servicesEnabled).toBe(true);
   });
