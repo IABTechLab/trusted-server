@@ -503,6 +503,8 @@ pub(crate) struct UpdateSlotsRequest<'a> {
     pub(crate) cookies: &'a [(String, String)],
     /// Print the candidate instead of writing it.
     pub(crate) dry_run: bool,
+    /// Whether the crawl used the deterministic scroll pass.
+    pub(crate) scroll: bool,
     /// Crawl bounds.
     pub(crate) budget: crawl_plan::CrawlBudget,
 }
@@ -741,12 +743,29 @@ pub(crate) fn run_update_slots(
         &fragmented,
         &mut notes,
     )?;
-    let (merged, merge_diagnostics) = slot_toml::merge_render_slots_with_diagnostics(
+    let observed_div_ids = table
+        .slots()
+        .map(|slot| slot.div_id.clone())
+        .collect::<Vec<_>>();
+    let (merged, merge_diagnostics) = slot_toml::merge_render_slots_with_observed_diagnostics(
         request.existing_creative,
         slots,
+        &observed_div_ids,
         request.replace,
     );
-    notes.extend(merge_diagnostics);
+    notes.extend(merge_diagnostics.notes);
+    if !merge_diagnostics.unobserved_existing_slot_ids.is_empty() {
+        let slot_ids = merge_diagnostics.unobserved_existing_slot_ids.join(", ");
+        let follow_up = if request.scroll {
+            "Re-run with broader page/profile coverage; use --replace only to intentionally prune them."
+        } else {
+            "Re-run with broader coverage or --scroll; use --replace only to intentionally prune them."
+        };
+        notes.push(format!(
+            "preserved {} configured slot(s) not observed during this crawl: {slot_ids}. {follow_up}",
+            merge_diagnostics.unobserved_existing_slot_ids.len(),
+        ));
+    }
     if merged.is_empty() {
         emit_notes(err, &mut notes)?;
         return cli_error(
@@ -1507,6 +1526,7 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
@@ -2147,6 +2167,7 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
@@ -2170,6 +2191,149 @@ mod tests {
             patterns,
             ["/news", "/news/*"],
             "should derive section patterns from the post-redirect path"
+        );
+    }
+
+    #[test]
+    fn update_slots_reports_preserved_unobserved_slots_contextually() {
+        for (scroll, expected_follow_up, unexpected_follow_up) in [
+            (false, "or --scroll", "page/profile coverage"),
+            (true, "page/profile coverage", "or --scroll"),
+        ] {
+            let temp = TempDir::new().expect("should create temp dir");
+            let config_path = temp.path().join("trusted-server.toml");
+            let mut original = loadable_config()
+                .replace("gam_network_id = \"123456789\"", "gam_network_id = \"222\"");
+            original.push_str(
+                "\n[[creative_opportunities.slot]]\n\
+                 id = \"header\"\n\
+                 div_id = \"div-gpt-ad-header\"\n\
+                 gam_unit_path = \"/222/homepage/header\"\n\
+                 page_patterns = [\"/\"]\n\
+                 formats = [{ width = 728, height = 90 }]\n\n\
+                 [[creative_opportunities.slot]]\n\
+                 id = \"sidebar\"\n\
+                 div_id = \"ad-sidebar\"\n\
+                 gam_unit_path = \"/222/sidebar\"\n\
+                 page_patterns = [\"/news/*\"]\n\
+                 formats = [{ width = 300, height = 250 }]\n",
+            );
+            fs::write(&config_path, &original).expect("should write config");
+            let existing = crate::commands::audit::creative_config(&original, &config_path)
+                .expect("should parse config")
+                .expect("should have creative opportunities");
+            let collector = FakeCollector::new(collected_page_with_header_slot());
+            let mut out = Vec::new();
+            let mut notes = Vec::new();
+
+            run_update_slots(
+                &UpdateSlotsRequest {
+                    url: "https://publisher.example/",
+                    config_path: &config_path,
+                    existing_creative: Some(&existing),
+                    page_patterns: &[],
+                    replace: false,
+                    cookies: &[],
+                    dry_run: true,
+                    scroll,
+                    budget: CrawlBudget::default(),
+                },
+                &[("desktop", &collector)],
+                &mut out,
+                &mut notes,
+            )
+            .expect("should preserve unobserved slot");
+
+            let notes = String::from_utf8(notes).expect("notes should be UTF-8");
+            assert!(
+                notes.contains(
+                    "preserved 1 configured slot(s) not observed during this crawl: sidebar"
+                ),
+                "should name the preserved slot, got {notes:?}"
+            );
+            assert!(notes.contains(expected_follow_up));
+            assert!(!notes.contains(unexpected_follow_up));
+            assert!(out.is_empty(), "unchanged dry-run stdout should stay empty");
+            assert_eq!(
+                fs::read_to_string(&config_path).expect("should read config"),
+                original,
+                "dry-run should preserve the original config"
+            );
+        }
+    }
+
+    #[test]
+    fn observed_but_refused_slot_is_not_reported_as_unobserved() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        let mut original = loadable_config();
+        original.push_str(
+            "\n[[creative_opportunities.slot]]\n\
+             id = \"stable\"\n\
+             div_id = \"ad-stable\"\n\
+             gam_unit_path = \"/123456789/site/header\"\n\
+             page_patterns = [\"/\"]\n\
+             formats = [{ width = 728, height = 90 }]\n\n\
+             [[creative_opportunities.slot]]\n\
+             id = \"ad-refused\"\n\
+             gam_unit_path = \"/123456789/desktop/homepage\"\n\
+             page_patterns = [\"/\"]\n\
+             formats = [{ width = 300, height = 250 }]\n",
+        );
+        fs::write(&config_path, &original).expect("should write config");
+        let existing = crate::commands::audit::creative_config(&original, &config_path)
+            .expect("should parse config")
+            .expect("should have creative opportunities");
+
+        let page = |profile: &str| {
+            let mut page = collected_page();
+            page.requested_url = "https://publisher.example/".to_string();
+            page.final_url = page.requested_url.clone();
+            page.gpt_slots = vec![
+                collector::CollectedGptSlot {
+                    gam_unit_path: "/123456789/site/header".to_string(),
+                    div_id: "ad-stable".to_string(),
+                    sizes: vec![(728, 90)],
+                },
+                collector::CollectedGptSlot {
+                    gam_unit_path: format!("/123456789/{profile}/homepage"),
+                    div_id: "ad-refused".to_string(),
+                    sizes: vec![(300, 250)],
+                },
+            ];
+            page
+        };
+        let desktop = FakeCollector::new(page("desktop"));
+        let mobile = FakeCollector::new(page("mobile"));
+        let mut out = Vec::new();
+        let mut notes = Vec::new();
+
+        run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: Some(&existing),
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: true,
+                scroll: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &desktop), ("mobile", &mobile)],
+            &mut out,
+            &mut notes,
+        )
+        .expect("the accepted slot should let generation complete");
+
+        let notes = String::from_utf8(notes).expect("notes should be UTF-8");
+        assert!(
+            notes.contains("skipped refused slot `ad-refused` (`ad-refused`)"),
+            "should retain the refusal diagnostic, got {notes:?}"
+        );
+        assert!(
+            !notes.contains("not observed during this crawl: ad-refused"),
+            "a crawl-observed refused slot must not be labeled unobserved, got {notes:?}"
         );
     }
 
@@ -2206,6 +2370,7 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
@@ -2251,6 +2416,7 @@ mod tests {
                 replace: false,
                 cookies: &[("session".to_string(), "secret".to_string())],
                 dry_run: false,
+                scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
@@ -2309,6 +2475,7 @@ mod tests {
                 cookies: &[],
                 dry_run: false,
                 budget: CrawlBudget::default(),
+                scroll: false,
             },
             &[("desktop", &collector)],
             &mut std::io::sink(),
@@ -2392,6 +2559,7 @@ mod tests {
                 cookies: &[],
                 dry_run: false,
                 budget: CrawlBudget::default(),
+                scroll: false,
             },
             &[("desktop", &desktop), ("mobile", &mobile)],
             &mut std::io::sink(),
@@ -2444,6 +2612,7 @@ mod tests {
                 replace: false,
                 cookies: &[("session".to_string(), "secret".to_string())],
                 dry_run: false,
+                scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
@@ -2490,6 +2659,7 @@ mod tests {
                 replace: false,
                 cookies: &[("session".to_string(), "secret".to_string())],
                 dry_run: false,
+                scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
@@ -2523,6 +2693,7 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &desktop), ("mobile", &FailingCollector)],
@@ -2557,6 +2728,7 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
@@ -2624,6 +2796,7 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
@@ -2665,6 +2838,7 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
@@ -2702,6 +2876,7 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
@@ -2795,6 +2970,7 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
@@ -2901,6 +3077,7 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &desktop), ("mobile", &mobile)],
@@ -2976,6 +3153,7 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &desktop), ("mobile", &mobile)],
@@ -3035,6 +3213,7 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
@@ -3080,6 +3259,7 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                scroll: false,
                 budget: CrawlBudget {
                     max_sections: 8,
                     max_pages: 1,
@@ -3134,6 +3314,7 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
@@ -3231,6 +3412,7 @@ mod tests {
                         replace: false,
                         cookies: &[],
                         dry_run: true,
+                        scroll: false,
                         budget: CrawlBudget::default(),
                     },
                     &[("desktop", &collector)],
@@ -3281,6 +3463,7 @@ mod tests {
                 replace: false,
                 cookies: &[],
                 dry_run: false,
+                scroll: false,
                 budget: CrawlBudget::default(),
             },
             &[("desktop", &collector)],
