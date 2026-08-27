@@ -181,7 +181,10 @@ src, out, mode, port = sys.argv[1:5]
 s = open(src).read()
 
 s = s.replace('origin_url = "https://origin.example.com"', f'origin_url = "http://127.0.0.1:{port}"', 1)
-# The example config ships placeholders that validation rejects outright.
+# The example config ships placeholders that validation rejects outright,
+# including the reserved publisher domain/cookie_domain.
+s = s.replace('domain = "example.com"', 'domain = "local-harness.example"', 1)
+s = s.replace('cookie_domain = ".example.com"', 'cookie_domain = ".local-harness.example"', 1)
 s = s.replace('password = "replace-with-admin-password-32-bytes"',
               'password = "local-harness-admin-password-not-a-real-one"', 1)
 s = s.replace('proxy_secret = "change-me-proxy-secret"',
