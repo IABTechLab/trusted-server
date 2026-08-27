@@ -514,14 +514,20 @@ formats = [{ width = 300, height = 250 }]
         "/../../trusted-server.example.toml"
     ));
 
-    /// Returns the template with its deliberately-invalid placeholder admin
-    /// password swapped for a valid one, so parse-time validation succeeds and
-    /// the test can exercise the optional blocks it uncomments.
+    /// Returns the template with its secrets-store key references swapped for
+    /// literal strong values, so parse-time validation of resolved-secret
+    /// strength succeeds and the test can exercise the optional blocks it
+    /// uncomments.
     fn template_with_valid_admin_password() -> String {
-        EXAMPLE_TEMPLATE.replace(
-            "password = \"replace-with-admin-password-32-bytes\"",
-            "password = \"unit-test-admin-password-that-is-long-enough\"",
-        )
+        EXAMPLE_TEMPLATE
+            .replace(
+                "password = \"handler_password\"",
+                "password = \"unit-test-admin-password-that-is-long-enough\"",
+            )
+            .replace(
+                "passphrase = \"ec_passphrase\"",
+                "passphrase = \"unit-test-ec-passphrase-that-is-long-enough\"",
+            )
     }
 
     /// Uncomments the contiguous `#`-prefixed block that begins at the line
