@@ -96,8 +96,9 @@ is a safety assertion about the whole store: nothing in it changed within the
 window and no writer is targeting it. Unlike the other `config` subcommands,
 `gc` never loads the typed app config; its `--no-env` flag instead ignores
 `EDGEZERO__STORES__CONFIG__<ID>__NAME` when resolving which physical store to
-sweep. On a destructive run, check the store id `gc` reports before passing
-`--yes`.
+sweep, and `--store <id>` overrides the manifest's config-store id outright.
+Both change which store gets swept, so on a destructive run check the store id
+`gc` reports before passing `--yes`.
 
 ## Lifecycle commands
 
@@ -113,9 +114,11 @@ ts serve --adapter fastly
 
 `ts deploy` accepts `--staging` (Fastly only) to build and upload a staged
 draft version cloned from the active one instead of activating a production
-deploy. Adapter passthrough arguments must follow a `--` separator; unknown
+deploy. Adapter passthrough arguments must now follow a `--` separator; unknown
 flags before `--` (including the renamed-away `--stage`) are rejected at parse
-time rather than forwarded:
+time rather than forwarded. This is a change: passthrough args previously
+worked without the separator, so existing runbooks and CI jobs that pass
+adapter flags directly need the `--` added:
 
 ```bash
 ts deploy --adapter fastly --service-id <service-id> --staging
@@ -124,30 +127,41 @@ ts deploy --adapter fastly -- --comment "release"
 
 A staged deploy only redirects the staged version's config selector at the
 `<logical-store-id>_staging` key — it does not copy the production config blob
-there. Push the staged config before probing the staged version, or it comes up
-with no config at all:
+there. Push the staged config before probing the staged version:
 
 ```bash
 ts config push --adapter fastly --staging
 ts config diff --adapter fastly --staging
 ```
 
+> **Known limitation:** Trusted Server's Fastly entry point does not yet read
+> the version-linked `edgezero_runtime_env` selectors, so a staged version
+> currently loads the **production** config blob rather than the staged one —
+> a staging healthcheck exercises the new binary against production config.
+> Selector resolution for custom entry points is tracked upstream in EdgeZero;
+> until it lands, do not rely on `--staging` to validate a config change.
+
 `--staging` on `config push` / `config diff` writes and compares the
 `<logical-store-id>_staging` key in the same store. It is mutually exclusive
 with `--key`: the staging key is derived from the store's logical id, so an
 explicit key would be written where nothing reads it.
 
-Inspect and verify deployments with the deploy lifecycle commands:
+Inspect and verify deployments with the deploy lifecycle commands. All three are
+Fastly-only — the axum, cloudflare, and spin adapters reject them:
 
 ```bash
-# Print the currently active deployment version
+# Capture the production rollback target BEFORE deploying: after a deploy this
+# prints the NEW version, and Fastly keeps no record of which version was live
+# before it, so the target is then unrecoverable.
 ts active-version --adapter fastly --service-id <service-id>
 
-# Probe a deployed version until it reports healthy
+# Probe a deployed version until it reports healthy. `<version>` is the version
+# the deploy activated; pass `--service-id` to `ts deploy` and it emits that as
+# a machine-readable `version=<N>` line.
 ts healthcheck --adapter fastly --service-id <service-id> \
   --version <version> --domain edge.example
 
-# Re-activate a previously active version
+# Re-activate the version captured before the deploy
 ts rollback --adapter fastly --service-id <service-id> \
   --version <bad-version> --rollback-to <previous-version>
 ```

@@ -547,9 +547,34 @@ mod tests {
         );
         assert!(!gc.dry_run);
         assert!(!gc.no_env);
+        assert_eq!(
+            gc.store, None,
+            "should default to the manifest's config-store id"
+        );
         assert!(
             !gc.yes,
             "should not delete without an explicit --yes; --yes is the only destructive gate"
+        );
+    }
+
+    #[test]
+    fn config_gc_parses_store_override() {
+        let args = parse(&[
+            "ts",
+            "config",
+            "gc",
+            "--adapter",
+            "fastly",
+            "--store",
+            "other_config_store",
+        ]);
+        let Command::Config(ConfigCommand::Gc(gc)) = args.command else {
+            panic!("expected config gc command");
+        };
+        assert_eq!(
+            gc.store,
+            Some("other_config_store".to_owned()),
+            "should retarget which store a sweep inspects"
         );
     }
 
