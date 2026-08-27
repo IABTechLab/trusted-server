@@ -361,7 +361,7 @@ fn requested_ec_id(req: &Request<EdgeBody>) -> Result<String, Box<Response<EdgeB
     if !is_valid_ec_id(&ec_id) {
         return Err(Box::new(json_error(
             StatusCode::BAD_REQUEST,
-            "invalid EC ID format (expected {64hex}.{6alnum})",
+            "invalid EC ID format (expected {64hex}.{6alnum}, with or without the hmac~ prefix)",
         )));
     }
 
@@ -1519,5 +1519,16 @@ mod tests {
         assert_eq!(matched.len(), 1, "should match the sharedid partner");
         assert_eq!(matched[0]["source_domain"], "sharedid.org");
         assert_eq!(matched[0]["uid"], "shared-uid-123");
+    }
+
+    #[test]
+    fn requested_ec_id_accepts_the_hmac_envelope() {
+        let coded = format!("hmac~{}", test_ec_id());
+        let request = request_with_method(http::Method::GET, &format!("/_ts/admin/ec/{coded}"));
+
+        let ec_id = requested_ec_id(&request)
+            .unwrap_or_else(|_| panic!("should accept a coded HMAC identifier in the path"));
+
+        assert_eq!(ec_id, coded, "should look up the identifier as given");
     }
 }

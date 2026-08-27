@@ -711,4 +711,23 @@ mod tests {
             "hour 1 rotation should move beta to front"
         );
     }
+
+    #[test]
+    fn build_pull_sync_context_accepts_a_minted_coded_ec_id() {
+        let consent = ConsentContext {
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
+        };
+        // The form the mint path produces since the provider-code envelope.
+        let ec_id = format!("hmac~{}.ABC123", "a".repeat(64));
+        let ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
+
+        let context = build_pull_sync_context(&ec_context)
+            .expect("should build pull sync context for a coded HMAC identifier");
+        assert_eq!(
+            context.ec_id(),
+            ec_id,
+            "should dispatch the coded identifier as minted"
+        );
+    }
 }

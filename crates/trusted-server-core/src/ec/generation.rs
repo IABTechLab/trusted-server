@@ -10,7 +10,12 @@ use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::Sha256;
 
+use crate::ec::provider::{PROVIDER_CODE_SEPARATOR, split_provider_code};
 use crate::error::TrustedServerError;
+
+/// The registry code of the built-in HMAC provider, whose identifier shape
+/// this module defines.
+const HMAC_PROVIDER_CODE: &str = "hmac";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -139,12 +144,33 @@ pub fn ec_hash(ec_id: &str) -> &str {
 /// so internal EC IDs are already lowercase. This normalization is a
 /// defense-in-depth measure for EC IDs submitted by external partners
 /// (via batch sync) that may use uppercase hex.
+///
+/// A minted identifier carries the built-in provider's code envelope
+/// (`hmac~` before the value, see
+/// [`PROVIDER_CODE_SEPARATOR`](super::provider::PROVIDER_CODE_SEPARATOR)),
+/// and partners echo that form back, so the envelope is kept and only the
+/// value inside it is lowercased. That keeps the key identical to the one
+/// written at mint. An identifier under any other provider's code is not
+/// HMAC-shaped and is returned unchanged, because only that provider knows
+/// how to normalize it.
 #[must_use]
 pub fn normalize_ec_id_for_kv(ec_id: &str) -> String {
-    let mut parts = ec_id.splitn(2, '.');
+    let (code, bare) = match split_provider_code(ec_id) {
+        (Some(code), bare) if code == HMAC_PROVIDER_CODE => (Some(code), bare),
+        (Some(_), _) => return ec_id.to_owned(),
+        (None, bare) => (None, bare),
+    };
+    let mut parts = bare.splitn(2, '.');
     let hash = parts.next().unwrap_or_default();
     let suffix = parts.next().unwrap_or_default();
-    format!("{}.{}", hash.to_ascii_lowercase(), suffix)
+    match code {
+        Some(code) => format!(
+            "{code}{PROVIDER_CODE_SEPARATOR}{}.{}",
+            hash.to_ascii_lowercase(),
+            suffix
+        ),
+        None => format!("{}.{}", hash.to_ascii_lowercase(), suffix),
+    }
 }
 
 /// Checks whether a string is a valid 64-character hex EC hash prefix.
@@ -158,17 +184,30 @@ pub fn is_valid_ec_hash(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Checks whether a string matches the expected EC ID format.
+/// Checks whether a string is a built-in HMAC identifier, bare or enveloped.
 ///
-/// The format is `{64hex}.{6alnum}` where the first part is a 64-character
-/// **lowercase** hex string and the second part is a 6-character alphanumeric
-/// string. Only lowercase hex is accepted; callers must normalize before
-/// validation to prevent duplicate KV keys from case-variant EC IDs. The HMAC
-/// prefix is lowercase because it comes from `hex::encode`; the random suffix
-/// allows mixed-case alphanumeric characters by construction.
+/// The bare format is `{64hex}.{6alnum}` where the first part is a
+/// 64-character **lowercase** hex string and the second part is a 6-character
+/// alphanumeric string. Only lowercase hex is accepted; callers must
+/// normalize before validation to prevent duplicate KV keys from case-variant
+/// EC IDs. The HMAC prefix is lowercase because it comes from `hex::encode`;
+/// the random suffix allows mixed-case alphanumeric characters by
+/// construction.
+///
+/// A minted identifier carries the provider-code envelope, `hmac~` before
+/// the bare value, and that is the form the partner-facing paths (pull sync,
+/// batch sync, the admin lookup) receive, so both the enveloped and the
+/// legacy bare form are accepted. An identifier under any other provider's
+/// code is not an HMAC identifier and is rejected here: those paths accept
+/// only the built-in provider's identifiers today.
 #[must_use]
 pub fn is_valid_ec_id(value: &str) -> bool {
-    let mut parts = value.split('.');
+    let bare = match split_provider_code(value) {
+        (Some(code), bare) if code == HMAC_PROVIDER_CODE => bare,
+        (Some(_), _) => return false,
+        (None, bare) => bare,
+    };
+    let mut parts = bare.split('.');
     let Some(hmac_part) = parts.next() else {
         return false;
     };
@@ -369,6 +408,39 @@ mod tests {
         assert!(
             !is_valid_ec_id(&extra_segment),
             "should reject extra segments"
+        );
+    }
+
+    #[test]
+    fn is_valid_ec_id_accepts_the_hmac_envelope() {
+        let coded = format!("hmac~{}.ABC123", "a".repeat(64));
+        assert!(
+            is_valid_ec_id(&coded),
+            "should accept a minted identifier carrying the hmac code"
+        );
+    }
+
+    #[test]
+    fn is_valid_ec_id_rejects_other_provider_codes() {
+        let coded = format!("t0op~{}.ABC123", "a".repeat(64));
+        assert!(
+            !is_valid_ec_id(&coded),
+            "should reject an identifier carrying another provider's code"
+        );
+    }
+
+    #[test]
+    fn normalize_ec_id_for_kv_keeps_the_hmac_envelope() {
+        let coded = format!("hmac~{}.ABC123", "A".repeat(64));
+        assert_eq!(
+            normalize_ec_id_for_kv(&coded),
+            format!("hmac~{}.ABC123", "a".repeat(64)),
+            "should lowercase the hash and keep the code prefix"
+        );
+        assert_eq!(
+            normalize_ec_id_for_kv("t0op~MixedCase"),
+            "t0op~MixedCase",
+            "should leave another provider's identifier unchanged"
         );
     }
 }

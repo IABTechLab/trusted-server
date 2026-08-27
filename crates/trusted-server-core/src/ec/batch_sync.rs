@@ -623,4 +623,21 @@ mod tests {
         );
         assert!(errors.is_empty(), "should accept valid mappings");
     }
+
+    #[test]
+    fn process_mappings_accepts_a_minted_coded_ec_id() {
+        let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
+        // Partners echo the identifier identify gave them, which carries the
+        // provider-code envelope since the mint path applies it.
+        let ec_id = format!("hmac~{}.ABC123", "a".repeat(64));
+        let mappings = vec![mapping(&ec_id, "uid-1", 1)];
+
+        let (accepted, errors) = process_mappings(&writer, "partner", &mappings);
+
+        assert_eq!(accepted, 1, "should accept a coded HMAC identifier");
+        assert!(
+            errors.is_empty(),
+            "should report no format error for a coded HMAC identifier"
+        );
+    }
 }

@@ -858,7 +858,7 @@ mod tests {
         use crate::platform::test_support::noop_services_with_ec_provider;
 
         // A vendor identifier that is deliberately not the built-in HMAC shape
-        // (no dot, mixed case) — the exact value the built-in check would drop.
+        // (no dot, mixed case), the exact value the built-in check would drop.
         const OPAQUE_ID: &str = "AbC123opaqueEnvelopeValueXYZ";
         const CODED_ID: &str = "t0op~AbC123opaqueEnvelopeValueXYZ";
 
