@@ -492,7 +492,7 @@ pub struct Ec {
     /// Deprecated location of the HMAC passphrase, read so a configuration
     /// written for the previous release still starts.
     ///
-    /// [`migrate_legacy_passphrase`](Self::migrate_legacy_passphrase) maps it
+    /// [`migrate_legacy_ec_layout`](Self::migrate_legacy_ec_layout) maps it
     /// to `provider = "hmac"` with the passphrase in the `[ec.providers.hmac]`
     /// block and logs a deprecation warning, so a fleet can move configuration
     /// and binaries independently. A configuration carrying both the old and
@@ -690,7 +690,7 @@ impl Ec {
     ///
     /// Returns [`TrustedServerError::Configuration`] when both the deprecated
     /// key and any part of the provider configuration are present.
-    pub fn migrate_legacy_passphrase(&mut self) -> Result<(), Report<TrustedServerError>> {
+    pub fn migrate_legacy_ec_layout(&mut self) -> Result<(), Report<TrustedServerError>> {
         let Some(passphrase) = self.passphrase.take() else {
             return Ok(());
         };
@@ -3131,7 +3131,7 @@ impl Settings {
             })
         })?;
 
-        settings.ec.migrate_legacy_passphrase()?;
+        settings.ec.migrate_legacy_ec_layout()?;
         settings.ec.validate_provider_selection()?;
         settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
@@ -5035,7 +5035,7 @@ mod tests {
             passphrase: Some(Redacted::new("test-secret-key-32-bytes-minimum".to_owned())),
             ..Ec::default()
         };
-        ec.migrate_legacy_passphrase()
+        ec.migrate_legacy_ec_layout()
             .expect("should migrate the deprecated form");
         assert_eq!(
             ec.provider.as_deref(),
@@ -5143,7 +5143,7 @@ mod tests {
             ..Ec::default()
         };
         let err = ec
-            .migrate_legacy_passphrase()
+            .migrate_legacy_ec_layout()
             .expect_err("both forms present should be rejected");
         assert!(
             matches!(
