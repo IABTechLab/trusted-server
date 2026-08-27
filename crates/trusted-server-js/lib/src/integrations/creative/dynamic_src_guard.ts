@@ -1,5 +1,6 @@
 import { log } from '../../core/log';
 import { createMutationScheduler } from '../../shared/scheduler';
+
 import type { ProxySignOutcome } from './proxy_sign';
 
 type ElementWithSrc = Element & { src: string };
