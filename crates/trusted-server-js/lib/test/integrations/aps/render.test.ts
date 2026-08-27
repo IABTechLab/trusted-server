@@ -4,17 +4,35 @@ import envelope from '../../fixtures/aps-renderer-v1.json';
 import type { ApsRendererV1 } from '../../../src/core/types';
 import { log } from '../../../src/core/log';
 import {
+  APS_NATIVE_RENDERER_TIMEOUT_MS,
+  APS_PREBID_CREATIVE_RUNNER_URL,
   APS_RENDERER_PATH,
   APS_RENDERER_SANDBOX,
+  APS_RENDERING_MODE_ATTRIBUTE_NAME,
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
   apsRendererUrl,
+  dispatchApsRendering as dispatchDefaultApsRendering,
   getApsPrebidRenderer,
   parseApsRendererDescriptor,
   registerApsPrebidRenderer,
   renderApsCreative,
   validateApsRenderer,
 } from '../../../src/integrations/aps/render';
+
+function nativeRunnerState(frame: HTMLIFrameElement): {
+  runner: HTMLScriptElement;
+  event: CustomEvent<{ aaxResponse: string; seatBidId: string }>;
+} {
+  const runner = frame.contentDocument?.querySelector<HTMLScriptElement>('script');
+  const frameWindow = frame.contentWindow as unknown as {
+    _aps: Map<string, { queue: Array<CustomEvent<{ aaxResponse: string; seatBidId: string }>> }>;
+  };
+  const account = frameWindow._aps.get('example-account-id');
+  expect(runner).not.toBeNull();
+  expect(account?.queue).toHaveLength(1);
+  return { runner: runner!, event: account!.queue[0] };
+}
 
 function encodeBytes(bytes: Uint8Array): string {
   let binary = '';
@@ -261,6 +279,257 @@ describe('Prebid APS renderer registry', () => {
   });
 });
 
+describe('APS rendering-mode authorization', () => {
+  it('ignores mode markers and duplicate script tags injected after module initialization', () => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    document.head.insertAdjacentHTML(
+      'beforeend',
+      '<meta name="trusted-server-aps-rendering-mode" content="publisher_native">' +
+        '<script data-ts-aps-rendering-mode="publisher_native"></script>'
+    );
+    const trustedServer = vi.fn(() => true);
+
+    expect(
+      dispatchDefaultApsRendering({
+        slotId: 'fictional-slot',
+        renderer: descriptor(),
+        trustedServer,
+      })
+    ).toBe(true);
+    expect(trustedServer).toHaveBeenCalledOnce();
+    expect(document.querySelector('#fictional-slot iframe')).toBeNull();
+
+    document.head
+      .querySelectorAll(
+        'meta[name="trusted-server-aps-rendering-mode"], script[data-ts-aps-rendering-mode]'
+      )
+      .forEach((element) => element.remove());
+    document.body.innerHTML = '';
+  });
+});
+
+describe('publisher-native APS runner contract tests', () => {
+  let dispatchApsRendering: typeof dispatchDefaultApsRendering;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    document.body.innerHTML = '<div id="fictional-slot"><span>existing</span></div>';
+    const publisherScript = document.createElement('script');
+    publisherScript.setAttribute(APS_RENDERING_MODE_ATTRIBUTE_NAME, 'publisher_native');
+    const currentScriptSpy = vi
+      .spyOn(document, 'currentScript', 'get')
+      .mockReturnValue(publisherScript);
+    ({ dispatchApsRendering } = await import('../../../src/integrations/aps/render'));
+    currentScriptSpy.mockRestore();
+  });
+
+  afterEach(() => {
+    delete window.tsjs;
+    vi.restoreAllMocks();
+    document.body.innerHTML = '';
+  });
+
+  it('queues the exact selected response for the fixed APS runner and commits on load', async () => {
+    const trustedServer = vi.fn(() => true);
+    const accepted = dispatchApsRendering({
+      slotId: 'fictional-slot',
+      renderer: descriptor(),
+      trustedServer,
+    });
+    const slot = document.getElementById('fictional-slot')!;
+    const frame = slot.querySelector('iframe')!;
+    const { runner, event } = nativeRunnerState(frame);
+
+    expect(frame.getAttribute('sandbox')).toBeNull();
+    expect(frame.style.display).toBe('none');
+    expect(runner.src).toBe(APS_PREBID_CREATIVE_RUNNER_URL);
+    expect(event.type).toBe('prebid/creative/render');
+    expect(event.detail).toEqual({
+      aaxResponse: descriptor().aaxResponse,
+      seatBidId: descriptor().bidId,
+    });
+    expect(slot.querySelector('span')).not.toBeNull();
+    expect(trustedServer).not.toHaveBeenCalled();
+
+    const runnerDocument = frame.contentDocument!;
+    expect(runnerDocument.querySelector('meta[name="referrer"]')?.getAttribute('content')).toBe(
+      'no-referrer'
+    );
+    expect(runnerDocument.documentElement.style.margin).toBe('0px');
+    expect(runnerDocument.documentElement.style.padding).toBe('0px');
+    expect(runnerDocument.body.style.margin).toBe('0px');
+    expect(runnerDocument.body.style.padding).toBe('0px');
+    const creativeFrame = runnerDocument.createElement('iframe');
+    runnerDocument.body.appendChild(creativeFrame);
+    await vi.waitFor(() => expect(creativeFrame.style.display).toBe('block'));
+
+    runner.dispatchEvent(new Event('load'));
+    await expect(accepted).resolves.toBe(true);
+    expect(slot.querySelector('span')).toBeNull();
+    expect(frame.style.display).toBe('');
+  });
+
+  it('fails closed when the runner fails without clearing publisher content', async () => {
+    const trustedServer = vi.fn(() => true);
+    const accepted = dispatchApsRendering({
+      slotId: 'fictional-slot',
+      renderer: descriptor(),
+      trustedServer,
+    });
+    const frame = document.querySelector<HTMLIFrameElement>('#fictional-slot iframe')!;
+    const { runner } = nativeRunnerState(frame);
+
+    runner.dispatchEvent(new Event('error'));
+
+    await expect(accepted).resolves.toBe(false);
+    expect(trustedServer).not.toHaveBeenCalled();
+    expect(document.querySelector('#fictional-slot iframe')).toBeNull();
+    expect(document.querySelector('#fictional-slot span')).not.toBeNull();
+  });
+
+  it('cancels a pending runner when a newer dispatch replaces it', async () => {
+    const first = dispatchApsRendering({
+      slotId: 'fictional-slot',
+      renderer: descriptor(),
+      trustedServer: () => true,
+    });
+    const firstFrame = document.querySelector<HTMLIFrameElement>('#fictional-slot iframe')!;
+
+    const second = dispatchApsRendering({
+      slotId: 'fictional-slot',
+      renderer: descriptor(),
+      trustedServer: () => true,
+    });
+    const secondFrame = document.querySelector<HTMLIFrameElement>('#fictional-slot iframe')!;
+
+    expect(firstFrame.isConnected).toBe(false);
+    expect(secondFrame).not.toBe(firstFrame);
+    await expect(first).resolves.toBe(false);
+    nativeRunnerState(secondFrame).runner.dispatchEvent(new Event('load'));
+    await expect(second).resolves.toBe(true);
+  });
+
+  it('lets an invalid replacement cancel an older pending runner', async () => {
+    const first = dispatchApsRendering({
+      slotId: 'fictional-slot',
+      renderer: descriptor(),
+      trustedServer: () => true,
+    });
+    const second = dispatchApsRendering({
+      slotId: 'fictional-slot',
+      renderer: descriptor({ aaxResponse: 'invalid' }),
+      trustedServer: () => true,
+    });
+
+    expect(second).toBe(false);
+    await expect(first).resolves.toBe(false);
+    expect(document.querySelector('#fictional-slot iframe')).toBeNull();
+    expect(document.querySelector('#fictional-slot span')).not.toBeNull();
+  });
+
+  it('resolves a logical GPT slot through the injected div mapping', async () => {
+    document.body.innerHTML = '<div id="div-header"><span>existing</span></div>';
+    window.tsjs = { divToSlotId: { 'div-header': 'homepage_header' } } as typeof window.tsjs;
+
+    const accepted = dispatchApsRendering({
+      slotId: 'homepage_header',
+      renderer: descriptor(),
+      trustedServer: () => true,
+    });
+    const frame = document.querySelector<HTMLIFrameElement>('#div-header iframe')!;
+    nativeRunnerState(frame).runner.dispatchEvent(new Event('load'));
+
+    await expect(accepted).resolves.toBe(true);
+    expect(document.querySelector('#div-header span')).toBeNull();
+  });
+
+  it('renders inside the inner slot when Prebid uses its container ID', async () => {
+    document.body.innerHTML =
+      '<div id="div-header-container"><div id="div-header"><iframe></iframe></div></div>';
+    const source = document.querySelector<HTMLIFrameElement>('#div-header > iframe')!.contentWindow;
+
+    const accepted = dispatchApsRendering({
+      slotId: 'div-header-container',
+      renderer: descriptor(),
+      source,
+      trustedServer: () => true,
+    });
+    const frame = Array.from(
+      document.querySelectorAll<HTMLIFrameElement>('#div-header > iframe')
+    ).find((candidate) => candidate.title === 'Ad content')!;
+    nativeRunnerState(frame).runner.dispatchEvent(new Event('load'));
+
+    await expect(accepted).resolves.toBe(true);
+    expect(document.getElementById('div-header-container')).not.toBeNull();
+    expect(document.getElementById('div-header')).not.toBeNull();
+    expect(document.querySelectorAll('#div-header > iframe')).toHaveLength(1);
+  });
+
+  it('uses the requesting frame to resolve a dynamic slot prefix', async () => {
+    document.body.innerHTML =
+      '<div id="div-header-first"><iframe></iframe></div>' +
+      '<div id="div-header-second"><iframe></iframe></div>';
+    const source = document.querySelector<HTMLIFrameElement>(
+      '#div-header-second > iframe'
+    )!.contentWindow;
+
+    const accepted = dispatchApsRendering({
+      slotId: 'div-header-',
+      renderer: descriptor(),
+      source,
+      trustedServer: () => true,
+    });
+    const frame = Array.from(
+      document.querySelectorAll<HTMLIFrameElement>('#div-header-second > iframe')
+    ).find((candidate) => candidate.title === 'Ad content')!;
+    nativeRunnerState(frame).runner.dispatchEvent(new Event('load'));
+
+    await expect(accepted).resolves.toBe(true);
+    expect(document.querySelector('#div-header-first > iframe')).not.toBeNull();
+    expect(document.querySelectorAll('#div-header-second > iframe')).toHaveLength(1);
+  });
+
+  it('contains throwing publisher slot mappings without falling back', async () => {
+    const tsjs = {} as NonNullable<typeof window.tsjs>;
+    Object.defineProperty(tsjs, 'divToSlotId', {
+      get: () => {
+        throw new Error('fictional mapping lookup failure');
+      },
+    });
+    window.tsjs = tsjs;
+    const trustedServer = vi.fn(() => true);
+
+    await expect(
+      dispatchApsRendering({
+        slotId: 'logical-slot',
+        renderer: descriptor(),
+        trustedServer,
+      })
+    ).resolves.toBe(false);
+    expect(trustedServer).not.toHaveBeenCalled();
+    expect(document.querySelector('iframe')).toBeNull();
+  });
+
+  it('times out an unacknowledged runner without clearing publisher content', async () => {
+    vi.useFakeTimers();
+    try {
+      const result = dispatchApsRendering({
+        slotId: 'fictional-slot',
+        renderer: descriptor(),
+        trustedServer: () => true,
+      });
+      await vi.advanceTimersByTimeAsync(APS_NATIVE_RENDERER_TIMEOUT_MS);
+
+      await expect(result).resolves.toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(document.querySelector('#fictional-slot iframe')).toBeNull();
+      expect(document.querySelector('#fictional-slot span')).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe('direct APS rendering', () => {
   beforeEach(() => {
     document.body.innerHTML = '<div id="fictional-slot"><span>existing</span></div>';
@@ -269,6 +538,42 @@ describe('direct APS rendering', () => {
   afterEach(() => {
     vi.restoreAllMocks();
     document.body.innerHTML = '';
+  });
+
+  it('keeps a valid default frame when an invalid replacement is rejected', () => {
+    const trustedServer = (renderer: ApsRendererV1): boolean =>
+      renderApsCreative({ slotId: 'fictional-slot', renderer });
+    expect(
+      dispatchDefaultApsRendering({
+        slotId: 'fictional-slot',
+        renderer: descriptor(),
+        trustedServer,
+      })
+    ).toBe(true);
+
+    const slot = document.getElementById('fictional-slot')!;
+    const iframe = slot.querySelector('iframe')!;
+    const postMessage = vi.spyOn(iframe.contentWindow!, 'postMessage');
+    iframe.dispatchEvent(new Event('load'));
+    const sent = postMessage.mock.calls[0][0] as { nonce: string };
+
+    expect(
+      dispatchDefaultApsRendering({
+        slotId: 'fictional-slot',
+        renderer: descriptor({ aaxResponse: 'invalid' }),
+        trustedServer,
+      })
+    ).toBe(false);
+    expect(iframe.isConnected).toBe(true);
+
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        data: { message: 'trusted-server/aps/renderer-ready', nonce: sent.nonce },
+        source: iframe.contentWindow,
+      })
+    );
+    expect(slot.querySelector('span')).toBeNull();
+    expect(iframe.style.display).toBe('');
   });
 
   it('loads the static route with a fragment-bound 128-bit nonce and opaque sandbox', () => {

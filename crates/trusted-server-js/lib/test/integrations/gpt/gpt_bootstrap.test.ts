@@ -33,6 +33,7 @@ interface MockGoogleTag {
   pubads: () => unknown;
   enableServices: () => void;
   display: (divId: string) => void;
+  setConfig?: (config: Record<string, unknown>) => void;
 }
 
 // `tsjs` is declared globally as the full `TsjsApi`; `Omit` drops it from
@@ -40,7 +41,24 @@ interface MockGoogleTag {
 type TestWindow = Omit<Window, 'tsjs'> & {
   googletag?: MockGoogleTag;
   tsjs?: Partial<TsjsApi>;
+  __tsjs_gam_attribution_enabled?: boolean;
 };
+
+function makeGoogleTag(overrides: Partial<MockGoogleTag> = {}): MockGoogleTag {
+  const pubads = {
+    getSlots: vi.fn(() => []),
+    refresh: vi.fn(),
+  };
+
+  return {
+    cmd: [],
+    defineSlot: vi.fn(),
+    pubads: vi.fn(() => pubads),
+    enableServices: vi.fn(),
+    display: vi.fn(),
+    ...overrides,
+  };
+}
 
 function runBootstrap(): void {
   // Evaluate in the jsdom global scope, exactly as an inline <script> would.
@@ -60,6 +78,7 @@ describe('gpt_bootstrap.js fallback', () => {
   beforeEach(() => {
     delete (window as TestWindow).tsjs;
     delete (window as TestWindow).googletag;
+    delete (window as TestWindow).__tsjs_gam_attribution_enabled;
     rafQueue = [];
     (
       window as { requestAnimationFrame: typeof window.requestAnimationFrame }
@@ -81,7 +100,137 @@ describe('gpt_bootstrap.js fallback', () => {
     delete (window as unknown as Record<string, unknown>).requestAnimationFrame;
     delete (window as TestWindow).tsjs;
     delete (window as TestWindow).googletag;
+    delete (window as TestWindow).__tsjs_gam_attribution_enabled;
     vi.restoreAllMocks();
+  });
+
+  it('does not create googletag before the guard when attribution is omitted or false', () => {
+    for (const flag of [undefined, false]) {
+      const bundleAdInit = vi.fn();
+      (window as TestWindow).tsjs = { adInit: bundleAdInit };
+      delete (window as TestWindow).googletag;
+      if (flag === undefined) {
+        delete (window as TestWindow).__tsjs_gam_attribution_enabled;
+      } else {
+        (window as TestWindow).__tsjs_gam_attribution_enabled = flag;
+      }
+
+      runBootstrap();
+
+      expect((window as TestWindow).googletag).toBeUndefined();
+      expect((window as TestWindow).tsjs!.adInit).toBe(bundleAdInit);
+    }
+  });
+
+  it('queues string-valued page targeting before a later publisher command', () => {
+    const queue: Array<() => void> = [];
+    const setConfig = vi.fn();
+    (window as TestWindow).googletag = makeGoogleTag({ cmd: queue, setConfig });
+    (window as TestWindow).__tsjs_gam_attribution_enabled = true;
+
+    runBootstrap();
+    const publisherCommand = vi.fn();
+    queue.push(publisherCommand);
+    [...queue].forEach((command) => command());
+
+    expect(setConfig).toHaveBeenCalledWith({ targeting: { ts: 'true' } });
+    expect(setConfig.mock.invocationCallOrder[0]).toBeLessThan(
+      publisherCommand.mock.invocationCallOrder[0]
+    );
+  });
+
+  it('queues targeting before the preinstalled adInit guard without replacing bundle APIs', () => {
+    const queue: Array<() => void> = [];
+    const setConfig = vi.fn();
+    const bundleAdInit = vi.fn();
+    (window as TestWindow).googletag = makeGoogleTag({ cmd: queue, setConfig });
+    (window as TestWindow).tsjs = { adInit: bundleAdInit };
+    (window as TestWindow).__tsjs_gam_attribution_enabled = true;
+
+    runBootstrap();
+
+    expect(queue).toHaveLength(1);
+    expect((window as TestWindow).tsjs!.adInit).toBe(bundleAdInit);
+    expect((window as TestWindow).tsjs!.scheduleInitialAdInit).toBeUndefined();
+    queue.forEach((command) => command());
+    expect(setConfig).toHaveBeenCalledWith({ targeting: { ts: 'true' } });
+  });
+
+  it('keeps bootstrap installation working when setConfig is unavailable', () => {
+    const queue: Array<() => void> = [];
+    (window as TestWindow).googletag = makeGoogleTag({ cmd: queue });
+    (window as TestWindow).__tsjs_gam_attribution_enabled = true;
+
+    runBootstrap();
+
+    expect(() => [...queue].forEach((command) => command())).not.toThrow();
+    expect(typeof (window as TestWindow).tsjs!.adInit).toBe('function');
+    expect(typeof (window as TestWindow).tsjs!.scheduleInitialAdInit).toBe('function');
+  });
+
+  it('isolates a throwing setConfig from later publisher commands', () => {
+    const queue: Array<() => void> = [];
+    const setConfig = vi.fn(() => {
+      throw new Error('publisher setConfig failed');
+    });
+    const warn = vi.fn();
+    const disableInitialLoad = vi.fn();
+    const pubads = {
+      disableInitialLoad,
+      getSlots: vi.fn(() => []),
+      refresh: vi.fn(),
+    };
+    const publisherCommand = vi.fn();
+    (window as TestWindow).tsjs = {
+      log: {
+        setLevel: vi.fn(),
+        getLevel: vi.fn(() => 'warn'),
+        info: vi.fn(),
+        warn,
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    };
+    (window as TestWindow).googletag = makeGoogleTag({
+      cmd: queue,
+      setConfig,
+      pubads: vi.fn(() => pubads),
+    });
+    (window as TestWindow).__tsjs_gam_attribution_enabled = true;
+
+    runBootstrap();
+    queue.push(publisherCommand);
+
+    expect(() => [...queue].forEach((command) => command())).not.toThrow();
+    expect(setConfig).toHaveBeenCalledWith({ targeting: { ts: 'true' } });
+    expect(warn).toHaveBeenCalledWith('GAM attribution targeting failed', expect.any(Error));
+    expect(publisherCommand).toHaveBeenCalledTimes(1);
+    expect(typeof (window as TestWindow).tsjs!.adInit).toBe('function');
+    pubads.disableInitialLoad();
+    expect(disableInitialLoad).toHaveBeenCalledTimes(1);
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+  });
+
+  it('still tracks the wrapped legacy disableInitialLoad path', () => {
+    const queue: Array<() => void> = [];
+    const disableInitialLoad = vi.fn();
+    const pubads = {
+      disableInitialLoad,
+      getSlots: vi.fn(() => []),
+      refresh: vi.fn(),
+    };
+    (window as TestWindow).googletag = makeGoogleTag({
+      cmd: queue,
+      pubads: vi.fn(() => pubads),
+    });
+    (window as TestWindow).__tsjs_gam_attribution_enabled = true;
+
+    runBootstrap();
+    [...queue].forEach((command) => command());
+    pubads.disableInitialLoad();
+
+    expect(disableInitialLoad).toHaveBeenCalledTimes(1);
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
   });
 
   it('installs fallback adInit and scheduleInitialAdInit when the bundle is absent', () => {
@@ -117,6 +266,57 @@ describe('gpt_bootstrap.js fallback', () => {
     expect(adInit).not.toHaveBeenCalled();
     flushFrame();
     expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('fallback scheduler accepts only the first schedule call', () => {
+    runBootstrap();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    ts.scheduleInitialAdInit!({ first: { hb_pb: '1.00' } });
+    ts.scheduleInitialAdInit!({ second: { hb_pb: '2.00' } });
+    expect(ts.bids).toEqual({ first: { hb_pb: '1.00' } });
+
+    window.dispatchEvent(new Event('load'));
+    flushFrame();
+    flushFrame();
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('fallback scheduler preserves head-injected slots when initialSlots is omitted', () => {
+    runBootstrap();
+    const ts = (window as TestWindow).tsjs!;
+    ts.adInit = vi.fn();
+    const headSlot = {
+      id: 'head_slot',
+      gam_unit_path: '/123/head',
+      div_id: 'div-head',
+      formats: [[300, 250]] as Array<[number, number]>,
+    };
+    ts.adSlots = [headSlot];
+
+    ts.scheduleInitialAdInit!({ head_slot: { hb_pb: '1.00' } });
+
+    expect(ts.adSlots).toEqual([headSlot]);
+  });
+
+  it('fallback scheduler replaces existing slots when initialSlots is explicitly empty', () => {
+    runBootstrap();
+    const ts = (window as TestWindow).tsjs!;
+    ts.adInit = vi.fn();
+    ts.adSlots = [
+      {
+        id: 'stale_slot',
+        gam_unit_path: '/123/stale',
+        div_id: 'div-stale',
+        formats: [[300, 250]],
+      },
+    ];
+
+    ts.scheduleInitialAdInit!({}, []);
+
+    expect(ts.adSlots).toEqual([]);
   });
 
   it('fallback scheduler rides animation frames in a hidden document, holding adInit until first view', () => {
@@ -157,6 +357,36 @@ describe('gpt_bootstrap.js fallback', () => {
     flushFrame();
     flushFrame();
     expect(adInit).not.toHaveBeenCalled();
+  });
+
+  it('fallback scheduler guards the SSR slot definitions with the same generation check', () => {
+    // The shared-template seam hands slots to the scheduler rather than assigning
+    // them itself, so the fallback has to honour the same guard as the bundle. If it
+    // applied them unconditionally, a page whose bundle failed to load would take the
+    // stale SSR slots over a committed navigation's.
+    runBootstrap();
+    const ts = (window as TestWindow).tsjs!;
+    ts.adInit = vi.fn();
+    const liveSlot = {
+      id: 'live_slot',
+      gam_unit_path: '/123/live',
+      div_id: 'div-live',
+      formats: [[300, 250]] as Array<[number, number]>,
+    };
+    const ssrSlot = {
+      id: 'ssr_slot',
+      gam_unit_path: '/123/ssr',
+      div_id: 'div-ssr',
+      formats: [[728, 90]] as Array<[number, number]>,
+    };
+
+    ts.scheduleInitialAdInit!({ ssr_slot: { hb_pb: '1.00' } }, [ssrSlot]);
+    expect(ts.adSlots).toEqual([ssrSlot]);
+
+    ts.adSlots = [liveSlot];
+    ts.navGeneration = 1;
+    ts.scheduleInitialAdInit!({ ssr_slot: { hb_pb: '1.00' } }, [ssrSlot]);
+    expect(ts.adSlots).toEqual([liveSlot]);
   });
 
   it('fallback adInit defines, targets, and displays a TS slot through the command queue', () => {
