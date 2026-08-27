@@ -200,12 +200,16 @@ import {
   installPrebidNpm,
   installRefreshHandler,
 } from '../../../src/integrations/prebid/index';
+import { installTsAdInit } from '../../../src/integrations/gpt/index';
 import type { AuctionBid } from '../../../src/core/auction';
 import {
   claimFirstImpressionForTrustedServer,
   consumePublisherFirstImpressionDelivery,
+  firstImpressionClaim,
   observeFirstImpressionGptLifecycle,
   registerPublisherFirstImpressionAuctions,
+  releaseTrustedServerFirstImpressionClaim,
+  reservePublisherFirstImpressionFallback,
 } from '../../../src/core/first_impression';
 import { log } from '../../../src/core/log';
 import type { TsjsApi } from '../../../src/core/types';
@@ -2635,6 +2639,113 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     element.remove();
   });
 
+  it('rejects a connected claim whose element is no longer canonical for its ID', () => {
+    const element = document.createElement('div');
+    element.id = 'replaced-canonical-element';
+    document.body.appendChild(element);
+    const ts = {} as TsjsApi;
+    claimFirstImpressionForTrustedServer(ts, element, 100);
+    const token = registerPublisherFirstImpressionAuctions(ts, [element.id], 101).get(element.id);
+    const replacement = document.createElement('div');
+    replacement.id = element.id;
+    document.body.insertBefore(replacement, element);
+
+    expect(document.getElementById(element.id)).toBe(replacement);
+    expect(consumePublisherFirstImpressionDelivery(ts, token, 102)).toBe(false);
+    expect(ts.firstImpression?.slots[element.id]).toBeUndefined();
+
+    replacement.remove();
+    element.remove();
+  });
+
+  it('prunes a claim stored under a registry key that does not match its slot element ID', () => {
+    const element = document.createElement('div');
+    element.id = 'malformed-registry-key-slot';
+    document.body.appendChild(element);
+    const ts = {} as TsjsApi;
+    const claim = claimFirstImpressionForTrustedServer(ts, element, 100)!;
+    delete ts.firstImpression!.slots[element.id];
+    ts.firstImpression!.slots['wrong-registry-key'] = claim;
+
+    expect(firstImpressionClaim(ts, element)).toBeUndefined();
+    expect(ts.firstImpression!.slots['wrong-registry-key']).toBeUndefined();
+
+    element.remove();
+  });
+
+  it('rejects a connected same-ID TS claim from a foreign document', () => {
+    const element = document.createElement('div');
+    element.id = 'foreign-document-claim-slot';
+    document.body.appendChild(element);
+    const foreignDocument = document.implementation.createHTMLDocument('foreign');
+    const foreignElement = foreignDocument.createElement('div');
+    foreignElement.id = element.id;
+    foreignDocument.body.appendChild(foreignElement);
+    const ts = {} as TsjsApi;
+    const claim = claimFirstImpressionForTrustedServer(ts, element, 100)!;
+    const token = registerPublisherFirstImpressionAuctions(ts, [element.id], 101).get(element.id);
+    claim.element = foreignElement;
+
+    expect(foreignElement.isConnected).toBe(true);
+    expect(consumePublisherFirstImpressionDelivery(ts, token, 102)).toBe(false);
+    expect(ts.firstImpression?.slots[element.id]).toBeUndefined();
+    expect(claimFirstImpressionForTrustedServer(ts, element, 103)?.element).toBe(element);
+
+    element.remove();
+  });
+
+  it('prunes an ordinary expired publisher registration without a reserved fallback', () => {
+    const element = document.createElement('div');
+    element.id = 'ordinary-expired-publisher-slot';
+    document.body.appendChild(element);
+    const ts = {} as TsjsApi;
+    const token = registerPublisherFirstImpressionAuctions(ts, [element.id], 100).get(element.id);
+
+    expect(consumePublisherFirstImpressionDelivery(ts, token, 5_101)).toBe(false);
+    expect(ts.firstImpression?.slots[element.id]).toBeUndefined();
+
+    element.remove();
+  });
+
+  it('clears a failed fallback reservation before a later ordinary publisher claim expires', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100);
+    try {
+      const element = document.createElement('div');
+      element.id = 'failed-fallback-reservation-slot';
+      document.body.appendChild(element);
+      const ts = {} as TsjsApi;
+      const originalToken = registerPublisherFirstImpressionAuctions(ts, [element.id]).get(
+        element.id
+      );
+      expect(originalToken).toBeDefined();
+      expect(reservePublisherFirstImpressionFallback(ts, element)).toBe(true);
+
+      vi.advanceTimersByTime(5_001);
+      const fallbackClaim = claimFirstImpressionForTrustedServer(ts, element)!;
+      expect(fallbackClaim.owner).toBe('trusted_server');
+      expect(fallbackClaim.publisherAuctions[originalToken!]?.suppressDelivery).toBe(true);
+
+      releaseTrustedServerFirstImpressionClaim(ts, element, fallbackClaim);
+      expect(ts.firstImpression?.slots[element.id]).toBeUndefined();
+      expect(ts.firstImpression?.fallbackSlots[element.id]).toBeUndefined();
+
+      const laterToken = registerPublisherFirstImpressionAuctions(ts, [element.id]).get(element.id);
+      expect(laterToken).toBeDefined();
+      vi.advanceTimersByTime(5_001);
+      expect(consumePublisherFirstImpressionDelivery(ts, laterToken)).toBe(false);
+      expect(ts.firstImpression?.slots[element.id]).toBeUndefined();
+
+      const freshClaim = claimFirstImpressionForTrustedServer(ts, element)!;
+      expect(freshClaim.publisherAuctions).toEqual({});
+
+      element.remove();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it('reserves first impression while a publisher refresh auction is pending', () => {
     const code = 'pending-publisher-refresh-slot';
     const slot = {
@@ -2662,6 +2773,74 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
 
     expect(originalRefresh).toHaveBeenCalledOnce();
     expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
+  });
+
+  it('suppresses an original publisher delivery after the lease-boundary TS fallback', () => {
+    vi.useFakeTimers();
+    try {
+      const code = 'lease-boundary-fallback-slot';
+      const slot = {
+        getSlotElementId: () => code,
+        getTargeting: () => [],
+        getSizes: () => [[300, 250]],
+        clearTargeting: vi.fn(),
+        setTargeting: vi.fn(),
+      };
+      const { originalRefresh, pubads } = installGpt([slot]);
+      let originalPublisherAuction: Parameters<typeof completePublisherAuction>[0];
+      mockRequestBids.mockImplementation((options) => {
+        if (!originalPublisherAuction) {
+          originalPublisherAuction = options;
+          return;
+        }
+        completePublisherAuction(options);
+      });
+      const pbjs = installPrebidNpm();
+      const ts = (testWindow.tsjs ??= {}) as unknown as TsjsApi;
+      ts.servicesEnabled = true;
+      ts.adSlots = [
+        {
+          id: 'lease-boundary-fallback-ad',
+          gam_unit_path: '/123/lease-boundary',
+          div_id: code,
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ];
+      ts.bids = {
+        'lease-boundary-fallback-ad': {
+          hb_pb: '1.00',
+          hb_adid: 'trusted-server-fallback-ad',
+        },
+      };
+
+      pbjs.requestBids({
+        adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+        bidsBackHandler: () => pubads.refresh([slot]),
+      } as unknown as RequestBidsArg);
+      installTsAdInit();
+      ts.adInit!();
+
+      vi.advanceTimersByTime(5001);
+      observeFirstImpressionGptLifecycle(ts, document.getElementById(code)!, 'requested');
+      expect(originalRefresh).toHaveBeenCalledOnce();
+      expect(ts.firstImpression?.slots[code]?.owner).toBe('trusted_server');
+      expect(ts.firstImpression?.fallbackSlots[code]).toBe(document.getElementById(code));
+      expect(Object.values(ts.firstImpression?.slots[code]?.publisherAuctions ?? {})).toEqual([
+        expect.objectContaining({ suppressDelivery: true }),
+      ]);
+
+      completePublisherAuction(originalPublisherAuction);
+      expect(originalRefresh).toHaveBeenCalledOnce();
+
+      deliveryAdIds.delete(slot);
+      pubads.refresh([slot]);
+      expect(mockRequestBids).toHaveBeenCalledTimes(2);
+      expect(originalRefresh).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
   });
 
   it('suppresses a delayed publisher refresh when TS already owns first impression', () => {
@@ -4431,7 +4610,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
   });
 
-  it('consumes all overlapping pending bids for the same ad-unit code', () => {
+  it('preserves a sibling registration after consuming an exact overlapping delivery', () => {
     const code = 'example-overlapping-code';
     const slot = {
       getSlotElementId: () => code,
@@ -4443,26 +4622,89 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
     const pbjs = installPrebidNpm();
 
-    pbjs.requestBids({
-      adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
-      bidsBackHandler: () => {},
-    } as unknown as RequestBidsArg);
-    pbjs.requestBids({
-      adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
-      bidsBackHandler: () => {},
-    } as unknown as RequestBidsArg);
+    for (let index = 0; index < 2; index += 1) {
+      pbjs.requestBids({
+        adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+        bidsBackHandler: () => {},
+      } as unknown as RequestBidsArg);
+    }
 
+    deliveryAdIds.set(slot, `example-auction-0-${code}`);
     pubads.refresh([slot]);
+    deliveryAdIds.set(slot, `example-auction-1-${code}`);
+    pubads.refresh([slot]);
+
     expect(mockRequestBids).toHaveBeenCalledTimes(2);
     expect(slot.clearTargeting).not.toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenNthCalledWith(1, [slot], undefined);
+    expect(originalRefresh).toHaveBeenNthCalledWith(2, [slot], undefined);
+  });
+
+  it('does not guess between ordinary overlapping code-only registrations', () => {
+    const code = 'example-ambiguous-code-only';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
+    const pbjs = installPrebidNpm();
+
+    for (let index = 0; index < 2; index += 1) {
+      pbjs.requestBids({
+        adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+        bidsBackHandler: () => {},
+      } as unknown as RequestBidsArg);
+    }
+
+    deliveryAdIds.delete(slot);
+    pubads.refresh([slot]);
+    expect(mockRequestBids).toHaveBeenCalledTimes(3);
 
     deliveryAdIds.set(slot, `example-auction-0-${code}`);
     pubads.refresh([slot]);
 
     expect(mockRequestBids).toHaveBeenCalledTimes(3);
-    expect(slot.clearTargeting).toHaveBeenCalledWith('hb_adid');
-    expect(originalRefresh).toHaveBeenNthCalledWith(1, [slot], undefined);
-    expect(originalRefresh).toHaveBeenNthCalledWith(2, [slot], undefined);
+    expect(originalRefresh).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails closed without consuming TS-owned ambiguous code-only registrations', () => {
+    const code = 'example-ts-ambiguous-code-only';
+    const element = document.createElement('div');
+    element.id = code;
+    document.body.appendChild(element);
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+      setTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    const ts = (testWindow.tsjs ??= {}) as unknown as TsjsApi;
+    claimFirstImpressionForTrustedServer(ts, element);
+    mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
+    const pbjs = installPrebidNpm();
+
+    for (let index = 0; index < 2; index += 1) {
+      pbjs.requestBids({
+        adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+        bidsBackHandler: () => {},
+      } as unknown as RequestBidsArg);
+    }
+
+    deliveryAdIds.delete(slot);
+    pubads.refresh([slot]);
+    deliveryAdIds.set(slot, `example-auction-0-${code}`);
+    pubads.refresh([slot]);
+    deliveryAdIds.set(slot, `example-auction-1-${code}`);
+    pubads.refresh([slot]);
+
+    expect(mockRequestBids).toHaveBeenCalledTimes(2);
+    expect(originalRefresh).not.toHaveBeenCalled();
+    element.remove();
   });
 
   it('filters invalid explicit entries without duplicating or leaking a valid delivery', () => {

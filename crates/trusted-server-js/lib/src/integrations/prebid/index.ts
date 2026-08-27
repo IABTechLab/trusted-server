@@ -15,6 +15,7 @@ import type _pbjsDefault from 'prebid.js';
 
 import {
   consumePublisherFirstImpressionDelivery,
+  FIRST_IMPRESSION_LEASE_MS,
   firstImpressionClaim,
   markPublisherFirstImpressionDeliveryPending,
   registerPublisherFirstImpressionAuctions,
@@ -138,7 +139,7 @@ const TS_REFRESH_TARGETING_KEYS = [
 ] as const;
 const MAX_PUBLISHER_AD_UNIT_SNAPSHOTS = 256;
 const MAX_PENDING_PUBLISHER_BIDS = 2048;
-const PENDING_PUBLISHER_DELIVERY_TTL_MS = 5000;
+const PENDING_PUBLISHER_DELIVERY_TTL_MS = FIRST_IMPRESSION_LEASE_MS;
 
 /** Configuration options for the Prebid integration. */
 export interface PrebidNpmConfig {
@@ -901,6 +902,24 @@ function removePendingPublisherBidsForCode(adUnitCode: string, registrationId?: 
   }
 }
 
+function removeConsumedPublisherRegistration(adUnitCode: string, registrationId: number): void {
+  const registrations = pendingPublisherCodes.get(adUnitCode);
+  const pendingCode = registrations?.get(registrationId);
+  registrations?.delete(registrationId);
+  if (registrations?.size === 0) pendingPublisherCodes.delete(adUnitCode);
+
+  const tokens = new Set<string>();
+  if (pendingCode?.firstImpressionToken) tokens.add(pendingCode.firstImpressionToken);
+  for (const [adId, pendingBid] of pendingPublisherBids) {
+    if (pendingBid.adUnitCode !== adUnitCode || pendingBid.registrationId !== registrationId) {
+      continue;
+    }
+    pendingPublisherBids.delete(adId);
+    if (pendingBid.firstImpressionToken) tokens.add(pendingBid.firstImpressionToken);
+  }
+  for (const token of tokens) forgetPublisherFirstImpressionToken(adUnitCode, token);
+}
+
 function pendingPublisherContextIsCurrent(
   pending: PendingPublisherBid | PendingPublisherCode
 ): boolean {
@@ -1133,26 +1152,33 @@ function publisherDeliverySlots(targetSlots: RefreshGptSlot[]): PublisherDeliver
     const hasAdId =
       Array.isArray(adIds) && adIds.some((adId) => typeof adId === 'string' && adId.length > 0);
     const injectedSlot = findInjectedSlotForRefresh(slot);
-    const pendingCode = [refreshSlotElementId(slot), injectedSlot?.div_id]
-      .filter((code): code is string => typeof code === 'string' && code.length > 0)
-      .flatMap((code) => [...(pendingPublisherCodes.get(code)?.values() ?? [])])
-      .filter(
-        (pending) =>
-          pendingPublisherContextMatchesSlot(pending, slot) &&
-          (!hasAdId || pending.retainUntilContextChange)
-      )
-      .sort((left, right) => left.registrationId - right.registrationId)[0];
+    const pendingCodeCandidates = [
+      ...new Map(
+        [refreshSlotElementId(slot), injectedSlot?.div_id]
+          .filter((code): code is string => typeof code === 'string' && code.length > 0)
+          .flatMap((code) => [...(pendingPublisherCodes.get(code)?.values() ?? [])])
+          .filter(
+            (pending) =>
+              pendingPublisherContextMatchesSlot(pending, slot) &&
+              (!hasAdId || pending.retainUntilContextChange)
+          )
+          .map((pending) => [pending.registrationId, pending] as const)
+      ).values(),
+    ].sort((left, right) => left.registrationId - right.registrationId);
+    const pendingCode = pendingCodeCandidates.length === 1 ? pendingCodeCandidates[0] : undefined;
     const pending = pendingBid ?? pendingCode;
-    if (!pending) continue;
+    if (!pending) {
+      if (pendingCodeCandidates.some((candidate) => candidate.retainUntilContextChange)) {
+        suppressedSlots.add(slot);
+      }
+      continue;
+    }
 
     const suppress =
       pending.firstImpressionToken && window.tsjs
         ? consumePublisherFirstImpressionDelivery(window.tsjs, pending.firstImpressionToken)
         : false;
-    if (pending.firstImpressionToken) {
-      forgetPublisherFirstImpressionToken(pending.adUnitCode, pending.firstImpressionToken);
-    }
-    removePendingPublisherBidsForCode(pending.adUnitCode);
+    removeConsumedPublisherRegistration(pending.adUnitCode, pending.registrationId);
     (suppress ? suppressedSlots : deliverySlots).add(slot);
   }
 

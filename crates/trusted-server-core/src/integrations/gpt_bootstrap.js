@@ -103,6 +103,7 @@
   });
 
   var FIRST_IMPRESSION_LEASE_MS = 5000;
+  var MAX_FIRST_IMPRESSION_SLOTS = 256;
 
   function firstImpressionState(now) {
     var generation = ts.navGeneration || 0;
@@ -125,14 +126,24 @@
       if (
         claim.generation !== generation ||
         claim.slotElementId !== elementId ||
+        claim.element.ownerDocument !== document ||
         claim.element !== document.getElementById(elementId) ||
         !claim.element.isConnected
       ) {
         delete state.slots[elementId];
         return;
       }
+      var hasReservedFallback =
+        claim.owner === "publisher" &&
+        (claim.phase === "auctioning" || claim.phase === "delivery_pending") &&
+        state.fallbackSlots[elementId] === claim.element;
       Object.keys(claim.publisherAuctions || {}).forEach(function (token) {
-        if (claim.publisherAuctions[token].expiresAt <= now) {
+        var auction = claim.publisherAuctions[token];
+        if (
+          auction.expiresAt <= now &&
+          !hasReservedFallback &&
+          !(claim.owner === "trusted_server" && auction.suppressDelivery)
+        ) {
           delete claim.publisherAuctions[token];
         }
       });
@@ -140,7 +151,8 @@
         claim.owner === "publisher" &&
         (claim.phase === "auctioning" || claim.phase === "delivery_pending") &&
         Object.keys(claim.publisherAuctions || {}).length === 0 &&
-        claim.expiresAt <= now
+        claim.expiresAt <= now &&
+        !hasReservedFallback
       ) {
         delete state.slots[elementId];
       }
@@ -162,10 +174,37 @@
     return firstImpressionState(Date.now()).slots[element.id];
   }
 
+  function storeFirstImpressionClaim(state, claim) {
+    if (
+      !state.slots[claim.slotElementId] &&
+      Object.keys(state.slots).length >= MAX_FIRST_IMPRESSION_SLOTS
+    ) {
+      return false;
+    }
+    state.slots[claim.slotElementId] = claim;
+    return true;
+  }
+
   function claimFirstImpressionForTrustedServer(element) {
     var now = Date.now();
     var state = firstImpressionState(now);
-    if (state.slots[element.id]) return null;
+    var existing = state.slots[element.id];
+    if (existing) {
+      var canTransitionPublisherFallback =
+        existing.owner === "publisher" &&
+        existing.phase !== "requested" &&
+        existing.phase !== "rendered" &&
+        existing.expiresAt <= now &&
+        state.fallbackSlots[element.id] === element;
+      if (!canTransitionPublisherFallback) return null;
+      existing.owner = "trusted_server";
+      existing.phase = "delivery_pending";
+      existing.expiresAt = now + FIRST_IMPRESSION_LEASE_MS;
+      Object.keys(existing.publisherAuctions || {}).forEach(function (token) {
+        existing.publisherAuctions[token].suppressDelivery = true;
+      });
+      return existing;
+    }
     var claim = {
       generation: state.generation,
       slotElementId: element.id,
@@ -175,8 +214,7 @@
       expiresAt: now + FIRST_IMPRESSION_LEASE_MS,
       publisherAuctions: {},
     };
-    state.slots[element.id] = claim;
-    return claim;
+    return storeFirstImpressionClaim(state, claim) ? claim : null;
   }
 
   function releaseTrustedServerFirstImpressionClaim(element, claim) {
@@ -184,10 +222,12 @@
     if (
       state.slots[element.id] === claim &&
       claim.owner === "trusted_server" &&
-      claim.phase === "delivery_pending" &&
-      Object.keys(claim.publisherAuctions || {}).length === 0
+      claim.phase === "delivery_pending"
     ) {
       delete state.slots[element.id];
+      if (state.fallbackSlots[element.id] === element) {
+        delete state.fallbackSlots[element.id];
+      }
     }
   }
 
@@ -208,7 +248,7 @@
           var state = firstImpressionState(Date.now());
           var claim = state.slots[elementId];
           if (!claim) {
-            claim = state.slots[elementId] = {
+            storeFirstImpressionClaim(state, {
               generation: state.generation,
               slotElementId: elementId,
               element: element,
@@ -216,12 +256,14 @@
               phase: phase,
               expiresAt: Number.POSITIVE_INFINITY,
               publisherAuctions: {},
-            };
+            });
+            return;
+          }
+          claim.phase = phase;
+          if (claim.owner === "publisher") {
+            claim.expiresAt = Number.POSITIVE_INFINITY;
           } else {
-            claim.phase = phase;
-            if (claim.owner === "publisher") {
-              claim.expiresAt = Number.POSITIVE_INFINITY;
-            }
+            claim.publisherRegistrationClosed = true;
           }
         };
       };
@@ -635,6 +677,10 @@
         ts.divToSlotId = ts.divToSlotId || {};
         ts.divToSlotId[element.id] = slot.id;
         ts.divToSlotId[slotElementId] = slot.id;
+        ts.prevSlotTargetingKeys = ts.prevSlotTargetingKeys || {};
+        var targetingKeys = Object.keys(slot.targeting || {});
+        ts.prevSlotTargetingKeys[element.id] = targetingKeys;
+        ts.prevSlotTargetingKeys[slotElementId] = targetingKeys;
         if (tsOwned) {
           ts.prevGptSlots = ts.prevGptSlots || [];
           ts.prevGptSlots.push(gptSlot);
@@ -670,6 +716,7 @@
     var slots = ts.adSlots || [];
     var bids = ts.bids || {};
     var divToSlotId = {};
+    var nextSlotTargetingKeys = {};
     // Generation this invocation belongs to. The slot work below is queued on
     // googletag.cmd, which drains only when GPT loads; recheck first inside
     // the queued callback so a navigation committed in the gap cancels the
@@ -783,8 +830,11 @@
         // by the bundle's render bridge (index.ts) once it loads.
         divToSlotId[actualDivId] = slot.id;
         var slotElementId = s.getSlotElementId();
+        var targetingKeys = Object.keys(slot.targeting || {});
+        nextSlotTargetingKeys[actualDivId] = targetingKeys;
         if (slotElementId && slotElementId !== actualDivId) {
           divToSlotId[slotElementId] = slot.id;
+          nextSlotTargetingKeys[slotElementId] = targetingKeys;
         }
         if (tsOwned) {
           newSlots.push(s);
@@ -796,6 +846,7 @@
       });
       ts.prevGptSlots = newSlots;
       ts.divToSlotId = divToSlotId;
+      ts.prevSlotTargetingKeys = nextSlotTargetingKeys;
       var hasRenderableWork =
         slotsToDisplay.length > 0 || slotsToRefresh.length > 0;
       if (!ts.servicesEnabled && hasRenderableWork) {

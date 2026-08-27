@@ -23,8 +23,12 @@ closes, so an arbitrarily late correlated callback cannot become unrelated.
 
 Prebid's pending bid/code correlation records carry the navigation generation and
 physical element identity captured at registration. A record is usable only while
-both still match. Scoped `requestBids({ adUnitCodes })` calls inspect, mutate,
-claim, and correlate only those requested global ad units.
+both still match, and consuming one exact ad-ID delivery removes only its auction's
+registration. A code-only delivery consumes a record only when exactly one current
+registration matches. Ambiguous ordinary code-only deliveries run an independent
+auction rather than guessing; ambiguous TS-owned suppressing deliveries fail closed
+without deleting their tombstones. Scoped `requestBids({ adUnitCodes })` calls
+inspect, mutate, claim, and correlate only those requested global ad units.
 
 ## Refresh suppression
 
@@ -55,9 +59,10 @@ physical element, dropping stale work rather than refreshing a replacement slot.
 Every asynchronous renderer/cache result is revalidated before posting a creative
 response or recording successful response/billing evidence. A stale result may be
 recorded as safe failure telemetry, but is never recorded as a response or win.
-Validation covers navigation
-generation, winning bid identity, authenticated source iframe identity, DOM
-connectivity, and containment in the authenticated slot root.
+Validation covers navigation generation, winning bid identity, authenticated
+source iframe identity, DOM connectivity, and containment in the authenticated
+slot root. When a configured prefix matches several roots, the requesting frame
+may disambiguate them only when exactly one candidate root owns that source.
 
 After a valid response is posted, a collapsed 1x1 source iframe is expanded to the
 winning creative size. The bridge walks all collapsed ancestors through the
