@@ -1,19 +1,21 @@
 //! Provider permissions: a technical permission model gating provider execution.
 //!
-//! A provider (Edge Cookie, device, or geo) advertises the [`Permission`]s its
-//! data use *requires*. Trusted Server resolves which permissions are currently
-//! *set* from the session's signals and the country it resolves to, and refuses
-//! to execute a provider whose required permissions are not set.
+//! A provider advertises the [`Permission`]s its data use *requires*. Trusted
+//! Server resolves which permissions are currently *set* from the session's
+//! signals and the country it resolves to, and refuses to run the Edge Cookie
+//! provider when its required permissions are not set. The device and geo
+//! providers declare their requirements through the same method, and the
+//! built-in ones require none; gating their execution on that declaration is
+//! follow-up work.
 //!
 //! The vocabulary is the IAB Privacy Taxonomy Data Uses, mapped from the IAB TCF
 //! Europe purposes and used **only** as a technical identifier for a permission.
 //! Two purposes have no Data Use yet: TCF purpose 1 (device storage) uses a
 //! proposed `necessary.operations.storage` key and TCF purpose 11 keeps its TCF
-//! identifier. No CMP or TCF *policy* is implemented here, and
-//! only [`Permission::StoreOnDevice`] (TCF Purpose 1) and
-//! [`Permission::SelectPersonalisedAds`] (TCF Purpose 4) are resolved against a
-//! session signal today. The remaining purposes are modeled for forward
-//! compatibility.
+//! identifier. No CMP or TCF *policy* is implemented here. Every TCF purpose
+//! is resolved against the session's signals (a present TCF record grants or
+//! revokes each purpose, and a US-style opt-out revokes), and the Data Uses
+//! with no TCF purpose keep their configured baseline.
 //!
 //! How a permission is acquired varies by country, so resolution is keyed on the
 //! ISO 3166-1 country code a geo provider returns. [`PermissionMaps::standard`]

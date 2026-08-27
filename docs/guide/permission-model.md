@@ -1,7 +1,8 @@
 # Permission Model
 
-Trusted Server runs an Edge Cookie, device, or geo provider only when the
-technical permissions that provider requires are set. The permission model is
+Trusted Server runs the Edge Cookie provider only when the technical
+permissions it requires are set, and the device and geo providers declare
+their requirements the same way. The permission model is
 how a deployer's policy decides whether those permissions are set, without that
 policy being baked into the core.
 
@@ -84,8 +85,8 @@ storage) uses a proposed `necessary.operations.storage` key, and purpose 11
 keeps its TCF identifier `select-basic-content`. Both are flagged for an upstream
 taxonomy addition. All eleven purposes are now resolved against the incoming
 consent and privacy signals. A present TCF record grants or revokes each purpose
-directly, and where no TCF record is present a US-style opt-out (GPC, a GPP sale
-opt-out, or a US Privacy opt-out) is honored. The remaining taxonomy Data Uses
+directly, and a US-style opt-out (GPC, a GPP sale opt-out, or a US Privacy
+opt-out) revokes whether or not a TCF record is present. The remaining taxonomy Data Uses
 have no TCF purpose, so no signal maps to them and their configured baseline
 stands. The mapping itself, which TCF purpose grants which Data Use and what a
 US-style opt-out revokes, is declared in the `signals` section of
@@ -187,8 +188,8 @@ same consent against a `requires_signal` baseline would set it. Consent lifts
 
 The shipped `permissions.yaml` defines `gdpr-eu`, `gdpr-uk`, and `us-opt-out`
 groups, and maps the EU 27 and the EEA members (IS, LI, NO) to `gdpr-eu`, the
-UK to `gdpr-uk`, and the US (with all 50 states and DC) and Australia to
-`us-opt-out`. For device storage (Purpose 1), that yields:
+UK to `gdpr-uk`, and the US (one country-level rule, with state rules
+available as overrides) and Australia to `us-opt-out`. For device storage (Purpose 1), that yields:
 
 | Country        | Device storage (Purpose 1)                                      |
 | -------------- | --------------------------------------------------------------- |

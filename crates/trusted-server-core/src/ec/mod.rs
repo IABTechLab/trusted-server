@@ -749,7 +749,7 @@ impl EcContext {
     /// permissions are set for this request.
     ///
     /// Resolved once at construction through the permission model (see
-    /// [`consent::ec_permission_granted`]).
+    /// [`consent::assemble_permissions`]).
     #[must_use]
     pub fn ec_allowed(&self) -> bool {
         self.ec_allowed
