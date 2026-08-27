@@ -3230,7 +3230,7 @@ describe('installTsRenderBridge', () => {
       Object.assign(new Event('message'), {
         data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
         ports: [{ postMessage }],
-        source: collapsed.source,
+        source: collapsed.iframe.contentWindow!,
         stopImmediatePropagation: vi.fn(),
       }) as unknown as MessageEvent
     );
@@ -3240,6 +3240,36 @@ describe('installTsRenderBridge', () => {
     expect(collapsed.iframe.height).toBe('90');
     expect(collapsed.wrapper.style.width).toBe('728px');
     expect(collapsed.wrapper.style.height).toBe('90px');
+  });
+
+  it('expands every collapsed ancestor through the authenticated slot root', async () => {
+    const tsjs = (window as TestWindow).tsjs!;
+    tsjs.bids.homepage_header.adm = '<div>Fictional creative</div>';
+    tsjs.bids.homepage_header.w = 728;
+    tsjs.bids.homepage_header.h = 90;
+    delete tsjs.bids.homepage_header.nurl;
+    delete tsjs.bids.homepage_header.burl;
+    const bridgeListener = await captureBridgeListener();
+    const collapsed = createCollapsedTrustedSlotIframe();
+    const outerWrapper = document.createElement('div');
+    outerWrapper.style.width = '1px';
+    outerWrapper.style.height = '1px';
+    collapsed.slot.insertBefore(outerWrapper, collapsed.wrapper);
+    outerWrapper.appendChild(collapsed.wrapper);
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [{ postMessage: vi.fn() }],
+        source: collapsed.iframe.contentWindow!,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+
+    expect(collapsed.wrapper.style.width).toBe('728px');
+    expect(collapsed.wrapper.style.height).toBe('90px');
+    expect(outerWrapper.style.width).toBe('728px');
+    expect(outerWrapper.style.height).toBe('90px');
   });
 
   it.each(['fixed', 'anchor', 'expanded', 'oversized'] as const)(
@@ -4633,6 +4663,13 @@ describe('installTsRenderBridge', () => {
   });
 
   it('does not resize a stale cache response after navigation', async () => {
+    const recordTrustedServerCreativeResponse = vi.fn();
+    (window as TestWindow).tsjs!.gptDiagnosticsRecorder = {
+      recordTrustedServerCreativeRequest: vi.fn().mockReturnValue(91),
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure: vi.fn(),
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     let resolveText: ((body: string) => void) | undefined;
     fetchStub.mockResolvedValue({
       ok: true,
@@ -4659,9 +4696,12 @@ describe('installTsRenderBridge', () => {
     resolveText?.(JSON.stringify({ adm: '<div>cached</div>', w: 300, h: 250 }));
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-    expect(postMessage).toHaveBeenCalledOnce();
+    expect(postMessage).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+    expect(beaconSpy).not.toHaveBeenCalled();
     expect(collapsed.iframe.width).toBe('1');
     expect(collapsed.iframe.height).toBe('1');
+    beaconSpy.mockRestore();
   });
 
   it('expands ${AUCTION_PRICE} from the cached bid price before responding', async () => {
