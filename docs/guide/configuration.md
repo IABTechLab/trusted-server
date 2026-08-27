@@ -1485,10 +1485,13 @@ bidder routes before deployment.
 For Prebid Server, move `server_url` to provider `endpoint`, server timeout to
 provider `timeout_ms`, request controls and bidder-parameter overrides to the
 `prebid-server` `profile_config`, notification suppression to `notifications`,
-and each server bidder to `[auction.bidders.<id>]`. Browser timeout, debug,
-bundle, script interception, refresh exclusions, and `client_side_bidders`
-remain under `[integrations.prebid]`. Configure timeout or debug under both
-owners when both browser and server behavior should retain the old value.
+and each server bidder to `[auction.bidders.<id>]`. Origin-only legacy
+`server_url` values compile to `/openrtb2/auction`; query parameters survive,
+and configured non-root custom endpoint paths remain exact. Browser timeout,
+debug, bundle, script interception, refresh exclusions, and
+`client_side_bidders` remain under `[integrations.prebid]`. Configure timeout or
+debug under both owners when both browser and server behavior should retain the
+old value.
 
 For APS, move endpoint and timeout to the provider, then move account,
 inventory, debug, and creative controls to the `aps` `profile_config`.

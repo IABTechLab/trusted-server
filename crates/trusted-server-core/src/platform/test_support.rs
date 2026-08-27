@@ -573,6 +573,14 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock cache bypass flags")
             .push(request.bypass_cache);
+        self.request_methods
+            .lock()
+            .expect("should lock request methods")
+            .push(request.request.method().to_string());
+        self.request_uris
+            .lock()
+            .expect("should lock request URIs")
+            .push(request.request.uri().to_string());
 
         let headers: Vec<(String, String)> = request
             .request
