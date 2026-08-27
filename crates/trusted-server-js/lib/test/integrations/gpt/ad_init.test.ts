@@ -6,7 +6,10 @@ import { resolve } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 
 import envelope from '../../fixtures/aps-renderer-v1.json';
-import { registerPublisherFirstImpressionAuctions } from '../../../src/core/first_impression';
+import {
+  registerPublisherFirstImpressionAuctions,
+  resolveFirstImpressionElement,
+} from '../../../src/core/first_impression';
 import type { AuctionBidData, TsjsApi } from '../../../src/core/types';
 import {
   APS_PREBID_CREATIVE_RUNNER_URL,
@@ -2791,6 +2794,7 @@ describe('installTsAdInit', () => {
         )
       );
       const selectedElement = selectedIndex === null ? undefined : elements[selectedIndex];
+      expect(resolveFirstImpressionElement(divId)).toBe(selectedElement);
       const mockSlot = {
         addService: vi.fn().mockReturnThis(),
         setTargeting: vi.fn().mockReturnThis(),
@@ -3767,7 +3771,7 @@ describe('installTsRenderBridge', () => {
     }
   });
 
-  it('does not use the requesting frame to disambiguate a registered APS slot prefix', async () => {
+  it('uses the requesting frame to disambiguate a registered APS slot prefix', async () => {
     const renderer = apsRenderer();
     const prebidAdId = 'native-dynamic-prebid-ad-id';
     const markUsed = vi.fn();
@@ -3795,9 +3799,14 @@ describe('installTsRenderBridge', () => {
         }) as unknown as MessageEvent
       );
 
-      expect(document.querySelector('iframe[title="Ad content"]')).toBeNull();
-      expect(markUsed).not.toHaveBeenCalled();
-      expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeDefined();
+      const native = nativeRunnerIn('div-native-second');
+      native.runner.dispatchEvent(new Event('load'));
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(native.frame.style.display).toBe('');
+      expect(markUsed).toHaveBeenCalledOnce();
+      expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
     } finally {
       marker.remove();
       document.getElementById('div-native-first')?.remove();
@@ -4491,7 +4500,86 @@ describe('installTsRenderBridge', () => {
     expect(fetchStub).not.toHaveBeenCalled();
   });
 
-  it('uses the adInit-resolved div when a responsive prefix becomes ambiguous', async () => {
+  it('uses the requesting frame to resolve inline adm under an ambiguous prefix', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const tsjs = (window as TestWindow).tsjs!;
+    tsjs.bids.homepage_header.adm = '<div>Prefix inline creative</div>';
+    delete tsjs.bids.homepage_header.hb_cache_host;
+    delete tsjs.bids.homepage_header.hb_cache_path;
+    tsjs.adSlots = [
+      {
+        id: 'homepage_header',
+        formats: [[728, 90]],
+        gam_unit_path: '/a/b/c',
+        div_id: 'div-inline-prefix-',
+        targeting: {},
+      },
+    ];
+    tsjs.divToSlotId = {};
+    createTrustedSlotIframe('div-inline-prefix-first');
+    const source = createTrustedSlotIframe('div-inline-prefix-second');
+    const bridgeListener = await captureBridgeListener();
+    const postMessage = vi.fn();
+    const stopImmediatePropagation = vi.fn();
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [{ postMessage }],
+        source,
+        stopImmediatePropagation,
+      }) as unknown as MessageEvent
+    );
+
+    expect(postMessage).toHaveBeenCalledOnce();
+    expect(JSON.parse(postMessage.mock.calls[0]![0])).toEqual(
+      expect.objectContaining({ ad: '<div>Prefix inline creative</div>' })
+    );
+    expect(stopImmediatePropagation).toHaveBeenCalledOnce();
+    expect(fetchStub).not.toHaveBeenCalled();
+    beaconSpy.mockRestore();
+  });
+
+  it('rejects a requesting frame owned by multiple prefix candidates', async () => {
+    const tsjs = (window as TestWindow).tsjs!;
+    tsjs.bids.homepage_header.adm = '<div>Ambiguous inline creative</div>';
+    tsjs.adSlots = [
+      {
+        id: 'homepage_header',
+        formats: [[728, 90]],
+        gam_unit_path: '/a/b/c',
+        div_id: 'div-nested-prefix-',
+        targeting: {},
+      },
+    ];
+    tsjs.divToSlotId = {};
+    const outer = document.createElement('div');
+    outer.id = 'div-nested-prefix-outer';
+    const inner = document.createElement('div');
+    inner.id = 'div-nested-prefix-inner';
+    const iframe = document.createElement('iframe');
+    inner.appendChild(iframe);
+    outer.appendChild(inner);
+    document.body.appendChild(outer);
+    const bridgeListener = await captureBridgeListener();
+    const postMessage = vi.fn();
+    const stopImmediatePropagation = vi.fn();
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [{ postMessage }],
+        source: iframe.contentWindow,
+        stopImmediatePropagation,
+      }) as unknown as MessageEvent
+    );
+
+    expect(postMessage).not.toHaveBeenCalled();
+    expect(stopImmediatePropagation).not.toHaveBeenCalled();
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it('uses the requesting frame when a responsive prefix is ambiguous', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     fetchStub.mockResolvedValue({
       ok: true,
@@ -4516,9 +4604,7 @@ describe('installTsRenderBridge', () => {
         targeting: {},
       },
     ];
-    (window as TestWindow).tsjs!.divToSlotId = {
-      'div-responsive-a': 'homepage_header',
-    };
+    (window as TestWindow).tsjs!.divToSlotId = {};
 
     const bridgeListener = await captureBridgeListener();
     const portMessages: string[] = [];
