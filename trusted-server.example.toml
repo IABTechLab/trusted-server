@@ -184,6 +184,9 @@ debug = false
 # inventory_page_origin = "https://www.publisher.example"
 # Script creatives require separate security validation before opt-in.
 allow_script_creatives = false
+# Default: Trusted Server's opaque static renderer route. Set publisher_native only
+# for the controlled publisher-origin friendly-frame experiment.
+rendering_mode = "trusted_server"
 
 [integrations.google_tag_manager]
 enabled = false
@@ -223,6 +226,14 @@ verbosity = "redacted"
 format = "compact"
 
 [creative_opportunities]
+# Set to false to disable server-side ad templates while retaining slot definitions
+# and direct POST /auction callers. Structurally inactive templates use the
+# browser-only Cache-Control: private, max-age=60 policy; this setting is one cause.
+# Origin private/no-store policies and bot, prefetch, or consent-denied requests
+# retain their origin policy. CDN-specific cache headers remain unchanged.
+# Before rolling back to a binary that predates this setting, restore true, re-push
+# and finalize the config first.
+enabled = true
 gam_network_id = "123456789"
 # FCP is not affected by this value — body content above </body> has already
 # streamed and painted before the hold begins. What this caps is the slip on
