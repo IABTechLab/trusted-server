@@ -280,6 +280,22 @@ function usesFixedPositioning(element: HTMLElement): boolean {
 
 const MAX_CREATIVE_SHELL_DIMENSION = 10_000;
 
+function creativeFrameIsCurrent(
+  source: MessageEventSource | null,
+  frame: MessageSourceFrame,
+  generation: number,
+  stillOwnsCreative: () => boolean
+): boolean {
+  return (
+    (window.tsjs?.navGeneration ?? 0) === generation &&
+    stillOwnsCreative() &&
+    frame.iframe.isConnected &&
+    frame.root.isConnected &&
+    frame.root.contains(frame.iframe) &&
+    frame.iframe.contentWindow === source
+  );
+}
+
 /** Resize only the authenticated source iframe for a still-current collapsed display shell. */
 function resizeCollapsedCreativeFrame(
   source: MessageEventSource | null,
@@ -290,18 +306,13 @@ function resizeCollapsedCreativeFrame(
   stillOwnsCreative: () => boolean
 ): void {
   if (
-    (window.tsjs?.navGeneration ?? 0) !== generation ||
-    !stillOwnsCreative() ||
+    !creativeFrameIsCurrent(source, frame, generation, stillOwnsCreative) ||
     !Number.isFinite(width) ||
     !Number.isFinite(height) ||
     width <= 0 ||
     height <= 0 ||
     width > MAX_CREATIVE_SHELL_DIMENSION ||
     height > MAX_CREATIVE_SHELL_DIMENSION ||
-    !frame.iframe.isConnected ||
-    !frame.root.isConnected ||
-    !frame.root.contains(frame.iframe) ||
-    frame.iframe.contentWindow !== source ||
     frame.iframe.getAttribute('width') !== '1' ||
     frame.iframe.getAttribute('height') !== '1' ||
     !hasCollapsedDimension(frame.iframe, 'width') ||
@@ -314,24 +325,37 @@ function resizeCollapsedCreativeFrame(
     return;
   }
 
-  const wrapper = frame.iframe.parentElement;
-  if (
-    !wrapper ||
-    wrapper === document.body ||
-    wrapper === document.documentElement ||
-    !frame.root.contains(wrapper) ||
-    usesFixedPositioning(wrapper)
-  ) {
-    return;
+  const collapsedAncestors: HTMLElement[] = [];
+  let reachedRoot = false;
+  for (let ancestor = frame.iframe.parentElement; ancestor; ancestor = ancestor.parentElement) {
+    if (
+      ancestor === document.body ||
+      ancestor === document.documentElement ||
+      !ancestor.isConnected ||
+      usesFixedPositioning(ancestor) ||
+      ancestor.matches(
+        'ins[data-anchor-status], [data-google-interstitial], [data-vignette-loaded]'
+      )
+    ) {
+      return;
+    }
+    if (hasCollapsedDimension(ancestor, 'width') || hasCollapsedDimension(ancestor, 'height')) {
+      collapsedAncestors.push(ancestor);
+    }
+    if (ancestor === frame.root) {
+      reachedRoot = true;
+      break;
+    }
   }
+  if (!reachedRoot) return;
 
   frame.iframe.width = String(width);
   frame.iframe.height = String(height);
   frame.iframe.style.width = `${width}px`;
   frame.iframe.style.height = `${height}px`;
-  if (hasCollapsedDimension(wrapper, 'width') && hasCollapsedDimension(wrapper, 'height')) {
-    wrapper.style.width = `${width}px`;
-    wrapper.style.height = `${height}px`;
+  for (const ancestor of collapsedAncestors) {
+    ancestor.style.width = `${width}px`;
+    ancestor.style.height = `${height}px`;
   }
 }
 
@@ -1992,6 +2016,12 @@ export function installTsRenderBridge(): void {
         trustedServer: (validatedRenderer) => {
           const rendererUrl = apsRendererUrl();
           if (!rendererUrl) return false;
+          const stillOwnsCreative = () =>
+            sourceFrameForAdUnit(e.source, prebidRendererEntry.adUnitCode)?.iframe ===
+            sourceFrame.iframe;
+          if (!creativeFrameIsCurrent(e.source, sourceFrame, generation, stillOwnsCreative)) {
+            return false;
+          }
           try {
             port.postMessage(
               JSON.stringify({
@@ -2011,11 +2041,9 @@ export function installTsRenderBridge(): void {
               validatedRenderer.width,
               validatedRenderer.height,
               generation,
-              () =>
-                sourceFrameForAdUnit(e.source, prebidRendererEntry.adUnitCode)?.iframe ===
-                sourceFrame.iframe
+              stillOwnsCreative
             );
-            return true;
+            return creativeFrameIsCurrent(e.source, sourceFrame, generation, stillOwnsCreative);
           } catch (err) {
             log.warn(`[tsjs-gpt] APS Prebid response post failed for '${adId}'`, err);
             return false;
@@ -2066,6 +2094,13 @@ export function installTsRenderBridge(): void {
           trustedServer: (validatedRenderer) => {
             const rendererUrl = apsRendererUrl();
             if (!rendererUrl) return false;
+            const stillOwnsCreative = () =>
+              window.tsjs?.bids?.[slotId] === matchedBid &&
+              matchedBid.hb_adid === adId &&
+              sourceFrameForSlotId(e.source, slotId)?.iframe === sourceSlotFrame.iframe;
+            if (!creativeFrameIsCurrent(e.source, sourceSlotFrame, generation, stillOwnsCreative)) {
+              return false;
+            }
             try {
               port.postMessage(
                 JSON.stringify({
@@ -2085,12 +2120,14 @@ export function installTsRenderBridge(): void {
                 validatedRenderer.width,
                 validatedRenderer.height,
                 generation,
-                () =>
-                  window.tsjs?.bids?.[slotId] === matchedBid &&
-                  matchedBid.hb_adid === adId &&
-                  sourceFrameForSlotId(e.source, slotId)?.iframe === sourceSlotFrame.iframe
+                stillOwnsCreative
               );
-              return true;
+              return creativeFrameIsCurrent(
+                e.source,
+                sourceSlotFrame,
+                generation,
+                stillOwnsCreative
+              );
             } catch (err) {
               log.warn(`[tsjs-gpt] APS server response post failed for '${slotId}'`, err);
               return false;
@@ -2120,6 +2157,15 @@ export function installTsRenderBridge(): void {
 
     if (inlineAdm) {
       e.stopImmediatePropagation();
+      const stillOwnsCreative = () =>
+        Boolean(
+          window.tsjs?.bids?.[slotId] === matchedBid &&
+          matchedBid.hb_adid === adId &&
+          sourceFrameForSlotId(e.source, slotId)?.iframe === sourceSlotFrame.iframe
+        );
+      if (!creativeFrameIsCurrent(e.source, sourceSlotFrame, generation, stillOwnsCreative)) {
+        return;
+      }
       try {
         port.postMessage(
           JSON.stringify({
@@ -2136,13 +2182,15 @@ export function installTsRenderBridge(): void {
         log.warn(`[tsjs-gpt] pbRender bridge: response post failed for '${slotId}'`, err);
         return;
       }
-      resizeCollapsedCreativeFrame(e.source, sourceSlotFrame, width, height, generation, () =>
-        Boolean(
-          window.tsjs?.bids?.[slotId] === matchedBid &&
-          matchedBid.hb_adid === adId &&
-          sourceFrameForSlotId(e.source, slotId)?.iframe === sourceSlotFrame.iframe
-        )
+      resizeCollapsedCreativeFrame(
+        e.source,
+        sourceSlotFrame,
+        width,
+        height,
+        generation,
+        stillOwnsCreative
       );
+      if (!creativeFrameIsCurrent(e.source, sourceSlotFrame, generation, stillOwnsCreative)) return;
       safelyRecordCreativeResponse(attemptId);
       fireWinBillingBeacons(slotId, matchedBid);
       log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from inline adm`);
@@ -2194,6 +2242,13 @@ export function installTsRenderBridge(): void {
               : cached.adm;
           const cachedWidth = cached.width ?? width;
           const cachedHeight = cached.height ?? height;
+          const stillOwnsCreative = () =>
+            window.tsjs?.bids?.[slotId] === matchedBid &&
+            matchedBid.hb_adid === adId &&
+            sourceFrameForSlotId(e.source, slotId)?.iframe === sourceSlotFrame.iframe;
+          if (!creativeFrameIsCurrent(e.source, sourceSlotFrame, generation, stillOwnsCreative)) {
+            return;
+          }
           try {
             port.postMessage(
               JSON.stringify({
@@ -2211,14 +2266,14 @@ export function installTsRenderBridge(): void {
               cachedWidth,
               cachedHeight,
               generation,
-              () =>
-                window.tsjs?.bids?.[slotId] === matchedBid &&
-                matchedBid.hb_adid === adId &&
-                sourceFrameForSlotId(e.source, slotId)?.iframe === sourceSlotFrame.iframe
+              stillOwnsCreative
             );
           } catch (err) {
             safelyRecordCreativeFailure(attemptId, 'response_post_failed');
             log.warn(`[tsjs-gpt] pbRender bridge: response post failed for '${slotId}'`, err);
+            return;
+          }
+          if (!creativeFrameIsCurrent(e.source, sourceSlotFrame, generation, stillOwnsCreative)) {
             return;
           }
           safelyRecordCreativeResponse(attemptId);
