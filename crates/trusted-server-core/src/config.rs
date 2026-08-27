@@ -18,8 +18,9 @@ use crate::error::TrustedServerError;
 use crate::integrations::{
     adserver_mock::AdServerMockConfig, aps::ApsConfig, datadome::DataDomeConfig,
     didomi::DidomiIntegrationConfig, google_tag_manager::GoogleTagManagerConfig, gpt::GptConfig,
-    lockr::LockrConfig, nextjs::NextJsIntegrationConfig, osano::OsanoConfig,
-    permutive::PermutiveConfig, prebid, sourcepoint::SourcepointConfig, testlight::TestlightConfig,
+    gpt_diagnostics::GptDiagnosticsConfig, lockr::LockrConfig, nextjs::NextJsIntegrationConfig,
+    osano::OsanoConfig, permutive::PermutiveConfig, prebid, sourcepoint::SourcepointConfig,
+    testlight::TestlightConfig,
 };
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -39,6 +40,7 @@ const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
     "google_tag_manager",
     "datadome",
     "gpt",
+    "gpt_diagnostics",
 ];
 
 /// Typed app-config root used by the `ts` CLI.
@@ -153,8 +155,11 @@ fn validate_enabled_integrations(
     validate_integration::<SourcepointConfig>(settings, "sourcepoint")?;
     validate_integration::<OsanoConfig>(settings, "osano")?;
     validate_integration::<GoogleTagManagerConfig>(settings, "google_tag_manager")?;
-    validate_integration::<DataDomeConfig>(settings, "datadome")?;
+    if let Some(config) = settings.integration_config::<DataDomeConfig>("datadome")? {
+        crate::integrations::datadome::DataDomeIntegration::validate_config_for_startup(config)?;
+    }
     validate_integration::<GptConfig>(settings, "gpt")?;
+    validate_integration::<GptDiagnosticsConfig>(settings, "gpt_diagnostics")?;
 
     Ok(enabled_auction_providers)
 }
@@ -215,6 +220,46 @@ mod tests {
     use super::*;
     use crate::test_support::tests::crate_test_settings_str;
 
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct LegacyCreativeOpportunitiesConfig {
+        gam_network_id: String,
+        #[serde(default)]
+        auction_timeout_ms: Option<u32>,
+        #[serde(default)]
+        price_granularity: serde_json::Value,
+        #[serde(default)]
+        slot: Vec<serde_json::Value>,
+    }
+
+    fn serialized_creative_opportunities(gam_unit_path: Option<&str>) -> serde_json::Value {
+        let mut toml = crate_test_settings_str();
+        toml.push_str(
+            r#"
+
+[creative_opportunities]
+gam_network_id = "99999"
+
+[[creative_opportunities.slot]]
+id = "example-slot"
+page_patterns = ["/*"]
+formats = [{ width = 300, height = 250 }]
+"#,
+        );
+        if let Some(gam_unit_path) = gam_unit_path {
+            toml.push_str(&format!("gam_unit_path = {gam_unit_path:?}\n"));
+        }
+
+        let app_config: TrustedServerAppConfig =
+            toml::from_str(&toml).expect("should deserialize app config wrapper");
+        serde_json::to_value(app_config)
+            .expect("should serialize app config wrapper")
+            .get("creative_opportunities")
+            .cloned()
+            .expect("should contain creative opportunities")
+    }
+
     fn valid_settings() -> Settings {
         let mut settings =
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
@@ -249,6 +294,64 @@ mod tests {
             "test-publisher.com",
             "should load publisher settings"
         );
+    }
+
+    #[test]
+    fn dynamic_gam_unit_templates_are_rejected_by_legacy_schema() {
+        for gam_unit_path in ["/{network_id}/example", "/example/{slot_id}"] {
+            let creative_opportunities = serialized_creative_opportunities(Some(gam_unit_path));
+            let err =
+                serde_json::from_value::<LegacyCreativeOpportunitiesConfig>(creative_opportunities)
+                    .expect_err("should reject dynamic GAM unit template");
+
+            assert!(
+                err.to_string().contains("section_segment"),
+                "legacy error should name section_segment: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn static_gam_unit_template_is_accepted_by_legacy_schema() {
+        let creative_opportunities = serialized_creative_opportunities(Some("/99999/example/home"));
+
+        serde_json::from_value::<LegacyCreativeOpportunitiesConfig>(creative_opportunities)
+            .expect("should accept static GAM unit template");
+    }
+
+    #[test]
+    fn absent_gam_unit_template_is_accepted_by_legacy_schema() {
+        let creative_opportunities = serialized_creative_opportunities(None);
+
+        assert!(
+            creative_opportunities.get("enabled").is_none(),
+            "default template switch should be omitted for legacy binaries"
+        );
+        serde_json::from_value::<LegacyCreativeOpportunitiesConfig>(creative_opportunities)
+            .expect("should accept absent GAM unit template");
+    }
+
+    #[test]
+    fn disabled_creative_opportunities_flag_is_rejected_by_legacy_schema() {
+        let mut toml = crate_test_settings_str();
+        toml.push_str(
+            r#"
+
+[creative_opportunities]
+enabled = false
+gam_network_id = "99999"
+"#,
+        );
+        let app_config: TrustedServerAppConfig =
+            toml::from_str(&toml).expect("should deserialize app config wrapper");
+        let creative_opportunities = serde_json::to_value(app_config)
+            .expect("should serialize app config wrapper")
+            .get("creative_opportunities")
+            .cloned()
+            .expect("should contain creative opportunities");
+
+        serde_json::from_value::<LegacyCreativeOpportunitiesConfig>(creative_opportunities)
+            .expect_err("legacy binaries should reject an explicit disabled switch");
     }
 
     #[test]
@@ -328,6 +431,44 @@ password = "production-admin-password-32-bytes"
             error_text.contains("osano") || error_text.contains("typo"),
             "error should mention Osano or the invalid field: {err:?}"
         );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_invalid_datadome_test_bypass() {
+        for (enable_protection, store, name, expected_message) in [
+            (
+                false,
+                "ts_secrets",
+                "datadome_test_bypass",
+                "requires enable_protection",
+            ),
+            (true, "", "datadome_test_bypass", "credential_secret_store"),
+            (true, "ts_secrets", "", "credential_secret_name"),
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert_config(
+                    "datadome",
+                    &serde_json::json!({
+                        "enabled": true,
+                        "enable_protection": enable_protection,
+                        "protection_test_bypass": {
+                            "enabled": true,
+                            "credential_secret_store": store,
+                            "credential_secret_name": name,
+                        },
+                    }),
+                )
+                .expect("should insert DataDome config");
+
+            let err = validate_settings_for_deploy(&settings)
+                .expect_err("should reject invalid DataDome test bypass");
+            assert!(
+                format!("{err:?}").contains(expected_message),
+                "error should mention the invalid bypass setting: {err:?}"
+            );
+        }
     }
 
     #[test]

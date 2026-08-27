@@ -10,7 +10,13 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::ec::EcContext;
+use trusted_server_core::ec::admin::{
+    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
+    deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
+};
+use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -142,12 +148,15 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 13] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 16] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
         ("/_ts/admin/keys/rotate", &[Method::POST]),
         ("/_ts/admin/keys/deactivate", &[Method::POST]),
+        ("/_ts/admin/ec", &[Method::GET]),
+        ("/_ts/admin/ec/{id}", &[Method::GET]),
+        ("/_ts/admin/eids", &[Method::GET]),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
@@ -156,7 +165,7 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 13] {
         ("/first-party/proxy", &[Method::GET]),
         ("/first-party/click", &[Method::GET]),
         ("/first-party/sign", &[Method::GET, Method::POST]),
-        ("/first-party/proxy-rebuild", &[Method::POST]),
+        ("/first-party/proxy-rebuild", &[Method::GET, Method::POST]),
     ]
 }
 
@@ -361,6 +370,10 @@ fn admin_key_management_not_supported() -> Response {
     response
 }
 
+fn admin_ec_lookup_not_supported() -> Response {
+    core_admin_ec_lookup_not_supported()
+}
+
 // ---------------------------------------------------------------------------
 // Error helper
 // ---------------------------------------------------------------------------
@@ -513,6 +526,23 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             Ok::<Response, EdgeError>(admin_key_management_not_supported())
         };
 
+        let admin_ec_not_supported_handler = |_ctx: RequestContext| async {
+            Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
+        };
+
+        // Admin EIDs echo: pure request inspection (no KV), so this adapter
+        // serves the real handler.
+        let s = Arc::clone(&state);
+        let admin_eids_handler = move |ctx: RequestContext| {
+            let s = Arc::clone(&s);
+            async move {
+                let req = ctx.into_request();
+                let result = PartnerRegistry::from_config(&s.settings.ec.partners)
+                    .and_then(|registry| handle_admin_eids_lookup(&registry, &req));
+                Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
+            }
+        };
+
         // /auction
         let s = Arc::clone(&state);
         let auction_handler = move |ctx: RequestContext| {
@@ -524,7 +554,15 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 // `NormalizeMiddleware` before this handler runs, so the signed
                 // OpenRTB metadata that auction signing derives from
                 // `RequestInfo::from_request` uses the trusted runtime authority.
-                let req = ctx.into_request();
+                let mut req = ctx.into_request();
+                if let Err(error) =
+                    trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+                        &s.settings,
+                        &mut req,
+                    )
+                {
+                    return Ok(http_error(&error));
+                }
                 // Build the geo-aware EC context so the auction consent gate sees
                 // the caller's jurisdiction — `EcContext::default()` fails it
                 // closed for consented users.
@@ -549,7 +587,15 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
+                let mut req = ctx.into_request();
+                if let Err(error) =
+                    trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+                        &s.settings,
+                        &mut req,
+                    )
+                {
+                    return Ok(http_error(&error));
+                }
                 let ec_context = build_ec_context(&s.settings, &services, &req);
                 let auction = AuctionDispatch {
                     orchestrator: &s.orchestrator,
@@ -610,7 +656,10 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         };
         let fp_sign_post_handler = fp_sign_handler.clone();
 
-        // /first-party/proxy-rebuild
+        // GET + POST /first-party/proxy-rebuild — GET serves the click guard's
+        // navigation fallback: the creative iframe is an opaque origin (sandbox
+        // without `allow-same-origin`), so its JSON POST is blocked by CORS and
+        // the guard navigates here for a 302 instead.
         let s = Arc::clone(&state);
         let fp_rebuild_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
@@ -624,6 +673,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 )
             }
         };
+        let fp_rebuild_post_handler = fp_rebuild_handler.clone();
 
         // Shared fallback dispatch: routes to tsjs (GET only), integration proxy, or publisher.
         async fn dispatch(
@@ -631,7 +681,16 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
             let services = build_runtime_services(&ctx);
-            let req = ctx.into_request();
+            let mut req = ctx.into_request();
+            if let Some(response) = deny_admin_diagnostic_fallback(&req) {
+                return Ok(response);
+            }
+            if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+                &state.settings,
+                &mut req,
+            ) {
+                return Ok(http_error(&error));
+            }
 
             let path = req.uri().path().to_owned();
             let method = req.method().clone();
@@ -639,7 +698,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // Dynamic tsjs serving is GET-only; other methods fall through to the
             // integration/publisher fallback.
             let result = if method == Method::GET && path.starts_with("/static/tsjs=") {
-                handle_tsjs_dynamic(&req, &state.registry)
+                handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback)
             } else if state.registry.has_route(&method, &path) {
                 let mut ec_context = EcContext::default();
                 state
@@ -673,6 +732,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     &mut ec_context,
                     auction,
                     req,
+                    EdgeCacheHeader::SMaxageFallback,
                 )
                 .await
                 {
@@ -732,6 +792,14 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // credentials and key-management payloads to the origin.
             .post("/_ts/admin/keys/rotate", admin_not_supported_handler)
             .post("/_ts/admin/keys/deactivate", admin_not_supported_handler)
+            // Admin EC lookup routes. Registered explicitly (like the key
+            // routes above) so they never fall through to the publisher
+            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
+            // coverage. The EC identity graph is Fastly KV backed, so this
+            // adapter has no store to read.
+            .get("/_ts/admin/ec", admin_ec_not_supported_handler)
+            .get("/_ts/admin/ec/{id}", admin_ec_not_supported_handler)
+            .get("/_ts/admin/eids", admin_eids_handler)
             .post("/auction", auction_handler)
             .get(PAGE_BIDS_PATH, page_bids_handler.clone())
             .route(PAGE_BIDS_PATH, Method::OPTIONS, page_bids_options_handler)
@@ -749,7 +817,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get("/first-party/click", fp_click_handler)
             .get("/first-party/sign", fp_sign_handler)
             .post("/first-party/sign", fp_sign_post_handler)
-            .post("/first-party/proxy-rebuild", fp_rebuild_handler);
+            .get("/first-party/proxy-rebuild", fp_rebuild_handler)
+            .post("/first-party/proxy-rebuild", fp_rebuild_post_handler);
 
         for method in LEGACY_ADMIN_DENY_METHODS {
             builder = builder.route("/admin/keys/rotate", method.clone(), legacy_admin_deny);

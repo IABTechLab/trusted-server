@@ -1,17 +1,18 @@
 # Integrations Overview
 
-Trusted Server provides built-in integrations with popular third-party services, enabling first-party data collection and privacy-preserving advertising. This page provides a comparison of all available integrations.
+Trusted Server provides built-in integrations with third-party services for first-party data collection and consent-aware advertising. The available integrations are compared below.
 
 ## Quick Comparison
 
-| Integration     | Type             | Endpoints  | HTML Rewriting               | Primary Use Case            | Status      |
-| --------------- | ---------------- | ---------- | ---------------------------- | --------------------------- | ----------- |
-| **Prebid**      | Proxy + Rewriter | 2-3 routes | Removes Prebid.js scripts    | Server-side header bidding  | Production  |
-| **Next.js**     | Script Rewriter  | None       | Rewrites Next.js data        | First-party Next.js routing | Production  |
-| **Permutive**   | Proxy + Rewriter | 6 routes   | Rewrites SDK URLs            | First-party audience data   | Production  |
-| **Sourcepoint** | Proxy + Rewriter | 2 routes   | Rewrites CMP asset URLs      | First-party CMP delivery    | Development |
-| **Osano**       | Browser Mirror   | None       | Consent cookie mirroring     | First-party consent signals | Development |
-| **Testlight**   | Proxy + Rewriter | 1 route    | Rewrites integration scripts | Testing/development         | Development |
+| Integration         | Type                | Endpoints  | HTML Rewriting               | Primary Use Case            | Status      |
+| ------------------- | ------------------- | ---------- | ---------------------------- | --------------------------- | ----------- |
+| **Prebid**          | Proxy + Rewriter    | 2-3 routes | Removes Prebid.js scripts    | Server-side header bidding  | Production  |
+| **Next.js**         | Script Rewriter     | None       | Rewrites Next.js data        | First-party Next.js routing | Production  |
+| **Permutive**       | Proxy + Rewriter    | 6 routes   | Rewrites SDK URLs            | First-party audience data   | Production  |
+| **Sourcepoint**     | Proxy + Rewriter    | 2 routes   | Rewrites CMP asset URLs      | First-party CMP delivery    | Development |
+| **Osano**           | Browser Mirror      | None       | Consent cookie mirroring     | First-party consent signals | Development |
+| **GPT Diagnostics** | Browser Diagnostics | None       | Closed-shadow local console  | GPT lifecycle debugging     | Development |
+| **Testlight**       | Proxy + Rewriter    | 1 route    | Rewrites integration scripts | Testing/development         | Development |
 
 ## Integration Details
 
@@ -22,7 +23,7 @@ Trusted Server provides built-in integrations with popular third-party services,
 **Key Features:**
 
 - OpenRTB 2.x protocol conversion
-- EC ID injection for privacy
+- EC ID injection into bid requests
 - First-party creative resource proxying
 - CDN URL rewriting (7+ major SSPs)
 - GPC signal support
@@ -46,7 +47,7 @@ debug = false
 - `POST /third-party/ad` - Client-side auction endpoint
 - `GET /prebid.js` - Optional empty script override
 
-**When to use:** You want to monetize your site with programmatic advertising while maintaining privacy and first-party context.
+**When to use:** You want to monetize your site with programmatic advertising while maintaining first-party context.
 
 **Learn more:** [Ad Serving Guide](./ad-serving.md)
 
@@ -74,7 +75,7 @@ rewrite_attributes = ["href", "link", "url"]
 
 **Endpoints:** None (pure HTML/script rewriting)
 
-**When to use:** You have a Next.js application and want to ensure all links and assets route through your first-party domain for better tracking and privacy.
+**When to use:** You have a Next.js application and want to ensure all links and assets route through your first-party domain.
 
 **Learn more:** [Integration Guide](./integration-guide.md)
 
@@ -89,7 +90,7 @@ rewrite_attributes = ["href", "link", "url"]
 - Complete first-party SDK serving
 - Multi-endpoint proxying (API, Events, Sync, Secure Signals, CDN)
 - SDK caching for performance
-- Privacy compliance (first-party cookies)
+- Cookies set on the publisher's domain
 - Header forwarding for authentication
 
 **Configuration:**
@@ -111,11 +112,11 @@ rewrite_sdk = true
 - `GET /integrations/permutive/sdk` - SDK serving
 - `GET/POST /integrations/permutive/api/*` - API proxy
 - `GET/POST /integrations/permutive/secure-signal/*` - Secure Signals
-- `GET/POST /integrations/permutive/events/*` - Event tracking
+- `GET/POST /integrations/permutive/events/*` - Event collection
 - `GET/POST /integrations/permutive/sync/*` - ID synchronization
 - `GET /integrations/permutive/cdn/*` - CDN proxy
 
-**When to use:** You use Permutive for audience segmentation and want to maintain first-party data collection in a privacy-compliant way.
+**When to use:** You use Permutive for audience segmentation and want to maintain first-party data collection.
 
 **Learn more:** [Integration Guide](./integration-guide.md)
 
@@ -180,6 +181,37 @@ enabled = true
 **When to use:** You use Osano for consent management and want Osano's browser consent signals available to Trusted Server as standard first-party cookies.
 
 **Learn more:** [Osano Integration](./integrations/osano.md)
+
+---
+
+### GPT Runtime Diagnostics
+
+**What it does:** Observes documented GPT lifecycle callbacks and Trusted Server integration evidence, then presents directly observed slot, request-path, delivery, timing, coverage, binding, and visibility facts in a local browser console.
+
+**Key Features:**
+
+- Explicit browser-session `ts_console` activation through a host-only HttpOnly cookie
+- Conditional standalone delivery only on active HTML documents
+- Initial and refresh request-cycle history, with observed request paths and replacements
+- Delivery states derived only from observed Trusted Server creative evidence
+- Source-neutral Ad Manager identifiers and response classes reported by GPT
+- Conservative unmatched, ambiguous, and attribution issue reporting
+- Exact DOM binding and non-layout-changing viewport badges
+- Versioned local JSON export with no diagnostic upload
+- No inferred demand ownership: a filled slot alone never proves Trusted Server delivery
+
+**Configuration:**
+
+```toml
+[integrations.gpt_diagnostics]
+enabled = true
+```
+
+**Endpoints:** None. The feature observes GPT in the browser and makes no diagnostic network request.
+
+**When to use:** You need to debug GPT request, response, render, load, viewability, refresh, delivery-attribution, and slot-binding behavior without changing ad delivery.
+
+**Learn more:** [GPT Runtime Diagnostics](./integrations/gpt-diagnostics.md)
 
 ---
 
@@ -277,13 +309,14 @@ Are you developing/testing integrations?
 
 ## Performance Considerations
 
-| Integration     | Performance Impact | Caching Strategy            | Notes                                        |
-| --------------- | ------------------ | --------------------------- | -------------------------------------------- |
-| **Prebid**      | Medium             | Response caching possible   | Timeout configurable (default 1s)            |
-| **Next.js**     | Low                | N/A (streaming rewrite)     | Minimal overhead, runs during HTML streaming |
-| **Permutive**   | Low                | SDK cached (1 hour default) | API calls proxied in real-time               |
-| **Sourcepoint** | Low                | CDN cached (1 hour default) | JS rewriting adds minor overhead             |
-| **Testlight**   | Low                | No caching                  | Development use only                         |
+| Integration         | Performance Impact | Caching Strategy              | Notes                                           |
+| ------------------- | ------------------ | ----------------------------- | ----------------------------------------------- |
+| **Prebid**          | Medium             | Response caching possible     | Timeout configurable (default 1s)               |
+| **Next.js**         | Low                | N/A (streaming rewrite)       | Minimal overhead, runs during HTML streaming    |
+| **Permutive**       | Low                | SDK cached (1 hour default)   | API calls proxied in real-time                  |
+| **Sourcepoint**     | Low                | CDN cached (1 hour default)   | JS rewriting adds minor overhead                |
+| **GPT Diagnostics** | Low when active    | Static module publicly cached | Module omitted until browser-session activation |
+| **Testlight**       | Low                | No caching                    | Development use only                            |
 
 ## Environment Variables
 

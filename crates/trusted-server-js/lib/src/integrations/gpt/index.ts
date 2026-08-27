@@ -1,5 +1,21 @@
 import { log } from '../../core/log';
-import type { AuctionSlot, AuctionBidData, TsjsApi } from '../../core/types';
+import type {
+  AuctionSlot,
+  AuctionBidData,
+  GptDiagnosticsCreativeFailure,
+  GptDiagnosticsTrustedServerOpportunity,
+  GptSlotHandoff,
+  TsjsApi,
+} from '../../core/types';
+import {
+  APS_UNIVERSAL_CREATIVE_RENDERER,
+  APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+  apsRendererUrl,
+  dispatchApsRendering,
+  consumeApsPrebidRenderer,
+  getApsPrebidRenderer,
+  validateApsRenderer,
+} from '../aps/render';
 
 import { installGptGuard } from './script_guard';
 
@@ -34,6 +50,21 @@ const TS_BID_TARGETING_KEYS = [
 ] as const;
 const TS_BASE_TARGETING_KEYS = [...TS_BID_TARGETING_KEYS, TS_INITIAL_TARGETING_KEY] as const;
 
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function trustedServerOpportunity(bid: AuctionBidData): GptDiagnosticsTrustedServerOpportunity {
+  const hasBidTargeting = TS_BID_TARGETING_KEYS.some((key) => isNonEmptyString(bid[key]));
+  if (!hasBidTargeting) return 'no_candidate';
+
+  const hasAdId = isNonEmptyString(bid.hb_adid);
+  const hasInline = isNonEmptyString(bid.adm);
+  const hasCache = isNonEmptyString(bid.hb_cache_host) && isNonEmptyString(bid.hb_cache_path);
+
+  return hasAdId && (hasInline || hasCache) ? 'renderable_candidate' : 'unrenderable_candidate';
+}
+
 // ------------------------------------------------------------------
 // googletag type stubs (minimal surface needed by the shim)
 // ------------------------------------------------------------------
@@ -52,43 +83,156 @@ interface SlotRenderEndedEvent {
   slot: GoogleTagSlot;
 }
 
-function findSlotElementByDivId(divId: string): HTMLElement | null {
-  const exact = document.getElementById(divId);
-  if (exact) return exact;
-
-  return (
-    Array.from(document.querySelectorAll<HTMLElement>('[id]')).find(
-      (el) => el.id.startsWith(divId) && !el.id.endsWith('-container')
-    ) ?? null
-  );
+interface SlotElementResolution {
+  element: HTMLElement | null;
+  prefixMatchCount: number;
+  activeMatchCount: number;
 }
 
-function candidateSlotRoots(divId: string): HTMLElement[] {
-  const roots: HTMLElement[] = [];
-  const slotEl = findSlotElementByDivId(divId);
-  if (slotEl) {
-    roots.push(slotEl);
-    const container = document.getElementById(`${slotEl.id}-container`);
-    if (container) roots.push(container);
+function isElementVisible(element: HTMLElement): boolean {
+  const elementWithVisibilityCheck = element as HTMLElement & {
+    checkVisibility?: (options?: {
+      checkVisibilityCSS?: boolean;
+      visibilityProperty?: boolean;
+    }) => boolean;
+  };
+  if (typeof elementWithVisibilityCheck.checkVisibility === 'function') {
+    return elementWithVisibilityCheck.checkVisibility({
+      checkVisibilityCSS: true,
+      visibilityProperty: true,
+    });
   }
 
-  const configuredContainer = document.getElementById(`${divId}-container`);
-  if (configuredContainer && !roots.includes(configuredContainer)) {
-    roots.push(configuredContainer);
+  for (let current: HTMLElement | null = element; current; current = current.parentElement) {
+    const style = window.getComputedStyle(current);
+    if (
+      style.display === 'none' ||
+      style.visibility === 'hidden' ||
+      style.visibility === 'collapse'
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function slotElementHasLayout(element: HTMLElement): boolean {
+  if (!isElementVisible(element)) return false;
+  const elementRect = element.getBoundingClientRect();
+  if (elementRect.width > 0 && elementRect.height > 0) return true;
+
+  const container = document.getElementById(`${element.id}-container`);
+  if (!container || !isElementVisible(container)) return false;
+  const containerRect = container.getBoundingClientRect();
+  return containerRect.width > 0;
+}
+
+function resolveSlotElementByDivId(divId: string): SlotElementResolution {
+  if (!divId) {
+    return { element: null, prefixMatchCount: 0, activeMatchCount: 0 };
+  }
+  // Exact-id matches intentionally skip the visibility tiers below: a
+  // configured literal id is unambiguous, so a hidden match is still the
+  // right element (adInit defines the slot; GPT simply renders nothing while
+  // it is hidden). Prefix matches go through the tiers because a prefix can
+  // match several candidates and only visibility/layout disambiguates them —
+  // so a hidden exact-id match resolves while a hidden prefix match does not.
+  const exact = document.getElementById(divId);
+  if (exact) {
+    return { element: exact, prefixMatchCount: 1, activeMatchCount: 1 };
+  }
+
+  const prefixMatches = Array.from(document.querySelectorAll<HTMLElement>('[id]')).filter(
+    (element) => element.id.startsWith(divId) && !element.id.endsWith('-container')
+  );
+  // A unique prefix match may be a lazy slot that has not been sized yet, but
+  // it must still be visible through its ancestor containers.
+  if (prefixMatches.length === 1 && isElementVisible(prefixMatches[0]!)) {
+    return {
+      element: prefixMatches[0]!,
+      prefixMatchCount: 1,
+      activeMatchCount: 1,
+    };
+  }
+
+  const visibleMatches = prefixMatches.filter(isElementVisible);
+  if (visibleMatches.length === 1) {
+    return {
+      element: visibleMatches[0]!,
+      prefixMatchCount: prefixMatches.length,
+      activeMatchCount: 1,
+    };
+  }
+
+  const activeMatches = visibleMatches.filter(slotElementHasLayout);
+  return {
+    element: activeMatches.length === 1 ? activeMatches[0]! : null,
+    prefixMatchCount: prefixMatches.length,
+    activeMatchCount: activeMatches.length,
+  };
+}
+
+function findSlotElementByDivId(divId: string): HTMLElement | null {
+  return resolveSlotElementByDivId(divId).element;
+}
+
+function candidateSlotRoots(elementId: string): HTMLElement[] {
+  const roots: HTMLElement[] = [];
+  const slotEl = document.getElementById(elementId);
+  if (slotEl) {
+    roots.push(slotEl);
+  }
+
+  const container = document.getElementById(`${elementId}-container`);
+  if (container && !roots.includes(container)) {
+    roots.push(container);
   }
 
   return roots;
 }
 
+function candidateSlotRootsForConfiguredDivId(divId: string): HTMLElement[] {
+  const roots = candidateSlotRoots(divId);
+  const dynamicElements = Array.from(document.querySelectorAll<HTMLElement>('[id]')).filter(
+    (element) => element.id.startsWith(divId) && !element.id.endsWith('-container')
+  );
+  for (const element of dynamicElements) {
+    if (!roots.includes(element)) roots.push(element);
+    const container = document.getElementById(`${element.id}-container`);
+    if (container && !roots.includes(container)) roots.push(container);
+  }
+  return roots;
+}
+
+function sourceIsInSlotRoots(source: MessageEventSource, roots: HTMLElement[]): boolean {
+  return roots.some((root) =>
+    Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
+  );
+}
+
 function slotIdForMessageSource(source: MessageEventSource | null): string | undefined {
   if (!source) return undefined;
 
+  const divToSlotId = window.tsjs?.divToSlotId ?? {};
+  const resolvedSlotId = Object.entries(divToSlotId).find(([elementId]) =>
+    sourceIsInSlotRoots(source, candidateSlotRoots(elementId))
+  )?.[1];
+  if (resolvedSlotId) return resolvedSlotId;
+
   const slots = window.tsjs?.adSlots ?? [];
-  return slots.find((slot) =>
-    candidateSlotRoots(slot.div_id).some((root) =>
-      Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
-    )
-  )?.id;
+  return [...slots]
+    .sort((left, right) => right.div_id.length - left.div_id.length)
+    .find((slot) => sourceIsInSlotRoots(source, candidateSlotRootsForConfiguredDivId(slot.div_id)))
+    ?.id;
+}
+
+function messageSourceBelongsToAdUnit(
+  source: MessageEventSource | null,
+  adUnitCode: string
+): boolean {
+  return source
+    ? sourceIsInSlotRoots(source, candidateSlotRootsForConfiguredDivId(adUnitCode))
+    : false;
 }
 
 function clearTargetingKeys(slot: GoogleTagSlot, keys: Iterable<string>): void {
@@ -99,12 +243,16 @@ function clearTargetingKeys(slot: GoogleTagSlot, keys: Iterable<string>): void {
   }
 }
 
+interface GoogleTagRefreshOptions {
+  changeCorrelator?: boolean;
+}
+
 interface GoogleTagPubAdsService {
   setTargeting(key: string, value: string | string[]): GoogleTagPubAdsService;
   getTargeting(key: string): string[];
   enableSingleRequest(): void;
   addEventListener(event: string, fn: (e: SlotRenderEndedEvent) => void): void;
-  refresh(slots?: GoogleTagSlot[]): void;
+  refresh(slots?: GoogleTagSlot[], options?: GoogleTagRefreshOptions): void;
   getSlots?(): GoogleTagSlot[];
   disableInitialLoad?(): void;
 }
@@ -117,17 +265,19 @@ interface GoogleTagEffectiveConfig {
   disableInitialLoad?: boolean;
 }
 
+type GoogleTagDisplayTarget = string | Element | GoogleTagSlot;
+
 interface GoogleTag {
   cmd: Array<() => void>;
   pubads(): GoogleTagPubAdsService;
   defineSlot(
     adUnitPath: string,
     size: Array<number | number[]>,
-    elementId: string
+    elementId?: string
   ): GoogleTagSlot | null;
   destroySlots(slots?: GoogleTagSlot[]): boolean;
   enableServices(): void;
-  display(elementId: string): void;
+  display(target: GoogleTagDisplayTarget): void;
   setConfig?(config: GoogleTagConfig): void;
   getConfig?(keys: string | string[]): GoogleTagEffectiveConfig | undefined;
   _loaded_?: boolean;
@@ -137,6 +287,8 @@ type GptWindow = Window & {
   googletag?: Partial<GoogleTag>;
   __tsjs_slim_prebid_url?: string;
 };
+
+const executingPublisherScript = typeof document === 'undefined' ? null : document.currentScript;
 
 // ------------------------------------------------------------------
 // Shim implementation
@@ -156,6 +308,25 @@ function ensureGoogleTagStub(win: GptWindow): Partial<GoogleTag> {
   const tag = (win.googletag = win.googletag ?? {});
   tag.cmd = tag.cmd ?? [];
   return tag;
+}
+
+function installTrustedServerPageTargeting(): void {
+  if (executingPublisherScript?.getAttribute('data-ts-gam-attribution') !== 'true') {
+    return;
+  }
+
+  const win = window as GptWindow;
+  const tag = ensureGoogleTagStub(win);
+  tag.cmd!.push(() => {
+    try {
+      const gpt = win.googletag;
+      if (typeof gpt?.setConfig === 'function') {
+        gpt.setConfig({ targeting: { ts: 'true' } });
+      }
+    } catch (error) {
+      log.warn('[tsjs-gpt] GAM attribution targeting failed', error);
+    }
+  });
 }
 
 /**
@@ -414,8 +585,10 @@ function queueWinBillingBeacon(url: string): boolean {
  * Reads `window.tsjs.adSlots` (injected at head-open) and `window.tsjs.bids`
  * (injected before </body>) synchronously — no fetch, no Promise. Applies bid
  * targeting to GPT slots, sets the `ts_initial` sentinel, then calls refresh().
- * Win/billing beacons fire from the TS render bridge, where a matching Prebid
- * Universal Creative request proves the TS creative actually rendered.
+ * Win/billing beacons fire from the TS render bridge after a matching Prebid
+ * Universal Creative request selects the TS bid and markup is successfully posted
+ * to its MessagePort. Neither observation proves that PUC consumed the response or
+ * that the creative rendered pixels.
  *
  * Idempotent: destroys previously created TS-managed slots before redefining them,
  * so it is safe to call again after SPA navigation updates `tsjs.adSlots`/`tsjs.bids`.
@@ -514,15 +687,18 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * SSR bootstrap as current. For the same reason the initial bids payload is
  * passed in and applied here, generation-guarded — assigning it
  * unconditionally at body end would clobber the live bids a faster SPA
- * navigation already applied. When a navigation has committed since — or
- * commits while the deferred callback is pending — the SSR payload is
- * dropped and `adInit()` is not run: running anyway would re-run the newer
- * route's live slots/bids, destroying and redefining that route's TS slots
- * and double-refreshing it. The generation counter (not a URL comparison)
- * keeps this guard aligned with the SPA auction hook's own navigation
- * identity: a query-only history change the hook ignores must not cancel the
- * initial call, while an `/a → /b → /a` round trip — where the URL compares
- * equal again — must.
+ * navigation already applied.
+ *
+ * Shared-template seams pass `initialSlots`; inline documents omit them because
+ * their head script already installed the slots. An explicit empty array clears
+ * that state, while omission preserves it. The scheduler accepts only its first
+ * generation-0 call so duplicate public API calls cannot define and display the
+ * initial slots twice. The latch lives on `tsjs` so a bootstrap fallback that
+ * claims the initial pass keeps that claim when the bundle replaces its
+ * scheduler. If a navigation commits before scheduling or before the deferred
+ * callback, the SSR payload and `adInit()` are both dropped. The generation
+ * counter (not a URL comparison) keeps this aligned with the SPA auction hook's
+ * navigation identity.
  *
  * Hidden documents: browsers do not service `requestAnimationFrame` while a
  * document is hidden, so a background-tab load (Cmd+click, open-in-new-tab)
@@ -534,9 +710,14 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * holds whenever the request is actually issued.
  */
 function installScheduleInitialAdInit(ts: TsjsApi): void {
-  ts.scheduleInitialAdInit = function (initialBids?: Record<string, AuctionBidData>) {
-    if ((ts.navGeneration ?? 0) !== 0) return;
-    if (initialBids) ts.bids = initialBids;
+  ts.scheduleInitialAdInit = function (
+    initialBids?: Record<string, AuctionBidData>,
+    initialSlots?: AuctionSlot[]
+  ) {
+    if ((ts.navGeneration ?? 0) !== 0 || ts.initialAdInitScheduled) return;
+    ts.initialAdInitScheduled = true;
+    if (initialSlots !== undefined) ts.adSlots = initialSlots;
+    if (initialBids !== undefined) ts.bids = initialBids;
     const runUnlessNavigated = (): void => {
       if ((ts.navGeneration ?? 0) !== 0) return;
       ts.adInit?.();
@@ -554,10 +735,207 @@ function installScheduleInitialAdInit(ts: TsjsApi): void {
   };
 }
 
+interface HandoffPatchedFunction {
+  __tsSlotHandoffPatched?: boolean;
+}
+
+function findGptSlotByElementId(
+  pubads: GoogleTagPubAdsService,
+  elementId: string
+): GoogleTagSlot | undefined {
+  return pubads.getSlots?.().find((slot) => slot.getSlotElementId() === elementId);
+}
+
+function handoffForSlot(ts: TsjsApi, slot: GoogleTagSlot): GptSlotHandoff | undefined {
+  return ts.gptSlotHandoffs?.[slot.getSlotElementId()];
+}
+
+function displayTargetElementId(target: GoogleTagDisplayTarget): string | undefined {
+  if (typeof target === 'string') return target;
+  if (typeof (target as GoogleTagSlot).getSlotElementId === 'function') {
+    return (target as GoogleTagSlot).getSlotElementId();
+  }
+  return (target as Element).id || undefined;
+}
+
+function normalizedGptFormats(formats: Array<number | number[]>): Array<number | number[]> {
+  return formats.length === 2 && formats.every((format) => typeof format === 'number')
+    ? [formats as number[]]
+    : formats;
+}
+
+function handoffFormatsMatch(handoff: GptSlotHandoff, formats: Array<number | number[]>): boolean {
+  return JSON.stringify(handoff.formats) === JSON.stringify(normalizedGptFormats(formats));
+}
+
+function matchingHandoff(
+  ts: TsjsApi,
+  pubads: GoogleTagPubAdsService,
+  adUnitPath: string,
+  formats: Array<number | number[]>,
+  elementId: string
+): GptSlotHandoff | undefined {
+  const exact = ts.gptSlotHandoffs?.[elementId];
+  if (exact) return exact.publisherClaimed ? undefined : exact;
+
+  const candidates = new Set(Object.values(ts.gptSlotHandoffs ?? {})).values();
+  const matching = Array.from(candidates).filter(
+    (handoff) =>
+      !handoff.publisherClaimed &&
+      !document.getElementById(handoff.slotElementId) &&
+      elementId.startsWith(handoff.divIdPrefix) &&
+      handoff.gamUnitPath === adUnitPath &&
+      handoffFormatsMatch(handoff, formats) &&
+      findGptSlotByElementId(pubads, handoff.slotElementId)
+  );
+  return matching.length === 1 ? matching[0] : undefined;
+}
+
+function registerHandoffAlias(ts: TsjsApi, elementId: string, handoff: GptSlotHandoff): void {
+  (ts.gptSlotHandoffs ??= {})[elementId] = handoff;
+}
+
+function withGptSlotHandoffInternal<T>(ts: TsjsApi, callback: () => T): T {
+  const wasInternal = ts.gptSlotHandoffInternal;
+  ts.gptSlotHandoffInternal = true;
+  try {
+    return callback();
+  } finally {
+    ts.gptSlotHandoffInternal = wasInternal;
+  }
+}
+
+/**
+ * Reuse a TS-created inner-div slot when its publisher defines that div later.
+ *
+ * TS cannot wait an arbitrary amount of time for framework hydration: doing so
+ * would leave placements blank when no publisher slot is ever defined. Instead,
+ * TS creates its fallback on the publisher's actual div and aliases only a later
+ * `defineSlot()` for that exact div, or for a hydration-renamed replacement after
+ * the original div is gone. The first duplicate publisher request is suppressed
+ * because TS has already issued the initial request with TS targeting.
+ */
+function installLatePublisherSlotHandoff(ts: TsjsApi): void {
+  const win = window as GptWindow;
+  const cmd = win.googletag?.cmd;
+  if (!cmd) return;
+
+  cmd.push(() => {
+    const g = win.googletag;
+    const pubads = g?.pubads?.();
+    if (!g?.defineSlot || !g.display || !pubads) return;
+
+    const defineSlot = g.defineSlot;
+    if (!(defineSlot as HandoffPatchedFunction).__tsSlotHandoffPatched) {
+      const originalDefineSlot = defineSlot.bind(g);
+      const patchedDefineSlot = (
+        adUnitPath: string,
+        formats: Array<number | number[]>,
+        elementId?: string
+      ): GoogleTagSlot | null => {
+        if (!ts.gptSlotHandoffInternal && typeof elementId === 'string') {
+          const handoff = matchingHandoff(ts, pubads, adUnitPath, formats, elementId);
+          if (handoff) {
+            const existingSlot = findGptSlotByElementId(pubads, handoff.slotElementId);
+            if (existingSlot) {
+              registerHandoffAlias(ts, elementId, handoff);
+              handoff.publisherClaimed = true;
+              // The supported publisher lifecycle is defineSlot → addService → display.
+              // Intentionally wait for that display instead of applying a time heuristic.
+              handoff.suppressPublisherDisplay = true;
+              handoff.suppressPublisherRefresh = ts.gptInitialLoadDisabled === true;
+              ts.prevGptSlots = (ts.prevGptSlots ?? []).filter(
+                (ownedSlot) => ownedSlot !== existingSlot
+              );
+              if (handoff.gamUnitPath !== adUnitPath || !handoffFormatsMatch(handoff, formats)) {
+                log.warn('GPT slot handoff: publisher definition differs from TS configuration', {
+                  elementId,
+                  tsGamUnitPath: handoff.gamUnitPath,
+                  publisherGamUnitPath: adUnitPath,
+                });
+              }
+              return existingSlot;
+            }
+          }
+        }
+        return elementId === undefined
+          ? originalDefineSlot(adUnitPath, formats)
+          : originalDefineSlot(adUnitPath, formats, elementId);
+      };
+      (patchedDefineSlot as HandoffPatchedFunction).__tsSlotHandoffPatched = true;
+      g.defineSlot = patchedDefineSlot;
+    }
+
+    const display = g.display;
+    if (!(display as HandoffPatchedFunction).__tsSlotHandoffPatched) {
+      const originalDisplay = display.bind(g);
+      const patchedDisplay = (target: GoogleTagDisplayTarget): void => {
+        const elementId = displayTargetElementId(target);
+        const handoff = elementId ? ts.gptSlotHandoffs?.[elementId] : undefined;
+        if (!ts.gptSlotHandoffInternal && handoff?.suppressPublisherDisplay) {
+          handoff.suppressPublisherDisplay = false;
+          return;
+        }
+        originalDisplay(target);
+      };
+      (patchedDisplay as HandoffPatchedFunction).__tsSlotHandoffPatched = true;
+      g.display = patchedDisplay;
+    }
+
+    const refresh = pubads.refresh;
+    if (!(refresh as HandoffPatchedFunction).__tsSlotHandoffPatched) {
+      const originalRefresh = refresh.bind(pubads);
+      const callRefresh = (
+        slots: GoogleTagSlot[] | undefined,
+        options: GoogleTagRefreshOptions | undefined
+      ): void => {
+        if (options === undefined) {
+          originalRefresh(slots);
+        } else {
+          originalRefresh(slots, options);
+        }
+      };
+      const patchedRefresh = (
+        requestedSlots?: GoogleTagSlot[],
+        options?: GoogleTagRefreshOptions
+      ): void => {
+        if (ts.gptSlotHandoffInternal) {
+          callRefresh(requestedSlots, options);
+          return;
+        }
+
+        const slots = requestedSlots ?? pubads.getSlots?.();
+        if (!slots) {
+          callRefresh(requestedSlots, options);
+          return;
+        }
+
+        let suppressed = false;
+        const remainingSlots = slots.filter((slot) => {
+          const handoff = handoffForSlot(ts, slot);
+          if (!handoff?.suppressPublisherRefresh) return true;
+          handoff.suppressPublisherRefresh = false;
+          suppressed = true;
+          return false;
+        });
+        if (!suppressed) {
+          callRefresh(requestedSlots, options);
+        } else if (remainingSlots.length > 0) {
+          callRefresh(remainingSlots, options);
+        }
+      };
+      (patchedRefresh as HandoffPatchedFunction).__tsSlotHandoffPatched = true;
+      pubads.refresh = patchedRefresh;
+    }
+  });
+}
+
 export function installTsAdInit(): void {
   const ts = (window.tsjs ??= {} as TsjsApi);
   installInitialLoadDetector(ts);
   installScheduleInitialAdInit(ts);
+
+  installLatePublisherSlotHandoff(ts);
   ts.adInit = function () {
     const slots = ts.adSlots ?? [];
     // Snapshot bids at adInit() call time — correct for targeting setup.
@@ -573,12 +951,23 @@ export function installTsAdInit(): void {
     const generation = ts.navGeneration ?? 0;
     const g = (window as GptWindow).googletag;
     if (!g) return;
+    const warnedResolutionFailures = new Set<string>();
 
     g.cmd?.push(() => {
       if ((ts.navGeneration ?? 0) !== generation) return;
       // Destroy previously defined TS slots before redefining for the new page.
       if (ts.prevGptSlots && ts.prevGptSlots.length > 0) {
+        const destroyedSlotElementIds = new Set(
+          (ts.prevGptSlots as GoogleTagSlot[]).map((slot) => slot.getSlotElementId())
+        );
         g.destroySlots?.(ts.prevGptSlots as GoogleTagSlot[]);
+        if (ts.gptSlotHandoffs) {
+          for (const [elementId, handoff] of Object.entries(ts.gptSlotHandoffs)) {
+            if (destroyedSlotElementIds.has(handoff.slotElementId)) {
+              delete ts.gptSlotHandoffs[elementId];
+            }
+          }
+        }
         ts.prevGptSlots = [];
       }
 
@@ -619,11 +1008,33 @@ export function installTsAdInit(): void {
       }
 
       slots.forEach((slot) => {
-        // Resolve actual div ID: exact match first, then prefix query.
-        // div_id in config may be a stable prefix (e.g. "ad-header-0-") when
-        // the suffix is dynamically generated by the framework at render time.
-        const el = findSlotElementByDivId(slot.div_id);
-        if (!el) return;
+        // Resolve actual div ID: exact match first, then the visibility and
+        // geometry tiers for prefix matches. div_id in config may be a stable
+        // prefix (e.g. "ad-header-0-") when the suffix is dynamically
+        // generated by the framework at render time.
+        const resolution = resolveSlotElementByDivId(slot.div_id);
+        const el = resolution.element;
+        if (!el) {
+          if (!warnedResolutionFailures.has(slot.div_id)) {
+            if (resolution.prefixMatchCount > 1) {
+              warnedResolutionFailures.add(slot.div_id);
+              log.warn('GPT slot prefix did not resolve to one active element', {
+                divId: slot.div_id,
+                prefixMatchCount: resolution.prefixMatchCount,
+                activeMatchCount: resolution.activeMatchCount,
+              });
+            } else if (resolution.prefixMatchCount === 1 && resolution.activeMatchCount === 0) {
+              // The common breakpoint-hidden config: the prefix matched one
+              // element but it is hidden, so the slot is skipped. Logged so a
+              // blank placement is diagnosable without stepping the resolver.
+              warnedResolutionFailures.add(slot.div_id);
+              log.debug('GPT slot prefix matched only a hidden element; skipping slot', {
+                divId: slot.div_id,
+              });
+            }
+          }
+          return;
+        }
         const actualDivId = el.id;
         const bid = bids[slot.id] ?? {};
 
@@ -635,16 +1046,25 @@ export function installTsAdInit(): void {
         if (existingSlot) {
           gptSlot = existingSlot;
         } else {
-          // Use outer container div for TS's slot when publisher hasn't defined
-          // theirs yet — keeps both slots on separate divs so publisher's
-          // later defineSlot on the inner div doesn't conflict.
-          const containerEl = document.getElementById(`${actualDivId}-container`);
-          const slotDivId = containerEl?.id ?? actualDivId;
-          const defined = g.defineSlot?.(slot.gam_unit_path, slot.formats, slotDivId);
+          // Define TS's fallback on the publisher's actual div. A late publisher
+          // defineSlot() for this div is handed the same slot by the scoped GPT
+          // wrapper, preventing a competing container-slot request.
+          const defined = withGptSlotHandoffInternal(ts, () =>
+            g.defineSlot?.(slot.gam_unit_path, slot.formats, actualDivId)
+          );
           if (!defined) return;
           defined.addService(g.pubads!());
           gptSlot = defined;
           tsOwned = true;
+          (ts.gptSlotHandoffs ??= {})[actualDivId] = {
+            gamUnitPath: slot.gam_unit_path,
+            formats: slot.formats,
+            divIdPrefix: slot.div_id,
+            slotElementId: actualDivId,
+            publisherClaimed: false,
+            suppressPublisherDisplay: false,
+            suppressPublisherRefresh: false,
+          };
         }
 
         const slotDivId2 = gptSlot.getSlotElementId?.() ?? actualDivId;
@@ -659,9 +1079,23 @@ export function installTsAdInit(): void {
           if (bid[key]) gptSlot.setTargeting(key, String(bid[key]!));
         });
         gptSlot.setTargeting(TS_INITIAL_TARGETING_KEY, '1');
-        // Map both inner div and container div → slot ID so slotRenderEnded
-        // (which reports the GPT slot's div, i.e. slotDivId/container) can look up
-        // the slot, while adm injection (which targets the inner div) also works.
+        // Diagnostics are observational only. A missing or malformed debug
+        // implementation must never interrupt slot mapping or delivery.
+        try {
+          const requestedSlotSizes = ts.gptSlotHandoffs?.[slotDivId2]?.formats;
+          const opportunity = trustedServerOpportunity(bid);
+          ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
+            gptSlot,
+            slot.id,
+            opportunity,
+            bid.hb_auction_id,
+            requestedSlotSizes
+          );
+        } catch {
+          // Diagnostics must not alter ad delivery.
+        }
+        // Map the resolved inner div to the slot ID so slotRenderEnded and ADM
+        // injection address the same, single GPT slot.
         divToSlotId[actualDivId] = slot.id;
         if (slotDivId2 !== actualDivId) divToSlotId[slotDivId2] = slot.id;
         const slotTargetingKeys = Object.keys(slot.targeting ?? {});
@@ -674,13 +1108,8 @@ export function installTsAdInit(): void {
           slotsToRefresh.push(gptSlot);
         }
 
-        // APS: signal to apstag that bids are ready so Amazon's GAM creative
-        // can render.  apstag must already be initialised on the page (which it
-        // is on production publisher pages).  Safe no-op if apstag is absent.
-        if (bid.hb_bidder === 'aps' || bid.hb_bidder === 'amazon-aps') {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (window as any).apstag?.setDisplayBids?.();
-        }
+        // Trusted Server APS winners carry their own typed renderer and never
+        // enter the publisher-owned native apstag rendering path.
       });
 
       ts.prevGptSlots = newSlots as unknown[];
@@ -689,8 +1118,8 @@ export function installTsAdInit(): void {
       ts.prevSlotTargetingKeys = nextSlotTargetingKeys;
 
       // Whether this call produced any TS slot to render. A gated page-bids
-      // response (auction kill switch or consent denial) returns no slots, so
-      // the loops above leave these empty.
+      // response (template switch, auction gate, or consent denial) returns no
+      // slots, so the loops above leave these empty.
       const hasRenderableWork = slotsToDisplay.length > 0 || slotsToRefresh.length > 0;
 
       // enableSingleRequest and enableServices must only be called once per page
@@ -728,18 +1157,18 @@ export function installTsAdInit(): void {
       // called without a matching display call") and misses its impression.
       // Must run after enableServices(); on SPA navigation services are already
       // enabled, so this runs unconditionally for any newly-defined slots.
-      slotsToDisplay.forEach((divId) => g.display?.(divId));
+      slotsToDisplay.forEach((divId) => withGptSlotHandoffInternal(ts, () => g.display?.(divId)));
 
+      syncInitialLoadDisabled(g, ts);
       // Slots needing an explicit ad request via refresh(). Reused
       // publisher-owned slots always need one to pick up the just-applied
       // server-side targeting. TS-defined slots are normally fetched by the
-      // display() above — but when the publisher disabled initial load through
-      // setConfig() or the legacy pubads() method, display() only registers the
-      // slot and the ad request must come from refresh(). Without this, a TS-owned
+      // display() above — but when the publisher called
+      // pubads().disableInitialLoad(), display() only registers the slot and the
+      // ad request must come from refresh(). Without this, a TS-owned
       // first-impression slot renders blank on initial-load-disabled pages. Only
       // add them in that case; otherwise display() + refresh() would
       // double-request the impression.
-      syncInitialLoadDisabled(g, ts);
       const slotsNeedingRefresh = ts.gptInitialLoadDisabled
         ? slotsToRefresh.concat(newSlots)
         : slotsToRefresh;
@@ -752,7 +1181,7 @@ export function installTsAdInit(): void {
         // the same slots still go through the wrapper normally.
         ts.adInitRefreshInProgress = true;
         try {
-          g.pubads!().refresh(slotsNeedingRefresh);
+          withGptSlotHandoffInternal(ts, () => g.pubads!().refresh(slotsNeedingRefresh));
         } finally {
           ts.adInitRefreshInProgress = false;
         }
@@ -860,23 +1289,47 @@ function waitForSlotElements(slots: AuctionSlot[], signal: AbortSignal): Promise
   // A newer navigation may have aborted this signal before we were called; skip
   // installing an observer/timer that the stale run would only tear down.
   if (signal.aborted) return Promise.resolve();
-  const allPresent = (): boolean => slots.every((slot) => !!findSlotElementByDivId(slot.div_id));
+  // Presence and eligibility are different questions here. The tiered
+  // resolver returns no element for a prefix match that is hidden (e.g. a
+  // breakpoint-hidden mobile-only placement), but such a slot has rendered and
+  // will never "appear" — waiting on it would stall every slot on the route
+  // for the full timeout. Count it as present; adInit still applies the strict
+  // tiers when it runs and skips ineligible slots.
+  const allPresent = (): boolean =>
+    slots.every((slot) => {
+      const resolution = resolveSlotElementByDivId(slot.div_id);
+      return resolution.element !== null || resolution.prefixMatchCount > 0;
+    });
   if (slots.length === 0 || allPresent() || typeof MutationObserver === 'undefined') {
     return Promise.resolve();
   }
 
   return new Promise<void>((resolve) => {
     let settled = false;
+    let animationFrame: number | undefined;
     const finish = (): void => {
       if (settled) return;
       settled = true;
+      if (animationFrame !== undefined) cancelAnimationFrame(animationFrame);
       observer.disconnect();
       clearTimeout(timer);
       signal.removeEventListener('abort', finish);
       resolve();
     };
     const observer = new MutationObserver(() => {
-      if (allPresent()) finish();
+      if (document.visibilityState === 'hidden' || typeof requestAnimationFrame === 'undefined') {
+        if (animationFrame !== undefined) {
+          cancelAnimationFrame(animationFrame);
+          animationFrame = undefined;
+        }
+        if (allPresent()) finish();
+        return;
+      }
+      if (animationFrame !== undefined) return;
+      animationFrame = requestAnimationFrame(() => {
+        animationFrame = undefined;
+        if (allPresent()) finish();
+      });
     });
     observer.observe(document.documentElement, { childList: true, subtree: true });
     const timer = setTimeout(finish, SPA_SLOT_WAIT_MS);
@@ -909,9 +1362,7 @@ export function installSpaAuctionHook(): void {
 
   let inflight: AbortController | null = null;
   // Last path an auction was run for. popstate fires for hash-only and
-  // same-pathname back/forward (scroll restoration), and pushState/replaceState
-  // can be called with the current URL, so guard every entry point against
-  // re-requesting impressions for a path we already loaded.
+  // same-pathname changes, so guard against re-requesting loaded impressions.
   let currentPath = location.pathname;
   // Last path whose slots/bids were actually applied — the initial SSR page
   // counts. A failed navigation rolls `currentPath` back to this rather than to
@@ -947,6 +1398,11 @@ export function installSpaAuctionHook(): void {
     if (path === currentPath) return;
     currentPath = path;
     ts.navGeneration = (ts.navGeneration ?? 0) + 1;
+    // A route change invalidates hydration aliases before the new route's
+    // publisher can define a same-prefix slot while page-bids is in flight.
+    for (const [elementId, handoff] of Object.entries(ts.gptSlotHandoffs ?? {})) {
+      if (!handoff.publisherClaimed) delete ts.gptSlotHandoffs![elementId];
+    }
     inflight?.abort();
     const controller = new AbortController();
     inflight = controller;
@@ -971,10 +1427,10 @@ export function installSpaAuctionHook(): void {
       // This route is now the committed, loaded state — a later failed
       // navigation rolls back here, and a return trip no-ops correctly.
       lastAppliedPath = path;
-      // An empty page-bids response (auction kill switch or consent gate) carries
-      // no TS slots. Only run adInit() when there are slots to apply or prior TS
-      // state to sweep — otherwise a consent-denied or kill-switched navigation
-      // must not enter the GPT command queue and risk activating services.
+      // An empty page-bids response (template switch, auction, or consent gate)
+      // carries no TS slots. Only run adInit() when there are slots to apply or
+      // prior TS state to sweep — otherwise a gated navigation must not enter
+      // the GPT command queue and risk activating services.
       const hasPriorTsState =
         (ts.prevGptSlots?.length ?? 0) > 0 ||
         Object.keys(ts.prevSlotTargetingKeys ?? {}).length > 0 ||
@@ -993,7 +1449,8 @@ export function installSpaAuctionHook(): void {
     const original = history[method].bind(history);
     history[method] = function (state: unknown, unused: string, url?: string | URL | null): void {
       original(state, unused, url);
-      const newPath = url ? new URL(String(url), location.href).pathname : location.pathname;
+      const locationUrl = url ? new URL(String(url), location.href) : location;
+      const newPath = locationUrl.pathname;
       // onNavigate no-ops when newPath equals the last loaded path.
       void onNavigate(newPath);
     };
@@ -1107,12 +1564,76 @@ export function parseCachedBid(body: string): CachedBid | undefined {
   };
 }
 
+function safelyRecordCreativeRequest(slotId: string): number | undefined {
+  try {
+    const attemptId =
+      window.tsjs?.gptDiagnosticsRecorder?.recordTrustedServerCreativeRequest(slotId);
+    return typeof attemptId === 'number' && Number.isFinite(attemptId) ? attemptId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function safelyRecordCreativeResponse(attemptId: number | undefined): void {
+  if (attemptId === undefined) return;
+
+  try {
+    window.tsjs?.gptDiagnosticsRecorder?.recordTrustedServerCreativeResponse(attemptId);
+  } catch {
+    // Diagnostics must not alter creative delivery.
+  }
+}
+
+function safelyRecordCreativeFailure(
+  attemptId: number | undefined,
+  reason: GptDiagnosticsCreativeFailure
+): void {
+  if (attemptId === undefined) return;
+
+  try {
+    window.tsjs?.gptDiagnosticsRecorder?.recordTrustedServerCreativeFailure(attemptId, reason);
+  } catch {
+    // Diagnostics must not alter creative delivery.
+  }
+}
+
+/** Maximum number of consumed APS Prebid IDs retained as security tombstones. */
+const MAX_CONSUMED_PREBID_APS_IDS = 256;
+
+function pruneConsumedPrebidApsIds(
+  consumedIds: Map<string, { expiresAt: number }>,
+  now: number
+): void {
+  for (const [adId, consumed] of consumedIds) {
+    if (consumed.expiresAt <= now) consumedIds.delete(adId);
+  }
+}
+
+function hasConsumedPrebidApsIdCapacity(
+  consumedIds: Map<string, { expiresAt: number }>,
+  adId: string
+): boolean {
+  if (consumedIds.has(adId) || consumedIds.size < MAX_CONSUMED_PREBID_APS_IDS) return true;
+
+  log.warn(`[tsjs-gpt] APS Prebid renderer tombstone capacity reached; declining '${adId}'`);
+  return false;
+}
+
+function recordConsumedPrebidApsId(
+  consumedIds: Map<string, { expiresAt: number }>,
+  adId: string,
+  expiresAt: number
+): void {
+  consumedIds.set(adId, { expiresAt });
+}
+
 /**
  * Install the TS → pbRender bridge.
  *
  * Must be installed synchronously at module init — before `adInit()` fires
- * `refresh()`, which triggers GAM to serve the Prebid creative. Installing
- * post-load would miss first-impression `"Prebid Request"` messages.
+ * `refresh()`, which initiates the GAM request that may select the Prebid
+ * creative. Installing post-load would miss first-impression `"Prebid Request"`
+ * messages.
  *
  * When `adId` matches a TS server-side bid in `window.tsjs.bids` AND the bid
  * has renderable markup, the bridge:
@@ -1137,6 +1658,10 @@ export function installTsRenderBridge(): void {
   // is scoped to the slot, not the bare adId: hb_adid is not unique per bid, so
   // keying on it alone would let one slot block a distinct slot's render.
   const renderingKeys = new Set<string>();
+  const consumedPrebidApsIds = new Map<string, { expiresAt: number }>();
+  // One consumed APS ad ID per slot is sufficient: a newer bid replaces the
+  // slot's old ad ID in `window.tsjs.bids`, so the ownership guard rejects it.
+  const consumedServerApsBySlot = new Map<string, string>();
 
   window.addEventListener('message', (e: MessageEvent) => {
     let data: Record<string, unknown>;
@@ -1155,13 +1680,83 @@ export function installTsRenderBridge(): void {
 
     const port = e.ports?.[0];
     if (!port) return;
+
+    const now = Date.now();
+    pruneConsumedPrebidApsIds(consumedPrebidApsIds, now);
+    const consumedPrebidAps = consumedPrebidApsIds.get(adId);
+    if (consumedPrebidAps) {
+      // Once TS claims an APS capability, keep the ad ID unavailable to every
+      // other iframe. Letting Prebid's global handler answer a foreign source
+      // would expose the creative despite the slot-bound capability check.
+      e.stopImmediatePropagation();
+      return;
+    }
+
+    const prebidRendererEntry = getApsPrebidRenderer(adId);
+    if (prebidRendererEntry) {
+      // Fail closed for a TS-owned APS ad ID before checking its source. Native
+      // Prebid handles ad IDs globally and would otherwise answer a request from
+      // an unrelated iframe when this slot-bound capability rejects it.
+      e.stopImmediatePropagation();
+      if (!messageSourceBelongsToAdUnit(e.source, prebidRendererEntry.adUnitCode)) return;
+      const renderer = validateApsRenderer(prebidRendererEntry.renderer);
+      if (!renderer || !hasConsumedPrebidApsIdCapacity(consumedPrebidApsIds, adId)) return;
+      if (!consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
+      recordConsumedPrebidApsId(consumedPrebidApsIds, adId, prebidRendererEntry.expiresAt);
+
+      const markUsed = (): void => {
+        try {
+          prebidRendererEntry.markUsed();
+        } catch (err) {
+          log.warn(`[tsjs-gpt] APS Prebid markUsed callback threw for '${adId}'`, err);
+        }
+      };
+      const dispatched = dispatchApsRendering({
+        slotId: prebidRendererEntry.adUnitCode,
+        renderer,
+        source: e.source,
+        trustedServer: (validatedRenderer) => {
+          const rendererUrl = apsRendererUrl();
+          if (!rendererUrl) return false;
+          try {
+            port.postMessage(
+              JSON.stringify({
+                message: 'Prebid Response',
+                adId,
+                renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+                rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+                rendererUrl,
+                apsRenderer: validatedRenderer,
+                width: validatedRenderer.width,
+                height: validatedRenderer.height,
+              })
+            );
+            return true;
+          } catch (err) {
+            log.warn(`[tsjs-gpt] APS Prebid response post failed for '${adId}'`, err);
+            return false;
+          }
+        },
+      });
+      if (typeof dispatched === 'boolean') {
+        if (dispatched) markUsed();
+      } else {
+        void dispatched.then((accepted) => {
+          if (accepted) markUsed();
+        });
+      }
+      return;
+    }
+
     const sourceSlotId = slotIdForMessageSource(e.source);
     if (!sourceSlotId) return;
 
     // Resolve the bid by the requesting slot, not by the first bid whose hb_adid
-    // matches. hb_adid is not unique per bid: absent PBS Cache, it falls back to a
-    // creative id a bidder may reuse across slots. A first-match-by-adId lookup
-    // would resolve every duplicate to one slot, so all but that slot render blank.
+    // matches. hb_adid is not unique per bid: absent PBS Cache it falls back to a
+    // creative id a bidder may reuse across slots, and only absent that too does it
+    // fall back to the OpenRTB bid id, which is unique per bid instance. A
+    // first-match-by-adId lookup would resolve every duplicate to one slot, so all
+    // but that slot render blank.
     const bids = window.tsjs?.bids ?? {};
     const slotId = sourceSlotId;
     const matchedBid = bids[slotId];
@@ -1171,6 +1766,48 @@ export function installTsRenderBridge(): void {
     // pulling slot B's creative and firing slot B's win/billing beacons.
     if (!matchedBid || matchedBid.hb_adid !== adId) return;
 
+    if (matchedBid.renderer !== undefined) {
+      // This slot and ad ID belong to TS, so fail closed before validating the
+      // descriptor and never let native Prebid answer a rejected or replayed request.
+      e.stopImmediatePropagation();
+      if (consumedServerApsBySlot.get(slotId) === adId) return;
+      const renderer = validateApsRenderer(matchedBid.renderer);
+      if (!renderer) return;
+      consumedServerApsBySlot.set(slotId, adId);
+      void Promise.resolve(
+        dispatchApsRendering({
+          slotId,
+          renderer,
+          source: e.source,
+          trustedServer: (validatedRenderer) => {
+            const rendererUrl = apsRendererUrl();
+            if (!rendererUrl) return false;
+            try {
+              port.postMessage(
+                JSON.stringify({
+                  message: 'Prebid Response',
+                  adId,
+                  renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+                  rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+                  rendererUrl,
+                  apsRenderer: validatedRenderer,
+                  width: validatedRenderer.width,
+                  height: validatedRenderer.height,
+                })
+              );
+              return true;
+            } catch (err) {
+              log.warn(`[tsjs-gpt] APS server response post failed for '${slotId}'`, err);
+              return false;
+            }
+          },
+        })
+      );
+      return;
+    }
+
+    const attemptId = safelyRecordCreativeRequest(slotId);
+
     const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
     // Prefer the winning creative's own dimensions; the first configured slot
     // format is only a fallback and mis-sizes a multi-size slot whose winner is
@@ -1178,26 +1815,43 @@ export function installTsRenderBridge(): void {
     const [fallbackWidth, fallbackHeight] = slot?.formats?.[0] ?? [728, 90];
     const width = matchedBid.w ?? fallbackWidth;
     const height = matchedBid.h ?? fallbackHeight;
+    const inlineAdm = isNonEmptyString(matchedBid.adm) ? matchedBid.adm : undefined;
+    const cacheHost = isNonEmptyString(matchedBid.hb_cache_host)
+      ? matchedBid.hb_cache_host
+      : undefined;
+    const cachePath = isNonEmptyString(matchedBid.hb_cache_path)
+      ? matchedBid.hb_cache_path
+      : undefined;
 
-    if (matchedBid.adm) {
+    if (inlineAdm) {
       e.stopImmediatePropagation();
-      port.postMessage(
-        JSON.stringify({
-          message: 'Prebid Response',
-          adId,
-          ad: matchedBid.adm,
-          renderer: TS_DISPLAY_RENDERER,
-          width,
-          height,
-        })
-      );
+      try {
+        port.postMessage(
+          JSON.stringify({
+            message: 'Prebid Response',
+            adId,
+            ad: inlineAdm,
+            renderer: TS_DISPLAY_RENDERER,
+            width,
+            height,
+          })
+        );
+      } catch (err) {
+        safelyRecordCreativeFailure(attemptId, 'response_post_failed');
+        log.warn(`[tsjs-gpt] pbRender bridge: response post failed for '${slotId}'`, err);
+        return;
+      }
+      safelyRecordCreativeResponse(attemptId);
       fireWinBillingBeacons(slotId, matchedBid);
       log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from inline adm`);
       return;
     }
 
     // No TS render source — let Prebid.js handle it.
-    if (!matchedBid.hb_cache_host || !matchedBid.hb_cache_path) return;
+    if (!cacheHost || !cachePath) {
+      safelyRecordCreativeFailure(attemptId, 'missing_render_source');
+      return;
+    }
 
     // TS owns this adId — stop Prebid from also processing it.
     e.stopImmediatePropagation();
@@ -1208,48 +1862,73 @@ export function installTsRenderBridge(): void {
     if (renderingKeys.has(renderingKey)) return;
     renderingKeys.add(renderingKey);
 
-    const cacheUrl = `https://${matchedBid.hb_cache_host}${matchedBid.hb_cache_path}?uuid=${encodeURIComponent(adId)}`;
+    const cacheUrl = `https://${cacheHost}${cachePath}?uuid=${encodeURIComponent(adId)}`;
 
-    fetch(cacheUrl, { mode: 'cors' })
-      .then((res) => (res.ok ? res.text() : Promise.reject(res.status)))
-      .then((body) => {
-        // PBS Cache returns the cached bid as a JSON object; decode its creative
-        // and render metadata the same way the Prebid Universal Creative does.
-        const cached = parseCachedBid(body);
-        if (!cached) {
-          // No renderable creative in the cache payload — decline rather than
-          // ship a serialized bid document to PUC. Beacons stay unfired.
-          log.warn(
-            `[tsjs-gpt] pbRender bridge: PBS Cache response for '${slotId}' had no renderable adm`
-          );
-          return;
+    const cachedBody = fetch(cacheUrl, { mode: 'cors' }).then((res) =>
+      res.ok ? res.text() : Promise.reject(res.status)
+    );
+
+    cachedBody
+      .then(
+        (body) => {
+          // PBS Cache returns the cached bid as a JSON object; decode its creative
+          // and render metadata the same way the Prebid Universal Creative does.
+          const cached = parseCachedBid(body);
+          if (!cached) {
+            // No renderable creative in the cache payload — decline rather than
+            // ship a serialized bid document to PUC. Beacons stay unfired.
+            safelyRecordCreativeFailure(attemptId, 'invalid_cache_payload');
+            log.warn(
+              `[tsjs-gpt] pbRender bridge: PBS Cache response for '${slotId}' had no renderable adm`
+            );
+            return;
+          }
+          // Resolve the auction-price macro from the cached clearing price, and
+          // size from the cached bid's own dimensions, falling back to the slot
+          // format only when the cache omits them.
+          const ad =
+            cached.price !== undefined
+              ? expandAuctionPriceMacro(cached.adm, cached.price)
+              : cached.adm;
+          try {
+            port.postMessage(
+              JSON.stringify({
+                message: 'Prebid Response',
+                adId,
+                ad,
+                renderer: TS_DISPLAY_RENDERER,
+                width: cached.width ?? width,
+                height: cached.height ?? height,
+              })
+            );
+          } catch (err) {
+            safelyRecordCreativeFailure(attemptId, 'response_post_failed');
+            log.warn(`[tsjs-gpt] pbRender bridge: response post failed for '${slotId}'`, err);
+            return;
+          }
+          safelyRecordCreativeResponse(attemptId);
+          // Beacons carry the server-expanded ${AUCTION_PRICE} from the auction's
+          // clearing price, not `cached.price` — the auction result is the
+          // authoritative clearing price, and the cached copy is only the render
+          // source. Do not re-expand them here.
+          fireWinBillingBeacons(slotId, matchedBid);
+          log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from PBS Cache`);
+        },
+        (err) => {
+          safelyRecordCreativeFailure(attemptId, 'cache_fetch_failed');
+          log.warn(`[tsjs-gpt] pbRender bridge: PBS Cache fetch failed for '${slotId}'`, err);
         }
-        // Resolve the auction-price macro from the cached clearing price, and
-        // size from the cached bid's own dimensions, falling back to the slot
-        // format only when the cache omits them.
-        const ad =
-          cached.price !== undefined
-            ? expandAuctionPriceMacro(cached.adm, cached.price)
-            : cached.adm;
-        port.postMessage(
-          JSON.stringify({
-            message: 'Prebid Response',
-            adId,
-            ad,
-            renderer: TS_DISPLAY_RENDERER,
-            width: cached.width ?? width,
-            height: cached.height ?? height,
-          })
-        );
-        // Beacons carry the server-expanded ${AUCTION_PRICE} from the auction's
-        // clearing price, not `cached.price` — the auction result is the
-        // authoritative clearing price, and the cached copy is only the render
-        // source. Do not re-expand them here.
-        fireWinBillingBeacons(slotId, matchedBid);
-        log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from PBS Cache`);
-      })
+      )
       .catch((err) => {
-        log.warn(`[tsjs-gpt] pbRender bridge: PBS Cache fetch failed for '${slotId}'`, err);
+        // Errors reaching this stage were thrown after the cache body promise
+        // settled, so parsing, posting follow-up work, beacons, success logging,
+        // or failure reporting must not create new cache-failure evidence. Keep
+        // the fire-and-forget bridge promise handled without changing evidence.
+        try {
+          log.warn(`[tsjs-gpt] pbRender bridge: response processing failed for '${slotId}'`, err);
+        } catch {
+          // Logging must not create an unhandled bridge rejection.
+        }
       })
       .finally(() => {
         renderingKeys.delete(renderingKey);
@@ -1274,6 +1953,7 @@ if (typeof window !== 'undefined') {
     installGptShim();
   }
 
+  installTrustedServerPageTargeting();
   installTsAdInit();
   installSpaAuctionHook();
   installSlimPrebidLoader();

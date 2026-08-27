@@ -7,7 +7,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, "feature/**"]
 
 jobs:
   test-rust:
@@ -28,6 +27,11 @@ jobs:
         run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
 
+      - name: Retrieve Node.js version
+        id: node-version
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -46,8 +50,19 @@ jobs:
         if: steps.cache-viceroy.outputs.cache-hit != 'true'
         run: cargo install viceroy --version "${{ steps.viceroy-version.outputs.viceroy-version }}" --locked --force
 
+      - name: Use Node.js for the served-seam contract
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.node-version }}
+
       - name: Run tests
         run: cargo test-fastly
+
+      - name: Run template cache ESI local harness
+        run: BID_DELAY=3 ./scripts/template-cache-local-test.sh esi
+
+      - name: Run inline control harness
+        run: BID_DELAY=3 ./scripts/template-cache-local-test.sh inline
 
   test-axum:
     name: cargo test (axum native)

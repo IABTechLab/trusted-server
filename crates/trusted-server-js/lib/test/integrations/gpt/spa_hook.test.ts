@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import type { TsjsApi } from '../../../src/core/types';
@@ -17,6 +20,12 @@ async function importGptModule() {
 /** Flush the microtask/timer queue so onNavigate's awaits settle. */
 async function flushAsync(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/** Allow a MutationObserver-scheduled slot check to run. */
+async function flushAnimationFrame(): Promise<void> {
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  await Promise.resolve();
 }
 
 describe('installSpaAuctionHook', () => {
@@ -83,6 +92,98 @@ describe('installSpaAuctionHook', () => {
     await flushAsync();
   });
 
+  it.each(['bootstrap', 'bundle'] as const)(
+    'invalidates unclaimed GPT handoffs before an SPA fetch (%s)',
+    async (implementation) => {
+      let resolveFetch: ((response: unknown) => void) | undefined;
+      fetchStub.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFetch = resolve;
+          })
+      );
+
+      const routeADiv = document.createElement('div');
+      routeADiv.id = 'div-atf-sidebar';
+      document.body.appendChild(routeADiv);
+      const routeASlot = {
+        getSlotElementId: vi.fn().mockReturnValue(routeADiv.id),
+      };
+      const routeBSlot = {
+        getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar-2'),
+      };
+      const nativeDefineSlot = vi.fn().mockReturnValue(routeBSlot);
+      const nativeDisplay = vi.fn();
+      const pubads = {
+        getSlots: vi.fn().mockReturnValue([routeASlot]),
+        refresh: vi.fn(),
+      };
+      const googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: nativeDefineSlot,
+        display: nativeDisplay,
+        pubads: vi.fn().mockReturnValue(pubads),
+      };
+      const staleHandoff = {
+        gamUnitPath: '/123/atf',
+        formats: [[300, 250]],
+        divIdPrefix: 'div-atf-sidebar',
+        slotElementId: routeADiv.id,
+        publisherClaimed: false,
+        suppressPublisherDisplay: false,
+        suppressPublisherRefresh: false,
+      };
+      const claimedHandoff = {
+        ...staleHandoff,
+        slotElementId: 'div-claimed',
+        publisherClaimed: true,
+      };
+      (window as TestWindow).googletag = googletag;
+      (window as TestWindow).tsjs = {
+        gptSlotHandoffs: {
+          [staleHandoff.slotElementId]: staleHandoff,
+          'div-atf-sidebar-hydrated': staleHandoff,
+          [claimedHandoff.slotElementId]: claimedHandoff,
+        },
+      };
+
+      if (implementation === 'bootstrap') {
+        const bootstrap = readFileSync(
+          resolve(process.cwd(), '../../trusted-server-core/src/integrations/gpt_bootstrap.js'),
+          'utf8'
+        );
+        window.eval(bootstrap);
+      }
+      await importGptModule();
+
+      routeADiv.remove();
+      const routeBDiv = document.createElement('div');
+      routeBDiv.id = 'div-atf-sidebar-2';
+      document.body.appendChild(routeBDiv);
+      history.pushState({}, '', '/route-b');
+
+      const publisherSlot = (
+        googletag.defineSlot as unknown as (
+          adUnitPath: string,
+          formats: number[][],
+          elementId: string
+        ) => typeof routeBSlot
+      )('/123/atf', [[300, 250]], routeBDiv.id);
+      googletag.display(routeBDiv.id);
+
+      expect(publisherSlot).toBe(routeBSlot);
+      expect(nativeDefineSlot).toHaveBeenCalledWith('/123/atf', [[300, 250]], routeBDiv.id);
+      expect(nativeDisplay).toHaveBeenCalledWith(routeBDiv.id);
+      expect((window as TestWindow).tsjs!.gptSlotHandoffs).toEqual({
+        [claimedHandoff.slotElementId]: claimedHandoff,
+      });
+      expect(resolveFetch).toBeDefined();
+
+      resolveFetch!({ ok: true, json: async () => ({ slots: [], bids: {} }) });
+      await flushAsync();
+    }
+  );
+
   it('fetches page-bids on pushState and applies slots/bids via adInit', async () => {
     // The route's ad container already exists, so bids apply immediately.
     document.body.innerHTML = '<div id="div-s1"></div>';
@@ -99,7 +200,7 @@ describe('installSpaAuctionHook', () => {
     const adInit = vi.fn();
     ts.adInit = adInit;
 
-    history.pushState({}, '', '/next-page');
+    history.pushState({}, '', '/next-page?edition=fictional#section');
     await flushAsync();
 
     expect(fetchStub).toHaveBeenCalledWith(
@@ -115,9 +216,9 @@ describe('installSpaAuctionHook', () => {
   });
 
   it('skips adInit on an empty page-bids response with no prior TS state', async () => {
-    // A gated page-bids response (auction kill switch or consent denial) returns
-    // no slots. With no prior TS state to sweep, the hook must not call adInit()
-    // so a consent-denied navigation cannot activate the publisher's GPT setup.
+    // A gated page-bids response (template switch, auction gate, or consent
+    // denial) returns no slots. With no prior TS state to sweep, the hook must
+    // not call adInit() so a gated navigation cannot activate publisher GPT.
     fetchStub.mockResolvedValue({
       ok: true,
       json: async () => ({ slots: [], bids: {} }),
@@ -179,11 +280,114 @@ describe('installSpaAuctionHook', () => {
 
     // Container commits — the hook should now apply bids exactly once.
     document.body.innerHTML = '<div id="div-late"></div>';
-    await flushAsync();
+    await flushAnimationFrame();
 
     expect(ts.adSlots).toEqual([{ id: 'late', div_id: 'div-late' }]);
     expect(ts.bids).toEqual({ late: { hb_pb: '2.00' } });
     expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('applies bids immediately when a prefix-configured placement exists but is hidden', async () => {
+    // A breakpoint-hidden placement (mobile-only config while on desktop) has
+    // rendered its div but the tiered resolver returns no element for it. The
+    // slot wait must count it as present — otherwise every navigation to the
+    // route stalls for the full SPA_SLOT_WAIT_MS before applying bids to the
+    // visible slots, and adInit skips the hidden slot anyway.
+    document.body.innerHTML =
+      '<div id="div-visible"></div>' + '<div id="ad-hidden-r1x" style="display:none"></div>';
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        slots: [
+          { id: 'visible', div_id: 'div-visible' },
+          { id: 'hidden', div_id: 'ad-hidden-' },
+        ],
+        bids: { visible: { hb_pb: '2.00' } },
+      }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    history.pushState({}, '', '/mixed-route');
+    await flushAsync();
+
+    // Bids apply without waiting out the slot timeout.
+    expect(ts.adSlots).toEqual([
+      { id: 'visible', div_id: 'div-visible' },
+      { id: 'hidden', div_id: 'ad-hidden-' },
+    ]);
+    expect(ts.bids).toEqual({ visible: { hb_pb: '2.00' } });
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('checks for route containers directly in a hidden document', async () => {
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+    vi.stubGlobal('requestAnimationFrame', undefined);
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        slots: [{ id: 'hidden', div_id: 'div-hidden' }],
+        bids: { hidden: { hb_pb: '3.00' } },
+      }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    history.pushState({}, '', '/hidden-route');
+    await flushAsync();
+    expect(adInit).not.toHaveBeenCalled();
+
+    document.body.innerHTML = '<div id="div-hidden"></div>';
+    await flushAsync();
+
+    expect(ts.adSlots).toEqual([{ id: 'hidden', div_id: 'div-hidden' }]);
+    expect(ts.bids).toEqual({ hidden: { hb_pb: '3.00' } });
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels a pending visible-tab frame when the document becomes hidden', async () => {
+    let visibility: DocumentVisibilityState = 'visible';
+    vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => visibility);
+    const requestAnimationFrameMock = vi.fn().mockReturnValue(17);
+    const cancelAnimationFrameMock = vi.fn();
+    vi.stubGlobal('requestAnimationFrame', requestAnimationFrameMock);
+    vi.stubGlobal('cancelAnimationFrame', cancelAnimationFrameMock);
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        slots: [{ id: 'hidden-late', div_id: 'div-hidden-late' }],
+        bids: { 'hidden-late': { hb_pb: '3.50' } },
+      }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    history.pushState({}, '', '/hidden-late-route');
+    await flushAsync();
+
+    // A mutation while visible schedules a frame that never runs.
+    document.body.appendChild(document.createElement('span'));
+    await flushAsync();
+    expect(requestAnimationFrameMock).toHaveBeenCalledTimes(1);
+
+    // The next mutation happens after the document is hidden. It must cancel
+    // the stale frame and perform the presence check immediately.
+    visibility = 'hidden';
+    document.body.innerHTML = '<div id="div-hidden-late"></div>';
+    await flushAsync();
+
+    expect(cancelAnimationFrameMock).toHaveBeenCalledWith(17);
+    expect(adInit).toHaveBeenCalledTimes(1);
+    expect(ts.adSlots).toEqual([{ id: 'hidden-late', div_id: 'div-hidden-late' }]);
   });
 
   it('waits for every configured route ad container before applying bids', async () => {
@@ -216,7 +420,7 @@ describe('installSpaAuctionHook', () => {
     const second = document.createElement('div');
     second.id = 'div-second';
     document.body.appendChild(second);
-    await flushAsync();
+    await flushAnimationFrame();
 
     expect(ts.adSlots).toEqual([
       { id: 'first', div_id: 'div-first' },

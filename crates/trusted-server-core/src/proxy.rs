@@ -1,4 +1,6 @@
-use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq, enforce_max_body_size};
+use crate::http_util::{
+    RequestInfo, compute_encrypted_sha256_token, ct_str_eq, enforce_max_body_size,
+};
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::{Uri as EdgeUri, request_builder as edge_request_builder};
 use error_stack::{Report, ResultExt};
@@ -11,6 +13,11 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use web_time::{SystemTime, UNIX_EPOCH};
 
+use crate::cache_policy::{
+    CachePolicy, EdgeCacheHeader, NO_STORE_PRIVATE_CACHE_CONTROL,
+    apply_no_store_private_to_headers, cache_control_headers_are_private_or_no_store,
+    remove_edge_cache_headers,
+};
 use crate::constants::{
     HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_REFERER,
     HEADER_USER_AGENT, HEADER_X_FORWARDED_FOR,
@@ -94,7 +101,7 @@ const ASSET_PROXY_STRIP_RESPONSE_HEADERS: [&str; 3] =
     ["set-cookie", "strict-transport-security", "clear-site-data"];
 
 /// Cache-control value used when asset proxy responses must not be stored.
-pub const ASSET_NO_STORE_PRIVATE_CACHE_CONTROL: &str = "no-store, private";
+pub const ASSET_NO_STORE_PRIVATE_CACHE_CONTROL: &str = NO_STORE_PRIVATE_CACHE_CONTROL;
 
 /// Cache policy metadata emitted by the asset proxy handler.
 ///
@@ -107,13 +114,32 @@ pub enum AssetProxyCachePolicy {
     OriginControlled,
     /// Reapply `Cache-Control: no-store, private` after standard finalization.
     NoStorePrivate,
+    /// Reapply an operator-selected normalized cache policy after finalization.
+    ///
+    /// The adapter must call [`Self::apply_after_route_finalization`] after
+    /// standard response and privacy finalization, passing its runtime
+    /// [`EdgeCacheHeader`]. Asset rehosting is Fastly-only today; a future
+    /// adapter must preserve this finalization step to emit its edge directive.
+    Normalized(CachePolicy),
 }
 
 impl AssetProxyCachePolicy {
     /// Apply protected cache headers after route-level response finalization.
-    pub fn apply_after_route_finalization(self, response: &mut Response<EdgeBody>) {
-        if self == Self::NoStorePrivate {
-            apply_no_store_cache_control(response);
+    pub fn apply_after_route_finalization(
+        self,
+        response: &mut Response<EdgeBody>,
+        edge_header: EdgeCacheHeader,
+    ) {
+        match self {
+            Self::OriginControlled => {}
+            Self::NoStorePrivate => apply_no_store_cache_control(response),
+            Self::Normalized(policy) => {
+                if cache_control_headers_are_private_or_no_store(response.headers()) {
+                    remove_edge_cache_headers(response.headers_mut());
+                } else {
+                    policy.apply_to_headers(response.headers_mut(), edge_header);
+                }
+            }
         }
     }
 }
@@ -165,6 +191,11 @@ impl AssetProxyResponse {
     fn apply_no_store_private_policy(&mut self) {
         self.cache_policy = AssetProxyCachePolicy::NoStorePrivate;
         apply_no_store_cache_control(&mut self.response);
+    }
+
+    fn apply_normalized_cache_policy(&mut self, policy: CachePolicy) {
+        self.cache_policy = AssetProxyCachePolicy::Normalized(policy);
+        policy.apply_to_headers(self.response.headers_mut(), EdgeCacheHeader::None);
     }
 
     /// Return cache policy metadata for router finalization.
@@ -552,7 +583,7 @@ fn origin_response_metadata(
 /// Apply image content-type header and log pixel heuristics.
 ///
 /// Sets a generic `image/*` content-type when the response has none, then logs
-/// a warning if size or path heuristics suggest a tracking pixel. Both call
+/// a warning if size or path heuristics suggest a pixel image. Both call
 /// sites pass the response through unchanged afterwards, so this returns
 /// nothing.
 fn apply_image_passthrough_metadata(
@@ -657,8 +688,41 @@ fn finalize_proxied_response_streaming(
     beresp
 }
 
+/// CORS policy headers stripped from every proxied response.
+///
+/// Emitting none of our own is not enough: the buffered path preserves upstream
+/// headers wholesale and the streaming path passes the upstream response
+/// through, so an upstream that answers `Access-Control-Allow-Origin: *` (or
+/// `null`) would hand the browser a readable cross-origin response through our
+/// endpoint. Removing the policy makes the browser fall back to the same-origin
+/// rule, which is the intent.
+const STRIPPED_CORS_RESPONSE_HEADERS: [header::HeaderName; 3] = [
+    header::ACCESS_CONTROL_ALLOW_ORIGIN,
+    header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+    header::ACCESS_CONTROL_EXPOSE_HEADERS,
+];
+
+/// Remove any upstream CORS grant so proxied bodies stay unreadable cross-origin.
+fn strip_cors_policy(response: &mut Response<EdgeBody>) {
+    for name in STRIPPED_CORS_RESPONSE_HEADERS {
+        response.headers_mut().remove(name);
+    }
+}
+
 /// Finalize a proxied response, choosing between streaming passthrough and full
 /// content processing based on the `stream_passthrough` flag.
+///
+/// Guarantees no CORS grant reaches the browser — neither one of ours nor one
+/// forwarded from upstream. `/first-party/proxy` is a generic signed fetcher: it
+/// forwards the EC ID and curated client-derived headers, follows redirects, and
+/// runs in open mode when `proxy.allowed_domains` is empty. A signature proves
+/// only that this service minted the URL — and with `sanitize_creatives`
+/// disabled the rewriter mints them from bidder-controlled markup — so letting
+/// an opaque creative frame *read* those bodies would turn the endpoint into a
+/// readable bidder-controlled proxy. Non-CORS subresources (`<img>`,
+/// `<script src>`, stylesheets) are unaffected; CORS-mode ones are covered by
+/// the constrained asset capability tracked in
+/// <https://github.com/IABTechLab/trusted-server/issues/982>.
 fn finalize_response(
     settings: &Settings,
     req: &Request<EdgeBody>,
@@ -666,11 +730,13 @@ fn finalize_response(
     beresp: Response<EdgeBody>,
     stream_passthrough: bool,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    if stream_passthrough {
-        Ok(finalize_proxied_response_streaming(req, url, beresp))
+    let mut response = if stream_passthrough {
+        finalize_proxied_response_streaming(req, url, beresp)
     } else {
-        finalize_proxied_response(settings, req, url, beresp)
-    }
+        finalize_proxied_response(settings, req, url, beresp)?
+    };
+    strip_cors_policy(&mut response);
+    Ok(response)
 }
 
 /// Bundles per-request header configuration and [`RuntimeServices`] for the proxy redirect loop.
@@ -983,10 +1049,7 @@ fn strip_asset_proxy_response_headers(response: &mut Response<EdgeBody>) {
 }
 
 fn apply_no_store_cache_control(response: &mut Response<EdgeBody>) {
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static(ASSET_NO_STORE_PRIVATE_CACHE_CONTROL),
-    );
+    apply_no_store_private_to_headers(response.headers_mut());
 }
 
 fn should_preflight_s3(
@@ -1168,6 +1231,13 @@ pub async fn handle_asset_proxy_request(
 
     let mut response = platform_response_to_fastly_asset(platform_resp);
     strip_asset_proxy_response_headers(response.response_mut());
+
+    let status = response.response().status();
+    if (status.is_success() || status == StatusCode::NOT_MODIFIED)
+        && let Some(policy) = settings.asset_cache_policy_for_path(incoming_path)?
+    {
+        response.apply_normalized_cache_policy(policy);
+    }
 
     Ok(response)
 }
@@ -1611,6 +1681,21 @@ pub async fn handle_first_party_proxy_sign(
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let method = req.method().clone();
     let req_url = req.uri().to_string();
+    // Capture the request's own scheme before the body is consumed: a
+    // protocol-relative sign target inherits it.
+    //
+    // Prefer the URI's explicit scheme, which adapters that deliver absolute
+    // request targets (Fastly, Spin after normalization) always carry, and fall
+    // back to TLS/forwarded metadata otherwise. What must never be used is the
+    // parsed request target: origin-form URIs — what browsers send and the Axum
+    // adapter forwards verbatim — have no scheme of their own, so parsing would
+    // hand back the placeholder base's `https` and make an HTTP dev server sign
+    // an HTTPS target it then proxies over TLS against a plaintext service.
+    let request_scheme = req
+        .uri()
+        .scheme_str()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| RequestInfo::from_request(&req, _services.client_info()).scheme);
 
     let payload = if method == Method::POST {
         let body_bytes = request_body_bytes(req.into_body(), "first-party sign")?;
@@ -1623,9 +1708,7 @@ pub async fn handle_first_party_proxy_sign(
             message: "invalid JSON".to_string(),
         })?
     } else {
-        let parsed = url::Url::parse(&req_url).change_context(TrustedServerError::Proxy {
-            message: "Invalid URL".to_string(),
-        })?;
+        let parsed = parse_request_target(&req_url)?;
         let url = parsed
             .query_pairs()
             .find(|(k, _)| k == "url")
@@ -1640,12 +1723,7 @@ pub async fn handle_first_party_proxy_sign(
 
     let trimmed = payload.url.trim();
     let abs = if trimmed.starts_with("//") {
-        let default_scheme = url::Url::parse(&req_url)
-            .ok()
-            .map(|u| u.scheme().to_ascii_lowercase())
-            .filter(|scheme| !scheme.is_empty())
-            .unwrap_or_else(|| "https".to_string());
-        format!("{}:{}", default_scheme, trimmed)
+        format!("{}:{}", request_scheme, trimmed)
     } else {
         crate::creative::to_abs(settings, trimmed).ok_or_else(|| {
             Report::new(TrustedServerError::Proxy {
@@ -1709,6 +1787,48 @@ struct ProxyRebuildReq {
     del: Option<Vec<String>>,
 }
 
+/// Media type of a browser form submission, the rebuild endpoint's navigation form.
+const FORM_URLENCODED_MIME: &str = "application/x-www-form-urlencoded";
+
+/// Build a rebuild request from `key=value` pairs, shared by the GET query form
+/// and the form-encoded POST body form. `add`/`del` carry JSON payloads;
+/// unparseable values are ignored rather than failing the request, matching the
+/// endpoint's existing leniency about unknown parameters.
+fn rebuild_request_from_pairs<'a>(
+    pairs: impl Iterator<Item = (std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>)>,
+) -> Result<ProxyRebuildReq, Report<TrustedServerError>> {
+    let mut tsclick: Option<String> = None;
+    let mut add: Option<std::collections::HashMap<String, String>> = None;
+    let mut del: Option<Vec<String>> = None;
+    for (k, v) in pairs {
+        match k.as_ref() {
+            "tsclick" => tsclick = Some(v.into_owned()),
+            "add" => {
+                if let Ok(m) = serde_json::from_str::<std::collections::HashMap<String, String>>(&v)
+                {
+                    add = Some(m);
+                }
+            }
+            "del" => {
+                if let Ok(arr) = serde_json::from_str::<Vec<String>>(&v) {
+                    del = Some(arr);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ProxyRebuildReq {
+        tsclick: tsclick.ok_or_else(|| {
+            Report::new(TrustedServerError::Proxy {
+                message: "missing tsclick".to_string(),
+            })
+        })?,
+        add,
+        del,
+    })
+}
+
 #[derive(Serialize)]
 struct ProxyRebuildResp {
     href: String,
@@ -1732,7 +1852,25 @@ pub async fn handle_first_party_proxy_rebuild(
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let method = req.method().clone();
-    let req_url = req.uri().to_string();
+    let req_query = req.uri().query().unwrap_or_default().to_owned();
+    // A form POST is a navigation, not a fetch: the click guard uses it when the
+    // GET recovery URL would exceed the platform's request-URL limit, since the
+    // click is too long to nest in a query string but a body has no such bound.
+    // It answers with the same redirect a GET does — a JSON body would render as
+    // text in the frame the browser just navigated.
+    let is_form_post = method == Method::POST
+        && req
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim().eq_ignore_ascii_case(FORM_URLENCODED_MIME))
+            });
+    let redirect_response = method == Method::GET || is_form_post;
+
     let payload = if method == Method::POST {
         let body_bytes = request_body_bytes(req.into_body(), "first-party rebuild")?;
         enforce_max_body_size(&body_bytes, REBUILD_MAX_BODY_BYTES, "first-party rebuild")?;
@@ -1740,52 +1878,33 @@ pub async fn handle_first_party_proxy_rebuild(
             std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
                 message: "first-party rebuild request body should be valid UTF-8".to_string(),
             })?;
-        serde_json::from_str::<ProxyRebuildReq>(body).change_context(TrustedServerError::Proxy {
-            message: "invalid JSON".to_string(),
-        })?
+        if is_form_post {
+            rebuild_request_from_pairs(url::form_urlencoded::parse(body.as_bytes()))?
+        } else {
+            serde_json::from_str::<ProxyRebuildReq>(body).change_context(
+                TrustedServerError::Proxy {
+                    message: "invalid JSON".to_string(),
+                },
+            )?
+        }
     } else {
         // Support GET: /first-party/proxy-rebuild?tsclick=...&add=...&del=...
-        let parsed = url::Url::parse(&req_url).change_context(TrustedServerError::Proxy {
-            message: "Invalid URL".to_string(),
-        })?;
-        let mut tsclick: Option<String> = None;
-        let mut add: Option<std::collections::HashMap<String, String>> = None;
-        let mut del: Option<Vec<String>> = None;
-        for (k, v) in parsed.query_pairs() {
-            match k.as_ref() {
-                "tsclick" => tsclick = Some(v.into_owned()),
-                "add" => {
-                    if let Ok(m) =
-                        serde_json::from_str::<std::collections::HashMap<String, String>>(&v)
-                    {
-                        add = Some(m);
-                    }
-                }
-                "del" => {
-                    if let Ok(arr) = serde_json::from_str::<Vec<String>>(&v) {
-                        del = Some(arr);
-                    }
-                }
-                _ => {}
-            }
-        }
-        ProxyRebuildReq {
-            tsclick: tsclick.ok_or_else(|| {
-                Report::new(TrustedServerError::Proxy {
-                    message: "missing tsclick".to_string(),
-                })
-            })?,
-            add,
-            del,
-        }
+        // Parse the query component directly rather than the full URI: browsers
+        // (and the Axum/Spin adapters) deliver origin-form URIs (`/path?query`),
+        // which `url::Url::parse` rejects as relative.
+        rebuild_request_from_pairs(url::form_urlencoded::parse(req_query.as_bytes()))?
     };
 
-    let base = "https://edge.local"; // dummy origin to parse relative path
-    let c_url = url::Url::parse(&format!("{}{}", base, payload.tsclick)).change_context(
-        TrustedServerError::Proxy {
+    // Accept both the root-relative form the rewriter emits and an absolute
+    // first-party URL: the client may have absolutized the click to keep it
+    // resolvable inside a `srcdoc` frame. Concatenating a dummy origin would
+    // mangle the absolute form, so parse it properly instead. The signature
+    // covers `tsurl` plus params only, never the origin, so both forms validate
+    // identically.
+    let c_url =
+        parse_request_target(&payload.tsclick).change_context(TrustedServerError::Proxy {
             message: "invalid tsclick".to_string(),
-        },
-    )?;
+        })?;
     if c_url.path() != "/first-party/click" {
         return Err(Report::new(TrustedServerError::Proxy {
             message: "invalid tsclick path".to_string(),
@@ -1794,7 +1913,7 @@ pub async fn handle_first_party_proxy_rebuild(
     // Validate the tstoken on the original click URL before applying any changes.
     // Without this, an attacker could submit an unsigned tsclick and mint valid
     // click redirects to arbitrary URLs.
-    reconstruct_and_validate_signed_target(settings, &format!("{}{}", base, payload.tsclick))?;
+    reconstruct_and_validate_signed_target(settings, c_url.as_str())?;
 
     // Extract tsurl and original params (exclude tstoken if present)
     let mut tsurl: Option<String> = None;
@@ -1896,8 +2015,8 @@ pub async fn handle_first_party_proxy_rebuild(
         }
     }
 
-    if method == Method::GET {
-        // Redirect for GET usage to streamline navigation
+    if redirect_response {
+        // Redirect for navigation usage (GET, or a form-encoded POST)
         let location = HeaderValue::from_str(&href).map_err(|_| {
             Report::new(TrustedServerError::InvalidHeaderValue {
                 message: "invalid rebuild redirect target".to_string(),
@@ -1943,6 +2062,39 @@ struct SignedTarget {
     had_params: bool,
 }
 
+/// Placeholder authority used to parse origin-form request targets.
+///
+/// Only the path and query of the parsed value are ever read, so the authority
+/// is irrelevant to behaviour; `.invalid` is reserved by RFC 2606 and can never
+/// resolve.
+const REQUEST_TARGET_BASE: &str = "https://request.invalid";
+
+/// Parse a request target that may be either an absolute URL or origin-form.
+///
+/// Adapters differ in what `Request::uri()` carries: Fastly and the normalized
+/// Spin path expose an absolute URL, while browsers send origin-form targets
+/// (`/path?query`) that the Axum adapter passes through verbatim. Joining a
+/// fixed placeholder origin lets one parser serve both, so first-party
+/// endpoints behave identically across adapters.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Proxy`] when the target parses as neither form.
+fn parse_request_target(req_url: &str) -> Result<url::Url, Report<TrustedServerError>> {
+    match url::Url::parse(req_url) {
+        Ok(url) => Ok(url),
+        Err(url::ParseError::RelativeUrlWithoutBase) => url::Url::parse(REQUEST_TARGET_BASE)
+            .and_then(|base| base.join(req_url))
+            .change_context(TrustedServerError::Proxy {
+                message: "Invalid URL".to_string(),
+            }),
+        Err(error) => Err(Report::new(TrustedServerError::Proxy {
+            message: "Invalid URL".to_string(),
+        })
+        .attach(error.to_string())),
+    }
+}
+
 /// Validate a `/first-party/proxy|click` request and reconstruct the clear target URL.
 ///
 /// The first-party URL encodes the clear target in `tsurl=...` along with any
@@ -1961,9 +2113,7 @@ fn reconstruct_and_validate_signed_target(
     settings: &Settings,
     req_url: &str,
 ) -> Result<SignedTarget, Report<TrustedServerError>> {
-    let parsed = url::Url::parse(req_url).change_context(TrustedServerError::Proxy {
-        message: "Invalid URL".to_string(),
-    })?;
+    let parsed = parse_request_target(req_url)?;
 
     // Extract tsurl and tstoken while preserving original param order for others
     let mut tsurl: Option<String> = None;
@@ -2050,6 +2200,7 @@ mod tests {
     use std::io;
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::{
         AssetProxyCachePolicy, IMAGE_FALLBACK_CONTENT_TYPE, ProxyRequestConfig,
@@ -2060,6 +2211,7 @@ mod tests {
         proxy_request, rebuild_response_with_body, reconstruct_and_validate_signed_target,
         redirect_is_permitted, stream_asset_body,
     };
+    use crate::cache_policy::{CachePolicy, EdgeCacheHeader};
     use crate::constants::{HEADER_ACCEPT, HEADER_X_FORWARDED_FOR};
     use crate::creative;
     use crate::error::{IntoHttpResponse, TrustedServerError};
@@ -2074,9 +2226,9 @@ mod tests {
     use crate::settings::{
         AssetImageOptimizerConfig, AssetOriginAuth, ImageOptimizerAspectRatioConfig,
         ImageOptimizerCropOffsetsConfig, ImageOptimizerProfileSet, ImageOptimizerSettings,
-        OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, UnknownProfilePolicy,
+        OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, Settings, UnknownProfilePolicy,
     };
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::response_builder as edge_response_builder;
@@ -2439,6 +2591,36 @@ mod tests {
     }
 
     #[test]
+    fn proxy_sign_inherits_the_request_scheme_for_protocol_relative_urls() {
+        // A protocol-relative target adopts the scheme the visitor is on. It
+        // must come from the request, not from the parser's placeholder base:
+        // origin-form URIs (browsers, and the Axum adapter verbatim) carry no
+        // scheme, so an HTTP dev server would otherwise sign an HTTPS target
+        // and proxy TLS against a plaintext service.
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+
+            for (uri, expected) in [
+                ("/first-party/sign", "http"),
+                ("http://edge.example/first-party/sign", "http"),
+                ("https://edge.example/first-party/sign", "https"),
+            ] {
+                let body = serde_json::json!({ "url": "//cdn.example/asset.js" });
+                let req = build_http_post_json_request(uri, &body);
+                let resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                    .await
+                    .expect("should sign protocol-relative URL");
+                let json = response_body_string(resp);
+
+                assert!(
+                    json.contains(&format!("\"base\":\"{expected}://cdn.example/asset.js\"")),
+                    "request `{uri}` should sign a {expected} target: {json}"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn proxy_sign_preserves_non_standard_port() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
@@ -2672,6 +2854,343 @@ mod tests {
             );
             assert!(json.contains("\"added\":{\"y\":\"2\"}"), "{}", json);
             assert!(json.contains("\"removed\":[\"x\"]"), "{}", json);
+        });
+    }
+
+    // Build a signed `/first-party/click` target with one extra param.
+    fn signed_click_target(settings: &crate::settings::Settings) -> String {
+        let tsurl = "https://cdn.example/landing.html";
+        let full_for_token = format!("{}?x=1", tsurl);
+        let token = crate::http_util::compute_encrypted_sha256_token(settings, &full_for_token);
+        format!(
+            "/first-party/click?tsurl={}&x=1&tstoken={}",
+            url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+            token,
+        )
+    }
+
+    #[test]
+    fn proxied_responses_strip_upstream_cors_policy() {
+        // Emitting no header of our own is not enough: the buffered path
+        // preserves upstream headers and the streaming path passes the response
+        // through, so an upstream CORS grant would still make the body readable
+        // from an opaque creative frame.
+        let settings = create_test_settings();
+
+        for upstream_origin in ["*", "null", "https://attacker.example"] {
+            for streaming in [false, true] {
+                let mut beresp = build_http_response(StatusCode::OK, EdgeBody::from("secret"));
+                beresp.headers_mut().insert(
+                    header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                    HeaderValue::from_str(upstream_origin).expect("valid header"),
+                );
+                beresp.headers_mut().insert(
+                    header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                    HeaderValue::from_static("true"),
+                );
+                beresp.headers_mut().insert(
+                    header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                    HeaderValue::from_static("x-secret"),
+                );
+
+                let out = super::finalize_response(
+                    &settings,
+                    &build_http_request(Method::GET, "https://edge.example/first-party/proxy"),
+                    "https://cdn.example/asset.bin",
+                    beresp,
+                    streaming,
+                )
+                .expect("finalize should succeed");
+
+                assert_eq!(
+                    response_header(&out, header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                    None,
+                    "upstream '{upstream_origin}' grant must be stripped (streaming={streaming})"
+                );
+                assert_eq!(
+                    response_header(&out, header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+                    None,
+                    "upstream credentials grant must be stripped (streaming={streaming})"
+                );
+                assert_eq!(
+                    response_header(&out, header::ACCESS_CONTROL_EXPOSE_HEADERS),
+                    None,
+                    "upstream expose-headers must be stripped (streaming={streaming})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proxied_responses_are_not_cross_origin_readable() {
+        // `/first-party/proxy` forwards the EC ID and client-derived headers and
+        // runs in open mode with an empty allowlist, and the rewriter mints its
+        // signed URLs from bidder-controlled markup when sanitization is off.
+        // An allow-origin header would therefore let a creative in an opaque
+        // frame read arbitrary proxied bodies, so neither branch may emit one.
+        let settings = create_test_settings();
+
+        let buffered = super::finalize_response(
+            &settings,
+            &build_http_request(Method::GET, "https://edge.example/first-party/proxy"),
+            "https://cdn.example/app.mjs",
+            build_http_response(StatusCode::OK, EdgeBody::from("body{}")),
+            false,
+        )
+        .expect("finalize should succeed");
+
+        assert_eq!(
+            response_header(&buffered, header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            None,
+            "proxied responses must not be readable cross-origin"
+        );
+
+        let streamed = super::finalize_response(
+            &settings,
+            &build_http_request(Method::GET, "https://edge.example/first-party/proxy"),
+            "https://cdn.example/font.woff2",
+            build_http_response(StatusCode::OK, EdgeBody::from("font")),
+            true,
+        )
+        .expect("streaming finalize should succeed");
+
+        assert_eq!(
+            response_header(&streamed, header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            None,
+            "streaming passthrough must agree"
+        );
+    }
+
+    #[test]
+    fn first_party_click_accepts_origin_form_uri() {
+        // Browsers send origin-form request targets and the Axum adapter passes
+        // them through verbatim, so the shared signed-target parser must accept
+        // both forms — otherwise the second hop of the rebuild redirect chain
+        // fails instead of reaching the advertiser.
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(signed_click_target(&settings))
+                .body(EdgeBody::empty())
+                .expect("should build origin-form click request");
+
+            let resp = handle_first_party_click(&settings, &noop_services(), req)
+                .await
+                .expect("origin-form click should succeed");
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::FOUND,
+                "should redirect to the advertiser"
+            );
+            let location = resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .expect("should carry a Location header");
+            assert!(
+                location.starts_with("https://cdn.example/landing.html"),
+                "should redirect to the signed target: {location}"
+            );
+        });
+    }
+
+    #[test]
+    fn first_party_proxy_accepts_origin_form_uri() {
+        // Same parser, reached through the proxy endpoint: an origin-form target
+        // must validate rather than fail as a relative URL.
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let tsurl = "https://cdn.example/pixel.png";
+            let token = crate::http_util::compute_encrypted_sha256_token(&settings, tsurl);
+            let uri = format!(
+                "/first-party/proxy?tsurl={}&tstoken={}",
+                url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+                token,
+            );
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(&uri)
+                .body(EdgeBody::empty())
+                .expect("should build origin-form proxy request");
+
+            // The signature check runs before any upstream fetch; reaching a
+            // non-"Invalid URL" outcome proves origin-form parsing succeeded.
+            let result = handle_first_party_proxy(&settings, &noop_services(), req).await;
+            if let Err(err) = result {
+                let rendered = format!("{err:?}");
+                assert!(
+                    !rendered.contains("Invalid URL"),
+                    "origin-form proxy target must parse: {rendered}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn proxy_rebuild_get_with_origin_form_uri_redirects() {
+        // The opaque-origin creative click guard navigates to this endpoint,
+        // and browsers (via the Axum/Spin adapters) deliver origin-form URIs
+        // (`/path?query`) rather than absolute URLs. The handler must parse the
+        // query and answer with the 302 recovery redirect.
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let tsurl = "https://cdn.example/landing.html";
+            let full_for_token = format!("{}?x=1", tsurl);
+            let token =
+                crate::http_util::compute_encrypted_sha256_token(&settings, &full_for_token);
+            let tsclick = format!(
+                "/first-party/click?tsurl={}&x=1&tstoken={}",
+                url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+                token,
+            );
+            let mut query = url::form_urlencoded::Serializer::new(String::new());
+            query.append_pair("tsclick", &tsclick);
+            query.append_pair("add", "{\"y\":\"2\"}");
+            query.append_pair("del", "[\"x\"]");
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!("/first-party/proxy-rebuild?{}", query.finish()))
+                .body(EdgeBody::empty())
+                .expect("should build origin-form rebuild request");
+
+            let resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                .await
+                .expect("origin-form GET rebuild should succeed");
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::FOUND,
+                "should answer GET with the 302 recovery redirect"
+            );
+            let location = resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .expect("should carry a Location header");
+            assert!(
+                location.starts_with("/first-party/click?tsurl="),
+                "should redirect to the rebuilt first-party click: {location}"
+            );
+            assert!(
+                location.contains("y=2") && !location.contains("x=1"),
+                "should apply the add/del mutations: {location}"
+            );
+        });
+    }
+
+    #[test]
+    fn proxy_rebuild_form_post_redirects_like_get() {
+        // The click guard falls back to a form POST when the GET recovery URL
+        // would exceed the platform's request-URL limit. A form submission is a
+        // navigation, so it must answer with the same 302 a GET does rather than
+        // a JSON body the browser would render as text.
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let tsclick = signed_click_target(&settings);
+            let mut form = url::form_urlencoded::Serializer::new(String::new());
+            form.append_pair("tsclick", &tsclick);
+            form.append_pair("add", "{\"y\":\"2\"}");
+            form.append_pair("del", "[\"x\"]");
+
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("/first-party/proxy-rebuild")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded; charset=UTF-8",
+                )
+                .body(EdgeBody::from(form.finish()))
+                .expect("should build form rebuild request");
+
+            let resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                .await
+                .expect("form-encoded rebuild should succeed");
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::FOUND,
+                "a form navigation must redirect, not return JSON"
+            );
+            let location = resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .expect("should carry a Location header");
+            assert!(
+                location.starts_with("/first-party/click?tsurl="),
+                "should redirect to the rebuilt click: {location}"
+            );
+            assert!(
+                location.contains("y=2") && !location.contains("x=1"),
+                "should apply the add/del mutations: {location}"
+            );
+        });
+    }
+
+    #[test]
+    fn proxy_rebuild_json_post_still_returns_json() {
+        // The same-origin click guard depends on the JSON response shape.
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let body = serde_json::json!({
+                "tsclick": signed_click_target(&settings),
+                "add": {"y": "2"},
+            });
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://edge.example/first-party/proxy-rebuild")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(EdgeBody::from(
+                    serde_json::to_string(&body).expect("test JSON should serialize"),
+                ))
+                .expect("should build JSON rebuild request");
+
+            let resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                .await
+                .expect("JSON rebuild should succeed");
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(response_body_string(resp).contains("\"href\":\"/first-party/click?tsurl="));
+        });
+    }
+
+    #[test]
+    fn proxy_rebuild_accepts_absolute_tsclick() {
+        // The creative runtime absolutizes hrefs so they resolve inside a
+        // `srcdoc` frame; a client that echoes an absolute click back as the
+        // rebuild payload must still be accepted, since the signature covers
+        // `tsurl` plus params and never the origin.
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let absolute = format!(
+                "https://publisher.example{}",
+                signed_click_target(&settings)
+            );
+            let body = serde_json::json!({
+                "tsclick": absolute,
+                "add": {"y": "2"},
+            });
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://edge.example/first-party/proxy-rebuild")
+                .body(EdgeBody::from(
+                    serde_json::to_string(&body).expect("test JSON should serialize"),
+                ))
+                .expect("should build proxy rebuild request");
+
+            let resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                .await
+                .expect("absolute tsclick should be accepted");
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            let json = response_body_string(resp);
+            assert!(
+                json.contains("/first-party/click?tsurl="),
+                "should rebuild a first-party click: {json}"
+            );
+            assert!(json.contains("\"added\":{\"y\":\"2\"}"), "{json}");
         });
     }
 
@@ -3816,6 +4335,167 @@ mod tests {
                 response_header(&response, header::ETAG),
                 Some("\"asset-etag\""),
                 "should preserve safe cache validator headers on asset responses"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_replaces_third_party_cache_policy_for_rehosted_asset() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                b"asset".to_vec(),
+                vec![(header::CACHE_CONTROL.as_str(), "no-store")],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = Settings::from_toml(&format!(
+                r#"{}
+
+                [[cache.asset_rules]]
+                id = "fingerprinted-assets"
+                enabled = true
+                path_globs = ["/assets/**/*.js"]
+                fingerprint_style = "hex"
+                visibility = "public"
+                browser_ttl_seconds = 31536000
+                edge_ttl_seconds = 31536000
+                immutable = true
+            "#,
+                crate_test_settings_str()
+            ))
+            .expect("should parse settings with cache asset rule");
+            let req = build_http_request(
+                Method::GET,
+                "https://www.example.com/assets/app.0123abcd.js",
+            );
+            let route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
+
+            let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy asset request");
+            assert_eq!(
+                asset_response.cache_policy(),
+                AssetProxyCachePolicy::Normalized(CachePolicy::public_immutable(
+                    Duration::from_secs(31_536_000)
+                )),
+                "should carry normalized cache policy metadata"
+            );
+
+            let mut response = asset_response
+                .into_response()
+                .expect("should return buffered asset response");
+            assert_eq!(
+                response_header(&response, header::CACHE_CONTROL),
+                Some("public, max-age=31536000, immutable"),
+                "configured rehost policy should replace the third-party no-store directive"
+            );
+            assert!(
+                response.headers().get("surrogate-control").is_none(),
+                "runtime-specific edge header should wait for adapter finalization"
+            );
+
+            AssetProxyCachePolicy::Normalized(CachePolicy::public_immutable(Duration::from_secs(
+                31_536_000,
+            )))
+            .apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("surrogate-control")
+                    .and_then(|value| value.to_str().ok()),
+                Some("max-age=31536000"),
+                "Fastly finalization should render Surrogate-Control"
+            );
+        });
+    }
+
+    #[test]
+    fn normalized_asset_policy_preserves_final_private_or_no_store_directives() {
+        for cache_control in ["private, max-age=0", "no-store"] {
+            let mut response = edge_response_builder()
+                .header(header::CACHE_CONTROL, cache_control)
+                .header("surrogate-control", "max-age=31536000")
+                .header("cdn-cache-control", "max-age=31536000")
+                .header("cloudflare-cdn-cache-control", "max-age=31536000")
+                .body(EdgeBody::empty())
+                .expect("should build asset response");
+
+            AssetProxyCachePolicy::Normalized(CachePolicy::public_immutable(Duration::from_secs(
+                31_536_000,
+            )))
+            .apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
+
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some(cache_control),
+                "final privacy directive should veto normalized cache policy"
+            );
+            assert!(
+                [
+                    "surrogate-control",
+                    "cdn-cache-control",
+                    "cloudflare-cdn-cache-control",
+                ]
+                .iter()
+                .all(|name| !response.headers().contains_key(*name)),
+                "final privacy directive should remove every edge-cache header"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_leaves_non_matching_assets_origin_controlled() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                b"asset".to_vec(),
+                vec![(header::CACHE_CONTROL.as_str(), "public, max-age=60")],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = Settings::from_toml(&format!(
+                r#"{}
+
+                [[cache.asset_rules]]
+                id = "fingerprinted-assets"
+                enabled = true
+                path_globs = ["/assets/**/*.js"]
+                fingerprint_style = "hex"
+                visibility = "public"
+                browser_ttl_seconds = 31536000
+                edge_ttl_seconds = 31536000
+                immutable = true
+            "#,
+                crate_test_settings_str()
+            ))
+            .expect("should parse settings with cache asset rule");
+            let req = build_http_request(Method::GET, "https://www.example.com/assets/app.js");
+            let route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
+
+            let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy asset request");
+
+            assert_eq!(
+                asset_response.cache_policy(),
+                AssetProxyCachePolicy::OriginControlled,
+                "non-fingerprinted file should not receive normalized immutable policy"
+            );
+            let response = asset_response
+                .into_response()
+                .expect("should return buffered asset response");
+            assert_eq!(
+                response_header(&response, header::CACHE_CONTROL),
+                Some("public, max-age=60"),
+                "origin-controlled response should preserve origin cache header"
             );
         });
     }

@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, "feature/**"]
 
 permissions:
   contents: read
@@ -119,3 +118,6 @@ jobs:
 
       - name: Run Prettier (check)
         run: npm run format
+
+      - name: Build with VitePress (fails on dead links)
+        run: npm run build

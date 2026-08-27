@@ -1,8 +1,8 @@
 //! Google Publisher Tags (GPT) integration for first-party ad serving.
 //!
 //! This module provides transparent proxying for Google's entire GPT script
-//! chain, enabling first-party ad tag delivery while maintaining privacy
-//! controls. GPT loads scripts in a cascade:
+//! chain, enabling first-party ad tag delivery.
+//! GPT loads scripts in a cascade:
 //!
 //! 1. `gpt.js` – the thin bootstrap loader
 //! 2. `pubads_impl.js` – the main GPT implementation (~640 KB)
@@ -67,6 +67,10 @@ pub struct GptConfig {
     /// Enable/disable the integration.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+
+    /// Enable page-level `ts=true` delivery attribution in GAM.
+    #[serde(default)]
+    pub gam_attribution_enabled: bool,
 
     /// URL for the GPT bootstrap script (default: Google's CDN).
     #[serde(default = "default_script_url")]
@@ -487,10 +491,17 @@ impl IntegrationHeadInjector for GptIntegration {
     /// route changes (see `auction/endpoints.rs`).
     /// The `POST /auction` endpoint is not involved in scroll or refresh flows.
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        let gam_attribution_flag = if self.config.gam_attribution_enabled {
+            "window.__tsjs_gam_attribution_enabled=true;"
+        } else {
+            ""
+        };
+
         let mut scripts = vec![
-            "<script>window.__tsjs_gpt_enabled=true;\
-             window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>"
-                .to_string(),
+            format!(
+                "<script>window.__tsjs_gpt_enabled=true;{gam_attribution_flag}\
+                 window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>"
+            ),
             format!("<script>{}</script>", GPT_BOOTSTRAP_JS),
         ];
 
@@ -507,6 +518,14 @@ impl IntegrationHeadInjector for GptIntegration {
         }
 
         scripts
+    }
+
+    fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
+        if self.config.gam_attribution_enabled {
+            vec![("data-ts-gam-attribution", "true")]
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -549,6 +568,7 @@ mod tests {
     fn test_config() -> GptConfig {
         GptConfig {
             enabled: true,
+            gam_attribution_enabled: false,
             script_url: default_script_url(),
             cache_ttl_seconds: 3600,
             rewrite_script: true,
@@ -571,6 +591,29 @@ mod tests {
             .uri(uri)
             .body(EdgeBody::empty())
             .expect("should build HTTP request")
+    }
+
+    #[test]
+    fn gam_attribution_defaults_to_disabled() {
+        let config: GptConfig =
+            serde_json::from_value(serde_json::json!({})).expect("should parse defaults");
+
+        assert!(!config.gam_attribution_enabled);
+    }
+
+    #[test]
+    fn gam_attribution_deserializes_explicit_values() {
+        let disabled: GptConfig = serde_json::from_value(serde_json::json!({
+            "gam_attribution_enabled": false
+        }))
+        .expect("should parse explicit false");
+        let enabled: GptConfig = serde_json::from_value(serde_json::json!({
+            "gam_attribution_enabled": true
+        }))
+        .expect("should parse explicit true");
+
+        assert!(!disabled.gam_attribution_enabled);
+        assert!(enabled.gam_attribution_enabled);
     }
 
     // -- URL detection --
@@ -1146,6 +1189,38 @@ mod tests {
             "<script>window.__tsjs_gpt_enabled=true;window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>",
             "should set the enable flag and call the GPT shim activation function"
         );
+        assert!(
+            integration.tsjs_script_tag_attributes().is_empty(),
+            "should not authorize GAM attribution metadata by default"
+        );
+    }
+
+    #[test]
+    fn gam_attribution_true_adds_both_activation_signals_without_a_new_insert() {
+        let integration = GptIntegration::new(GptConfig {
+            gam_attribution_enabled: true,
+            ..test_config()
+        });
+        let document_state = IntegrationDocumentState::default();
+        let context = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&context);
+
+        assert_eq!(inserts.len(), 2, "should not add another head insert");
+        assert!(
+            inserts[0].contains("window.__tsjs_gam_attribution_enabled=true;"),
+            "should activate the early bootstrap marker"
+        );
+        assert_eq!(
+            integration.tsjs_script_tag_attributes(),
+            vec![("data-ts-gam-attribution", "true")],
+            "should authorize the bundle fallback on the publisher tag"
+        );
     }
 
     #[test]
@@ -1253,12 +1328,41 @@ mod tests {
             "bootstrap should scan ID-bearing elements instead of interpolating div_id into CSS"
         );
         assert!(
-            combined.contains(".startsWith(slot.div_id)"),
+            combined.contains("candidate.id.startsWith(divId)"),
             "bootstrap should match metacharacter-containing div_id prefixes with startsWith"
         );
         assert!(
             !combined.contains("[id^='\" + slot.div_id"),
             "bootstrap must not build a CSS attribute selector from raw div_id"
+        );
+    }
+
+    #[test]
+    fn head_inserts_bootstrap_installs_inner_div_slot_handoff() {
+        let integration = GptIntegration::new(test_config());
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let combined = integration.head_inserts(&ctx).join("");
+        assert!(
+            combined.contains("gptSlotHandoffs"),
+            "bootstrap should keep late publisher slot handoff state on window.tsjs"
+        );
+        assert!(
+            combined.contains("__tsSlotHandoffPatched"),
+            "bootstrap should install idempotent GPT handoff wrappers"
+        );
+        assert!(
+            combined.contains("return googletag.defineSlot") && combined.contains("actualDivId"),
+            "bootstrap should define the TS fallback on the actual inner div"
+        );
+        assert!(
+            !combined.contains("actualDivId + \"-container\""),
+            "bootstrap must not define a competing outer-container GPT slot"
         );
     }
 
@@ -1320,6 +1424,35 @@ mod tests {
         assert!(
             combined.contains("slotsNeedingRefresh"),
             "bootstrap should refresh TS-defined slots when initial load is disabled"
+        );
+    }
+
+    #[test]
+    fn head_inserts_queue_gam_attribution_before_guard_and_ad_requests() {
+        let targeting_index = GPT_BOOTSTRAP_JS
+            .find("gpt.setConfig({ targeting: { ts: \"true\" } })")
+            .expect("should apply the fixed page-level GAM targeting pair");
+        let guard_index = GPT_BOOTSTRAP_JS
+            .find("if (ts.adInit) return;")
+            .expect("should retain the preinstalled adInit guard");
+        let display_index = GPT_BOOTSTRAP_JS
+            .find("googletag.display(divId);")
+            .expect("should retain the executable GPT display call");
+        let refresh_index = GPT_BOOTSTRAP_JS
+            .find("googletag.pubads().refresh(slotsNeedingRefresh);")
+            .expect("should retain the bounded GPT refresh call");
+
+        assert!(
+            targeting_index < guard_index,
+            "should enqueue attribution before the preinstalled adInit guard"
+        );
+        assert!(
+            targeting_index < display_index,
+            "should enqueue attribution before the executable display call"
+        );
+        assert!(
+            targeting_index < refresh_index,
+            "should enqueue attribution before the executable refresh call"
         );
     }
 

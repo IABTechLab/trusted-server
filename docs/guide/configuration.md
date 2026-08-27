@@ -72,6 +72,7 @@ fail and the service will return its startup-error response.
 | `[ec]`              | Edge Cookie (EC) ID generation               |
 | `[tester_cookie]`   | Optional tester-cookie endpoint              |
 | `[proxy]`           | Proxy SSRF allowlist and asset routes        |
+| `[cache]`           | Static/rehosted asset cache policy rules     |
 | `[image_optimizer]` | Reusable Image Optimizer profile sets        |
 | `[request_signing]` | Ed25519 request signing                      |
 | `[auction]`         | Auction orchestration                        |
@@ -400,7 +401,7 @@ TRUSTED_SERVER__TESTER_COOKIE__ENABLED=true
 
 ## EC Configuration
 
-Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_store` KV store is the only KV-backed EC lifecycle store; it holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. Consent configuration controls request-local interpretation and forwarding, not separate KV persistence.
+Settings for Edge Cookie identifier generation. The `ec_store` KV store is the only KV-backed EC lifecycle store. It holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. Consent configuration controls request-local interpretation and forwarding, not separate KV persistence.
 
 ### `[ec]`
 
@@ -495,7 +496,7 @@ Individual env var keys like `TRUSTED_SERVER__RESPONSE_HEADERS__X_CUSTOM_HEADER`
 
 **Use Cases**:
 
-- Custom tracking headers
+- Custom measurement headers
 - Cache control overrides
 - Debugging identifiers
 - CORS headers (if needed)
@@ -644,6 +645,23 @@ path = "^/api/v[0-9]+/private"  # /api/v1/private, /api/v2/private
 ```
 
 **Validation**: Application startup fails if regex is invalid.
+
+::: warning Admin coverage and passwords are validated at startup
+
+Startup fails when no handler covers an admin route. The dynamic
+`/_ts/admin/ec/{id}` route accepts any segment after `/_ts/admin/ec/`, and
+Basic Auth runs on the raw path before routing, so coverage cannot be inferred
+from ID-shaped samples: a pattern such as
+`^/_ts/admin/ec/[a-f0-9]{64}[.][A-Za-z0-9]{6}$` is rejected. Use a prefix-level
+matcher (`^/_ts/admin`, or `^/_ts/admin/ec/` alongside the other admin
+patterns).
+
+Startup also fails when any handler — admin or not — uses a placeholder or
+well-known weak password (`changeme`, `password`, `admin`, or a
+`replace-with-…` template value). Handler selection is first-match-wins, so a
+narrow handler ahead of the admin pattern governs the paths it matches.
+
+:::
 
 ::: warning Scope patterns to the paths you mean
 
@@ -1031,6 +1049,125 @@ when_missing = "smart"
 
 See [Asset Routes](/guide/asset-routes) for request flow, S3 auth details, and Image Optimizer behavior.
 
+## Cache Configuration
+
+Static and rehosted asset cache upgrades are operator-controlled. By default,
+Trusted Server leaves arbitrary publisher-origin assets under origin cache
+control. Add `[[cache.asset_rules]]` entries only for paths that are known to be
+content-addressed or otherwise safe for the configured TTL.
+
+### `[[cache.asset_rules]]`
+
+Rules are evaluated in file order; the first enabled matching rule wins.
+Disabled rules never match, and their matcher and policy validation is deferred
+until they are enabled. Rule IDs are always normalized and must remain nonempty
+and unique, including for disabled placeholders.
+
+| Field                            | Type          | Required | Description                                                                        |
+| -------------------------------- | ------------- | -------- | ---------------------------------------------------------------------------------- |
+| `id`                             | String        | Yes      | Unique operator-facing rule identifier                                             |
+| `enabled`                        | Boolean       | No       | Whether the rule participates in matching (default `false`)                        |
+| `preset`                         | String        | Matcher  | Built-in preset such as `nextjs-static`                                            |
+| `path_prefix`                    | String        | Matcher  | Request path prefix                                                                |
+| `path_glob`                      | String        | Matcher  | Single glob matched against the request path                                       |
+| `path_globs`                     | Array[String] | Matcher  | Multiple globs matched against the request path                                    |
+| `path_regex`                     | String        | Matcher  | Regex matched against the request path                                             |
+| `extensions`                     | Array[String] | Matcher  | Case-insensitive file extensions                                                   |
+| `fingerprint_style`              | String        | No       | Required bundler fingerprint convention before matching                            |
+| `visibility`                     | String        | No       | `public` or `private` (default `public`)                                           |
+| `browser_ttl_seconds`            | Integer       | Policy   | Browser `max-age`; required for private rules and positive with `immutable = true` |
+| `edge_ttl_seconds`               | Integer       | Policy   | Public rules only: TTL emitted through the runtime-specific shared-cache directive |
+| `stale_while_revalidate_seconds` | Integer       | No       | Optional `stale-while-revalidate`                                                  |
+| `stale_if_error_seconds`         | Integer       | No       | Optional `stale-if-error`                                                          |
+| `immutable`                      | Boolean       | No       | Add `immutable` for a validated content-addressed rule                             |
+
+An enabled rule must configure exactly one matcher. Public rules must configure
+at least one of `browser_ttl_seconds` or `edge_ttl_seconds`; private rules must
+configure `browser_ttl_seconds` and must not configure `edge_ttl_seconds`.
+`path_glob` and `path_globs` are mutually exclusive. `immutable = true`
+additionally requires a positive browser TTL and either the content-addressed
+`nextjs-static` preset, `hex`, or `esbuild-base32`.
+
+The filename fingerprint check examines the suffix immediately before the final
+extension and requires a nonempty filename prefix separated by `.`, `-`, `_`,
+or `~`. The accepted immutable conventions are:
+
+- `hex`: hexadecimal suffixes of at least eight characters containing a letter,
+  such as `app.0123abcd.js`;
+- `esbuild-base32`: eight-character uppercase Base32 suffixes, such as
+  `app-VRTVD5R5.js`.
+
+`vite-base64-url` remains available for non-immutable cache rules, but it cannot
+prove content addressing. Ordinary names such as `hero-Portrait.jpg` can match
+its eight-character Base64URL shape. A matching rule whose selected fingerprint
+style fails emits a debug log with the rule ID and rejected path.
+
+Glob patterns are case-sensitive. `*` matches within a single path component,
+while `**` matches recursively: `/assets/*.js` matches `/assets/app.js` but not
+`/assets/vendor/app.js`; `/assets/**/*.js` matches both.
+
+**Next.js preset example** (disabled until the publisher confirms
+`/_next/static/` is content-addressed):
+
+```toml
+[[cache.asset_rules]]
+id = "nextjs-static"
+enabled = false
+preset = "nextjs-static"
+visibility = "public"
+browser_ttl_seconds = 31536000
+edge_ttl_seconds = 31536000
+immutable = true
+```
+
+**Publisher allowlist example** (enable only for an unambiguous immutable
+filename convention):
+
+```toml
+[[cache.asset_rules]]
+id = "publisher-fingerprinted-assets"
+enabled = false
+path_globs = [
+  "/assets/**/*.js",
+  "/assets/**/*.css",
+  "/assets/**/*.png",
+  "/assets/**/*.webp",
+]
+fingerprint_style = "hex"
+visibility = "public"
+browser_ttl_seconds = 31536000
+edge_ttl_seconds = 31536000
+immutable = true
+```
+
+If `[cache]` is omitted or no enabled rule matches, Trusted Server preserves the
+origin cache policy for publisher-origin assets. On the publisher pass-through
+path, an origin `private` or `no-store` directive vetoes a matching rule. Other
+origin cache directives, including `no-cache`, are replaced by the configured
+policy. `Vary` is preserved, so do not assign a public immutable rule to paths
+that vary by cookies or other user-specific request state.
+
+On a configured Fastly asset-rehost route, a matching rule is authoritative
+over the third-party origin's cache defaults, including `no-store`, because
+Trusted Server owns the rehosted copy. A later Trusted Server or operator-applied
+`private` or `no-store` directive still vetoes public policy reapplication and
+removes shared-cache headers.
+
+TS-owned validated hash URLs such as `/static/tsjs=...js?v=<hash>` use their
+built-in cache policy and do not require an asset rule. Shared-cache keys for
+`/static/tsjs=` must preserve `v`; otherwise a matching immutable response can
+collide with the missing or mismatched version's short-TTL response.
+
+`edge_ttl_seconds` only emits the selected runtime's shared-cache directive for
+public rules. The runtime or service must also enable and consume that
+directive. The checked-in Cloudflare manifests intentionally do not enable
+Workers Cache: the Worker serves the full publisher gateway, not an isolated
+static-only entrypoint. Emitting `Cloudflare-CDN-Cache-Control` alone must not
+be treated as permission to cache every response. Any future Workers Cache
+opt-in must isolate or explicitly allowlist cacheable traffic. Fastly synthetic
+and final egress responses still require explicit runtime cache integration,
+tracked in [#908](https://github.com/IABTechLab/trusted-server/issues/908).
+
 ## Integration Configurations
 
 Settings for built-in integrations (Prebid, Next.js, Osano, Permutive, Testlight). For other
@@ -1065,6 +1202,12 @@ apply when the integration section exists in `trusted-server.toml`.
 | `debug_query_params`       | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                             |
 | `client_side_bidders`      | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side (see [Prebid docs](/guide/integrations/prebid#client-side-bidders)) |
 | `script_patterns`          | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                           |
+
+APS is configured exclusively under `[integrations.aps]`. `aps` entries in
+`bidders` or `client_side_bidders` are logged and removed case-insensitively so
+an upgrade does not prevent Trusted Server from starting. Remove those entries
+from operator configuration; this guard prevents APS demand from reaching
+Prebid Server or the client-side Prebid bundle.
 
 **Example**:
 
@@ -1238,38 +1381,60 @@ Settings for the auction orchestrator that coordinates multiple bid providers.
 
 ### `[auction]`
 
-| Field               | Type          | Default            | Description                                                       |
-| ------------------- | ------------- | ------------------ | ----------------------------------------------------------------- |
-| `enabled`           | Boolean       | `false`            | Enable the auction orchestrator                                   |
-| `rewrite_creatives` | Boolean       | `true`             | Rewrite sanitized winning-bid `adm` through first-party endpoints |
-| `providers`         | Array[String] | `[]`               | Provider names that participate (e.g., `["prebid", "aps"]`)       |
-| `mediator`          | String        | Optional           | Mediator provider name (runs parallel mediation when set)         |
-| `timeout_ms`        | Integer       | `2000`             | Auction timeout in milliseconds                                   |
-| `creative_store`    | String        | `"creative_store"` | Deprecated; creatives are now delivered inline                    |
+| Field                | Type          | Default            | Description                                                    |
+| -------------------- | ------------- | ------------------ | -------------------------------------------------------------- |
+| `enabled`            | Boolean       | `false`            | Enable the auction orchestrator                                |
+| `sanitize_creatives` | Boolean       | `false`            | Strip executable markup from winning-bid `adm` before delivery |
+| `rewrite_creatives`  | Boolean       | `true`             | Rewrite winning-bid `adm` through first-party endpoints        |
+| `providers`          | Array[String] | `[]`               | Provider names that participate (e.g., `["prebid", "aps"]`)    |
+| `mediator`           | String        | Optional           | Mediator provider name (runs parallel mediation when set)      |
+| `timeout_ms`         | Integer       | `2000`             | Auction timeout in milliseconds                                |
+| `creative_store`     | String        | `"creative_store"` | Deprecated; creatives are now delivered inline                 |
 
 Creative markup delivered by `POST /auction` and the publisher SSAT/page-bids
-path is always server-sanitized. With `rewrite_creatives = true` (the default),
-eligible absolute or protocol-relative resource and click URLs not excluded by
-rewrite configuration are converted to signed first-party endpoints. The
+path is processed by two independent passes. With `sanitize_creatives = true`
+(opt-in, default `false`), executable markup (`script`/`object`/`embed`/`form`
+and event handlers) is stripped together with its inner content — note this
+blanks script-based creatives, so enable it only when creatives render in a
+context that shares the publisher's origin. With `rewrite_creatives = true`
+(the default), eligible absolute or protocol-relative resource and click URLs
+not excluded by rewrite configuration are converted to signed first-party
+endpoints, and any bidder-supplied `<base>` element is removed. The
 `POST /auction` path emits root-relative endpoints and injects the creative TSJS
-runtime when a `<body>` exists; the foreign-origin SSAT renderer emits absolute
-endpoints and does not inject that bundle. Setting the option to `false` returns
-sanitized but not rewritten `adm` from both paths. Accepted external URLs remain
-direct and are not host allowlisted by the sanitizer. The setting does not
-affect HTML or CSS fetched through `/first-party/proxy`. See
+runtime exactly once — whether or not the bidder supplied a `<body>`, since bare
+fragments are the common `adm` shape; the foreign-origin SSAT renderer emits
+absolute endpoints and does not inject that bundle. With both disabled, `adm` ships
+exactly as the bidder returned it — except that a creative larger than the
+1 MiB per-creative cap is rejected in every mode and its `adm` is dropped.
+Accepted external URLs are not host allowlisted by the sanitizer. Neither
+setting affects HTML or CSS fetched through `/first-party/proxy`. See
 [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
-::: warning Existing configs and rollback
-Configs created before `rewrite_creatives` was introduced must first add
-`rewrite_creatives = true` under `[auction]`. After adding the leaf, set
-`TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES`, run `ts config validate`, and push
-the resolved config.
+::: warning Existing configs, upgrade sequencing, and rollback
+Default values are omitted from stored JSON; non-default values
+(`sanitize_creatives = true`, `rewrite_creatives = false`) are serialized, and
+older `AuctionConfig` schemas reject unknown fields.
 
-The default `true` is omitted from stored JSON so older binaries can read the
-blob during rollback. An explicit `false` must remain serialized. Before rolling
-back to a binary without this field, remove the `false` environment override (or
-set the file value to `true`), push the resulting default-compatible blob, and
-only then roll back the binary.
+**Upgrading:** binaries that predate `sanitize_creatives` reject a blob that
+carries it, so in a rolling deployment upgrade the binary **first**, then push
+a config with `sanitize_creatives = true` if you want sanitization. Between the
+binary upgrade and the config push, sanitization is off (the new default) —
+during that interval the creative iframe sandbox is the only isolation for
+`/auction` markup. There is no mixed-version-safe value that keeps the old
+unconditional sanitization: omission means "sanitize" on old code and "don't"
+on new code, while an explicit `true` fails startup on old code.
+
+**Rolling back:** before reverting to a binary that does not know a field,
+remove that field's non-default value (and any environment override), run
+`ts config validate`, push the resulting default-compatible blob, and only then
+roll back the binary.
+
+**Environment overlays:** EdgeZero v0.0.4 overlays cannot create missing TOML
+leaves. Existing configs must add **both** leaves under `[auction]`
+(`rewrite_creatives` and `sanitize_creatives`) before
+`TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES` /
+`TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES` can take effect — an override for
+a missing leaf is silently ignored.
 :::
 
 **Example**:
@@ -1277,14 +1442,19 @@ only then roll back the binary.
 ```toml
 [auction]
 enabled = true
+sanitize_creatives = false
 rewrite_creatives = true
 providers = ["aps", "prebid"]
 timeout_ms = 2000
 
 [integrations.aps]
 enabled = true
-pub_id = "example-publisher"
-endpoint = "https://aps.example.com/e/dtb/bid"
+account_id = "example-account"
+debug = false
+# Optional pair for deployments hosted away from APS-authorized inventory.
+# inventory_domain = "publisher.example"
+# inventory_page_origin = "https://www.publisher.example"
+allow_script_creatives = false
 
 [integrations.prebid]
 enabled = true
@@ -1295,6 +1465,7 @@ server_url = "https://prebid-server.example.com/openrtb2/auction"
 
 ```bash
 TRUSTED_SERVER__AUCTION__ENABLED=true
+TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES=false
 TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES=true
 TRUSTED_SERVER__AUCTION__PROVIDERS=aps,prebid
 TRUSTED_SERVER__AUCTION__PROVIDERS__0=aps
@@ -1302,7 +1473,306 @@ TRUSTED_SERVER__AUCTION__PROVIDERS__1=prebid
 TRUSTED_SERVER__AUCTION__MEDIATOR=adserver_mock
 TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000
 TRUSTED_SERVER__AUCTION__CREATIVE_STORE=creative_store
+TRUSTED_SERVER__INTEGRATIONS__APS__DEBUG=false
 ```
+
+## Creative Opportunities Configuration
+
+### `[creative_opportunities]`
+
+Defines the ad slots the trusted server offers on a page: which pages each slot
+appears on (`page_patterns`), its supported sizes (`formats`), and the GAM ad
+unit it maps to (`gam_unit_path`).
+
+`enabled` is the dedicated server-side ad-template switch. It defaults to `true`
+for compatibility with existing configurations. Set it to `false` to stop
+publisher HTML and SPA page-bids template delivery while retaining the slot
+configuration and direct `POST /auction` endpoint.
+
+#### Publisher document cache policy
+
+For a successful GET publisher document, Trusted Server applies the
+browser-only `Cache-Control: private, max-age=60` policy from
+[#1007](https://github.com/IABTechLab/trusted-server/issues/1007) when the
+server-side ad stack is structurally inactive. Trusted Server also applies this
+policy to a subsequent `304 Not Modified` response so revalidation cannot
+restore the origin freshness policy. This includes an absent
+`[creative_opportunities]` section, `enabled = false`, no slot matching the
+path, or a disabled auction. The `private` directive prevents shared caches
+that use `Cache-Control` from storing the document. The policy replaces the
+origin browser cache policy except when the origin sends `private` or
+`no-store`, which are preserved. Bot, prefetch, and consent-denied requests
+also retain the origin policy because they can produce a request-specific
+representation for the same URL. Error responses and non-document requests
+retain the origin policy.
+
+Trusted Server leaves origin validators and CDN-specific cache headers
+unchanged. Those headers continue to control supporting CDNs independently of
+the browser-only policy. If a response using the generated inactive-stack
+policy later carries `Set-Cookie`, cookie privacy finalization replaces it with
+`Cache-Control: private, max-age=0` and removes the CDN-specific cache headers.
+
+```toml
+[creative_opportunities]
+enabled = true # set to false to disable server-side ad templates
+gam_network_id = "123456789"
+price_granularity = "dense"
+
+# Shared placeholder value for the site root ("/") — see {section} below.
+section_root = "home"
+# Which path segment names the section, 0-based. Default 0 (first segment).
+# Set to 1 for locale-prefixed URLs such as "/en/news/article".
+# section_segment = 0
+
+[[creative_opportunities.slot]]
+id = "ad-header"
+gam_unit_path = "/{network_id}/example/{section}"
+# List each section landing page as well as its subtree: `/news/*` matches
+# `/news/article` but NOT `/news` — the glob requires the trailing separator.
+page_patterns = ["/", "/news", "/news/*", "/reviews", "/reviews/*"]
+formats = [{ width = 728, height = 90 }]
+```
+
+The same switch can be overridden through the typed CLI environment overlay.
+Because EdgeZero only replaces TOML leaves that already exist, first add
+`enabled = true` to the `[creative_opportunities]` block in the base config
+before using this override. See [Environment Variable Overrides (Typed
+CLI)](#environment-variable-overrides-typed-cli) for the general overlay rules.
+
+```bash
+TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED=false
+```
+
+> [!WARNING]
+> Setting `enabled = false` writes this field into the pushed configuration blob.
+> Binaries released before this setting reject the unknown field and fail to load
+> settings, which makes every request fail. Before rolling back to an older binary,
+> restore `enabled` to its default, re-push and finalize the configuration, then
+> roll back the binary.
+
+### Shared template assembly (`assembly_mode = "esi"`)
+
+This configuration is an experimental validation spike scoped to
+[IABTechLab/trusted-server#1009](https://github.com/IABTechLab/trusted-server/issues/1009),
+not a settled production cache interface.
+
+`assembly_mode` controls how initial-page slot and bid state is delivered:
+
+- `inline` (default) transforms every origin response and injects the current
+  reader's slots and bids directly.
+- `esi` opts into a reader-neutral transformed-template cache on Fastly. The
+  cache stores identity bytes containing one inert, versioned comment. On an
+  authorized cold miss, Fastly replaces that comment in a private working copy
+  with one synthetic ESI include and resolves it from the already-built reader
+  state using the pinned `stackpop/esi` parser. No HTTP fragment request occurs.
+  Warm hits use an exact byte split instead, preserving the fast article-prefix
+  stream while the auction finishes.
+
+This is deliberately not general publisher-controlled ESI. A transformed origin
+document containing any `<esi:` directive bypasses the template cache and the parser, while the
+ordinary byte seam still produces the reader's complete response. The stored shared template
+object never contains executable ESI markup.
+
+Only Fastly currently supplies the Core Cache backend used by the shared template cache. Other adapters accept
+the mode but safely fall back to the inline transform on every request. This is
+not a top-level HTTP cache hit: Compute still runs and the final assembled
+response is always `Cache-Control: private, no-store`.
+
+All four keys below belong directly under `[creative_opportunities]`. They are
+one feature contract: `assembly_mode` selects how creative-opportunity state is
+delivered, while the other three constrain when and how long that mode may share
+its template.
+They are not a general top-level HTTP-cache configuration.
+
+```toml
+[creative_opportunities]
+assembly_mode = "esi"
+
+# Every request header, except Accept-Encoding, that the publisher origin can
+# name in Vary for these documents. Names are validated and de-duplicated.
+template_cache_vary = [
+  "rsc",
+  "next-router-state-tree",
+  "next-router-prefetch",
+  "next-router-segment-prefetch",
+]
+
+# Safety ceiling for the shared template. Defaults to 60; valid range 1–86400.
+# The origin's remaining edge freshness may make the actual lifetime shorter.
+template_cache_max_age_seconds = 1200
+
+# Default false. Enable only after proving publisher HTML ignores Cookie.
+origin_is_cookie_independent = true
+```
+
+The cache fails closed. A template is stored only for a `GET` with a processable
+`200 text/html` origin response, a supported content encoding, and explicit
+positive shared freshness. `private`, `no-store`, `no-cache`, exhausted or
+malformed freshness, `Set-Cookie`, `Vary: *`, `Vary: Cookie`, uncovered `Vary`
+names, response-bound CSP nonces, authorization, diagnostics sessions, range or
+conditional requests, positive or malformed request `max-age`, `min-fresh`, and
+unsupported CDN-specific cache policy fields all bypass the template cache. Fastly
+`Surrogate-Control` is the narrow exception: the template cache accepts exactly one positive
+`max-age` plus optional valid `stale-while-revalidate` and `stale-if-error`
+delta-seconds. Restrictive, duplicated, malformed, or unknown directives fail
+closed. Stale windows never extend template-cache freshness. Freshness follows Fastly edge
+precedence: `Surrogate-Control: max-age`, then `Cache-Control: s-maxage`,
+`Cache-Control: max-age`, then `Expires`. Restrictive directives in either policy
+still refuse sharing. Origin `Age` and apparent age from `Date` are deducted, time
+spent transforming the page continues consuming freshness, and the remaining
+lifetime is capped by `template_cache_max_age_seconds`.
+
+A browser reload commonly sends `Cache-Control: max-age=0`. TS may reuse a fresh
+reader-neutral shared template for that reload, but it still builds a new private
+response and runs a new per-reader auction. Explicit `no-cache`, `no-store`,
+positive or malformed request `max-age`, range, and conditional requests still bypass the template cache.
+Check `X-TS-Template-Cache: hit` to verify template reuse.
+
+`template_cache_vary` is necessary because lookup occurs before the origin can
+return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
+origin identity, complete template-shaping settings, TSJS content, and schema
+version all participate in an opaque SHA-256 cache key. `Accept-Encoding` does
+not: the stored template is decoded identity and the assembled result is encoded
+for each reader with `Vary: Accept-Encoding`. This assumes the origin's
+`Accept-Encoding` variants differ only by HTTP content coding, as normal
+compression negotiation does. Do not enable ESI for an origin that changes the
+document's meaning based on `Accept-Encoding`. Never put `Cookie` in
+`template_cache_vary`; startup rejects it because a per-cookie object is not a
+reader-neutral template. With `origin_is_cookie_independent = false` (the safe
+default), all cookie-bearing requests bypass. With it set to `true`, an origin
+`Vary: Cookie` still overrides the assertion and refuses storage.
+Every other name the origin emits in `Vary` must appear in the configured list;
+an uncovered name safely refuses template storage.
+
+For a canary, inspect `X-TS-Template-Cache`. Its bounded values are `hit`,
+`miss-stored`, `miss-store-error`, `miss-reserved`, `bypass-request`,
+`bypass-response`, `unsupported`, `invalid`, and `backend-error`. No URL, header
+value, or cache key is exposed. `invalid` and `backend-error` fail open to a
+fresh origin response; they do not fail the page. The corresponding
+`template_cache` logs provide server-side observability for this path.
+
+`X-TS-Assembly` identifies how the private response was assembled:
+
+- `esi-parser` — authorized cold miss assembled by the repaired parser;
+- `byte-seam` — warm template-cache hit using the streaming byte seam;
+- `byte-seam-fallback` — cold response safely assembled by byte seam because
+  the platform parser was unavailable or rejected the document.
+
+The two headers together are the reliable verification signal. Timing alone can
+vary with the origin, auction, compression, browser connection reuse, and local
+proxy buffering.
+
+Rollback must preserve configuration compatibility:
+
+1. Change `assembly_mode` to `inline` and deploy/push that configuration.
+2. Before rolling back to a binary that predates these fields, remove
+   `assembly_mode`, `template_cache_vary`, `template_cache_max_age_seconds`, and
+   `origin_is_cookie_independent`, then push the cleaned configuration. Older binaries
+   use `deny_unknown_fields` and intentionally reject unknown keys.
+3. Purge the Fastly surrogate key `ts-template` using the service's normal purge
+   tooling, or wait for the bounded origin-derived lifetime to expire.
+
+Run `scripts/template-cache-local-test.sh esi` before a rollout and
+`scripts/template-cache-local-test.sh inline` as its control. The harness uses a temporary
+manifest, never edits the tracked `fastly.toml`, verifies cold/warm origin
+counts and response integrity, and executes the generated GPT module against
+the served seam to require a real `defineSlot` call.
+
+### `gam_unit_path` templating
+
+`gam_unit_path` is a template. A publisher whose ad unit varies by site section
+expresses that in **one** slot rule instead of one rule per (slot × section).
+
+Supported placeholders:
+
+| Placeholder    | Resolves to                                                             |
+| -------------- | ----------------------------------------------------------------------- |
+| `{network_id}` | `gam_network_id`                                                        |
+| `{slot_id}`    | the slot's `id`                                                         |
+| `{section}`    | non-empty path segment at `section_segment` (default: first; see below) |
+
+A template with **no** placeholders is used verbatim. A slot with **no**
+`gam_unit_path` falls back to `/<network_id>/<slot_id>`. Both preserve the
+pre-templating behavior, so existing static configs are unchanged.
+
+Trusted Server conservatively caps the whole rendered dynamic path at 100 UTF-8
+bytes, informed by Google's [100-character per-ad-unit-code
+limit](https://support.google.com/admanager/answer/1628457?hl=en). If a
+request-specific substitution would exceed the dynamic limit, only that slot is
+omitted before auction dispatch; the response itself still succeeds. Trusted
+Server logs a warning containing the slot ID and request path. Explicit static
+paths and absent/default paths retain legacy behavior and are not subject to this
+dynamic-only limit.
+
+### `{section}` derivation
+
+`{section}` is derived from the request path at request time:
+
+- It is the non-empty path segment at `section_segment` (0-based, default `0`).
+  With the default, `/news/article-123` → `news`. A site that prefixes a locale
+  sets `section_segment = 1`, so `/en/news/article` → `news` rather than `en`.
+- It is sanitized: each run of characters outside `[A-Za-z0-9_-]` becomes a
+  single `_`, and the request-derived result is capped at 100 ASCII bytes.
+- Casing is preserved. [Google documents GAM ad-unit codes as
+  case-insensitive](https://support.google.com/admanager/answer/10477476?hl=en),
+  so do not lowercase the value.
+- The path is used **raw — it is not percent-decoded**. So `/new%20s` →
+  `new_20s` (only `%` is disallowed; `2` and `0` are kept), never the decoded
+  `new_s`. This keeps `{section}` consistent with how `page_patterns` match the
+  same raw path.
+- When the path has no segment at that index — the site root (`/`, or repeated
+  slashes), or a path shorter than `section_segment` — `{section}` is
+  `section_root`. So with `section_segment = 1`, the path `/en` renders the root
+  section rather than reusing the locale.
+
+`section_root` is **required** whenever any slot's template uses `{section}`,
+and must match `[A-Za-z0-9_-]+`. There is no default: the home-section name is
+publisher-specific. Startup fails if `{section}` is used without a valid
+`section_root`. Startup rejects a blank `gam_network_id` only when an absent
+path/default or a `{network_id}` template consumes it; static paths and
+templates without `{network_id}` do not consume it. A
+`[creative_opportunities]` block with `enabled = false` or no slots is
+inactive, so no publisher templates are delivered and its `gam_network_id` is
+not checked when no slot uses it.
+
+Both knobs are config-driven, so the URL→section convention stays with the
+publisher: `section_segment` selects which segment names the section, and
+`section_root` names the section when there is none.
+
+During typed/startup finalization, after templates parse successfully, every
+placeholder-bearing dynamic template that omits `section_segment` has
+`section_segment = 0` materialized, so an older binary rejects the pushed blob
+loudly. Static and absent paths remain compatible with the legacy config schema
+only when both `section_root` and `section_segment` are omitted. Before rolling
+back below this feature, replace or remove dynamic paths, remove both
+`section_root` and `section_segment`, re-push and finalize the config, then
+roll back the binary.
+
+Example resolution for `gam_unit_path = "/{network_id}/example/{section}"` with
+`gam_network_id = "123456789"`, `section_root = "home"`, and the
+`page_patterns` shown above:
+
+| Request path    | `gam_unit_path`              |
+| --------------- | ---------------------------- |
+| `/`             | `/123456789/example/home`    |
+| `/news`         | `/123456789/example/news`    |
+| `/news/article` | `/123456789/example/news`    |
+| `/reviews/x`    | `/123456789/example/reviews` |
+
+The same config with `section_segment = 1` and locale-prefixed patterns
+(`["/en", "/en/news", "/en/news/*"]`):
+
+| Request path       | `gam_unit_path`           |
+| ------------------ | ------------------------- |
+| `/en`              | `/123456789/example/home` |
+| `/en/news`         | `/123456789/example/news` |
+| `/en/news/article` | `/123456789/example/news` |
+
+An **unmatched route** — a path matched by no slot's `page_patterns` — produces
+no slot at all, so no template is rendered for it.
+
+Startup validation rejects a malformed template: an unknown placeholder (e.g.
+`{oops}`), an unmatched or nested `{`, a stray `}`, or an empty `gam_unit_path`.
 
 ## Fastly Runtime Config Store
 
@@ -1516,5 +1986,5 @@ cat trusted-server.toml | npx toml-cli validate
 
 - Set up [Request Signing](/guide/request-signing) for secure API calls
 - Configure [First-Party Proxy](/guide/first-party-proxy) for URL proxying
-- Learn about [Edge Cookies](/guide/edge-cookies) for privacy-preserving identification
+- Learn about [Edge Cookies](/guide/edge-cookies) for first-party state management
 - Review [Integrations](/guide/integrations-overview) for partner support

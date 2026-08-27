@@ -86,9 +86,13 @@ rewrite_sdk = true
 
 [integrations.gpt]
 enabled = false
+gam_attribution_enabled = false
 script_url = "https://ads.example.com/gpt.js"
 cache_ttl_seconds = 3600
 rewrite_script = true
+
+[integrations.gpt_diagnostics]
+enabled = true
 
 [proxy]
 certificate_check = false
@@ -100,10 +104,11 @@ timeout_ms = 2000
 allowed_context_keys = []
 
 [integrations.aps]
-enabled = false
-pub_id = "example-aps-publisher-id"
-endpoint = "https://aps.example.com/e/dtb/bid"
+enabled = true
+account_id = "example-aps-account-id"
+endpoint = "https://aps.example.com/e/pb/bid"
 timeout_ms = 1000
+allow_script_creatives = false
 
 [integrations.google_tag_manager]
 enabled = false

@@ -10,9 +10,15 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::cache_policy::EdgeCacheHeader;
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
+use trusted_server_core::ec::admin::{
+    admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
+    deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
+};
+use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::RuntimeServices;
@@ -173,7 +179,13 @@ where
         let f = f.clone();
         Box::pin(async move {
             let services = build_per_request_services(&ctx);
-            let req = ctx.into_request();
+            let mut req = ctx.into_request();
+            if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+                &s.settings,
+                &mut req,
+            ) {
+                return Ok(http_error(&error));
+            }
             Ok(f(s, services, req).await.unwrap_or_else(|e| http_error(&e)))
         })
     }
@@ -241,6 +253,10 @@ fn admin_key_management_not_supported() -> Response {
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     response
+}
+
+fn admin_ec_lookup_not_supported() -> Response {
+    core_admin_ec_lookup_not_supported()
 }
 
 /// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
@@ -361,14 +377,27 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
             let services = build_per_request_services(&ctx);
-            let req = ctx.into_request();
+            let mut req = ctx.into_request();
+            if let Some(response) = deny_admin_diagnostic_fallback(&req) {
+                return Ok(response);
+            }
+            if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+                &state.settings,
+                &mut req,
+            ) {
+                return Ok(http_error(&error));
+            }
             let path = req.uri().path().to_owned();
             let method = req.method().clone();
             // tsjs assets are served for GET only, matching the Axum/Fastly adapters.
             let allow_tsjs = method == Method::GET;
 
             let result = if allow_tsjs && path.starts_with("/static/tsjs=") {
-                handle_tsjs_dynamic(&req, &state.registry)
+                handle_tsjs_dynamic(
+                    &req,
+                    &state.registry,
+                    EdgeCacheHeader::CloudflareCdnCacheControl,
+                )
             } else if state.registry.has_route(&method, &path) {
                 let mut ec_context = EcContext::default();
                 state
@@ -402,6 +431,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     &mut ec_context,
                     auction,
                     req,
+                    EdgeCacheHeader::CloudflareCdnCacheControl,
                 )
                 .await
                 {
@@ -462,6 +492,26 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post("/_ts/admin/keys/deactivate", |_ctx: RequestContext| async {
                 Ok::<Response, EdgeError>(admin_key_management_not_supported())
             })
+            // Admin EC lookup routes. Registered explicitly (like the key
+            // routes above) so they never fall through to the publisher
+            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
+            // coverage. The EC identity graph is Fastly KV backed, so this
+            // adapter has no store to read.
+            .get("/_ts/admin/ec", |_ctx: RequestContext| async {
+                Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
+            })
+            .get("/_ts/admin/ec/{id}", |_ctx: RequestContext| async {
+                Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
+            })
+            // Admin EIDs echo: pure request inspection (no KV), so this
+            // adapter serves the real handler.
+            .get(
+                "/_ts/admin/eids",
+                make_handler(Arc::clone(&state), |s, _services, req| async move {
+                    let partner_registry = PartnerRegistry::from_config(&s.settings.ec.partners)?;
+                    handle_admin_eids_lookup(&partner_registry, &req)
+                }),
+            )
             .post(
                 "/auction",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
@@ -503,6 +553,16 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 "/first-party/sign",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
                     handle_first_party_proxy_sign(&s.settings, &services, req).await
+                }),
+            )
+            // GET serves the click guard's navigation fallback: the creative
+            // iframe is an opaque origin (sandbox without `allow-same-origin`),
+            // so its JSON POST is blocked by CORS and the guard navigates here
+            // for a 302 instead.
+            .get(
+                "/first-party/proxy-rebuild",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_first_party_proxy_rebuild(&s.settings, &services, req).await
                 }),
             )
             .post(

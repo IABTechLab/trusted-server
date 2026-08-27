@@ -212,6 +212,8 @@ pub enum AuctionTerminalOutcome<'a> {
         request: &'a AuctionRequest,
         /// Orchestration result.
         result: &'a OrchestrationResult,
+        /// Winners actually serialized for delivery, when conversion can drop bids.
+        delivered_winner_slots: Option<&'a HashSet<String>>,
     },
     /// Execution failure.
     ExecutionFailed {
@@ -506,7 +508,11 @@ pub fn build_auction_events(
     let mut rows = Vec::new();
 
     match terminal {
-        AuctionTerminalOutcome::Completed { request, result } => {
+        AuctionTerminalOutcome::Completed {
+            request,
+            result,
+            delivered_winner_slots,
+        } => {
             push_summary(
                 &mut rows,
                 &observation,
@@ -514,7 +520,7 @@ pub fn build_auction_events(
                 AuctionTerminalStatus::Completed,
                 None,
                 result.total_time_ms,
-                result.winning_bids.len(),
+                delivered_winner_slots.map_or(result.winning_bids.len(), HashSet::len),
             );
             push_provider_rows(
                 &mut rows,
@@ -532,7 +538,14 @@ pub fn build_auction_events(
                     "mediator",
                 );
             }
-            push_bid_rows(&mut rows, &observation, &event_ts, request, result);
+            push_bid_rows(
+                &mut rows,
+                &observation,
+                &event_ts,
+                request,
+                result,
+                delivered_winner_slots,
+            );
         }
         AuctionTerminalOutcome::ExecutionFailed {
             request: _,
@@ -682,6 +695,7 @@ fn push_bid_rows(
     event_ts: &str,
     request: &AuctionRequest,
     result: &OrchestrationResult,
+    delivered_winner_slots: Option<&HashSet<String>>,
 ) {
     let mut matched_wins = HashSet::new();
 
@@ -691,7 +705,9 @@ fn push_bid_rows(
                 .winning_bids
                 .iter()
                 .find(|(slot_id, winning)| {
-                    !matched_wins.contains(*slot_id) && bid_matches_winning_bid(bid, winning)
+                    delivered_winner_slots.is_none_or(|slots| slots.contains(*slot_id))
+                        && !matched_wins.contains(*slot_id)
+                        && bid_matches_winning_bid(bid, winning)
                 })
                 .map(|(slot_id, winning)| (slot_id.clone(), winning));
             let (is_win, price) = if let Some((slot_id, winning)) = matched_slot {
@@ -714,7 +730,9 @@ fn push_bid_rows(
 
     if let Some(mediator_response) = &result.mediator_response {
         for (slot_id, winning) in &result.winning_bids {
-            if matched_wins.contains(slot_id) {
+            if delivered_winner_slots.is_some_and(|slots| !slots.contains(slot_id))
+                || matched_wins.contains(slot_id)
+            {
                 continue;
             }
             if mediator_response
@@ -960,7 +978,10 @@ mod tests {
             height: 250,
             nurl: None,
             burl: None,
+            bid_id: None,
             ad_id: ad_id.map(str::to_owned),
+            creative_id: None,
+            renderer: None,
             cache_id: None,
             cache_host: None,
             cache_path: None,
@@ -1039,6 +1060,7 @@ mod tests {
             AuctionTerminalOutcome::Completed {
                 request: &request,
                 result: &result,
+                delivered_winner_slots: None,
             },
         );
 
@@ -1079,6 +1101,45 @@ mod tests {
     }
 
     #[test]
+    fn completed_events_do_not_mark_dropped_winners_as_delivered() {
+        let request = test_request("ts-ec-derived-id");
+        let provider_success = AuctionResponse::success(
+            "prebid",
+            vec![bid("slot-1", "kargo", Some("ad-1"), Some(1.25))],
+            42,
+        );
+        let result = OrchestrationResult {
+            provider_responses: vec![provider_success.clone()],
+            mediator_response: None,
+            winning_bids: HashMap::from([("slot-1".to_owned(), provider_success.bids[0].clone())]),
+            total_time_ms: 42,
+            metadata: HashMap::new(),
+        };
+        let delivered = HashSet::new();
+        let batch = build_auction_events(
+            AuctionObservationContext::for_test(AuctionSource::AuctionApi, "/auction", 1),
+            AuctionTerminalOutcome::Completed {
+                request: &request,
+                result: &result,
+                delivered_winner_slots: Some(&delivered),
+            },
+        );
+
+        let summary = batch
+            .rows()
+            .iter()
+            .find(|row| row.event_kind == "summary")
+            .expect("should emit summary row");
+        assert_eq!(summary.winning_bid_count, Some(0));
+        let bid_row = batch
+            .rows()
+            .iter()
+            .find(|row| row.event_kind == "bid")
+            .expect("should preserve parsed bid telemetry");
+        assert_eq!(bid_row.is_win, Some(0));
+    }
+
+    #[test]
     fn provider_call_maps_http_status_errors_to_their_own_bucket() {
         // A non-2xx upstream status (e.g. a PBS 4xx/5xx) is tagged
         // `error_type = "http_status"` by the prebid provider; telemetry must
@@ -1103,6 +1164,7 @@ mod tests {
             AuctionTerminalOutcome::Completed {
                 request: &request,
                 result: &result,
+                delivered_winner_slots: None,
             },
         );
 
@@ -1140,6 +1202,7 @@ mod tests {
             AuctionTerminalOutcome::Completed {
                 request: &request,
                 result: &result,
+                delivered_winner_slots: None,
             },
         );
         let winning_rows: Vec<_> = batch
@@ -1179,6 +1242,7 @@ mod tests {
             AuctionTerminalOutcome::Completed {
                 request: &request,
                 result: &result,
+                delivered_winner_slots: None,
             },
         )
         .to_ndjson(4096)

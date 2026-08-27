@@ -1,5 +1,11 @@
 // Public tsjs core bundle: sets up the global API, queue, and default methods.
-export type { AdUnit, TsjsApi } from './types';
+export type {
+  AdUnit,
+  GptDiagnosticsApi,
+  GptDiagnosticsExportV1,
+  GptDiagnosticsRequestCycle,
+  TsjsApi,
+} from './types';
 import type { TsjsApi } from './types';
 import { addAdUnits } from './registry';
 import { renderAdUnit, renderAllAdUnits } from './render';
@@ -30,10 +36,10 @@ api.getConfig = getConfig;
 // Provide core requestAds API
 api.requestAds = requestAds;
 // Defensive defaults: the edge injects adSlots (head-open) and bids (before
-// </body>) only when the server-side ad stack runs for the request. When it
-// is gated off (kill switch, consent fail-closed, bots, prefetch), page code
-// reading window.tsjs.bids / window.tsjs.adSlots must still see defined
-// values instead of throwing. Injected scripts overwrite these wholesale.
+// </body>) only when server-side ad templates run for the request. When template
+// delivery is disabled or gated off (auction/consent, bots, prefetch), page code
+// reading window.tsjs.bids / window.tsjs.adSlots must still see defined values
+// instead of throwing. Injected scripts overwrite these wholesale.
 api.adSlots ??= [];
 api.bids ??= {};
 // Point global tsjs
