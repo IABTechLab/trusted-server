@@ -387,7 +387,8 @@ export interface FirstImpressionSlotClaim {
   phase: FirstImpressionPhase;
   expiresAt: number;
   publisherAuctions: Record<string, FirstImpressionPublisherAuction>;
-  suppressionConsumed?: boolean;
+  /** No later publisher auction may join this TS-owned first impression. */
+  publisherRegistrationClosed?: boolean;
   targeting?: Record<string, string | string[]>;
 }
 
