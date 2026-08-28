@@ -1301,7 +1301,7 @@ mod tests {
             edgezero_core::http::HeaderValue::from_static("short"),
         );
 
-        let decision = filter_with_staging(&integration, &settings, &services, &mut request);
+        let decision = filter_request(&integration, &settings, &services, &mut request);
 
         assert!(matches!(decision, RequestFilterDecision::Continue(_)));
         assert!(

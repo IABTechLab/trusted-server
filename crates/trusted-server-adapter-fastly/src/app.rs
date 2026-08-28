@@ -1361,8 +1361,9 @@ mod tests {
     use super::{
         AppState, AuctionDispatch, EcContext, EdgeCacheHeader, HandlerFuture, NAMED_ROUTES,
         NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RuntimeStoreConfig,
-        TrustedServerApp, build_per_request_services, build_state_from_settings,
-        handle_publisher_request, publisher_response_into_streaming_response, startup_error_router,
+        TrustedServerApp, build_orchestrator_with_plan, build_per_request_services,
+        build_state_from_settings, compile_auction_plan, handle_publisher_request,
+        publisher_response_into_streaming_response, startup_error_router,
     };
     use base64::Engine as _;
     use bytes::Bytes;
@@ -2947,7 +2948,6 @@ mod tests {
 
                     [auction]
                     enabled = true
-                    providers = []
 
                     [creative_opportunities]
                     gam_network_id = "99999"
@@ -2974,11 +2974,13 @@ mod tests {
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(ClientInfo::default())
             .build();
+        let plan = Arc::new(compile_auction_plan(&settings).expect("should compile auction plan"));
         let registry = Arc::new(
-            IntegrationRegistry::new(&settings).expect("should build integration registry"),
+            IntegrationRegistry::with_plan(&settings, Arc::clone(&plan))
+                .expect("should build integration registry"),
         );
         let orchestrator = Arc::new(
-            trusted_server_core::auction::build_orchestrator(&settings)
+            build_orchestrator_with_plan(plan, &settings)
                 .expect("should build auction orchestrator"),
         );
 

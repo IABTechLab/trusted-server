@@ -815,15 +815,6 @@ mod tests {
         }
     }
 
-    struct InMemoryConfigStore(std::collections::BTreeMap<String, String>);
-
-    #[async_trait::async_trait(?Send)]
-    impl ConfigStore for InMemoryConfigStore {
-        async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
-            Ok(self.0.get(key).cloned())
-        }
-    }
-
     fn make_ctx_without_spin_context() -> RequestContext {
         let req = request_builder()
             .method("GET")
