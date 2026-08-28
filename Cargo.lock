@@ -5364,11 +5364,13 @@ dependencies = [
  "futures",
  "log",
  "reqwest 0.12.28",
+ "serde_json",
  "simple_logger",
  "temp-env",
  "tokio",
  "tower 0.4.13",
  "trusted-server-core",
+ "trusted-server-integration-seam-probe",
 ]
 
 [[package]]
@@ -5544,6 +5546,23 @@ dependencies = [
  "error-stack",
  "fastly",
  "trusted-server-core",
+]
+
+[[package]]
+name = "trusted-server-integration-seam-probe"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "hex",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "trusted-server-core",
+ "validator",
 ]
 
 [[package]]

@@ -3,6 +3,11 @@ resolver = "2"
 members = [
     "crates/device/fastly",
     "crates/geo/fastly",
+    # Test fixture that proves the integration seam from outside core. A
+    # workspace member so it shares workspace settings and lints; no default
+    # member and no adapter build reaches it, and only the Axum adapter's tests
+    # depend on it.
+    "crates/integrations/seam-probe",
     "crates/trusted-server-adapter-axum",
     "crates/trusted-server-adapter-cloudflare",
     "crates/trusted-server-adapter-fastly",

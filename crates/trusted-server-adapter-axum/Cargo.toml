@@ -33,6 +33,10 @@ trusted-server-core = { workspace = true }
 [dev-dependencies]
 axum = { workspace = true }
 base64 = { workspace = true }
+serde_json = { workspace = true }
 temp-env = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tower = { workspace = true, features = ["util"] }
+# Test fixture only. It proves the integration seam from outside core and must
+# never reach a production build, so it stays a dev-dependency.
+trusted-server-integration-seam-probe = { path = "../integrations/seam-probe" }
