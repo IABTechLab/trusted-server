@@ -753,6 +753,11 @@ from ID-shaped samples: a pattern such as
 matcher (`^/_ts/admin`, or `^/_ts/admin/ec/` alongside the other admin
 patterns).
 
+Handler expressions match the raw URI path, while a publisher origin may decode
+percent-encoded aliases before routing. For a whole-site staging gate, use
+`path = "^/"`; do not rely on a decoded-path prefix such as `^/secure` to protect
+equivalent origin paths.
+
 Startup also fails when any handler — admin or not — uses a placeholder or
 well-known weak password (`changeme`, `password`, `admin`, or a
 `replace-with-…` template value). Handler selection is first-match-wins, so a
@@ -1706,9 +1711,10 @@ The cache fails closed. A template is stored only for a `GET` with a processable
 `200 text/html` origin response, a supported content encoding, and explicit
 positive shared freshness. `private`, `no-store`, `no-cache`, exhausted or
 malformed freshness, `Set-Cookie`, `Vary: *`, `Vary: Cookie`, uncovered `Vary`
-names, response-bound CSP nonces, authorization, diagnostics sessions, range or
-conditional requests, positive or malformed request `max-age`, `min-fresh`, and
-unsupported CDN-specific cache policy fields all bypass the template cache. Fastly
+names, response-bound CSP nonces, pass-through or ambiguous authorization,
+diagnostics sessions, range or conditional requests, positive or malformed
+request `max-age`, `min-fresh`, and unsupported CDN-specific cache policy fields
+all bypass the template cache. Fastly
 `Surrogate-Control` is the narrow exception: the template cache accepts exactly one positive
 `max-age` plus optional valid `stale-while-revalidate` and `stale-if-error`
 delta-seconds. Restrictive, duplicated, malformed, or unknown directives fail
@@ -1725,6 +1731,14 @@ response and runs a new per-reader auction. Explicit `no-cache`, `no-store`,
 positive or malformed request `max-age`, range, and conditional requests still bypass the template cache.
 Check `X-TS-Template-Cache: hit` to verify template reuse.
 
+Authorization has one narrow exception. A request carrying exactly the same
+single Basic credential that Trusted Server just validated at the edge may share
+a template; pass-through, repeated, appended, or replaced values still bypass.
+Trusted Server does not remove the validated header, so it remains forwarded to
+the publisher origin. If the origin uses that credential to select response
+content, it must declare `Vary: Authorization`; that response is deliberately not
+stored as a shared template.
+
 `template_cache_vary` is necessary because lookup occurs before the origin can
 return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
 origin identity, complete template-shaping settings, TSJS content, and schema
@@ -1733,13 +1747,14 @@ not: the stored template is decoded identity and the assembled result is encoded
 for each reader with `Vary: Accept-Encoding`. This assumes the origin's
 `Accept-Encoding` variants differ only by HTTP content coding, as normal
 compression negotiation does. Do not enable ESI for an origin that changes the
-document's meaning based on `Accept-Encoding`. Never put `Cookie` in
-`template_cache_vary`; startup rejects it because a per-cookie object is not a
-reader-neutral template. With `origin_is_cookie_independent = false` (the safe
-default), all cookie-bearing requests bypass. With it set to `true`, an origin
-`Vary: Cookie` still overrides the assertion and refuses storage.
-Every other name the origin emits in `Vary` must appear in the configured list;
-an uncovered name safely refuses template storage.
+document's meaning based on `Accept-Encoding`. Never put `Cookie` or
+`Authorization` in `template_cache_vary`; startup rejects both because raw cookie
+or credential values are not reader-neutral template dimensions. With
+`origin_is_cookie_independent = false` (the safe default), all cookie-bearing
+requests bypass. With it set to `true`, an origin `Vary: Cookie` still overrides
+the assertion and refuses storage. Every other name the origin emits in `Vary`
+must appear in the configured list; an uncovered name safely refuses template
+storage.
 
 For a canary, inspect `X-TS-Template-Cache`. Its bounded values are `hit`,
 `miss-stored`, `miss-store-error`, `miss-reserved`, `bypass-request`,
