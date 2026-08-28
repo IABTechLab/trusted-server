@@ -297,6 +297,10 @@ pub(crate) fn runtime_services_for_consent_route(
 /// absent (e.g. tests that dispatch without the entry point). Scheme detection
 /// continues to rely on the trusted `fastly-ssl` header injected by
 /// `edgezero_main` after sanitization.
+///
+/// Applies the module-supplied geo provider selected by `[geo] provider`. When
+/// the selector is unset the registry resolves no provider and the Fastly
+/// lookup stands, so the request path is unchanged.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
     let client_info = ctx
         .request()
@@ -349,9 +353,16 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
     // again. Nothing is set for a deployment that selects no provider, or one
     // whose provider is built from this request's own host signals, and both
     // are resolved on the request path instead.
-    match state.ec_provider.clone() {
+    let services = match state.ec_provider.clone() {
         Some(provider) => builder.resolved_ec_provider(provider).build(),
         None => builder.build(),
+    };
+
+    // A module-supplied geo provider selected by `[geo] provider` replaces the
+    // Fastly lookup, and an unset selector leaves the host lookup in place.
+    match state.registry.geo_provider() {
+        Some(provider) => services.with_geo(provider),
+        None => services,
     }
 }
 

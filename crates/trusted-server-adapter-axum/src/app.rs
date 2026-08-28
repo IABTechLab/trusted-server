@@ -102,6 +102,23 @@ fn build_state_with_settings(
 }
 
 // ---------------------------------------------------------------------------
+// Per-request RuntimeServices
+// ---------------------------------------------------------------------------
+
+/// Build per-request [`RuntimeServices`], applying the module-supplied geo
+/// provider selected by `[geo] provider`.
+///
+/// When the selector is unset the registry resolves no provider and this
+/// adapter's own host lookup stands, so the request path is unchanged.
+fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
+    let services = build_runtime_services(ctx, &state.settings);
+    match state.registry.geo_provider() {
+        Some(provider) => services.with_geo(provider),
+        None => services,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Error helper
 // ---------------------------------------------------------------------------
 
@@ -150,7 +167,7 @@ where
     F: FnOnce(Arc<AppState>, RuntimeServices, Request) -> Fut,
     Fut: Future<Output = Result<Response, Report<TrustedServerError>>>,
 {
-    let services = build_runtime_services(&ctx, &state.settings);
+    let services = build_per_request_services(&state, &ctx);
     let mut req = ctx.into_request();
     if let Err(error) = state.registry.prepare_request(&state.settings, &mut req) {
         return Ok(http_error(&error));

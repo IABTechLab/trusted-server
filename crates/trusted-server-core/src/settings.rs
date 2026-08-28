@@ -955,12 +955,11 @@ impl GeoConfig {
     /// Returns [`TrustedServerError::Configuration`] when the selected provider
     /// key is not one this build provides.
     pub fn validate_provider_selection(&self) -> Result<(), Report<TrustedServerError>> {
-        match self.provider.as_deref() {
-            None | Some("platform") | Some("none") => Ok(()),
-            Some(key) => Err(Report::new(TrustedServerError::Configuration {
-                message: format!("Geo provider `{key}` is not available in this build"),
-            })),
-        }
+        // Unset, `none` and `platform` are resolved by the core. Any other key
+        // names an integration module that declares a geo provider, and the
+        // registry rejects one that no module supplies, so this check cannot be
+        // a closed list without shutting modules out of geo entirely.
+        Ok(())
     }
 
     /// Validates that the compiled `permissions.yaml` parses and declares its
@@ -4183,6 +4182,44 @@ mod tests {
 
         serde_json::from_value::<BaseRevisionSettings>(value)
             .expect("base revision schema should accept a config blob with no trusted client IP");
+    }
+
+    #[test]
+    fn geo_selector_is_omitted_from_serialized_config_when_unset() {
+        // `ts config push` serializes `Settings` verbatim. An empty `geo` table in
+        // the blob makes a `deny_unknown_fields` binary that predates the selector
+        // reject it during rollout or rollback.
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without a geo selector");
+
+        let value = serde_json::to_value(&settings).expect("should serialize settings");
+
+        assert!(
+            value.get("geo").is_none(),
+            "an unset geo selector should not be serialized, got {value}"
+        );
+    }
+
+    #[test]
+    fn a_selected_geo_provider_stays_in_the_serialized_config() {
+        let settings = Settings::from_toml(&format!(
+            "{}
+[geo]
+provider = \"none\"
+",
+            crate_test_settings_str()
+        ))
+        .expect("should parse settings with a geo selector");
+
+        let value = serde_json::to_value(&settings).expect("should serialize settings");
+
+        assert_eq!(
+            value
+                .pointer("/geo/provider")
+                .and_then(serde_json::Value::as_str),
+            Some("none"),
+            "a selected geo provider should survive serialization"
+        );
     }
 
     #[test]

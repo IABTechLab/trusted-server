@@ -133,6 +133,13 @@ pull_sync_concurrency = 3
 # batch_rate_limit = 60      # max batch-sync requests/min (default 60)
 # pull_sync_enabled = false  # default false
 
+# Which module resolves location. Leave the whole section out to keep the
+# host's own lookup, which is what every adapter ships with today.
+# [geo]
+# `none` resolves no location at all, or name a registered module that declares
+# a geo provider to have that module resolve location instead of the host.
+# provider = "none"
+
 
 # =============================================================================
 # OPTIONAL — Core features (disabled/omitted by default)

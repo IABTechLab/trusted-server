@@ -35,6 +35,7 @@
 use std::time::Duration;
 
 mod error;
+mod geo;
 mod http;
 mod image_optimizer;
 mod kv;
@@ -47,6 +48,7 @@ mod types;
 
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
 pub use error::PlatformError;
+pub use geo::DisabledGeo;
 pub use http::{
     PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
     PlatformSelectResult, UnavailableHttpClient,
@@ -76,28 +78,9 @@ pub use types::{
 /// Default first-byte timeout for platform backends.
 pub(crate) const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 
-use std::net::IpAddr;
 use std::sync::Arc;
 
-use error_stack::Report;
-
 use crate::settings::Settings;
-
-/// A geo provider that resolves nothing.
-///
-/// Installed when no geo provider is selected (`"none"` spells the same
-/// choice explicitly), so a client IP is never sent to any host geo service
-/// and a default deployment is not tied to any host geo capability. Every geo
-/// consumer already treats [`GeoInfo`] as optional, so a `None` result
-/// degrades gracefully (the permission baseline falls back to the top of the
-/// `permissions.yaml` rules tree, the auction omits geo, and so on).
-pub struct DisabledGeo;
-
-impl PlatformGeo for DisabledGeo {
-    fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
-        Ok(None)
-    }
-}
 
 /// Selects the geo provider named by the `[geo] provider` selector.
 ///

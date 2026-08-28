@@ -355,6 +355,18 @@ impl RuntimeServices {
         }
     }
 
+    /// Returns a clone of this instance with the geo provider replaced by
+    /// `geo`.
+    ///
+    /// Adapters use this to apply the module-supplied geo provider selected by
+    /// `[geo] provider`, so a vendor module can resolve location in place of
+    /// the host's own lookup without the rest of the runtime services graph
+    /// being rebuilt.
+    #[must_use]
+    pub fn with_geo(self, geo: Arc<dyn PlatformGeo>) -> Self {
+        Self { geo, ..self }
+    }
+
     /// Returns a clone of this instance with the template cache replaced.
     ///
     /// Spike-only (#1009).

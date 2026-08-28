@@ -15,7 +15,7 @@ use crate::ec::kv::KvIdentityGraph;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
-use crate::platform::RuntimeServices;
+use crate::platform::{DisabledGeo, PlatformGeo, RuntimeServices};
 use crate::settings::Settings;
 
 /// Action returned by attribute rewriters to describe how the runtime should mutate the element.
@@ -622,6 +622,11 @@ pub struct IntegrationRegistration {
     pub html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
     pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    /// Geo provider this module supplies, selectable by `[geo] provider`.
+    ///
+    /// Declaring one does not make it active: the module is only asked to
+    /// resolve location when `[geo] provider` names this module's id.
+    pub geo_provider: Option<Arc<dyn PlatformGeo>>,
 }
 
 impl IntegrationRegistration {
@@ -650,6 +655,7 @@ impl IntegrationRegistrationBuilder {
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                geo_provider: None,
             },
         }
     }
@@ -693,6 +699,17 @@ impl IntegrationRegistrationBuilder {
     #[must_use]
     pub fn with_request_filter(mut self, filter: Arc<dyn IntegrationRequestFilter>) -> Self {
         self.registration.request_filters.push(filter);
+        self
+    }
+
+    /// Declare the geo provider this module supplies.
+    ///
+    /// The provider only resolves location when `[geo] provider` names this
+    /// module's id, and a declared provider the selector does not choose is
+    /// reported as a startup warning.
+    #[must_use]
+    pub fn with_geo_provider(mut self, provider: Arc<dyn PlatformGeo>) -> Self {
+        self.registration.geo_provider = Some(provider);
         self
     }
 
@@ -777,6 +794,12 @@ struct IntegrationRegistryInner {
     extra_js_module_ids: Vec<&'static str>,
     // Preparers from every builder, enabled or not, in registration order.
     request_preparers: Vec<crate::integrations::IntegrationPrepareRequestFn>,
+    // Geo providers declared by the enabled registrations, in registration
+    // order. Declaring one does not activate it.
+    geo_providers: Vec<(&'static str, Arc<dyn PlatformGeo>)>,
+    // The provider `[geo] provider` resolved to, or `None` when the selector
+    // is unset and the adapter's own host lookup stands.
+    geo_provider: Option<Arc<dyn PlatformGeo>>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -803,8 +826,101 @@ impl Default for IntegrationRegistryInner {
             request_filters: Vec::new(),
             extra_js_module_ids: Vec::new(),
             request_preparers: Vec::new(),
+            geo_providers: Vec::new(),
+            geo_provider: None,
         }
     }
+}
+
+/// Reserved value of `[geo] provider` that resolves no location at all.
+const GEO_PROVIDER_NONE: &str = "none";
+
+/// `[geo] provider` value opting in to the adapter's own host geo lookup.
+const GEO_PROVIDER_PLATFORM: &str = "platform";
+
+/// Resolves `[geo] provider` against the modules that declared a geo provider.
+///
+/// Returns `None` when the selector is unset, which leaves the adapter's own
+/// host lookup in place. A module that declares a geo provider the selector
+/// does not choose is reported as a warning, so an operator can see a module
+/// shipping a capability the deployment never uses.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the selector names a
+/// module that is not registered, is registered but not enabled, or is enabled
+/// and declares no geo provider.
+fn resolve_geo_provider(
+    settings: &Settings,
+    inner: &IntegrationRegistryInner,
+) -> Result<Option<Arc<dyn PlatformGeo>>, Report<TrustedServerError>> {
+    let selector = settings.geo.provider.as_deref();
+    let resolved = match selector {
+        // Unset resolves nothing and makes no host geo call, so a default
+        // deployment is not tied to any host geo service. `none` spells the
+        // same choice explicitly.
+        None | Some(GEO_PROVIDER_NONE) => Some(Arc::new(DisabledGeo) as Arc<dyn PlatformGeo>),
+        // `platform` opts in to the adapter's own host lookup, so the registry
+        // supplies nothing and the adapter's provider stands.
+        Some(GEO_PROVIDER_PLATFORM) => None,
+        Some(module_id) => Some(module_geo_provider(module_id, inner)?),
+    };
+
+    for (id, _) in &inner.geo_providers {
+        if selector != Some(*id) {
+            log::warn!(
+                "integration module `{id}` declares a geo provider that `[geo] provider` does not select"
+            );
+        }
+    }
+
+    Ok(resolved)
+}
+
+/// Looks up the geo provider declared by the module `module_id`.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] naming the module and the
+/// capability when the module declares no geo provider, is registered but not
+/// enabled, or is not registered at all.
+fn module_geo_provider(
+    module_id: &str,
+    inner: &IntegrationRegistryInner,
+) -> Result<Arc<dyn PlatformGeo>, Report<TrustedServerError>> {
+    if let Some((_, provider)) = inner.geo_providers.iter().find(|(id, _)| *id == module_id) {
+        return Ok(Arc::clone(provider));
+    }
+
+    // Only an enabled registration reaches the collection loop, so a module
+    // that exists but is switched off must say so rather than read as a module
+    // that never declared the capability.
+    let message = if inner
+        .enabled_integration_ids
+        .iter()
+        .copied()
+        .any(|id| id == module_id)
+    {
+        format!(
+            "`[geo] provider` selects integration module `{module_id}`, which declares no geo provider"
+        )
+    } else if inner.builder_ids.iter().any(|(id, _)| *id == module_id) {
+        format!(
+            "`[geo] provider` selects integration module `{module_id}`, which is registered but not enabled, so its geo provider is unavailable"
+        )
+    } else {
+        format!(
+            "`[geo] provider` selects integration module `{module_id}`, which is not registered; the registered modules that declare a geo provider are [{}]",
+            inner
+                .geo_providers
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    Err(Report::new(TrustedServerError::Configuration { message }))
 }
 
 /// Summary of registered integration capabilities.
@@ -974,6 +1090,11 @@ impl IntegrationRegistry {
                     .extend(registration.html_post_processors);
                 inner.head_injectors.extend(registration.head_injectors);
                 inner.request_filters.extend(registration.request_filters);
+                if let Some(provider) = registration.geo_provider {
+                    inner
+                        .geo_providers
+                        .push((registration.integration_id, provider));
+                }
                 if registration.js_disabled {
                     inner.disabled_js_ids.push(registration.integration_id);
                 } else if registration.js_deferred {
@@ -1012,10 +1133,19 @@ impl IntegrationRegistry {
         }) {
             inner.extra_js_module_ids.push("ec_client_fixed");
         }
+        let geo_provider = resolve_geo_provider(settings, &inner)?;
+        inner.geo_provider = geo_provider;
 
         Ok(Self {
             inner: Arc::new(inner),
         })
+    }
+
+    /// The geo provider `[geo] provider` selected, or `None` when the selector
+    /// is unset and the adapter's own host lookup stands.
+    #[must_use]
+    pub fn geo_provider(&self) -> Option<Arc<dyn PlatformGeo>> {
+        self.inner.geo_provider.clone()
     }
 
     /// Every integration id the registry was built from, enabled or not, in
@@ -1521,6 +1651,8 @@ impl IntegrationRegistry {
                 extra_js_module_ids: Vec::new(),
                 standalone_js_ids: Vec::new(),
                 carried_js: Vec::new(),
+                geo_providers: Vec::new(),
+                geo_provider: None,
             }),
         }
     }
@@ -1555,6 +1687,8 @@ impl IntegrationRegistry {
                 extra_js_module_ids: Vec::new(),
                 standalone_js_ids: Vec::new(),
                 carried_js: Vec::new(),
+                geo_providers: Vec::new(),
+                geo_provider: None,
             }),
         }
     }
@@ -1585,6 +1719,8 @@ impl IntegrationRegistry {
                 extra_js_module_ids: Vec::new(),
                 standalone_js_ids: Vec::new(),
                 carried_js: Vec::new(),
+                geo_providers: Vec::new(),
+                geo_provider: None,
             }),
         }
     }
@@ -1655,6 +1791,8 @@ impl IntegrationRegistry {
                 extra_js_module_ids: Vec::new(),
                 standalone_js_ids: Vec::new(),
                 carried_js: Vec::new(),
+                geo_providers: Vec::new(),
+                geo_provider: None,
             }),
         }
     }
@@ -3280,6 +3418,170 @@ mod tests {
                 .map(|value| value.to_str().expect("cookie should be text")),
             Some("keep-me=yes"),
             "should strip the reserved diagnostics cookie and keep the rest"
+        );
+    }
+
+    /// Example country code returned by the test geo provider. `ZZ` is the
+    /// user-assigned code, so it names no real place.
+    const GEO_PROBE_COUNTRY: &str = "ZZ";
+
+    /// A geo provider that resolves one fixed location, so a test can tell the
+    /// module's provider apart from the "no location" one.
+    #[derive(Debug)]
+    struct FixedCountryGeo;
+
+    impl crate::platform::PlatformGeo for FixedCountryGeo {
+        fn lookup(
+            &self,
+            _client_ip: Option<std::net::IpAddr>,
+        ) -> Result<Option<GeoInfo>, Report<crate::platform::PlatformError>> {
+            Ok(Some(GeoInfo {
+                city: "Example City".to_owned(),
+                country: GEO_PROBE_COUNTRY.to_owned(),
+                continent: "Example".to_owned(),
+                latitude: 0.0,
+                longitude: 0.0,
+                metro_code: 0,
+                region: None,
+                asn: None,
+            }))
+        }
+    }
+
+    /// Builds a `geo-probe` registration that declares a geo provider.
+    fn geo_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("geo-probe")
+                .with_geo_provider(Arc::new(FixedCountryGeo))
+                .build(),
+        ))
+    }
+
+    fn geo_probe_builders() -> [crate::integrations::IntegrationBuilder; 1] {
+        [crate::integrations::IntegrationBuilder::new(
+            "geo-probe",
+            "seam-probe",
+            geo_probe_registration,
+            validate_nothing,
+        )]
+    }
+
+    fn settings_selecting_geo_provider(provider: &str) -> Settings {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.geo.provider = Some(provider.to_owned());
+        settings
+    }
+
+    #[test]
+    fn geo_provider_resolves_the_provider_declared_by_the_selected_module() {
+        let settings = settings_selecting_geo_provider("geo-probe");
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &geo_probe_builders())
+            .expect("should build registry with a module geo provider");
+
+        let provider = registry
+            .geo_provider()
+            .expect("should resolve the module's geo provider");
+        let resolved = provider
+            .lookup(None)
+            .expect("should look up without failing")
+            .expect("should resolve a location");
+        assert_eq!(
+            resolved.country, GEO_PROBE_COUNTRY,
+            "should resolve through the module's own provider"
+        );
+    }
+
+    #[test]
+    fn geo_provider_none_resolves_no_location() {
+        let settings = settings_selecting_geo_provider("none");
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &geo_probe_builders())
+            .expect("should build registry with the disabled geo provider");
+
+        let provider = registry
+            .geo_provider()
+            .expect("should resolve the disabled geo provider");
+        assert!(
+            provider
+                .lookup(None)
+                .expect("should look up without failing")
+                .is_none(),
+            "should resolve no location when the selector is `none`"
+        );
+    }
+
+    #[test]
+    fn geo_provider_is_unset_when_no_module_is_selected() {
+        let settings = crate::test_support::tests::create_test_settings();
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &geo_probe_builders())
+            .expect("should build registry with an unset geo selector");
+
+        assert!(
+            registry.geo_provider().is_none(),
+            "should leave the adapter's own host lookup in place"
+        );
+    }
+
+    #[test]
+    fn geo_provider_rejects_a_module_that_declares_no_geo_provider() {
+        let settings = settings_selecting_geo_provider("probe");
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            probe_registration,
+            validate_nothing,
+        )];
+
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should reject a module that declares no geo provider");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("probe") && message.contains("geo provider"),
+            "error should name the module and the capability: {message}"
+        );
+    }
+
+    #[test]
+    fn geo_provider_rejects_a_module_that_is_registered_but_not_enabled() {
+        let settings = settings_selecting_geo_provider("probe-disabled");
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "probe-disabled",
+            "seam-probe",
+            never_enabled_registration,
+            validate_nothing,
+        )];
+
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should reject a module that is registered but not enabled");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("probe-disabled")
+                && message.contains("not enabled")
+                && message.contains("geo provider"),
+            "error should name the module, that it is not enabled, and the capability: {message}"
+        );
+    }
+
+    #[test]
+    fn geo_provider_rejects_a_module_that_is_not_registered() {
+        let settings = settings_selecting_geo_provider("absent-module");
+
+        let error = IntegrationRegistry::with_registrations(&settings, &geo_probe_builders())
+            .err()
+            .expect("should reject a selector naming nothing registered");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("absent-module") && message.contains("not registered"),
+            "error should name the module and say it is not registered: {message}"
         );
     }
 }

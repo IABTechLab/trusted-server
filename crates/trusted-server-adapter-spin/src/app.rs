@@ -117,6 +117,26 @@ fn build_state_with_settings(
 }
 
 // ---------------------------------------------------------------------------
+// Per-request RuntimeServices
+// ---------------------------------------------------------------------------
+
+/// Build per-request [`RuntimeServices`], carrying the Edge Cookie provider the
+/// composition root already resolved and applying the module-supplied geo
+/// provider selected by `[geo] provider`.
+///
+/// No Edge Cookie provider is carried when the composition root found nothing
+/// safe to keep, and no geo provider is applied when the selector is unset and
+/// the registry resolves none, so in both cases the request path is unchanged.
+fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
+    let services = build_runtime_services(ctx, &state.settings)
+        .with_resolved_ec_provider(state.ec_provider.clone());
+    match state.registry.geo_provider() {
+        Some(provider) => services.with_geo(provider),
+        None => services,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Publisher response helper
 // ---------------------------------------------------------------------------
 
@@ -536,14 +556,6 @@ impl TrustedServerApp {
         let state = build_state_with_settings(settings)?;
         Ok(build_router(&state))
     }
-}
-
-/// Builds the per-request services, carrying the Edge Cookie provider the
-/// composition root already resolved so the request path does not resolve
-/// `[ec] provider` a second time.
-fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
-    build_runtime_services(ctx, &state.settings)
-        .with_resolved_ec_provider(state.ec_provider.clone())
 }
 
 fn build_router(state: &Arc<AppState>) -> RouterService {
