@@ -4658,8 +4658,13 @@ pub async fn handle_publisher_request(
         platform_request = platform_request.with_cache_bypass();
     }
 
+    // The span must end when the origin responds (or fails), before any
+    // abandonment-telemetry await below — otherwise `ts-origin` would
+    // absorb Tinybird emission time on the error path.
     let origin_span = timings.span(Phase::Origin);
-    let mut response = match services.http_client().send(platform_request).await {
+    let origin_send_result = services.http_client().send(platform_request).await;
+    drop(origin_span);
+    let mut response = match origin_send_result {
         Ok(platform_response) => platform_response.response,
         Err(err) => {
             if let Some(dispatched) = dispatched_auction.take() {
@@ -4676,7 +4681,6 @@ pub async fn handle_publisher_request(
             }));
         }
     };
-    drop(origin_span);
 
     log::debug!(
         "Publisher origin response received: status={}, header_count={}",
@@ -7848,6 +7852,53 @@ mod tests {
         assert!(
             timings.snapshot().origin_ms.is_some(),
             "should record the Origin phase span around the publisher fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn origin_span_is_recorded_when_the_origin_send_fails() {
+        // Regression guard for the review finding that the origin span
+        // guard stayed alive through the error branch (and its
+        // abandonment-telemetry await): the span must close when the send
+        // resolves, so a failed fetch still records `origin_ms` and the
+        // error branch's own work is excluded from it.
+        let settings = create_test_settings();
+        // No queued response: the stub client fails the origin send.
+        let stub = Arc::new(StubHttpClient::new());
+        let services =
+            build_services_with_http_client(stub as Arc<dyn crate::platform::PlatformHttpClient>);
+        let mut request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/some-page")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let timings = RequestTimings::new();
+        request.extensions_mut().insert(timings.clone());
+
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let mut ec_context = EcContext::read_from_request(&settings, &request, &services)
+            .expect("should read EC context");
+        let result = handle_publisher_request(
+            &settings,
+            &services,
+            None,
+            &mut ec_context,
+            AuctionDispatch {
+                orchestrator: &orchestrator,
+                slots: &[],
+                registry: None,
+            },
+            request,
+            EdgeCacheHeader::SurrogateControl,
+        )
+        .await;
+
+        assert!(result.is_err(), "should surface the origin failure");
+        timings.mark_headers_ready();
+        assert!(
+            timings.snapshot().origin_ms.is_some(),
+            "should record the Origin span even when the origin send fails"
         );
     }
 
