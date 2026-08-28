@@ -46,10 +46,17 @@ impl DataDomeIntegration {
         let test_bypass_matched =
             self.take_protection_test_bypass_header(input.request, input.services);
         if test_bypass_matched {
+            // The first marker is DataDome's own tag-suppression signal, read by its
+            // head injector. The second tells core the response is personalized to
+            // this request and cannot be shared through a cache or a template.
             input
                 .request
                 .extensions_mut()
                 .insert(super::DataDomeClientTagSuppressed);
+            input
+                .request
+                .extensions_mut()
+                .insert(crate::response_privacy::PersonalizedResponse);
             log_protection_test_bypass(&input);
             return RequestFilterDecision::Continue(RequestFilterEffects::default());
         }
@@ -162,10 +169,18 @@ impl DataDomeIntegration {
                 suppress_client_tag,
             } => {
                 if suppress_client_tag {
+                    // The first marker is DataDome's own tag-suppression signal, read
+                    // by its head injector. The second tells core the response is
+                    // personalized to this request and cannot be shared through a
+                    // cache or a template.
                     input
                         .request
                         .extensions_mut()
                         .insert(super::DataDomeClientTagSuppressed);
+                    input
+                        .request
+                        .extensions_mut()
+                        .insert(crate::response_privacy::PersonalizedResponse);
                 }
                 log_protection_skip(input, &rule_id, reason, suppress_client_tag);
                 return false;

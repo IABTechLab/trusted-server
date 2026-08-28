@@ -2678,6 +2678,13 @@ fn is_html_document_request(req: &Request<EdgeBody>) -> bool {
     is_navigation_request(req)
 }
 
+/// Whether an integration marked this request's response as personalized.
+fn request_requires_personalized_delivery(req: &Request<EdgeBody>) -> bool {
+    req.extensions()
+        .get::<crate::response_privacy::PersonalizedResponse>()
+        .is_some()
+}
+
 /// Removes request headers that can produce a bodyless or partial origin response.
 fn strip_conditional_and_range_headers(req: &mut Request<EdgeBody>) {
     req.headers_mut().remove(header::IF_NONE_MATCH);
@@ -2701,14 +2708,14 @@ fn response_carries_body(method: &Method, status: StatusCode) -> bool {
         && status != StatusCode::NOT_MODIFIED
 }
 
-/// Prevent shared caches from replaying tag-suppressed HTML to other clients.
-fn apply_datadome_client_tag_cache_privacy(
+/// Prevent shared caches from replaying personalized HTML to other clients.
+fn apply_personalized_response_cache_privacy(
     response: &mut Response<EdgeBody>,
     method: &Method,
-    suppress_datadome_client_side_tag: bool,
+    response_is_personalized: bool,
     content_type: &str,
 ) {
-    if suppress_datadome_client_side_tag
+    if response_is_personalized
         && response_carries_body(method, response.status())
         && is_html_content_type(content_type)
     {
@@ -4449,19 +4456,25 @@ pub async fn handle_publisher_request(
             .creative_opportunities
             .as_ref()
             .is_some_and(CreativeOpportunitiesConfig::origin_is_cookie_independent);
+    let response_is_personalized = request_requires_personalized_delivery(&req);
+    // A personalized response is request-scoped (for example, an IP exclusion), while a
+    // template cache template is shared across readers. A shared template can represent
+    // neither the personalized nor the ordinary variant safely for the other population.
+    let personalization_requires_origin = response_is_personalized;
+    let personalization_requires_full_body =
+        response_is_personalized && is_html_document_request(&req);
+    let request_requires_origin = request_bypasses_template_cache(req.headers())
+        || gpt_diagnostics.requires_private_no_store()
+        || personalization_requires_origin;
+    // The only vendor-named signal core still reads. It decides nothing about caching
+    // or the origin path, because it travels to `HtmlProcessorConfig` so DataDome's own
+    // head injection can leave its client-side tag out, and it moves out of core with
+    // the DataDome integration. Read from the request rather than derived from the
+    // neutral personalization marker above, so the two concerns stay separate.
     let suppress_datadome_client_side_tag = req
         .extensions()
         .get::<crate::integrations::datadome::DataDomeClientTagSuppressed>()
         .is_some();
-    // Tag suppression is request-scoped (for example, an IP exclusion), while a template cache
-    // template is shared across readers. A shared template can represent neither the
-    // suppressed nor unsuppressed variant safely for the other population.
-    let datadome_suppression_requires_origin = suppress_datadome_client_side_tag;
-    let datadome_suppression_requires_full_body =
-        suppress_datadome_client_side_tag && is_html_document_request(&req);
-    let request_requires_origin = request_bypasses_template_cache(req.headers())
-        || gpt_diagnostics.requires_private_no_store()
-        || datadome_suppression_requires_origin;
     let reader_compression = negotiate_reader_compression(req.headers());
     let reader_supports_assembly = reader_compression.is_ok();
     // A failed negotiation bypasses template cache below, so this value is used only on an
@@ -4469,7 +4482,7 @@ pub async fn handle_publisher_request(
     // a panic-prone invariant in the public request handler.
     let reader_compression = reader_compression.unwrap_or(Compression::None);
 
-    if should_run_ad_stack || datadome_suppression_requires_full_body {
+    if should_run_ad_stack || personalization_requires_full_body {
         // HTML document contexts whose output may be synthesized must not
         // receive a cached 304 or partial 206. Non-document subresources contain
         // no executable injected tag, so retain their validators and ranges.
@@ -4850,10 +4863,10 @@ pub async fn handle_publisher_request(
             }
         }
     }
-    apply_datadome_client_tag_cache_privacy(
+    apply_personalized_response_cache_privacy(
         &mut response,
         &request_method,
-        suppress_datadome_client_side_tag,
+        response_is_personalized,
         &origin_content_type,
     );
     apply_publisher_asset_cache_policy(
@@ -11280,6 +11293,9 @@ mod tests {
             suppressed_request
                 .extensions_mut()
                 .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+            suppressed_request
+                .extensions_mut()
+                .insert(crate::response_privacy::PersonalizedResponse);
             let suppressed = run(&settings, &services, suppressed_request).await;
             assert_eq!(
                 suppressed
@@ -14413,6 +14429,8 @@ mod tests {
             .expect("should build conditional request");
         req.extensions_mut()
             .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+        req.extensions_mut()
+            .insert(crate::response_privacy::PersonalizedResponse);
 
         let _response = run_publisher_proxy(&settings, &services, req).await;
 
@@ -14461,6 +14479,8 @@ mod tests {
             .expect("should build conditional iframe request");
         req.extensions_mut()
             .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+        req.extensions_mut()
+            .insert(crate::response_privacy::PersonalizedResponse);
 
         let _response = run_publisher_proxy(&settings, &services, req).await;
 
@@ -14509,6 +14529,8 @@ mod tests {
             .expect("should build conditional subresource request");
         req.extensions_mut()
             .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+        req.extensions_mut()
+            .insert(crate::response_privacy::PersonalizedResponse);
 
         let _response = run_publisher_proxy(&settings, &services, req).await;
 
@@ -14780,7 +14802,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build cacheable HTML response");
 
-        super::apply_datadome_client_tag_cache_privacy(
+        super::apply_personalized_response_cache_privacy(
             &mut response,
             &Method::GET,
             true,
@@ -14826,7 +14848,7 @@ mod tests {
             .header(header::CACHE_CONTROL, "no-store")
             .body(EdgeBody::empty())
             .expect("should build no-store HTML response");
-        super::apply_datadome_client_tag_cache_privacy(
+        super::apply_personalized_response_cache_privacy(
             &mut no_store_response,
             &Method::GET,
             true,
@@ -14851,7 +14873,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build cacheable response");
 
-        super::apply_datadome_client_tag_cache_privacy(
+        super::apply_personalized_response_cache_privacy(
             &mut response,
             &Method::GET,
             false,
@@ -14866,7 +14888,7 @@ mod tests {
             "unsuppressed HTML should retain its existing cache policy"
         );
 
-        super::apply_datadome_client_tag_cache_privacy(
+        super::apply_personalized_response_cache_privacy(
             &mut response,
             &Method::GET,
             true,
@@ -14879,6 +14901,86 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("public, max-age=600"),
             "non-HTML should retain its existing cache policy"
+        );
+    }
+
+    #[test]
+    fn a_personalized_response_marker_from_any_integration_forces_private_caching() {
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CACHE_CONTROL, "public, max-age=600")
+            .header("surrogate-control", "max-age=600")
+            .header("fastly-surrogate-control", "max-age=600")
+            .header("cloudflare-cdn-cache-control", "max-age=600")
+            .header("cdn-cache-control", "max-age=600")
+            .header(header::ETAG, "\"origin-tag\"")
+            .header(header::LAST_MODIFIED, "Wed, 21 Oct 2015 07:28:00 GMT")
+            .body(EdgeBody::empty())
+            .expect("should build cacheable HTML response");
+
+        super::apply_personalized_response_cache_privacy(
+            &mut response,
+            &Method::GET,
+            true,
+            "text/html; charset=utf-8",
+        );
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private"),
+            "a personalized response should be private and non-storable"
+        );
+        for header_name in [
+            "surrogate-control",
+            "fastly-surrogate-control",
+            "cloudflare-cdn-cache-control",
+            "cdn-cache-control",
+        ] {
+            assert!(
+                response.headers().get(header_name).is_none(),
+                "a personalized response should not retain {header_name}"
+            );
+        }
+        for header_name in [header::ETAG, header::LAST_MODIFIED] {
+            assert!(
+                !response.headers().contains_key(&header_name),
+                "a personalized response should not retain {header_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn core_reads_the_neutral_marker_not_the_datadome_type() {
+        let mut personalized = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/page")
+            .header(header::HOST, "publisher.example")
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build personalized request");
+        personalized
+            .extensions_mut()
+            .insert(crate::response_privacy::PersonalizedResponse);
+
+        assert!(
+            super::request_requires_personalized_delivery(&personalized),
+            "the neutral marker alone should mark a response personalized"
+        );
+
+        let ordinary = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/page")
+            .header(header::HOST, "publisher.example")
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build ordinary request");
+
+        assert!(
+            !super::request_requires_personalized_delivery(&ordinary),
+            "a request carrying no marker should not be personalized"
         );
     }
 

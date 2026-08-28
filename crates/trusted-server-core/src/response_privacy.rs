@@ -24,6 +24,16 @@ use crate::settings::Settings;
 #[derive(Clone, Copy, Debug)]
 pub struct TerminalPrivateResponse;
 
+/// Request marker meaning the response is personalized to this request and
+/// must not be shared through any cache or template.
+///
+/// Any integration may set it from a request filter. Core buffers the full
+/// document, keeps the request on the origin path rather than a shared
+/// template, and enforces private caching whenever it is present, without
+/// knowing which integration asked.
+#[derive(Debug, Clone, Copy)]
+pub struct PersonalizedResponse;
+
 const INACTIVE_AD_STACK_BROWSER_CACHE_CONTROL: &str = "private, max-age=60";
 
 #[derive(Debug, Clone, Copy)]
