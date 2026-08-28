@@ -1,7 +1,7 @@
 # Documentation Refresh (Full Surface)
 
 **Date:** 2026-08-19
-**Revised:** 2026-08-27 (round 9)
+**Revised:** 2026-08-27 (round 10)
 **Status:** Draft, pending review
 **Scope:** Documentation and doc tooling. No runtime behavior changes.
 **Baseline:** audited_target_tip `985ff2298` ("Restore secret-store key
@@ -13,9 +13,12 @@ literal-placeholder consumer surface; folded into WP3/WP8a below).
 Baseline contract - a merge-base check alone false-greens when the target
 advances without a rebase, so the guard is exact-tip: after fetching,
 `origin/rc/202608` must equal the recorded audited_target_tip AND the
-implementation branch must contain that commit; the same assertion repeats
-at the final PR HEAD. If either fails, rebase, re-audit the delta, and
-update this spec first. Rounds 1-8 of review history live in git; this
+implementation branch must contain that commit; the same exact-tip
+assertion (never a merge-base comparison) repeats at the final rc-PR
+HEAD. The containment work targets `main`, so an audited_main_tip is
+recorded when the containment PR is cut and the same exact-tip assertion
+runs before that PR merges. If any assertion fails, rebase, re-audit the
+delta, and update this spec first. Rounds 1-8 of review history live in git; this
 revision supersedes their inventories.
 
 ## Context
@@ -248,10 +251,14 @@ the owner to confirm this shape.
   content.
 - `business-use-cases.md` gains its source-level unverified banner
   (asserted by WP1 acceptance).
-- Resolve `docs/public/CNAME` in its own follow-up commit (open question
-  2; both branches specified: delete and re-smoke project URLs, or custom
-  domain with `base: '/'`, Pages/DNS/TLS setup, canonical+asset smokes,
-  and a project-owned-public-domain allowlist classification).
+- Resolve `docs/public/CNAME` (open question 2; both branches specified:
+  delete and re-smoke project URLs, or custom domain with `base: '/'`,
+  Pages/DNS/TLS setup, canonical+asset smokes, and a
+  project-owned-public-domain allowlist classification). Because only
+  `main` deploys, an rc-only edit never reaches the live site: the
+  resolved disposition ships inside the containment PR if question 2 is
+  answered by then, otherwise as a second `main`-target PR. Question 2
+  plus its live smoke is a completion gate for this refresh either way.
 - `fastly.toml`: empty `authors` list; label the key fixtures
   consistently as local test fixtures; comment the four KV stores; remove
   the `test-prebid-eids.sh` comment. `service_id` stays under its
@@ -330,8 +337,10 @@ the retired-token scan is case-insensitive and whitespace-tolerant
 (`rg -i` for prose identifiers; pattern classes for spacing variants such
 as `mock\s*=\s*true`) for `RequestWrapper`, `Equativ`, `with_asset`,
 `type-check`, `settings_data::get_settings`, `SEQUENCE.md`,
-`synthetic_id` (outside shipped changelog entries), and the APS `mock`
-key, returning nothing; the all-tracked privacy scan is clean modulo the
+`synthetic_id` (outside shipped changelog entries),
+`TRUSTED_SERVER__SYNTHETIC__` (the retired env-overlay root in
+`.env.example`/`.env.dev`, with its own synthesized regression fixture),
+and the APS `mock` key, returning nothing; the all-tracked privacy scan is clean modulo the
 allowlist; checkpoint scope = surfaces this package touches, full-set
 greps re-run at final HEAD.
 
@@ -370,11 +379,14 @@ provider profile schemas, and the secret model.
   `scripts/template-cache-local-test.sh` all splice on exact strings -
   the WP8a harness enumerates these consumers and CI fails when a
   placeholder change strands one.
-- Directional field dispositions: the inventory classifies every path as
-  one of canonical-runtime-active, accepted-deprecated-alias,
-  accepted-but-normalized-away, deserialization-only,
-  skipped-at-serialization, store-resolved secret, deliberately-inline
-  secret, or rejected. `tinybird.access_token_secret` is
+- Directional field dispositions as independent axes, not a flat
+  "one of" (real fields overlap: `S3SigV4AuthConfig.secret_store` is
+  simultaneously deprecated, skip-serializing, and normalized away) -
+  lifecycle (canonical / deprecated-alias / rejected), serialization
+  (serialized / skipped), runtime (active / normalized-away /
+  deserialization-only), and secret handling (store-resolved /
+  deliberately-inline / none); the generated reference renders every
+  applicable axis. `tinybird.access_token_secret` is
   accepted-but-normalized-away (deserialized, then set to `None` and
   never serialized) - not a deliberately inline secret; only
   `trusted_client_ip.shared_secret` currently holds that classification.
@@ -427,10 +439,17 @@ contract standard and binds it to generated regions.
   live `/health`; Cloudflare/Fastly 500; degraded-router differences).
 - `trusted_client_ip` documented as middleware (sanitization on all
   adapters, IP resolution only on Fastly), not a route.
-- Cloudflare route parity source: `docs-parity` parses the `build_router`
-  chain with a fail-closed grammar that expands the known constants and
-  loops (path arrays, `publisher_fallback_methods()`); an unrecognized
-  construct fails the check rather than undercounting.
+- Route parity is mechanically closed over all four adapters, not just
+  Cloudflare: Fastly, Axum, and Spin expose named route collections that
+  the per-adapter tests snapshot directly; Cloudflare's inline
+  `build_router` chain is parsed by `docs-parity` with a fail-closed
+  grammar that expands the known constants and loops (path arrays,
+  `publisher_fallback_methods()`) - an unrecognized construct fails the
+  check rather than undercounting. Each adapter's snapshot covers the
+  full route set, methods, predicates, unsupported/guarded semantics,
+  and the startup-error router behavior, asserted as set equality
+  against the checked inventory - a new route on any adapter fails CI
+  until the inventory and generated regions update.
 
 Acceptance: generated regions match the checked inventory per adapter;
 contract checklist satisfied; manual-ownership markers present.
@@ -449,9 +468,15 @@ contract checklist satisfied; manual-ownership markers present.
     are exact and copyable; "seed the keys" prose is not acceptance.
   - `cloudflare.md`: an executable bridge, not a concept. Decided
     retrieval path: after `ts config push --adapter cloudflare --local`,
-    read the envelope back from local Wrangler KV
-    (`wrangler kv key get trusted_server_config --local` against the
-    manifest's namespace), double-encode it into
+    read the envelope back from local Wrangler KV with an explicit
+    binding selector (the guide first defines the binding strategy: the
+    config store gets its own provisioned namespace mapped via
+    `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME`, or reuses
+    the existing `TRUSTED_SERVER_KV` namespace with that mapping - one
+    of the two is chosen and provisioned before the first push, so the
+    clean-state journey never pushes into an unmapped namespace):
+    `wrangler kv key get trusted_server_config --binding <BINDING>
+--local` (or `--namespace-id`), then double-encode it into
     `{"app_config": "<envelope>"}` with `jq`, and write it into a
     gitignored generated manifest (the `wrangler.ci.toml` +
     single-placeholder substitution pattern the integration harness
@@ -463,8 +488,12 @@ contract checklist satisfied; manual-ownership markers present.
     writes; cleanup removes the generated files. The guide carries the
     exact copyable commands, warns that a green push does not configure
     the Worker, and notes no `/health`, the single-provider restriction,
-    and the unwired `TRUSTED_SERVER_KV`. The preferred end state is the
-    CLI envelope-export follow-up, which retires the KV read-back.
+    and the unwired request-time `TRUSTED_SERVER_KV`. The smoke
+    terminates with a publisher request asserting EXPECTED rewritten
+    content, not merely a response - the degraded error router also
+    answers, so status-only checks false-green. The preferred end state
+    is the CLI envelope-export follow-up, which retires the KV
+    read-back.
   - `spin.md` (now writable - the runtime fix landed): `ts config push
 --adapter spin --local` with the required
     `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=default`
@@ -551,17 +580,30 @@ Rustdoc command matrix (self-contained; run with
 doctest jobs need pinned Node because the js crate's build script runs
 npm):
 
-- `cargo doc --no-deps -p trusted-server-core -p trusted-server-js -p trusted-server-openrtb --target wasm32-wasip1`
+- `cargo doc --no-deps --all-features -p trusted-server-core -p trusted-server-js -p trusted-server-openrtb --target wasm32-wasip1`
 - `cargo doc --no-deps -p trusted-server-adapter-fastly --target wasm32-wasip1`
 - `cargo doc --no-deps -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare`
 - `cargo doc --no-deps -p trusted-server-adapter-spin --target wasm32-wasip1 --features spin`
-- `cargo doc --no-deps -p trusted-server-adapter-axum`
-- `cargo doc --no-deps -p trusted-server-cli -p trusted-server-openrtb-codegen --target x86_64-unknown-linux-gnu` (CI; locally substitute the host triple)
+- `cargo doc --no-deps --all-features -p trusted-server-adapter-axum`
+- `cargo doc --no-deps --all-features -p trusted-server-cli -p trusted-server-openrtb-codegen --target x86_64-unknown-linux-gnu` (CI; locally substitute the host triple)
+- The adapter invocations deliberately pin explicit features instead of
+  `--all-features` because their features are target-gated (the
+  cloudflare feature carries a non-wasm32 `compile_error!`); everywhere
+  else `--all-features` applies, matching the repo's documented rustdoc
+  rule and covering core's test-utils feature.
 - Native doctests: `cargo test --doc -p trusted-server-core` (host).
 
+The JSDoc contract is explicit: the ESLint jsdoc rule set applies to
+the WP7 file globs (`lib/src/core/render.ts`, `lib/src/core/types.ts`,
+`lib/src/core/registry.ts`, `lib/src/shared/globals.ts`,
+`lib/src/integrations/creative/**`), requiring a file-header block plus
+JSDoc on every exported declaration (functions, classes, interfaces,
+type aliases) via `jsdoc/require-jsdoc` with those contexts, plus
+`jsdoc/check-alignment` and `jsdoc/check-types`.
+
 Acceptance: worklist complete; matrix builds warning-free with
-`RUSTDOCFLAGS="-D warnings"`; the WP8 jsdoc lint (mandatory, scoped)
-green.
+`RUSTDOCFLAGS="-D warnings"`; the WP8 jsdoc lint (mandatory, scoped as
+above) green.
 
 ### WP8: Enforcement (WP8a scaffolding early, WP8b activation last)
 
@@ -581,13 +623,16 @@ WP8a (lands right after WP1):
   (all languages; graded modes incl. `expected_compile_failure` /
   `expected_validation_failure` / `illustrative_fragment`; expiring
   waivers), the domain/credential scanner + typed allowlist (with a
-  defined input contract: text files detected by content, invalid UTF-8
-  and binaries scanned as metadata/path only, a size cap, generated
-  lockfiles and image assets excluded structurally by path+type rather
-  than hash-by-hash allowlisting, cryptographic checksums and integrity
-  strings recognized structurally, and base64 test fixtures
-  distinguished via the hash-pinned fixture allowlist class - results
-  must be deterministic across platforms), the maintained-source
+  defined input contract: text files detected by content; an
+  expected-text file that is oversized or invalid UTF-8 FAILS the scan
+  rather than being skipped (thresholds must not become evasion
+  mechanisms); generated lockfiles are not blanket-excluded - their
+  structured URL/source/registry fields are scanned while checksum and
+  integrity strings are recognized structurally; known media assets get
+  metadata-string inspection (or are individually manifest-listed with
+  rationale); true binaries are scanned by path/metadata; base64 test
+  fixtures distinguish via the hash-pinned fixture allowlist class -
+  results must be deterministic across platforms), the maintained-source
   manifest checker, and the gate manifest.
 - The example harness, in eight explicit phases (secret resolution
   alone cannot make the template valid: placeholder rejection also
@@ -632,6 +677,12 @@ WP8b (lands last):
   jsdoc lint, gate-manifest check across every surface in its mode,
   repo/orphan/tombstone inventory, disposition-set equality,
   maintained-source manifest equality.
+- Link enforcement per set: VitePress covers only the built public set
+  (and after `srcExclude`, nothing internal), so `docs-parity` adds a
+  repository-relative path and anchor check over the active repo and
+  maintained internal sets; the scheduled external-link check's input
+  is all three active sets; each set gets its own synthesized dead-link
+  negative fixture.
 - Workflow edits: CodeQL `rc/*` PR triggers; `.tool-versions` in
   deploy-docs paths; normalized setup-node cache keys (all workflows, to
   lockfiles); Dependabot roots (github-actions, browser and Next.js
@@ -685,8 +736,11 @@ matrix locally; acceptance greps over the defined sets with output in the
 PR description; the four adapter first-success smokes (Axum env bridge,
 Fastly local push + secrets, Cloudflare envelope transfer, Spin local
 push + variables) executed as documented with commands and cleanup
-recorded; the `main` containment PR merged with its positive smoke; the
-baseline assertion (merge base equals the recorded SHA) passing.
+recorded; the `main` containment PR merged with its positive smoke (its
+audited_main_tip assertion having passed); and the exact-tip baseline
+assertion for `origin/rc/202608` (equal to the recorded
+audited_target_tip, contained in the branch) passing at the final HEAD -
+not a merge-base comparison.
 
 ## Open questions
 
@@ -774,7 +828,8 @@ Fastly resolves the client IP from it). Spin adds an innermost
 
 Integration route families (the checked inventory WP4 generates from;
 disabled integrations register nothing and their paths fall through to
-the publisher proxy; first registration wins on collisions):
+the publisher proxy; a duplicate route registration is a startup
+configuration error, not silently resolved):
 
 - Fixed: `prebid` `GET /integrations/prebid/bundle.js`; `aps`
   `GET /integrations/aps/renderer` (conditional: only in
@@ -785,8 +840,9 @@ the publisher proxy; first registration wins on collisions):
   `g/collect`; `gpt` `script`, `pagead/*`, `tag/*`; `sourcepoint`
   `cdn/*`; `permutive` `api/*`, `secure-signal/*`, `events/*`, `sync/*`,
   `cdn/*`, `sdk`; `lockr` `sdk`, `api/*`.
-- Prefix-overridable: every integration's default
-  `/integrations/<id>` prefix can be overridden by its registration.
+- Prefix-overridable: the trait default `/integrations/<id>` can be
+  overridden by an integration's implementation; the operator-
+  configurable case is Didomi's `proxy_path` config field.
 - Config-derived: `prebid` additionally neutralizes operator-configured
   `script_patterns` plus `/static/prebid/{*rest}`.
 - Methods are per-registration (GET for scripts/CDN, GET+POST for
@@ -837,12 +893,17 @@ attributes and requires key names conditionally. Redacted-but-inline:
 `trusted_client_ip.shared_secret` only; `tinybird.access_token_secret`
 is accepted-but-normalized-away (set to `None`, never serialized).
 Directional dispositions (WP3) classify every path.
-Template placeholder constants and their three literal-string test call
-sites (the config.rs template tests, the CLI ad_templates substitutions,
-the `config init` byte source) are load-bearing. Validator inventory for
+Template placeholder constants and their consumer surface are
+load-bearing; the WP8a-enumerated consumer manifest is canonical (it
+distinguishes literal-substitution consumers - config.rs template tests,
+CLI ad_templates and audit generate/validate substitutions, the
+template-cache script - from include-only consumers such as
+`config init`), and this appendix does not restate its count. Validator inventory for
 companion entries: 2 struct-level schema validators
-(`validate_trusted_client_ip`, APS inventory-identity override), 23
-field-level custom-validator sites, the imperative
+(`validate_trusted_client_ip`, APS inventory-identity override), the
+field-level custom-validator sites (enumerated canonically by the WP8a
+companion manifest, which fails closed on unclassified validators,
+rather than by a count here), the imperative
 `finalize_deserialized` pipeline (normalize → prepare_runtime → derive
 validate → admin coverage → placeholder rejection), the plan-compiler
 family (`ProviderId`/`BidderId` grammars, `canonicalize_endpoint`,
