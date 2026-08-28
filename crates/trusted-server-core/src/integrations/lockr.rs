@@ -312,6 +312,19 @@ fn build(settings: &Settings) -> Result<Option<Arc<LockrIntegration>>, Report<Tr
     Ok(Some(LockrIntegration::new(config)))
 }
 
+/// Validates the Lockr configuration for deployment and reports whether
+/// the integration is enabled.
+///
+/// # Errors
+///
+/// Returns an error when the Lockr configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<LockrConfig>(LOCKR_INTEGRATION_ID)
+        .map(|config| config.is_some())
+}
+
 /// Register the Lockr integration.
 ///
 /// # Errors

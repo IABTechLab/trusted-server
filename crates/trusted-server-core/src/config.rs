@@ -697,7 +697,11 @@ password = "production-admin-password-32-bytes"
     fn deploy_validation_covers_registered_integration_builders() {
         let validated_ids: HashSet<&'static str> =
             DEPLOY_VALIDATED_INTEGRATION_IDS.iter().copied().collect();
-        let missing_ids = crate::integrations::registered_builder_ids()
+        let registry = crate::integrations::IntegrationRegistry::new(&valid_settings())
+            .expect("should build registry from valid settings");
+        let missing_ids = registry
+            .registered_builder_ids()
+            .into_iter()
             .filter(|id| !validated_ids.contains(id))
             .collect::<Vec<_>>();
 

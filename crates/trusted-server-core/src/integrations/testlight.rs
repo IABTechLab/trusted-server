@@ -141,6 +141,19 @@ fn build(
     Ok(Some(TestlightIntegration::new(config)))
 }
 
+/// Validates the Testlight configuration for deployment and reports whether
+/// the integration is enabled.
+///
+/// # Errors
+///
+/// Returns an error when the Testlight configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<TestlightConfig>(TESTLIGHT_INTEGRATION_ID)
+        .map(|config| config.is_some())
+}
+
 /// Register the Testlight integration when enabled.
 ///
 /// # Errors

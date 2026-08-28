@@ -400,6 +400,19 @@ fn build(
     Ok(Some(GoogleTagManagerIntegration::new(config)))
 }
 
+/// Validates the Google Tag Manager configuration for deployment and reports whether
+/// the integration is enabled.
+///
+/// # Errors
+///
+/// Returns an error when the Google Tag Manager configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<GoogleTagManagerConfig>(GTM_INTEGRATION_ID)
+        .map(|config| config.is_some())
+}
+
 /// Register the Google Tag Manager integration when enabled.
 ///
 /// # Errors

@@ -209,6 +209,19 @@ struct ConsoleCookieState {
     canonical: bool,
 }
 
+/// Validates the GPT diagnostics configuration for deployment and reports whether
+/// the integration is enabled.
+///
+/// # Errors
+///
+/// Returns an error when the GPT diagnostics configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<GptDiagnosticsConfig>(GPT_DIAGNOSTICS_INTEGRATION_ID)
+        .map(|config| config.is_some())
+}
+
 /// Register GPT diagnostics when explicitly enabled.
 ///
 /// # Errors

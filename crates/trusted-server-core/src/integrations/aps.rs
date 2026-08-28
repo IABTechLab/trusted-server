@@ -1264,6 +1264,19 @@ impl IntegrationHeadInjector for ApsRendererIntegration {
     }
 }
 
+/// Validates the APS configuration for deployment and reports whether
+/// the integration is enabled.
+///
+/// # Errors
+///
+/// Returns an error when the APS configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<ApsConfig>(APS_INTEGRATION_ID)
+        .map(|config| config.is_some())
+}
+
 /// Register the APS static renderer endpoint when APS is enabled.
 ///
 /// # Errors

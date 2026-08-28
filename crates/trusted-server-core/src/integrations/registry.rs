@@ -710,6 +710,8 @@ struct IntegrationRegistryInner {
 
     // Metadata for introspection
     routes: Vec<(IntegrationEndpoint, &'static str)>,
+    // Every builder considered at construction, enabled or not, in order.
+    builder_ids: Vec<(&'static str, &'static str)>,
     enabled_integration_ids: Vec<&'static str>,
     deferred_js_ids: Vec<&'static str>,
     disabled_js_ids: Vec<&'static str>,
@@ -735,6 +737,7 @@ impl Default for IntegrationRegistryInner {
             head_router: Router::new(),
             options_router: Router::new(),
             routes: Vec::new(),
+            builder_ids: Vec::new(),
             enabled_integration_ids: Vec::new(),
             deferred_js_ids: Vec::new(),
             disabled_js_ids: Vec::new(),
@@ -794,7 +797,7 @@ pub struct IntegrationRegistry {
 }
 
 impl IntegrationRegistry {
-    /// Build a registry from the provided settings.
+    /// Build a registry from the built-in integrations.
     ///
     /// # Errors
     ///
@@ -804,12 +807,45 @@ impl IntegrationRegistry {
     ///
     /// Panics if a route path ends with `/*` but `strip_suffix` unexpectedly fails (invariant violation).
     pub fn new(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
+        Self::with_registrations(settings, &[])
+    }
+
+    /// Build a registry from the built-in integrations followed by `extra`,
+    /// the builders an adapter or a vendor crate supplies.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when two builders claim the same integration id, when
+    /// route registration fails due to duplicate routes or invalid paths, or
+    /// when a builder fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a route path ends with `/*` but `strip_suffix` unexpectedly fails (invariant violation).
+    pub fn with_registrations(
+        settings: &Settings,
+        extra: &[crate::integrations::IntegrationBuilder],
+    ) -> Result<Self, Report<TrustedServerError>> {
         let mut inner = IntegrationRegistryInner::default();
 
-        for builder in crate::integrations::builders() {
-            if let Some(registration) = (builder.build)(settings)? {
+        for builder in crate::integrations::all_builders(extra) {
+            if let Some((_, first_source)) =
+                inner.builder_ids.iter().find(|(id, _)| *id == builder.id())
+            {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "integration id `{}` is registered twice, by `{first_source}` and by `{}`",
+                        builder.id(),
+                        builder.source()
+                    ),
+                }));
+            }
+            inner.builder_ids.push((builder.id(), builder.source()));
+
+            if let Some(registration) = builder.build(settings)? {
                 debug_assert_eq!(
-                    registration.integration_id, builder.id,
+                    registration.integration_id,
+                    builder.id(),
                     "integration builder ID should match registration ID"
                 );
                 inner
@@ -895,6 +931,14 @@ impl IntegrationRegistry {
         Ok(Self {
             inner: Arc::new(inner),
         })
+    }
+
+    /// Every integration id the registry was built from, enabled or not, in
+    /// registration order. The deploy validation and registry tests enumerate
+    /// this to check every builder was considered.
+    #[must_use]
+    pub fn registered_builder_ids(&self) -> Vec<&'static str> {
+        self.inner.builder_ids.iter().map(|(id, _)| *id).collect()
     }
 
     fn find_route(&self, method: &Method, path: &str) -> Option<&RouteValue> {
@@ -1246,6 +1290,7 @@ impl IntegrationRegistry {
                 head_router: Router::new(),
                 options_router: Router::new(),
                 routes: Vec::new(),
+                builder_ids: Vec::new(),
                 enabled_integration_ids: Vec::new(),
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
@@ -1276,6 +1321,7 @@ impl IntegrationRegistry {
                 head_router: Router::new(),
                 options_router: Router::new(),
                 routes: Vec::new(),
+                builder_ids: Vec::new(),
                 enabled_integration_ids: Vec::new(),
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
@@ -1302,6 +1348,7 @@ impl IntegrationRegistry {
                 head_router: Router::new(),
                 options_router: Router::new(),
                 routes: Vec::new(),
+                builder_ids: Vec::new(),
                 enabled_integration_ids: Vec::new(),
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
@@ -1368,6 +1415,7 @@ impl IntegrationRegistry {
                 head_router,
                 options_router,
                 routes: Vec::new(),
+                builder_ids: Vec::new(),
                 enabled_integration_ids: Vec::new(),
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
@@ -1383,7 +1431,31 @@ impl IntegrationRegistry {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use error_stack::Report;
+
+    use super::IntegrationRegistration;
+    use crate::error::TrustedServerError;
+    use crate::settings::Settings;
+
+    /// Builds a registration for the `probe` integration on every call.
+    pub(crate) fn probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(IntegrationRegistration::builder("probe").build()))
+    }
+
+    /// Validates nothing and reports the integration as enabled.
+    pub(crate) fn validate_nothing(
+        _settings: &Settings,
+    ) -> Result<bool, Report<TrustedServerError>> {
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::{probe_registration, validate_nothing};
     use super::*;
     use crate::constants::COOKIE_TS_EC;
     use crate::permissions::{Permission, PermissionSet, PermissionState};
@@ -2449,6 +2521,67 @@ mod tests {
         assert_eq!(
             recombined, all_sorted,
             "should reconstruct full module list from immediate + deferred"
+        );
+    }
+
+    fn duplicate_lockr_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(IntegrationRegistration::builder("lockr").build()))
+    }
+
+    #[test]
+    fn with_registrations_adds_an_external_builder_after_the_built_ins() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            probe_registration,
+            validate_nothing,
+        )];
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build registry with an external builder");
+
+        assert!(
+            registry.integration_enabled("probe"),
+            "should register the external integration"
+        );
+        let ids = registry.registered_builder_ids();
+        assert_eq!(
+            ids.last().copied(),
+            Some("probe"),
+            "should order the external builder after every built-in"
+        );
+    }
+
+    #[test]
+    fn with_registrations_rejects_a_duplicate_integration_id_naming_both_sources() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "lockr",
+                &serde_json::json!({ "enabled": true, "app_id": "test-app-id" }),
+            )
+            .expect("should insert lockr config");
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "lockr",
+            "seam-probe",
+            duplicate_lockr_registration,
+            validate_nothing,
+        )];
+
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should reject a duplicate integration id");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("lockr")
+                && message.contains("trusted-server-core")
+                && message.contains("seam-probe"),
+            "error should name the id and both sources: {message}"
         );
     }
 }

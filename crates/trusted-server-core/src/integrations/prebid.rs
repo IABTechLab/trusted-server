@@ -977,6 +977,17 @@ fn build(
     Ok(Some(PrebidIntegration::try_new(config)?))
 }
 
+/// Validates the Prebid configuration for deployment and reports whether
+/// the integration is enabled.
+///
+/// # Errors
+///
+/// Returns an error when the Prebid configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    validate_config_for_startup(settings).map(|config| config.is_some())
+}
+
 /// Register the Prebid integration when enabled.
 ///
 /// # Errors

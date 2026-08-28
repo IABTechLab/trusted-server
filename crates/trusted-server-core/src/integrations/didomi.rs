@@ -240,6 +240,19 @@ fn build(
     Ok(Some(DidomiIntegration::new(Arc::new(config))))
 }
 
+/// Validates the Didomi configuration for deployment and reports whether
+/// the integration is enabled.
+///
+/// # Errors
+///
+/// Returns an error when the Didomi configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<DidomiIntegrationConfig>(DIDOMI_INTEGRATION_ID)
+        .map(|config| config.is_some())
+}
+
 /// Register the Didomi consent notice integration when enabled.
 ///
 /// # Errors

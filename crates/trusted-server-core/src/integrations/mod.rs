@@ -5,6 +5,7 @@ use std::time::Duration;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use futures::StreamExt as _;
+use http::Request;
 use url::Url;
 
 use crate::error::TrustedServerError;
@@ -279,72 +280,196 @@ pub(crate) async fn collect_response_bounded(
     }
 }
 
-type IntegrationBuilderFn =
+/// Builds an integration's registration from settings, or `None` when the
+/// integration is not enabled.
+pub type IntegrationBuilderFn =
     fn(&Settings) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>>;
 
-pub(crate) struct IntegrationBuilder {
+/// Validates an integration's configuration for deployment and reports
+/// whether the integration is enabled.
+///
+/// Runs for every builder, enabled or not, so a typo in a disabled block is
+/// still caught.
+pub type IntegrationValidateFn = fn(&Settings) -> Result<bool, Report<TrustedServerError>>;
+
+/// Prepares a request before routing, for every request the adapter sees.
+///
+/// Runs whether or not the integration is enabled, so an integration can
+/// strip its reserved query or cookie even when it is switched off.
+pub type IntegrationPrepareRequestFn =
+    fn(&Settings, &mut Request<EdgeBody>) -> Result<(), Report<TrustedServerError>>;
+
+/// Source label for the built-in integrations.
+pub const CORE_SOURCE: &str = "trusted-server-core";
+
+/// A named factory for one integration, the unit an adapter or a vendor crate
+/// hands to [`IntegrationRegistry::with_registrations`].
+///
+/// # Examples
+///
+/// ```
+/// use error_stack::Report;
+/// use trusted_server_core::error::TrustedServerError;
+/// use trusted_server_core::integrations::{
+///     IntegrationBuilder, IntegrationRegistration, IntegrationRegistry,
+/// };
+/// use trusted_server_core::settings::Settings;
+///
+/// fn build(
+///     _settings: &Settings,
+/// ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+///     Ok(Some(IntegrationRegistration::builder("example").build()))
+/// }
+///
+/// fn validate(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+///     Ok(true)
+/// }
+///
+/// # fn demo(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+/// let builder = IntegrationBuilder::new("example", "example-crate", build, validate);
+/// let registry = IntegrationRegistry::with_registrations(settings, &[builder])?;
+/// assert!(registry.integration_enabled("example"));
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Copy)]
+pub struct IntegrationBuilder {
     id: &'static str,
+    source: &'static str,
     build: IntegrationBuilderFn,
+    validate: IntegrationValidateFn,
+    prepare_request: Option<IntegrationPrepareRequestFn>,
 }
 
-pub(crate) fn builders() -> &'static [IntegrationBuilder] {
-    &[
-        IntegrationBuilder {
-            id: "aps",
-            build: aps::register,
-        },
-        IntegrationBuilder {
-            id: "prebid",
-            build: prebid::register,
-        },
-        IntegrationBuilder {
-            id: "testlight",
-            build: testlight::register,
-        },
-        IntegrationBuilder {
-            id: "nextjs",
-            build: nextjs::register,
-        },
-        IntegrationBuilder {
-            id: "permutive",
-            build: permutive::register,
-        },
-        IntegrationBuilder {
-            id: "lockr",
-            build: lockr::register,
-        },
-        IntegrationBuilder {
-            id: "didomi",
-            build: didomi::register,
-        },
-        IntegrationBuilder {
-            id: "sourcepoint",
-            build: sourcepoint::register,
-        },
-        IntegrationBuilder {
-            id: "osano",
-            build: osano::register,
-        },
-        IntegrationBuilder {
-            id: "google_tag_manager",
-            build: google_tag_manager::register,
-        },
-        IntegrationBuilder {
-            id: "datadome",
-            build: datadome::register,
-        },
-        IntegrationBuilder {
-            id: "gpt",
-            build: gpt::register,
-        },
-        IntegrationBuilder {
-            id: "gpt_diagnostics",
-            build: gpt_diagnostics::register,
-        },
-    ]
+impl IntegrationBuilder {
+    /// Creates a builder for the integration `id`, attributed to `source`
+    /// (a crate or package name used in duplicate-id errors).
+    #[must_use]
+    pub const fn new(
+        id: &'static str,
+        source: &'static str,
+        build: IntegrationBuilderFn,
+        validate: IntegrationValidateFn,
+    ) -> Self {
+        Self {
+            id,
+            source,
+            build,
+            validate,
+            prepare_request: None,
+        }
+    }
+
+    /// Attaches a request preparation function that runs before routing on
+    /// every request, enabled or not.
+    #[must_use]
+    pub const fn with_request_preparer(mut self, prepare: IntegrationPrepareRequestFn) -> Self {
+        self.prepare_request = Some(prepare);
+        self
+    }
+
+    /// The integration id this builder produces.
+    #[must_use]
+    pub const fn id(&self) -> &'static str {
+        self.id
+    }
+
+    /// The source label used in diagnostics.
+    #[must_use]
+    pub const fn source(&self) -> &'static str {
+        self.source
+    }
+
+    /// Builds the registration, or `None` when the integration is not enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the integration is enabled with invalid
+    /// configuration.
+    pub(crate) fn build(
+        &self,
+        settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        (self.build)(settings)
+    }
+
+    /// Validates the integration's configuration for deployment and reports
+    /// whether the integration is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration cannot be parsed or fails
+    /// validation.
+    // Deploy validation does not yet enumerate builders, so nothing in the
+    // crate calls this until that is wired up.
+    #[allow(dead_code)]
+    pub(crate) fn validate(&self, settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+        (self.validate)(settings)
+    }
+
+    /// The request preparation function, when one is attached.
+    // The adapters do not yet run request preparers, so nothing in the crate
+    // calls this until that is wired up.
+    #[allow(dead_code)]
+    pub(crate) fn prepare_request(&self) -> Option<IntegrationPrepareRequestFn> {
+        self.prepare_request
+    }
 }
 
-#[cfg(test)]
-pub(crate) fn registered_builder_ids() -> impl Iterator<Item = &'static str> {
-    builders().iter().map(|builder| builder.id)
+/// The built-in integrations, in hook order.
+const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
+    IntegrationBuilder::new("aps", CORE_SOURCE, aps::register, aps::validate),
+    IntegrationBuilder::new("prebid", CORE_SOURCE, prebid::register, prebid::validate),
+    IntegrationBuilder::new(
+        "testlight",
+        CORE_SOURCE,
+        testlight::register,
+        testlight::validate,
+    ),
+    IntegrationBuilder::new("nextjs", CORE_SOURCE, nextjs::register, nextjs::validate),
+    IntegrationBuilder::new(
+        "permutive",
+        CORE_SOURCE,
+        permutive::register,
+        permutive::validate,
+    ),
+    IntegrationBuilder::new("lockr", CORE_SOURCE, lockr::register, lockr::validate),
+    IntegrationBuilder::new("didomi", CORE_SOURCE, didomi::register, didomi::validate),
+    IntegrationBuilder::new(
+        "sourcepoint",
+        CORE_SOURCE,
+        sourcepoint::register,
+        sourcepoint::validate,
+    ),
+    IntegrationBuilder::new("osano", CORE_SOURCE, osano::register, osano::validate),
+    IntegrationBuilder::new(
+        "google_tag_manager",
+        CORE_SOURCE,
+        google_tag_manager::register,
+        google_tag_manager::validate,
+    ),
+    IntegrationBuilder::new(
+        "datadome",
+        CORE_SOURCE,
+        datadome::register,
+        datadome::validate,
+    ),
+    IntegrationBuilder::new("gpt", CORE_SOURCE, gpt::register, gpt::validate),
+    IntegrationBuilder::new(
+        "gpt_diagnostics",
+        CORE_SOURCE,
+        gpt_diagnostics::register,
+        gpt_diagnostics::validate,
+    ),
+];
+
+/// Every builder the registry will consider: the built-in set followed by
+/// `extra`, in that order, so hook order for the built-ins never changes.
+pub(crate) fn all_builders(
+    extra: &[IntegrationBuilder],
+) -> impl Iterator<Item = IntegrationBuilder> + '_ {
+    BUILT_IN_BUILDERS
+        .iter()
+        .copied()
+        .chain(extra.iter().copied())
 }

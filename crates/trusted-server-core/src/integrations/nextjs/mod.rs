@@ -70,6 +70,19 @@ pub(super) fn configuration_error(message: impl Into<String>) -> Report<TrustedS
     })
 }
 
+/// Validates the Next.js configuration for deployment and reports whether
+/// the integration is enabled.
+///
+/// # Errors
+///
+/// Returns an error when the Next.js configuration cannot be parsed or fails
+/// validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<NextJsIntegrationConfig>(NEXTJS_INTEGRATION_ID)
+        .map(|config| config.is_some())
+}
+
 /// Register the Next.js integration when enabled.
 ///
 /// # Errors

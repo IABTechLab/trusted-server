@@ -973,6 +973,23 @@ fn build(
     Ok(Some(integration))
 }
 
+/// Validates the `DataDome` configuration for deployment and reports whether
+/// the integration is enabled.
+///
+/// # Errors
+///
+/// Returns an error when the `DataDome` configuration cannot be parsed, fails
+/// validation, or fails the startup checks on protection, bypass, or
+/// client-tag settings.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    let Some(config) = settings.integration_config::<DataDomeConfig>(DATADOME_INTEGRATION_ID)?
+    else {
+        return Ok(false);
+    };
+    DataDomeIntegration::validate_config_for_startup(config)?;
+    Ok(true)
+}
+
 /// Register the `DataDome` integration with Trusted Server.
 ///
 /// # Errors
