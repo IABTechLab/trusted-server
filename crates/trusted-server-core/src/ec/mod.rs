@@ -120,32 +120,6 @@ fn request_ec_id_if_allowed(value: &str, source: &str) -> Option<String> {
     None
 }
 
-/// Gets an existing EC ID from the request.
-///
-/// Attempts to retrieve an existing EC ID from the `ts-ec` cookie.
-///
-/// Returns `None` if the cookie does not contain a valid EC ID.
-///
-/// # Errors
-///
-/// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
-pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<TrustedServerError>> {
-    let parsed = parse_ec_from_request(req)?;
-    // Accept the coded form (any provider's `{code}~value` within the global
-    // identifier bounds) and the legacy bare HMAC form. Provider-aware
-    // ownership lives in `EcContext`; this helper only reads the string.
-    let ec_id = parsed
-        .cookie_ec
-        .filter(|v| match provider::split_provider_code(v) {
-            (Some(_), value) => !value.is_empty() && cookies::ec_id_has_only_allowed_chars(v),
-            (None, value) => is_valid_ec_id(value),
-        });
-    if let Some(ref id) = ec_id {
-        log::trace!("Existing EC ID found: {}", log_id(id));
-    }
-    Ok(ec_id)
-}
-
 /// Captures the EC state for a single request lifecycle.
 ///
 /// Created via [`read_from_request`](Self::read_from_request) during
