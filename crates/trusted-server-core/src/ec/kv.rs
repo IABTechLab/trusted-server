@@ -525,6 +525,11 @@ impl KvIdentityGraph {
     /// write. A failed *write* still reports [`EcKvSnapshot::Failed`] — that is
     /// an operation failure, not an ambiguous read.
     ///
+    /// A caller-supplied `Missing` snapshot is revalidated once before the
+    /// updates are dropped, because a point read on an eventually-consistent
+    /// store cannot prove absence and routes without orphan recovery have no
+    /// later chance to retry.
+    ///
     /// [`generate_if_needed`]: super::generate_if_needed
     pub(crate) fn upsert_partner_ids_from_snapshot(
         &self,
@@ -546,10 +551,16 @@ impl KvIdentityGraph {
             _ => None,
         };
 
-        // Resolve the initial usable snapshot without spending a CAS attempt. A
-        // not-read, generation-unavailable, or foreign-ID snapshot is refreshed
-        // once; an authoritative miss or failure for this EC ID is returned
-        // as-is (the hot path never retries a failed lookup). This keeps all
+        // Resolve the initial usable snapshot without spending a CAS attempt.
+        // Every snapshot except a usable `Present` for this EC ID and a read
+        // that already failed is refreshed once. A `Missing` recorded earlier
+        // in the request is not proof of absence: edge KV point reads are
+        // eventually consistent, and named routes such as `/auction` and
+        // `/_ts/page-bids` never run orphan recovery, so short-circuiting on a
+        // stale miss there would drop the request's collected partner IDs
+        // outright. A refresh that still misses keeps the no-create behavior.
+        // A `Failed` read is returned as-is — the hot path never retries a
+        // lookup that already errored. Resolving here keeps all
         // `MAX_CAS_RETRIES` iterations available for actual writes.
         let mut current = match snapshot {
             EcKvSnapshot::Present {
@@ -557,10 +568,7 @@ impl KvIdentityGraph {
                 generation: Some(_),
                 ..
             } if snapshot_id == ec_id => snapshot,
-            EcKvSnapshot::Missing {
-                ec_id: ref snapshot_id,
-            }
-            | EcKvSnapshot::Failed {
+            EcKvSnapshot::Failed {
                 ec_id: ref snapshot_id,
             } if snapshot_id == ec_id => return snapshot,
             _ => self.load_snapshot(ec_id),
@@ -629,6 +637,11 @@ impl KvIdentityGraph {
             }
         }
 
+        log::warn!(
+            "snapshot partner upsert for '{}': CAS conflict after {MAX_CAS_RETRIES} retries;              {} partner updates were not persisted",
+            log_id(ec_id),
+            updates.len(),
+        );
         EcKvSnapshot::Failed {
             ec_id: ec_id.to_owned(),
         }
@@ -1013,6 +1026,13 @@ impl KvIdentityGraph {
                 }
             }
         }
+        // Withdrawal enforcement lost every CAS race, so the row can still be
+        // live with consent granted while the browser cookie is cleared. That
+        // divergence is only visible to operators if it is logged here.
+        log::warn!(
+            "withdrawal tombstone for '{}': CAS conflict after {MAX_CAS_RETRIES} retries; the              identity-graph row may still be live with consent granted",
+            log_id(ec_id)
+        );
         EcKvSnapshot::Failed {
             ec_id: ec_id.to_owned(),
         }
@@ -2028,6 +2048,92 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_upsert_revalidates_transient_missing_and_persists() {
+        // An eventually-consistent point read earlier in the request missed a
+        // row that exists. Named routes such as `/auction` never run orphan
+        // recovery, so this refresh is the request's only chance to persist the
+        // collected partner IDs.
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = snapshot_ec_id();
+        kv.create(&ec_id, &live_entry()).expect("should seed live");
+        let updates = [PartnerIdUpdate::new("ssp_x", "uid-1")];
+
+        let outcome = kv.upsert_partner_ids_from_snapshot(
+            &ec_id,
+            &updates,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+        );
+
+        assert_eq!(
+            outcome
+                .entry_for(&ec_id)
+                .and_then(|entry| entry.ids.get("ssp_x").map(|id| id.uid.clone())),
+            Some("uid-1".to_owned()),
+            "a stale miss must be revalidated before the updates are dropped"
+        );
+        let (stored, _) = kv
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("row should remain");
+        assert_eq!(
+            stored.ids.get("ssp_x").map(|id| id.uid.as_str()),
+            Some("uid-1"),
+            "the revalidated update must reach the store"
+        );
+    }
+
+    #[test]
+    fn snapshot_upsert_confirmed_missing_still_never_creates() {
+        // Revalidation only changes what a *stale* miss does. A row that is
+        // genuinely absent on the refresh must stay absent.
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = snapshot_ec_id();
+        let updates = [PartnerIdUpdate::new("ssp_x", "uid-1")];
+
+        let outcome = kv.upsert_partner_ids_from_snapshot(
+            &ec_id,
+            &updates,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+        );
+
+        assert!(
+            matches!(outcome, EcKvSnapshot::Missing { .. }),
+            "a confirmed miss must stay missing"
+        );
+        assert!(
+            kv.get(&ec_id).expect("should read store").is_none(),
+            "must not create a root entry for a missing key"
+        );
+    }
+
+    #[test]
+    fn snapshot_upsert_failed_snapshot_is_not_revalidated() {
+        // A lookup that already errored is not retried on the hot path, even
+        // though the row exists.
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = snapshot_ec_id();
+        kv.create(&ec_id, &live_entry()).expect("should seed live");
+        let updates = [PartnerIdUpdate::new("ssp_x", "uid-1")];
+
+        let outcome = kv.upsert_partner_ids_from_snapshot(
+            &ec_id,
+            &updates,
+            EcKvSnapshot::Failed {
+                ec_id: ec_id.clone(),
+            },
+        );
+
+        assert!(
+            matches!(outcome, EcKvSnapshot::Failed { .. }),
+            "a failed lookup must not be retried by partner enrichment"
+        );
+    }
+
+    #[test]
     fn snapshot_upsert_rejects_tombstone() {
         let kv = KvIdentityGraph::in_memory("test_store");
         let ec_id = snapshot_ec_id();
@@ -2108,6 +2214,32 @@ mod tests {
                 .entry_for(&ec_id)
                 .is_some_and(|entry| !entry.consent.ok),
             "the fifth CAS attempt must persist the tombstone after a refresh and four conflicts"
+        );
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_returns_failed_after_cas_exhaustion() {
+        // Every CAS attempt loses its race, so the row stays live with consent
+        // granted while the browser cookie is already cleared. The caller must
+        // see a failure it can report rather than a silent no-op.
+        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(MAX_CAS_RETRIES, false));
+        let ec_id = snapshot_ec_id();
+        graph.create(&ec_id, &live_entry()).expect("should seed");
+        let snapshot = graph.load_snapshot(&ec_id);
+
+        let outcome = graph.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        assert!(
+            matches!(outcome, EcKvSnapshot::Failed { .. }),
+            "CAS exhaustion must report a failed withdrawal"
+        );
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("row should remain");
+        assert!(
+            stored.consent.ok,
+            "the row is still live, which is exactly why the failure must be reported"
         );
     }
 

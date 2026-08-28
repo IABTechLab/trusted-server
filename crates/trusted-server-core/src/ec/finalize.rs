@@ -18,7 +18,7 @@ use super::kv::{CreateIfAbsentOutcome, KvIdentityGraph, apply_partner_id_updates
 use super::kv_types::KvEntry;
 use super::prebid_eids::collect_eid_cookie_updates;
 use super::registry::PartnerRegistry;
-use super::{EcKvSnapshot, current_timestamp};
+use super::{EcKvSnapshot, current_timestamp, log_id};
 
 /// TS-managed response headers tied to EC identity output.
 const EC_RESPONSE_HEADERS: &[&str] = &[
@@ -76,6 +76,18 @@ pub fn ec_finalize_response(
                         EcKvSnapshot::NotRead
                     };
                     let outcome = graph.tombstone_existing_from_snapshot(ec_id, initial);
+                    // The browser cookie is already cleared, so a failed
+                    // tombstone leaves a live row that server-side consumers
+                    // still read as consented. Report every failure, including
+                    // the non-active cookie ID whose outcome is not retained on
+                    // the request context.
+                    if matches!(outcome, EcKvSnapshot::Failed { .. }) {
+                        log::warn!(
+                            "EC withdrawal tombstone failed for '{}': the identity-graph row may \
+                             still be live with consent granted",
+                            log_id(ec_id)
+                        );
+                    }
                     if ec_context.ec_value() == Some(ec_id) {
                         ec_context.set_kv_snapshot(outcome);
                     }
@@ -742,6 +754,92 @@ mod tests {
         assert!(
             get_header(&response, "set-cookie").is_some(),
             "should emit replacement cookie after persistence"
+        );
+    }
+
+    #[test]
+    fn finalize_named_route_transient_miss_still_persists_eid_updates() {
+        // `/auction` and `/_ts/page-bids` save their first lookup into the
+        // context and are never recovery eligible, so a stale miss there has no
+        // later chance to retry. Finalization must revalidate before dropping
+        // the collected partner IDs.
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("named1");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let live = KvEntry::new(
+            &granting_consent(),
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&ec_id, &live)
+            .expect("should seed the live row the endpoint lookup missed");
+        let mut ec_context = returning_user_context(
+            &ec_id,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+            false,
+        );
+        let partners = vec![make_partner("sharedid.org")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            Some("shared-cookie-id"),
+            &mut response,
+        );
+
+        assert_did_not_rotate(&ec_context, &ec_id, &response);
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("row should remain");
+        assert_eq!(
+            stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
+            Some("shared-cookie-id"),
+            "a stale endpoint miss must not suppress EID persistence"
+        );
+    }
+
+    #[test]
+    fn finalize_named_route_confirmed_miss_does_not_create_a_row() {
+        // The same path with a genuinely absent row must stay a no-op: a route
+        // without orphan recovery must never mint an identity-graph entry.
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("named2");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let mut ec_context = returning_user_context(
+            &ec_id,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+            false,
+        );
+        let partners = vec![make_partner("sharedid.org")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            Some("shared-cookie-id"),
+            &mut response,
+        );
+
+        assert_did_not_rotate(&ec_context, &ec_id, &response);
+        assert!(
+            graph.get(&ec_id).expect("should read store").is_none(),
+            "a confirmed miss must not create a root entry"
         );
     }
 
