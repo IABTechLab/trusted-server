@@ -313,10 +313,10 @@ pub struct CreativeOpportunitiesConfig {
     ///
     /// **Unset or empty means no operator-stated header is covered, so any origin
     /// `Vary` other than structurally covered `Accept-Encoding` disqualifies the
-    /// response.** `Cookie` may never be configured: a per-cookie object violates the
-    /// reader-neutral template contract. This fail-closed default prevents a deployment
-    /// that has not stated what its origin varies on from gaining a shared cache by
-    /// omission.
+    /// response.** `Cookie` and `Authorization` may never be configured: their values
+    /// are not reader-neutral template dimensions. This fail-closed default prevents a
+    /// deployment that has not stated what its origin varies on from gaining a shared
+    /// cache by omission.
     ///
     /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -476,6 +476,15 @@ impl CreativeOpportunitiesConfig {
             if names.iter().any(|name| name.eq_ignore_ascii_case("cookie")) {
                 return Err(
                     "template_cache_vary must not include Cookie; shared templates are reader-neutral"
+                        .to_string(),
+                );
+            }
+            if names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("authorization"))
+            {
+                return Err(
+                    "template_cache_vary must not include Authorization; shared templates are keyed on the edge-terminated credential decision, not the header value"
                         .to_string(),
                 );
             }
@@ -2107,6 +2116,20 @@ mod tests {
             .validate_runtime()
             .expect_err("per-cookie templates violate the reader-neutral shared-template contract");
         assert!(err.contains("Cookie"), "unexpected error: {err}");
+
+        for name in ["Authorization", "aUtHoRiZaTiOn"] {
+            let authorization_key: CreativeOpportunitiesConfig = toml::from_str(&format!(
+                r#"
+                    gam_network_id = "99999"
+                    template_cache_vary = ["{name}"]
+                "#,
+            ))
+            .expect("shape should deserialize before runtime validation");
+            let err = authorization_key
+                .validate_runtime()
+                .expect_err("authorization must not enter shared-template cache keys");
+            assert!(err.contains("Authorization"), "unexpected error: {err}");
+        }
     }
 
     #[test]
