@@ -7,6 +7,7 @@ import { GptDiagnosticsBindingManager } from './binding';
 import { GptDiagnosticsObserver } from './observer';
 import type { GptObserverWindow } from './observer';
 import { GptDiagnosticsOverlay } from './overlay';
+import { GptDiagnosticsSlotSizeObserver } from './slot_size_observer';
 import { GptDiagnosticsStore } from './store';
 
 interface GptDiagnosticsRuntime {
@@ -44,6 +45,7 @@ export function installGptDiagnosticsRuntime(
   let bindings: GptDiagnosticsBindingManager | undefined;
   let badges: GptDiagnosticsBadgeManager | undefined;
   let overlay: GptDiagnosticsOverlay | undefined;
+  let slotSizeObserver: GptDiagnosticsSlotSizeObserver | undefined;
   let apiController: GptDiagnosticsApiController | undefined;
 
   try {
@@ -59,6 +61,7 @@ export function installGptDiagnosticsRuntime(
       window: target,
       document: target.document,
     });
+    slotSizeObserver = new GptDiagnosticsSlotSizeObserver(store, bindings, { window: target });
     overlay = new GptDiagnosticsOverlay(store, bindings, {
       window: target,
       document: target.document,
@@ -83,6 +86,7 @@ export function installGptDiagnosticsRuntime(
         apiController?.destroy();
         overlay?.destroy();
         badges?.destroy();
+        slotSizeObserver?.destroy();
         bindings?.destroy();
         delete target.__tsjs_gpt_diagnostics_runtime;
       },
@@ -95,6 +99,7 @@ export function installGptDiagnosticsRuntime(
     apiController?.destroy();
     overlay?.destroy();
     badges?.destroy();
+    slotSizeObserver?.destroy();
     bindings?.destroy();
     log.warn('gpt diagnostics: runtime installation failed', error);
     return undefined;

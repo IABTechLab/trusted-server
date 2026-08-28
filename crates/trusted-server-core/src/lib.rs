@@ -35,6 +35,7 @@ pub(crate) mod asset_image_optimizer;
 pub mod auction;
 pub mod auction_config_types;
 pub mod auth;
+pub mod cache_policy;
 pub mod config;
 pub mod config_payload;
 pub mod consent;

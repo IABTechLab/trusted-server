@@ -29,6 +29,7 @@ glob = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
 http = { workspace = true }
+httpdate = { workspace = true }
 iab_gpp = { workspace = true }
 jose-jwk = { workspace = true }
 log = { workspace = true }

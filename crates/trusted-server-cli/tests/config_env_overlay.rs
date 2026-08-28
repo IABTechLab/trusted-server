@@ -30,6 +30,7 @@ ids = ["trusted_server_secrets"]
 const REWRITE_ENV: &str = "TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES";
 const SANITIZE_ENV: &str = "TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES";
 const GAM_ATTRIBUTION_ENV: &str = "TRUSTED_SERVER__INTEGRATIONS__GPT__GAM_ATTRIBUTION_ENABLED";
+const AD_TEMPLATES_ENABLED_ENV: &str = "TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED";
 
 struct MigratedProject {
     directory: TempDir,
@@ -45,10 +46,12 @@ fn migrated_legacy_project() -> MigratedProject {
         .parse::<DocumentMut>()
         .expect("should parse legacy integration config");
     // EdgeZero v0.0.4 environment overlays cannot create missing TOML leaves,
-    // so a migrated config must carry both creative-processing leaves for the
-    // corresponding environment variables to take effect.
+    // so a migrated config must carry every leaf whose environment override is
+    // expected to take effect.
     document["auction"]["rewrite_creatives"] = value(true);
     document["auction"]["sanitize_creatives"] = value(false);
+    document["creative_opportunities"]["enabled"] = value(true);
+    document["creative_opportunities"]["gam_network_id"] = value("123456789");
     fs::write(&config_path, document.to_string()).expect("should write migrated config");
     fs::write(&manifest_path, MANIFEST).expect("should write test manifest");
     MigratedProject {
@@ -114,7 +117,7 @@ fn migrated_legacy_config_applies_rewrite_creatives_environment_override() {
 }
 
 #[test]
-fn migrated_legacy_config_applies_gam_attribution_environment_override() {
+fn migrated_legacy_config_applies_boolean_environment_overrides() {
     let project = migrated_legacy_project();
     let output = Command::new(env!("CARGO_BIN_EXE_ts"))
         .args(["config", "push", "--adapter", "axum", "--manifest"])
@@ -124,6 +127,7 @@ fn migrated_legacy_config_applies_gam_attribution_environment_override() {
         .args(["--yes", "--no-diff"])
         .current_dir(project.directory.path())
         .env(GAM_ATTRIBUTION_ENV, "true")
+        .env(AD_TEMPLATES_ENABLED_ENV, "false")
         .output()
         .expect("should run ts config push");
 
@@ -153,6 +157,11 @@ fn migrated_legacy_config_applies_gam_attribution_environment_override() {
         envelope["data"]["integrations"]["gpt"]["gam_attribution_enabled"],
         serde_json::Value::Bool(true),
         "pushed config should contain the GAM attribution environment override"
+    );
+    assert_eq!(
+        envelope["data"]["creative_opportunities"]["enabled"],
+        serde_json::Value::Bool(false),
+        "pushed config should contain the creative opportunities environment override"
     );
 }
 

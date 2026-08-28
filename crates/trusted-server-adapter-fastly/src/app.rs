@@ -22,6 +22,9 @@
 //! | POST | `/verify-signature` | [`handle_verify_signature`] |
 //! | POST | `/_ts/admin/keys/rotate` | [`handle_rotate_key`] |
 //! | POST | `/_ts/admin/keys/deactivate` | [`handle_deactivate_key`] |
+//! | GET | `/_ts/admin/ec` | [`handle_admin_ec_lookup`] |
+//! | GET | `/_ts/admin/ec/{id}` | [`handle_admin_ec_lookup`] |
+//! | GET | `/_ts/admin/eids` | [`handle_admin_eids_lookup`] |
 //! | POST | `/_ts/api/v1/batch-sync` | [`handle_batch_sync`] |
 //! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
 //! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
@@ -49,7 +52,8 @@
 //! `route_request` (tracked in issue #495):
 //!
 //! - [`build_ec_request_state`] runs before every dispatched route (except
-//!   batch-sync, which uses Bearer auth) and reproduces the legacy
+//!   batch-sync, which uses Bearer auth, and the read-only admin diagnostics)
+//!   and reproduces the legacy
 //!   pre-routing prelude: device signals, bot gate, `ts-eids`/`sharedid`
 //!   cookie capture, geo lookup, [`EcContext`] creation, and KV-graph gating.
 //! - `handle_auction` and integration proxy dispatch receive the same
@@ -97,8 +101,12 @@ use error_stack::Report;
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::EcContext;
+use trusted_server_core::ec::admin::{
+    deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
+};
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
@@ -257,6 +265,11 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(Arc::clone(&state.default_kv_store))
+        // Spike-only (#1009). Constructed unconditionally, but only read when the
+        // assembly mode is a shared-template one — which defaults to Inline, so this
+        // is inert until an operator opts in.
+        .template_cache(Arc::new(crate::template_cache::FastlyTemplateCache::new()))
+        .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(Arc::new(FastlyPlatformGeo))
@@ -525,6 +538,29 @@ async fn execute_named(
         return Ok(run_batch_sync(&state, &services, req));
     }
 
+    // These diagnostics are read-only. Running the normal EC lifecycle would
+    // attach finalization state and could ingest request cookies into KV after
+    // the handler returns, violating that contract.
+    if matches!(
+        handler,
+        NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup
+    ) {
+        let response = PartnerRegistry::from_config(&state.settings.ec.partners)
+            .and_then(|registry| match handler {
+                NamedRouteHandler::AdminEcLookup => {
+                    // Deliberately do not use an EC request-state graph: that
+                    // copy is bot-gated, while operators use curl for this
+                    // authenticated diagnostic.
+                    let kv = crate::maybe_identity_graph(&state.settings);
+                    handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
+                }
+                NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
+                _ => unreachable!("admin diagnostics should use early dispatch"),
+            })
+            .unwrap_or_else(|error| http_error(&error));
+        return Ok(response);
+    }
+
     if let Err(report) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
         &state.settings,
         &mut req,
@@ -574,6 +610,9 @@ async fn run_named_route(
         }
         NamedRouteHandler::RotateKey => handle_rotate_key(&state.settings, services, req),
         NamedRouteHandler::DeactivateKey => handle_deactivate_key(&state.settings, services, req),
+        NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup => {
+            unreachable!("admin diagnostics should be handled before EC setup")
+        }
         NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
         NamedRouteHandler::BatchSync => {
             // Dispatched by execute_named before EC state is built.
@@ -708,6 +747,10 @@ async fn dispatch_fallback(
     services: &RuntimeServices,
     mut req: Request,
 ) -> Response {
+    if let Some(response) = deny_admin_diagnostic_fallback(&req) {
+        return response;
+    }
+
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
@@ -735,7 +778,7 @@ async fn dispatch_fallback(
     };
 
     let result = if uses_dynamic_tsjs_fallback(&method, &path) {
-        handle_tsjs_dynamic(&req, &state.registry)
+        handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SurrogateControl)
     } else if state.registry.has_route(&method, &path) {
         // Integration-proxy responses are not bounded by
         // publisher.max_buffered_body_bytes. Publisher fallback below uses the
@@ -808,6 +851,7 @@ async fn dispatch_fallback(
                             &mut ec.ec_context,
                             auction,
                             req,
+                            EdgeCacheHeader::SurrogateControl,
                         )
                         .await
                         {
@@ -1001,6 +1045,8 @@ enum NamedRouteHandler {
     VerifySignature,
     RotateKey,
     DeactivateKey,
+    AdminEcLookup,
+    AdminEidsLookup,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
@@ -1052,6 +1098,25 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/admin/keys/deactivate",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::DeactivateKey,
+    },
+    // Admin EC lookup: the bare route reads the EC ID from the caller's
+    // `ts-ec` cookie; the parameterized route takes an explicit EC ID.
+    NamedRoute {
+        path: "/_ts/admin/ec",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::AdminEcLookup,
+    },
+    NamedRoute {
+        path: "/_ts/admin/ec/{id}",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::AdminEcLookup,
+    },
+    // Admin EIDs echo: decodes the request's ts-eids/sharedId cookies with
+    // an ingestion preview. Pure request inspection — no KV access.
+    NamedRoute {
+        path: "/_ts/admin/eids",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::AdminEidsLookup,
     },
     // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with a
     // 404 instead of executing key operations: the production basic-auth handler
@@ -1235,19 +1300,26 @@ impl Hooks for TrustedServerApp {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::{
-        AppState, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
-        TrustedServerApp, build_state_from_settings, startup_error_router,
+        AppState, AuctionDispatch, EcContext, EdgeCacheHeader, HandlerFuture, NAMED_ROUTES,
+        NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, TrustedServerApp,
+        build_per_request_services, build_state_from_settings, handle_publisher_request,
+        publisher_response_into_streaming_response, startup_error_router,
     };
+    use base64::Engine as _;
     use bytes::Bytes;
     use edgezero_core::body::Body;
+    use edgezero_core::context::RequestContext;
     use edgezero_core::http::{Method, Response, StatusCode, header, request_builder};
     use edgezero_core::key_value_store::NoopKvStore;
+    use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::Mutex;
 
     use error_stack::Report;
     use futures::executor::block_on;
@@ -1262,7 +1334,9 @@ mod tests {
     use trusted_server_core::platform::{
         ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, PlatformHttpClient,
         PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
-        PlatformSelectResult, RuntimeServices,
+        PlatformSelectResult, PlatformTemplateCache, PlatformTemplateCacheReservation,
+        RuntimeServices, TemplateCacheError, TemplateCacheKey, TemplateCacheLookup,
+        TemplateCacheMiss, TemplateCacheReservation, TemplateEntry, TemplateMetadata,
     };
     use trusted_server_core::settings::Settings;
 
@@ -1377,6 +1451,36 @@ mod tests {
     fn test_router() -> RouterService {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         TrustedServerApp::routes_for_state(&state)
+    }
+
+    #[test]
+    fn per_request_services_register_the_fastly_template_assembler() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = RequestContext::new(
+            empty_request(Method::GET, "/article"),
+            PathParams::default(),
+        );
+
+        let services = build_per_request_services(&state, &context);
+        let template = format!(
+            "<html><body>article{}</body></html>",
+            trusted_server_core::publisher::AD_ASSEMBLY_SEAM
+        );
+        let fragment = b"<script>reader state</script>";
+        let assembled = services
+            .template_assembler()
+            .assemble(template.as_bytes(), fragment)
+            .expect("Fastly services should provide ESI assembly");
+
+        assert_eq!(
+            assembled,
+            template
+                .replace(
+                    trusted_server_core::publisher::AD_ASSEMBLY_SEAM,
+                    std::str::from_utf8(fragment).expect("fragment should be UTF-8")
+                )
+                .into_bytes()
+        );
     }
 
     /// Builds a router whose `AppState` uses a registry containing the given
@@ -1652,6 +1756,44 @@ mod tests {
     }
 
     #[test]
+    fn admin_ec_lookup_routes_are_registered() {
+        // Both lookup shapes must be explicitly routed to the admin EC
+        // handler: the bare cookie-based route and the parameterized route.
+        // Leaving either unrouted would fall through to the publisher
+        // fallback, forwarding the caller's `Authorization` header to the
+        // origin.
+        for path in ["/_ts/admin/ec", "/_ts/admin/ec/{id}"] {
+            let route = NAMED_ROUTES
+                .iter()
+                .find(|route| route.path == path)
+                .unwrap_or_else(|| panic!("{path} must be a named route"));
+            assert!(
+                matches!(route.handler, NamedRouteHandler::AdminEcLookup),
+                "{path} must map to the admin EC lookup handler"
+            );
+            assert_eq!(
+                route.primary_methods,
+                &[Method::GET],
+                "{path} must have GET as its only primary method"
+            );
+        }
+
+        let eids_route = NAMED_ROUTES
+            .iter()
+            .find(|route| route.path == "/_ts/admin/eids")
+            .expect("should register /_ts/admin/eids as a named route");
+        assert!(
+            matches!(eids_route.handler, NamedRouteHandler::AdminEidsLookup),
+            "/_ts/admin/eids must map to the admin EIDs lookup handler"
+        );
+        assert_eq!(
+            eids_route.primary_methods,
+            &[Method::GET],
+            "/_ts/admin/eids must have GET as its only primary method"
+        );
+    }
+
+    #[test]
     fn page_bids_serves_canonical_path_and_deprecated_alias() {
         // The SPA re-auction endpoint lives at the canonical single-underscore
         // `/_ts/page-bids`, matching every other internal route. The deprecated
@@ -1739,6 +1881,93 @@ mod tests {
                     response.status(),
                     StatusCode::NOT_FOUND,
                     "{method} {path} with Authorization must be denied locally (404), not proxied to publisher"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn authenticated_admin_diagnostic_fallback_is_denied_locally() {
+        let router = test_router();
+        let ec_id = format!("{}.abc123", "a".repeat(64));
+        let valid_paths = [
+            "/_ts/admin/ec".to_owned(),
+            format!("/_ts/admin/ec/{ec_id}"),
+            "/_ts/admin/eids".to_owned(),
+        ];
+
+        for path in valid_paths {
+            for method in [
+                Method::POST,
+                Method::HEAD,
+                Method::OPTIONS,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+            ] {
+                let request = request_builder()
+                    .method(method.clone())
+                    .uri(format!("https://test-publisher.com{path}"))
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                    .body(Body::from("sensitive-admin-body"))
+                    .expect("should build authenticated admin request");
+                let response = route(&router, request);
+
+                assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::ALLOW)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("GET")
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("no-store")
+                );
+            }
+        }
+
+        for path in [
+            "/_ts/admin/ec/".to_owned(),
+            format!("/_ts/admin/ec/{ec_id}/extra"),
+            "/_ts/admin/eids/".to_owned(),
+            "/_ts/admin/eids/extra".to_owned(),
+            "/_ts/admin/eids.json".to_owned(),
+            "/_ts/admin/ec;foo".to_owned(),
+            format!("/_ts/admin/ec%2F{ec_id}"),
+            // Percent-encoded separators match the `^/_ts/admin` basic-auth
+            // handler but not a literal-slash namespace check, so they must be
+            // reserved before publisher fallback forwards credentials upstream.
+            "/_ts/admin%2Fec".to_owned(),
+            "/_ts/admin%2fec".to_owned(),
+            // Retired non-`/_ts` alias namespace: only the two exact paths are
+            // routed to a local deny, so descendants and encoded separators must
+            // be reserved at the shared fallback boundary.
+            "/admin/keys".to_owned(),
+            "/admin/keys/rotate/extra".to_owned(),
+            "/admin/keys%2Frotate".to_owned(),
+            "/admin%2fkeys/rotate".to_owned(),
+        ] {
+            for method in [Method::GET, Method::POST] {
+                let request = request_builder()
+                    .method(method)
+                    .uri(format!("https://test-publisher.com{path}"))
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                    .body(Body::from("sensitive-admin-body"))
+                    .expect("should build malformed admin request");
+                let response = route(&router, request);
+
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("no-store")
                 );
             }
         }
@@ -1971,13 +2200,27 @@ mod tests {
             server_region: Some("US-East".to_string()),
         });
 
-        let _ = route(&router, req);
+        let response = route(&router, req);
 
         let observed = captured
             .lock()
             .expect("should lock captured client info")
             .clone()
             .expect("request filter should have observed the entry-point ClientInfo");
+        assert_eq!(
+            observed.client_ip,
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
+            "request-scoped services should preserve the resolved client IP used by EC"
+        );
+        let finalize = response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("fallback response should carry EC finalization state");
+        assert_eq!(
+            finalize.ec_context.client_ip(),
+            Some("203.0.113.7"),
+            "EC should capture the resolved client IP from request-scoped services"
+        );
         assert_eq!(
             observed.tls_protocol.as_deref(),
             Some("TLSv1.3"),
@@ -2026,6 +2269,103 @@ mod tests {
                 .get::<super::EcFinalizeState>()
                 .is_some(),
             "named-route responses should carry EcFinalizeState for entry-point EC finalization"
+        );
+    }
+
+    #[test]
+    fn admin_eids_diagnostic_skips_ec_finalization() {
+        let router = test_router();
+        let ec_id = format!("{}.abc123", "a".repeat(64));
+        let eids = serde_json::json!([{
+            "source": "example.com",
+            "uids": [{ "id": "example-uid", "atype": 1 }]
+        }]);
+        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(eids.to_string());
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("https://test-publisher.com/_ts/admin/eids")
+            .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
+            .header(
+                header::COOKIE,
+                format!("ts-ec={ec_id}; ts-eids={eids_cookie}; sharedId=example-shared-id"),
+            )
+            .body(Body::empty())
+            .expect("should build authenticated EIDs diagnostic request");
+        request.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+
+        let response = route(&router, request);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .is_none(),
+            "admin EIDs diagnostics should not attach EC finalization state"
+        );
+    }
+
+    #[test]
+    fn admin_ec_diagnostic_skips_ec_finalization() {
+        let router = test_router();
+        let ec_id = format!("{}.abc123", "a".repeat(64));
+        let eids = serde_json::json!([{
+            "source": "example.com",
+            "uids": [{ "id": "example-uid", "atype": 1 }]
+        }]);
+        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(eids.to_string());
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri(format!("https://test-publisher.com/_ts/admin/ec/{ec_id}"))
+            .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
+            .header(
+                header::COOKIE,
+                format!("ts-ec={ec_id}; ts-eids={eids_cookie}; sharedId=example-shared-id"),
+            )
+            .body(Body::empty())
+            .expect("should build authenticated EC diagnostic request");
+        request.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+
+        let response = route(&router, request);
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "configured admin EC handler should run and report the unavailable test KV graph"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .is_none(),
+            "admin EC diagnostics should not attach EC finalization state"
+        );
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "admin EC diagnostics should not mutate the EC cookie"
+        );
+    }
+
+    #[test]
+    fn admin_ec_route_without_credentials_returns_401() {
+        let router = test_router();
+
+        let response = route(&router, empty_request(Method::GET, "/_ts/admin/ec"));
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            response.headers().contains_key(header::WWW_AUTHENTICATE),
+            "admin EC 401 should include the Basic authentication challenge"
         );
     }
 
@@ -2274,6 +2614,296 @@ mod tests {
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(ClientInfo::default())
             .build()
+    }
+
+    #[derive(Default)]
+    struct DispatchTemplateCache {
+        entries: Arc<Mutex<HashMap<String, TemplateEntry>>>,
+    }
+
+    struct DispatchTemplateReservation {
+        entries: Arc<Mutex<HashMap<String, TemplateEntry>>>,
+        key: TemplateCacheKey,
+    }
+
+    impl PlatformTemplateCacheReservation for DispatchTemplateReservation {
+        fn insert(
+            self: Box<Self>,
+            metadata: &TemplateMetadata,
+            body: Vec<u8>,
+            _max_age: Duration,
+        ) -> Result<(), TemplateCacheError> {
+            self.entries.lock().expect("should lock entries").insert(
+                self.key.to_cache_key(),
+                TemplateEntry {
+                    metadata: metadata.clone(),
+                    body,
+                },
+            );
+            Ok(())
+        }
+
+        fn cancel(self: Box<Self>) -> Result<(), TemplateCacheError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformTemplateCache for DispatchTemplateCache {
+        async fn lookup_or_reserve(
+            &self,
+            key: &TemplateCacheKey,
+        ) -> Result<TemplateCacheLookup, TemplateCacheError> {
+            if let Some(entry) = self
+                .entries
+                .lock()
+                .expect("should lock entries")
+                .get(&key.to_cache_key())
+                .cloned()
+            {
+                return Ok(TemplateCacheLookup::Hit(entry));
+            }
+            Ok(TemplateCacheLookup::Reserved(
+                TemplateCacheReservation::new(Box::new(DispatchTemplateReservation {
+                    entries: Arc::clone(&self.entries),
+                    key: key.clone(),
+                })),
+            ))
+        }
+
+        async fn get(&self, key: &TemplateCacheKey) -> Result<TemplateEntry, TemplateCacheMiss> {
+            self.entries
+                .lock()
+                .expect("should lock entries")
+                .get(&key.to_cache_key())
+                .cloned()
+                .ok_or(TemplateCacheMiss::NotFound)
+        }
+
+        async fn put(
+            &self,
+            key: &TemplateCacheKey,
+            metadata: &TemplateMetadata,
+            body: Vec<u8>,
+            _max_age: Duration,
+        ) -> Result<(), TemplateCacheError> {
+            self.entries.lock().expect("should lock entries").insert(
+                key.to_cache_key(),
+                TemplateEntry {
+                    metadata: metadata.clone(),
+                    body,
+                },
+            );
+            Ok(())
+        }
+
+        async fn purge_url(&self, key: &TemplateCacheKey) -> Result<(), TemplateCacheError> {
+            self.entries
+                .lock()
+                .expect("should lock entries")
+                .remove(&key.to_cache_key());
+            Ok(())
+        }
+
+        async fn purge_all(&self) -> Result<(), TemplateCacheError> {
+            self.entries.lock().expect("should lock entries").clear();
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct DispatchOriginClient {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformHttpClient for DispatchOriginClient {
+        async fn send(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let response = edgezero_core::http::response_builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .header(header::CACHE_CONTROL, "public, max-age=300")
+                .body(Body::from(
+                    b"<html><head></head><body>origin</body></html>".as_ref(),
+                ))
+                .map_err(|_| Report::new(PlatformError::HttpClient))?;
+            Ok(PlatformResponse::new(response))
+        }
+
+        async fn send_async(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        async fn select(
+            &self,
+            _pending_requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    #[test]
+    fn dispatch_edge_authenticated_esi_request_stores_then_hits_template() {
+        let settings = Arc::new(
+            Settings::from_toml(
+                r#"
+                    [[handlers]]
+                    path = "^/secure"
+                    username = "user"
+                    password = "pass"
+
+                    [[handlers]]
+                    path = "^/_ts/admin"
+                    username = "admin"
+                    password = "admin-pass"
+
+                    [publisher]
+                    domain = "test-publisher.com"
+                    cookie_domain = ".test-publisher.com"
+                    origin_url = "https://origin.test-publisher.com"
+                    proxy_secret = "unit-test-proxy-secret"
+
+                    [ec]
+                    passphrase = "test-secret-key-32-bytes-minimum"
+
+                    [auction]
+                    enabled = true
+                    providers = []
+
+                    [creative_opportunities]
+                    gam_network_id = "99999"
+                    assembly_mode = "esi"
+
+                    [[creative_opportunities.slot]]
+                    id = "test-slot"
+                    page_patterns = ["/secure/article"]
+                    formats = [{ width = 728, height = 90 }]
+                "#,
+            )
+            .expect("should parse dispatch cache settings"),
+        );
+        let cache = Arc::new(DispatchTemplateCache::default());
+        let origin = Arc::new(DispatchOriginClient::default());
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
+            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
+            .template_cache(Arc::clone(&cache) as Arc<dyn PlatformTemplateCache>)
+            .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
+            .backend(Arc::new(FixedBackend))
+            .http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>)
+            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .client_info(ClientInfo::default())
+            .build();
+        let registry = Arc::new(
+            IntegrationRegistry::new(&settings).expect("should build integration registry"),
+        );
+        let orchestrator = Arc::new(
+            trusted_server_core::auction::build_orchestrator(&settings)
+                .expect("should build auction orchestrator"),
+        );
+
+        let handler = {
+            let settings = Arc::clone(&settings);
+            let services = services.clone();
+            let registry = Arc::clone(&registry);
+            let orchestrator = Arc::clone(&orchestrator);
+            move |ctx: RequestContext| {
+                let settings = Arc::clone(&settings);
+                let services = services.clone();
+                let registry = Arc::clone(&registry);
+                let orchestrator = Arc::clone(&orchestrator);
+                Box::pin(async move {
+                    let request = ctx.into_request();
+                    let method = request.method().clone();
+                    let mut ec_context =
+                        match EcContext::read_from_request(&settings, &request, &services) {
+                            Ok(context) => context,
+                            Err(report) => return Ok(super::http_error(&report)),
+                        };
+                    let response = match handle_publisher_request(
+                        &settings,
+                        &services,
+                        None,
+                        &mut ec_context,
+                        AuctionDispatch {
+                            orchestrator: &orchestrator,
+                            slots: settings.creative_opportunity_slots(),
+                            registry: None,
+                        },
+                        request,
+                        EdgeCacheHeader::SurrogateControl,
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(report) => return Ok(super::http_error(&report)),
+                    };
+                    match publisher_response_into_streaming_response(
+                        response,
+                        &method,
+                        Arc::clone(&settings),
+                        &registry,
+                        orchestrator,
+                        services,
+                    )
+                    .await
+                    {
+                        Ok(response) => Ok(response),
+                        Err(report) => Ok(super::http_error(&report)),
+                    }
+                }) as HandlerFuture
+            }
+        };
+        let router = RouterService::builder()
+            .middleware(crate::middleware::AuthMiddleware::new(Arc::clone(
+                &settings,
+            )))
+            .route("/secure/article", Method::GET, handler)
+            .build();
+        let authorized_request = || {
+            request_builder()
+                .method(Method::GET)
+                .uri("https://test-publisher.com/secure/article")
+                .header(header::HOST, "test-publisher.com")
+                .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+                .header("sec-fetch-dest", "document")
+                .header("sec-fetch-mode", "navigate")
+                .body(Body::empty())
+                .expect("should build authorized navigation")
+        };
+
+        let cold = route(&router, authorized_request());
+        assert_eq!(
+            cold.headers()
+                .get("x-ts-template-cache")
+                .and_then(|value| value.to_str().ok()),
+            Some("miss-stored")
+        );
+        block_on(cold.into_body().into_bytes_bounded(1024 * 1024))
+            .expect("should drain cold response");
+
+        let warm = route(&router, authorized_request());
+        assert_eq!(
+            warm.headers()
+                .get("x-ts-template-cache")
+                .and_then(|value| value.to_str().ok()),
+            Some("hit")
+        );
+        block_on(warm.into_body().into_bytes_bounded(1024 * 1024))
+            .expect("should drain warm response");
+        assert_eq!(
+            origin.calls.load(Ordering::Relaxed),
+            1,
+            "the warm dispatch must not fetch the publisher origin"
+        );
     }
 
     #[test]

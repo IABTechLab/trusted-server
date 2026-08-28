@@ -7,6 +7,7 @@ Quick reference for all Trusted Server HTTP endpoints.
 - [First-Party Endpoints](#first-party-endpoints) - Core ad serving and proxying
 - [Edge Cookie Endpoints](#edge-cookie-endpoints) - Identity sync and enrichment
 - [Request Signing](#request-signing-endpoints) - Cryptographic signing and key management
+- [Admin Diagnostics](#admin-diagnostic-endpoints) - Protected EC troubleshooting
 - [TSJS Library](#tsjs-library-endpoint) - JavaScript library serving
 - [Utility Endpoints](#utility-endpoints) - Optional operational helpers
 - [Integration Endpoints](#integration-endpoints) - Third-party service proxying
@@ -580,6 +581,87 @@ curl -X POST https://edge.example.com/_ts/admin/keys/deactivate \
 
 ---
 
+## Admin Diagnostic Endpoints
+
+These endpoints expose sensitive identity and cookie data and require HTTP Basic Authentication. Configure a handler that covers the entire `/_ts/admin` namespace; startup rejects configurations that do not protect every admin route, including handlers that match only some `/_ts/admin/ec/{id}` values — the dynamic route needs a prefix-level matcher such as `^/_ts/admin` or `^/_ts/admin/ec/`. The whole `/_ts/admin` prefix is reserved: any admin path that reaches publisher fallback — unknown, malformed, or percent-encoded (`/_ts/admin%2Fec`) — is answered locally with `404` and is never proxied, so an admin `Authorization` header and request body never reach the publisher origin. The retired non-`/_ts` `/admin/keys` aliases are reserved the same way. Normal diagnostic-handler responses after successful authentication are JSON with `Cache-Control: no-store`. Missing or invalid credentials receive the shared plaintext `401 Unauthorized` Basic-auth challenge. Unexpected configuration or KV failures use the adapter's shared plaintext `5xx` error response. Those authentication and internal-error responses are outside the diagnostic JSON and cache-header contract.
+
+The examples below use fictional IDs and values only.
+
+### GET /\_ts/admin/ec
+
+### GET /\_ts/admin/ec/`{id}`
+
+Reads an EC identity-graph record for troubleshooting. The explicit route accepts an EC ID in `{64 lowercase hex}.{6 alphanumeric}` format. The bare route uses the request's `ts-ec` cookie.
+
+This lookup is implemented only by the Fastly adapter because the identity graph is stored in Fastly KV. Other adapters return `501 Not Implemented`.
+
+**Response fields:**
+
+- `ec_id`, `store`, and `generation` identify the raw KV lookup.
+- `entry` preserves the stored JSON shape, including unknown and legacy fields. Derived `created_iso` and `consent.updated_iso` fields are added only when absent.
+- `metadata` preserves the stored metadata JSON shape.
+- `tombstone` reports whether consent has been withdrawn. It is absent when the entry body cannot be parsed as JSON or deserialized as the typed EC schema.
+- `auction.eids` previews the partner EIDs the stored record can contribute; `auction.skipped` explains filtered IDs.
+- `entry_error`, `metadata_error`, and `raw_body` keep malformed or schema-incompatible records inspectable.
+
+The auction preview validates the stored record and partner configuration, but cannot reproduce live per-request consent checks. It must not be treated as proof that a specific auction request will receive those EIDs.
+
+**Status codes:**
+
+| Status | Meaning                                                     |
+| ------ | ----------------------------------------------------------- |
+| `200`  | Record found, including inspectable corrupt records         |
+| `400`  | Invalid explicit EC ID                                      |
+| `401`  | Missing or invalid Basic credentials                        |
+| `404`  | Record not found, or the bare route has no `ts-ec` cookie   |
+| `405`  | Method other than `GET` (`Allow: GET`)                      |
+| `501`  | EC identity graph unavailable on this adapter or deployment |
+| `5xx`  | Unexpected configuration or KV failure (plaintext)          |
+
+```bash
+curl -u admin:secure-password \
+  "https://edge.example.com/_ts/admin/ec/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.abc123"
+
+curl -u admin:secure-password \
+  --cookie "ts-ec=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.abc123" \
+  "https://edge.example.com/_ts/admin/ec"
+```
+
+### GET /\_ts/admin/eids
+
+Parses the request's `ts-eids` and `sharedId` cookies and previews which configured partner IDs cookie ingestion would match or drop. It performs request inspection only: it does not read or write KV and is available on every adapter.
+
+After successful authentication this endpoint always returns `200 OK`; missing or malformed cookies are represented by `cookie_present`, `sharedid_present`, and `parse_error`. The `ingest.matched` and `ingest.unmatched` arrays show the ingestion preview. Each unmatched entry contains its `source` and either a `no_partner` reason when no configured partner recognizes it or `no_valid_uid` when the partner exists but every supplied UID is empty or exceeds the storage limit.
+
+```json
+{
+  "ingest": {
+    "matched": [
+      {
+        "source_domain": "configured.example",
+        "uid": "fictional-uid"
+      }
+    ],
+    "unmatched": [
+      {
+        "source": "unknown.example",
+        "reason": "no_partner"
+      }
+    ]
+  }
+}
+```
+
+```bash
+curl -u admin:secure-password \
+  --cookie "sharedId=fictional-shared-id" \
+  "https://edge.example.com/_ts/admin/eids"
+```
+
+Malformed diagnostic paths return a local `404`, and unsupported methods return a local `405`; they are never forwarded to the publisher origin.
+
+---
+
 ## TSJS Library Endpoint
 
 ### GET /static/tsjs=`<filename>`
@@ -768,6 +850,9 @@ curl -u admin:secure-password https://edge.example.com/_ts/admin/keys/rotate
 
 - `/_ts/admin/keys/rotate`
 - `/_ts/admin/keys/deactivate`
+- `/_ts/admin/ec`
+- `/_ts/admin/ec/{id}`
+- `/_ts/admin/eids`
 - Any paths matching configured `handlers` patterns
 
 ---
