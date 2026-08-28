@@ -11,6 +11,7 @@ use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
+use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -23,17 +24,20 @@ use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
+use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
 
 mod app;
 mod backend;
 mod compat;
 mod ec_kv;
+mod esi_assembly;
 mod logging;
 mod management_api;
 mod middleware;
 mod platform;
 mod rate_limiter;
+mod template_cache;
 mod tinybird;
 
 use crate::app::{EcFinalizeState, TrustedServerApp, load_settings_from_config_store};
@@ -202,7 +206,7 @@ fn edgezero_main(mut req: FastlyRequest) {
     }
 
     if let Some(policy) = asset_cache_policy {
-        policy.apply_after_route_finalization(&mut response);
+        policy.apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
     }
 
     if let Some(ec_state) = ec_state {
@@ -328,14 +332,7 @@ fn send_edgezero_response(
     mut response: HttpResponse,
     request_filter_effects: Option<&RequestFilterEffects>,
 ) {
-    if let Some(effects) = request_filter_effects {
-        effects.apply_to_response(&mut response);
-    }
-
-    // Final cache guard: EC finalization and request-filter effects may have
-    // added a per-user Set-Cookie after `apply_finalize_headers` ran, so
-    // re-apply the privacy downgrade before send.
-    crate::middleware::enforce_set_cookie_cache_privacy(&mut response);
+    apply_terminal_response_effects(&mut response, request_filter_effects);
 
     let (parts, body) = response.into_parts();
 
@@ -362,6 +359,29 @@ fn send_edgezero_response(
             compat::to_fastly_response(HttpResponse::from_parts(parts, once)).send_to_client();
         }
     }
+}
+
+/// Apply every late response mutation, then restore privacy invariants before headers commit.
+fn apply_terminal_response_effects(
+    response: &mut HttpResponse,
+    request_filter_effects: Option<&RequestFilterEffects>,
+) {
+    let must_remain_private = response
+        .extensions()
+        .get::<TerminalPrivateResponse>()
+        .is_some();
+    if let Some(effects) = request_filter_effects {
+        effects.apply_to_response(response);
+    }
+    if must_remain_private {
+        trusted_server_core::response_privacy::enforce_private_no_store(response);
+    }
+
+    // Final cache guards: EC finalization and request-filter effects may have
+    // added a per-user Set-Cookie or a private/no-store directive after
+    // `apply_finalize_headers` and normalized asset policy reapplication ran.
+    crate::middleware::enforce_set_cookie_cache_privacy(response);
+    crate::middleware::enforce_uncacheable_cache_privacy(response);
 }
 
 const FALLBACK_UNAVAILABLE: &str = "unavailable";
@@ -485,6 +505,7 @@ mod tests {
     use edgezero_core::http::HeaderValue;
     use edgezero_core::http::response_builder;
     use fastly::mime;
+    use trusted_server_core::integrations::HeaderMutation;
 
     fn test_settings() -> Settings {
         Settings::from_toml(
@@ -554,6 +575,187 @@ mod tests {
         assert!(
             response.headers().get("x-ts-finalized").is_none(),
             "sentinel should not be sent to clients"
+        );
+    }
+
+    #[test]
+    fn late_filter_effects_cannot_make_an_assembled_response_public() {
+        let mut response = response_builder()
+            .header("cache-control", "private, no-store")
+            .header("etag", "\"reader-document\"")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        response.extensions_mut().insert(TerminalPrivateResponse);
+        let effects = RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("cache-control", "public, s-maxage=3600"),
+                HeaderMutation::set("surrogate-control", "max-age=3600"),
+                HeaderMutation::set("cdn-cache-control", "public, max-age=3600"),
+            ],
+        };
+
+        apply_terminal_response_effects(&mut response, Some(&effects));
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private")
+        );
+        assert!(response.headers().get("surrogate-control").is_none());
+        assert!(response.headers().get("cdn-cache-control").is_none());
+        assert!(response.headers().get("etag").is_none());
+    }
+
+    #[test]
+    fn late_filter_effects_cannot_make_a_page_bids_response_public() {
+        let mut response = trusted_server_core::publisher::page_bids_preflight_denied();
+        let effects = RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("cache-control", "public, s-maxage=3600"),
+                HeaderMutation::set("surrogate-control", "max-age=3600"),
+                HeaderMutation::set("cdn-cache-control", "public, max-age=3600"),
+            ],
+        };
+
+        apply_terminal_response_effects(&mut response, Some(&effects));
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private")
+        );
+        assert!(response.headers().get("surrogate-control").is_none());
+        assert!(response.headers().get("cdn-cache-control").is_none());
+    }
+
+    fn diagnostics_settings() -> Settings {
+        Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+
+            [integrations.gpt_diagnostics]
+            enabled = true
+            "#,
+        )
+        .expect("should parse diagnostics settings")
+    }
+
+    #[test]
+    fn late_filter_effects_cannot_make_an_active_diagnostics_response_public() {
+        // The narrowest hole: an established diagnostics session sets no new cookie, so
+        // the `Set-Cookie` privacy net never fires, and before this the decision only
+        // stamped `Cache-Control` without leaving a marker for the terminal guard.
+        let mut request = edgezero_core::http::request_builder()
+            .method(fastly::http::Method::GET)
+            .uri("https://test-publisher.com/article")
+            .header("sec-fetch-dest", "document")
+            .header("cookie", "__Host-ts-console=1")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let decision = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+            &diagnostics_settings(),
+            &mut request,
+        )
+        .expect("should prepare the diagnostics decision");
+        assert!(
+            decision.active(),
+            "the session cookie should activate diagnostics"
+        );
+
+        let mut response = response_builder()
+            .header("cache-control", "public, max-age=600")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        trusted_server_core::integrations::gpt_diagnostics::finalize_response(
+            &decision,
+            &mut response,
+        );
+
+        let effects = RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("cache-control", "public, s-maxage=3600"),
+                HeaderMutation::set("surrogate-control", "max-age=3600"),
+            ],
+        };
+
+        apply_terminal_response_effects(&mut response, Some(&effects));
+
+        assert!(
+            response.headers().get("set-cookie").is_none(),
+            "the case under test is the one with no Set-Cookie to protect it"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private"),
+            "request-scoped diagnostics HTML must never become shared-cacheable"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "should strip CDN cache directives a late filter added"
+        );
+    }
+
+    #[test]
+    fn terminal_response_preserves_unmarked_origin_private_policy() {
+        let mut response = response_builder()
+            .header("cache-control", "private, max-age=600")
+            .header("etag", "\"origin\"")
+            .header("last-modified", "Wed, 12 Aug 2026 00:00:00 GMT")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+
+        apply_terminal_response_effects(&mut response, None);
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("private, max-age=600"),
+            "should preserve the origin browser-cache policy"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("etag")
+                .and_then(|value| value.to_str().ok()),
+            Some("\"origin\""),
+            "should preserve the origin validator"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("last-modified")
+                .and_then(|value| value.to_str().ok()),
+            Some("Wed, 12 Aug 2026 00:00:00 GMT"),
+            "should preserve the origin modification date"
         );
     }
 

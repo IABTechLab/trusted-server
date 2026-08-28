@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import type { TsjsApi } from '../../../src/core/types';
@@ -9,6 +12,14 @@ type TestWindow = Window & {
 
 const originalPushState = history.pushState.bind(history);
 const originalReplaceState = history.replaceState.bind(history);
+const BOOTSTRAP_SOURCE = readFileSync(
+  path.resolve(process.cwd(), '../../trusted-server-core/src/integrations/gpt_bootstrap.js'),
+  'utf8'
+);
+
+function runBootstrap(): void {
+  new Function(BOOTSTRAP_SOURCE)();
+}
 
 /**
  * Executable lifecycle coverage for `tsjs.scheduleInitialAdInit` — the
@@ -145,6 +156,52 @@ describe('scheduleInitialAdInit', () => {
     flushFrame();
     flushFrame();
 
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('accepts only the first schedule call', async () => {
+    await importGptModule();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    ts.scheduleInitialAdInit!({ first: { hb_pb: '1.00' } });
+    ts.scheduleInitialAdInit!({ second: { hb_pb: '2.00' } });
+    expect(ts.bids).toEqual({ first: { hb_pb: '1.00' } });
+
+    window.dispatchEvent(new Event('load'));
+    flushFrame();
+    flushFrame();
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the first schedule claim across bootstrap-to-bundle handoff', async () => {
+    runBootstrap();
+    const ts = (window as TestWindow).tsjs!;
+    const firstSlot = {
+      id: 'first_slot',
+      gam_unit_path: '/123/first',
+      div_id: 'div-first',
+      formats: [[300, 250]] as Array<[number, number]>,
+    };
+    const secondSlot = {
+      id: 'second_slot',
+      gam_unit_path: '/123/second',
+      div_id: 'div-second',
+      formats: [[728, 90]] as Array<[number, number]>,
+    };
+
+    ts.scheduleInitialAdInit!({ first_slot: { hb_pb: '1.00' } }, [firstSlot]);
+    await importGptModule();
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+    ts.scheduleInitialAdInit!({ second_slot: { hb_pb: '2.00' } }, [secondSlot]);
+
+    expect(ts.bids).toEqual({ first_slot: { hb_pb: '1.00' } });
+    expect(ts.adSlots).toEqual([firstSlot]);
+    window.dispatchEvent(new Event('load'));
+    flushFrame();
+    flushFrame();
     expect(adInit).toHaveBeenCalledTimes(1);
   });
 
@@ -308,6 +365,104 @@ describe('scheduleInitialAdInit', () => {
 
     expect(ts.bids).toEqual({ s1: { hb_pb: '3.00' } });
     expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('applies the SSR slot definitions on the initial document', async () => {
+    // Under a shared-template mode the head script emits no `tsjs.adSlots`, so the
+    // `</body>` seam is the only source of slot definitions. They must arrive, or
+    // `adInit()` iterates an empty list and the page defines no TS slots at all.
+    await importGptModule();
+    const ts = (window as TestWindow).tsjs!;
+    ts.adInit = vi.fn();
+    const ssrSlot = {
+      id: 'ssr_slot',
+      gam_unit_path: '/123/ssr',
+      div_id: 'div-ssr',
+      formats: [[728, 90]] as Array<[number, number]>,
+    };
+
+    ts.scheduleInitialAdInit!({ ssr_slot: { hb_pb: '1.00' } }, [ssrSlot]);
+
+    expect(ts.adSlots).toEqual([ssrSlot]);
+    expect(ts.bids).toEqual({ ssr_slot: { hb_pb: '1.00' } });
+  });
+
+  it('preserves head-injected slots when initialSlots is omitted', async () => {
+    await importGptModule();
+    const ts = (window as TestWindow).tsjs!;
+    ts.adInit = vi.fn();
+    const headSlot = {
+      id: 'head_slot',
+      gam_unit_path: '/123/head',
+      div_id: 'div-head',
+      formats: [[300, 250]] as Array<[number, number]>,
+    };
+    ts.adSlots = [headSlot];
+
+    ts.scheduleInitialAdInit!({ head_slot: { hb_pb: '1.00' } });
+
+    expect(ts.adSlots).toEqual([headSlot]);
+  });
+
+  it('replaces existing slots when initialSlots is explicitly empty', async () => {
+    await importGptModule();
+    const ts = (window as TestWindow).tsjs!;
+    ts.adInit = vi.fn();
+    ts.adSlots = [
+      {
+        id: 'stale_slot',
+        gam_unit_path: '/123/stale',
+        div_id: 'div-stale',
+        formats: [[300, 250]],
+      },
+    ];
+
+    ts.scheduleInitialAdInit!({}, []);
+
+    expect(ts.adSlots).toEqual([]);
+  });
+
+  it('drops the SSR slot definitions when a navigation has already committed', async () => {
+    // The guard covered the bids and the adInit call, but the shared-template seam
+    // assigned `tsjs.adSlots` on the line *before* calling the scheduler — outside the
+    // guard entirely. A navigation that committed while the SSR document was still
+    // streaming therefore kept its own bids and silently lost its slots to the stale
+    // SSR payload, and the next `adInit()` for that route defined the wrong slots.
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({ slots: [], bids: {} }),
+    });
+    await importGptModule();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    history.pushState({}, '', '/b');
+    await flushAsync();
+    expect(ts.navGeneration).toBe(1);
+    const liveSlot = {
+      id: 'live_slot',
+      gam_unit_path: '/123/live',
+      div_id: 'div-live',
+      formats: [[300, 250]] as Array<[number, number]>,
+    };
+    ts.adSlots = [liveSlot];
+
+    ts.scheduleInitialAdInit!({ ssr_slot: { hb_pb: '1.00' } }, [
+      {
+        id: 'ssr_slot',
+        gam_unit_path: '/123/ssr',
+        div_id: 'div-ssr',
+        formats: [[728, 90]],
+      },
+    ]);
+
+    expect(ts.adSlots).toEqual([liveSlot]);
+
+    window.dispatchEvent(new Event('load'));
+    flushFrame();
+    flushFrame();
+    expect(adInit).not.toHaveBeenCalled();
   });
 
   it('cancels queued GPT work when a navigation commits before the command queue drains', async () => {

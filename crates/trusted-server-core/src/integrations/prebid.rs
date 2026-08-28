@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -13,6 +13,7 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::header::HeaderValue;
 use http::{Method, StatusCode, header};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use url::{Url, Url as ParsedUrl};
@@ -23,6 +24,7 @@ use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
 };
+use crate::cache_policy::{CacheControlPolicy, EdgeCacheHeader};
 use crate::consent_config::ConsentForwardingMode;
 use crate::cookies::{CONSENT_COOKIE_NAMES, strip_cookies};
 use crate::error::TrustedServerError;
@@ -210,6 +212,7 @@ pub struct PrebidIntegrationConfig {
     #[serde(default)]
     pub account_id: Option<String>,
     #[serde(default = "default_timeout_ms")]
+    #[validate(range(min = 1, max = 60000))]
     pub timeout_ms: u32,
     #[serde(
         default = "default_bidders",
@@ -240,7 +243,10 @@ pub struct PrebidIntegrationConfig {
     pub external_bundle_url: Option<String>,
     /// Optional hex SHA-256 of the exact external bundle bytes.
     #[serde(default)]
-    #[validate(custom(function = "validate_external_bundle_sha256"))]
+    #[validate(regex(
+        path = *EXTERNAL_BUNDLE_SHA256_PATTERN,
+        message = "external_bundle_sha256 must be a 64-character hex SHA-256"
+    ))]
     pub external_bundle_sha256: Option<String>,
     /// Optional browser Subresource Integrity value for the first-party script.
     #[serde(default)]
@@ -518,15 +524,10 @@ fn validate_external_bundle_url(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-fn validate_external_bundle_sha256(value: &str) -> Result<(), ValidationError> {
-    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Ok(());
-    }
-
-    let mut err = ValidationError::new("invalid_external_bundle_sha256");
-    err.message = Some("external_bundle_sha256 must be a 64-character hex SHA-256".into());
-    Err(err)
-}
+/// Exact hex SHA-256: 64 hex digits. Used by the built-in `regex` validator on
+/// [`PrebidIntegrationConfig::external_bundle_sha256`].
+static EXTERNAL_BUNDLE_SHA256_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[0-9a-fA-F]{64}$").expect("SHA-256 hex regex should compile"));
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum ExternalBundleSriAlgorithm {
@@ -754,14 +755,16 @@ impl PrebidIntegration {
     ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
         let body = "// Script overridden by Trusted Server\n";
 
-        http::Response::builder()
+        let mut response = http::Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, PREBID_BUNDLE_CONTENT_TYPE)
-            .header(header::CACHE_CONTROL, "public, max-age=31536000")
             .body(EdgeBody::from(body))
             .change_context(TrustedServerError::Prebid {
                 message: "Failed to build Prebid script handler response".to_string(),
-            })
+            })?;
+        CacheControlPolicy::NoStorePrivate
+            .apply_to_headers(response.headers_mut(), EdgeCacheHeader::None);
+        Ok(response)
     }
 
     fn external_bundle_script_src(&self) -> String {
@@ -2718,6 +2721,39 @@ mod tests {
     use std::collections::HashMap;
     use std::io::Cursor;
 
+    #[test]
+    fn external_bundle_sha256_validation_matches_hex_pattern() {
+        use validator::Validate as _;
+
+        let config = |sha: &str| -> PrebidIntegrationConfig {
+            serde_json::from_value(serde_json::json!({
+                "server_url": "https://prebid.example.com/openrtb2/auction",
+                "external_bundle_sha256": sha,
+            }))
+            .expect("should deserialize prebid config")
+        };
+
+        // Exactly 64 hex digits (either case) passes.
+        config(&"a".repeat(64))
+            .validate()
+            .expect("64-char lowercase hex sha256 should pass");
+        config("ABCDEF0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789")
+            .validate()
+            .expect("mixed-case 64-char hex sha256 should pass");
+
+        // Wrong length or non-hex characters are rejected.
+        for bad in [
+            "a".repeat(63),
+            "a".repeat(65),
+            "g".repeat(64),
+            String::new(),
+        ] {
+            config(&bad)
+                .validate()
+                .expect_err(&format!("invalid sha256 {bad:?} should be rejected"));
+        }
+    }
+
     fn make_settings() -> Settings {
         create_test_settings()
     }
@@ -3557,7 +3593,14 @@ external_bundle_sri = "sha384-AAAA"
             .get(header::CACHE_CONTROL)
             .and_then(|value| value.to_str().ok())
             .expect("should have cache-control");
-        assert!(cache_control.contains("max-age=31536000"));
+        assert_eq!(
+            cache_control, "no-store, private",
+            "neutralized stable shim must not be cached for a year"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "neutralized shim must not emit edge-cache headers"
+        );
 
         let body = String::from_utf8(
             response

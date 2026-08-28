@@ -11,6 +11,7 @@ import {
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
   apsRendererUrl,
+  dispatchApsRendering,
   consumeApsPrebidRenderer,
   getApsPrebidRenderer,
   validateApsRenderer,
@@ -686,15 +687,18 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * SSR bootstrap as current. For the same reason the initial bids payload is
  * passed in and applied here, generation-guarded — assigning it
  * unconditionally at body end would clobber the live bids a faster SPA
- * navigation already applied. When a navigation has committed since — or
- * commits while the deferred callback is pending — the SSR payload is
- * dropped and `adInit()` is not run: running anyway would re-run the newer
- * route's live slots/bids, destroying and redefining that route's TS slots
- * and double-refreshing it. The generation counter (not a URL comparison)
- * keeps this guard aligned with the SPA auction hook's own navigation
- * identity: a query-only history change the hook ignores must not cancel the
- * initial call, while an `/a → /b → /a` round trip — where the URL compares
- * equal again — must.
+ * navigation already applied.
+ *
+ * Shared-template seams pass `initialSlots`; inline documents omit them because
+ * their head script already installed the slots. An explicit empty array clears
+ * that state, while omission preserves it. The scheduler accepts only its first
+ * generation-0 call so duplicate public API calls cannot define and display the
+ * initial slots twice. The latch lives on `tsjs` so a bootstrap fallback that
+ * claims the initial pass keeps that claim when the bundle replaces its
+ * scheduler. If a navigation commits before scheduling or before the deferred
+ * callback, the SSR payload and `adInit()` are both dropped. The generation
+ * counter (not a URL comparison) keeps this aligned with the SPA auction hook's
+ * navigation identity.
  *
  * Hidden documents: browsers do not service `requestAnimationFrame` while a
  * document is hidden, so a background-tab load (Cmd+click, open-in-new-tab)
@@ -706,9 +710,14 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * holds whenever the request is actually issued.
  */
 function installScheduleInitialAdInit(ts: TsjsApi): void {
-  ts.scheduleInitialAdInit = function (initialBids?: Record<string, AuctionBidData>) {
-    if ((ts.navGeneration ?? 0) !== 0) return;
-    if (initialBids) ts.bids = initialBids;
+  ts.scheduleInitialAdInit = function (
+    initialBids?: Record<string, AuctionBidData>,
+    initialSlots?: AuctionSlot[]
+  ) {
+    if ((ts.navGeneration ?? 0) !== 0 || ts.initialAdInitScheduled) return;
+    ts.initialAdInitScheduled = true;
+    if (initialSlots !== undefined) ts.adSlots = initialSlots;
+    if (initialBids !== undefined) ts.bids = initialBids;
     const runUnlessNavigated = (): void => {
       if ((ts.navGeneration ?? 0) !== 0) return;
       ts.adInit?.();
@@ -1073,21 +1082,15 @@ export function installTsAdInit(): void {
         // Diagnostics are observational only. A missing or malformed debug
         // implementation must never interrupt slot mapping or delivery.
         try {
+          const requestedSlotSizes = ts.gptSlotHandoffs?.[slotDivId2]?.formats;
           const opportunity = trustedServerOpportunity(bid);
-          if (bid.hb_auction_id !== undefined) {
-            ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
-              gptSlot,
-              slot.id,
-              opportunity,
-              bid.hb_auction_id
-            );
-          } else {
-            ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
-              gptSlot,
-              slot.id,
-              opportunity
-            );
-          }
+          ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
+            gptSlot,
+            slot.id,
+            opportunity,
+            bid.hb_auction_id,
+            requestedSlotSizes
+          );
         } catch {
           // Diagnostics must not alter ad delivery.
         }
@@ -1115,8 +1118,8 @@ export function installTsAdInit(): void {
       ts.prevSlotTargetingKeys = nextSlotTargetingKeys;
 
       // Whether this call produced any TS slot to render. A gated page-bids
-      // response (auction kill switch or consent denial) returns no slots, so
-      // the loops above leave these empty.
+      // response (template switch, auction gate, or consent denial) returns no
+      // slots, so the loops above leave these empty.
       const hasRenderableWork = slotsToDisplay.length > 0 || slotsToRefresh.length > 0;
 
       // enableSingleRequest and enableServices must only be called once per page
@@ -1424,10 +1427,10 @@ export function installSpaAuctionHook(): void {
       // This route is now the committed, loaded state — a later failed
       // navigation rolls back here, and a return trip no-ops correctly.
       lastAppliedPath = path;
-      // An empty page-bids response (auction kill switch or consent gate) carries
-      // no TS slots. Only run adInit() when there are slots to apply or prior TS
-      // state to sweep — otherwise a consent-denied or kill-switched navigation
-      // must not enter the GPT command queue and risk activating services.
+      // An empty page-bids response (template switch, auction, or consent gate)
+      // carries no TS slots. Only run adInit() when there are slots to apply or
+      // prior TS state to sweep — otherwise a gated navigation must not enter
+      // the GPT command queue and risk activating services.
       const hasPriorTsState =
         (ts.prevGptSlots?.length ?? 0) > 0 ||
         Object.keys(ts.prevSlotTargetingKeys ?? {}).length > 0 ||
@@ -1697,29 +1700,50 @@ export function installTsRenderBridge(): void {
       e.stopImmediatePropagation();
       if (!messageSourceBelongsToAdUnit(e.source, prebidRendererEntry.adUnitCode)) return;
       const renderer = validateApsRenderer(prebidRendererEntry.renderer);
-      const rendererUrl = apsRendererUrl();
-      if (!renderer || !rendererUrl) return;
-      if (!hasConsumedPrebidApsIdCapacity(consumedPrebidApsIds, adId)) return;
+      if (!renderer || !hasConsumedPrebidApsIdCapacity(consumedPrebidApsIds, adId)) return;
       if (!consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
       recordConsumedPrebidApsId(consumedPrebidApsIds, adId, prebidRendererEntry.expiresAt);
 
-      port.postMessage(
-        JSON.stringify({
-          message: 'Prebid Response',
-          adId,
-          renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
-          rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
-          rendererUrl,
-          apsRenderer: renderer,
-          width: renderer.width,
-          height: renderer.height,
-        })
-      );
-
-      try {
-        prebidRendererEntry.markUsed();
-      } catch (err) {
-        log.warn(`[tsjs-gpt] APS Prebid markUsed callback threw for '${adId}'`, err);
+      const markUsed = (): void => {
+        try {
+          prebidRendererEntry.markUsed();
+        } catch (err) {
+          log.warn(`[tsjs-gpt] APS Prebid markUsed callback threw for '${adId}'`, err);
+        }
+      };
+      const dispatched = dispatchApsRendering({
+        slotId: prebidRendererEntry.adUnitCode,
+        renderer,
+        source: e.source,
+        trustedServer: (validatedRenderer) => {
+          const rendererUrl = apsRendererUrl();
+          if (!rendererUrl) return false;
+          try {
+            port.postMessage(
+              JSON.stringify({
+                message: 'Prebid Response',
+                adId,
+                renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+                rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+                rendererUrl,
+                apsRenderer: validatedRenderer,
+                width: validatedRenderer.width,
+                height: validatedRenderer.height,
+              })
+            );
+            return true;
+          } catch (err) {
+            log.warn(`[tsjs-gpt] APS Prebid response post failed for '${adId}'`, err);
+            return false;
+          }
+        },
+      });
+      if (typeof dispatched === 'boolean') {
+        if (dispatched) markUsed();
+      } else {
+        void dispatched.then((accepted) => {
+          if (accepted) markUsed();
+        });
       }
       return;
     }
@@ -1748,19 +1772,35 @@ export function installTsRenderBridge(): void {
       e.stopImmediatePropagation();
       if (consumedServerApsBySlot.get(slotId) === adId) return;
       const renderer = validateApsRenderer(matchedBid.renderer);
-      const rendererUrl = apsRendererUrl();
-      if (!renderer || !rendererUrl) return;
+      if (!renderer) return;
       consumedServerApsBySlot.set(slotId, adId);
-      port.postMessage(
-        JSON.stringify({
-          message: 'Prebid Response',
-          adId,
-          renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
-          rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
-          rendererUrl,
-          apsRenderer: renderer,
-          width: renderer.width,
-          height: renderer.height,
+      void Promise.resolve(
+        dispatchApsRendering({
+          slotId,
+          renderer,
+          source: e.source,
+          trustedServer: (validatedRenderer) => {
+            const rendererUrl = apsRendererUrl();
+            if (!rendererUrl) return false;
+            try {
+              port.postMessage(
+                JSON.stringify({
+                  message: 'Prebid Response',
+                  adId,
+                  renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+                  rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+                  rendererUrl,
+                  apsRenderer: validatedRenderer,
+                  width: validatedRenderer.width,
+                  height: validatedRenderer.height,
+                })
+              );
+              return true;
+            } catch (err) {
+              log.warn(`[tsjs-gpt] APS server response post failed for '${slotId}'`, err);
+              return false;
+            }
+          },
         })
       );
       return;
