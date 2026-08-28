@@ -105,9 +105,11 @@ const CURRENT_PROVIDER_SOURCE_OWNERS = Object.freeze({
   'src/integrations/sourcepoint/consent.ts': 'sourcepoint_consent',
 });
 const CURRENT_EXACT_SOURCE_OWNERS = Object.freeze({
+  'src/first_display/agent.ts': 'bootstrap',
+  'src/first_display/base_marker.ts': 'first_display',
+  'src/first_display/leaf/projection.ts': 'bootstrap',
   'src/first_display/render_journal.ts': 'render_owner_initial',
   'src/first_display/render_bridge.ts': 'aps_initial',
-  'src/core/adapters/gam_attribution.ts': 'bootstrap',
   'src/core/bootstrap.ts': 'bootstrap',
   'src/core/contracts/server_boot_transport.ts': 'bootstrap',
   'src/core/contracts/boot.ts': 'core',
@@ -190,6 +192,7 @@ const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
     'prebid',
     'prebid_later',
   ]),
+  'src/core/contracts/fallback_ad_units.ts': Object.freeze(['bootstrap']),
   'src/core/contracts/auction_projection.ts': Object.freeze(['core', 'prebid', 'prebid_later']),
   'src/core/contracts/generated/renderer_validator_v1.ts': Object.freeze([
     'bootstrap',
@@ -296,7 +299,7 @@ const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
   'src/kernel/sessions.ts': Object.freeze(['core']),
   'src/shared/async.ts': Object.freeze(['creative', 'datadome']),
   'src/shared/first_display_contracts.ts': Object.freeze(['bootstrap', 'core']),
-  'src/shared/first_display_handoff.ts': Object.freeze(['bootstrap', 'first_display']),
+  'src/shared/first_display_handoff.ts': Object.freeze(['bootstrap', 'first_display', 'core']),
   'src/shared/first_display_registration.ts': Object.freeze(['bootstrap', 'first_display']),
   'src/shared/first_display_transaction.ts': Object.freeze(['bootstrap']),
   'src/shared/integration_config_validators.ts': Object.freeze([
@@ -872,12 +875,12 @@ function validateCurrentSourceOwnership(currentGraph, release) {
       ['first_display_base', 'first_display_slice'].includes(artifactsById.get(owner)?.role)
     );
     if (firstDisplaySource) {
+      const policy = currentExactSourceOwner(source);
       for (const owner of owners) {
-        if (!firstDisplayOwners.includes(owner)) {
+        if (!firstDisplayOwners.includes(owner) && owner !== policy?.owner) {
           violations.push(`${owner} reaches first-display source ${source}`);
         }
       }
-      const policy = currentExactSourceOwner(source);
       if (policy) {
         if (!artifactIds.has(policy.owner)) {
           violations.push(`${source} requires missing current owner ${policy.owner}`);
@@ -1017,7 +1020,10 @@ function validateFirstDisplayMaskMeasurements(metrics, contents) {
     ) {
       fail(`build metrics first-display mask ${index} is not canonical`);
     }
-    for (const sizeName of SIZE_NAMES) {
+    if (!Number.isSafeInteger(measured.rawBytes) || measured.rawBytes < 0) {
+      fail(`firstDisplay.masks.${index}.rawBytes must be a non-negative integer`);
+    }
+    for (const sizeName of ['gzipBytes', 'brotliBytes']) {
       assertPositiveInteger(measured[sizeName], `firstDisplay.masks.${index}.${sizeName}`);
     }
     const bytes = firstDisplayCompositionBytes(canonical.files, contents);

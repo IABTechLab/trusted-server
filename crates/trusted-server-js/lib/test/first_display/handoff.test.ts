@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { createFirstDisplayHandoffOwner } from '../../src/shared/first_display_handoff';
+import {
+  createFirstDisplayHandoffOwner,
+  finalizeFirstDisplayAgentCaptureV1,
+} from '../../src/shared/first_display_handoff';
 
 const RELEASE_ID = 'a'.repeat(64);
 const RESERVATION_ID = `r1_${'a'.repeat(22)}`;
@@ -10,7 +13,7 @@ function handoff(
   overrides: Record<string, unknown> = {}
 ): Record<string, unknown> {
   return {
-    version: 1,
+    captureVersion: 1,
     releaseId: RELEASE_ID,
     generation: 1,
     projectionDigest: 'b'.repeat(64),
@@ -35,12 +38,14 @@ function handoff(
     cycles: [],
     trace: { nextSequence: 1, nextGlobalSlotOrdinal: 1, slots: [] },
     mutationRevision: revision,
+    identityCount: 0,
     ...overrides,
   };
 }
 
 function acceptedHandoff(revision: number): Record<string, unknown> {
   return handoff(revision, {
+    identityCount: 2,
     slices: ['first_display', 'gpt_initial'],
     slots: [
       {
@@ -157,6 +162,46 @@ function owner(options: { initialRevision?: number } = {}) {
 }
 
 describe('first-display final handoff owner', () => {
+  it('materializes the compact data handoff and capsule only inside the finalizer call', () => {
+    const artifact = {};
+    const physicalSlot = {};
+    const finalized = finalizeFirstDisplayAgentCaptureV1([
+      {
+        releaseId: RELEASE_ID,
+        generation: 1,
+        integrationConfigDigest: 'c'.repeat(64),
+        slices: ['first_display'],
+      },
+      ['b'.repeat(64), []],
+      new Map(),
+      new Map(),
+      new Map(),
+      [],
+      [['slot-1', 'slot-1', 'trusted_server', [], 'gt1_1', physicalSlot]],
+      [[['slot-1', 'gt1_1', 2, false, [], []]], [], 2, 0, 0],
+      [
+        [[null, null, artifact, 'gpt_adm', 'trusted_server', 'slot-1', 'reservation-1']],
+        [],
+        3,
+        1,
+        1,
+      ],
+      [1, null, 2, 3, 3],
+      1,
+      0,
+    ]);
+
+    expect(finalized?.handoff).toMatchObject({
+      captureVersion: 1,
+      releaseId: RELEASE_ID,
+      generation: 1,
+      mutationRevision: 0,
+      identityCount: 2,
+    });
+    expect(finalized?.capsule.consume(RELEASE_ID, 1)).toEqual([physicalSlot, artifact]);
+    expect(finalized?.capsule.consume(RELEASE_ID, 1)).toBeUndefined();
+  });
+
   it('seals the final revision and mints one release-bound capsule in the same task', () => {
     const h = owner();
     const physicalSlot = {};
@@ -234,7 +279,7 @@ describe('first-display final handoff owner', () => {
     expect(stale.failures).toEqual(['bundle_partial']);
   });
 
-  it('rejects nonterminal/live-authority data, wrong identity, and revision exhaustion', () => {
+  it('defers semantic validation but rejects wrong identity and revision exhaustion', () => {
     const nonterminal = owner();
     expect(
       nonterminal.value.finalize(() => ({
@@ -265,8 +310,8 @@ describe('first-display final handoff owner', () => {
         }),
         identities: [],
       }))
-    ).toBeUndefined();
-    expect(nonterminal.failures).toEqual(['bundle_partial']);
+    ).toBeDefined();
+    expect(nonterminal.failures).toEqual([]);
 
     const badIdentity = owner();
     expect(

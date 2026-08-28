@@ -12,56 +12,60 @@ function installPucDynamicOwner(): void {
   const reservationPattern = /^r1_[A-Za-z0-9_-]{22}$/;
   const admSandbox =
     'allow-forms allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation';
-  const renderFailureReason =
-    /^(?:auction_timeout|auction_disabled|consent_denied|slot_not_eligible|provider_timeout|provider_error|invalid_provider_response|mediation_failed|winner_not_renderable|internal_error|network_error|http_error|invalid_response|slot_unresolved|descriptor_invalid|invalid_dimensions|dimensions_out_of_range|no_render_source|registry_full|capability_registry_full|external_queue_full|external_ready_timeout|external_artifact_incompatible|prebid_admission_failed|prebid_contract_violation|prebid_selection_timeout|reservation_collision|identity_generation_failed|cycle_unattributable|slot_quarantined|gpt_request_failed|gpt_request_timeout|gpt_completion_timeout|reconciliation_capacity|gam_empty|bridge_claim_timeout|bridge_id_mismatch|owner_registration_timeout|owner_insertion_timeout|renderer_document_no_load|runner_no_load|runner_failed|adm_document_no_load|abi_mismatch|bundle_partial)$/;
-  const cancellationReason = /^(?:caller_aborted|superseded|navigation_disposed)$/;
+  const ownerError = 'TS render owner ';
   const messageEventDataGetter = Object.getOwnPropertyDescriptor(MessageEvent.prototype, 'data')
     ?.get as ((this: MessageEvent) => unknown) | undefined;
   const messageEventPortsGetter = Object.getOwnPropertyDescriptor(MessageEvent.prototype, 'ports')
     ?.get as ((this: MessageEvent) => readonly MessagePort[]) | undefined;
 
-  const ownDataValue = (candidate: unknown, name: string): unknown => {
+  const attempt = <T>(callback: () => T): T | undefined => {
     try {
-      if (typeof candidate !== 'object' || candidate === null) return undefined;
-      const descriptor = Object.getOwnPropertyDescriptor(candidate, name);
-      return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+      return callback();
     } catch {
       return undefined;
     }
   };
+  const closePort = (port: MessagePort | undefined): void => {
+    attempt(() => port?.close());
+  };
+
+  const ownDataValue = (candidate: unknown, name: string): unknown => {
+    return attempt(() => {
+      if (typeof candidate !== 'object' || candidate === null) return undefined;
+      const descriptor = Object.getOwnPropertyDescriptor(candidate, name);
+      return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+    });
+  };
   const eventDataValue = (event: unknown): unknown => {
-    try {
+    return attempt(() => {
       if (typeof event !== 'object' || event === null) return undefined;
       const descriptor = Object.getOwnPropertyDescriptor(event, 'data');
       if (descriptor) return 'value' in descriptor ? descriptor.value : undefined;
       return messageEventDataGetter ? Reflect.apply(messageEventDataGetter, event, []) : undefined;
-    } catch {
-      return undefined;
-    }
+    });
   };
 
   const exactRecord = (
     candidate: unknown,
     keys: readonly string[]
   ): Record<string, unknown> | undefined => {
-    if (
-      typeof candidate !== 'object' ||
-      candidate === null ||
-      Array.isArray(candidate) ||
-      Object.getPrototypeOf(candidate) !== Object.prototype ||
-      Object.getOwnPropertySymbols(candidate).length !== 0
-    ) {
-      return undefined;
-    }
-    const names = Object.getOwnPropertyNames(candidate).sort();
-    const expected = [...keys].sort();
-    if (names.length !== expected.length) return undefined;
-    for (let index = 0; index < expected.length; index += 1) {
-      if (names[index] !== expected[index]) return undefined;
-      const descriptor = Object.getOwnPropertyDescriptor(candidate, expected[index] as string);
-      if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return undefined;
-    }
-    return candidate as Record<string, unknown>;
+    return attempt(() => {
+      if (
+        typeof candidate !== 'object' ||
+        candidate === null ||
+        Array.isArray(candidate) ||
+        Object.getPrototypeOf(candidate) !== Object.prototype ||
+        Object.getOwnPropertySymbols(candidate).length !== 0 ||
+        Object.getOwnPropertyNames(candidate).length !== keys.length
+      ) {
+        return undefined;
+      }
+      for (let index = 0; index < keys.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(candidate, keys[index] as string);
+        if (!descriptor?.enumerable || !('value' in descriptor)) return undefined;
+      }
+      return candidate as Record<string, unknown>;
+    });
   };
   const inspectEventPorts = (
     event: unknown
@@ -72,7 +76,7 @@ function installPucDynamicOwner(): void {
         ports: readonly MessagePort[];
       }>
     | undefined => {
-    try {
+    return attempt(() => {
       if (typeof event !== 'object' || event === null) return undefined;
       const descriptor = Object.getOwnPropertyDescriptor(event, 'ports');
       const ports = descriptor
@@ -105,15 +109,13 @@ function installPucDynamicOwner(): void {
           continue;
         }
         const port = descriptor.value as Partial<MessagePort> | undefined;
-        let validPort = false;
-        try {
-          validPort =
-            !!port &&
-            typeof Reflect.get(port, 'postMessage') === 'function' &&
-            typeof Reflect.get(port, 'close') === 'function';
-        } catch {
-          validPort = false;
-        }
+        const validPort =
+          attempt(
+            () =>
+              !!port &&
+              typeof Reflect.get(port, 'postMessage') === 'function' &&
+              typeof Reflect.get(port, 'close') === 'function'
+          ) === true;
         if (!port || !validPort) {
           exactShape = false;
           continue;
@@ -127,27 +129,21 @@ function installPucDynamicOwner(): void {
         snapshot[snapshot.length] = accepted;
       }
       return { exactShape, originalCount: length.value, ports: snapshot };
-    } catch {
-      return undefined;
-    }
+    });
   };
   const eventPorts = (event: unknown, count: number): MessagePort[] | undefined => {
     const inspection = inspectEventPorts(event);
     return inspection?.exactShape === true &&
       inspection.originalCount === count &&
       inspection.ports.length === count
-      ? [...inspection.ports]
+      ? (inspection.ports as MessagePort[])
       : undefined;
   };
   const closeEventPorts = (event: unknown): void => {
     const inspection = inspectEventPorts(event);
     if (!inspection) return;
     for (let index = 0; index < inspection.ports.length; index += 1) {
-      try {
-        inspection.ports[index]?.close();
-      } catch {
-        // Late or malformed endpoints are still contained independently.
-      }
+      closePort(inspection.ports[index]);
     }
   };
   const validDimension = (value: unknown): value is number =>
@@ -204,7 +200,7 @@ function installPucDynamicOwner(): void {
         !creativeWindow ||
         !creativeWindow.document
       ) {
-        reject(new Error('TS render owner input refused'));
+        reject(new Error(`${ownerError}input refused`));
         return;
       }
 
@@ -220,84 +216,46 @@ function installPucDynamicOwner(): void {
 
       const removeFrameHandlers = (): void => {
         if (!frame) return;
-        try {
-          frame.onload = null;
-        } catch {
-          // One hostile DOM setter cannot skip the remaining terminal cleanup.
-        }
-        try {
-          frame.onerror = null;
-        } catch {
-          // One hostile DOM setter cannot skip the remaining terminal cleanup.
-        }
+        attempt(() => (frame!.onload = null));
+        attempt(() => (frame!.onerror = null));
       };
       const clearTimer = (handle: number | undefined): void => {
-        if (handle === undefined) return;
-        try {
-          creativeWindow.clearTimeout(handle);
-        } catch {
-          // Timer cleanup cannot prevent channel cleanup or Promise settlement.
-        }
+        if (handle !== undefined) attempt(() => creativeWindow.clearTimeout(handle));
       };
       const removeFrame = (candidate: HTMLIFrameElement | undefined): void => {
-        try {
-          candidate?.remove();
-        } catch {
-          // DOM cleanup is best-effort after authority is already terminal.
-        }
-      };
-      const closePort = (port: MessagePort | undefined): void => {
-        try {
-          port?.close();
-        } catch {
-          // Endpoint cleanup remains best-effort after the owner is inert.
-        }
+        attempt(() => candidate?.remove());
       };
       const stopHelper = (): void => {
         const dispose = helperDisposer;
         helperDisposer = undefined;
-        try {
-          dispose?.();
-        } catch {
-          // PUC helper cleanup cannot replay owner settlement.
-        }
+        attempt(() => dispose?.());
       };
       const finish = (accepted: boolean, reason: string): void => {
         if (settled) return;
         settled = true;
-        try {
-          clearTimer(registrationTimer);
-          clearTimer(ownerTimer);
-          stopHelper();
-          removeFrameHandlers();
-          if (!accepted && frame && !frameCommitted) removeFrame(frame);
-          if (controlPort) {
-            try {
-              controlPort.onmessage = null;
-            } catch {
-              // One hostile handler setter cannot retain the remaining authority.
-            }
-            try {
-              controlPort.onmessageerror = null;
-            } catch {
-              // One hostile handler setter cannot retain the remaining authority.
-            }
-          }
-          closePort(controlPort);
-          controlPort = undefined;
-          ownerFrameCurrent = undefined;
-        } finally {
-          if (accepted) resolve();
-          else reject(new Error(reason));
+        clearTimer(registrationTimer);
+        clearTimer(ownerTimer);
+        stopHelper();
+        removeFrameHandlers();
+        if (!accepted && frame && !frameCommitted) removeFrame(frame);
+        if (controlPort) {
+          attempt(() => (controlPort!.onmessage = null));
+          attempt(() => (controlPort!.onmessageerror = null));
         }
+        closePort(controlPort);
+        controlPort = undefined;
+        ownerFrameCurrent = undefined;
+        if (accepted) resolve();
+        else reject(new Error(reason));
       };
+      const fail = (reason: string): void => finish(false, `${ownerError}${reason}`);
       const postControl = (message: Record<string, unknown>): boolean => {
         try {
           if (!controlPort || settled) return false;
           controlPort.postMessage(message);
           return true;
         } catch {
-          finish(false, 'TS render owner control post failed');
+          fail('control post failed');
           return false;
         }
       };
@@ -308,20 +266,33 @@ function installPucDynamicOwner(): void {
         const width = source['width'] as number;
         const height = source['height'] as number;
         const next = creativeWindow.document.createElement('iframe');
-        next.setAttribute('sandbox', sandbox);
-        next.setAttribute('referrerpolicy', 'no-referrer');
-        next.setAttribute('width', String(width));
-        next.setAttribute('height', String(height));
-        next.setAttribute('scrolling', 'no');
-        next.setAttribute('frameborder', '0');
-        next.setAttribute('marginwidth', '0');
-        next.setAttribute('marginheight', '0');
-        next.setAttribute('title', 'Ad content');
-        next.setAttribute('aria-label', 'Advertisement');
-        next.setAttribute(
+        const attributes = [
+          'sandbox',
+          sandbox,
+          'referrerpolicy',
+          'no-referrer',
+          'width',
+          String(width),
+          'height',
+          String(height),
+          'scrolling',
+          'no',
+          'frameborder',
+          '0',
+          'marginwidth',
+          '0',
+          'marginheight',
+          '0',
+          'title',
+          'Ad content',
+          'aria-label',
+          'Advertisement',
           'style',
-          `border: 0; margin: 0; overflow: hidden; display: block; width: ${width}px; height: ${height}px;`
-        );
+          `border: 0; margin: 0; overflow: hidden; display: block; width: ${width}px; height: ${height}px;`,
+        ];
+        for (let index = 0; index < attributes.length; index += 2) {
+          next.setAttribute(attributes[index]!, attributes[index + 1]!);
+        }
         return next;
       };
       const prepareDocument = (): void => {
@@ -391,9 +362,7 @@ function installPucDynamicOwner(): void {
           ...(routedMessage === 'TS ADM Start'
             ? ['source']
             : routedMessage === 'TS Owner Settled' && routedOutcome !== undefined
-              ? routedOutcome === 'accepted'
-                ? ['outcome']
-                : ['outcome', 'reason']
+              ? ['outcome']
               : []),
         ]);
         if (
@@ -403,29 +372,19 @@ function installPucDynamicOwner(): void {
           message['lifecycleTicket'] !== lifecycleTicket
         ) {
           closeEventPorts(event);
-          finish(false, 'TS render owner control refused');
+          fail('control refused');
           return;
         }
-        if (
-          message['message'] === 'TS ADM Start' &&
-          ownerKind === 'adm' &&
-          ports.length === 0 &&
-          !started
-        ) {
+        if (message['message'] === 'TS ADM Start' && ownerKind === 'adm' && !started) {
           started = true;
           insertAdm(message['source'] as Record<string, unknown>);
           return;
         }
-        if (
-          message['message'] === 'TS APS Top Mount Started' &&
-          ownerKind === 'aps' &&
-          ports.length === 0 &&
-          !started
-        ) {
+        if (message['message'] === 'TS APS Top Mount Started' && ownerKind === 'aps' && !started) {
           started = true;
           return;
         }
-        if (message['message'] === 'TS Owner Settled' && ports.length === 0) {
+        if (message['message'] === 'TS Owner Settled') {
           if (
             message['outcome'] === 'accepted' &&
             started &&
@@ -435,25 +394,13 @@ function installPucDynamicOwner(): void {
             finish(true, '');
             return;
           }
-          if (
-            message['outcome'] === 'failed' &&
-            typeof message['reason'] === 'string' &&
-            renderFailureReason.test(message['reason'])
-          ) {
-            finish(false, message['reason']);
-            return;
-          }
-          if (
-            message['outcome'] === 'cancelled' &&
-            typeof message['reason'] === 'string' &&
-            cancellationReason.test(message['reason'])
-          ) {
-            finish(false, String(message['reason']));
+          if (message['outcome'] === 'failed' || message['outcome'] === 'cancelled') {
+            finish(false, String(message['outcome']));
             return;
           }
         }
         closeEventPorts(event);
-        finish(false, 'TS render owner control refused');
+        fail('control refused');
       };
       const receiveRegistration = (event: unknown): void => {
         if (settled || registrationFinished) {
@@ -481,30 +428,27 @@ function installPucDynamicOwner(): void {
           typeof lifecycleTicket !== 'string'
         ) {
           closeEventPorts(event);
-          finish(false, 'TS render owner registration refused');
+          fail('registration refused');
           return;
         }
         const registeredPort = ports[0];
         if (!registeredPort) {
-          finish(false, 'TS render owner registration refused');
+          fail('registration refused');
           return;
         }
         controlPort = registeredPort;
-        ownerTimer = creativeWindow.setTimeout(
-          () => finish(false, 'TS render owner settlement timeout'),
-          20_000
-        );
+        ownerTimer = creativeWindow.setTimeout(() => fail('settlement timeout'), 20_000);
         registeredPort.onmessage = receiveControl;
-        registeredPort.onmessageerror = () => finish(false, 'TS render owner channel failed');
+        registeredPort.onmessageerror = () => fail('channel failed');
         try {
           registeredPort.start();
         } catch {
-          finish(false, 'TS render owner channel failed');
+          fail('channel failed');
         }
       };
 
       const registrationTimer = creativeWindow.setTimeout(
-        () => finish(false, 'TS render owner registration timeout'),
+        () => fail('registration timeout'),
         3_000
       );
       try {
@@ -514,13 +458,13 @@ function installPucDynamicOwner(): void {
           receiveRegistration,
         ]) as unknown;
         if (typeof disposer !== 'function') {
-          finish(false, 'TS render owner registration failed');
+          fail('registration failed');
           return;
         }
         helperDisposer = disposer as () => void;
         if (registrationFinished) stopHelper();
       } catch {
-        finish(false, 'TS render owner registration failed');
+        fail('registration failed');
       }
     });
 }

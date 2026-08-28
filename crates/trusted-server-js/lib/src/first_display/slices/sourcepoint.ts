@@ -1,10 +1,20 @@
 import { installSourcepointInitial } from '../leaf/consent_snapshot';
+import { registerFirstDisplayBrowserRoute } from '../leaf/browser_route_owner';
+import { registerCurrentFirstDisplayComponent } from '../registration_client';
 
-import { defineInitialSlice, registerInitialSlice } from './definition';
+import type { InitialSliceInstaller } from './definition';
 
-export const SOURCEPOINT_INITIAL_SLICE = defineInitialSlice(
-  'sourcepoint_initial',
-  installSourcepointInitial
-);
+export const installSourcepointInitialSlice: InitialSliceInstaller = (candidate, own, config) =>
+  installSourcepointInitial(
+    Object.freeze({
+      config,
+      document,
+      observe: (candidate as Readonly<{ observe: unknown }>).observe,
+      origin: location.origin,
+      registerRoute: registerFirstDisplayBrowserRoute,
+      storage: window.localStorage,
+    }),
+    own
+  );
 
-registerInitialSlice(SOURCEPOINT_INITIAL_SLICE, 12);
+registerCurrentFirstDisplayComponent('sourcepoint_initial', installSourcepointInitialSlice);

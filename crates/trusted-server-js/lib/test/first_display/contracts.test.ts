@@ -6,6 +6,7 @@ import {
   MAX_GPT_FACT_BYTES,
   createFirstDisplayOwnershipCapsuleV1,
   snapshotFirstDisplayHandoffV1,
+  snapshotOutlinedFirstDisplayCaptureV1,
   snapshotTakeoverOutlineV1,
 } from '../../src/shared/first_display_contracts';
 
@@ -168,6 +169,97 @@ function handoff(overrides: Record<string, unknown> = {}): Record<string, unknow
 }
 
 describe('first-display immutable contracts', () => {
+  it('expands one compact old-owner capture only against the validated boot projection', () => {
+    const full = handoff();
+    (full.slots as Array<Record<string, unknown>>)[0]!.aliases = [];
+    const compact = {
+      captureVersion: 1,
+      releaseId: HASH,
+      generation: 1,
+      data: [
+        'b'.repeat(64),
+        'c'.repeat(64),
+        ['first_display', 'gpt_initial'],
+        [['accepted', null, 3, 1]],
+        [['slot-1', 'div-1', 'trusted_server', [], 'gt1_1']],
+        [['reservation', RESERVATION_ID, 1_000, 1]],
+        [[null, null, 'slot-1', 'gpt_adm', 'trusted_server', RESERVATION_ID]],
+        [
+          [
+            'gpt_initial',
+            [
+              ['gam', false],
+              ['v', 1],
+            ],
+          ],
+        ],
+        [(full.gptDiagnostics as Record<string, unknown>).facts, 0, 0],
+        [1, 2, 3, 4],
+        [2, 0, 2, 1],
+        full.cycles,
+        2,
+        2,
+      ],
+      mutationRevision: 7,
+      identityCount: 2,
+    };
+    const boot = {
+      abi: 1,
+      releaseId: HASH,
+      manifest: {},
+      auctionProjection: {
+        version: 1,
+        auction: {
+          version: 1,
+          auctionId: 'initial',
+          results: [{ slot: 'slot-1', outcome: 'winner', candidateId: 'AAAAAAAAAAAA' }],
+        },
+        slots: [
+          {
+            slot: 'slot-1',
+            gamUnitPath: '/123/home',
+            divId: 'div-1',
+            formats: [[300, 250]],
+            targeting: {},
+          },
+        ],
+        bids: [
+          {
+            candidateId: 'AAAAAAAAAAAA',
+            slot: 'slot-1',
+            provider: 'trusted',
+            upstreamBidId: 'upstream-1',
+            cpm: 1,
+            currency: 'USD',
+            targeting: {},
+            rendererReservationId: RESERVATION_ID,
+            renderSource: {
+              type: 'adm',
+              version: 1,
+              adm: '<main>trusted</main>',
+              width: 300,
+              height: 250,
+            },
+          },
+        ],
+      },
+      integrations: {},
+      creative: {},
+      diagnostics: {},
+    };
+
+    const issuer = {
+      mintAttemptId: () => ({
+        ok: true as const,
+        value: 'a1_AAECAwQFBgcAAAAAAAAAAQ',
+      }),
+      snapshotPrefix: () => 'AAECAwQFBgc',
+    };
+    expect(snapshotOutlinedFirstDisplayCaptureV1(compact, outline(), boot, issuer)).toEqual(full);
+    compact.data[3] = [['accepted', null, null, 1]];
+    expect(snapshotOutlinedFirstDisplayCaptureV1(compact, outline(), boot, issuer)).toBeUndefined();
+  });
+
   it('snapshots an exact takeover outline into a fresh recursively frozen value', () => {
     const input = outline();
     const accepted = snapshotTakeoverOutlineV1(input);

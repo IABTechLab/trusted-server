@@ -23,7 +23,7 @@ export function firstDisplayMaskIsPermitted(measurement) {
   return BUNDLE_SIZE_NAMES.every(
     (sizeName) =>
       Number.isSafeInteger(measurement?.[sizeName]) &&
-      measurement[sizeName] > 0 &&
+      measurement[sizeName] >= 0 &&
       measurement[sizeName] <= FIRST_DISPLAY_AGENT_SIZE_CEILING[sizeName]
   );
 }
@@ -236,7 +236,7 @@ export function enumerateReachableFirstDisplayMasks(catalog) {
     result.push({
       mask: mask.toString(16).padStart(4, '0'),
       ids: selected.map(({ id }) => id),
-      files: selected.map(({ file }) => file),
+      files: selected.filter(({ id }) => id !== 'first_display').map(({ file }) => file),
     });
   }
   return result;
@@ -257,7 +257,9 @@ export async function measureReachableFirstDisplayMasks(catalog, contents, concu
       const mask = masks[index];
       measured[index] = {
         ...mask,
-        ...(await measureBytesAsync(concatenateBundleSet(mask.files, contents))),
+        ...(await measureBytesAsync(
+          mask.files.length === 0 ? Buffer.alloc(0) : concatenateBundleSet(mask.files, contents)
+        )),
       };
       measured[index].permitted = firstDisplayMaskIsPermitted(measured[index]);
     }

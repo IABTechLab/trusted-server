@@ -39,7 +39,6 @@ const CONFIG_IDS = Object.freeze([
   'sourcepoint',
   'testlight',
 ] as const);
-
 export interface ServerBootIntegrityV1 {
   readonly version: 1;
   readonly projectionDigest: string;
@@ -68,9 +67,11 @@ function exact(value: unknown, keys: readonly string[]): Record<string, unknown>
     : undefined;
 }
 
-function deepFreeze(value: unknown): void {
+export function deepFreezeTransportV1(value: unknown): void {
   if (typeof value !== 'object' || value === null || Object.isFrozen(value)) return;
-  for (const key of Object.keys(value)) deepFreeze((value as Record<string, unknown>)[key]);
+  for (const key of Object.keys(value)) {
+    deepFreezeTransportV1((value as Record<string, unknown>)[key]);
+  }
   Object.freeze(value);
 }
 
@@ -229,7 +230,6 @@ function validBoot(candidate: unknown, releaseId: string): Readonly<TsjsBootV1> 
   }
   return boot as unknown as Readonly<TsjsBootV1>;
 }
-
 function validIntegrity(candidate: unknown): Readonly<ServerBootIntegrityV1> | undefined {
   const integrity = exact(candidate, ['version', 'projectionDigest', 'integrationConfigDigest']);
   return integrity &&
@@ -320,7 +320,7 @@ export function snapshotServerBootTransportV1(
     if (!boot || !integrity) return undefined;
     const outline = validOutline(root.outline, releaseId, integrity, boot);
     if (outline === undefined) return undefined;
-    deepFreeze(root);
+    deepFreezeTransportV1(root);
     return root as unknown as ServerBootTransportSnapshotV1;
   } catch {
     return undefined;

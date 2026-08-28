@@ -1,7 +1,4 @@
 import { installPrebidInitial } from '../leaf/prebid_protocol';
+import { registerCurrentFirstDisplayComponent } from '../registration_client';
 
-import { defineInitialSlice, registerInitialSlice } from './definition';
-
-export const PREBID_INITIAL_SLICE = defineInitialSlice('prebid_initial', installPrebidInitial);
-
-registerInitialSlice(PREBID_INITIAL_SLICE, 13);
+registerCurrentFirstDisplayComponent('prebid_initial', installPrebidInitial);

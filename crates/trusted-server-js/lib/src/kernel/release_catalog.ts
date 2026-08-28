@@ -152,7 +152,6 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     allowedImports: [
       'shared/first_display_contracts',
       'first_display/registration_client',
-      'first_display/slices/definition',
       'first_display/render_journal',
       'kernel/contracts/puc_dynamic_owner',
     ],
@@ -168,7 +167,6 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     allowedImports: [
       'shared/first_display_contracts',
       'first_display/registration_client',
-      'first_display/slices/definition',
       'first_display/leaf/aps_protocol',
       'first_display/render_bridge',
     ],
@@ -183,7 +181,6 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     allowedImports: [
       'shared/first_display_contracts',
       'first_display/registration_client',
-      'first_display/slices/definition',
       'first_display/leaf/creative_guard',
     ],
     inputs: ['first_display.control.v1'],
@@ -197,7 +194,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     allowedImports: [
       'shared/first_display_contracts',
       'first_display/registration_client',
-      'first_display/slices/definition',
+      'first_display/leaf/browser_route_owner',
       'first_display/leaf/route_guard',
     ],
     inputs: ['first_display.control.v1'],
@@ -211,7 +208,6 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     allowedImports: [
       'shared/first_display_contracts',
       'first_display/registration_client',
-      'first_display/slices/definition',
       'first_display/leaf/config_guard',
     ],
     inputs: ['first_display.control.v1'],
@@ -225,7 +221,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     allowedImports: [
       'shared/first_display_contracts',
       'first_display/registration_client',
-      'first_display/slices/definition',
+      'first_display/leaf/browser_route_owner',
       'first_display/leaf/route_guard',
     ],
     inputs: ['first_display.control.v1'],
@@ -239,7 +235,6 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     allowedImports: [
       'shared/first_display_contracts',
       'first_display/registration_client',
-      'first_display/slices/definition',
       'first_display/adapters/googletag',
       'first_display/leaf/gpt_protocol',
     ],
@@ -254,7 +249,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     allowedImports: [
       'shared/first_display_contracts',
       'first_display/registration_client',
-      'first_display/slices/definition',
+      'first_display/leaf/browser_route_owner',
       'first_display/leaf/route_guard',
     ],
     inputs: ['first_display.control.v1'],
@@ -268,7 +263,6 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     allowedImports: [
       'shared/first_display_contracts',
       'first_display/registration_client',
-      'first_display/slices/definition',
       'first_display/leaf/consent_snapshot',
     ],
     inputs: ['first_display.control.v1'],
@@ -282,7 +276,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     allowedImports: [
       'shared/first_display_contracts',
       'first_display/registration_client',
-      'first_display/slices/definition',
+      'first_display/leaf/browser_route_owner',
       'first_display/leaf/context_snapshot',
     ],
     inputs: ['first_display.control.v1'],
@@ -296,7 +290,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     allowedImports: [
       'shared/first_display_contracts',
       'first_display/registration_client',
-      'first_display/slices/definition',
+      'first_display/leaf/browser_route_owner',
       'first_display/leaf/consent_snapshot',
     ],
     inputs: ['first_display.control.v1'],
@@ -310,7 +304,6 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     allowedImports: [
       'shared/first_display_contracts',
       'first_display/registration_client',
-      'first_display/slices/definition',
       'first_display/leaf/prebid_protocol',
     ],
     inputs: ['first_display.control.v1', 'gpt.initial.v1'],
@@ -325,7 +318,6 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     allowedImports: [
       'shared/first_display_contracts',
       'first_display/registration_client',
-      'first_display/slices/definition',
       'first_display/leaf/callback_capture',
     ],
     inputs: ['first_display.control.v1'],

@@ -1,15 +1,22 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import {
   createFirstDisplayAgent,
-  type FirstDisplayAuctionProtocolId,
+  type FirstDisplayAgentOptions,
   type FirstDisplayBatchOutcomeV1,
-  type FirstDisplayBootstrapController,
   type FirstDisplayDriver,
   type FirstDisplayTerminalResult,
 } from '../../src/first_display/agent';
+import type { FirstDisplayRenderBridgeCapabilityV1 } from '../../src/first_display/driver';
+import type { FirstDisplayGptProtocolV1 } from '../../src/first_display/leaf/gpt_protocol';
+import type {
+  FirstDisplayGoogletagBatchCallbacks,
+  FirstDisplayGoogletagBatchInput,
+  FirstDisplayGptBoundCycleV1,
+} from '../../src/first_display/adapters/googletag';
 import { snapshotFirstDisplayBatchV1 } from '../../src/first_display/leaf/projection';
 import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
+import { finalizeFirstDisplayAgentCaptureV1 } from '../../src/shared/first_display_handoff';
 
 function batch(
   kinds: readonly ('no_bid' | 'failed' | 'gpt_adm' | 'aps')[]
@@ -101,44 +108,15 @@ function harness(options: { now?: number; hidden?: boolean } = {}) {
     mark: (name: string) => marks.push(name),
     measure: (name: string, start: string, end: string) => measures.push([name, start, end]),
   };
-  let bootstrapState: FirstDisplayBootstrapController['state'] = 'installing';
   const startedAtMs = now;
-  const deadline = () => !Number.isFinite(now - startedAtMs) || now - startedAtMs >= 10_000;
-  const fail = (reason: 'abi_mismatch' | 'bundle_partial'): boolean => {
-    if (bootstrapState === 'settled' || bootstrapState === 'failed') return false;
-    bootstrapState = 'failed';
-    failures.push(reason);
-    return true;
-  };
   performance.mark('tsjs:bids-script');
-  const bootstrap: FirstDisplayBootstrapController = Object.freeze({
-    get state() {
-      return bootstrapState;
-    },
+  const owner = Object.freeze({
     startedAtMs,
-    registerAgent: () => {
-      if (bootstrapState !== 'installing') return false;
-      if (deadline()) return fail('bundle_partial') && false;
-      bootstrapState = 'agent_registered';
-      return true;
-    },
-    startAction: () => {
-      if (bootstrapState !== 'agent_registered') return false;
-      if (deadline()) return fail('bundle_partial') && false;
-      bootstrapState = 'action_started';
-      return true;
-    },
-    settle: () => {
-      if (bootstrapState !== 'agent_registered' && bootstrapState !== 'action_started') {
-        return false;
-      }
-      bootstrapState = 'settled';
-      return true;
-    },
-    fail,
+    now: () => now,
+    onSettled: () => undefined,
   });
   return {
-    bootstrap,
+    owner,
     failures,
     frames,
     marks,
@@ -204,24 +182,186 @@ function driver(events: string[]): FirstDisplayDriver & {
   });
 }
 
+function production(
+  driver: FirstDisplayDriver
+): NonNullable<FirstDisplayAgentOptions['production']> {
+  let captured: ReturnType<FirstDisplayDriver['captureHandoff']>;
+  let closed: boolean | undefined;
+  let detached: boolean | undefined;
+  let disposed = false;
+  const terminals = new Map<
+    string,
+    (result: FirstDisplayTerminalResult, reason: string | null) => void
+  >();
+  const capture = () => {
+    if (captured === undefined) captured = driver.captureHandoff();
+    return captured;
+  };
+  const close = () => {
+    if (closed === undefined) closed = driver.closeIngress();
+    return closed;
+  };
+  const detach = () => {
+    if (detached === undefined) detached = driver.detachCommittedArtifacts();
+    return detached;
+  };
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    driver.dispose();
+  };
+  const gpt: FirstDisplayGptProtocolV1 = Object.freeze([
+    1,
+    'gpt',
+    (input: FirstDisplayGoogletagBatchInput) =>
+      Object.freeze([
+        (callbacks: FirstDisplayGoogletagBatchCallbacks) => {
+          const outcomes: FirstDisplayBatchOutcomeV1[] = [];
+          for (const decision of input[4].auction.results) {
+            if (decision.outcome !== 'winner') continue;
+            const bid = input[4].bids.find(
+              ({ candidateId }) => candidateId === decision.candidateId
+            );
+            if (bid) {
+              outcomes.push(
+                Object.freeze({
+                  kind: bid.renderSource.type === 'aps' ? 'aps' : 'gpt_adm',
+                  slotId: decision.slot,
+                })
+              );
+            }
+          }
+          for (const outcome of outcomes) {
+            const bid = input[4].bids.find(({ slot }) => slot === outcome.slotId)!;
+            const placement = input[4].slots.find(({ slot }) => slot === outcome.slotId)!;
+            callbacks[0](
+              Object.freeze([
+                bid,
+                document.createElement('div'),
+                () => true,
+                'trusted_server' as const,
+                {},
+                placement,
+                outcome.slotId,
+                `gt1_${outcome.slotId}`,
+              ])
+            );
+          }
+          driver.start(outcomes, callbacks[2], (slotId, result, reason) => {
+            terminals.get(slotId)?.(result, reason);
+          });
+          return true;
+        },
+        () => close(),
+        () =>
+          capture()?.cycles.map((cycle) =>
+            Object.freeze([cycle[6], cycle[1].id, cycle[3], cycle[8], cycle[7], cycle[4]] as const)
+          ),
+        () => {
+          const value = capture();
+          return value
+            ? Object.freeze([
+                value.diagnosticCycles.map((cycle) =>
+                  Object.freeze([
+                    cycle.slotId,
+                    cycle.token,
+                    cycle.nextCycleOrdinal,
+                    cycle.unknownPriorCycle,
+                    cycle.quarantines,
+                    cycle.records.map((record) =>
+                      Object.freeze([
+                        record.ordinal,
+                        record.responseIdentifier,
+                        record.seen,
+                        record.state,
+                      ] as const)
+                    ),
+                  ] as const)
+                ),
+                value.gptDiagnostics.facts,
+                value.nextTraceTokenOrdinal,
+                value.gptDiagnostics.overflowCount,
+                value.gptDiagnostics.dropCount,
+              ] as const)
+            : undefined;
+        },
+        () => detach(),
+        dispose,
+      ] as const),
+  ] as const);
+  const renderer: FirstDisplayRenderBridgeCapabilityV1 = Object.freeze([
+    (
+      cycle: FirstDisplayGptBoundCycleV1,
+      onTerminal: (result: FirstDisplayTerminalResult, reason: string | null) => void
+    ) => {
+      terminals.set(cycle[6], onTerminal);
+      return true;
+    },
+    () => true,
+    () => true,
+    () => true,
+    () => driver.sweepCommittedArtifacts(),
+    () => driver.sealTsAdmission(),
+    () => close(),
+    () => {
+      const value = capture();
+      return value
+        ? Object.freeze([
+            value.artifacts.map((artifact) =>
+              Object.freeze([
+                artifact.hostPosition,
+                artifact.hostPositionPriority,
+                artifact.identity,
+                artifact.kind,
+                artifact.owner,
+                artifact.slotId,
+                artifact.token,
+              ] as const)
+            ),
+            value.tombstones.map((entry) =>
+              Object.freeze([entry.kind, entry.value, entry.expiresAtMs, entry.ordinal] as const)
+            ),
+            value.clockEpochMs,
+            value.nextReservationOrdinal,
+            value.nextTicketOrdinal,
+          ] as const)
+        : undefined;
+    },
+    () => detach(),
+    dispose,
+  ] as const);
+  return Object.freeze({
+    gpt,
+    gptInput: Object.freeze([
+      window,
+      (handle: unknown) => window.clearTimeout(handle as number),
+      document,
+      (callback: () => void, delayMs: number) => window.setTimeout(callback, delayMs),
+    ] as const),
+    renderer,
+  });
+}
+
 describe('bounded first-display agent', () => {
   it('derives the protected action from the immutable projection and rejects outcome summaries', () => {
     const accepted = harness();
     const received: FirstDisplayBatchOutcomeV1[][] = [];
     const projectionAgent = createFirstDisplayAgent({
       batch: batch(['gpt_adm']),
-      bootstrap: accepted.bootstrap,
-      driver: Object.freeze({
-        captureHandoff: () => undefined,
-        closeIngress: () => true,
-        detachCommittedArtifacts: () => true,
-        sweepCommittedArtifacts: () => 0,
-        start: (outcomes: readonly FirstDisplayBatchOutcomeV1[]) => {
-          received.push([...outcomes]);
-        },
-        sealTsAdmission: () => undefined,
-        dispose: () => undefined,
-      }),
+      ...accepted.owner,
+      production: production(
+        Object.freeze({
+          captureHandoff: () => undefined,
+          closeIngress: () => true,
+          detachCommittedArtifacts: () => true,
+          sweepCommittedArtifacts: () => 0,
+          start: (outcomes: readonly FirstDisplayBatchOutcomeV1[]) => {
+            received.push([...outcomes]);
+          },
+          sealTsAdmission: () => undefined,
+          dispose: () => undefined,
+        })
+      ),
       performance: accepted.performance,
       paint: accepted.paint,
       onProtectedPaint: () => undefined,
@@ -239,8 +379,8 @@ describe('bounded first-display agent', () => {
         requiredProtocols: Object.freeze(['gpt']),
         outcomes: Object.freeze([Object.freeze({ slotId: 'slot-0', kind: 'gpt_adm' })]),
       }),
-      bootstrap: rejected.bootstrap,
-      driver: driver([]),
+      ...rejected.owner,
+      production: production(driver([])),
       performance: rejected.performance,
       paint: rejected.paint,
       onProtectedPaint: () => undefined,
@@ -250,55 +390,14 @@ describe('bounded first-display agent', () => {
     expect(rejected.failures).toEqual(['abi_mismatch']);
   });
 
-  it('requires exact activated protocol coverage for the immutable batch', () => {
-    const h = harness();
-    const coverage = createFirstDisplayAgent({
-      batch: batch(['aps']),
-      bootstrap: h.bootstrap,
-      driver: driver([]),
-      performance: h.performance,
-      paint: h.paint,
-      onProtectedPaint: () => undefined,
-      onFailure: () => undefined,
-    });
-    const aps = Object.freeze({ version: 1, id: 'aps' });
-    const gpt = Object.freeze({ version: 1, id: 'gpt' });
-    expect(
-      coverage.coversProtocols(
-        new Map<FirstDisplayAuctionProtocolId, unknown>([
-          ['aps', aps],
-          ['gpt', gpt],
-        ])
-      )
-    ).toBe(true);
-    expect(
-      coverage.coversProtocols(new Map<FirstDisplayAuctionProtocolId, unknown>([['aps', aps]]))
-    ).toBe(false);
-    expect(
-      coverage.coversProtocols(
-        new Map<FirstDisplayAuctionProtocolId, unknown>([
-          ['aps', aps],
-          ['gpt', Object.freeze({ version: 1, id: 'prebid' })],
-        ])
-      )
-    ).toBe(false);
-    expect(
-      coverage.coversProtocols(
-        new Map<FirstDisplayAuctionProtocolId, unknown>([
-          ['aps', Object.freeze({ version: 1, id: 'aps', extra: true })],
-          ['gpt', gpt],
-        ])
-      )
-    ).toBe(false);
-  });
   it('emits the four authoritative marks around one mixed protected batch', () => {
     const h = harness();
     const events: string[] = [];
     const ownedDriver = driver(events);
     const agent = createFirstDisplayAgent({
       batch: batch(['no_bid', 'gpt_adm', 'aps']),
-      bootstrap: h.bootstrap,
-      driver: ownedDriver,
+      ...h.owner,
+      production: production(ownedDriver),
       performance: h.performance,
       paint: h.paint,
       onProtectedPaint: () => events.push('protected:paint'),
@@ -338,8 +437,8 @@ describe('bounded first-display agent', () => {
     const events: string[] = [];
     const agent = createFirstDisplayAgent({
       batch: batch(['no_bid', 'failed', 'failed']),
-      bootstrap: h.bootstrap,
-      driver: driver(events),
+      ...h.owner,
+      production: production(driver(events)),
       performance: h.performance,
       paint: h.paint,
       onProtectedPaint: () => events.push('protected:paint'),
@@ -376,8 +475,8 @@ describe('bounded first-display agent', () => {
     });
     const agent = createFirstDisplayAgent({
       batch: batch(['gpt_adm']),
-      bootstrap: h.bootstrap,
-      driver: ownedDriver,
+      ...h.owner,
+      production: production(ownedDriver),
       performance: h.performance,
       paint: h.paint,
       onProtectedPaint: () => undefined,
@@ -397,18 +496,23 @@ describe('bounded first-display agent', () => {
     let lateAction: (() => boolean) | undefined;
     const lateAgent = createFirstDisplayAgent({
       batch: batch(['aps']),
-      bootstrap: late.bootstrap,
-      driver: Object.freeze({
-        captureHandoff: () => undefined,
-        closeIngress: () => true,
-        detachCommittedArtifacts: () => true,
-        sweepCommittedArtifacts: () => 0,
-        start: (_outcomes: readonly FirstDisplayBatchOutcomeV1[], onFirstAction: () => boolean) => {
-          lateAction = onFirstAction;
-        },
-        sealTsAdmission: () => undefined,
-        dispose: () => undefined,
-      }),
+      ...late.owner,
+      production: production(
+        Object.freeze({
+          captureHandoff: () => undefined,
+          closeIngress: () => true,
+          detachCommittedArtifacts: () => true,
+          sweepCommittedArtifacts: () => 0,
+          start: (
+            _outcomes: readonly FirstDisplayBatchOutcomeV1[],
+            onFirstAction: () => boolean
+          ) => {
+            lateAction = onFirstAction;
+          },
+          sealTsAdmission: () => undefined,
+          dispose: () => undefined,
+        })
+      ),
       performance: late.performance,
       paint: late.paint,
       onProtectedPaint: () => undefined,
@@ -432,42 +536,37 @@ describe('bounded first-display agent', () => {
       const events: string[] = [];
       const agent = createFirstDisplayAgent({
         batch: batch(['gpt_adm']),
-        bootstrap: h.bootstrap,
-        driver: driver(events),
+        ...h.owner,
+        production: production(driver(events)),
         performance: h.performance,
         paint: h.paint,
         onProtectedPaint: () => undefined,
         onFailure: (reason) => h.failures.push(reason),
       });
       expect(agent.start()).toBe(accepted);
-      expect(events).toEqual(accepted ? ['driver:start'] : []);
+      expect(events).toEqual(accepted ? ['driver:start'] : ['driver:dispose']);
       expect(h.failures).toEqual(accepted ? [] : ['bundle_partial']);
     }
   });
 
-  it('seals TS bidder admission at paint while native activity remains observable', () => {
+  it('seals the immutable TS batch at paint while native activity remains observable', () => {
     const h = harness();
     const events: string[] = [];
-    const complete = vi.fn();
     const agent = createFirstDisplayAgent({
       batch: batch(['no_bid']),
-      bootstrap: h.bootstrap,
-      driver: driver(events),
+      ...h.owner,
+      production: production(driver(events)),
       performance: h.performance,
       paint: h.paint,
       onProtectedPaint: () => undefined,
       onFailure: (reason) => h.failures.push(reason),
-      onPrebidAdmissionFailure: (reason) => events.push(reason),
     });
     agent.start();
     h.frames.shift()?.();
     h.frames.shift()?.();
 
-    expect(agent.admitTsBid(complete)).toBe(false);
-    expect(complete).toHaveBeenCalledTimes(1);
-    expect(events).toContain('prebid_admission_failed');
     expect(agent.observeNativeMutation()).toBe(true);
-    expect(agent.snapshot().mutationRevision).toBe(1);
+    expect(agent.mutationRevision).toBe(1);
   });
 
   it('drains pending DOM mutation records into the final handoff revision', () => {
@@ -480,8 +579,8 @@ describe('bounded first-display agent', () => {
     if (!issuer.ok) throw new Error('Expected first-display identity issuer');
     const agent = createFirstDisplayAgent({
       batch: batch(['no_bid']),
-      bootstrap: h.bootstrap,
-      driver: driver([]),
+      ...h.owner,
+      production: production(driver([])),
       performance: h.performance,
       paint: h.paint,
       mutationDocument: document,
@@ -500,7 +599,7 @@ describe('bounded first-display agent', () => {
     h.frames.shift()?.();
 
     host.append(document.createElement('span'));
-    const finalized = agent.finalizeHandoff();
+    const finalized = agent.finalizeHandoff(finalizeFirstDisplayAgentCaptureV1);
     expect(finalized?.handoff.mutationRevision).toBe(1);
     expect(h.failures).toEqual([]);
 
@@ -512,8 +611,8 @@ describe('bounded first-display agent', () => {
     const malformed = harness();
     const invalidAgent = createFirstDisplayAgent({
       batch: { ...batch(['no_bid']), extra: true },
-      bootstrap: malformed.bootstrap,
-      driver: driver([]),
+      ...malformed.owner,
+      production: production(driver([])),
       performance: malformed.performance,
       paint: malformed.paint,
       onProtectedPaint: () => undefined,
@@ -536,8 +635,8 @@ describe('bounded first-display agent', () => {
     });
     const failedAgent = createFirstDisplayAgent({
       batch: batch(['aps']),
-      bootstrap: throwing.bootstrap,
-      driver: throwingDriver,
+      ...throwing.owner,
+      production: production(throwingDriver),
       performance: throwing.performance,
       paint: throwing.paint,
       onProtectedPaint: () => undefined,
@@ -550,8 +649,8 @@ describe('bounded first-display agent', () => {
     const revision = harness();
     const revisionAgent = createFirstDisplayAgent({
       batch: batch(['no_bid']),
-      bootstrap: revision.bootstrap,
-      driver: driver([]),
+      ...revision.owner,
+      production: production(driver([])),
       performance: revision.performance,
       paint: revision.paint,
       onProtectedPaint: () => undefined,
@@ -614,17 +713,17 @@ describe('bounded first-display agent', () => {
             }),
           ]),
           cycles: Object.freeze([
-            Object.freeze({
-              bid: projectedBatch.projection.bids[0]!,
+            Object.freeze([
+              projectedBatch.projection.bids[0]!,
               element,
-              isCurrent: () => true,
-              ownership: 'trusted_server' as const,
+              () => true,
+              'trusted_server' as const,
               physicalSlot,
-              placement: projectedBatch.projection.slots[0]!,
-              slotId: 'slot-0',
-              targetingOwnership: Object.freeze([]),
-              traceToken: 'gt1_1',
-            }),
+              projectedBatch.projection.slots[0]!,
+              'slot-0',
+              'gt1_1',
+              Object.freeze([]),
+            ] as const),
           ]),
           diagnosticCycles: Object.freeze([
             Object.freeze({
@@ -665,8 +764,8 @@ describe('bounded first-display agent', () => {
     });
     const agent = createFirstDisplayAgent({
       batch: batch(['gpt_adm', 'gpt_adm']),
-      bootstrap: h.bootstrap,
-      driver: ownedDriver,
+      ...h.owner,
+      production: production(ownedDriver),
       performance: h.performance,
       paint: h.paint,
       onProtectedPaint: () => undefined,
@@ -674,14 +773,13 @@ describe('bounded first-display agent', () => {
       identityIssuer: issuer.value,
       parserState: () =>
         Object.freeze([
-          Object.freeze({
-            sliceId: 'gpt_initial',
-            observations: Object.freeze(['gam', 'v']),
-            values: Object.freeze([
+          Object.freeze([
+            'gpt_initial',
+            Object.freeze([
               Object.freeze(['gam', false] as const),
               Object.freeze(['v', 1] as const),
             ]),
-          }),
+          ] as const),
         ]),
       handoff: Object.freeze({
         releaseId: 'a'.repeat(64),
@@ -691,62 +789,41 @@ describe('bounded first-display agent', () => {
       }),
     });
     expect(agent.start()).toBe(true);
-    expect(agent.finalizeHandoff()).toBeUndefined();
+    expect(agent.finalizeHandoff(finalizeFirstDisplayAgentCaptureV1)).toBeUndefined();
     h.frames.shift()?.();
     h.frames.shift()?.();
 
-    const finalized = agent.finalizeHandoff();
+    const finalized = agent.finalizeHandoff(finalizeFirstDisplayAgentCaptureV1);
     expect(events.slice(-2)).toEqual(['close', 'capture']);
     expect(finalized?.handoff).toMatchObject({
+      captureVersion: 1,
       releaseId: 'a'.repeat(64),
       generation: 1,
-      projectionDigest: 'b'.repeat(64),
-      slices: ['first_display', 'gpt_initial'],
       mutationRevision: 0,
-      parserState: [
-        {
-          sliceId: 'gpt_initial',
-          observations: ['gam', 'v'],
-          values: [
-            ['gam', false],
-            ['v', 1],
-          ],
-        },
-      ],
-      attempts: [
-        expect.objectContaining({ id: 'a1_AAECAwQFBgcAAAAAAAAAAQ', ordinal: 1 }),
-        expect.objectContaining({
-          id: 'a1_AAECAwQFBgcAAAAAAAAAAg',
-          ordinal: 2,
-          reason: 'renderer_document_no_load',
-          state: 'failed',
-        }),
-      ],
-      highWater: expect.objectContaining({
-        navigationAttemptPrefix: 'AAECAwQFBgc',
-        nextNavigationAttemptOrdinal: 3,
-      }),
-      trace: {
-        nextGlobalSlotOrdinal: 2,
-        nextSequence: 2,
-        slots: [
-          {
-            bindings: [
-              {
-                atMs: 0,
-                cycleOrdinal: 1,
-                historySequence: 1,
-                state: 'completed',
-                token: 'gt1_1',
-              },
-            ],
-            impressions: 1,
-            slotId: 'slot-0',
-          },
-          { bindings: [], impressions: 0, slotId: 'slot-1' },
-        ],
-      },
+      identityCount: 2,
     });
+    const data = finalized?.handoff['data'] as readonly unknown[];
+    expect(data).toHaveLength(14);
+    expect(data.slice(0, 3)).toEqual([
+      'b'.repeat(64),
+      'c'.repeat(64),
+      ['first_display', 'gpt_initial'],
+    ]);
+    expect(data[3]).toEqual([
+      ['accepted', null, 0, 1],
+      ['failed', 'renderer_document_no_load', null, null],
+    ]);
+    expect(data[4]).toEqual([['slot-0', 'slot-0', 'trusted_server', [], 'gt1_1']]);
+    expect(data[7]).toEqual([
+      [
+        'gpt_initial',
+        [
+          ['gam', false],
+          ['v', 1],
+        ],
+      ],
+    ]);
+    expect(finalized?.handoff).not.toHaveProperty('attempts');
     expect(finalized?.capsule.consume('a'.repeat(64), 1)).toEqual([physicalSlot, artifact]);
     expect(agent.detachCommittedArtifacts()).toBe(true);
     agent.dispose();

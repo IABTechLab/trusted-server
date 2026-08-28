@@ -27,6 +27,12 @@ export interface NavigationIdentityIssuer {
   readonly snapshotOrdinalForTest: () => readonly [number, number];
 }
 
+/** Initial-display-only issuer; the projected batch is bounded to 256 attempts. */
+export interface FirstDisplayNavigationIdentityIssuer {
+  readonly mintAttemptId: () => IdentityGenerationResult<string>;
+  readonly snapshotPrefix: () => string;
+}
+
 /** Test-only controls for a deterministic navigation identity issuer. */
 export interface TestNavigationIdentityIssuerOptions {
   readonly getRandomValues?: RandomValuesSource;
@@ -208,6 +214,59 @@ export function createNavigationIdentityIssuerFromSource(
   observer?: IdentityFailureObserver
 ): IdentityGenerationResult<NavigationIdentityIssuer> {
   return createNavigationIdentityIssuer(source, [0, 0], observer);
+}
+
+/**
+ * Mint the same wire identities without bundling persistent adoption and u64
+ * rollover machinery into the protected first-display artifact.
+ */
+export function createFirstDisplayNavigationIdentityIssuerFromSource(
+  source: RandomValuesSource,
+  observer?: IdentityFailureObserver
+): IdentityGenerationResult<FirstDisplayNavigationIdentityIssuer> {
+  const prefixResult = randomBytes(8, source, observer);
+  if (!prefixResult.ok) return prefixResult;
+  let prefix: Uint8Array<ArrayBuffer>;
+  try {
+    prefix = new Uint8Array(8);
+    prefix.set(prefixResult.value);
+  } catch {
+    return reportFailure(observer);
+  }
+  let ordinal = 0;
+  return Object.freeze({
+    ok: true,
+    value: Object.freeze({
+      mintAttemptId: (): IdentityGenerationResult<string> => {
+        if (ordinal >= 256) return reportFailure(observer);
+        try {
+          const next = ordinal + 1;
+          const identity = new Uint8Array(16);
+          identity.set(prefix);
+          new DataView(identity.buffer).setUint32(12, next, false);
+          if (
+            identity.byteLength !== 16 ||
+            identity[12] !== 0 ||
+            identity[13] !== 0 ||
+            identity[14] !== next >>> 8 ||
+            identity[15] !== (next & 0xff)
+          ) {
+            return reportFailure(observer);
+          }
+          for (let index = 0; index < prefix.length; index += 1) {
+            if (identity[index] !== prefix[index]) return reportFailure(observer);
+          }
+          const encoded = encodeBase64Url(identity);
+          if (encoded.length !== 22) return reportFailure(observer);
+          ordinal = next;
+          return Object.freeze({ ok: true, value: `a1_${encoded}` });
+        } catch {
+          return reportFailure(observer);
+        }
+      },
+      snapshotPrefix: () => encodeBase64Url(prefix),
+    }),
+  });
 }
 
 function browserRandomSource(): RandomValuesSource | undefined {

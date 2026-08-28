@@ -36,6 +36,7 @@ import {
 import { createTargetingService } from '../../../src/services/targeting';
 import { createReservationService } from '../../../src/services/reservations';
 import type { SlotRequestOutcome } from '../../../src/services/slots';
+import { acceptedGptFirstDisplayTakeover } from '../../first_display/helpers/compact_takeover';
 
 const RELEASE_ID = 'a'.repeat(64);
 const RESERVATION_ID = `r1_${'a'.repeat(22)}`;
@@ -1067,122 +1068,133 @@ describe('transactional GPT integration module', () => {
                     ? (['first_display'] as const)
                     : (['first_display', 'gpt_initial'] as const)
                 );
+                const candidate = acceptedGptFirstDisplayTakeover(
+                  RELEASE_ID,
+                  RESERVATION_ID,
+                  parserStateValid === true
+                    ? 'valid'
+                    : parserStateValid === false
+                      ? 'invalid'
+                      : 'absent',
+                  gamAttributionEnabled
+                );
                 const handoff = prepared.validateHandoff(
-                  Object.freeze({
-                    version: 1 as const,
-                    releaseId: RELEASE_ID,
-                    generation: 1,
-                    projectionDigest: 'b'.repeat(64),
-                    integrationConfigDigest: 'c'.repeat(64),
-                    slices,
-                    slots: Object.freeze([
-                      Object.freeze({
-                        id: 'takeover-slot',
-                        aliases: Object.freeze([]),
-                        owner: 'publisher',
-                        domId: 'takeover-slot',
-                        gamPath: '/123/takeover-slot',
-                        formats: Object.freeze([Object.freeze([300, 250])]),
-                        outcome: 'accepted' as const,
-                        targeting: Object.freeze([
-                          Object.freeze(['hb_adid', RESERVATION_ID] as const),
-                        ]),
-                        committedArtifact: 'gpt_adm' as const,
-                        targetingOwnership: Object.freeze([]),
-                        gptToken: 'gt1_1',
-                      }),
-                    ]),
-                    attempts: Object.freeze([
-                      Object.freeze({
-                        id: 'a1_AAECAwQFBgcAAAAAAAAAAQ',
-                        slotId: 'takeover-slot',
-                        ordinal: 1,
-                        state: 'accepted' as const,
-                        reason: null,
-                      }),
-                    ]),
-                    tombstones: Object.freeze([]),
-                    artifacts: Object.freeze([
-                      Object.freeze({
-                        hostPosition: null,
-                        hostPositionPriority: null,
-                        slotId: 'takeover-slot',
-                        kind: 'gpt_adm' as const,
-                        owner: 'trusted_server' as const,
-                        token: RESERVATION_ID,
-                      }),
-                    ]),
-                    parserState:
-                      parserStateValid === true
-                        ? Object.freeze([
-                            Object.freeze({
-                              sliceId: 'gpt_initial',
-                              observations: Object.freeze(['gam', 'v']),
-                              values: Object.freeze([
-                                Object.freeze(['gam', gamAttributionEnabled] as const),
-                                Object.freeze(['v', 1] as const),
-                              ]),
-                            }),
-                          ])
-                        : Object.freeze([]),
-                    gptDiagnostics: Object.freeze({
-                      facts: Object.freeze([]),
-                      overflowCount: 0,
-                      dropCount: 0,
-                    }),
-                    timing: Object.freeze({
-                      bidsScriptMs: 1,
-                      firstDisplayMs: 2,
-                      terminalMs: 3,
-                      paintMs: 4,
-                    }),
-                    highWater: Object.freeze({
-                      navigationAttemptPrefix: 'AAECAwQFBgc',
-                      nextAttemptOrdinal: 2,
-                      nextNavigationAttemptOrdinal: 2,
-                      nextSlotRegistrationOrdinal: 2,
-                      nextReservationOrdinal: 2,
-                      nextTicketOrdinal: 1,
-                      reservationClockEpochMs: 0,
-                    }),
-                    cycles: Object.freeze([
-                      Object.freeze({
-                        nextCycleOrdinal: 2,
-                        quarantines: Object.freeze([]),
-                        records: Object.freeze([
-                          Object.freeze({
-                            ordinal: 1,
-                            responseIdentifier: 'response-one',
-                            seen: Object.freeze(['slotRequested', 'slotRenderEnded'] as const),
-                            state: 'completed' as const,
-                          }),
-                        ]),
-                        slotId: 'takeover-slot',
-                        token: 'gt1_1',
-                        unknownPriorCycle: false,
-                      }),
-                    ]),
-                    trace: Object.freeze({
-                      nextGlobalSlotOrdinal: 2,
-                      nextSequence: 2,
+                  candidate.capture ||
+                    Object.freeze({
+                      version: 1 as const,
+                      releaseId: RELEASE_ID,
+                      generation: 1,
+                      projectionDigest: 'b'.repeat(64),
+                      integrationConfigDigest: 'c'.repeat(64),
+                      slices,
                       slots: Object.freeze([
                         Object.freeze({
-                          bindings: Object.freeze([
-                            Object.freeze({
-                              atMs: 2,
-                              cycleOrdinal: 1,
-                              historySequence: 1,
-                              state: 'completed' as const,
-                              token: 'gt1_1',
-                            }),
+                          id: 'takeover-slot',
+                          aliases: Object.freeze([]),
+                          owner: 'publisher',
+                          domId: 'takeover-slot',
+                          gamPath: '/123/takeover-slot',
+                          formats: Object.freeze([Object.freeze([300, 250])]),
+                          outcome: 'accepted' as const,
+                          targeting: Object.freeze([
+                            Object.freeze(['hb_adid', RESERVATION_ID] as const),
                           ]),
-                          impressions: 1,
-                          slotId: 'takeover-slot',
+                          committedArtifact: 'gpt_adm' as const,
+                          targetingOwnership: Object.freeze([]),
+                          gptToken: 'gt1_1',
                         }),
                       ]),
+                      attempts: Object.freeze([
+                        Object.freeze({
+                          id: 'a1_AAECAwQFBgcAAAAAAAAAAQ',
+                          slotId: 'takeover-slot',
+                          ordinal: 1,
+                          state: 'accepted' as const,
+                          reason: null,
+                        }),
+                      ]),
+                      tombstones: Object.freeze([]),
+                      artifacts: Object.freeze([
+                        Object.freeze({
+                          hostPosition: null,
+                          hostPositionPriority: null,
+                          slotId: 'takeover-slot',
+                          kind: 'gpt_adm' as const,
+                          owner: 'trusted_server' as const,
+                          token: RESERVATION_ID,
+                        }),
+                      ]),
+                      parserState:
+                        parserStateValid === true
+                          ? Object.freeze([
+                              Object.freeze({
+                                sliceId: 'gpt_initial',
+                                observations: Object.freeze(['gam', 'v']),
+                                values: Object.freeze([
+                                  Object.freeze(['gam', gamAttributionEnabled] as const),
+                                  Object.freeze(['v', 1] as const),
+                                ]),
+                              }),
+                            ])
+                          : Object.freeze([]),
+                      gptDiagnostics: Object.freeze({
+                        facts: Object.freeze([]),
+                        overflowCount: 0,
+                        dropCount: 0,
+                      }),
+                      timing: Object.freeze({
+                        bidsScriptMs: 1,
+                        firstDisplayMs: 2,
+                        terminalMs: 3,
+                        paintMs: 4,
+                      }),
+                      highWater: Object.freeze({
+                        navigationAttemptPrefix: 'AAECAwQFBgc',
+                        nextAttemptOrdinal: 2,
+                        nextNavigationAttemptOrdinal: 2,
+                        nextSlotRegistrationOrdinal: 2,
+                        nextReservationOrdinal: 2,
+                        nextTicketOrdinal: 1,
+                        reservationClockEpochMs: 0,
+                      }),
+                      cycles: Object.freeze([
+                        Object.freeze({
+                          nextCycleOrdinal: 2,
+                          quarantines: Object.freeze([]),
+                          records: Object.freeze([
+                            Object.freeze({
+                              ordinal: 1,
+                              responseIdentifier: 'response-one',
+                              seen: Object.freeze(['slotRequested', 'slotRenderEnded'] as const),
+                              state: 'completed' as const,
+                            }),
+                          ]),
+                          slotId: 'takeover-slot',
+                          token: 'gt1_1',
+                          unknownPriorCycle: false,
+                        }),
+                      ]),
+                      trace: Object.freeze({
+                        nextGlobalSlotOrdinal: 2,
+                        nextSequence: 2,
+                        slots: Object.freeze([
+                          Object.freeze({
+                            bindings: Object.freeze([
+                              Object.freeze({
+                                atMs: 2,
+                                cycleOrdinal: 1,
+                                historySequence: 1,
+                                state: 'completed' as const,
+                                token: 'gt1_1',
+                              }),
+                            ]),
+                            impressions: 1,
+                            slotId: 'takeover-slot',
+                          }),
+                        ]),
+                      }),
+                      mutationRevision: 0,
                     }),
-                    mutationRevision: 0,
-                  }),
                   Object.freeze({
                     version: 1 as const,
                     releaseId: RELEASE_ID,
@@ -1194,7 +1206,8 @@ describe('transactional GPT integration module', () => {
                     outcomeCount: 1,
                     capabilities: Object.freeze([]),
                     objectKinds: Object.freeze(['gpt_slot', 'dom_artifact']),
-                  })
+                  }),
+                  candidate.boot
                 );
                 if (!handoff) throw new Error('should validate test handoff');
                 prepared.activate(

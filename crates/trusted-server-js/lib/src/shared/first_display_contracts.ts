@@ -1230,6 +1230,323 @@ export function snapshotOutlinedFirstDisplayHandoffV1(
   return handoff;
 }
 
+/**
+ * Expand the compact old-owner capture after the persistent bundle is available,
+ * then run the unchanged canonical handoff validator before either owner detaches.
+ */
+export function snapshotOutlinedFirstDisplayCaptureV1(
+  candidate: unknown,
+  outlineCandidate: unknown,
+  bootCandidate: unknown,
+  identityIssuer?: Readonly<{
+    mintAttemptId: () => Readonly<{ ok: boolean; value?: string }>;
+    snapshotPrefix: () => string;
+  }>
+): FirstDisplayHandoffV1 | undefined {
+  try {
+    const capture = exactRecord(candidate, [
+      'captureVersion',
+      'releaseId',
+      'generation',
+      'data',
+      'mutationRevision',
+      'identityCount',
+    ]);
+    const data = exactArray(capture?.data, 14);
+    const boot = exactRecord(bootCandidate, [
+      'abi',
+      'releaseId',
+      'manifest',
+      'auctionProjection',
+      'integrations',
+      'creative',
+      'diagnostics',
+    ]);
+    const projection = exactRecord(boot?.auctionProjection, [
+      'version',
+      'auction',
+      'slots',
+      'bids',
+    ]);
+    const auction = exactRecord(projection?.auction, ['version', 'auctionId', 'results']);
+    const placements = exactArray(projection?.slots, MAX_FIRST_DISPLAY_SLOTS);
+    const bids = exactArray(projection?.bids, MAX_FIRST_DISPLAY_SLOTS);
+    const decisions = exactArray(auction?.results, MAX_FIRST_DISPLAY_SLOTS);
+    const results = exactArray(data?.[3], MAX_FIRST_DISPLAY_SLOTS);
+    const bindings = exactArray(data?.[4], MAX_FIRST_DISPLAY_SLOTS);
+    const rawTombstones = exactArray(data?.[5], 512);
+    const rawArtifacts = exactArray(data?.[6], MAX_FIRST_DISPLAY_SLOTS);
+    const rawParserState = exactArray(data?.[7], FIRST_DISPLAY_CONTRACT_IDS.length);
+    const diagnostics = exactArray(data?.[8], 3);
+    const timing = exactArray(data?.[9], 4);
+    const highWater = exactArray(data?.[10], 4);
+    const cycles = exactArray(data?.[11], MAX_FIRST_DISPLAY_SLOTS);
+    if (
+      !capture ||
+      capture.captureVersion !== 1 ||
+      !data ||
+      data.length !== 14 ||
+      !boot ||
+      boot.abi !== 1 ||
+      !projection ||
+      projection.version !== 1 ||
+      !auction ||
+      auction.version !== 1 ||
+      !placements ||
+      !bids ||
+      !decisions ||
+      !results ||
+      results.length !== placements.length ||
+      decisions.length !== placements.length ||
+      !bindings ||
+      !rawTombstones ||
+      !rawArtifacts ||
+      !rawParserState ||
+      !diagnostics ||
+      diagnostics.length !== 3 ||
+      !timing ||
+      timing.length !== 4 ||
+      !highWater ||
+      highWater.length !== 4 ||
+      !cycles ||
+      !Number.isInteger(capture.identityCount) ||
+      !identityIssuer
+    ) {
+      return undefined;
+    }
+    const bidBySlot = new Map<string, Readonly<Record<string, unknown>>>();
+    for (const value of bids) {
+      const bid = exactRecord(
+        value,
+        Object.prototype.hasOwnProperty.call(value, 'creativeId')
+          ? [
+              'candidateId',
+              'slot',
+              'provider',
+              'upstreamBidId',
+              'cpm',
+              'currency',
+              'targeting',
+              'rendererReservationId',
+              'renderSource',
+              'creativeId',
+            ]
+          : [
+              'candidateId',
+              'slot',
+              'provider',
+              'upstreamBidId',
+              'cpm',
+              'currency',
+              'targeting',
+              'rendererReservationId',
+              'renderSource',
+            ]
+      );
+      if (!bid || typeof bid.slot !== 'string' || bidBySlot.has(bid.slot)) return undefined;
+      bidBySlot.set(bid.slot, bid);
+    }
+    const bindingBySlot = new Map<string, Readonly<Record<string, unknown>>>();
+    for (const value of bindings) {
+      const fields = exactArray(value, 5);
+      if (!fields || fields.length !== 5 || typeof fields[0] !== 'string') return undefined;
+      const binding = {
+        slotId: fields[0],
+        domId: fields[1],
+        owner: fields[2],
+        targetingOwnership: fields[3],
+        gptToken: fields[4],
+      };
+      if (bindingBySlot.has(binding.slotId)) {
+        return undefined;
+      }
+      bindingBySlot.set(binding.slotId, binding);
+    }
+    const tombstones: Readonly<Record<string, unknown>>[] = [];
+    for (const value of rawTombstones) {
+      const fields = exactArray(value, 4);
+      if (!fields || fields.length !== 4) return undefined;
+      tombstones.push({
+        kind: fields[0],
+        value: fields[1],
+        expiresAtMs: fields[2],
+        ordinal: fields[3],
+      });
+    }
+    const artifacts: Readonly<Record<string, unknown>>[] = [];
+    for (const value of rawArtifacts) {
+      const fields = exactArray(value, 6);
+      if (!fields || fields.length !== 6) return undefined;
+      artifacts.push({
+        hostPosition: fields[0],
+        hostPositionPriority: fields[1],
+        slotId: fields[2],
+        kind: fields[3],
+        owner: fields[4],
+        token: fields[5],
+      });
+    }
+    const parserState: Readonly<Record<string, unknown>>[] = [];
+    for (const value of rawParserState) {
+      const fields = exactArray(value, 2);
+      const values = exactArray(fields?.[1], 256);
+      if (!fields || fields.length !== 2 || !values) return undefined;
+      const observations: unknown[] = [];
+      for (const value of values) {
+        const pair = exactArray(value, 2);
+        if (!pair || pair.length !== 2) return undefined;
+        observations.push(pair[0]);
+      }
+      parserState.push({ sliceId: fields[0], observations, values });
+    }
+    let acceptedBindings = 0;
+    const slots: Readonly<Record<string, unknown>>[] = [];
+    const attempts: Readonly<Record<string, unknown>>[] = [];
+    const traceSlots: Readonly<Record<string, unknown>>[] = [];
+    for (let index = 0; index < placements.length; index += 1) {
+      const placement = exactRecord(placements[index], [
+        'slot',
+        'gamUnitPath',
+        'divId',
+        'formats',
+        'targeting',
+      ]);
+      const decision = exactRecord(
+        decisions[index],
+        Object.prototype.hasOwnProperty.call(decisions[index], 'candidateId')
+          ? ['slot', 'outcome', 'candidateId']
+          : Object.prototype.hasOwnProperty.call(decisions[index], 'reason')
+            ? ['slot', 'outcome', 'reason']
+            : ['slot', 'outcome']
+      );
+      const result = exactArray(results[index], 4);
+      const slotId = placement?.slot;
+      if (
+        !placement ||
+        typeof slotId !== 'string' ||
+        !decision ||
+        decision.slot !== slotId ||
+        !result ||
+        result.length !== 4
+      ) {
+        return undefined;
+      }
+      const bid = bidBySlot.get(slotId);
+      const renderSource = bid?.renderSource as Readonly<Record<string, unknown>> | undefined;
+      const projectedKind =
+        decision.outcome === 'no_bid'
+          ? 'no_bid'
+          : decision.outcome === 'failed'
+            ? 'failed'
+            : renderSource?.type === 'aps'
+              ? 'aps'
+              : renderSource?.type === 'adm'
+                ? 'gpt_adm'
+                : undefined;
+      if (!projectedKind) return undefined;
+      const binding = bindingBySlot.get(slotId);
+      const accepted = result[0] === 'accepted';
+      if (accepted !== Boolean(binding) || (accepted && !bid)) return undefined;
+      if (!accepted && (result[2] !== null || result[3] !== null)) return undefined;
+      if (binding) acceptedBindings += 1;
+      const identity = identityIssuer.mintAttemptId();
+      if (!identity.ok || typeof identity.value !== 'string') return undefined;
+      attempts.push({
+        id: identity.value,
+        slotId,
+        ordinal: index + 1,
+        state: result[0],
+        reason: result[1],
+      });
+      const targeting = {
+        ...(placement.targeting as Record<string, string>),
+        ...(bid?.targeting as Record<string, string> | undefined),
+      };
+      if (bid) targeting['hb_adid'] = bid.rendererReservationId as string;
+      slots.push({
+        id: slotId,
+        aliases: [],
+        domId: binding?.domId ?? placement.divId,
+        gamPath: placement.gamUnitPath,
+        formats: placement.formats,
+        owner: binding?.owner ?? 'trusted_server',
+        outcome: result[0],
+        targeting: Object.keys(targeting)
+          .sort()
+          .map((key) => [key, targeting[key]]),
+        targetingOwnership: binding?.targetingOwnership ?? [],
+        committedArtifact:
+          accepted && (projectedKind === 'gpt_adm' || projectedKind === 'aps')
+            ? projectedKind
+            : 'none',
+        gptToken: binding?.gptToken ?? null,
+      });
+      traceSlots.push({
+        slotId,
+        impressions: accepted ? 1 : 0,
+        bindings: accepted
+          ? [
+              {
+                atMs: result[2],
+                cycleOrdinal: 1,
+                historySequence: result[3],
+                state: 'completed',
+                token: binding?.gptToken,
+              },
+            ]
+          : [],
+      });
+    }
+    if (bindingBySlot.size !== acceptedBindings) return undefined;
+    const expanded = {
+      version: 1,
+      releaseId: capture.releaseId,
+      generation: capture.generation,
+      projectionDigest: data[0],
+      integrationConfigDigest: data[1],
+      slices: data[2],
+      slots,
+      attempts,
+      tombstones,
+      artifacts,
+      parserState,
+      gptDiagnostics: {
+        facts: diagnostics[0],
+        overflowCount: diagnostics[1],
+        dropCount: diagnostics[2],
+      },
+      timing: {
+        bidsScriptMs: timing[0],
+        firstDisplayMs: timing[1],
+        terminalMs: timing[2],
+        paintMs: timing[3],
+      },
+      highWater: {
+        navigationAttemptPrefix: identityIssuer.snapshotPrefix(),
+        nextNavigationAttemptOrdinal: attempts.length + 1,
+        nextAttemptOrdinal: attempts.length + 1,
+        nextSlotRegistrationOrdinal: highWater[0],
+        reservationClockEpochMs: highWater[1],
+        nextReservationOrdinal: highWater[2],
+        nextTicketOrdinal: highWater[3],
+      },
+      cycles,
+      trace: {
+        nextSequence: data[12],
+        nextGlobalSlotOrdinal: data[13],
+        slots: traceSlots,
+      },
+      mutationRevision: capture.mutationRevision,
+    };
+    const accepted = snapshotOutlinedFirstDisplayHandoffV1(expanded, outlineCandidate);
+    return accepted && capture.identityCount === accepted.cycles.length + accepted.artifacts.length
+      ? accepted
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Mint a closure-private, release/generation-bound one-use object-identity capsule. */
 export function createFirstDisplayOwnershipCapsuleV1<T extends object>(
   releaseId: string,

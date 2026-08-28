@@ -10,12 +10,6 @@ export interface FirstDisplayCreativeGuardV1 {
 }
 
 interface CreativeInitialBindings {
-  readonly config: Readonly<{
-    version: 1;
-    enabled: true;
-    clickGuard: boolean;
-    renderGuard: boolean;
-  }>;
   readonly location: Readonly<{ href: string; origin: string }>;
   readonly observe: (name: 'guard_count', value: number) => void;
   readonly register: (guard: FirstDisplayCreativeGuardV1) => () => void;
@@ -51,45 +45,24 @@ function exactRecord(value: unknown, keys: readonly string[]): Record<string, un
   }
 }
 
-function snapshotBindings(candidate: unknown): CreativeInitialBindings | undefined {
-  const fields = exactRecord(candidate, ['config', 'location', 'observe', 'register']);
-  const config = exactRecord(fields?.config, ['version', 'enabled', 'clickGuard', 'renderGuard']);
-  const location = exactRecord(fields?.location, ['href', 'origin']);
+function snapshotConfig(candidate: unknown):
+  | Readonly<{
+      clickGuard: boolean;
+      renderGuard: boolean;
+    }>
+  | undefined {
+  const config = exactRecord(candidate, ['version', 'enabled', 'clickGuard', 'renderGuard']);
   if (
-    !fields ||
     !config ||
     config.version !== 1 ||
     config.enabled !== true ||
     typeof config.clickGuard !== 'boolean' ||
     typeof config.renderGuard !== 'boolean' ||
-    (!config.clickGuard && !config.renderGuard) ||
-    !location ||
-    typeof location.href !== 'string' ||
-    typeof location.origin !== 'string' ||
-    typeof fields.observe !== 'function' ||
-    typeof fields.register !== 'function'
+    (!config.clickGuard && !config.renderGuard)
   ) {
     return undefined;
   }
-  try {
-    const href = new URL(location.href);
-    if (href.origin !== location.origin || !['http:', 'https:'].includes(href.protocol)) {
-      return undefined;
-    }
-  } catch {
-    return undefined;
-  }
-  return {
-    config: Object.freeze({
-      version: 1,
-      enabled: true,
-      clickGuard: config.clickGuard,
-      renderGuard: config.renderGuard,
-    }),
-    location: Object.freeze({ href: location.href, origin: location.origin }),
-    observe: fields.observe as CreativeInitialBindings['observe'],
-    register: fields.register as CreativeInitialBindings['register'],
-  };
+  return Object.freeze({ clickGuard: config.clickGuard, renderGuard: config.renderGuard });
 }
 
 function normalizeNavigation(raw: string, base: string): string | undefined {
@@ -123,17 +96,20 @@ function shouldProxyResource(raw: string, href: string, origin: string): boolean
 /** Register the selected parser-time creative policy with one generic provisional guard owner. */
 export function installCreativeInitial(
   candidate: unknown,
-  own: FirstDisplaySliceActivationContext['own']
+  own: FirstDisplaySliceActivationContext['own'],
+  configCandidate: unknown
 ): void {
-  const bindings = snapshotBindings(candidate);
-  if (!bindings || typeof own !== 'function') {
+  // The authenticated bootstrap owns bindings; only server-carried config is untrusted here.
+  const bindings = candidate as CreativeInitialBindings;
+  const config = snapshotConfig(configCandidate);
+  if (!config || typeof own !== 'function') {
     throw new TypeError('tsjs');
   }
   const guard: FirstDisplayCreativeGuardV1 = Object.freeze({
     version: 1,
     id: 'creative',
-    clickGuard: bindings.config.clickGuard,
-    renderGuard: bindings.config.renderGuard,
+    clickGuard: config.clickGuard,
+    renderGuard: config.renderGuard,
     normalizeNavigation: (raw: string) => normalizeNavigation(raw, bindings.location.href),
     shouldProxyResource: (raw: string) =>
       shouldProxyResource(raw, bindings.location.href, bindings.location.origin),
@@ -141,8 +117,5 @@ export function installCreativeInitial(
   const release = bindings.register(guard);
   if (typeof release !== 'function') throw new TypeError('tsjs');
   own(release);
-  bindings.observe(
-    'guard_count',
-    (bindings.config.clickGuard ? 1 : 0) + (bindings.config.renderGuard ? 2 : 0)
-  );
+  bindings.observe('guard_count', (config.clickGuard ? 1 : 0) + (config.renderGuard ? 2 : 0));
 }

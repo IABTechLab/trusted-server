@@ -33,21 +33,25 @@ const bootstrapPrivateProperties =
 // Mangle only that artifact: protocol, registration, handoff, and public agent keys
 // intentionally keep their authored names across independently built components.
 const firstDisplayBasePrivateProperties =
-  /^(?:options|stateValue|agentBatch|slotResults|handoffOwner|mutationObserver|observedMutationRevision|displayWasCommitted|sealed|failed|pending|reasons|actionStarted|disposedDriver|handoffFinalized|committedArtifactsDetached|lastTimingMs|firstActionAtMs|terminalAtMs|paintAtMs|nextTraceSequence|acceptedTrace|recordTerminal|recordFirstAction|scheduleProtectedPaint|readTiming|captureHandoffData|disposeDriver|installNativeMutationIngress|observeDomMutations|isOwnedRuntimeInsertion|closeNativeMutationIngress|disposeNativeMutationIngress|claimTimer|completionTimer|controlRelease|directFrame|documentAccepted|documentAcceptancePending|documentRelease|documentTimer|documentTransferred|insertionTimer|pendingDocumentTerminal|ownerSource|ownerTicket|bootstrapNonce|rendererNonce|phaseValue|registryState|expiresAtInternal|ordinalInternal|controlPort|claim|gam|inserted|ticket|active|cycle|onTerminal|reservationId|timer|attempt|recordFailure)$/;
+  /^(?:options|driver|production|renderer|startedAtMs|performance|paint|onProtectedPaint|onSettled|onFailure|onPrebidAdmissionFailure|mutationDocument|initialMutationRevision|identityIssuer|gptInput|onAgentReady|sliceBindings|stateValue|agentBatch|handoffOwner|handoffCapsule|mutationObserver|observedMutationRevision|displayWasCommitted|failed|pending|actionStarted|disposedDriver|handoffFinalized|committedArtifactsDetached|lastTimingMs|firstActionAtMs|terminalAtMs|paintAtMs|bound|productionBatch|recordTerminal|recordFirstAction|scheduleProtectedPaint|readTiming|startProduction|acceptedSlotIds|closeDriverIngress|captureDriverHandoff|detachDriverArtifacts|captureHandoffData|disposeDriver|installNativeMutationIngress|observeDomMutations|isOwnedRuntimeInsertion|closeNativeMutationIngress|disposeNativeMutationIngress|observeNativeMutation|finalizeHandoff|detachCommittedArtifacts|mutationRevision|start|settle|fail|dispose|activate|sliceHost|install|parserState|observations|own|afterActivate|claimTimer|completionTimer|controlRelease|directFrame|documentAccepted|documentAcceptancePending|documentRelease|documentTimer|documentTransferred|insertionTimer|pendingDocumentTerminal|ownerSource|ownerTicket|bootstrapNonce|rendererNonce|phaseValue|registryState|expiresAtInternal|ordinalInternal|controlPort|claim|inserted|ticket|cycle|onTerminal|reservationId|timer|attempt|batch|slotResults|reasons|acceptedTrace|nextTraceSequence)$/;
+
+const combinedBootstrapPrivateProperties = new RegExp(
+  `${bootstrapPrivateProperties.source}|${firstDisplayBasePrivateProperties.source}`
+);
 
 // The source-neutral owner keeps these fields inside one independently built IIFE.
 const firstDisplayRenderOwnerPrivateProperties =
-  /^(?:claimTimer|controlRelease|insertionTimer|ownerSource|ownerTicket|phaseValue|registryState|expiresAtInternal|ordinalInternal|controlPort|claim|gam|inserted|ticket|active|cycle|onTerminal|reservationId|timer|attempt|execution|originalCount|exact|exactShape|ports|port|source)$/;
+  /^(?:claimTimer|controlRelease|insertionTimer|ownerSource|ownerTicket|phaseValue|registryState|expiresAtInternal|ordinalInternal|controlPort|claim|gam|inserted|ticket|active|cycle|onTerminal|reservationId|timer|attempt|execution|originalCount|exact|exactShape|ports|port|source|bind|recordGam|recordFailure|sweepCommittedArtifacts|sealTsAdmission|closeIngress|captureHandoff|detachCommittedArtifacts|artifacts|tombstones|clockEpochMs|nextReservationOrdinal|nextTicketOrdinal|expiresAtMs|ordinal)$/;
 
 // APS keeps these renderer-specific fields inside its independently built IIFE.
 // Cross-artifact strategy, protocol, callback, and artifact keys remain authored.
 const firstDisplayApsPrivateProperties =
-  /^(?:callbacks|overlay|active|accepted|bootstrapNavigated|bootstrapNonceInternal|bootstrapSource|completionTimer|cycle|documentAccepted|documentPort|documentRelease|documentTimer|frame|hostPositionOwned|pendingTerminal|previousHostPosition|previousHostPositionPriority|rendererNonceInternal|originalCount|exact|ports|publisherOrigin|rendererUrl|sandbox|permanentSandbox|deadlines|documentAcceptanceMs|completionMs|isBootstrapNonce|isRendererNonce|bootstrapPolicy|parseDocumentMessage|parseWindowMessage)$/;
+  /^(?:callbacks|overlay|active|accepted|bootstrapNavigated|bootstrapNonceInternal|bootstrapSource|completionTimer|cycle|documentAccepted|documentPort|documentRelease|documentTimer|frame|hostPositionOwned|pendingTerminal|previousHostPosition|previousHostPositionPriority|rendererNonceInternal|originalCount|exact|ports|rendererUrl|sandbox|permanentSandbox|deadlines|documentAcceptanceMs|completionMs|isBootstrapNonce|isRendererNonce|bootstrapPolicy|parseDocumentMessage|parseWindowMessage)$/;
 
 // These names are private to the GPT initial IIFE and never cross its protocol
 // receipt or handoff boundary. Keep the cross-artifact protocol keys authored.
 const firstDisplayGptPrivateProperties =
-  /^(?:options|binding|command|cycleMap|createdSlots|diagnosticFacts|diagnosticListeners|targetingObservers|targetingRestorers|publisherCallRestorers|timers|service|started|disposed|ingressClosed|firstAction|commandQueue|commandQueueIndex|createdBinding|renderListener|requestedListener|committedSlotsDetached|detachedSlots|diagnosticFactOverflow|diagnosticFactDrops|targetingWriteDepth|ensureBinding|restoreCreatedBinding|installListeners|removeListener|removePendingCommand|failCycle|failRows|journalPublisherTargeting|observePublisherTargeting|observePublisherCalls|restorePublisherCalls|restoreTargetingObservers|restorePublisherTargeting|notifyNativeMutation|captureDiagnosticFact|clearOwnedTimer|incrementDiagnosticDrops|writeTargeting|invalidateTargeting|sealedTargetingOwnership|targetingWrites|ingressClosing|diagnosticRecords|nextDiagnosticCycleOrdinal|requestTimer|completionTimer|requestOperation|requestInvoked|bindingState|operations|requested|settled|encodedBytes|readPhysicalElementId|retireCycle|snapshotDestroyedCycles|invalidateCyclesForElement|invalidateCyclesForPublisherCall|consumeTargetingWrite|invalidateStaleTargetingObservers|captureRetainedTargeting|timer)$/;
+  /^(?:options|clearTimer|setTimer|projection|diagnosticsActive|onNativeMutation|binding|command|cycleMap|createdSlots|diagnosticFacts|diagnosticListeners|targetingObservers|targetingRestorers|publisherCallRestorers|timers|service|started|disposed|ingressClosed|firstAction|commandQueue|commandQueueIndex|createdBinding|renderListener|requestedListener|committedSlotsDetached|detachedSlots|diagnosticFactOverflow|diagnosticFactDrops|targetingWriteDepth|ensureBinding|restoreCreatedBinding|activate|installListeners|removeListener|removePendingCommand|failCycle|failRows|journalPublisherTargeting|observePublisherTargeting|observePublisherCalls|restorePublisherCalls|restoreTargetingObservers|restorePublisherTargeting|notifyNativeMutation|captureDiagnosticFact|clearOwnedTimer|incrementDiagnosticDrops|writeTargeting|invalidateTargeting|sealedTargetingOwnership|targetingWrites|ingressClosing|diagnosticRecords|nextDiagnosticCycleOrdinal|publicCycle|requestTimer|completionTimer|requestOperation|requestInvoked|bindingState|operations|requested|settled|elementId|runtimeSlotNumber|current|valid|consumed|operation|protocol|restore|handle|fired|deadlines|externalReadyMs|requestStartMs|completionMs|requestPlan|classifyRenderEnded|encodedBytes|readPhysicalElementId|retireCycle|snapshotDestroyedCycles|invalidateCyclesForElement|invalidateCyclesForPublisherCall|consumeTargetingWrite|invalidateStaleTargetingObservers|captureRetainedTargeting|targetingOwnership|cycles|facts|nextTraceTokenOrdinal|overflowCount|dropCount|nextCycleOrdinal|quarantines|records|responseIdentifier|seen|state|unknownPriorCycle|ordinal|timer|start|closeIngress|captureHandoff|captureDiagnosticsHandoff|detachCommittedSlots|dispose)$/;
 
 fs.rmSync(distributionDirectory, { recursive: true, force: true });
 fs.mkdirSync(distributionDirectory, { recursive: true });
@@ -109,7 +113,7 @@ const sourceById = Object.freeze({
 });
 
 const firstDisplaySourceById = Object.freeze({
-  first_display: 'first_display/agent.ts',
+  first_display: 'first_display/base_marker.ts',
   render_owner_initial: 'first_display/slices/render_owner.ts',
   aps_initial: 'first_display/slices/aps.ts',
   creative_initial: 'first_display/slices/creative.ts',
@@ -208,15 +212,20 @@ async function buildArtifact(artifact) {
     configFile: false,
     root: libDirectory,
     ...(artifact.role === 'bootstrap'
-      ? { esbuild: { mangleProps: bootstrapPrivateProperties } }
+      ? { esbuild: { mangleProps: combinedBootstrapPrivateProperties, mangleQuoted: true } }
       : artifact.id === 'first_display'
-        ? { esbuild: { mangleProps: firstDisplayBasePrivateProperties } }
+        ? { esbuild: { mangleProps: firstDisplayBasePrivateProperties, mangleQuoted: true } }
         : artifact.id === 'render_owner_initial'
-          ? { esbuild: { mangleProps: firstDisplayRenderOwnerPrivateProperties } }
+          ? {
+              esbuild: {
+                mangleProps: firstDisplayRenderOwnerPrivateProperties,
+                mangleQuoted: true,
+              },
+            }
           : artifact.id === 'aps_initial'
-            ? { esbuild: { mangleProps: firstDisplayApsPrivateProperties } }
+            ? { esbuild: { mangleProps: firstDisplayApsPrivateProperties, mangleQuoted: true } }
             : artifact.id === 'gpt_initial'
-              ? { esbuild: { mangleProps: firstDisplayGptPrivateProperties } }
+              ? { esbuild: { mangleProps: firstDisplayGptPrivateProperties, mangleQuoted: true } }
               : {}),
     define: {
       __TSJS_EMBEDDED_RELEASE_ID_V1__: JSON.stringify(RELEASE_SENTINEL),
@@ -228,6 +237,7 @@ async function buildArtifact(artifact) {
       emptyOutDir: false,
       outDir: distributionDirectory,
       assetsDir: '.',
+      target: 'es2022',
       sourcemap: false,
       minify: 'esbuild',
       rollupOptions: {

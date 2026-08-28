@@ -379,6 +379,7 @@ function loadReleaseFixtureResources(
   for (const artifact of firstDisplayArtifacts)
     expect(artifact.phase).toBe("first_display");
   const selectedBody = firstDisplayArtifacts
+    .filter(({ id }) => id !== "first_display")
     .map((artifact) => readFileSync(resolve(dist, artifact.file), "utf8"))
     .join(";\n");
   const selectedHash = createHash("sha256").update(selectedBody).digest("hex");
@@ -435,7 +436,9 @@ function loadReleaseFixtureResources(
   const selectedTag = `<script src="${selectedSrc}" id="trustedserver-js"></script>`;
   // The single generated bootstrap carries mutually exclusive direct-runtime and
   // first-display branches; each branch owns one mark callsite.
-  expect(controllerDocument.match(/tsjs:bids-script/gu)).toHaveLength(2);
+  expect(
+    controllerDocument.match(/performance\.mark\("tsjs:bids-script"\)/gu),
+  ).toHaveLength(2);
   expect(controllerDocument.match(/id="trustedserver-js"/gu)).toHaveLength(1);
   expect(controllerDocument).toContain(selectedTag);
   expect(controllerDocument).toContain(
@@ -1924,12 +1927,20 @@ test("gates semantic reference transfer against the exact rc base build", () => 
   const baselineResources = loadBaselineFixtureResources(baselineRoot);
   const candidateResources = loadReleaseFixtureResources(REPO_ROOT);
 
-  for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"] as const) {
-    expect(
-      candidateResources.referenceTransfer[metric],
-      `candidate ${metric} semantic transfer`,
-    ).toBeLessThanOrEqual(baselineResources.referenceTransfer[metric]);
-  }
+  const regressions = (
+    ["rawBytes", "gzipBytes", "brotliBytes"] as const
+  ).filter(
+    (metric) =>
+      candidateResources.referenceTransfer[metric] >
+      baselineResources.referenceTransfer[metric],
+  );
+  expect(
+    regressions,
+    JSON.stringify({
+      baseline: baselineResources.referenceTransfer,
+      candidate: candidateResources.referenceTransfer,
+    }),
+  ).toEqual([]);
 });
 
 test("boots the generated first-display artifact through persistent takeover", async ({

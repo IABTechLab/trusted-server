@@ -1,6 +1,6 @@
 import type { BootManifestV1 } from '../core/types';
 import {
-  snapshotOutlinedFirstDisplayHandoffV1,
+  snapshotOutlinedFirstDisplayCaptureV1,
   type FirstDisplayHandoffV1,
 } from '../shared/first_display_contracts';
 import { snapshotPersistentFirstDisplayAdoptionV1 } from '../shared/takeover';
@@ -9,6 +9,7 @@ import type { ReleaseConfigSourceV1 } from './release_catalog';
 import { EMBEDDED_MAX_MANIFEST_MODULES } from './contracts/release_capacity';
 import { DisposableStack, type DisposeCallback } from './disposable';
 import { trustedArtifactOrigin, type BootFailureReason } from './fallback';
+import { createBrowserNavigationIdentityIssuer } from './identity';
 
 const INTEGRATION_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const RELEASE_ID = /^[0-9a-f]{64}$/;
@@ -89,7 +90,8 @@ export interface PreparedKernelTakeover {
   /** Validate and freeze the complete handoff before either owner mutates state. */
   readonly validateHandoff: (
     handoff: unknown,
-    outline: unknown
+    outline: unknown,
+    boot?: unknown
   ) => FirstDisplayHandoffV1 | undefined;
   readonly activate: (adoption?: unknown) => void;
   readonly commit: () => void;
@@ -1431,9 +1433,16 @@ class IntegrationRegistryOwner {
     let committed: IntegrationKernelResult | undefined;
     let validatedHandoff: FirstDisplayHandoffV1 | undefined;
     const prepared: PreparedKernelTakeover = Object.freeze({
-      validateHandoff: (candidate: unknown, outlineCandidate: unknown) => {
+      validateHandoff: (candidate: unknown, outlineCandidate: unknown, bootCandidate?: unknown) => {
         if (activated || committed || validatedHandoff) return undefined;
-        const handoff = snapshotOutlinedFirstDisplayHandoffV1(candidate, outlineCandidate);
+        const identityIssuer = createBrowserNavigationIdentityIssuer();
+        if (!identityIssuer.ok) return undefined;
+        const handoff = snapshotOutlinedFirstDisplayCaptureV1(
+          candidate,
+          outlineCandidate,
+          bootCandidate,
+          identityIssuer.value
+        );
         if (!handoff) return undefined;
         validatedHandoff = handoff;
         return handoff;

@@ -1,10 +1,4 @@
 import { installTestlightInitial } from '../leaf/callback_capture';
+import { registerCurrentFirstDisplayComponent } from '../registration_client';
 
-import { defineInitialSlice, registerInitialSlice } from './definition';
-
-export const TESTLIGHT_INITIAL_SLICE = defineInitialSlice(
-  'testlight_initial',
-  installTestlightInitial
-);
-
-registerInitialSlice(TESTLIGHT_INITIAL_SLICE, 14);
+registerCurrentFirstDisplayComponent('testlight_initial', installTestlightInitial);

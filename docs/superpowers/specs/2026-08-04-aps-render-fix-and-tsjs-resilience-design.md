@@ -2815,15 +2815,15 @@ freezes `initialDisplayCommitted` to whether the completed protected batch conta
 at least one `accepted` result, then drains those same callbacks. Wrong
 release/source/manifest/ABI identity is `abi_mismatch`; transport/load/deadline,
 preparation/activation failure, or a live TS entry at the seal is `bundle_partial`.
-Every `requestAds` made by a drained or later callback is a new post-paint call against
-the empty safe fallback projection defined below: omitted selection resolves
-`{slots:[]}`, while an explicit valid id resolves `slot_unresolved` (or
-`caller_aborted` for an already-aborted signal). It does not re-report, remove, or
-replay the completed initial display. Every such `addAdUnits` throws
-`TsjsUnavailableError{code:'runtime_unavailable',reason:fallbackReason}` before
-mutation, and `_internal.reason` is that same frozen value. No queued callback or API
-call remains pending, and no post-paint transient failure retries the runtime artifact
-in that document generation.
+Every `requestAds` made by a drained or later callback rejects
+`TsjsUnavailableError{code:'runtime_unavailable',reason:fallbackReason}` without
+reading its argument. Every `addAdUnits` throws the same classified unavailable
+error without reading or validating its argument. This hard-cutover shell does not
+emulate kernel input validation or synthesize auction results when no kernel exists;
+it does not re-report, remove, or replay the completed initial display.
+`_internal.reason` is the same frozen classification. No queued callback or API call
+remains pending, and no post-paint transient failure retries the runtime artifact in
+that document generation.
 
 Every installed effect is a repository-owned primitive with a synchronous,
 nonthrowing, identity-checked disposer. Rollback attempts physical removal/restoration
@@ -3053,10 +3053,9 @@ any mutable DOM or realm authentication surface and rolls back only after a fail
 authentication. Its completion capability admits outcomes through primitive string
 comparisons, consumes its one-use guard before invoking the selected handler, and
 therefore remains one-shot under reentrant claim and completion attempts.
-The compact fallback's `addAdUnits` surface still runs the exact public registration
-validator before it refuses a valid call. That validator imports its bounded-string
-primitive from an effect-free bootstrap-safe leaf; it does not make bootstrap reach
-the auction-projection parser.
+The compact fallback does not import either public request validator. Both public
+operations refuse as unavailable without reading publisher input; full validation
+belongs only to a successfully committed kernel.
 The persistent core receives the manifest-entry capacity as a generated numeric
 build constant; it does not import the build-time release catalog merely to learn
 that bound. Substitution may tree-shake the declaration module completely, and the
@@ -3563,8 +3562,8 @@ commit atomically records one immutable boot failure reason:
   seal, or the owning deadline.
 
 Before draining user work it installs `version:'1.0.0'`, the embedded `releaseId`, a
-safe frozen `TsjsBootV1`, the final `tsjs.requestAds` input validator, the
-validating-then-refusing `tsjs.addAdUnits`, the local `tsjs.log`, the
+safe frozen `TsjsBootV1`, unavailable-only `tsjs.requestAds` and
+`tsjs.addAdUnits`, the local `tsjs.log`, the
 immediate-executor `tsjs.que`, a permanently refusing internal
 `_registerIntegration`, and a frozen
 `tsjs._internal` value containing only
@@ -3581,10 +3580,10 @@ always substitutes exactly
 and the creative/diagnostics disabled safe defaults from §§5.4/5.8. The controller
 does not retain or partially trust the server projection on a failure path and does
 not import §§3.1–3.2 merely to improve fallback reporting. Consequently
-`requestAds()` resolves `{slots:[]}`; each explicit valid id resolves
-`slot_unresolved`, or `cancelled{reason:'caller_aborted'}` when its signal is already
-aborted. Input-shape errors still reject with `RequestAdsInputError`. This deliberate
-terminal-shell behavior is not a compatibility promise or a render recovery path.
+`requestAds()` and every explicit selection reject the classified
+`TsjsUnavailableError` without inspecting slot ids or abort signals. This deliberate
+terminal-shell behavior is not a compatibility promise, input-validation substitute,
+or render recovery path.
 
 After installing those surfaces, fallback drains the preexisting callback queue FIFO
 exactly once with `this === tsjs`; one callback throw does not prevent later callbacks.
@@ -5046,6 +5045,42 @@ stores executable source in boot data, weakens the top-page owner, removes mixed
 APS/ADM support, reopens a handoff/retirement race, or relies on unsafe property
 mangling across independently built protocol components.
 
+The first complete revision-43 local build against exact rc base
+`58532d7c42d2a59f8e87f0d643f8d0b109a680cb` reduced the GPT semantic interval from
+105,391 to 97,198 raw bytes. Applying the hard-cutover unavailable-only fallback
+contract reduced it again to 89,803 bytes, but the unchanged rc ceiling is 72,148.
+The selected `008b` body is already slightly smaller than the complete legacy
+external body; the remaining 17,655-byte regression is the separately delivered
+controller/base ownership split. This evidence triggers the Task 15A/15B stop rule:
+more local compaction, a threshold change, or a different fixture is not an accepted
+remedy.
+
+Revision 44 therefore makes `first_display` a logical catalog capability physically
+owned by the bootstrap artifact. The bootstrap and first-display base are one
+controller and one state machine: queue ingress, sealed transport, component
+registration, projected action/terminal/paint state, fallback, and takeover cannot
+exist in separate artifacts or duplicate their generation/registration/disposal
+bookkeeping. The `first_display` catalog bit and mask position remain stable, but its
+generated release row is a non-routable marker and contributes no implementation
+bytes to the selected response. The one parser-blocking selected response contains
+only the selected initial slices, in catalog order, and those slices register with
+the already-installed controller. The server still emits exactly one inline sealed
+transport/controller and exactly one selected first-display request; no executable
+source moves into boot data and no auxiliary request, preload, cache assumption, or
+vendored dependency is introduced.
+
+The consolidated controller retains the same one-use capsule, exact source
+authentication, protected-paint boundary, fallback classifications, accepted-DOM
+preservation, post-detach reentrancy defenses, and bootstrap-only terminal
+publication. Its physical graph may reach the source-neutral base coordinator but
+must not reach APS, GPT, creative, PUC, or any optional-slice implementation. Every
+optional slice remains independently owned and is included only by its mask bit.
+Release/source-ownership tests prove the logical marker has exactly one physical
+owner, cannot be routed independently, and is absent from every served first-display
+body. The exact semantic rc comparison remains the acceptance test; the consolidation
+is incomplete until raw, gzip, and Brotli all pass without changing membership,
+fixture, baseline, or ceiling.
+
 The checked-in pre-change fixture is immutable historical evidence and is never
 regenerated or rewritten. Its original `bundles` values measured a different
 artifact model: minimal contained only the old core, reference omitted the now-
@@ -5608,9 +5643,8 @@ Tests must cover at least:
   9,999/10,000/10,001 ms post-paint deadline prove callback pushes remain queued
   until one commit; success drains against the full kernel, while failure freezes the
   exact true/false `initialDisplayCommitted`, drains once against fallback, makes
-  every new omitted-selection `requestAds` resolve the exact empty result, every
-  explicit valid id resolve `slot_unresolved` or already-aborted `caller_aborted`, and
-  every `addAdUnits` propagate the same classified
+  every new `requestAds` and `addAdUnits` call refuse without reading its input and
+  propagate the same classified
   `abi_mismatch`/`bundle_partial` fallback reason, preserves accepted DOM, and leaves
   no pending work or artifact retry;
 - final handoff boundaries for attempt/slot/GPT-token/cycle/trace ordinals at
@@ -5677,8 +5711,8 @@ Tests must cover at least:
   immediate post-load return values, `this`, non-callables, and callback throws;
 - main bundle absence after server GPT projection, proving the old degraded bootstrap
   renderer is deliberately gone: no GPT definition/targeting/display/refresh occurs,
-  fallback retains no server-projected slot membership, omitted-selection
-  `requestAds` resolves `{slots:[]}`, explicit valid ids resolve `slot_unresolved`, the
+  fallback retains no server-projected slot membership, every `requestAds` refuses
+  with the classified unavailable error, the
   queue drains once, and a late bundle cannot revive rendering;
 - explicit `requestAds` selection with exact server-projected and programmatic slot
   ids, an unknown id beside a valid sibling, GPT-path and DOM-alias collisions, and

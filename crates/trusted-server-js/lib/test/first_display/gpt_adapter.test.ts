@@ -2,10 +2,35 @@ import { describe, expect, it, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
 
 import { createFirstDisplayGoogletagBatch } from '../../src/first_display/adapters/googletag';
-import { enqueueFirstDisplayGamAttribution } from '../../src/core/adapters/gam_attribution';
+import { enqueueFirstDisplayGamAttribution } from '../../src/first_display/adapters/googletag';
+import type {
+  FirstDisplayGoogletagBatch,
+  FirstDisplayGoogletagBatchCallbacks,
+} from '../../src/first_display/adapters/googletag';
 import { snapshotFirstDisplayBatchV1 } from '../../src/first_display/leaf/projection';
 
 const RESERVATION_ID = `r1_${'a'.repeat(22)}`;
+
+function startAdapter(
+  adapter: FirstDisplayGoogletagBatch,
+  callbacks: Readonly<{
+    onBound: FirstDisplayGoogletagBatchCallbacks[0];
+    onFailure: FirstDisplayGoogletagBatchCallbacks[1];
+    onFirstAction: FirstDisplayGoogletagBatchCallbacks[2];
+    onRenderEnded: FirstDisplayGoogletagBatchCallbacks[3];
+    onRetire?: FirstDisplayGoogletagBatchCallbacks[4];
+  }>
+): boolean {
+  return adapter.start(
+    Object.freeze([
+      callbacks.onBound,
+      callbacks.onFailure,
+      callbacks.onFirstAction,
+      callbacks.onRenderEnded,
+      callbacks.onRetire,
+    ])
+  );
+}
 
 function fixture() {
   return Object.freeze({
@@ -243,7 +268,7 @@ describe('first-display GPT adapter', () => {
       setTimer: (callback) => callback,
       clearTimer: () => undefined,
     });
-    adapter.start({
+    startAdapter(adapter, {
       onBound: () => undefined,
       onFailure: () => undefined,
       onFirstAction: () => true,
@@ -267,19 +292,12 @@ describe('first-display GPT adapter', () => {
     expect(retired).toHaveBeenCalledOnce();
 
     expect(adapter.closeIngress(['slot-1'])).toBe(true);
-    expect(adapter.captureDiagnosticsHandoff()?.cycles).toEqual([
-      expect.objectContaining({
-        nextCycleOrdinal: 3,
-        records: [
-          expect.objectContaining({ ordinal: 1, state: 'completed' }),
-          expect.objectContaining({
-            ordinal: 2,
-            responseIdentifier: 'response-two',
-            seen: ['slotRequested', 'slotRenderEnded'],
-            state: 'completed',
-          }),
-        ],
-      }),
+    const diagnostics = adapter.captureDiagnosticsHandoff();
+    const [cycle] = diagnostics?.[0] ?? [];
+    expect(cycle?.[2]).toBe(3);
+    expect(cycle?.[5]).toEqual([
+      expect.arrayContaining([1, 'completed']),
+      [2, 'response-two', ['slotRequested', 'slotRenderEnded'], 'completed'],
     ]);
     mutations.mockClear();
     slot.setTargeting('publisher', 'later');
@@ -343,17 +361,17 @@ describe('first-display GPT adapter', () => {
     });
 
     expect(
-      adapter.start({
-        onBound: ({ element, slotId, ownership }) => {
-          expect(element).toBe(dom.window.document.getElementById('slot-1'));
-          events.push(`bound:${slotId}:${ownership}`);
+      startAdapter(adapter, {
+        onBound: (cycle) => {
+          expect(cycle[1]).toBe(dom.window.document.getElementById('slot-1'));
+          events.push(`bound:${cycle[6]}:${cycle[3]}`);
         },
         onFailure: (slotId, reason) => failures.push([slotId, reason]),
         onFirstAction: () => {
           events.push('first-action');
           return true;
         },
-        onRenderEnded: (cycle, result) => renders.push([cycle.slotId, result]),
+        onRenderEnded: (cycle, result) => renders.push([cycle[6], result]),
       })
     ).toBe(true);
     expect(events).toEqual([
@@ -424,7 +442,7 @@ describe('first-display GPT adapter', () => {
       value: binding,
     });
     const batch = snapshotFirstDisplayBatchV1(fixture())!;
-    let bound: { readonly isCurrent: () => boolean } | undefined;
+    const bound: { value?: Parameters<FirstDisplayGoogletagBatchCallbacks[0]>[0] } = {};
     const retired = vi.fn();
     const adapter = createFirstDisplayGoogletagBatch({
       browser: dom.window as unknown as Window,
@@ -434,9 +452,9 @@ describe('first-display GPT adapter', () => {
       protocol: protocol(),
       setTimer: (callback) => callback,
     });
-    adapter.start({
+    startAdapter(adapter, {
       onBound: (cycle) => {
-        bound = cycle;
+        bound.value = cycle;
       },
       onFailure: () => undefined,
       onFirstAction: () => true,
@@ -444,17 +462,17 @@ describe('first-display GPT adapter', () => {
       onRetire: retired,
     });
 
-    expect(bound?.isCurrent()).toBe(true);
+    expect(bound.value?.[2]()).toBe(true);
     listeners.get('slotRequested')?.({ slot });
     listeners.get('slotRenderEnded')?.({ slot, isEmpty: false });
-    expect(bound?.isCurrent()).toBe(true);
+    expect(bound.value?.[2]()).toBe(true);
 
     expect(() => binding.destroySlots([slot])).toThrow('fictional destroy failure');
-    expect(bound?.isCurrent()).toBe(true);
+    expect(bound.value?.[2]()).toBe(true);
     expect(retired).not.toHaveBeenCalled();
     destroyMode = 'false';
     expect(binding.destroySlots([slot])).toBe(false);
-    expect(bound?.isCurrent()).toBe(true);
+    expect(bound.value?.[2]()).toBe(true);
     expect(retired).not.toHaveBeenCalled();
     destroyMode = 'true';
     const targets = [slot];
@@ -462,7 +480,7 @@ describe('first-display GPT adapter', () => {
     expect(targets).toEqual([]);
     expect(binding.defineSlot('/publisher/replacement', [[300, 250]], 'slot-1')).toBe(replacement);
     binding.display('slot-1');
-    expect(bound?.isCurrent()).toBe(false);
+    expect(bound.value?.[2]()).toBe(false);
     expect(retired).toHaveBeenCalledOnce();
   });
 
@@ -484,7 +502,7 @@ describe('first-display GPT adapter', () => {
       clearTimer: () => undefined,
     });
     expect(
-      adapter.start({
+      startAdapter(adapter, {
         onBound: () => undefined,
         onFailure: () => undefined,
         onFirstAction: () => true,
@@ -545,8 +563,8 @@ describe('first-display GPT adapter', () => {
     });
     const firstAction = vi.fn(() => true);
 
-    adapter.start({
-      onBound: ({ ownership }) => expect(ownership).toBe('publisher'),
+    startAdapter(adapter, {
+      onBound: (cycle) => expect(cycle[3]).toBe('publisher'),
       onFailure: () => undefined,
       onFirstAction: firstAction,
       onRenderEnded: () => undefined,
@@ -560,7 +578,7 @@ describe('first-display GPT adapter', () => {
     listeners.get('slotRenderEnded')?.({ slot, isEmpty: false });
     slot.setTargeting('placement', 'article');
     expect(adapter.closeIngress(['slot-1'])).toBe(true);
-    expect(adapter.captureHandoff()?.[0]?.targetingOwnership).toEqual([
+    expect(adapter.captureHandoff()?.[0]?.[3]).toEqual([
       { installed: RESERVATION_ID, key: 'hb_adid', prior: [] },
       { installed: '1.25', key: 'hb_pb', prior: ['publisher-original'] },
     ]);
@@ -611,7 +629,7 @@ describe('first-display GPT adapter', () => {
       setTimer: (callback) => callback,
       clearTimer: () => undefined,
     });
-    adapter.start({
+    startAdapter(adapter, {
       onBound: () => undefined,
       onFailure: () => undefined,
       onFirstAction: () => true,
@@ -632,7 +650,7 @@ describe('first-display GPT adapter', () => {
     slot.setTargeting('hb_pb', '1.25');
 
     expect(adapter.closeIngress(['slot-1'])).toBe(true);
-    expect(adapter.captureHandoff()?.[0]?.targetingOwnership).toEqual([]);
+    expect(adapter.captureHandoff()?.[0]?.[3]).toEqual([]);
     expect(adapter.detachCommittedSlots(['slot-1'])).toBe(true);
     adapter.dispose();
     expect(replacement).toHaveBeenCalledWith('hb_pb', '1.25');
@@ -682,7 +700,7 @@ describe('first-display GPT adapter', () => {
         setTimer: (callback) => callback,
         clearTimer: () => undefined,
       });
-      adapter.start({
+      startAdapter(adapter, {
         onBound: () => undefined,
         onFailure: () => undefined,
         onFirstAction: () => true,
@@ -764,7 +782,7 @@ describe('first-display GPT adapter', () => {
         setTimer: (callback) => callback,
         clearTimer: () => undefined,
       });
-      adapter.start({
+      startAdapter(adapter, {
         onBound: () => undefined,
         onFailure: () => undefined,
         onFirstAction: () => true,
@@ -834,7 +852,7 @@ describe('first-display GPT adapter', () => {
       setTimer: (callback) => callback,
       clearTimer: () => undefined,
     });
-    adapter.start({
+    startAdapter(adapter, {
       onBound: () => undefined,
       onFailure: () => undefined,
       onFirstAction: () => true,
@@ -845,9 +863,7 @@ describe('first-display GPT adapter', () => {
 
     sealing = true;
     expect(adapter.closeIngress(['slot-1'])).toBe(true);
-    expect(
-      adapter.captureHandoff()?.[0]?.targetingOwnership.some(({ key }) => key === 'hb_pb')
-    ).toBe(false);
+    expect(adapter.captureHandoff()?.[0]?.[3].some(({ key }) => key === 'hb_pb')).toBe(false);
     expect(reentrantSealingCalls).toBe(1);
     expect(adapter.detachCommittedSlots(['slot-1'])).toBe(true);
     adapter.dispose();
@@ -907,7 +923,7 @@ describe('first-display GPT adapter', () => {
       setTimer: (callback) => callback,
       clearTimer: () => undefined,
     });
-    adapter.start({
+    startAdapter(adapter, {
       onBound: () => undefined,
       onFailure: () => undefined,
       onFirstAction: () => true,
@@ -920,9 +936,7 @@ describe('first-display GPT adapter', () => {
 
     expect(adapter.closeIngress(['slot-1'])).toBe(true);
     expect(destroySlots).toHaveBeenCalledOnce();
-    expect(
-      adapter.captureHandoff()?.[0]?.targetingOwnership.some(({ key }) => key === 'hb_pb')
-    ).toBe(false);
+    expect(adapter.captureHandoff()?.[0]?.[3].some(({ key }) => key === 'hb_pb')).toBe(false);
     expect(adapter.detachCommittedSlots(['slot-1'])).toBe(true);
     adapter.dispose();
     expect(destroySlots).toHaveBeenCalledOnce();
@@ -991,7 +1005,7 @@ describe('first-display GPT adapter', () => {
       setTimer: (callback) => callback,
       clearTimer: () => undefined,
     });
-    adapter.start({
+    startAdapter(adapter, {
       onBound: () => undefined,
       onFailure: () => undefined,
       onFirstAction: () => true,
@@ -1006,9 +1020,7 @@ describe('first-display GPT adapter', () => {
     expect(adapter.closeIngress(['slot-1'])).toBe(true);
     expect(failedTargeting.get('hb_pb')).toEqual(['failed-original']);
     expect(reentrantCleanupCalls).toBe(1);
-    expect(
-      adapter.captureHandoff()?.[0]?.targetingOwnership.some(({ key }) => key === 'hb_pb')
-    ).toBe(false);
+    expect(adapter.captureHandoff()?.[0]?.[3].some(({ key }) => key === 'hb_pb')).toBe(false);
     const cleanupWrites =
       failedSlot.clearTargeting.mock.calls.length + failedSlot.setTargeting.mock.calls.length;
 
@@ -1056,7 +1068,7 @@ describe('first-display GPT adapter', () => {
       setTimer: (callback) => callback,
       clearTimer: () => undefined,
     });
-    adapter.start({
+    startAdapter(adapter, {
       onBound: () => undefined,
       onFailure: () => undefined,
       onFirstAction: () => {
@@ -1092,7 +1104,7 @@ describe('first-display GPT adapter', () => {
       },
       clearTimer: () => undefined,
     });
-    adapter.start({
+    startAdapter(adapter, {
       onBound: () => undefined,
       onFailure: (slotId, reason) => failures.push([slotId, reason]),
       onFirstAction: () => true,
@@ -1150,11 +1162,11 @@ describe('first-display GPT adapter', () => {
         if (index >= 0) timers.splice(index, 1);
       },
     });
-    adapter.start({
+    startAdapter(adapter, {
       onBound: () => undefined,
       onFailure: (slotId, reason) => failures.push([slotId, reason]),
       onFirstAction: () => true,
-      onRenderEnded: (cycle, result) => renders.push([cycle.slotId, result]),
+      onRenderEnded: (cycle, result) => renders.push([cycle[6], result]),
     });
 
     listeners.get('slotRenderEnded')?.({ slot, isEmpty: false });
@@ -1203,7 +1215,7 @@ describe('first-display GPT adapter', () => {
       setTimer: (callback) => callback,
       clearTimer: () => undefined,
     });
-    adapter.start({
+    startAdapter(adapter, {
       onBound: () => undefined,
       onFailure: () => undefined,
       onFirstAction: () => true,
@@ -1251,7 +1263,7 @@ describe('first-display GPT adapter', () => {
       setTimer: (callback) => callback,
       clearTimer: () => undefined,
     });
-    adapter.start({
+    startAdapter(adapter, {
       onBound: () => undefined,
       onFailure: () => undefined,
       onFirstAction: () => true,
@@ -1261,9 +1273,7 @@ describe('first-display GPT adapter', () => {
     listeners.get('slotRenderEnded')?.({ slot, isEmpty: false });
 
     expect(adapter.closeIngress(['slot-1'])).toBe(true);
-    expect(adapter.captureHandoff()).toEqual([
-      expect.objectContaining({ slotId: 'slot-1', physicalSlot: slot }),
-    ]);
+    expect(adapter.captureHandoff()).toEqual([expect.arrayContaining(['slot-1', slot])]);
     expect(adapter.detachCommittedSlots(['slot-1'])).toBe(true);
     expect(adapter.detachCommittedSlots(['slot-1'])).toBe(false);
     adapter.dispose();
@@ -1310,7 +1320,7 @@ describe('first-display GPT adapter', () => {
       protocol: protocol(),
       setTimer: (callback) => callback,
     });
-    adapter.start({
+    startAdapter(adapter, {
       onBound: () => undefined,
       onFailure: () => undefined,
       onFirstAction: () => true,
@@ -1341,27 +1351,22 @@ describe('first-display GPT adapter', () => {
       'impressionViewable',
       'slotVisibilityChanged',
     ]);
-    expect(diagnostics).toMatchObject({
-      nextTraceTokenOrdinal: 2,
-      overflowCount: 0,
-      dropCount: 0,
-    });
-    expect(diagnostics?.facts).toHaveLength(6);
-    expect(
-      (
-        diagnostics as unknown as {
-          readonly cycles: readonly unknown[];
-        }
-      )?.cycles
-    ).toEqual([
-      {
-        nextCycleOrdinal: 2,
-        quarantines: [],
-        records: [
-          {
-            ordinal: 1,
-            responseIdentifier: 'response-one',
-            seen: [
+    expect(diagnostics?.[2]).toBe(2);
+    expect(diagnostics?.[3]).toBe(0);
+    expect(diagnostics?.[4]).toBe(0);
+    expect(diagnostics?.[1]).toHaveLength(6);
+    expect(diagnostics?.[0]).toEqual([
+      [
+        'slot-1',
+        'gt1_1',
+        2,
+        false,
+        [],
+        [
+          [
+            1,
+            'response-one',
+            [
               'slotRequested',
               'slotResponseReceived',
               'slotRenderEnded',
@@ -1369,15 +1374,12 @@ describe('first-display GPT adapter', () => {
               'impressionViewable',
               'slotVisibilityChanged',
             ],
-            state: 'completed',
-          },
+            'completed',
+          ],
         ],
-        slotId: 'slot-1',
-        token: 'gt1_1',
-        unknownPriorCycle: false,
-      },
+      ],
     ]);
-    expect(diagnostics?.facts[0]).toEqual({
+    expect(diagnostics?.[1][0]).toEqual({
       version: 1,
       event: 'slotRequested',
       token: 'gt1_1',
@@ -1394,14 +1396,14 @@ describe('first-display GPT adapter', () => {
       slotContentChanged: null,
       visibilityPercent: null,
     });
-    expect(diagnostics?.facts[2]).toMatchObject({
+    expect(diagnostics?.[1][2]).toMatchObject({
       event: 'slotRenderEnded',
       isEmpty: false,
       renderedSize: [300, 250],
       isBackfill: false,
       slotContentChanged: true,
     });
-    expect(diagnostics?.facts[5]).toMatchObject({
+    expect(diagnostics?.[1][5]).toMatchObject({
       event: 'slotVisibilityChanged',
       visibilityPercent: 42,
     });

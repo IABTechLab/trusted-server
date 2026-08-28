@@ -5,8 +5,7 @@ import type { FirstDisplayComponentRegistrationV1 } from '../shared/first_displa
 /** Submit one immutable component record and the synchronous current-script identity. */
 export function registerCurrentFirstDisplayComponent(
   id: string,
-  order: number,
-  prepare: FirstDisplayComponentRegistrationV1['prepare']
+  install: FirstDisplayComponentRegistrationV1['install']
 ): boolean {
   try {
     const browser = (globalThis as unknown as { window: Window }).window;
@@ -14,13 +13,7 @@ export function registerCurrentFirstDisplayComponent(
     const sink = Object.getOwnPropertyDescriptor(target, '_registerFirstDisplay')?.value;
     return (
       Reflect.apply(sink, target, [
-        Object.freeze({
-          abi: 1,
-          id,
-          releaseId: __TSJS_EMBEDDED_RELEASE_ID_V1__,
-          order,
-          prepare,
-        }),
+        Object.freeze([1, id, __TSJS_EMBEDDED_RELEASE_ID_V1__, install]),
         browser.document.currentScript,
       ]) === true
     );

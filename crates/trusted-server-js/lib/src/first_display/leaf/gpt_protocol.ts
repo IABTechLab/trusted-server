@@ -1,40 +1,57 @@
 import type { FirstDisplaySliceActivationContext } from '../../shared/first_display_transaction';
 import type {
   FirstDisplayGoogletagBatch,
+  FirstDisplayGoogletagBatchCallbacks,
   FirstDisplayGoogletagBatchInput,
+  FirstDisplayGptCaptureCycleV1,
+  FirstDisplayGptDiagnosticsHandoffV1,
 } from '../adapters/googletag';
+import { enqueueFirstDisplayGamAttribution } from '../adapters/googletag';
+
+export type { FirstDisplayGptCaptureCycleV1 } from '../adapters/googletag';
 
 export interface FirstDisplayGptRequestPlanV1 {
   readonly operations: readonly ('display' | 'refresh')[];
   readonly requestOperation: 0 | 1;
 }
 
-export interface FirstDisplayGptProtocolV1 {
-  readonly version: 1;
-  readonly id: 'gpt';
+export type FirstDisplayGptProtocolV1 = readonly [
+  version: 1,
+  id: 'gpt',
+  createBatch: (input: FirstDisplayGoogletagBatchInput) => FirstDisplayGptCapabilityV1,
+];
+
+export type FirstDisplayGptDiagnosticsCaptureV1 = FirstDisplayGptDiagnosticsHandoffV1;
+
+export type FirstDisplayGptCapabilityV1 = readonly [
+  start: (callbacks: FirstDisplayGoogletagBatchCallbacks) => boolean,
+  closeIngress: (committedSlotIds: readonly string[]) => boolean,
+  captureHandoff: () => readonly FirstDisplayGptCaptureCycleV1[] | undefined,
+  captureDiagnosticsHandoff: () => FirstDisplayGptDiagnosticsCaptureV1 | undefined,
+  detachCommittedSlots: (slotIds: readonly string[]) => boolean,
+  dispose: () => void,
+];
+
+export interface FirstDisplayGptBatchPolicyV1 {
   readonly deadlines: Readonly<{
     externalReadyMs: 10_000;
     requestStartMs: 3_000;
     completionMs: 10_000;
   }>;
-  readonly createBatch: (input: FirstDisplayGoogletagBatchInput) => FirstDisplayGoogletagBatch;
   readonly requestPlan: (candidate: unknown) => FirstDisplayGptRequestPlanV1 | undefined;
-  readonly validTargetingValue: (candidate: unknown) => candidate is string;
   readonly classifyRenderEnded: (candidate: unknown) => 'gam_empty' | 'nonempty_gam' | undefined;
 }
 
 interface GptInitialBindings {
-  readonly gam: () => boolean;
+  readonly browser: Window & { googletag?: unknown };
   readonly observe: (name: 'gam' | 'v', value: boolean | number) => void;
   readonly register: (protocol: FirstDisplayGptProtocolV1) => () => void;
 }
 
 export type FirstDisplayGptBatchFactoryV1 = (
   input: FirstDisplayGoogletagBatchInput,
-  protocol: FirstDisplayGptProtocolV1
+  policy: FirstDisplayGptBatchPolicyV1
 ) => FirstDisplayGoogletagBatch;
-
-const textEncoder = new TextEncoder();
 
 function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | undefined {
   try {
@@ -65,29 +82,6 @@ function exactRecord(value: unknown, keys: readonly string[]): Record<string, un
   }
 }
 
-function bindings(candidate: unknown): GptInitialBindings | undefined {
-  try {
-    if (
-      typeof candidate !== 'object' ||
-      candidate === null ||
-      Array.isArray(candidate) ||
-      Object.getPrototypeOf(candidate) !== Object.prototype ||
-      !Object.isFrozen(candidate)
-    ) {
-      return undefined;
-    }
-    const fields = exactRecord(candidate, ['gam', 'observe', 'register']);
-    return fields &&
-      typeof fields.gam === 'function' &&
-      typeof fields.observe === 'function' &&
-      typeof fields.register === 'function'
-      ? (fields as unknown as GptInitialBindings)
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function requestPlan(candidate: unknown): FirstDisplayGptRequestPlanV1 | undefined {
   const fields = exactRecord(candidate, ['initialLoadDisabled', 'ownership']);
   if (
@@ -110,25 +104,6 @@ function requestPlan(candidate: unknown): FirstDisplayGptRequestPlanV1 | undefin
   return Object.freeze({ operations: Object.freeze(['display'] as const), requestOperation: 0 });
 }
 
-function validTargetingValue(candidate: unknown): candidate is string {
-  if (typeof candidate !== 'string' || candidate.length === 0) return false;
-  let scalars = 0;
-  for (let index = 0; index < candidate.length; index += 1) {
-    const code = candidate.charCodeAt(index);
-    if (code <= 0x1f || code === 0x7f) return false;
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = candidate.charCodeAt(index + 1);
-      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
-      index += 1;
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      return false;
-    }
-    scalars += 1;
-    if (scalars > 40) return false;
-  }
-  return textEncoder.encode(candidate).byteLength <= 160;
-}
-
 function classifyRenderEnded(candidate: unknown): 'gam_empty' | 'nonempty_gam' | undefined {
   const fields = exactRecord(candidate, ['isEmpty']);
   if (!fields || typeof fields.isEmpty !== 'boolean') return undefined;
@@ -141,38 +116,50 @@ export function installGptInitial(
   own: FirstDisplaySliceActivationContext['own'],
   createBatch: FirstDisplayGptBatchFactoryV1,
   configCandidate: unknown
-): Readonly<{ version: 1; id: 'gpt' }> {
-  const value = bindings(candidate);
+): readonly [version: 1, id: 'gpt'] {
+  // The authenticated bootstrap is the sole caller and owns this capability object.
+  const value = candidate as GptInitialBindings;
   const gamAttributionEnabled = (
     configCandidate as Readonly<{ gamAttributionEnabled?: unknown }> | undefined
   )?.gamAttributionEnabled;
   if (
-    !value ||
     typeof own !== 'function' ||
     typeof createBatch !== 'function' ||
     typeof gamAttributionEnabled !== 'boolean'
   ) {
     throw new TypeError('tsjs');
   }
-  const protocol: FirstDisplayGptProtocolV1 = Object.freeze({
-    version: 1,
-    id: 'gpt',
+  const policy: FirstDisplayGptBatchPolicyV1 = Object.freeze({
     deadlines: Object.freeze({
       externalReadyMs: 10_000,
       requestStartMs: 3_000,
       completionMs: 10_000,
     }),
-    createBatch: (input: FirstDisplayGoogletagBatchInput): FirstDisplayGoogletagBatch =>
-      createBatch(input, protocol),
     requestPlan,
-    validTargetingValue,
     classifyRenderEnded,
   });
+  const protocol: FirstDisplayGptProtocolV1 = Object.freeze([
+    1,
+    'gpt',
+    (input: FirstDisplayGoogletagBatchInput): FirstDisplayGptCapabilityV1 => {
+      const batch = createBatch(input, policy);
+      return Object.freeze([
+        batch.start,
+        batch.closeIngress,
+        batch.captureHandoff,
+        batch.captureDiagnosticsHandoff,
+        batch.detachCommittedSlots,
+        batch.dispose,
+      ]);
+    },
+  ]);
   const release = value.register(protocol);
   if (typeof release !== 'function') throw new TypeError('tsjs');
   own(release);
   value.observe('gam', gamAttributionEnabled);
   value.observe('v', 1);
-  if (gamAttributionEnabled && !value.gam()) throw new TypeError('tsjs');
-  return Object.freeze({ version: 1, id: 'gpt' });
+  if (gamAttributionEnabled && !enqueueFirstDisplayGamAttribution(value.browser)) {
+    throw new TypeError('tsjs');
+  }
+  return Object.freeze([1, 'gpt']);
 }

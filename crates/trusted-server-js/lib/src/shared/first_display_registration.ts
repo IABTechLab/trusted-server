@@ -29,7 +29,11 @@ export interface FirstDisplayComponentRegistrationV1 {
   readonly releaseId: string;
   /** Absolute catalog order, not the component's position in one selected mask. */
   readonly order: number;
-  readonly prepare: (host: unknown) => unknown;
+  readonly install: (
+    bindings: unknown,
+    own: (dispose: () => void) => void,
+    config: unknown
+  ) => unknown;
 }
 
 type FirstDisplayBootstrapTarget = object & {
@@ -172,7 +176,7 @@ export function snapshotFirstDisplayComponentRegistration(
       keys.length !== 5 ||
       !keys.every(
         (key) =>
-          typeof key === 'string' && ['abi', 'id', 'releaseId', 'order', 'prepare'].includes(key)
+          typeof key === 'string' && ['abi', 'id', 'releaseId', 'order', 'install'].includes(key)
       )
     ) {
       return undefined;
@@ -189,7 +193,7 @@ export function snapshotFirstDisplayComponentRegistration(
       !Number.isInteger(registration.order) ||
       registration.order < 1 ||
       registration.order > 14 ||
-      typeof registration.prepare !== 'function'
+      typeof registration.install !== 'function'
     ) {
       return undefined;
     }
@@ -198,7 +202,7 @@ export function snapshotFirstDisplayComponentRegistration(
       id: registration.id,
       releaseId: registration.releaseId,
       order: registration.order,
-      prepare: registration.prepare,
+      install: registration.install,
     });
   } catch {
     return undefined;
@@ -285,14 +289,14 @@ export function registerFirstDisplayComponent(
 export function firstDisplayComponentRegistration(
   id: string,
   order: number,
-  prepare: FirstDisplayComponentRegistrationV1['prepare']
+  install: FirstDisplayComponentRegistrationV1['install']
 ): FirstDisplayComponentRegistrationV1 {
   return Object.freeze({
     abi: 1,
     id,
     releaseId: __TSJS_EMBEDDED_RELEASE_ID_V1__,
     order,
-    prepare,
+    install,
   });
 }
 

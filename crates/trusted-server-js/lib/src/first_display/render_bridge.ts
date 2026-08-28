@@ -1,5 +1,5 @@
 import type { FirstDisplayGptBoundCycleV1 } from './adapters/googletag';
-import type { FirstDisplayApsProtocolV1 } from './leaf/aps_protocol';
+import type { FirstDisplayApsPolicyV1 } from './leaf/aps_protocol';
 import type {
   FirstDisplayCommittedRenderArtifactV1,
   FirstDisplayRenderOwnerOptionsV1,
@@ -182,7 +182,7 @@ function snapshotFrameAttributes(frame: HTMLIFrameElement): string | undefined {
 /** Create the APS-owned URL, nonce, document-port, and overlay strategy. */
 export function createFirstDisplayApsRenderStrategy(
   options: FirstDisplayRenderOwnerOptionsV1,
-  aps: FirstDisplayApsProtocolV1
+  aps: FirstDisplayApsPolicyV1
 ): FirstDisplayRenderStrategyV1 {
   const attempts = new Set<ApsAttempt>();
   const bootstrapNonces = new Map<string, ApsAttempt>();
@@ -191,7 +191,7 @@ export function createFirstDisplayApsRenderStrategy(
   let disposed = false;
   const messageEventPrototype = (() => {
     try {
-      const constructor = Reflect.get(options.browser, 'MessageEvent');
+      const constructor = Reflect.get(options[0], 'MessageEvent');
       const prototype =
         typeof constructor === 'function' ? Reflect.get(constructor, 'prototype') : undefined;
       return typeof prototype === 'object' && prototype !== null ? prototype : undefined;
@@ -202,7 +202,7 @@ export function createFirstDisplayApsRenderStrategy(
 
   const notifyNativeMutation = (): void => {
     try {
-      options.onNativeMutation?.();
+      options[6]?.();
     } catch {
       // Observation cannot alter admitted APS state.
     }
@@ -211,7 +211,7 @@ export function createFirstDisplayApsRenderStrategy(
   const clearOwnedTimer = (handle: unknown): void => {
     if (handle === undefined || !timers.delete(handle)) return;
     try {
-      options.clearTimer(handle);
+      options[1](handle);
     } catch {
       // Timer state is already detached.
     }
@@ -222,7 +222,7 @@ export function createFirstDisplayApsRenderStrategy(
     let scheduling = true;
     let firedSynchronously = false;
     try {
-      handle = options.setTimer(() => {
+      handle = options[7](() => {
         if (scheduling) {
           firedSynchronously = true;
           return;
@@ -237,7 +237,7 @@ export function createFirstDisplayApsRenderStrategy(
     if (handle === undefined) return undefined;
     if (firedSynchronously) {
       try {
-        options.clearTimer(handle);
+        options[1](handle);
       } catch {
         // Synchronous timers are refused regardless of cleanup outcome.
       }
@@ -254,7 +254,7 @@ export function createFirstDisplayApsRenderStrategy(
     for (let draw = 0; draw < MAX_DRAWS; draw += 1) {
       const bytes = new Uint8Array(16);
       try {
-        options.fillRandom(bytes);
+        options[4](bytes);
       } catch {
         return undefined;
       }
@@ -292,7 +292,7 @@ export function createFirstDisplayApsRenderStrategy(
     if (!attempt.hostPositionOwned) return;
     attempt.hostPositionOwned = false;
     try {
-      const style = attempt.cycle.element.style;
+      const style = attempt.cycle[1].style;
       if (
         style.getPropertyValue('position') !== 'relative' ||
         style.getPropertyPriority('position') !== ''
@@ -313,9 +313,9 @@ export function createFirstDisplayApsRenderStrategy(
   const acquireHostPosition = (attempt: ApsAttempt): boolean => {
     if (!attempt.overlay) return true;
     try {
-      const host = attempt.cycle.element;
+      const host = attempt.cycle[1];
       const browser = host.ownerDocument.defaultView;
-      if (!browser || !attempt.cycle.isCurrent()) return false;
+      if (!browser || !attempt.cycle[2]()) return false;
       if (browser.getComputedStyle(host).position !== 'static') return true;
       attempt.previousHostPosition = host.style.getPropertyValue('position');
       attempt.previousHostPositionPriority = host.style.getPropertyPriority('position');
@@ -323,7 +323,7 @@ export function createFirstDisplayApsRenderStrategy(
       attempt.hostPositionOwned =
         host.style.getPropertyValue('position') === 'relative' &&
         host.style.getPropertyPriority('position') === '';
-      return attempt.hostPositionOwned && attempt.cycle.isCurrent();
+      return attempt.hostPositionOwned && attempt.cycle[2]();
     } catch {
       return false;
     }
@@ -333,9 +333,9 @@ export function createFirstDisplayApsRenderStrategy(
     try {
       return (
         attempt.active &&
-        attempt.cycle.isCurrent() &&
+        attempt.cycle[2]() &&
         attempt.frame.isConnected &&
-        attempt.frame.parentNode === attempt.cycle.element &&
+        attempt.frame.parentNode === attempt.cycle[1] &&
         attempt.frame.contentWindow === attempt.bootstrapSource &&
         attempt.frame.getAttribute('src') ===
           `${aps.rendererUrl}#${attempt.bootstrapNonceInternal}` &&
@@ -343,8 +343,8 @@ export function createFirstDisplayApsRenderStrategy(
         attempt.frame.getAttribute('sandbox') ===
           (permanent ? aps.permanentSandbox : aps.sandbox) &&
         (!attempt.hostPositionOwned ||
-          (attempt.cycle.element.style.getPropertyValue('position') === 'relative' &&
-            attempt.cycle.element.style.getPropertyPriority('position') === ''))
+          (attempt.cycle[1].style.getPropertyValue('position') === 'relative' &&
+            attempt.cycle[1].style.getPropertyPriority('position') === ''))
       );
     } catch {
       return false;
@@ -495,23 +495,23 @@ export function createFirstDisplayApsRenderStrategy(
       identity: attempt.frame,
       kind: 'aps',
       owner: 'trusted_server',
-      slotId: attempt.cycle.slotId,
-      token: attempt.cycle.bid.rendererReservationId,
+      slotId: attempt.cycle[6],
+      token: attempt.cycle[0].rendererReservationId,
       current: () => {
         try {
           return (
             artifactLive &&
             attempt.accepted &&
-            attempt.cycle.isCurrent() &&
+            attempt.cycle[2]() &&
             attempt.frame.isConnected &&
-            attempt.frame.parentNode === attempt.cycle.element &&
+            attempt.frame.parentNode === attempt.cycle[1] &&
             attempt.frame.contentWindow === frameWindow &&
             attempt.frame.src === frameSource &&
             attempt.frame.srcdoc === frameSourceDocument &&
             snapshotFrameAttributes(attempt.frame) === attributes &&
             (!attempt.hostPositionOwned ||
-              (attempt.cycle.element.style.getPropertyValue('position') === 'relative' &&
-                attempt.cycle.element.style.getPropertyPriority('position') === ''))
+              (attempt.cycle[1].style.getPropertyValue('position') === 'relative' &&
+                attempt.cycle[1].style.getPropertyPriority('position') === ''))
           );
         } catch {
           return false;
@@ -600,7 +600,7 @@ export function createFirstDisplayApsRenderStrategy(
         fail(attempt, RENDERER_DOCUMENT_NO_LOAD);
         return;
       }
-      const policy = aps.bootstrapPolicy(attempt.cycle.bid.renderSource);
+      const policy = aps.bootstrapPolicy(attempt.cycle[0].renderSource);
       if (!policy) {
         fail(attempt, WINNER_NOT_RENDERABLE);
         return;
@@ -664,8 +664,8 @@ export function createFirstDisplayApsRenderStrategy(
       !post(port, {
         version: 1,
         nonce: rendererNonce,
-        publisherOrigin: aps.publisherOrigin,
-        renderer: attempt.cycle.bid.renderSource,
+        ['publisherOrigin']: aps.publisherOrigin,
+        renderer: attempt.cycle[0].renderSource,
       }) ||
       !attempt.active ||
       !exactFrame(attempt, true)
@@ -674,7 +674,7 @@ export function createFirstDisplayApsRenderStrategy(
   };
 
   try {
-    options.browser.addEventListener('message', dispatch as EventListener, true);
+    options[0].addEventListener('message', dispatch as EventListener, true);
   } catch {
     throw new TypeError('tsjs');
   }
@@ -692,8 +692,8 @@ export function createFirstDisplayApsRenderStrategy(
       overlay: boolean,
       callbacks: FirstDisplayRenderStrategyCallbacksV1
     ): FirstDisplayRenderStrategyAttemptV1 | undefined => {
-      const source = cycle.bid.renderSource;
-      if (disposed || source.type !== 'aps' || !cycle.isCurrent() || !aps.bootstrapPolicy(source)) {
+      const source = cycle[0].renderSource;
+      if (disposed || source.type !== 'aps' || !cycle[2]() || !aps.bootstrapPolicy(source)) {
         return undefined;
       }
       const bootstrapNonce = mint('b1_', bootstrapNonces);
@@ -707,7 +707,7 @@ export function createFirstDisplayApsRenderStrategy(
         return undefined;
       let frame: HTMLIFrameElement;
       try {
-        frame = options.document.createElement('iframe');
+        frame = options[3].createElement('iframe');
         configureFrame(frame, source.width, source.height, overlay);
       } catch {
         return undefined;
@@ -743,7 +743,7 @@ export function createFirstDisplayApsRenderStrategy(
           cancelAttempt(attempt);
           return undefined;
         }
-        cycle.element.appendChild(frame);
+        cycle[1].appendChild(frame);
         const frameWindow = frame.contentWindow;
         if (!frameWindow) {
           cancelAttempt(attempt);
@@ -769,7 +769,7 @@ export function createFirstDisplayApsRenderStrategy(
       if (disposed) return;
       disposed = true;
       try {
-        options.browser.removeEventListener('message', dispatch as EventListener, true);
+        options[0].removeEventListener('message', dispatch as EventListener, true);
       } catch {
         // Generation state remains authoritative.
       }

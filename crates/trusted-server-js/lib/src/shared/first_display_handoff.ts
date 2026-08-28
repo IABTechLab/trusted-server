@@ -1,5 +1,12 @@
 import type { BootFailureReason } from '../kernel/fallback_surface';
 import type { PreparedKernelTakeover } from '../kernel/integration_registry';
+import type { FirstDisplaySliceId } from '../kernel/release_catalog';
+import type { FirstDisplayRenderCaptureV1 } from '../first_display/driver';
+import type {
+  FirstDisplayGptCaptureCycleV1,
+  FirstDisplayGptDiagnosticsCaptureV1,
+} from '../first_display/leaf/gpt_protocol';
+import type { FirstDisplayProjectedKind } from '../first_display/leaf/projection';
 
 import type {
   FirstDisplayHandoffV1,
@@ -8,66 +15,30 @@ import type {
 
 const HASH = /^[0-9a-f]{64}$/;
 const MAX_U32 = 4_294_967_295;
-const HANDOFF_FIELDS = Object.freeze([
-  'version',
-  'releaseId',
-  'generation',
-  'projectionDigest',
-  'integrationConfigDigest',
-  'slices',
-  'slots',
-  'attempts',
-  'tombstones',
-  'artifacts',
-  'parserState',
-  'gptDiagnostics',
-  'timing',
-  'highWater',
-  'cycles',
-  'trace',
-  'mutationRevision',
-]);
-
 /** Seal inert ordinary data before the runtime download; semantic authority stays at takeover. */
-function snapshotFirstDisplayHandoffEnvelopeV1(
+export function snapshotFirstDisplayHandoffEnvelopeV1(
   candidate: unknown
-): FirstDisplayHandoffV1 | undefined {
+): Readonly<Record<string, unknown>> | undefined {
   try {
     const serialized = JSON.stringify(candidate);
     if (typeof serialized !== 'string' || serialized.length > 9 * 1024 * 1024) return undefined;
-    const snapshot = JSON.parse(serialized) as unknown;
-    if (typeof snapshot !== 'object' || snapshot === null || Array.isArray(snapshot)) {
-      return undefined;
-    }
-    const handoff = snapshot as unknown as FirstDisplayHandoffV1;
-    const keys = Reflect.ownKeys(snapshot);
-    if (
-      keys.length !== HANDOFF_FIELDS.length ||
-      !keys.every((key) => typeof key === 'string' && HANDOFF_FIELDS.includes(key)) ||
-      handoff.version !== 1 ||
-      !HASH.test(handoff.releaseId) ||
-      !Number.isInteger(handoff.generation) ||
-      handoff.generation < 1 ||
-      handoff.generation > MAX_U32 ||
-      !HASH.test(handoff.projectionDigest) ||
-      !HASH.test(handoff.integrationConfigDigest) ||
-      !Number.isInteger(handoff.mutationRevision) ||
-      handoff.mutationRevision < 0 ||
-      handoff.mutationRevision > MAX_U32 ||
-      !Array.isArray(handoff.slices) ||
-      !Array.isArray(handoff.slots) ||
-      !Array.isArray(handoff.attempts) ||
-      !Array.isArray(handoff.tombstones) ||
-      !Array.isArray(handoff.artifacts) ||
-      !Array.isArray(handoff.parserState) ||
-      !Array.isArray(handoff.cycles) ||
-      handoff.attempts.some(
-        (attempt) => !['accepted', 'no_bid', 'failed', 'cancelled'].includes(String(attempt.state))
-      )
-    ) {
-      return undefined;
-    }
-    return Object.freeze(handoff);
+    const handoff = JSON.parse(serialized) as Record<string, unknown>;
+    return handoff &&
+      !Array.isArray(handoff) &&
+      handoff['captureVersion'] === 1 &&
+      typeof handoff['releaseId'] === 'string' &&
+      HASH.test(handoff['releaseId']) &&
+      Number.isInteger(handoff['generation']) &&
+      (handoff['generation'] as number) >= 1 &&
+      (handoff['generation'] as number) <= MAX_U32 &&
+      Number.isInteger(handoff['mutationRevision']) &&
+      (handoff['mutationRevision'] as number) >= 0 &&
+      (handoff['mutationRevision'] as number) <= MAX_U32 &&
+      Number.isInteger(handoff['identityCount']) &&
+      (handoff['identityCount'] as number) >= 0 &&
+      (handoff['identityCount'] as number) <= 512
+      ? Object.freeze(handoff)
+      : undefined;
   } catch {
     return undefined;
   }
@@ -89,7 +60,7 @@ export interface FirstDisplayHandoffOwnerOptions {
 }
 
 export interface FinalizedFirstDisplayHandoffV1 {
-  readonly handoff: FirstDisplayHandoffV1;
+  readonly handoff: Readonly<Record<string, unknown>>;
   readonly capsule: FirstDisplayOwnershipCapsuleV1<object>;
 }
 
@@ -106,6 +77,7 @@ export interface FirstDisplayHandoffOwner {
 export interface FirstDisplayTakeoverOptions {
   readonly finalized: FinalizedFirstDisplayHandoffV1;
   readonly outline: unknown;
+  readonly boot?: unknown;
   readonly isCurrentGeneration: () => boolean;
   readonly authenticateRuntimeScript: () => boolean;
   readonly currentMutationRevision: () => number;
@@ -115,7 +87,8 @@ export interface FirstDisplayTakeoverOptions {
   /** Persistent-core validator; executes before either owner mutates state. */
   readonly validateHandoff: (
     handoff: unknown,
-    outline: unknown
+    outline: unknown,
+    boot?: unknown
   ) => FirstDisplayHandoffV1 | undefined;
   readonly activatePersistent: (
     handoff: FirstDisplayHandoffV1,
@@ -133,7 +106,44 @@ export interface PreparedFirstDisplayTakeoverOptions extends Omit<
   readonly prepared: PreparedKernelTakeover;
 }
 
-function createFirstDisplayOwnershipCapsuleV1<T extends object>(
+/** Stack-local old-owner state accepted only by the release-matched persistent finalizer. */
+export type FirstDisplayAgentCaptureSourceV1 = readonly [
+  handoff: Readonly<{
+    releaseId: string;
+    generation: number;
+    integrationConfigDigest: string;
+    slices: readonly FirstDisplaySliceId[];
+  }>,
+  batch: readonly [
+    projectionDigest: string,
+    outcomes: readonly (readonly [slotId: string, kind: FirstDisplayProjectedKind])[],
+  ],
+  slotResults: ReadonlyMap<string, string>,
+  reasons: ReadonlyMap<string, string | null>,
+  acceptedTrace: ReadonlyMap<string, Readonly<{ atMs: number; historySequence: number }>>,
+  parserState: readonly (readonly [
+    string,
+    readonly (readonly [string, string | number | boolean | null])[],
+  ])[],
+  gptCycles: readonly FirstDisplayGptCaptureCycleV1[] | undefined,
+  diagnostics: FirstDisplayGptDiagnosticsCaptureV1 | undefined,
+  render: FirstDisplayRenderCaptureV1 | undefined,
+  timing: readonly [
+    startedAtMs: number,
+    firstActionAtMs: number | null,
+    terminalAtMs: number,
+    paintAtMs: number,
+    currentTimeMs: number,
+  ],
+  nextTraceSequence: number,
+  mutationRevision: number,
+];
+
+export type FirstDisplayAgentCaptureFinalizerV1 = (
+  source: FirstDisplayAgentCaptureSourceV1
+) => FinalizedFirstDisplayHandoffV1 | undefined;
+
+export function createFirstDisplayOwnershipCapsuleV1<T extends object>(
   releaseId: string,
   generation: number,
   identities: readonly T[]
@@ -170,6 +180,107 @@ function createFirstDisplayOwnershipCapsuleV1<T extends object>(
       live = undefined;
     },
   });
+}
+
+/** Materialize the compact data envelope and one-use identities in the takeover task. */
+export function finalizeFirstDisplayAgentCaptureV1(
+  source: FirstDisplayAgentCaptureSourceV1
+): FinalizedFirstDisplayHandoffV1 | undefined {
+  try {
+    const [
+      handoffSource,
+      batch,
+      slotResults,
+      reasons,
+      acceptedTrace,
+      parserState,
+      gptCycles,
+      diagnosticsSource,
+      renderSource,
+      timing,
+      nextTraceSequence,
+      mutationRevision,
+    ] = source;
+    const cycles = gptCycles ?? Object.freeze([]);
+    const diagnostics =
+      diagnosticsSource ?? Object.freeze([Object.freeze([]), Object.freeze([]), 1, 0, 0] as const);
+    const render =
+      renderSource ??
+      Object.freeze([Object.freeze([]), Object.freeze([]), timing[4], 1, 1] as const);
+    if (
+      diagnostics[0].length !== cycles.length ||
+      diagnostics[0].some((cycle) => {
+        const physical = cycles.find((candidate) => candidate[0] === cycle[0]);
+        return !physical || physical[4] !== cycle[1];
+      })
+    ) {
+      return undefined;
+    }
+    const identities = [
+      ...cycles.map((cycle) => cycle[5]),
+      ...render[0].map((artifact) => artifact[2]),
+    ];
+    const capsule = createFirstDisplayOwnershipCapsuleV1(
+      handoffSource.releaseId,
+      handoffSource.generation,
+      identities
+    );
+    if (!capsule) return undefined;
+    const results = batch[1].map(([slotId]) => {
+      const accepted = acceptedTrace.get(slotId);
+      return [
+        slotResults.get(slotId) ?? 'failed',
+        reasons.get(slotId) ?? null,
+        accepted?.atMs ?? null,
+        accepted?.historySequence ?? null,
+      ];
+    });
+    const handoff = Object.freeze({
+      captureVersion: 1,
+      releaseId: handoffSource.releaseId,
+      generation: handoffSource.generation,
+      data: [
+        batch[0],
+        handoffSource.integrationConfigDigest,
+        handoffSource.slices,
+        results,
+        cycles.map((cycle) => cycle.slice(0, 5)),
+        render[1],
+        render[0].map((artifact) => [
+          artifact[0],
+          artifact[1],
+          artifact[5],
+          artifact[3],
+          artifact[4],
+          artifact[6],
+        ]),
+        parserState,
+        [diagnostics[1], diagnostics[3], diagnostics[4]],
+        timing.slice(0, 4),
+        [results.length + 1, render[2], render[3], render[4]],
+        diagnostics[0].map((cycle) => ({
+          slotId: cycle[0],
+          token: cycle[1],
+          nextCycleOrdinal: cycle[2],
+          unknownPriorCycle: cycle[3],
+          quarantines: cycle[4],
+          records: cycle[5].map((record) => ({
+            ordinal: record[0],
+            responseIdentifier: record[1],
+            seen: record[2],
+            state: record[3],
+          })),
+        })),
+        nextTraceSequence,
+        diagnostics[2],
+      ],
+      mutationRevision,
+      identityCount: identities.length,
+    });
+    return Object.freeze({ handoff, capsule });
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -248,10 +359,10 @@ export function createFirstDisplayHandoffOwner(
         const handoff = snapshotFirstDisplayHandoffEnvelopeV1(captured.candidate);
         if (
           !handoff ||
-          handoff.releaseId !== options.releaseId ||
-          handoff.generation !== options.generation ||
-          handoff.mutationRevision !== revision ||
-          captured.identities.length !== handoff.cycles.length + handoff.artifacts.length ||
+          handoff['releaseId'] !== options.releaseId ||
+          handoff['generation'] !== options.generation ||
+          handoff['mutationRevision'] !== revision ||
+          captured.identities.length !== handoff['identityCount'] ||
           new Set(captured.identities).size !== captured.identities.length
         ) {
           return publishFailure();
@@ -306,7 +417,11 @@ export function performFirstDisplayTakeoverV1(options: FirstDisplayTakeoverOptio
   };
 
   try {
-    const handoff = options.validateHandoff(options.finalized.handoff, options.outline);
+    const handoff = options.validateHandoff(
+      options.finalized.handoff,
+      options.outline,
+      options.boot
+    );
     const { capsule } = options.finalized;
     if (
       !handoff ||
@@ -358,6 +473,7 @@ export function coordinatePreparedFirstDisplayTakeoverV1(
   return performFirstDisplayTakeoverV1({
     finalized: options.finalized,
     outline: options.outline,
+    ...(options.boot === undefined ? {} : { boot: options.boot }),
     validateHandoff: options.prepared.validateHandoff,
     isCurrentGeneration: options.isCurrentGeneration,
     authenticateRuntimeScript: options.authenticateRuntimeScript,

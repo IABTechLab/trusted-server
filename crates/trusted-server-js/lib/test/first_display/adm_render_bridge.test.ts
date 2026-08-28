@@ -13,8 +13,8 @@ function harness() {
   });
   const element = dom.window.document.getElementById('slot-1');
   if (!(element instanceof dom.window.HTMLElement)) throw new Error('missing fixture element');
-  const cycle: FirstDisplayGptBoundCycleV1 = Object.freeze({
-    bid: Object.freeze({
+  const cycle: FirstDisplayGptBoundCycleV1 = Object.freeze([
+    Object.freeze({
       candidateId: 'candidate001',
       slot: 'slot-1',
       provider: 'example',
@@ -32,19 +32,19 @@ function harness() {
       }),
     }),
     element,
-    isCurrent: () => true,
-    ownership: 'trusted_server',
-    physicalSlot: {},
-    placement: Object.freeze({
+    () => true,
+    'trusted_server',
+    {},
+    Object.freeze({
       slot: 'slot-1',
       gamUnitPath: '/123/example',
       divId: 'slot-1',
       formats: Object.freeze([Object.freeze([300, 250] as const)]),
       targeting: Object.freeze({}),
     }),
-    slotId: 'slot-1',
-    traceToken: 'gt1_1',
-  });
+    'slot-1',
+    'gt1_1',
+  ]);
   const timers = new Map<object, () => void>();
   let now = 0;
   const terminal = vi.fn();
@@ -93,16 +93,8 @@ describe('ADM-only shared first-display render journal', () => {
 
     h.bridge.sealTsAdmission();
     expect(h.bridge.closeIngress()).toBe(true);
-    expect(h.bridge.captureHandoff()?.artifacts).toEqual([
-      {
-        hostPosition: null,
-        hostPositionPriority: null,
-        identity: frame,
-        kind: 'gpt_adm',
-        owner: 'trusted_server',
-        slotId: 'slot-1',
-        token: RESERVATION_ID,
-      },
+    expect(h.bridge.captureHandoff()?.[0]).toEqual([
+      [null, null, frame, 'gpt_adm', 'trusted_server', 'slot-1', RESERVATION_ID],
     ]);
     expect(h.bridge.detachCommittedArtifacts()).toBe(true);
     h.bridge.dispose();
@@ -133,7 +125,7 @@ describe('ADM-only shared first-display render journal', () => {
     const aps = Object.freeze({
       ...h.cycle,
       bid: Object.freeze({
-        ...h.cycle.bid,
+        ...h.cycle[0],
         rendererReservationId: `r1_${'b'.repeat(22)}`,
         renderSource: Object.freeze({
           type: 'aps' as const,

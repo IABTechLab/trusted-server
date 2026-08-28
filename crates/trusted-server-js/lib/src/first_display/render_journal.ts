@@ -5,7 +5,11 @@ import type {
   FirstDisplayGptBoundCycleV1,
   FirstDisplayGptRenderResult,
 } from './adapters/googletag';
-import type { FirstDisplayRenderBridgeV1, FirstDisplayRenderHandoffArtifactV1 } from './driver';
+import type {
+  FirstDisplayRenderBridgeCapabilityV1,
+  FirstDisplayRenderBridgeV1,
+  FirstDisplayRenderHandoffArtifactV1,
+} from './driver';
 
 const ADM_SANDBOX =
   'allow-forms allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation';
@@ -41,16 +45,17 @@ export interface FirstDisplayChannelLikeV1 {
   readonly port2: FirstDisplayPortLikeV1;
 }
 
-export interface FirstDisplayRenderOwnerOptionsV1 {
-  readonly browser: Window;
-  readonly clearTimer: (handle: unknown) => void;
-  readonly createChannel: () => FirstDisplayChannelLikeV1;
-  readonly document: Document;
-  readonly fillRandom: (bytes: Uint8Array) => void;
-  readonly now: () => number;
-  readonly onNativeMutation?: () => boolean;
-  readonly setTimer: (callback: () => void, delayMs: number) => unknown;
-}
+/** Compact authenticated capability crossing from the inline owner. */
+export type FirstDisplayRenderOwnerOptionsV1 = readonly [
+  browser: Window,
+  clearTimer: (handle: unknown) => void,
+  createChannel: () => FirstDisplayChannelLikeV1,
+  document: Document,
+  fillRandom: (bytes: Uint8Array) => void,
+  now: () => number,
+  onNativeMutation: (() => boolean) | undefined,
+  setTimer: (callback: () => void, delayMs: number) => unknown,
+];
 
 export interface FirstDisplayCommittedRenderArtifactV1 extends FirstDisplayRenderHandoffArtifactV1 {
   readonly current: () => boolean;
@@ -77,14 +82,14 @@ export interface FirstDisplayRenderStrategyV1 {
   readonly dispose: () => void;
 }
 
-export interface FirstDisplayRenderOwnerProtocolV1 {
-  readonly version: 1;
-  readonly id: 'render_owner';
-  readonly createRenderBridge: (
+export type FirstDisplayRenderOwnerProtocolV1 = readonly [
+  version: 1,
+  id: 'render_owner',
+  createRenderBridge: (
     options: FirstDisplayRenderOwnerOptionsV1,
     strategy?: FirstDisplayRenderStrategyV1
-  ) => FirstDisplayRenderBridgeV1;
-}
+  ) => FirstDisplayRenderBridgeCapabilityV1,
+];
 
 interface RenderOwnerInitialBindings {
   readonly observe: (name: 'protocol_version', value: number) => void;
@@ -157,13 +162,11 @@ function exactRecord(value: unknown, keys: readonly string[]): Record<string, un
     ) {
       return undefined;
     }
-    const names = Object.getOwnPropertyNames(value).sort();
-    const expected = [...keys].sort();
-    if (names.length !== expected.length) return undefined;
+    if (Object.getOwnPropertyNames(value).length !== keys.length) return undefined;
     const result: Record<string, unknown> = {};
-    for (let index = 0; index < expected.length; index += 1) {
-      const name = expected[index];
-      if (!name || names[index] !== name) return undefined;
+    for (let index = 0; index < keys.length; index += 1) {
+      const name = keys[index];
+      if (!name) return undefined;
       const descriptor = Object.getOwnPropertyDescriptor(value, name);
       if (!descriptor?.enumerable || !('value' in descriptor)) return undefined;
       result[name] = descriptor.value;
@@ -183,11 +186,9 @@ function parseJson(source: string): unknown {
   }
 }
 
-function routingMessage(data: unknown): Readonly<{
-  adId?: string;
-  lifecycleTicket?: string;
-  message?: string;
-}> {
+function routingMessage(
+  data: unknown
+): readonly [message: string | undefined, adId: string | undefined, ticket: string | undefined] {
   const value = typeof data === 'string' ? parseJson(data) : data;
   try {
     if (
@@ -196,7 +197,7 @@ function routingMessage(data: unknown): Readonly<{
       Array.isArray(value) ||
       Object.getPrototypeOf(value) !== Object.prototype
     ) {
-      return {};
+      return [undefined, undefined, undefined];
     }
     const read = (name: string): string | undefined => {
       const descriptor = Object.getOwnPropertyDescriptor(value, name);
@@ -207,17 +208,13 @@ function routingMessage(data: unknown): Readonly<{
     const message = read('message');
     const adId = read('adId');
     const lifecycleTicket = read('lifecycleTicket');
-    return {
-      ...(message ? { message } : {}),
-      ...(adId ? { adId } : {}),
-      ...(lifecycleTicket ? { lifecycleTicket } : {}),
-    };
+    return [message, adId, lifecycleTicket];
   } catch {
-    return {};
+    return [undefined, undefined, undefined];
   }
 }
 
-function exactPrebidRequest(data: unknown): Record<string, unknown> | undefined {
+function exactPrebidRequest(data: unknown): string | undefined {
   if (typeof data !== 'string') return undefined;
   const fields = exactRecord(parseJson(data), ['message', 'adId', 'adServerDomain']);
   return fields?.message === 'Prebid Request' &&
@@ -232,11 +229,13 @@ function exactPrebidRequest(data: unknown): Record<string, unknown> | undefined 
         adId: fields.adId,
         adServerDomain: fields.adServerDomain,
       })
-    ? fields
+    ? fields.adId
     : undefined;
 }
 
-function exactOwnerRegistration(data: unknown): Record<string, unknown> | undefined {
+function exactOwnerRegistration(
+  data: unknown
+): readonly [adId: string, ticket: string] | undefined {
   if (typeof data !== 'string') return undefined;
   const fields = exactRecord(parseJson(data), ['message', 'adId', 'version', 'lifecycleTicket']);
   return fields?.message === 'TS Render Owner Register' &&
@@ -252,7 +251,7 @@ function exactOwnerRegistration(data: unknown): Record<string, unknown> | undefi
         version: 1,
         lifecycleTicket: fields.lifecycleTicket,
       })
-    ? fields
+    ? [fields.adId, fields.lifecycleTicket]
     : undefined;
 }
 
@@ -536,23 +535,23 @@ function validCycle(
   strategy: FirstDisplayRenderStrategyV1 | undefined
 ): boolean {
   try {
-    const source = cycle.bid.renderSource;
-    const document = cycle.element.ownerDocument;
+    const source = cycle[0].renderSource;
+    const document = cycle[1].ownerDocument;
     let exactElementMatches = 0;
     const elements = document.getElementsByTagName('*');
     for (let index = 0; index < elements.length; index += 1) {
       const candidate = elements.item(index);
-      if (candidate?.id !== cycle.element.id) continue;
-      if (candidate !== cycle.element) return false;
+      if (candidate?.id !== cycle[1].id) continue;
+      if (candidate !== cycle[1]) return false;
       exactElementMatches += 1;
     }
     return (
-      cycle.isCurrent() &&
-      cycle.slotId === cycle.bid.slot &&
-      cycle.slotId === cycle.placement.slot &&
+      cycle[2]() &&
+      cycle[6] === cycle[0].slot &&
+      cycle[6] === cycle[5].slot &&
       exactElementMatches === 1 &&
-      document.getElementById(cycle.element.id) === cycle.element &&
-      RESERVATION_ID.test(cycle.bid.rendererReservationId) &&
+      document.getElementById(cycle[1].id) === cycle[1] &&
+      RESERVATION_ID.test(cycle[0].rendererReservationId) &&
       (source.type === 'adm' || strategy?.supports(source) === true)
     );
   } catch {
@@ -577,7 +576,7 @@ function publisherArtifact(
     identity: frame,
     kind: 'gpt_adm' as const,
     owner: 'publisher' as const,
-    slotId: attempt.cycle.slotId,
+    slotId: attempt.cycle[6],
     token: attempt.reservationId,
     current: () => {
       try {
@@ -604,7 +603,7 @@ function directAdmExecution(
   setTimer: (callback: () => void, delayMs: number) => unknown,
   clearTimer: (handle: unknown) => void
 ): FirstDisplayRenderStrategyAttemptV1 | undefined {
-  const source = cycle.bid.renderSource;
+  const source = cycle[0].renderSource;
   if (source.type !== 'adm') return undefined;
   let live = true;
   let timer: unknown;
@@ -636,8 +635,8 @@ function directAdmExecution(
       const attributes = snapshotFrameAttributes(created);
       const frameWindow = created.contentWindow;
       if (
-        !cycle.isCurrent() ||
-        created.parentNode !== cycle.element ||
+        !cycle[2]() ||
+        created.parentNode !== cycle[1] ||
         created.srcdoc !== intended ||
         created.getAttribute('src') !== null ||
         attributes === undefined ||
@@ -657,15 +656,15 @@ function directAdmExecution(
           identity: created,
           kind: 'gpt_adm' as const,
           owner: 'trusted_server' as const,
-          slotId: cycle.slotId,
-          token: cycle.bid.rendererReservationId,
+          slotId: cycle[6],
+          token: cycle[0].rendererReservationId,
           current: () => {
             try {
               return (
                 live &&
-                cycle.isCurrent() &&
+                cycle[2]() &&
                 created.isConnected &&
-                created.parentNode === cycle.element &&
+                created.parentNode === cycle[1] &&
                 created.contentWindow === frameWindow &&
                 created.srcdoc === intended &&
                 created.getAttribute('src') === null &&
@@ -681,7 +680,7 @@ function directAdmExecution(
     };
     created.onerror = () => callbacks.fail(ADM_DOCUMENT_NO_LOAD);
     created.srcdoc = intended;
-    cycle.element.appendChild(created);
+    cycle[1].appendChild(created);
     let scheduling = true;
     let firedSynchronously = false;
     timer = setTimer(() => {
@@ -724,7 +723,7 @@ export function createFirstDisplayRenderJournal(
   let lastNow = Number.NEGATIVE_INFINITY;
   const messageEventPrototype = (() => {
     try {
-      const constructor = Reflect.get(options.browser, 'MessageEvent');
+      const constructor = Reflect.get(options[0], 'MessageEvent');
       const prototype =
         typeof constructor === 'function' ? Reflect.get(constructor, 'prototype') : undefined;
       return typeof prototype === 'object' && prototype !== null ? prototype : undefined;
@@ -735,7 +734,7 @@ export function createFirstDisplayRenderJournal(
 
   const readNow = (): number | undefined => {
     try {
-      const value = options.now();
+      const value = options[5]();
       if (!Number.isFinite(value) || value < 0 || value < lastNow) return undefined;
       lastNow = value;
       return value;
@@ -746,7 +745,7 @@ export function createFirstDisplayRenderJournal(
 
   const notifyNativeMutation = (): void => {
     try {
-      options.onNativeMutation?.();
+      options[6]?.();
     } catch {
       // Observation cannot alter the admitted event.
     }
@@ -755,7 +754,7 @@ export function createFirstDisplayRenderJournal(
   const clearOwnedTimer = (handle: unknown): void => {
     if (handle === undefined || !timers.delete(handle)) return;
     try {
-      options.clearTimer(handle);
+      options[1](handle);
     } catch {
       // Timer state is already generation-inert.
     }
@@ -766,7 +765,7 @@ export function createFirstDisplayRenderJournal(
     let scheduling = true;
     let firedSynchronously = false;
     try {
-      handle = options.setTimer(() => {
+      handle = options[7](() => {
         if (scheduling) {
           firedSynchronously = true;
           return;
@@ -781,7 +780,7 @@ export function createFirstDisplayRenderJournal(
     if (handle === undefined) return undefined;
     if (firedSynchronously) {
       try {
-        options.clearTimer(handle);
+        options[1](handle);
       } catch {
         // Synchronous timers are refused regardless of cleanup outcome.
       }
@@ -795,7 +794,7 @@ export function createFirstDisplayRenderJournal(
     for (let draw = 0; draw < MAX_DRAWS; draw += 1) {
       const bytes = new Uint8Array(16);
       try {
-        options.fillRandom(bytes);
+        options[4](bytes);
       } catch {
         return undefined;
       }
@@ -873,13 +872,13 @@ export function createFirstDisplayRenderJournal(
     if (result === 'accepted') {
       if (
         !candidateArtifact ||
-        candidateArtifact.slotId !== attempt.cycle.slotId ||
+        candidateArtifact.slotId !== attempt.cycle[6] ||
         candidateArtifact.token !== attempt.reservationId ||
         candidateArtifact.current() !== true
       ) {
         return settle(attempt, 'failed', INTERNAL_ERROR);
       }
-      committed.set(attempt.cycle.slotId, candidateArtifact);
+      committed.set(attempt.cycle[6], candidateArtifact);
     }
     attempt.active = false;
     const ticket = attempt.ownerTicket;
@@ -902,7 +901,6 @@ export function createFirstDisplayRenderJournal(
         lifecycleTicket: ticket,
         outcome: result,
       };
-      if (result !== 'accepted') settlement.reason = reason;
       post(released.controlPort, settlement);
     }
     closePort(released.claim?.port);
@@ -994,7 +992,7 @@ export function createFirstDisplayRenderJournal(
       tsOwner: {
         version: 1,
         status: 'ready',
-        kind: attempt.cycle.bid.renderSource.type,
+        kind: attempt.cycle[0].renderSource.type,
         lifecycleTicket: ticket,
       },
     });
@@ -1002,8 +1000,8 @@ export function createFirstDisplayRenderJournal(
     attempt.ownerSource = claim.source;
     attempt.phaseValue = 'waiting_for_owner';
     retireReservation(attempt);
-    const source = attempt.cycle.bid.renderSource;
-    resizeCollapsedPucShell(options.document, claim.source, source.width, source.height);
+    const source = attempt.cycle[0].renderSource;
+    resizeCollapsedPucShell(options[3], claim.source, source.width, source.height);
     if (
       !attempt.active ||
       attempt.phaseValue !== 'waiting_for_owner' ||
@@ -1042,16 +1040,10 @@ export function createFirstDisplayRenderJournal(
       fail: (reason: string) => enqueue(Object.freeze({ kind: 'fail' as const, reason })),
     });
     let execution: FirstDisplayRenderStrategyAttemptV1 | undefined;
-    if (attempt.cycle.bid.renderSource.type === 'adm') {
+    if (attempt.cycle[0].renderSource.type === 'adm') {
       if (overlay) return false;
-      execution = directAdmExecution(
-        options.document,
-        attempt.cycle,
-        callbacks,
-        options.setTimer,
-        options.clearTimer
-      );
-    } else if (strategy?.supports(attempt.cycle.bid.renderSource) === true) {
+      execution = directAdmExecution(options[3], attempt.cycle, callbacks, options[7], options[1]);
+    } else if (strategy?.supports(attempt.cycle[0].renderSource) === true) {
       try {
         execution = strategy.start(attempt.cycle, overlay, callbacks);
       } catch {
@@ -1079,7 +1071,7 @@ export function createFirstDisplayRenderJournal(
     attempt.inserted = true;
     clearOwnedTimer(attempt.insertionTimer);
     attempt.insertionTimer = undefined;
-    if (attempt.cycle.bid.renderSource.type === 'adm') {
+    if (attempt.cycle[0].renderSource.type === 'adm') {
       attempt.insertionTimer = arm(() => fail(attempt, ADM_DOCUMENT_NO_LOAD), ADM_LOAD_DEADLINE_MS);
       if (attempt.insertionTimer === undefined) fail(attempt, INTERNAL_ERROR);
     }
@@ -1106,7 +1098,7 @@ export function createFirstDisplayRenderJournal(
       ownerInserted(attempt);
       return;
     }
-    if (attempt.cycle.bid.renderSource.type !== 'adm') {
+    if (attempt.cycle[0].renderSource.type !== 'adm') {
       fail(attempt, INTERNAL_ERROR);
       return;
     }
@@ -1118,7 +1110,7 @@ export function createFirstDisplayRenderJournal(
     ) {
       clearOwnedTimer(attempt.insertionTimer);
       attempt.insertionTimer = undefined;
-      const artifact = publisherArtifact(options.document, attempt);
+      const artifact = publisherArtifact(options[3], attempt);
       if (artifact) settle(attempt, 'accepted', INTERNAL_ERROR, artifact);
       else fail(attempt, ADM_DOCUMENT_NO_LOAD);
       return;
@@ -1144,13 +1136,13 @@ export function createFirstDisplayRenderJournal(
       INSERTION_DEADLINE_MS
     );
     if (attempt.insertionTimer === undefined) return fail(attempt, INTERNAL_ERROR);
-    if (attempt.cycle.bid.renderSource.type === 'adm') {
+    if (attempt.cycle[0].renderSource.type === 'adm') {
       return (
         post(controlPort, {
           message: 'TS ADM Start',
           version: 1,
           lifecycleTicket: ticket,
-          source: attempt.cycle.bid.renderSource,
+          source: attempt.cycle[0].renderSource,
         }) || fail(attempt, INTERNAL_ERROR)
       );
     }
@@ -1168,9 +1160,9 @@ export function createFirstDisplayRenderJournal(
   const handleOwnerRegistration = (
     event: unknown,
     data: unknown,
-    routing: Readonly<{ adId?: string; lifecycleTicket?: string }>
+    routing: ReturnType<typeof routingMessage>
   ): void => {
-    const ticket = routing.lifecycleTicket;
+    const ticket = routing[2];
     if (!ticket) return;
     const beforeSuppress = tickets.get(ticket);
     if (!beforeSuppress || !suppress(event)) return;
@@ -1178,7 +1170,7 @@ export function createFirstDisplayRenderJournal(
     const inspection = inspectPorts(event, messageEventPrototype);
     const responsePort = inspection?.ports[0];
     const refuse = (): void => {
-      if (responsePort) post(responsePort, ownerRefused(routing.adId ?? ''));
+      if (responsePort) post(responsePort, ownerRefused(routing[1] ?? ''));
       for (const port of inspection?.ports ?? []) closePort(port);
     };
     if (entry !== beforeSuppress || entry.registryState !== 'live') {
@@ -1193,8 +1185,8 @@ export function createFirstDisplayRenderJournal(
       inspection.originalCount !== 1 ||
       inspection.ports.length !== 1 ||
       !responsePort ||
-      exact.adId !== attempt.reservationId ||
-      exact.lifecycleTicket !== ticket ||
+      exact[0] !== attempt.reservationId ||
+      exact[1] !== ticket ||
       eventSource(event, messageEventPrototype) !== attempt.ownerSource ||
       !attempt.active ||
       attempt.phaseValue !== 'waiting_for_owner'
@@ -1205,7 +1197,7 @@ export function createFirstDisplayRenderJournal(
     }
     let channel: FirstDisplayChannelLikeV1;
     try {
-      channel = options.createChannel();
+      channel = options[2]();
     } catch {
       post(responsePort, ownerRefused(attempt.reservationId));
       closePort(responsePort);
@@ -1232,7 +1224,7 @@ export function createFirstDisplayRenderJournal(
       () =>
         fail(
           attempt,
-          attempt.cycle.bid.renderSource.type === 'adm' ? ADM_DOCUMENT_NO_LOAD : INTERNAL_ERROR
+          attempt.cycle[0].renderSource.type === 'adm' ? ADM_DOCUMENT_NO_LOAD : INTERNAL_ERROR
         ),
       (release) => {
         attempt.controlRelease = release;
@@ -1262,20 +1254,21 @@ export function createFirstDisplayRenderJournal(
     if (disposed || ingressClosed) return;
     const data = eventField(event, 'data', messageEventPrototype);
     const routing = routingMessage(data);
-    if (routing.message === 'TS Render Owner Register') {
+    if (routing[0] === 'TS Render Owner Register' && routing[2]) {
       notifyNativeMutation();
       handleOwnerRegistration(event, data, routing);
       return;
     }
-    if (routing.message !== 'Prebid Request' || !routing.adId) return;
-    const beforeSuppress = reservations.get(routing.adId);
+    const adId = routing[1];
+    if (routing[0] !== 'Prebid Request' || !adId) return;
+    const beforeSuppress = reservations.get(adId);
     if (!beforeSuppress || !suppress(event)) return;
     notifyNativeMutation();
-    const reservationState = reservations.get(routing.adId);
+    const reservationState = reservations.get(adId);
     const inspection = inspectPorts(event, messageEventPrototype);
     const responsePort = inspection?.ports[0];
     const refuse = (): void => {
-      if (responsePort) post(responsePort, refusedResponse(routing.adId!));
+      if (responsePort) post(responsePort, refusedResponse(adId));
       for (const port of inspection?.ports ?? []) closePort(port);
     };
     if (
@@ -1290,11 +1283,11 @@ export function createFirstDisplayRenderJournal(
       return;
     }
     const exact = exactPrebidRequest(data);
-    const attempt = attempts.get(routing.adId);
+    const attempt = attempts.get(adId);
     const source = eventSource(event, messageEventPrototype);
     if (
       !exact ||
-      exact.adId !== routing.adId ||
+      exact !== adId ||
       !attempt?.active ||
       attempt.phaseValue !== 'waiting_for_gam_and_claim' ||
       attempt.claim ||
@@ -1308,7 +1301,7 @@ export function createFirstDisplayRenderJournal(
   };
 
   try {
-    options.browser.addEventListener('message', dispatch as EventListener, true);
+    options[0].addEventListener('message', dispatch as EventListener, true);
   } catch {
     throw new TypeError('tsjs');
   }
@@ -1342,7 +1335,7 @@ export function createFirstDisplayRenderJournal(
         typeof onTerminal !== 'function' ||
         !validCycle(cycle, strategy) ||
         reservations.size >= MAX_CAPABILITIES ||
-        reservations.has(cycle.bid.rendererReservationId)
+        reservations.has(cycle[0].rendererReservationId)
       )
         return false;
       const observedAt = readNow();
@@ -1367,7 +1360,7 @@ export function createFirstDisplayRenderJournal(
         ownerSource: undefined,
         ownerTicket: undefined,
         phaseValue: 'waiting_for_gam_and_claim',
-        reservationId: cycle.bid.rendererReservationId,
+        reservationId: cycle[0].rendererReservationId,
         ticket: undefined,
       };
       attempts.set(attempt.reservationId, attempt);
@@ -1383,7 +1376,7 @@ export function createFirstDisplayRenderJournal(
       cycle: FirstDisplayGptBoundCycleV1,
       result: FirstDisplayGptRenderResult
     ): boolean => {
-      const attempt = attempts.get(cycle.bid.rendererReservationId);
+      const attempt = attempts.get(cycle[0].rendererReservationId);
       if (
         !attempt?.active ||
         attempt.cycle !== cycle ||
@@ -1409,16 +1402,16 @@ export function createFirstDisplayRenderJournal(
       return attempt.claimTimer !== undefined || fail(attempt, INTERNAL_ERROR);
     },
     recordFailure: (cycle: FirstDisplayGptBoundCycleV1): boolean => {
-      const attempt = attempts.get(cycle.bid.rendererReservationId);
+      const attempt = attempts.get(cycle[0].rendererReservationId);
       return Boolean(
         attempt?.active && attempt.cycle === cycle && fail(attempt, 'gpt_request_failed')
       );
     },
     retire: (cycle: FirstDisplayGptBoundCycleV1): boolean => {
       if (disposed || committedArtifactsDetached) return false;
-      const artifact = committed.get(cycle.slotId);
-      if (!artifact || artifact.token !== cycle.bid.rendererReservationId) return false;
-      committed.delete(cycle.slotId);
+      const artifact = committed.get(cycle[6]);
+      if (!artifact || artifact.token !== cycle[0].rendererReservationId) return false;
+      committed.delete(cycle[6]);
       try {
         artifact.retire();
       } catch {
@@ -1444,7 +1437,7 @@ export function createFirstDisplayRenderJournal(
         return false;
       ingressClosed = true;
       try {
-        options.browser.removeEventListener('message', dispatch as EventListener, true);
+        options[0].removeEventListener('message', dispatch as EventListener, true);
       } catch {
         // Closed generation state remains authoritative.
       }
@@ -1461,44 +1454,44 @@ export function createFirstDisplayRenderJournal(
           ([, entry]) => entry.registryState === 'tombstone' && entry.expiresAtInternal > observedAt
         )
         .map(([value, entry]) =>
-          Object.freeze({
-            kind: 'reservation' as const,
+          Object.freeze([
+            'reservation' as const,
             value,
-            expiresAtMs: entry.expiresAtInternal,
-            ordinal: entry.ordinalInternal,
-          })
+            entry.expiresAtInternal,
+            entry.ordinalInternal,
+          ] as const)
         );
       const ticketTombstones = [...tickets.entries()]
         .filter(
           ([, entry]) => entry.registryState === 'tombstone' && entry.expiresAtInternal > observedAt
         )
         .map(([value, entry]) =>
-          Object.freeze({
-            kind: 'ticket' as const,
+          Object.freeze([
+            'ticket' as const,
             value,
-            expiresAtMs: entry.expiresAtInternal,
-            ordinal: entry.ordinalInternal,
-          })
+            entry.expiresAtInternal,
+            entry.ordinalInternal,
+          ] as const)
         );
       const artifacts = [...committed.values()].map((artifact) =>
-        Object.freeze({
-          hostPosition: artifact.hostPosition,
-          hostPositionPriority: artifact.hostPositionPriority,
-          identity: artifact.identity,
-          kind: artifact.kind,
-          owner: artifact.owner,
-          slotId: artifact.slotId,
-          token: artifact.token,
-        })
+        Object.freeze([
+          artifact.hostPosition,
+          artifact.hostPositionPriority,
+          artifact.identity,
+          artifact.kind,
+          artifact.owner,
+          artifact.slotId,
+          artifact.token,
+        ] as const)
       );
       handoffCaptured = true;
-      return Object.freeze({
-        artifacts: Object.freeze(artifacts),
-        clockEpochMs: observedAt,
+      return Object.freeze([
+        Object.freeze(artifacts),
+        Object.freeze([...reservationTombstones, ...ticketTombstones]),
+        observedAt,
         nextReservationOrdinal,
         nextTicketOrdinal,
-        tombstones: Object.freeze([...reservationTombstones, ...ticketTombstones]),
-      });
+      ] as const);
     },
     detachCommittedArtifacts: (): boolean => {
       if (disposed || !ingressClosed || !handoffCaptured || committedArtifactsDetached) {
@@ -1514,7 +1507,7 @@ export function createFirstDisplayRenderJournal(
       if (!ingressClosed) {
         ingressClosed = true;
         try {
-          options.browser.removeEventListener('message', dispatch as EventListener, true);
+          options[0].removeEventListener('message', dispatch as EventListener, true);
         } catch {
           // Generation latching keeps a failed physical removal inert.
         }
@@ -1545,56 +1538,37 @@ export function createFirstDisplayRenderJournal(
   });
 }
 
-function exactBindings(candidate: unknown): RenderOwnerInitialBindings | undefined {
-  try {
-    if (
-      typeof candidate !== 'object' ||
-      candidate === null ||
-      Array.isArray(candidate) ||
-      Object.getPrototypeOf(candidate) !== Object.prototype ||
-      !Object.isFrozen(candidate) ||
-      Reflect.ownKeys(candidate).length !== 2
-    )
-      return undefined;
-    const observe = Object.getOwnPropertyDescriptor(candidate, 'observe');
-    const register = Object.getOwnPropertyDescriptor(candidate, 'register');
-    if (
-      !observe?.enumerable ||
-      !('value' in observe) ||
-      typeof observe.value !== 'function' ||
-      !register?.enumerable ||
-      !('value' in register) ||
-      typeof register.value !== 'function'
-    )
-      return undefined;
-    return candidate as RenderOwnerInitialBindings;
-  } catch {
-    return undefined;
-  }
-}
-
 /** Install the one-use release-private source-neutral initial render owner. */
 export function installRenderOwnerInitial(
   candidate: unknown,
   own: FirstDisplaySliceActivationContext['own']
-): Readonly<{ version: 1; id: 'render_owner' }> {
-  const bindings = exactBindings(candidate);
-  if (!bindings || typeof own !== 'function') throw new TypeError('tsjs');
+): readonly [version: 1, id: 'render_owner'] {
+  // The authenticated bootstrap is the sole caller and owns this capability object.
+  const bindings = candidate as RenderOwnerInitialBindings;
+  if (typeof own !== 'function') throw new TypeError('tsjs');
   let consumed = false;
   let created: FirstDisplayRenderBridgeV1 | undefined;
-  const protocol: FirstDisplayRenderOwnerProtocolV1 = Object.freeze({
-    version: 1,
-    id: 'render_owner',
-    createRenderBridge: (
-      options: FirstDisplayRenderOwnerOptionsV1,
-      strategy?: FirstDisplayRenderStrategyV1
-    ) => {
+  const protocol: FirstDisplayRenderOwnerProtocolV1 = Object.freeze([
+    1,
+    'render_owner',
+    (options: FirstDisplayRenderOwnerOptionsV1, strategy?: FirstDisplayRenderStrategyV1) => {
       if (consumed) throw new TypeError('tsjs');
       consumed = true;
       created = createFirstDisplayRenderJournal(options, strategy);
-      return created;
+      return Object.freeze([
+        created.bind,
+        created.recordGam,
+        created.recordFailure,
+        created.retire,
+        created.sweepCommittedArtifacts,
+        created.sealTsAdmission,
+        created.closeIngress,
+        created.captureHandoff,
+        created.detachCommittedArtifacts,
+        created.dispose,
+      ] as FirstDisplayRenderBridgeCapabilityV1);
     },
-  });
+  ]);
   const release = bindings.register(protocol);
   if (typeof release !== 'function') throw new TypeError('tsjs');
   own(() => {
@@ -1607,5 +1581,5 @@ export function installRenderOwnerInitial(
     }
   });
   bindings.observe('protocol_version', 1);
-  return Object.freeze({ version: 1, id: 'render_owner' });
+  return Object.freeze([1, 'render_owner']);
 }

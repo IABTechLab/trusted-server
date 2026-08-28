@@ -1,4 +1,9 @@
-import type { PreparedKernelTakeover } from '../kernel/integration_registry';
+import type { BootFailureReason } from '../kernel/fallback_surface';
+
+import type {
+  FinalizedFirstDisplayHandoffV1,
+  FirstDisplayAgentCaptureFinalizerV1,
+} from './first_display_handoff';
 
 export type FirstDisplayGptDiagnosticEventV1 =
   | 'slotRequested'
@@ -265,20 +270,35 @@ export function validatePersistentFirstDisplaySliceAdoptionV1(
 
 export const FIRST_DISPLAY_TAKEOVER_FIELD = '_firstDisplayTakeover' as const;
 
-export type FirstDisplayTakeoverCallback = (prepared: PreparedKernelTakeover) => void;
+/** One-use old-owner lease claimed only after persistent preparation is complete. */
+export type ClaimedFirstDisplayTakeoverV1 = readonly [
+  finalized: FinalizedFirstDisplayHandoffV1,
+  outline: unknown,
+  isCurrentGeneration: () => boolean,
+  authenticateRuntimeScript: () => boolean,
+  currentMutationRevision: () => number,
+  detachCommittedArtifacts: () => boolean,
+  disposeAgent: () => void,
+  onFailure: (reason: BootFailureReason) => void,
+  onCommit: () => void,
+];
+
+export type FirstDisplayTakeoverClaim = (
+  finalize: FirstDisplayAgentCaptureFinalizerV1
+) => ClaimedFirstDisplayTakeoverV1 | undefined;
 
 export type FirstDisplayTakeoverTransportResult =
   | Readonly<{ status: 'absent' }>
   | Readonly<{ status: 'invalid' }>
-  | Readonly<{ status: 'accepted'; coordinate: FirstDisplayTakeoverCallback }>;
+  | Readonly<{ status: 'accepted'; claim: FirstDisplayTakeoverClaim }>;
 
 /** Install one non-enumerable, one-use handoff sink shared only by bootstrap and core IIFEs. */
 export function installFirstDisplayTakeoverTransport(
   target: object,
-  coordinate: FirstDisplayTakeoverCallback
+  claim: FirstDisplayTakeoverClaim
 ): (() => void) | undefined {
   if (
-    typeof coordinate !== 'function' ||
+    typeof claim !== 'function' ||
     Object.getOwnPropertyDescriptor(target, FIRST_DISPLAY_TAKEOVER_FIELD)
   ) {
     return undefined;
@@ -287,7 +307,7 @@ export function installFirstDisplayTakeoverTransport(
     Object.defineProperty(target, FIRST_DISPLAY_TAKEOVER_FIELD, {
       configurable: true,
       enumerable: false,
-      value: coordinate,
+      value: claim,
       writable: false,
     });
   } catch {
@@ -299,7 +319,7 @@ export function installFirstDisplayTakeoverTransport(
     live = false;
     try {
       const descriptor = Object.getOwnPropertyDescriptor(target, FIRST_DISPLAY_TAKEOVER_FIELD);
-      if (descriptor && 'value' in descriptor && descriptor.value === coordinate) {
+      if (descriptor && 'value' in descriptor && descriptor.value === claim) {
         Reflect.deleteProperty(target, FIRST_DISPLAY_TAKEOVER_FIELD);
       }
     } catch {
@@ -329,7 +349,7 @@ export function consumeFirstDisplayTakeoverTransport(
     }
     return Object.freeze({
       status: 'accepted',
-      coordinate: descriptor.value as FirstDisplayTakeoverCallback,
+      claim: descriptor.value as FirstDisplayTakeoverClaim,
     });
   } catch {
     return Object.freeze({ status: 'invalid' });

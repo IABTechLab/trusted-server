@@ -1,10 +1,4 @@
 import { installCreativeInitial } from '../leaf/creative_guard';
+import { registerCurrentFirstDisplayComponent } from '../registration_client';
 
-import { defineInitialSlice, registerInitialSlice } from './definition';
-
-export const CREATIVE_INITIAL_SLICE = defineInitialSlice(
-  'creative_initial',
-  installCreativeInitial
-);
-
-registerInitialSlice(CREATIVE_INITIAL_SLICE, 4);
+registerCurrentFirstDisplayComponent('creative_initial', installCreativeInitial);

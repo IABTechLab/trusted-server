@@ -81,16 +81,16 @@ function fixture(kind: 'adm' | 'aps' = 'adm') {
     targeting: Object.freeze({}),
   });
   let cycleCurrent = true;
-  const cycle: FirstDisplayGptBoundCycleV1 = Object.freeze({
+  const cycle: FirstDisplayGptBoundCycleV1 = Object.freeze([
     bid,
     element,
-    ownership: 'trusted_server',
-    physicalSlot: {},
-    isCurrent: () => cycleCurrent,
+    () => cycleCurrent,
+    'trusted_server',
+    {},
     placement,
-    slotId: 'slot-1',
-    traceToken: 'gt1_1',
-  });
+    'slot-1',
+    'gt1_1',
+  ]);
   return { cycle, dom, element, invalidateCycle: () => (cycleCurrent = false) };
 }
 
@@ -367,8 +367,8 @@ function bindMixedAdm(h: ReturnType<typeof harness>) {
   element.id = 'slot-2';
   h.dom.window.document.body.appendChild(element);
   const reservationId = `r1_${'b'.repeat(22)}`;
-  const cycle: FirstDisplayGptBoundCycleV1 = Object.freeze({
-    bid: Object.freeze({
+  const cycle: FirstDisplayGptBoundCycleV1 = Object.freeze([
+    Object.freeze({
       candidateId: 'candidate002',
       slot: 'slot-2',
       provider: 'example',
@@ -386,19 +386,19 @@ function bindMixedAdm(h: ReturnType<typeof harness>) {
       }),
     }),
     element,
-    ownership: 'trusted_server',
-    physicalSlot: {},
-    isCurrent: () => true,
-    placement: Object.freeze({
+    () => true,
+    'trusted_server',
+    {},
+    Object.freeze({
       slot: 'slot-2',
       gamUnitPath: '/123/example-2',
       divId: 'slot-2',
       formats: Object.freeze([Object.freeze([300, 250] as const)]),
       targeting: Object.freeze({}),
     }),
-    slotId: 'slot-2',
-    traceToken: 'gt1_2',
-  });
+    'slot-2',
+    'gt1_2',
+  ]);
   const terminal = vi.fn();
   expect(h.bridge.bind(cycle, terminal)).toBe(true);
   return { cycle, element, reservationId, terminal };
@@ -425,14 +425,18 @@ describe('bounded first-display render bridge', () => {
     h.bridge.sealTsAdmission();
     expect(h.bridge.closeIngress()).toBe(true);
     const handoff = h.bridge.captureHandoff();
-    expect(handoff?.artifacts.map(({ kind, slotId, token }) => ({ kind, slotId, token }))).toEqual([
+    expect(
+      handoff?.[0].map((artifact) => ({
+        kind: artifact[3],
+        slotId: artifact[5],
+        token: artifact[6],
+      }))
+    ).toEqual([
       { kind: 'gpt_adm', slotId: 'slot-2', token: adm.reservationId },
       { kind: 'aps', slotId: 'slot-1', token: RESERVATION_ID },
     ]);
     expect(
-      new Set(
-        handoff?.tombstones.filter(({ kind }) => kind === 'reservation').map(({ value }) => value)
-      )
+      new Set(handoff?.[1].filter((entry) => entry[0] === 'reservation').map((entry) => entry[1]))
     ).toEqual(new Set([adm.reservationId, RESERVATION_ID]));
     expect(h.bridge.detachCommittedArtifacts()).toBe(true);
     h.bridge.dispose();
@@ -560,7 +564,7 @@ describe('bounded first-display render bridge', () => {
       message: 'TS ADM Start',
       version: 1,
       lifecycleTicket: ticket,
-      source: h.cycle.bid.renderSource,
+      source: h.cycle[0].renderSource,
     });
 
     h.channels[0]?.port1.dispatch({
@@ -728,7 +732,7 @@ describe('bounded first-display render bridge', () => {
 
       h.bridge.sealTsAdmission();
       expect(h.bridge.closeIngress()).toBe(true);
-      expect(h.bridge.captureHandoff()?.artifacts).toEqual([]);
+      expect(h.bridge.captureHandoff()?.[0]).toEqual([]);
       expect(h.bridge.detachCommittedArtifacts()).toBe(true);
     }
   );
@@ -754,7 +758,7 @@ describe('bounded first-display render bridge', () => {
 
       h.bridge.sealTsAdmission();
       expect(h.bridge.closeIngress()).toBe(true);
-      expect(h.bridge.captureHandoff()?.artifacts).toEqual([]);
+      expect(h.bridge.captureHandoff()?.[0]).toEqual([]);
       expect(h.bridge.detachCommittedArtifacts()).toBe(true);
     }
   );
@@ -837,7 +841,7 @@ describe('bounded first-display render bridge', () => {
         version: 1,
         nonce,
         publisherOrigin: 'https://publisher.example',
-        renderer: h.cycle.bid.renderSource,
+        renderer: h.cycle[0].renderSource,
       },
       []
     );
@@ -992,30 +996,13 @@ describe('bounded first-display render bridge', () => {
     h.bridge.sealTsAdmission();
 
     expect(h.bridge.closeIngress()).toBe(true);
-    expect(h.bridge.captureHandoff()).toEqual({
-      artifacts: [
-        {
-          hostPosition: null,
-          hostPositionPriority: null,
-          identity: frame,
-          kind: 'gpt_adm',
-          owner: 'trusted_server',
-          slotId: 'slot-1',
-          token: RESERVATION_ID,
-        },
-      ],
-      clockEpochMs: 0,
-      nextReservationOrdinal: 2,
-      nextTicketOrdinal: 1,
-      tombstones: [
-        {
-          expiresAtMs: 900_000,
-          kind: 'reservation',
-          ordinal: 1,
-          value: RESERVATION_ID,
-        },
-      ],
-    });
+    expect(h.bridge.captureHandoff()).toEqual([
+      [[null, null, frame, 'gpt_adm', 'trusted_server', 'slot-1', RESERVATION_ID]],
+      [['reservation', RESERVATION_ID, 900_000, 1]],
+      0,
+      2,
+      1,
+    ]);
     expect(h.bridge.detachCommittedArtifacts()).toBe(true);
     expect(h.bridge.detachCommittedArtifacts()).toBe(false);
     h.bridge.dispose();

@@ -1,7 +1,4 @@
 import { installApsInitial } from '../leaf/aps_protocol';
+import { registerCurrentFirstDisplayComponent } from '../registration_client';
 
-import { defineInitialSlice, registerInitialSlice } from './definition';
-
-export const APS_INITIAL_SLICE = defineInitialSlice('aps_initial', installApsInitial);
-
-registerInitialSlice(APS_INITIAL_SLICE, 3);
+registerCurrentFirstDisplayComponent('aps_initial', installApsInitial);

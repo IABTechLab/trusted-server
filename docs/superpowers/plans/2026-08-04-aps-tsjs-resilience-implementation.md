@@ -1206,16 +1206,14 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 
       The generated fallback tests require the exact safe manifest, empty
       `integrations:{version:1,entries:[]}`, empty fallback auction projection,
-      disabled creative/diagnostics defaults, omitted `requestAds()` → `{slots:[]}`,
-      explicit valid id → `slot_unresolved`, already-aborted explicit id →
-      `caller_aborted`, same frozen reason on `addAdUnits` refusal/internal state,
+      disabled creative/diagnostics defaults, every `requestAds` and `addAdUnits`
+      call refusing with the same classified unavailable reason without reading its
+      input, the same frozen reason in internal state,
       both `initialDisplayCommitted` values, exact FIFO queue drain, accepted-DOM
       preservation, no pending call, no artifact retry, and both
       `abi_mismatch`/`bundle_partial` classifications. Fallback never needs the full
-      projection validator, but `addAdUnits` still validates before refusing. The
-      registration validator obtains its bounded-string primitive from an
-      effect-free bootstrap-safe leaf rather than importing the auction-projection
-      graph. The persistent-core graph must consume a generated numeric manifest
+      projection or public request validator. Full request validation belongs only
+      to a committed kernel. The persistent-core graph must consume a generated numeric manifest
       capacity and exclude the build-time release catalog.
 
 - [ ] **Step 3: Run RED and inspect the expected failures.**
@@ -1454,6 +1452,63 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
   git add -A
   git commit -m "Thin the APS first-display owner"
   ```
+
+### Task 15C: Consolidate bootstrap and first-display base ownership
+
+**Files:**
+
+- Modify: `crates/trusted-server-js/lib/src/core/bootstrap.ts`
+- Modify: `crates/trusted-server-js/lib/src/first_display/agent.ts`
+- Modify: `crates/trusted-server-js/lib/src/first_display/registration_client.ts`
+- Modify: `crates/trusted-server-js/lib/src/kernel/release_catalog.ts`
+- Modify: `crates/trusted-server-js/lib/build-all.mjs`
+- Modify: `crates/trusted-server-js/build.rs`
+- Modify: `crates/trusted-server-js/src/bundle.rs`
+- Modify: `crates/trusted-server-core/src/tsjs.rs`
+- Modify: `crates/trusted-server-core/src/publisher.rs`
+- Modify: `crates/trusted-server-js/lib/scripts/bundle-metrics.mjs`
+- Modify: `crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs`
+- Test: `crates/trusted-server-js/lib/test/core/bootstrap.test.ts`
+- Test: `crates/trusted-server-js/lib/test/first_display/agent.test.ts`
+- Test: `crates/trusted-server-js/lib/test/build/{generated-fallback,release-v1}.test.mjs`
+- Test: colocated `crates/trusted-server-core/src/{tsjs,publisher}.rs` tests
+- Test: `crates/trusted-server-integration-tests/browser/tests/shared/{tsjs-performance,tsjs-runtime}.spec.ts`
+
+- [ ] **Step 1: Add RED physical-ownership and route tests.** Keep the 14-bit
+      logical first-display catalog and exact mask order, but require
+      `first_display` to have physical owner `bootstrap`, no separately served
+      implementation, and no independently routable static asset. Assert that an
+      `008b` response is exactly render owner + creative + GPT initial bytes in
+      catalog order, with the base implementation present only in the inline
+      bootstrap graph. Reject a release where both bootstrap and the marker reach
+      base coordinator source, or where bootstrap reaches APS/GPT/creative/PUC or
+      another optional slice.
+
+- [ ] **Step 2: Add RED one-owner lifecycle tests.** Drive the generated bootstrap
+      followed by a selected slice response and prove one generation owns component
+      registration, action start, terminal/paint, queue ingress, fallback, and
+      takeover. Cover missing/partial selected bytes, duplicate or out-of-order slice
+      registration, reentrant registration/disposal, accepted DOM preservation, and
+      exact-once handoff. Assert there is no second base registration, controller,
+      timer, observer, or disposer.
+
+- [ ] **Step 3: Implement the minimal consolidation.** Move the source-neutral base
+      coordinator into the bootstrap physical graph and delete the separate base
+      registration path. Retain `first_display` as a release-stamped non-routable
+      logical marker so mask/capability ordering remains stable. Build and serve one
+      selected response containing optional slices only. Share one closure-private
+      generation and disposer stack; do not bridge two controllers or move code into
+      transport data.
+
+- [ ] **Step 4: Run focused GREEN and measure.** Run bootstrap, first-display,
+      release, static-route, typecheck, architecture, and bundle tests. Then run the
+      exact rc semantic comparator. If any raw/gzip/Brotli value still exceeds rc,
+      inspect the consolidated source graph and remove only duplicated owner state;
+      do not change the fixture, mask membership, baseline, or threshold.
+
+- [ ] **Step 5: Run full verification and commit.** Run the Task 15B three-browser
+      lifecycle proof, complete JS/Rust quality scripts, exact performance sample,
+      and clean-worktree checks before committing and pushing one replacement SHA.
 
 ### Task 16: Enforce hard-cutover absence and supply-chain boundaries
 

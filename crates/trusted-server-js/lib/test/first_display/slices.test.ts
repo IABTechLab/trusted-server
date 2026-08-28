@@ -2,22 +2,27 @@ import { describe, expect, it, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
 
 import {
+  APS_INITIAL_SLICE,
+  CREATIVE_INITIAL_SLICE,
+  DATADOME_INITIAL_SLICE,
+  DIDOMI_INITIAL_SLICE,
+  GOOGLE_TAG_MANAGER_INITIAL_SLICE,
+  GPT_INITIAL_SLICE,
   INITIAL_SLICE_DEFINITIONS,
+  LOCKR_INITIAL_SLICE,
+  OSANO_INITIAL_SLICE,
+  PERMUTIVE_INITIAL_SLICE,
+  PREBID_INITIAL_SLICE,
   selectInitialSliceDefinitions,
+  SOURCEPOINT_INITIAL_SLICE,
+  TESTLIGHT_INITIAL_SLICE,
 } from '../../src/first_display/composition';
-import { DIDOMI_INITIAL_SLICE } from '../../src/first_display/slices/didomi';
-import { CREATIVE_INITIAL_SLICE } from '../../src/first_display/slices/creative';
-import { APS_INITIAL_SLICE } from '../../src/first_display/slices/aps';
-import { GPT_INITIAL_SLICE } from '../../src/first_display/slices/gpt';
-import { PREBID_INITIAL_SLICE } from '../../src/first_display/slices/prebid';
-import { DATADOME_INITIAL_SLICE } from '../../src/first_display/slices/datadome';
-import { GOOGLE_TAG_MANAGER_INITIAL_SLICE } from '../../src/first_display/slices/google_tag_manager';
-import { LOCKR_INITIAL_SLICE } from '../../src/first_display/slices/lockr';
-import { OSANO_INITIAL_SLICE } from '../../src/first_display/slices/osano';
-import { PERMUTIVE_INITIAL_SLICE } from '../../src/first_display/slices/permutive';
-import { SOURCEPOINT_INITIAL_SLICE } from '../../src/first_display/slices/sourcepoint';
-import { TESTLIGHT_INITIAL_SLICE } from '../../src/first_display/slices/testlight';
-import type { InitialSliceInstaller } from '../../src/first_display/slices/definition';
+import type {
+  FirstDisplaySliceHost,
+  InitialSliceDefinition,
+  InitialSliceInstaller,
+} from '../../src/first_display/slices/definition';
+import type { FirstDisplaySliceActivationContext } from '../../src/shared/first_display_transaction';
 import type { FirstDisplayRouteRuleV1 } from '../../src/first_display/leaf/route_guard';
 import { installDidomiInitial } from '../../src/first_display/leaf/config_guard';
 import type { FirstDisplayCreativeGuardV1 } from '../../src/first_display/leaf/creative_guard';
@@ -27,6 +32,7 @@ import {
 } from '../../src/first_display/leaf/aps_protocol';
 import {
   installGptInitial,
+  type FirstDisplayGptBatchPolicyV1,
   type FirstDisplayGptProtocolV1,
 } from '../../src/first_display/leaf/gpt_protocol';
 import {
@@ -81,8 +87,16 @@ function componentRegistration(): FirstDisplayComponentRegistrationV1 {
     id: 'gpt_initial',
     releaseId: RELEASE_ID,
     order: 7,
-    prepare: () => Object.freeze({ activate: () => undefined }),
+    install: () => undefined,
   });
+}
+
+function activateInitialSlice(
+  definition: InitialSliceDefinition,
+  host: FirstDisplaySliceHost,
+  context: FirstDisplaySliceActivationContext
+): void {
+  host.activate(definition.id, context.own, definition.install);
 }
 
 describe('first-display initial slice definitions', () => {
@@ -152,7 +166,7 @@ describe('first-display initial slice definitions', () => {
         own
       ),
       installGptInitial(
-        Object.freeze({ gam: () => true, observe, register }),
+        Object.freeze({ browser: {} as Window, observe, register }),
         own,
         () =>
           Object.freeze({
@@ -160,13 +174,7 @@ describe('first-display initial slice definitions', () => {
             closeIngress: () => true,
             captureHandoff: () => Object.freeze([]),
             captureDiagnosticsHandoff: () =>
-              Object.freeze({
-                cycles: Object.freeze([]),
-                facts: Object.freeze([]),
-                nextTraceTokenOrdinal: 1,
-                overflowCount: 0,
-                dropCount: 0,
-              }),
+              Object.freeze([Object.freeze([]), Object.freeze([]), 1, 0, 0] as const),
             detachCommittedSlots: () => true,
             dispose: () => undefined,
           }),
@@ -176,12 +184,12 @@ describe('first-display initial slice definitions', () => {
     ];
 
     expect(receipts).toEqual([
-      { version: 1, id: 'aps' },
-      { version: 1, id: 'gpt' },
-      { version: 1, id: 'prebid' },
+      [1, 'aps'],
+      [1, 'gpt'],
+      [1, 'prebid'],
     ]);
     for (const receipt of receipts) {
-      expect(Reflect.ownKeys(receipt)).toEqual(['version', 'id']);
+      expect(Reflect.ownKeys(receipt)).toEqual(['0', '1', 'length']);
       expect(Object.isFrozen(receipt)).toBe(true);
     }
     expect(register).toHaveBeenCalledTimes(3);
@@ -211,32 +219,38 @@ describe('first-display initial slice definitions', () => {
         }),
         (dispose) => owned.push(dispose)
       )
-    ).toEqual({ version: 1, id: 'render_owner' });
-    const bridge = protocol?.createRenderBridge({
-      browser: dom.window as unknown as Window,
-      clearTimer: () => undefined,
-      createChannel: () => {
+    ).toEqual([1, 'render_owner']);
+    expect(protocol).toEqual([1, 'render_owner', expect.any(Function)]);
+    expect(Object.isFrozen(protocol)).toBe(true);
+    const createRenderBridge = protocol?.[2];
+    const bridge = createRenderBridge?.([
+      dom.window as unknown as Window,
+      () => undefined,
+      () => {
         throw new Error('unused');
       },
-      document: dom.window.document,
-      fillRandom: () => undefined,
-      now: () => 0,
-      setTimer: () => ({}),
-    });
+      dom.window.document,
+      () => undefined,
+      () => 0,
+      undefined,
+      () => ({}),
+    ]);
 
-    expect(bridge).toBeDefined();
+    expect(bridge).toHaveLength(10);
+    expect(Object.isFrozen(bridge)).toBe(true);
     expect(() =>
-      protocol?.createRenderBridge({
-        browser: dom.window as unknown as Window,
-        clearTimer: () => undefined,
-        createChannel: () => {
+      createRenderBridge?.([
+        dom.window as unknown as Window,
+        () => undefined,
+        () => {
           throw new Error('unused');
         },
-        document: dom.window.document,
-        fillRandom: () => undefined,
-        now: () => 0,
-        setTimer: () => ({}),
-      })
+        dom.window.document,
+        () => undefined,
+        () => 0,
+        undefined,
+        () => ({}),
+      ])
     ).toThrow(TypeError);
 
     expect(owned).toHaveLength(1);
@@ -250,28 +264,28 @@ describe('first-display initial slice definitions', () => {
     'projects the typed GAM attribution flag into the first-display GPT owner (%s)',
     (gamAttributionEnabled) => {
       const observe = vi.fn();
-      const gam = vi.fn(() => true);
+      const commands: Array<() => void> = [];
+      const setConfig = vi.fn();
+      const browser = {
+        googletag: { cmd: commands, setConfig },
+      } as unknown as Window;
       let protocol: FirstDisplayGptProtocolV1 | undefined;
-      const createBatch = vi.fn((_input: unknown) =>
-        Object.freeze({
+      let policy: FirstDisplayGptBatchPolicyV1 | undefined;
+      const createBatch = vi.fn((_input: unknown, candidate: FirstDisplayGptBatchPolicyV1) => {
+        policy = candidate;
+        return Object.freeze({
           start: () => true,
           closeIngress: () => true,
           captureHandoff: () => Object.freeze([]),
           captureDiagnosticsHandoff: () =>
-            Object.freeze({
-              cycles: Object.freeze([]),
-              facts: Object.freeze([]),
-              nextTraceTokenOrdinal: 1,
-              overflowCount: 0,
-              dropCount: 0,
-            }),
+            Object.freeze([Object.freeze([]), Object.freeze([]), 1, 0, 0] as const),
           detachCommittedSlots: () => true,
           dispose: () => undefined,
-        })
-      );
+        });
+      });
       installGptInitial(
         Object.freeze({
-          gam,
+          browser,
           observe,
           register: (candidate: FirstDisplayGptProtocolV1) => {
             protocol = candidate;
@@ -283,11 +297,31 @@ describe('first-display initial slice definitions', () => {
         Object.freeze({ gamAttributionEnabled, pageBidsEnabled: true })
       );
 
-      protocol?.createBatch({} as never);
+      expect(protocol).toEqual([1, 'gpt', expect.any(Function)]);
+      expect(Object.isFrozen(protocol)).toBe(true);
+      const batch = protocol?.[2]({} as never);
+      expect(batch).toHaveLength(6);
+      expect(Object.isFrozen(batch)).toBe(true);
 
       expect(createBatch).toHaveBeenCalledOnce();
       expect(createBatch.mock.calls[0]?.[0]).toEqual({});
-      expect(gam).toHaveBeenCalledTimes(gamAttributionEnabled ? 1 : 0);
+      expect(policy?.deadlines).toEqual({
+        externalReadyMs: 10_000,
+        requestStartMs: 3_000,
+        completionMs: 10_000,
+      });
+      expect(
+        policy?.requestPlan(
+          Object.freeze({ initialLoadDisabled: true, ownership: 'trusted_server' })
+        )
+      ).toEqual({ operations: ['display', 'refresh'], requestOperation: 1 });
+      expect(policy?.classifyRenderEnded(Object.freeze({ isEmpty: false }))).toBe('nonempty_gam');
+      expect(commands).toHaveLength(gamAttributionEnabled ? 1 : 0);
+      commands.splice(0).forEach((command) => command());
+      expect(setConfig).toHaveBeenCalledTimes(gamAttributionEnabled ? 1 : 0);
+      if (gamAttributionEnabled) {
+        expect(setConfig).toHaveBeenCalledExactlyOnceWith({ targeting: { ts: 'true' } });
+      }
       expect(observe).toHaveBeenCalledWith('gam', gamAttributionEnabled);
     }
   );
@@ -310,24 +344,27 @@ describe('first-display initial slice definitions', () => {
     ]);
   });
 
-  it('prepares inertly and activates only its exact host obligation', () => {
+  it('exposes only each exact initial-slice installer obligation', () => {
     const events: string[] = [];
     const dispose = vi.fn();
     const host = Object.freeze({
-      activate: (id: string, own: (callback: () => void) => void) => {
+      activate: (
+        id: string,
+        own: (callback: () => void) => void,
+        _install: InitialSliceInstaller
+      ) => {
         own(dispose);
         events.push(id);
       },
     });
 
-    const prepared = INITIAL_SLICE_DEFINITIONS.map((definition) => definition.prepare(host));
-    expect(events).toEqual([]);
-    for (const slice of prepared)
-      slice.activate(Object.freeze({ own: () => undefined, afterActivate: () => undefined }));
+    for (const definition of INITIAL_SLICE_DEFINITIONS) {
+      host.activate(definition.id, () => undefined, definition.install);
+    }
     expect(events).toEqual(INITIAL_SLICE_DEFINITIONS.map(({ id }) => id));
     expect(
       INITIAL_SLICE_DEFINITIONS.every(
-        (definition) => Reflect.ownKeys(definition).join(',') === 'id,prepare'
+        (definition) => Reflect.ownKeys(definition).join(',') === 'id,install'
       )
     ).toBe(true);
   });
@@ -489,9 +526,9 @@ describe('first-display initial slice definitions', () => {
         install?.(bindings, own, undefined);
       },
     });
-    const prepared = DIDOMI_INITIAL_SLICE.prepare(host);
-
-    prepared.activate(
+    activateInitialSlice(
+      DIDOMI_INITIAL_SLICE,
+      host,
       Object.freeze({
         own: (dispose: () => void) => disposers.push(dispose),
         afterActivate: () => undefined,
@@ -610,7 +647,9 @@ describe('first-display initial slice definitions', () => {
       },
     });
 
-    TESTLIGHT_INITIAL_SLICE.prepare(host).activate(
+    activateInitialSlice(
+      TESTLIGHT_INITIAL_SLICE,
+      host,
       Object.freeze({
         own: (dispose: () => void) => disposers.push(dispose),
         afterActivate: () => undefined,
@@ -683,7 +722,9 @@ describe('first-display initial slice definitions', () => {
             undefined
           ),
       });
-      fixture.definition.prepare(host).activate(
+      activateInitialSlice(
+        fixture.definition,
+        host,
         Object.freeze({
           own: (release: () => void) => disposers.push(release),
           afterActivate: () => undefined,
@@ -732,7 +773,9 @@ describe('first-display initial slice definitions', () => {
       ) => install?.(bindings, own, undefined),
     });
 
-    LOCKR_INITIAL_SLICE.prepare(host).activate(
+    activateInitialSlice(
+      LOCKR_INITIAL_SLICE,
+      host,
       Object.freeze({
         own: (release: () => void) => disposers.push(release),
         afterActivate: () => undefined,
@@ -803,7 +846,9 @@ describe('first-display initial slice definitions', () => {
       },
     });
 
-    PERMUTIVE_INITIAL_SLICE.prepare(host).activate(
+    activateInitialSlice(
+      PERMUTIVE_INITIAL_SLICE,
+      host,
       Object.freeze({
         own: (release: () => void) => disposers.push(release),
         afterActivate: () => undefined,
@@ -879,7 +924,9 @@ describe('first-display initial slice definitions', () => {
       },
     });
 
-    SOURCEPOINT_INITIAL_SLICE.prepare(host).activate(
+    activateInitialSlice(
+      SOURCEPOINT_INITIAL_SLICE,
+      host,
       Object.freeze({
         own: (release: () => void) => disposers.push(release),
         afterActivate: () => undefined,
@@ -948,7 +995,9 @@ describe('first-display initial slice definitions', () => {
       },
     });
 
-    OSANO_INITIAL_SLICE.prepare(host).activate(
+    activateInitialSlice(
+      OSANO_INITIAL_SLICE,
+      host,
       Object.freeze({
         own: (release: () => void) => disposers.push(release),
         afterActivate: () => undefined,
@@ -1103,11 +1152,13 @@ describe('first-display initial slice definitions', () => {
         install?: InitialSliceInstaller
       ) => {
         expect(id).toBe('creative_initial');
-        install?.(bindings, own, undefined);
+        install?.(bindings, own, bindings.config);
       },
     });
 
-    CREATIVE_INITIAL_SLICE.prepare(host).activate(
+    activateInitialSlice(
+      CREATIVE_INITIAL_SLICE,
+      host,
       Object.freeze({
         own: (dispose: () => void) => disposers.push(dispose),
         afterActivate: () => undefined,
@@ -1173,11 +1224,13 @@ describe('first-display initial slice definitions', () => {
               register,
             }),
             own,
-            undefined
+            config
           ),
       });
       expect(() =>
-        CREATIVE_INITIAL_SLICE.prepare(host).activate(
+        activateInitialSlice(
+          CREATIVE_INITIAL_SLICE,
+          host,
           Object.freeze({ own: () => undefined, afterActivate: () => undefined })
         )
       ).toThrow();
@@ -1208,48 +1261,51 @@ describe('first-display initial slice definitions', () => {
       },
     });
 
-    APS_INITIAL_SLICE.prepare(host).activate(
+    activateInitialSlice(
+      APS_INITIAL_SLICE,
+      host,
       Object.freeze({
         own: (dispose: () => void) => disposers.push(dispose),
         afterActivate: () => undefined,
       })
     );
-    expect(protocol?.rendererUrl).toBe('https://publisher.example/integrations/aps/renderer/v2');
-    expect(protocol?.publisherOrigin).toBe('https://publisher.example');
-    expect(protocol?.sandbox).toBe(
+    const policy = protocol?.[2];
+    expect(policy?.rendererUrl).toBe('https://publisher.example/integrations/aps/renderer/v2');
+    expect(policy?.publisherOrigin).toBe('https://publisher.example');
+    expect(policy?.sandbox).toBe(
       'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation'
     );
-    expect(protocol?.permanentSandbox).toBe(
+    expect(policy?.permanentSandbox).toBe(
       'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts allow-top-navigation-by-user-activation'
     );
-    expect(protocol?.deadlines).toEqual({
+    expect(policy?.deadlines).toEqual({
       documentAcceptanceMs: 3_000,
       completionMs: 10_000,
     });
-    expect(protocol?.isBootstrapNonce(`b1_${'a'.repeat(22)}`)).toBe(true);
-    expect(protocol?.isRendererNonce(`n1_${'a'.repeat(22)}`)).toBe(true);
-    expect(protocol?.isBootstrapNonce(`n1_${'a'.repeat(22)}`)).toBe(false);
+    expect(policy?.isBootstrapNonce(`b1_${'a'.repeat(22)}`)).toBe(true);
+    expect(policy?.isRendererNonce(`n1_${'a'.repeat(22)}`)).toBe(true);
+    expect(policy?.isBootstrapNonce(`n1_${'a'.repeat(22)}`)).toBe(false);
     const nonce = `n1_${'b'.repeat(22)}`;
     expect(
-      protocol?.parseDocumentMessage(
+      policy?.parseDocumentMessage(
         Object.freeze({ message: 'TS APS Document Accepted', version: 1, nonce }),
         nonce
       )
     ).toEqual({ kind: 'document_accepted' });
     expect(
-      protocol?.parseDocumentMessage(
+      policy?.parseDocumentMessage(
         Object.freeze({ message: 'TS APS Runner Loaded', version: 1, nonce }),
         nonce
       )
     ).toEqual({ kind: 'runner_loaded' });
     expect(
-      protocol?.parseDocumentMessage(
+      policy?.parseDocumentMessage(
         Object.freeze({ message: 'TS APS Render Completed', version: 1, nonce }),
         nonce
       )
     ).toEqual({ kind: 'render_completed' });
     expect(
-      protocol?.parseDocumentMessage(
+      policy?.parseDocumentMessage(
         Object.freeze({
           message: 'TS APS Render Failed',
           version: 1,
@@ -1265,19 +1321,19 @@ describe('first-display initial slice definitions', () => {
       { message: 'TS APS Render Failed', version: 1, nonce, reason: 'unknown' },
       Object.create({ message: 'TS APS Render Completed', version: 1, nonce }),
     ]) {
-      expect(protocol?.parseDocumentMessage(Object.freeze(message), nonce)).toBeUndefined();
+      expect(policy?.parseDocumentMessage(Object.freeze(message), nonce)).toBeUndefined();
     }
 
     disposers.reverse().forEach((dispose) => dispose());
     expect(release).toHaveBeenCalledOnce();
   });
 
-  it('registers the GPT request-cycle and targeting policy before any initial action', () => {
+  it('registers only the attenuated GPT batch factory before any initial action', () => {
     const release = vi.fn();
     const disposers: Array<() => void> = [];
     let protocol: FirstDisplayGptProtocolV1 | undefined;
     const bindings = Object.freeze({
-      gam: vi.fn(() => true),
+      browser: {} as Window,
       observe: vi.fn(),
       register: (candidate: FirstDisplayGptProtocolV1) => {
         protocol = candidate;
@@ -1299,39 +1355,16 @@ describe('first-display initial slice definitions', () => {
       },
     });
 
-    GPT_INITIAL_SLICE.prepare(host).activate(
+    activateInitialSlice(
+      GPT_INITIAL_SLICE,
+      host,
       Object.freeze({
         own: (dispose: () => void) => disposers.push(dispose),
         afterActivate: () => undefined,
       })
     );
-    expect(protocol?.deadlines).toEqual({
-      externalReadyMs: 10_000,
-      requestStartMs: 3_000,
-      completionMs: 10_000,
-    });
-    expect(protocol?.createBatch).toBeTypeOf('function');
-    expect(
-      protocol?.requestPlan(
-        Object.freeze({ initialLoadDisabled: false, ownership: 'trusted_server' })
-      )
-    ).toEqual({ operations: ['display'], requestOperation: 0 });
-    expect(
-      protocol?.requestPlan(
-        Object.freeze({ initialLoadDisabled: true, ownership: 'trusted_server' })
-      )
-    ).toEqual({ operations: ['display', 'refresh'], requestOperation: 1 });
-    expect(
-      protocol?.requestPlan(Object.freeze({ initialLoadDisabled: false, ownership: 'publisher' }))
-    ).toEqual({ operations: ['refresh'], requestOperation: 0 });
-    expect(protocol?.validTargetingValue('x'.repeat(40))).toBe(true);
-    expect(protocol?.validTargetingValue('😀'.repeat(40))).toBe(true);
-    expect(protocol?.validTargetingValue('x'.repeat(41))).toBe(false);
-    expect(protocol?.validTargetingValue('😀'.repeat(41))).toBe(false);
-    expect(protocol?.validTargetingValue('bad\nvalue')).toBe(false);
-    expect(protocol?.classifyRenderEnded(Object.freeze({ isEmpty: true }))).toBe('gam_empty');
-    expect(protocol?.classifyRenderEnded(Object.freeze({ isEmpty: false }))).toBe('nonempty_gam');
-    expect(protocol?.classifyRenderEnded(Object.freeze({ isEmpty: 'false' }))).toBeUndefined();
+    expect(protocol).toEqual([1, 'gpt', expect.any(Function)]);
+    expect(Object.isFrozen(protocol)).toBe(true);
 
     disposers.reverse().forEach((dispose) => dispose());
     expect(release).toHaveBeenCalledOnce();
@@ -1359,22 +1392,25 @@ describe('first-display initial slice definitions', () => {
       },
     });
 
-    PREBID_INITIAL_SLICE.prepare(host).activate(
+    activateInitialSlice(
+      PREBID_INITIAL_SLICE,
+      host,
       Object.freeze({
         own: (dispose: () => void) => disposers.push(dispose),
         afterActivate: () => undefined,
       })
     );
-    expect(protocol).toMatchObject({
+    const policy = protocol?.[2];
+    expect(policy).toMatchObject({
       bidderCode: 'trustedServer',
       maxPendingOperations: 64,
       externalReadyMs: 10_000,
       admissionLeaseMs: 10_000,
       renderReservationMs: 15 * 60 * 1_000,
     });
-    expect(protocol?.normalizeEidSource('  ID5-SYNC.COM ')).toBe('id5-sync.com');
-    expect(protocol?.normalizeEidSource('   ')).toBeUndefined();
-    const prepared = protocol?.snapshotTrustedBid(
+    expect(policy?.normalizeEidSource('  ID5-SYNC.COM ')).toBe('id5-sync.com');
+    expect(policy?.normalizeEidSource('   ')).toBeUndefined();
+    const prepared = policy?.snapshotTrustedBid(
       Object.freeze({
         auctionId: 'auction-1',
         adUnitCode: 'slot-1',
@@ -1402,7 +1438,7 @@ describe('first-display initial slice definitions', () => {
     expect(Object.isFrozen(prepared)).toBe(true);
     expect(prepared?.bid.adId).toBe(`r1_${'a'.repeat(22)}`);
     expect(
-      protocol?.snapshotTrustedBid(
+      policy?.snapshotTrustedBid(
         Object.freeze({
           ...prepared,
           bid: Object.freeze({ ...prepared?.bid, bidderCode: 'publisherBidder' }),

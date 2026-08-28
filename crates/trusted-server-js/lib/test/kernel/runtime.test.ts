@@ -14,6 +14,7 @@ import type {
   PreparedIntegration,
 } from '../../src/kernel/integration_registry';
 import { createLifecycleIntegrationRegistration } from '../../src/kernel/lifecycle_module';
+import { failedFirstDisplayTakeover } from '../first_display/helpers/compact_takeover';
 
 const RELEASE = 'a'.repeat(64);
 const TRUSTED_RUNTIME_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
@@ -176,7 +177,10 @@ function boot(results: readonly object[] = []) {
 
 function takeoverHandoff() {
   const projectionDigest = 'b'.repeat(64);
+  const compact = failedFirstDisplayTakeover(RELEASE);
   return {
+    capture: compact.capture,
+    boot: compact.boot,
     handoff: {
       version: 1,
       releaseId: RELEASE,
@@ -1297,7 +1301,11 @@ describe('Runtime bootstrap owner', () => {
       coordinateTakeover: (prepared) => {
         order.push('takeover:begin');
         const candidate = takeoverHandoff();
-        const handoff = prepared.validateHandoff(candidate.handoff, candidate.outline);
+        const handoff = prepared.validateHandoff(
+          candidate.capture,
+          candidate.outline,
+          candidate.boot
+        );
         expect(handoff).toBeDefined();
         prepared.activate(
           Object.freeze({
@@ -1338,7 +1346,11 @@ describe('Runtime bootstrap owner', () => {
       const onInstallComplete = vi.fn();
       const coordinateTakeover = vi.fn((prepared) => {
         const candidate = takeoverHandoff();
-        const handoff = prepared.validateHandoff(candidate.handoff, candidate.outline);
+        const handoff = prepared.validateHandoff(
+          candidate.capture,
+          candidate.outline,
+          candidate.boot
+        );
         expect(handoff).toBeDefined();
         prepared.activate(
           Object.freeze({

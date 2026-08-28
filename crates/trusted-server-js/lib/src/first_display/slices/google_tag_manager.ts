@@ -1,10 +1,20 @@
-import { installGoogleTagManagerInitial } from '../leaf/route_guard';
+import { installGoogleTagManagerInitial, type FirstDisplayRouteRuleV1 } from '../leaf/route_guard';
+import { registerFirstDisplayBrowserRoute } from '../leaf/browser_route_owner';
+import { registerCurrentFirstDisplayComponent } from '../registration_client';
 
-import { defineInitialSlice, registerInitialSlice } from './definition';
+import type { InitialSliceInstaller } from './definition';
 
-export const GOOGLE_TAG_MANAGER_INITIAL_SLICE = defineInitialSlice(
+export const installGoogleTagManagerInitialSlice: InitialSliceInstaller = (candidate, own) =>
+  installGoogleTagManagerInitial(
+    Object.freeze({
+      observe: (candidate as Readonly<{ observe: unknown }>).observe,
+      origin: location.origin,
+      register: (rule: FirstDisplayRouteRuleV1) => registerFirstDisplayBrowserRoute(rule, true),
+    }),
+    own
+  );
+
+registerCurrentFirstDisplayComponent(
   'google_tag_manager_initial',
-  installGoogleTagManagerInitial
+  installGoogleTagManagerInitialSlice
 );
-
-registerInitialSlice(GOOGLE_TAG_MANAGER_INITIAL_SLICE, 7);

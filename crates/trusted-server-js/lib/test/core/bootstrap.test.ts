@@ -161,6 +161,15 @@ describe('sealed production boot transport', () => {
     expect(snapshotServerBootTransportV1(JSON.stringify(value), RELEASE)).toBeUndefined();
   });
 
+  it('rejects non-v1 outline capability metadata in the compact parser', () => {
+    const value = transportInput(true);
+    const outline = value.outline as Record<string, unknown>;
+    outline.capabilities = ['persistent-only'];
+    outline.objectKinds = ['persistent-only'];
+
+    expect(snapshotServerBootTransportV1(JSON.stringify(value), RELEASE)).toBeUndefined();
+  });
+
   it('rejects a decoded transport above 10 MiB before parsing it', () => {
     const encoded = `${JSON.stringify(transportInput())}${' '.repeat(10 * 1024 * 1024)}`;
     expect(snapshotServerBootTransportV1(encoded, RELEASE)).toBeUndefined();
@@ -201,6 +210,20 @@ describe('sealed production boot transport', () => {
 
     const deferred = (manifest.integrations as Array<Record<string, unknown>>)[1]!;
     deferred.src = `/static/tsjs=tsjs-evil.min.js?v=${'e'.repeat(64)}`;
+    expect(snapshotServerBootTransportV1(JSON.stringify(value), RELEASE)).toBeUndefined();
+  });
+
+  it('rejects unselected integration config entries out of canonical order', () => {
+    const value = transportInput();
+    const boot = value.boot as Record<string, unknown>;
+    boot.integrations = {
+      version: 1,
+      entries: [
+        { id: 'prebid', config: {} },
+        { id: 'aps', config: {} },
+      ],
+    };
+
     expect(snapshotServerBootTransportV1(JSON.stringify(value), RELEASE)).toBeUndefined();
   });
 

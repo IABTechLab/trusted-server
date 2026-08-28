@@ -1,15 +1,25 @@
 import { createFirstDisplayGoogletagBatch } from '../adapters/googletag';
 import { installGptInitial } from '../leaf/gpt_protocol';
+import { registerCurrentFirstDisplayComponent } from '../registration_client';
 
-import { defineInitialSlice, registerInitialSlice } from './definition';
+import type { InitialSliceInstaller } from './definition';
 
-export const GPT_INITIAL_SLICE = defineInitialSlice('gpt_initial', (candidate, own, config) =>
+export const installGptInitialSlice: InitialSliceInstaller = (candidate, own, config) =>
   installGptInitial(
     candidate,
     own,
-    (input, protocol) => createFirstDisplayGoogletagBatch({ ...input, protocol }),
+    (input, protocol) =>
+      createFirstDisplayGoogletagBatch({
+        browser: input[0],
+        clearTimer: input[1],
+        document: input[2],
+        setTimer: input[3],
+        projection: input[4],
+        ...(input[5] === undefined ? {} : { diagnosticsActive: input[5] }),
+        ...(input[6] === undefined ? {} : { onNativeMutation: input[6] }),
+        protocol,
+      }),
     config
-  )
-);
+  );
 
-registerInitialSlice(GPT_INITIAL_SLICE, 8);
+registerCurrentFirstDisplayComponent('gpt_initial', installGptInitialSlice);

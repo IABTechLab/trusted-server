@@ -3,7 +3,7 @@ import type {
   FirstDisplayProjectionSlotV1,
   FirstDisplayProjectionV1,
 } from '../leaf/projection';
-import type { FirstDisplayGptProtocolV1 } from '../leaf/gpt_protocol';
+import type { FirstDisplayGptBatchPolicyV1 } from '../leaf/gpt_protocol';
 import type {
   FirstDisplayGptDiagnosticEventV1,
   FirstDisplayGptDiagnosticsV1,
@@ -49,17 +49,18 @@ export type FirstDisplayGptFailureReason =
   | 'gpt_request_timeout'
   | typeof SLOT_UNRESOLVED;
 
-export interface FirstDisplayGptBoundCycleV1 {
-  readonly bid: FirstDisplayProjectionBidV1;
-  readonly element: HTMLElement;
+/** Compact live physical-cycle authority crossing GPT, bootstrap, and render owner. */
+export type FirstDisplayGptBoundCycleV1 = readonly [
+  bid: FirstDisplayProjectionBidV1,
+  element: HTMLElement,
   /** Closure-private physical-cycle validity; false after a later GPT request takes the slot. */
-  readonly isCurrent: () => boolean;
-  readonly ownership: 'publisher' | 'trusted_server';
-  readonly physicalSlot: object;
-  readonly placement: FirstDisplayProjectionSlotV1;
-  readonly slotId: string;
-  readonly traceToken: string;
-}
+  isCurrent: () => boolean,
+  ownership: 'publisher' | 'trusted_server',
+  physicalSlot: object,
+  placement: FirstDisplayProjectionSlotV1,
+  slotId: string,
+  traceToken: string,
+];
 
 export interface FirstDisplayTargetingOwnershipV1 {
   readonly installed: string;
@@ -67,40 +68,52 @@ export interface FirstDisplayTargetingOwnershipV1 {
   readonly prior: readonly string[];
 }
 
-export interface FirstDisplayGptHandoffCycleV1 extends FirstDisplayGptBoundCycleV1 {
-  readonly targetingOwnership: readonly FirstDisplayTargetingOwnershipV1[];
-}
+export type FirstDisplayGptHandoffCycleV1 = readonly [
+  ...FirstDisplayGptBoundCycleV1,
+  targetingOwnership: readonly FirstDisplayTargetingOwnershipV1[],
+];
 
-export interface FirstDisplayGptDiagnosticCycleV1 {
-  readonly nextCycleOrdinal: number;
-  readonly quarantines: readonly string[];
-  readonly records: readonly Readonly<{
-    readonly ordinal: number;
-    readonly responseIdentifier: string | null;
-    readonly seen: readonly FirstDisplayGptDiagnosticEventV1[];
-    readonly state: 'open' | 'completed' | 'retired';
-  }>[];
-  readonly slotId: string;
-  readonly token: string;
-  readonly unknownPriorCycle: boolean;
-}
+/** Compact physical GPT state crossing from the selected slice to the inline owner. */
+export type FirstDisplayGptCaptureCycleV1 = readonly [
+  slotId: string,
+  elementId: string,
+  ownership: 'trusted_server' | 'publisher',
+  targetingOwnership: readonly FirstDisplayTargetingOwnershipV1[],
+  traceToken: string,
+  physicalSlot: object,
+];
 
-export interface FirstDisplayGptDiagnosticsHandoffV1 extends FirstDisplayGptDiagnosticsV1 {
-  readonly cycles: readonly Readonly<FirstDisplayGptDiagnosticCycleV1>[];
-  readonly nextTraceTokenOrdinal: number;
-}
+export type FirstDisplayGptDiagnosticCycleV1 = readonly [
+  slotId: string,
+  token: string,
+  nextCycleOrdinal: number,
+  unknownPriorCycle: boolean,
+  quarantines: readonly string[],
+  records: readonly (readonly [
+    ordinal: number,
+    responseIdentifier: string | null,
+    seen: readonly FirstDisplayGptDiagnosticEventV1[],
+    state: 'open' | 'completed' | 'retired',
+  ])[],
+];
 
-export interface FirstDisplayGoogletagBatchCallbacks {
-  readonly onBound: (cycle: FirstDisplayGptBoundCycleV1) => void;
-  readonly onFailure: (slotId: string, reason: FirstDisplayGptFailureReason) => void;
-  readonly onFirstAction: () => boolean;
-  readonly onRenderEnded: (
-    cycle: FirstDisplayGptBoundCycleV1,
-    result: FirstDisplayGptRenderResult
-  ) => void;
+export type FirstDisplayGptDiagnosticsHandoffV1 = readonly [
+  cycles: readonly FirstDisplayGptDiagnosticCycleV1[],
+  facts: FirstDisplayGptDiagnosticsV1['facts'],
+  nextTraceTokenOrdinal: number,
+  overflowCount: number,
+  dropCount: number,
+];
+
+/** Compact authenticated callback capability crossing from the inline owner. */
+export type FirstDisplayGoogletagBatchCallbacks = readonly [
+  onBound: (cycle: FirstDisplayGptBoundCycleV1) => void,
+  onFailure: (slotId: string, reason: FirstDisplayGptFailureReason) => void,
+  onFirstAction: () => boolean,
+  onRenderEnded: (cycle: FirstDisplayGptBoundCycleV1, result: FirstDisplayGptRenderResult) => void,
   /** Retire an accepted TS artifact when its exact parser-time physical binding is lost. */
-  readonly onRetire?: (cycle: FirstDisplayGptBoundCycleV1) => void;
-}
+  onRetire: ((cycle: FirstDisplayGptBoundCycleV1) => void) | undefined,
+];
 
 export interface FirstDisplayGoogletagBatch {
   readonly start: (callbacks: FirstDisplayGoogletagBatchCallbacks) => boolean;
@@ -108,12 +121,22 @@ export interface FirstDisplayGoogletagBatch {
   /** Destroy noncommitted TS slots before closing publisher-mutation observation. */
   readonly closeIngress: (committedSlotIds: readonly string[]) => boolean;
   /** Capture exact terminal physical identities without changing disposal ownership. */
-  readonly captureHandoff: () => readonly FirstDisplayGptHandoffCycleV1[] | undefined;
+  readonly captureHandoff: () => readonly FirstDisplayGptCaptureCycleV1[] | undefined;
   readonly captureDiagnosticsHandoff: () => FirstDisplayGptDiagnosticsHandoffV1 | undefined;
   /** Exempt exactly the accepted slot identities from provisional destruction/restoration. */
   readonly detachCommittedSlots: (slotIds: readonly string[]) => boolean;
   readonly dispose: () => void;
 }
+
+/** Compact authenticated capability passed from the GPT slice to the inline owner. */
+export type FirstDisplayGoogletagBatchCapabilityV1 = readonly [
+  start: FirstDisplayGoogletagBatch['start'],
+  closeIngress: FirstDisplayGoogletagBatch['closeIngress'],
+  captureHandoff: FirstDisplayGoogletagBatch['captureHandoff'],
+  captureDiagnosticsHandoff: FirstDisplayGoogletagBatch['captureDiagnosticsHandoff'],
+  detachCommittedSlots: FirstDisplayGoogletagBatch['detachCommittedSlots'],
+  dispose: FirstDisplayGoogletagBatch['dispose'],
+];
 
 export interface FirstDisplayGoogletagBatchOptions {
   readonly browser: Window & { googletag?: unknown };
@@ -122,14 +145,20 @@ export interface FirstDisplayGoogletagBatchOptions {
   readonly diagnosticsActive?: boolean;
   readonly onNativeMutation?: () => boolean;
   readonly projection: FirstDisplayProjectionV1;
-  readonly protocol: Pick<
-    FirstDisplayGptProtocolV1,
-    'classifyRenderEnded' | 'deadlines' | 'requestPlan'
-  >;
+  readonly protocol: FirstDisplayGptBatchPolicyV1;
   readonly setTimer: (callback: () => void, delayMs: number) => unknown;
 }
 
-export type FirstDisplayGoogletagBatchInput = Omit<FirstDisplayGoogletagBatchOptions, 'protocol'>;
+/** Compact authenticated input crossing from the inline owner to the GPT slice. */
+export type FirstDisplayGoogletagBatchInput = readonly [
+  browser: FirstDisplayGoogletagBatchOptions['browser'],
+  clearTimer: FirstDisplayGoogletagBatchOptions['clearTimer'],
+  document: FirstDisplayGoogletagBatchOptions['document'],
+  setTimer: FirstDisplayGoogletagBatchOptions['setTimer'],
+  projection: FirstDisplayGoogletagBatchOptions['projection'],
+  diagnosticsActive?: FirstDisplayGoogletagBatchOptions['diagnosticsActive'],
+  onNativeMutation?: FirstDisplayGoogletagBatchOptions['onNativeMutation'],
+];
 
 type ExternalObject = Record<PropertyKey, unknown>;
 
@@ -140,11 +169,12 @@ interface FirstDisplayDiagnosticCycleRecord {
   state: 'open' | 'completed' | 'retired';
 }
 
-interface ActiveCycle extends FirstDisplayGptBoundCycleV1 {
+interface ActiveCycle {
   readonly bindingState: { current: boolean };
   readonly diagnosticRecords: FirstDisplayDiagnosticCycleRecord[];
   readonly elementId: string;
   readonly operations: readonly ('display' | 'refresh')[];
+  readonly publicCycle: FirstDisplayGptBoundCycleV1;
   readonly requestOperation: 0 | 1;
   readonly runtimeSlotNumber: number;
   completionTimer?: unknown;
@@ -184,6 +214,48 @@ function externalObject(value: unknown): ExternalObject | undefined {
   return (typeof value === 'object' && value !== null) || typeof value === 'function'
     ? (value as ExternalObject)
     : undefined;
+}
+
+/** Enqueue the document-local GAM attribution command at the parser-time boundary. */
+export function enqueueFirstDisplayGamAttribution(
+  target: Window & { googletag?: unknown }
+): boolean {
+  try {
+    let binding = externalObject(target.googletag);
+    if (!binding) {
+      binding = { cmd: [] };
+      if (
+        !Reflect.defineProperty(target, 'googletag', {
+          configurable: true,
+          enumerable: true,
+          value: binding,
+          writable: true,
+        }) ||
+        target.googletag !== binding
+      ) {
+        return false;
+      }
+    }
+    const queue = externalObject(Reflect.get(binding, 'cmd'));
+    const push = queue && Reflect.get(queue, 'push');
+    if (!queue || typeof push !== 'function') return false;
+    Reflect.apply(push, queue, [
+      () => {
+        try {
+          const root = externalObject(target.googletag) ?? binding;
+          const setConfig = Reflect.get(root, 'setConfig');
+          if (typeof setConfig === 'function') {
+            Reflect.apply(setConfig, root, [{ targeting: { ts: 'true' } }]);
+          }
+        } catch {
+          // Missing or hostile GPT targeting cannot block later queue work.
+        }
+      },
+    ]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function member(value: unknown, key: PropertyKey): unknown {
@@ -250,13 +322,10 @@ function targetingEntries(
   );
 }
 
-function winnerRows(projection: FirstDisplayProjectionV1): readonly Readonly<{
-  bid: FirstDisplayProjectionBidV1;
-  placement: FirstDisplayProjectionSlotV1;
-}>[] {
-  const rows: Array<
-    Readonly<{ bid: FirstDisplayProjectionBidV1; placement: FirstDisplayProjectionSlotV1 }>
-  > = [];
+function winnerRows(
+  projection: FirstDisplayProjectionV1
+): readonly (readonly [FirstDisplayProjectionBidV1, FirstDisplayProjectionSlotV1])[] {
+  const rows: Array<readonly [FirstDisplayProjectionBidV1, FirstDisplayProjectionSlotV1]> = [];
   let winner = 0;
   for (let index = 0; index < projection.auction.results.length; index += 1) {
     const decision = projection.auction.results[index];
@@ -264,7 +333,7 @@ function winnerRows(projection: FirstDisplayProjectionV1): readonly Readonly<{
     if (!decision || !placement || decision.outcome !== 'winner') continue;
     const bid = projection.bids[winner];
     winner += 1;
-    if (bid) rows.push(Object.freeze({ bid, placement }));
+    if (bid) rows.push(Object.freeze([bid, placement]));
   }
   return Object.freeze(rows);
 }
@@ -363,9 +432,11 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     if (committed.size !== committedSlotIds.length) return false;
     const retainedSlots = new Set<object>();
     for (const slotId of committed) {
-      const matches = [...this.cycleMap.values()].filter((cycle) => cycle.slotId === slotId);
+      const matches = [...this.cycleMap.values()].filter(
+        (cycle) => cycle.publicCycle[6] === slotId
+      );
       if (matches.length !== 1 || !matches[0]?.settled) return false;
-      retainedSlots.add(matches[0].physicalSlot);
+      retainedSlots.add(matches[0].publicCycle[4]);
     }
     const destroyableSlots = [...this.createdSlots].filter((slot) => !retainedSlots.has(slot));
     this.ingressClosing = true;
@@ -419,58 +490,55 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     return true;
   }
 
-  public captureHandoff(): readonly FirstDisplayGptHandoffCycleV1[] | undefined {
+  public captureHandoff(): readonly FirstDisplayGptCaptureCycleV1[] | undefined {
     if (this.disposed || !this.ingressClosed) return undefined;
     return Object.freeze(
-      [...this.cycleMap.values()].map((cycle) => {
-        const targetingOwnership =
-          this.sealedTargetingOwnership.get(cycle.physicalSlot) ?? Object.freeze([]);
-        return Object.freeze({
-          bid: cycle.bid,
-          element: cycle.element,
-          isCurrent: cycle.isCurrent,
-          ownership: cycle.ownership,
-          physicalSlot: cycle.physicalSlot,
-          placement: cycle.placement,
-          slotId: cycle.slotId,
-          targetingOwnership: Object.freeze(targetingOwnership),
-          traceToken: cycle.traceToken,
-        });
-      })
+      [...this.cycleMap.values()]
+        .filter((cycle) => this.sealedTargetingOwnership.has(cycle.publicCycle[4]))
+        .map((cycle) =>
+          Object.freeze([
+            cycle.publicCycle[6],
+            cycle.elementId,
+            cycle.publicCycle[3],
+            Object.freeze(this.sealedTargetingOwnership.get(cycle.publicCycle[4]) ?? []),
+            cycle.publicCycle[7],
+            cycle.publicCycle[4],
+          ] as const)
+        )
     );
   }
 
   public captureDiagnosticsHandoff(): FirstDisplayGptDiagnosticsHandoffV1 | undefined {
     if (this.disposed || !this.ingressClosed) return undefined;
-    return Object.freeze({
-      cycles: Object.freeze(
-        [...this.cycleMap.values()].map((cycle) =>
-          Object.freeze({
-            nextCycleOrdinal: cycle.nextDiagnosticCycleOrdinal,
-            quarantines: Object.freeze([]),
-            records: Object.freeze(
-              cycle.diagnosticRecords.map((record) =>
-                Object.freeze({
-                  ordinal: record.ordinal,
-                  responseIdentifier: record.responseIdentifier ?? null,
-                  seen: Object.freeze(
-                    DIAGNOSTIC_EVENT_ORDER.filter((event) => record.seen.has(event))
-                  ),
-                  state: record.state,
-                })
-              )
-            ),
-            slotId: cycle.slotId,
-            token: cycle.traceToken,
-            unknownPriorCycle: cycle.unknownPriorCycle,
-          })
-        )
+    return Object.freeze([
+      Object.freeze(
+        [...this.cycleMap.values()]
+          .filter((cycle) => this.sealedTargetingOwnership.has(cycle.publicCycle[4]))
+          .map((cycle) =>
+            Object.freeze([
+              cycle.publicCycle[6],
+              cycle.publicCycle[7],
+              cycle.nextDiagnosticCycleOrdinal,
+              cycle.unknownPriorCycle,
+              Object.freeze([]),
+              Object.freeze(
+                cycle.diagnosticRecords.map((record) =>
+                  Object.freeze([
+                    record.ordinal,
+                    record.responseIdentifier ?? null,
+                    Object.freeze(DIAGNOSTIC_EVENT_ORDER.filter((event) => record.seen.has(event))),
+                    record.state,
+                  ] as const)
+                )
+              ),
+            ] as const)
+          )
       ),
-      facts: Object.freeze([...this.diagnosticFacts]),
-      dropCount: this.diagnosticFactDrops,
-      nextTraceTokenOrdinal: this.nextTraceTokenOrdinal,
-      overflowCount: this.diagnosticFactOverflow,
-    });
+      Object.freeze([...this.diagnosticFacts]),
+      this.nextTraceTokenOrdinal,
+      this.diagnosticFactOverflow,
+      this.diagnosticFactDrops,
+    ] as const);
   }
 
   public detachCommittedSlots(slotIds: readonly string[]): boolean {
@@ -479,9 +547,11 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     if (requested.size !== slotIds.length) return false;
     const selected: object[] = [];
     for (const slotId of requested) {
-      const matches = [...this.cycleMap.values()].filter((cycle) => cycle.slotId === slotId);
+      const matches = [...this.cycleMap.values()].filter(
+        (cycle) => cycle.publicCycle[6] === slotId
+      );
       if (matches.length !== 1 || !matches[0]?.settled) return false;
-      selected.push(matches[0].physicalSlot);
+      selected.push(matches[0].publicCycle[4]);
     }
     this.committedSlotsDetached = true;
     for (const slot of selected) this.detachedSlots.add(slot);
@@ -562,10 +632,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
 
   private activate(
     binding: ExternalObject,
-    rows: readonly Readonly<{
-      bid: FirstDisplayProjectionBidV1;
-      placement: FirstDisplayProjectionSlotV1;
-    }>[],
+    rows: readonly (readonly [FirstDisplayProjectionBidV1, FirstDisplayProjectionSlotV1])[],
     callbacks: FirstDisplayGoogletagBatchCallbacks
   ): void {
     if (this.disposed || this.binding !== binding) return;
@@ -580,9 +647,10 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
 
     for (const row of rows) {
       if (this.disposed) return;
-      const element = resolveElement(this.options.document, row.placement);
+      const [bid, placement] = row;
+      const element = resolveElement(this.options.document, placement);
       if (!element) {
-        callbacks.onFailure(row.placement.slot, SLOT_UNRESOLVED);
+        callbacks[1](placement.slot, SLOT_UNRESOLVED);
         continue;
       }
       const matches = existing.filter((candidate) =>
@@ -593,21 +661,17 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
             : false
       );
       if (matches.length > 1) {
-        callbacks.onFailure(row.placement.slot, SLOT_UNRESOLVED);
+        callbacks[1](placement.slot, SLOT_UNRESOLVED);
         continue;
       }
       const publisherSlot = physicalSlot(matches[0]);
       const slot =
         publisherSlot ??
         physicalSlot(
-          call(binding, 'defineSlot', [
-            row.placement.gamUnitPath,
-            row.placement.formats,
-            element.id,
-          ])
+          call(binding, 'defineSlot', [placement.gamUnitPath, placement.formats, element.id])
         );
       if (!slot) {
-        callbacks.onFailure(row.placement.slot, SLOT_UNRESOLVED);
+        callbacks[1](placement.slot, SLOT_UNRESOLVED);
         continue;
       }
       const ownership = publisherSlot ? 'publisher' : 'trusted_server';
@@ -621,52 +685,44 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         Object.freeze({ initialLoadDisabled: disabled, ownership })
       );
       if (!plan) {
-        callbacks.onFailure(row.placement.slot, GPT_REQUEST_FAILED);
+        callbacks[1](placement.slot, GPT_REQUEST_FAILED);
         continue;
       }
       const traceTokenOrdinal = this.nextTraceTokenOrdinal;
       if (traceTokenOrdinal > 4_294_967_295) {
-        callbacks.onFailure(row.placement.slot, GPT_REQUEST_FAILED);
+        callbacks[1](placement.slot, GPT_REQUEST_FAILED);
         continue;
       }
       const traceToken = `gt1_${traceTokenOrdinal.toString(36)}`;
       this.nextTraceTokenOrdinal += 1;
       const bindingState = { current: true };
+      const publicCycle: FirstDisplayGptBoundCycleV1 = Object.freeze([
+        bid,
+        element,
+        () => bindingState.current,
+        ownership,
+        slot,
+        placement,
+        placement.slot,
+        traceToken,
+      ]);
       const cycle: ActiveCycle = {
-        bid: row.bid,
         bindingState,
         diagnosticRecords: [],
-        element,
         elementId: element.id,
-        isCurrent: () => bindingState.current,
         operations: plan.operations,
-        ownership,
-        physicalSlot: slot,
-        placement: row.placement,
+        publicCycle,
         requestOperation: plan.requestOperation,
         runtimeSlotNumber: traceTokenOrdinal,
         nextDiagnosticCycleOrdinal: 1,
         requestInvoked: false,
         requested: false,
         settled: false,
-        slotId: row.placement.slot,
-        traceToken,
         unknownPriorCycle: ownership === 'publisher',
       };
       this.cycleMap.set(slot, cycle);
-      callbacks.onBound(
-        Object.freeze({
-          bid: cycle.bid,
-          element: cycle.element,
-          isCurrent: cycle.isCurrent,
-          ownership: cycle.ownership,
-          physicalSlot: cycle.physicalSlot,
-          placement: cycle.placement,
-          slotId: cycle.slotId,
-          traceToken: cycle.traceToken,
-        })
-      );
-      for (const [key, value] of targetingEntries(row.bid, row.placement)) {
+      callbacks[0](publicCycle);
+      for (const [key, value] of targetingEntries(bid, placement)) {
         if (publisherSlot) this.journalPublisherTargeting(slot, key, value);
         this.writeTargeting(slot, 'setTargeting', [key, value]);
       }
@@ -689,11 +745,11 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
             );
             if (!this.firstAction) {
               this.firstAction = true;
-              if (!callbacks.onFirstAction()) throw new TypeError('tsjs');
+              if (!callbacks[2]()) throw new TypeError('tsjs');
             }
           }
           if (operation === 'display') call(binding, 'display', [cycle.elementId]);
-          else call(service, 'refresh', [[cycle.physicalSlot], { changeCorrelator: false }]);
+          else call(service, 'refresh', [[cycle.publicCycle[4]], { changeCorrelator: false }]);
         }
       } catch {
         if (cycle.settled) continue;
@@ -753,19 +809,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       cycle.settled = true;
       if (cycle.requestTimer !== undefined) this.clearOwnedTimer(cycle.requestTimer);
       if (cycle.completionTimer !== undefined) this.clearOwnedTimer(cycle.completionTimer);
-      callbacks.onRenderEnded(
-        Object.freeze({
-          bid: cycle.bid,
-          element: cycle.element,
-          isCurrent: cycle.isCurrent,
-          ownership: cycle.ownership,
-          physicalSlot: cycle.physicalSlot,
-          placement: cycle.placement,
-          slotId: cycle.slotId,
-          traceToken: cycle.traceToken,
-        }),
-        result
-      );
+      callbacks[3](cycle.publicCycle, result);
     };
     this.requestedListener = requestedListener;
     this.renderListener = renderListener;
@@ -815,7 +859,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     }
     if (cycle.requestTimer !== undefined) this.clearOwnedTimer(cycle.requestTimer);
     if (cycle.completionTimer !== undefined) this.clearOwnedTimer(cycle.completionTimer);
-    callbacks.onFailure(cycle.slotId, reason);
+    callbacks[1](cycle.publicCycle[6], reason);
   }
 
   private journalPublisherTargeting(slot: object, key: string, installed: string): void {
@@ -976,18 +1020,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     if (!cycle.bindingState.current) return false;
     cycle.bindingState.current = false;
     try {
-      callbacks.onRetire?.(
-        Object.freeze({
-          bid: cycle.bid,
-          element: cycle.element,
-          isCurrent: cycle.isCurrent,
-          ownership: cycle.ownership,
-          physicalSlot: cycle.physicalSlot,
-          placement: cycle.placement,
-          slotId: cycle.slotId,
-          traceToken: cycle.traceToken,
-        })
-      );
+      callbacks[4]?.(cycle.publicCycle);
     } catch {
       // Binding invalidation remains authoritative when retirement observation fails.
     }
@@ -1018,7 +1051,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
   ): void {
     if (!elementId) return;
     for (const cycle of this.cycleMap.values()) {
-      if (cycle.physicalSlot !== replacement && cycle.elementId === elementId) {
+      if (cycle.publicCycle[4] !== replacement && cycle.elementId === elementId) {
         this.retireCycle(cycle, callbacks);
       }
     }
@@ -1201,14 +1234,14 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     const fact: Readonly<FirstDisplayGptFactV1> = Object.freeze({
       version: 1,
       event: eventType,
-      token: cycle.traceToken,
+      token: cycle.publicCycle[7],
       runtimeSlotNumber: cycle.runtimeSlotNumber,
       cycleOrdinal: disposition === 'matched' ? (diagnosticCycle?.ordinal ?? null) : null,
       disposition,
       issueReason,
       capturedAtMs: observedAtMs,
       elementId: cycle.elementId,
-      adUnitPath: cycle.placement.gamUnitPath,
+      adUnitPath: cycle.publicCycle[5].gamUnitPath,
       isEmpty: eventType === SLOT_RENDER_ENDED ? optionalBoolean('isEmpty') : null,
       renderedSize,
       isBackfill: eventType === SLOT_RENDER_ENDED ? optionalBoolean('isBackfill') : null,
@@ -1372,13 +1405,13 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
   }
 
   private failRows(
-    rows: readonly Readonly<{ placement: FirstDisplayProjectionSlotV1 }>[],
+    rows: readonly (readonly [FirstDisplayProjectionBidV1, FirstDisplayProjectionSlotV1])[],
     callbacks: FirstDisplayGoogletagBatchCallbacks,
     reason: FirstDisplayGptFailureReason
   ): void {
     for (const row of rows) {
       try {
-        callbacks.onFailure(row.placement.slot, reason);
+        callbacks[1](row[1].slot, reason);
       } catch {
         // One consumer cannot prevent independent slot settlement.
       }

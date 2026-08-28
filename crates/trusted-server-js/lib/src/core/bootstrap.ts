@@ -1,28 +1,27 @@
 declare const __TSJS_SERVER_BOOT_TRANSPORT_V1__: unknown;
 
-import type {
-  FirstDisplayAgent,
-  FirstDisplayAgentRegistrationHostV1,
-  FirstDisplayBootstrapController,
+import {
+  prepareFirstDisplayBase,
+  type FirstDisplayAgent,
+  type FirstDisplayAgentRegistrationHostV1,
 } from '../first_display/agent';
-import type { PreparedKernelTakeover } from '../kernel/integration_registry';
+import type { InitialSliceInstaller } from '../first_display/slices/definition';
 import type { FirstDisplaySliceId } from '../kernel/release_catalog';
 import type { FirstDisplaySliceActivationContext } from '../shared/first_display_transaction';
+import type { ClaimedFirstDisplayTakeoverV1, FirstDisplayTakeoverClaim } from '../shared/takeover';
 
-import { enqueueFirstDisplayGamAttribution } from './adapters/gam_attribution';
-import { validateRequestAdsOptions } from './contracts/request_ads';
 import {
+  deepFreezeTransportV1,
   snapshotServerBootTransportV1,
   type ServerBootTransportSnapshotV1,
 } from './contracts/server_boot_transport';
-import { validateProgrammaticAdUnits } from './registry';
 import { EMBEDDED_RELEASE_ID } from './release_id';
 
 const RELEASE = EMBEDDED_RELEASE_ID;
 
 interface ComponentRegistration {
-  readonly id: string;
-  readonly prepare: (host: unknown) => unknown;
+  readonly id: Exclude<FirstDisplaySliceId, 'first_display'>;
+  readonly install: InitialSliceInstaller;
 }
 
 type BootstrapTarget = object & { boot?: unknown; que?: unknown };
@@ -44,15 +43,6 @@ class RuntimeUnavailableError extends Error {
     super('TSJS runtime is unavailable');
     this.name = 'TsjsUnavailableError';
   }
-}
-
-function deepFreeze(value: unknown): void {
-  if (typeof value !== 'object' || value === null || Object.isFrozen(value)) return;
-  for (const key of Reflect.ownKeys(value)) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (descriptor && 'value' in descriptor) deepFreeze(descriptor.value);
-  }
-  Object.freeze(value);
 }
 
 function prepareIngress(target: BootstrapTarget): unknown[] {
@@ -79,6 +69,9 @@ function fallbackFields(
   reason: BootFailureReason,
   initialDisplayCommitted: boolean
 ): Readonly<Record<string, unknown>> {
+  const unavailable = (): never => {
+    throw new RuntimeUnavailableError(RELEASE, reason);
+  };
   const safeBoot = {
     abi: 1,
     releaseId: RELEASE,
@@ -99,8 +92,7 @@ function fallbackFields(
     creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
     diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
   };
-  deepFreeze(safeBoot);
-  const knownSlots = new Set<string>();
+  deepFreezeTransportV1(safeBoot);
   let level = 'warn';
   const levels = ['silent', 'error', 'warn', 'info', 'debug'];
   const observe = (..._values: readonly unknown[]): void => undefined;
@@ -120,23 +112,8 @@ function fallbackFields(
       debug: observe,
     }),
     _registerIntegration: () => false,
-    addAdUnits: (units: unknown): never => {
-      validateProgrammaticAdUnits(units, knownSlots);
-      throw new RuntimeUnavailableError(RELEASE, reason);
-    },
-    requestAds: async (options?: unknown): Promise<unknown> => {
-      const validated = validateRequestAdsOptions(options);
-      const selected = validated.slots ?? [];
-      const result = {
-        slots: selected.map((slot) =>
-          validated.aborted
-            ? { slot, path: 'primary', outcome: 'cancelled', reason: 'caller_aborted' }
-            : { slot, path: 'primary', outcome: 'failed', reason: 'slot_unresolved' }
-        ),
-      };
-      deepFreeze(result);
-      return result;
-    },
+    addAdUnits: unavailable,
+    requestAds: async (): Promise<never> => unavailable(),
   };
   Object.defineProperty(fields, '_internal', {
     value: Object.freeze({
@@ -395,8 +372,6 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
   let bootstrapTimer: number | undefined;
   let takeoverTimer: number | undefined;
   let takeoverStartedAt = 0;
-  let controllerState: 'installing' | 'agent_registered' | 'action_started' | 'settled' | 'failed' =
-    'installing';
 
   const clear = (handle: number | undefined): void => {
     if (handle !== undefined) window.clearTimeout(handle);
@@ -424,10 +399,9 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
   };
   const commitFallback = (reason: BootFailureReason): void => {
     if (terminal) return;
-    const initialDisplayCommitted = agent?.snapshot().initialDisplayCommitted ?? false;
+    const initialDisplayCommitted = agent?.initialDisplayCommitted ?? false;
     terminal = true;
     current = false;
-    controllerState = 'failed';
     clear(bootstrapTimer);
     clear(takeoverTimer);
     removePrivate('_firstDisplayTakeover');
@@ -445,82 +419,44 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
   };
   const now = (): number => performance.now();
   const startedAtMs = now();
-  const controller: FirstDisplayBootstrapController = Object.freeze({
-    get state() {
-      return controllerState;
-    },
-    startedAtMs,
-    registerAgent: (): boolean => {
-      if (controllerState !== 'installing' || now() - startedAtMs >= 10_000) return false;
-      controllerState = 'agent_registered';
-      return true;
-    },
-    startAction: (): boolean => {
-      if (controllerState !== 'agent_registered' || now() - startedAtMs >= 10_000) return false;
-      controllerState = 'action_started';
-      return true;
-    },
-    settle: (): boolean => {
-      if (controllerState !== 'agent_registered' && controllerState !== 'action_started') {
-        return false;
-      }
-      controllerState = 'settled';
-      clear(bootstrapTimer);
-      return true;
-    },
-    fail: (reason: BootFailureReason): boolean => {
-      if (controllerState === 'settled' || controllerState === 'failed') return false;
-      commitFallback(reason);
-      return true;
-    },
-  });
-
   const bridge = (selected: FirstDisplayAgent): void => {
     agent = selected;
-    const coordinate = (prepared: PreparedKernelTakeover): void => {
-      let activated = false;
+    let live = true;
+    const claim: FirstDisplayTakeoverClaim = (
+      finalize
+    ): ClaimedFirstDisplayTakeoverV1 | undefined => {
+      if (!live) return undefined;
+      live = false;
       try {
-        if (
-          terminal ||
-          !current ||
-          !runtimeScript ||
-          now() - takeoverStartedAt >= 10_000 ||
-          !authentic(runtimeScript, boot.manifest.runtimeSrc, 'trustedserver-js-runtime') ||
-          agent?.state !== 'painted'
-        ) {
+        if (terminal || !current || selected.state !== 'painted') {
           throw new TypeError('tsjs');
         }
-        const finalized = agent.finalizeHandoff();
-        const handoff = finalized && prepared.validateHandoff(finalized.handoff, outline);
-        if (!handoff || agent.snapshot().mutationRevision !== handoff.mutationRevision) {
-          throw new TypeError('tsjs');
-        }
-        const identities = finalized.capsule.consume(handoff.releaseId, handoff.generation);
-        if (!identities || !agent.detachCommittedArtifacts()) throw new TypeError('tsjs');
-        disposeAgent();
-        prepared.activate(
-          Object.freeze({ version: 1, adoptInitialDisplay: true, handoff, identities })
-        );
-        activated = true;
-        if (
-          !current ||
-          now() - takeoverStartedAt >= 10_000 ||
-          !authentic(runtimeScript, boot.manifest.runtimeSrc, 'trustedserver-js-runtime')
-        ) {
-          throw new TypeError('tsjs');
-        }
-        prepared.commit();
-        terminal = true;
-        clear(takeoverTimer);
-        removePrivate('_firstDisplayTakeover');
+        const finalized = selected.finalizeHandoff(finalize);
+        if (!finalized) throw new TypeError('tsjs');
+        return Object.freeze([
+          finalized,
+          outline,
+          () => current && !terminal && now() - takeoverStartedAt < 10_000,
+          () =>
+            Boolean(
+              runtimeScript &&
+              authentic(runtimeScript, boot.manifest.runtimeSrc, 'trustedserver-js-runtime')
+            ),
+          () => selected.mutationRevision,
+          () => selected.detachCommittedArtifacts(),
+          disposeAgent,
+          (reason) => commitFallback(reason),
+          () => {
+            terminal = true;
+            try {
+              clear(takeoverTimer);
+            } catch {
+              // The committed persistent owner remains terminal if timer cleanup fails.
+            }
+            removePrivate('_firstDisplayTakeover');
+          },
+        ]);
       } catch (error) {
-        if (activated) {
-          try {
-            prepared.rollback();
-          } catch {
-            // Fallback remains terminal after a persistent rollback error.
-          }
-        }
         commitFallback('bundle_partial');
         throw error;
       }
@@ -528,7 +464,7 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
     Object.defineProperty(target, '_firstDisplayTakeover', {
       configurable: true,
       enumerable: false,
-      value: coordinate,
+      value: claim,
       writable: false,
     });
   };
@@ -557,40 +493,39 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
       commitFallback('bundle_partial');
     }
   };
-  const protocols = new Map<string, unknown>();
-  const rawBinding = (id: string): unknown => {
-    const observe = (): void => undefined;
-    const register = (value: unknown): (() => void) => {
-      if (protocols.has(id)) throw new TypeError('tsjs');
-      protocols.set(id, value);
-      return () => {
-        if (protocols.get(id) === value) protocols.delete(id);
-      };
-    };
+  const binding = (
+    id: string,
+    observe: (key: unknown, value: unknown) => void,
+    register: ((protocol: unknown) => () => void) | undefined
+  ): readonly [bindings: unknown, config: unknown] => {
+    let bindings: unknown;
     if (id === 'gpt_initial') {
-      return Object.freeze({
-        gam: () => enqueueFirstDisplayGamAttribution(window),
+      bindings = Object.freeze({ browser: window, observe, register });
+    } else if (id === 'render_owner_initial') {
+      bindings = Object.freeze({ observe, register });
+    } else if (id === 'aps_initial') {
+      bindings = Object.freeze({
         observe,
+        publisherOrigin: location.origin,
         register,
       });
-    }
-    if (id === 'render_owner_initial') {
-      return Object.freeze({ observe, register });
-    }
-    if (id === 'aps_initial') {
-      return Object.freeze({ observe, publisherOrigin: location.origin, register });
-    }
-    if (id === 'creative_initial') {
-      return Object.freeze({
-        config: boot.creative,
+    } else if (id === 'creative_initial') {
+      bindings = Object.freeze({
         location: Object.freeze({ href: location.href, origin: location.origin }),
         observe,
-        register,
+        register: () => () => undefined,
       });
+    } else if (id === 'testlight_initial') {
+      bindings = Object.freeze({
+        enqueue: (callback: () => void) => {
+          ingress.push(callback);
+        },
+        observe,
+        target: window,
+      });
+    } else {
+      bindings = register ? Object.freeze({ observe, register }) : Object.freeze({ observe });
     }
-    return undefined;
-  };
-  const binding = (id: string): unknown => {
     const product = id.endsWith('_initial') ? id.slice(0, -'_initial'.length) : '';
     let config: unknown =
       id === 'creative_initial'
@@ -606,7 +541,7 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
         }
       }
     }
-    return Object.freeze({ bindings: rawBinding(id), config });
+    return Object.freeze([bindings, config]);
   };
   const host: FirstDisplayAgentRegistrationHostV1 = Object.freeze({
     options: Object.freeze({
@@ -615,7 +550,7 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
         projectionDigest: outline.projectionDigest,
         projection: boot.auctionProjection,
       }),
-      bootstrap: controller,
+      startedAtMs,
       performance,
       paint: Object.freeze({
         hidden: () => document.visibilityState === 'hidden',
@@ -623,14 +558,15 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
         scheduleHidden: (callback: () => void) => window.setTimeout(callback, 0),
       }),
       onProtectedPaint: protectedPaint,
+      onSettled: () => clear(bootstrapTimer),
       onFailure: commitFallback,
-      gptInput: Object.freeze({
-        browser: window,
-        clearTimer: (handle: unknown) => window.clearTimeout(handle as number),
-        diagnosticsActive: boot.diagnostics.gpt.active,
+      gptInput: Object.freeze([
+        window,
+        (handle: unknown) => window.clearTimeout(handle as number),
         document,
-        setTimer: (callback: () => void, delayMs: number) => window.setTimeout(callback, delayMs),
-      }),
+        (callback: () => void, delayMs: number) => window.setTimeout(callback, delayMs),
+        boot.diagnostics.gpt.active,
+      ] as const),
       handoff: Object.freeze({
         releaseId: RELEASE,
         generation: outline.generation,
@@ -647,9 +583,41 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
     commitFallback('abi_mismatch');
     return false;
   };
+  const activateComponents = (): boolean => {
+    removePrivate('_registerFirstDisplay');
+    const base = prepareFirstDisplayBase(host);
+    let afterActivate: (() => void) | undefined;
+    let ownershipOpen = true;
+    try {
+      const context: FirstDisplaySliceActivationContext = Object.freeze({
+        own: (dispose: () => void) => {
+          if (!ownershipOpen || terminal || typeof dispose !== 'function') {
+            throw new TypeError('tsjs');
+          }
+          disposers.push(dispose);
+        },
+        afterActivate: (callback: () => void) => {
+          if (!ownershipOpen || terminal || afterActivate || typeof callback !== 'function') {
+            throw new TypeError('tsjs');
+          }
+          afterActivate = callback;
+        },
+      });
+      base.activate(context);
+      for (const component of registrations) {
+        base.sliceHost.activate(component.id, context.own, component.install);
+        if (terminal || !current) return false;
+      }
+    } finally {
+      ownershipOpen = false;
+    }
+    afterActivate?.();
+    if (terminal || !current) return false;
+    return Boolean(agent && !terminal);
+  };
   const register = function (this: unknown, candidate: unknown, source: unknown): boolean {
     try {
-      const expectedId = firstDisplay.slices[registrations.length];
+      const expectedId = firstDisplay.slices[registrations.length + 1];
       if (
         terminal ||
         this !== target ||
@@ -657,85 +625,29 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
         document.currentScript !== source ||
         (agentScript && source !== agentScript) ||
         !authentic(source, firstDisplay.src, 'trustedserver-js') ||
-        typeof candidate !== 'object' ||
-        candidate === null
+        !Array.isArray(candidate) ||
+        !Object.isFrozen(candidate) ||
+        candidate.length !== 4
       ) {
         return fail();
       }
       if (terminal || !current) return false;
-      const fields = candidate as Readonly<{
-        abi: unknown;
-        id: unknown;
-        releaseId: unknown;
-        prepare: unknown;
-      }>;
+      const fields = candidate as readonly unknown[];
       if (
-        fields.abi !== 1 ||
-        fields.id !== expectedId ||
-        fields.releaseId !== RELEASE ||
-        typeof fields.prepare !== 'function'
+        fields[0] !== 1 ||
+        fields[1] !== expectedId ||
+        fields[2] !== RELEASE ||
+        typeof fields[3] !== 'function'
       ) {
         return fail();
       }
       agentScript = source;
       registrations.push({
-        id: fields.id as string,
-        prepare: fields.prepare as (host: unknown) => unknown,
+        id: fields[1] as Exclude<FirstDisplaySliceId, 'first_display'>,
+        install: fields[3] as InitialSliceInstaller,
       });
-      if (registrations.length !== firstDisplay.slices.length) return true;
-      removePrivate('_registerFirstDisplay');
-      const prepared: Array<(context: FirstDisplaySliceActivationContext) => void> = [];
-      let sliceHost: unknown;
-      for (const component of registrations) {
-        const value = component.prepare(component.id === 'first_display' ? host : sliceHost);
-        if (terminal || !current) return false;
-        if (typeof value !== 'object' || value === null || !Object.isFrozen(value)) {
-          return fail();
-        }
-        const activate = Object.getOwnPropertyDescriptor(value, 'activate')?.value;
-        if (typeof activate !== 'function') return fail();
-        if (component.id === 'first_display') {
-          sliceHost = Object.getOwnPropertyDescriptor(value, 'sliceHost')?.value;
-          if (typeof sliceHost !== 'object' || sliceHost === null || !Object.isFrozen(sliceHost)) {
-            return fail();
-          }
-        }
-        prepared.push(activate as (context: FirstDisplaySliceActivationContext) => void);
-      }
-      let afterActivate: (() => void) | undefined;
-      let ownershipOpen = true;
-      try {
-        for (let index = 0; index < prepared.length; index += 1) {
-          prepared[index]!(
-            Object.freeze({
-              own: (dispose: () => void) => {
-                if (!ownershipOpen || terminal || typeof dispose !== 'function') {
-                  throw new TypeError('tsjs');
-                }
-                disposers.push(dispose);
-              },
-              afterActivate: (callback: () => void) => {
-                if (
-                  !ownershipOpen ||
-                  terminal ||
-                  index !== 0 ||
-                  afterActivate ||
-                  typeof callback !== 'function'
-                ) {
-                  throw new TypeError('tsjs');
-                }
-                afterActivate = callback;
-              },
-            })
-          );
-          if (terminal || !current) return false;
-        }
-      } finally {
-        ownershipOpen = false;
-      }
-      afterActivate?.();
-      if (terminal || !current) return false;
-      return Boolean(agent && !terminal);
+      if (registrations.length !== firstDisplay.slices.length - 1) return true;
+      return activateComponents();
     } catch {
       return fail();
     }
@@ -757,6 +669,7 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
     });
     performance.mark('tsjs:bids-script');
     bootstrapTimer = window.setTimeout(() => commitFallback('bundle_partial'), 10_000);
+    if (firstDisplay.slices.length === 1) activateComponents();
   } catch {
     commitFallback('abi_mismatch');
   }

@@ -159,9 +159,10 @@ pub fn first_display_component_bundle(id: &str) -> Option<&'static str> {
         .map(|artifact| artifact.bundle)
 }
 
-/// Compose the base plus selected optional first-display slices in canonical order.
+/// Compose selected optional first-display slices in canonical order.
 ///
-/// Unknown, duplicate, or explicitly supplied base IDs fail closed.
+/// The logical base is physically owned by the inline bootstrap. Unknown,
+/// duplicate, or explicitly supplied base IDs fail closed.
 #[must_use]
 pub fn concatenate_first_display_slices(ids: &[&str]) -> Option<String> {
     let selected = ids.iter().copied().collect::<HashSet<_>>();
@@ -177,10 +178,7 @@ pub fn concatenate_first_display_slices(ids: &[&str]) -> Option<String> {
     }
     let parts = TSJS_ARTIFACTS
         .iter()
-        .filter(|artifact| {
-            artifact.role == "first_display_base"
-                || (artifact.role == "first_display_slice" && selected.contains(artifact.id))
-        })
+        .filter(|artifact| artifact.role == "first_display_slice" && selected.contains(artifact.id))
         .map(|artifact| artifact.bundle)
         .collect::<Vec<_>>();
     Some(parts.join(";\n"))
@@ -420,11 +418,12 @@ mod tests {
         let gpt = first_display_component_bundle("gpt_initial")
             .expect("should embed GPT first-display slice");
 
-        assert!(body.starts_with(base));
-        assert!(
-            body.find(aps).expect("should contain APS")
-                < body.find(gpt).expect("should contain GPT")
+        assert_eq!(
+            body,
+            [aps, gpt].join(";\n"),
+            "should exclude the logical base marker and compose selected slices canonically"
         );
+        assert!(!body.contains(base));
         assert!(concatenate_first_display_slices(&["aps_initial", "aps_initial"]).is_none());
         assert!(concatenate_first_display_slices(&["first_display"]).is_none());
         assert!(concatenate_first_display_slices(&["unknown"]).is_none());

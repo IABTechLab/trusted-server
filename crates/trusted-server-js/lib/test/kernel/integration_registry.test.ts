@@ -10,6 +10,7 @@ import {
   type TakeoverIntegrationRegistration,
 } from '../../src/kernel/integration_registry';
 import { snapshotPersistentFirstDisplayAdoptionV1 } from '../../src/shared/takeover';
+import { failedFirstDisplayTakeover } from '../first_display/helpers/compact_takeover';
 
 const RELEASE_ID = 'a'.repeat(64);
 const OTHER_RELEASE_ID = 'b'.repeat(64);
@@ -129,8 +130,9 @@ describe('integration manifest and registration admission', () => {
       coordinateTakeover: (prepared) => {
         expect(Object.isFrozen(prepared)).toBe(true);
         expect(order).toEqual(['core:prepare', 'module:prepare']);
+        const candidate = failedFirstDisplayTakeover(RELEASE_ID);
         const handoff = prepared.validateHandoff(
-          {
+          candidate.capture || {
             version: 1,
             releaseId: RELEASE_ID,
             generation: 1,
@@ -199,7 +201,8 @@ describe('integration manifest and registration admission', () => {
             outcomeCount: 1,
             capabilities: [],
             objectKinds: [],
-          }
+          },
+          candidate.boot
         );
         expect(handoff).toBeDefined();
         adoption = Object.freeze({

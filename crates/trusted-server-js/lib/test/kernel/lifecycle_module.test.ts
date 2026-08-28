@@ -182,23 +182,76 @@ describe('shared integration lifecycle module', () => {
         },
         identities: Object.freeze([]),
       });
+      const slices = selected ? ['first_display', 'datadome_initial'] : ['first_display'];
+      const compactCapture = {
+        captureVersion: 1,
+        releaseId: RELEASE_ID,
+        generation: 1,
+        data: [
+          'b'.repeat(64),
+          'c'.repeat(64),
+          slices,
+          [['failed', 'internal_error', null, null]],
+          [],
+          [],
+          [],
+          state ? [['datadome_initial', [['route_guard', 'datadome']]]] : [],
+          [[], 0, 0],
+          [1, null, 2, 3],
+          [2, 0, 1, 1],
+          [],
+          1,
+          1,
+        ],
+        mutationRevision: 0,
+        identityCount: 0,
+      };
+      const boot = {
+        abi: 1,
+        releaseId: RELEASE_ID,
+        manifest: {},
+        auctionProjection: {
+          version: 1,
+          auction: {
+            version: 1,
+            auctionId: 'initial',
+            results: [{ slot: 'slot-1', outcome: 'failed', reason: 'internal_error' }],
+          },
+          slots: [
+            {
+              slot: 'slot-1',
+              gamUnitPath: '/123/slot-1',
+              divId: 'slot-1',
+              formats: [[300, 250]],
+              targeting: {},
+            },
+          ],
+          bids: [],
+        },
+        integrations: {},
+        creative: {},
+        diagnostics: {},
+      };
 
       const result = await owner.install({
         ...callbacks([]),
         coordinateTakeover: (prepared) => {
-          const slices = selected ? ['first_display', 'datadome_initial'] : ['first_display'];
-          const handoff = prepared.validateHandoff(adoption.handoff, {
-            version: 1,
-            releaseId: RELEASE_ID,
-            generation: 1,
-            projectionDigest: 'b'.repeat(64),
-            integrationConfigDigest: 'c'.repeat(64),
-            slices,
-            slotCount: 1,
-            outcomeCount: 1,
-            capabilities: [],
-            objectKinds: [],
-          });
+          const handoff = prepared.validateHandoff(
+            compactCapture,
+            {
+              version: 1,
+              releaseId: RELEASE_ID,
+              generation: 1,
+              projectionDigest: 'b'.repeat(64),
+              integrationConfigDigest: 'c'.repeat(64),
+              slices,
+              slotCount: 1,
+              outcomeCount: 1,
+              capabilities: [],
+              objectKinds: [],
+            },
+            boot
+          );
           if (!handoff) throw new Error('should validate lifecycle handoff');
           prepared.activate(Object.freeze({ ...adoption, handoff }));
           prepared.commit();

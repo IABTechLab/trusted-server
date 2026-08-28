@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   createBrowserNavigationIdentityIssuer,
+  createFirstDisplayNavigationIdentityIssuerFromSource,
   createTestNavigationIdentityIssuer,
   mintTestBootstrapNonce,
   mintTestLifecycleTicket,
@@ -54,6 +55,26 @@ describe('navigation identity issuer', () => {
     expect(calls).toHaveBeenCalledOnce();
     expect(calls.mock.calls[0]?.[0]).toHaveLength(8);
     expect(created.value.snapshotOrdinalForTest()).toEqual([0, 2]);
+  });
+
+  it('uses the compact initial-display issuer for the same bounded wire identities', () => {
+    const { source, calls } = deterministicSource([0, 1, 2, 3, 4, 5, 6, 7]);
+    const created = createFirstDisplayNavigationIdentityIssuerFromSource(source);
+
+    expect(created).toMatchObject({ ok: true });
+    if (!created.ok) throw new Error('Expected an initial-display identity issuer');
+
+    expect(created.value.mintAttemptId()).toEqual({
+      ok: true,
+      value: 'a1_AAECAwQFBgcAAAAAAAAAAQ',
+    });
+    expect(created.value.mintAttemptId()).toEqual({
+      ok: true,
+      value: 'a1_AAECAwQFBgcAAAAAAAAAAg',
+    });
+    expect(created.value.snapshotPrefix()).toBe('AAECAwQFBgc');
+    expect(calls).toHaveBeenCalledOnce();
+    expect(calls.mock.calls[0]?.[0]).toHaveLength(8);
   });
 
   it('adopts the next first-display ordinal once before minting', () => {

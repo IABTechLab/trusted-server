@@ -24,7 +24,7 @@ export interface FirstDisplayPreparedTrustedBidV1 {
   }>;
 }
 
-export interface FirstDisplayPrebidProtocolV1 {
+export interface FirstDisplayPrebidPolicyV1 {
   readonly version: 1;
   readonly id: 'prebid';
   readonly bidderCode: 'trustedServer';
@@ -35,6 +35,12 @@ export interface FirstDisplayPrebidProtocolV1 {
   readonly normalizeEidSource: (candidate: unknown) => string | undefined;
   readonly snapshotTrustedBid: (candidate: unknown) => FirstDisplayPreparedTrustedBidV1 | undefined;
 }
+
+export type FirstDisplayPrebidProtocolV1 = readonly [
+  version: 1,
+  id: 'prebid',
+  policy: FirstDisplayPrebidPolicyV1,
+];
 
 interface PrebidInitialBindings {
   readonly observe: (name: 'protocol_version', value: number) => void;
@@ -225,10 +231,10 @@ function snapshotTrustedBid(candidate: unknown): FirstDisplayPreparedTrustedBidV
 export function installPrebidInitial(
   candidate: unknown,
   own: FirstDisplaySliceActivationContext['own']
-): Readonly<{ version: 1; id: 'prebid' }> {
+): readonly [version: 1, id: 'prebid'] {
   const value = bindings(candidate);
   if (!value || typeof own !== 'function') throw new TypeError('tsjs');
-  const protocol: FirstDisplayPrebidProtocolV1 = Object.freeze({
+  const policy: FirstDisplayPrebidPolicyV1 = Object.freeze({
     version: 1,
     id: 'prebid',
     bidderCode: 'trustedServer',
@@ -239,9 +245,10 @@ export function installPrebidInitial(
     normalizeEidSource,
     snapshotTrustedBid,
   });
+  const protocol: FirstDisplayPrebidProtocolV1 = Object.freeze([1, 'prebid', policy]);
   const release = value.register(protocol);
   if (typeof release !== 'function') throw new TypeError('tsjs');
   own(release);
   value.observe('protocol_version', 1);
-  return Object.freeze({ version: 1, id: 'prebid' });
+  return Object.freeze([1, 'prebid']);
 }

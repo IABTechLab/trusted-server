@@ -27,7 +27,7 @@ export interface FirstDisplayApsBootstrapPolicyV2 {
   readonly tagType: 'iframe' | 'script';
 }
 
-export interface FirstDisplayApsProtocolV1 {
+export interface FirstDisplayApsPolicyV1 {
   readonly version: 1;
   readonly id: 'aps';
   readonly publisherOrigin: string;
@@ -52,6 +52,12 @@ export interface FirstDisplayApsProtocolV1 {
     options: FirstDisplayRenderOwnerOptionsV1
   ) => FirstDisplayRenderStrategyV1;
 }
+
+export type FirstDisplayApsProtocolV1 = readonly [
+  version: 1,
+  id: 'aps',
+  policy: FirstDisplayApsPolicyV1,
+];
 
 interface ApsInitialBindings {
   readonly observe: (name: 'protocol_version', value: number) => void;
@@ -279,11 +285,12 @@ function bootstrapPolicy(
 export function installApsInitial(
   candidate: unknown,
   own: FirstDisplaySliceActivationContext['own']
-): Readonly<{ version: 1; id: 'aps' }> {
+): readonly [version: 1, id: 'aps'] {
   const value = bindings(candidate);
   if (!value || typeof own !== 'function') throw new TypeError('tsjs');
-  const rendererUrl = new URL('/integrations/aps/renderer/v2', value.publisherOrigin).href;
-  const protocol: FirstDisplayApsProtocolV1 = Object.freeze({
+  const publisherOrigin = value['publisherOrigin'];
+  const rendererUrl = new URL('/integrations/aps/renderer/v2', publisherOrigin).href;
+  const policy: FirstDisplayApsPolicyV1 = Object.freeze({
     version: 1,
     id: 'aps',
     publisherOrigin: value.publisherOrigin,
@@ -300,11 +307,12 @@ export function installApsInitial(
     parseDocumentMessage,
     parseWindowMessage,
     createRenderStrategy: (options: FirstDisplayRenderOwnerOptionsV1) =>
-      createFirstDisplayApsRenderStrategy(options, protocol),
+      createFirstDisplayApsRenderStrategy(options, policy),
   });
+  const protocol: FirstDisplayApsProtocolV1 = Object.freeze([1, 'aps', policy]);
   const release = value.register(protocol);
   if (typeof release !== 'function') throw new TypeError('tsjs');
   own(release);
   value.observe('protocol_version', 1);
-  return Object.freeze({ version: 1, id: 'aps' });
+  return Object.freeze([1, 'aps']);
 }

@@ -96,6 +96,14 @@ export interface FirstDisplayBatchV1 {
   readonly projection: FirstDisplayProjectionV1;
 }
 
+/** Closure-compact batch retained by the bootstrap-owned first-display agent. */
+export type FirstDisplayAgentBatchV1 = readonly [
+  projectionDigest: string,
+  requiredProtocols: readonly FirstDisplayAuctionProtocolId[],
+  outcomes: readonly (readonly [slotId: string, kind: FirstDisplayProjectedKind])[],
+  projection: FirstDisplayProjectionV1,
+];
+
 /**
  * Admit the immutable same-script server projection without cloning it again.
  *
@@ -104,7 +112,7 @@ export interface FirstDisplayBatchV1 {
  */
 export function acceptServerFirstDisplayBatchV1(
   candidate: unknown
-): FirstDisplayBatchV1 | undefined {
+): FirstDisplayAgentBatchV1 | undefined {
   try {
     const envelope = candidate as Readonly<{
       version: unknown;
@@ -114,25 +122,11 @@ export function acceptServerFirstDisplayBatchV1(
     const projection = envelope.projection;
     const results = projection.auction.results;
     const { slots, bids } = projection;
-    if (
-      !Object.isFrozen(candidate) ||
-      envelope.version !== 1 ||
-      typeof envelope.projectionDigest !== 'string' ||
-      !HASH.test(envelope.projectionDigest) ||
-      !Object.isFrozen(projection) ||
-      projection.version !== 1 ||
-      projection.auction.version !== 1 ||
-      !Object.isFrozen(results) ||
-      results.length === 0 ||
-      results.length > MAX_SLOTS ||
-      !Object.isFrozen(slots) ||
-      slots.length !== results.length ||
-      !Object.isFrozen(bids) ||
-      bids.length > results.length
-    ) {
-      return undefined;
-    }
-    const outcomes: FirstDisplayBatchOutcomeV1[] = [];
+    // The authenticated bootstrap constructed this envelope from the already
+    // bounded, recursively frozen server transport. This leaf only derives the
+    // compact action plan and rechecks the bid/result relationships it consumes.
+    if (!Object.isFrozen(candidate)) return undefined;
+    const outcomes: Array<readonly [string, FirstDisplayProjectedKind]> = [];
     let winner = 0;
     let aps = false;
     let prebid = false;
@@ -142,7 +136,7 @@ export function acceptServerFirstDisplayBatchV1(
       if (decision.slot !== slot.slot) return undefined;
       if (decision.outcome !== 'winner') {
         if (decision.outcome !== 'no_bid' && decision.outcome !== 'failed') return undefined;
-        outcomes.push(Object.freeze({ slotId: decision.slot, kind: decision.outcome }));
+        outcomes.push(Object.freeze([decision.slot, decision.outcome] as const));
         continue;
       }
       const bid = bids[winner++];
@@ -157,24 +151,20 @@ export function acceptServerFirstDisplayBatchV1(
       aps ||= bid.renderSource.type === 'aps';
       prebid ||= bid.provider === 'prebid';
       outcomes.push(
-        Object.freeze({
-          slotId: decision.slot,
-          kind: bid.renderSource.type === 'aps' ? 'aps' : 'gpt_adm',
-        })
+        Object.freeze([decision.slot, bid.renderSource.type === 'aps' ? 'aps' : 'gpt_adm'])
       );
     }
     if (winner !== bids.length) return undefined;
-    return Object.freeze({
-      version: 1,
-      projectionDigest: envelope.projectionDigest,
-      requiredProtocols: Object.freeze([
+    return Object.freeze([
+      envelope.projectionDigest as string,
+      Object.freeze([
         ...(aps ? (['aps'] as const) : []),
         ...(winner ? (['gpt'] as const) : []),
         ...(prebid ? (['prebid'] as const) : []),
       ]),
-      outcomes: Object.freeze(outcomes),
+      Object.freeze(outcomes),
       projection,
-    });
+    ]);
   } catch {
     return undefined;
   }

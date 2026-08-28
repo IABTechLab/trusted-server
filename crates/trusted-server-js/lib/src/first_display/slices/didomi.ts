@@ -1,7 +1,16 @@
 import { installDidomiInitial } from '../leaf/config_guard';
+import { registerCurrentFirstDisplayComponent } from '../registration_client';
 
-import { defineInitialSlice, registerInitialSlice } from './definition';
+import type { InitialSliceInstaller } from './definition';
 
-export const DIDOMI_INITIAL_SLICE = defineInitialSlice('didomi_initial', installDidomiInitial);
+export const installDidomiInitialSlice: InitialSliceInstaller = (candidate, own, config) =>
+  installDidomiInitial(
+    Object.freeze({
+      config,
+      observe: (candidate as Readonly<{ observe: unknown }>).observe,
+      target: window,
+    }),
+    own
+  );
 
-registerInitialSlice(DIDOMI_INITIAL_SLICE, 6);
+registerCurrentFirstDisplayComponent('didomi_initial', installDidomiInitialSlice);

@@ -2,13 +2,13 @@ import {
   type PersistentFirstDisplaySliceStateV1,
   validatePersistentFirstDisplaySliceAdoptionV1,
 } from '../shared/takeover';
+import { EMBEDDED_RUNTIME_CATALOG } from '../core/release';
 
 import type {
   IntegrationActivationContext,
   IntegrationPrepareContext,
   IntegrationRegistration,
 } from './integration_registry';
-import { RELEASE_CATALOG } from './release_catalog';
 
 const MAX_CONFIG_DEPTH = 16;
 const MAX_CONFIG_NODES = 512;
@@ -109,7 +109,7 @@ export function createLifecycleIntegrationRegistration(
   releaseId: string,
   options: LifecycleIntegrationRegistrationOptions = {}
 ): IntegrationRegistration {
-  const catalogEntry = RELEASE_CATALOG.find((entry) => entry.id === id);
+  const catalogEntry = EMBEDDED_RUNTIME_CATALOG.find((entry) => entry.id === id);
   if (!catalogEntry) throw new TypeError(`Unknown release catalog module: ${id}`);
   const prepare = (context: IntegrationPrepareContext) => {
     const { config, interfaces } = context;

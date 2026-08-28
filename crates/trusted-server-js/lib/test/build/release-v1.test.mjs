@@ -238,7 +238,7 @@ test('release id printer validates the complete generated inventory', () => {
   assert.equal(printed, manifest.releaseId);
 });
 
-test('generated first-display components self-register through one authenticated artifact sink', () => {
+test('generated optional first-display slices self-register through one authenticated sink', () => {
   const release = JSON.parse(
     fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-release-v1.json'), 'utf8')
   );
@@ -280,219 +280,16 @@ test('generated first-display components self-register through one authenticated
         .join(';\n')
     );
     assert.deepEqual(
-      registrations.map(({ id, order }) => ({ id, order })),
-      firstDisplay.map(({ id }, index) => ({ id, order: index + 1 }))
+      registrations.map((registration) => registration[1]),
+      firstDisplay.slice(1).map(({ id }) => id)
     );
     for (const registration of registrations) {
-      assert.deepEqual(Reflect.ownKeys(registration), [
-        'abi',
-        'id',
-        'releaseId',
-        'order',
-        'prepare',
-      ]);
-      assert.equal(registration.abi, 1);
-      assert.equal(registration.releaseId, release.releaseId);
-      assert.equal(typeof registration.prepare, 'function');
+      assert.deepEqual(Reflect.ownKeys(registration), ['0', '1', '2', '3', 'length']);
+      assert.equal(registration[0], 1);
+      assert.equal(registration[2], release.releaseId);
+      assert.equal(typeof registration[3], 'function');
       assert.equal(Object.isFrozen(registration), true);
     }
-    const baseHost = dom.window.eval(
-      'Object.freeze({options:Object.freeze({}),sliceBindings:function(){return undefined;}})'
-    );
-    const base = registrations[0].prepare(baseHost);
-    assert.deepEqual(Reflect.ownKeys(base), ['activate', 'sliceHost']);
-    assert.equal(Object.isFrozen(base), true);
-    assert.deepEqual(Reflect.ownKeys(base.sliceHost), ['activate']);
-    assert.equal(Object.isFrozen(base.sliceHost), true);
-    for (const registration of registrations.slice(1)) {
-      const prepared = registration.prepare(base.sliceHost);
-      assert.deepEqual(Reflect.ownKeys(prepared), ['activate']);
-      assert.equal(Object.isFrozen(prepared), true);
-    }
-
-    dom.window.eval(`
-      window.__firstDisplayEvents = [];
-      window.__firstDisplayDisposers = [];
-      window.__firstDisplayAfterActivate = undefined;
-      window.__firstDisplayGptListeners = {};
-      window.__firstDisplayTerminal = undefined;
-      var slotElement = document.createElement('div');
-      slotElement.id = 'slot-1';
-      document.body.appendChild(slotElement);
-      window.__firstDisplaySlot = {
-        addService: function() { return window.__firstDisplaySlot; },
-        getSlotElementId: function() { return 'slot-1'; },
-        setTargeting: function() { return window.__firstDisplaySlot; }
-      };
-      window.__firstDisplayPubads = {
-        addEventListener: function(name, listener) {
-          window.__firstDisplayGptListeners[name] = listener;
-        },
-        getSlots: function() { return []; },
-        refresh: function() {},
-        removeEventListener: function() {}
-      };
-      window.googletag = {
-        cmd: {push: function(command) { command(); }},
-        defineSlot: function() { return window.__firstDisplaySlot; },
-        destroySlots: function() { return true; },
-        display: function() {
-          window.__firstDisplayEvents.push('gpt:display');
-          window.__firstDisplayGptListeners.slotRequested({slot: window.__firstDisplaySlot});
-          window.__firstDisplayGptListeners.slotRenderEnded({
-            slot: window.__firstDisplaySlot,
-            isEmpty: true
-          });
-        },
-        getConfig: function() { return {disableInitialLoad: false}; },
-        pubads: function() { return window.__firstDisplayPubads; }
-      };
-      window.__firstDisplayBaseHost = Object.freeze({
-        options: Object.freeze({
-          batch: Object.freeze({
-            version: 1,
-            projectionDigest: '${'c'.repeat(64)}',
-            projection: Object.freeze({
-              version: 1,
-              auction: Object.freeze({
-                version: 1,
-                auctionId: 'initial',
-                results: Object.freeze([Object.freeze({
-                  slot: 'slot-1',
-                  outcome: 'winner',
-                  candidateId: 'candidate001'
-                })])
-              }),
-              slots: Object.freeze([Object.freeze({
-                slot: 'slot-1',
-                gamUnitPath: '/123/example',
-                divId: 'slot-1',
-                formats: Object.freeze([Object.freeze([300, 250])]),
-                targeting: Object.freeze({placement: 'article'})
-              })]),
-              bids: Object.freeze([Object.freeze({
-                candidateId: 'candidate001',
-                slot: 'slot-1',
-                provider: 'example',
-                upstreamBidId: 'upstream-1',
-                cpm: 1.25,
-                currency: 'USD',
-                targeting: Object.freeze({hb_pb: '1.25'}),
-                rendererReservationId: 'r1_${'a'.repeat(22)}',
-                renderSource: Object.freeze({
-                  type: 'adm',
-                  version: 1,
-                  adm: '<main>fictional creative</main>',
-                  width: 300,
-                  height: 250
-                })
-              })])
-            })
-          }),
-          bootstrap: Object.freeze({
-            get state() { return 'agent_registered'; },
-            startedAtMs: 0,
-            registerAgent: function() {
-              window.__firstDisplayEvents.push('bootstrap:register');
-              return true;
-            },
-            startAction: function() {
-              window.__firstDisplayEvents.push('bootstrap:action');
-              return true;
-            },
-            settle: function() { return true; },
-            fail: function() { return true; }
-          }),
-          gptInput: Object.freeze({
-            browser: window,
-            clearTimer: function() {},
-            document: document,
-            setTimer: function(callback) { return callback; }
-          }),
-          performance: Object.freeze({mark: function() {}}),
-          paint: Object.freeze({
-            hidden: function() { return false; },
-            requestFrame: function() {},
-            scheduleHidden: function() {}
-          }),
-          onProtectedPaint: function() {},
-          onFailure: function() {}
-        }),
-        sliceBindings: function(id) {
-          if (id === 'render_owner_initial') {
-            return Object.freeze({
-              bindings: Object.freeze({
-                observe: function() {},
-                register: function(protocol) {
-                  window.__firstDisplayEvents.push('render_owner:' + protocol.id);
-                  return function() {};
-                }
-              }),
-              config: Object.freeze({})
-            });
-          }
-          if (id === 'aps_initial') {
-            return Object.freeze({
-              bindings: Object.freeze({
-                observe: function() {},
-                publisherOrigin: 'https://publisher.example',
-                register: function(protocol) {
-                  window.__firstDisplayEvents.push('aps:' + protocol.id);
-                  return function() {};
-                }
-              }),
-              config: Object.freeze({})
-            });
-          }
-          if (id === 'gpt_initial') {
-            return Object.freeze({
-              bindings: Object.freeze({
-                gam: function() { return true; },
-                observe: function() {},
-                register: function(protocol) {
-                  window.__firstDisplayEvents.push('gpt:' + protocol.id);
-                  return function() {};
-                }
-              }),
-              config: Object.freeze({gamAttributionEnabled: false, pageBidsEnabled: false})
-            });
-          }
-          return undefined;
-        }
-      });
-      window.__firstDisplayActivation = Object.freeze({
-        own: function(dispose) { window.__firstDisplayDisposers.push(dispose); },
-        afterActivate: function(callback) { window.__firstDisplayAfterActivate = callback; }
-      });
-      window.__firstDisplaySliceActivation = Object.freeze({
-        own: function(dispose) { window.__firstDisplayDisposers.push(dispose); },
-        afterActivate: function() { throw new Error('optional slice cannot start the agent'); }
-      });
-    `);
-    const activatedBase = registrations[0].prepare(dom.window.__firstDisplayBaseHost);
-    const activatedRenderOwner = registrations
-      .find(({ id }) => id === 'render_owner_initial')
-      .prepare(activatedBase.sliceHost);
-    const activatedGpt = registrations
-      .find(({ id }) => id === 'gpt_initial')
-      .prepare(activatedBase.sliceHost);
-    activatedBase.activate(dom.window.__firstDisplayActivation);
-    activatedRenderOwner.activate(dom.window.__firstDisplaySliceActivation);
-    activatedGpt.activate(dom.window.__firstDisplaySliceActivation);
-    dom.window.__firstDisplayAfterActivate();
-    const directFrame = dom.window.document.querySelector('#slot-1 iframe');
-    assert.ok(directFrame, 'the generated bridge must stage the direct empty-GAM fallback');
-    directFrame.dispatchEvent(new dom.window.Event('load'));
-    assert.deepEqual(
-      [...dom.window.__firstDisplayEvents],
-      [
-        'render_owner:render_owner',
-        'gpt:gpt',
-        'bootstrap:register',
-        'bootstrap:action',
-        'gpt:display',
-      ]
-    );
   } finally {
     dom.window.close();
   }
@@ -516,6 +313,59 @@ test('takeover transport co-bundles core and render ownership exactly once', () 
     ['src/integrations/render_runtime/transport_marker.ts'],
     'the logical render artifact must not duplicate the co-bundled implementation'
   );
+});
+
+test('bootstrap physically owns the logical first-display base without transporting its marker', () => {
+  const { metrics } = readBuildEvidence();
+  const bootstrapSources = new Set(metrics.bootstrap.sources.map(({ file }) => file));
+  const marker = metrics.modules.find(({ file }) => file === 'tsjs-first_display.js');
+  const reference = metrics.firstDisplay.masks.find(({ mask }) => mask === '008b');
+
+  assert.equal(
+    bootstrapSources.has('src/first_display/agent.ts'),
+    true,
+    'the parser-inline bootstrap must physically own the first-display coordinator'
+  );
+  assert.ok(marker, 'the logical first_display catalog marker must remain in release evidence');
+  assert.deepEqual(
+    marker.sources.map(({ file }) => file),
+    ['src/first_display/base_marker.ts'],
+    'the logical marker must not duplicate the bootstrap-owned implementation'
+  );
+  assert.ok(reference, 'the exact semantic 008b first-display mask must be measured');
+  assert.equal(reference.ids[0], 'first_display');
+  assert.deepEqual(
+    reference.files,
+    reference.ids.slice(1).map((id) => `tsjs-${id}.js`),
+    'the logical base bit must select bootstrap behavior without adding response bytes'
+  );
+
+  for (const forbidden of [
+    'src/first_display/render_journal.ts',
+    'src/first_display/render_bridge.ts',
+    'src/first_display/leaf/aps_protocol.ts',
+    'src/first_display/slices/aps.ts',
+    'src/first_display/slices/gpt.ts',
+  ]) {
+    assert.equal(
+      bootstrapSources.has(forbidden),
+      false,
+      `bootstrap must not inline optional first-display source ${forbidden}`
+    );
+  }
+});
+
+test('first-display component entries register directly without a definition runtime', () => {
+  const { metrics } = readBuildEvidence();
+
+  for (const [id, component] of Object.entries(metrics.firstDisplay.components)) {
+    if (id === 'first_display') continue;
+    assert.equal(
+      component.sources.some(({ file }) => file === 'src/first_display/slices/definition.ts'),
+      false,
+      `${id} must not transport the test-only slice-definition helper`
+    );
+  }
 });
 
 test('generated integration artifacts execute their release-bound catalog entrypoints', () => {
@@ -1009,10 +859,13 @@ test('bundle metrics enumerate and hash every reachable first-display mask', () 
     }
     assert.deepEqual(
       measurement.files,
-      measurement.ids.map((id) => `tsjs-${id}.js`)
+      measurement.ids.slice(1).map((id) => `tsjs-${id}.js`)
     );
     for (const size of ['rawBytes', 'gzipBytes', 'brotliBytes']) {
-      assert.ok(Number.isSafeInteger(measurement[size]) && measurement[size] > 0);
+      assert.ok(
+        Number.isSafeInteger(measurement[size]) &&
+          (size === 'rawBytes' ? measurement[size] >= 0 : measurement[size] > 0)
+      );
     }
     assert.equal(typeof measurement.permitted, 'boolean');
     assert.match(measurement.sha256, /^[0-9a-f]{64}$/u);

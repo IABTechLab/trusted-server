@@ -15,6 +15,10 @@ export type { Runtime, RuntimeOptions, RuntimeState } from '../kernel/runtime';
 
 import type { Runtime, RuntimeOptions } from '../kernel/runtime';
 import { validateRuntimeManifestV1 } from '../kernel/integration_registry';
+import {
+  coordinatePreparedFirstDisplayTakeoverV1,
+  finalizeFirstDisplayAgentCaptureV1,
+} from '../shared/first_display_handoff';
 import { consumeFirstDisplayTakeoverTransport } from '../shared/takeover';
 
 import { ownDataObject } from './contracts/auction_projection';
@@ -181,6 +185,7 @@ export function startProductionRuntime(createComposition: BrowserRuntimeComposit
   const { boot } = claimed;
   const takeover = consumeFirstDisplayTakeoverTransport(target);
   if (takeover.status === 'invalid') return;
+  let takeoverClaim = takeover.status === 'accepted' ? takeover.claim : undefined;
   const claimDirect = takeover.status === 'absent' ? directRuntimeClaim(target) : undefined;
   if (claimDirect === null) return;
   const composition = createComposition(
@@ -191,7 +196,36 @@ export function startProductionRuntime(createComposition: BrowserRuntimeComposit
       knownIntegrationIds: EMBEDDED_INTEGRATION_IDS,
       catalog: EMBEDDED_RUNTIME_CATALOG,
       boot,
-      ...(takeover.status === 'accepted' ? { coordinateTakeover: takeover.coordinate } : {}),
+      ...(takeoverClaim
+        ? {
+            coordinateTakeover: (prepared) => {
+              const claim = takeoverClaim;
+              takeoverClaim = undefined;
+              const leased = claim?.(finalizeFirstDisplayAgentCaptureV1);
+              if (!leased) throw new TypeError('tsjs');
+              if (
+                !coordinatePreparedFirstDisplayTakeoverV1({
+                  prepared,
+                  finalized: leased[0],
+                  outline: leased[1],
+                  boot,
+                  isCurrentGeneration: leased[2],
+                  authenticateRuntimeScript: leased[3],
+                  currentMutationRevision: leased[4],
+                  quiesceAgent: () => undefined,
+                  detachCommittedArtifacts: () => {
+                    if (!leased[5]()) throw new TypeError('tsjs');
+                  },
+                  disposeAgent: leased[6],
+                  onFailure: leased[7],
+                })
+              ) {
+                throw new TypeError('tsjs');
+              }
+              leased[8]();
+            },
+          }
+        : {}),
       autoInstall: true,
       onInstallComplete: (result) => {
         try {

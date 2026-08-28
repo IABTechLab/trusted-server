@@ -1074,7 +1074,6 @@ describe('Universal Creative bridge dispatcher', () => {
           version: 1,
           lifecycleTicket: LIFECYCLE_TICKET,
           outcome: 'failed',
-          reason: 'adm_document_no_load',
         },
         ports: [],
       });

@@ -1,7 +1,18 @@
 import { installOsanoInitial } from '../leaf/consent_snapshot';
+import { registerCurrentFirstDisplayComponent } from '../registration_client';
 
-import { defineInitialSlice, registerInitialSlice } from './definition';
+import type { InitialSliceInstaller } from './definition';
 
-export const OSANO_INITIAL_SLICE = defineInitialSlice('osano_initial', installOsanoInitial);
+export const installOsanoInitialSlice: InitialSliceInstaller = (candidate, own) =>
+  installOsanoInitial(
+    Object.freeze({
+      clearTimer: (handle: unknown) => window.clearTimeout(handle as number),
+      document,
+      observe: (candidate as Readonly<{ observe: unknown }>).observe,
+      setTimer: (callback: () => void, delayMs: number) => window.setTimeout(callback, delayMs),
+      target: window,
+    }),
+    own
+  );
 
-registerInitialSlice(OSANO_INITIAL_SLICE, 10);
+registerCurrentFirstDisplayComponent('osano_initial', installOsanoInitialSlice);

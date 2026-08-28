@@ -83,10 +83,11 @@ describe('first-display projection snapshot', () => {
   it('accepts only the already-frozen server envelope used by the production agent', () => {
     const candidate = freezeTree(winnerFixture({ provider: 'prebid' }));
 
-    expect(acceptServerFirstDisplayBatchV1(candidate)).toMatchObject({
-      requiredProtocols: ['gpt', 'prebid'],
-      outcomes: [{ slotId: 'slot-1', kind: 'gpt_adm' }],
-    });
+    expect(acceptServerFirstDisplayBatchV1(candidate)?.slice(0, 3)).toEqual([
+      'b'.repeat(64),
+      ['gpt', 'prebid'],
+      [['slot-1', 'gpt_adm']],
+    ]);
     expect(acceptServerFirstDisplayBatchV1(winnerFixture())).toBeUndefined();
     expect(
       acceptServerFirstDisplayBatchV1(freezeTree(winnerFixture({ source: 'pbs_cache' })))
