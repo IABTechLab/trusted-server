@@ -1364,6 +1364,33 @@ impl IntegrationRegistry {
         self.inner.standalone_js_ids.clone()
     }
 
+    /// Resolves a module id given as request text (the stem of a
+    /// `tsjs-<id>.min.js` filename) to this registry's own `&'static str`
+    /// id, covering bundle, deferred and standalone modules.
+    ///
+    /// `trusted_server_js::all_module_ids` knows only compile-time modules,
+    /// so a carried module could never be looked up through it. Returns
+    /// `None` for an id this registry serves nowhere, which includes a
+    /// disabled or unknown integration.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::integrations::IntegrationRegistry;
+    ///
+    /// let registry = IntegrationRegistry::default();
+    ///
+    /// assert_eq!(registry.js_module_id("creative"), Some("creative"));
+    /// assert_eq!(registry.js_module_id("not-a-module"), None);
+    /// ```
+    #[must_use]
+    pub fn js_module_id(&self, stem: &str) -> Option<&'static str> {
+        self.js_module_ids()
+            .into_iter()
+            .chain(self.js_standalone_ids())
+            .find(|id| *id == stem)
+    }
+
     /// Parts of the unified bundle: core, then every immediate module.
     #[must_use]
     pub fn js_parts_immediate(&self) -> Vec<crate::tsjs_bundle::JsModulePart> {

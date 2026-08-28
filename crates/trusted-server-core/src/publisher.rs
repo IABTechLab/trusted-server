@@ -518,8 +518,11 @@ fn encode_complete_body(
 /// Serves two types of bundles:
 /// - **Unified bundle** (`tsjs-unified.min.js`): core + immediate (non-deferred)
 ///   integration modules.
-/// - **Deferred module** (`tsjs-{id}.min.js`): a single self-contained IIFE for
-///   modules loaded with `defer` (e.g., prebid).
+/// - **Single module** (`tsjs-{id}.min.js`): a single self-contained IIFE for
+///   modules loaded with `defer` (e.g., prebid) or registered as standalone.
+///
+/// Every module comes from the registry's parts, so a module a registration
+/// carries is served and versioned like a compile-time one.
 ///
 /// # Errors
 ///
@@ -540,28 +543,28 @@ pub fn handle_tsjs_dynamic(
 
     if UNIFIED_FILENAMES.contains(&filename) {
         // Serve core + immediate modules (excludes deferred like prebid).
-        let module_ids = integration_registry.js_module_ids_immediate();
-        let body = trusted_server_js::concatenate_modules(&module_ids);
-        let hash = trusted_server_js::concatenated_hash(&module_ids);
+        let parts = integration_registry.js_parts_immediate();
+        let body = crate::tsjs_bundle::compose(&parts);
+        let hash = crate::tsjs_bundle::compose_hash(&parts);
         return Ok(serve_tsjs_static(req, &body, &hash, edge_header));
     }
 
-    if let Some(module_id) = parse_single_module_filename(filename) {
-        // Deferred modules and the conditionally injected diagnostics module
-        // are served as content-addressed standalone assets. Delivery remains
-        // cookie-independent so the static response can stay publicly cached.
-        let deferred_ids = integration_registry.js_module_ids_deferred();
-        let diagnostics_standalone = module_id
-            == crate::integrations::gpt_diagnostics::GPT_DIAGNOSTICS_INTEGRATION_ID
-            && integration_registry.integration_enabled(module_id);
-        if !deferred_ids.contains(&module_id) && !diagnostics_standalone {
+    if let Some(module_id) = parse_single_module_filename(filename, integration_registry) {
+        // Deferred modules and standalone modules are served as
+        // content-addressed single files. Delivery remains cookie-independent
+        // so the static response can stay publicly cached.
+        let deferred = integration_registry.js_module_ids_deferred();
+        let standalone = integration_registry.js_standalone_ids();
+        if !deferred.contains(&module_id) && !standalone.contains(&module_id) {
             return Ok(not_found_response());
         }
-        if let (Some(content), Some(hash)) = (
-            trusted_server_js::module_bundle(module_id),
-            trusted_server_js::single_module_hash(module_id),
-        ) {
-            return Ok(serve_tsjs_static(req, content, hash, edge_header));
+        if let Some(part) = integration_registry.js_part(module_id) {
+            return Ok(serve_tsjs_static(
+                req,
+                part.source,
+                part.sha256,
+                edge_header,
+            ));
         }
     }
 
@@ -597,20 +600,22 @@ fn request_version_hash(req: &Request<EdgeBody>) -> Option<&str> {
     })
 }
 
-/// Extract a module ID from a deferred-module filename like `tsjs-sourcepoint.min.js`.
+/// Extract a module ID from a single-module filename like `tsjs-sourcepoint.min.js`.
 ///
-/// Returns `Some(&'static str)` if the filename matches a known JS module ID,
-/// `None` otherwise. The caller must additionally verify that the module is
-/// both deferred and enabled via the [`IntegrationRegistry`].
+/// Returns `Some(&'static str)` if the filename names a module the registry
+/// serves somewhere (bundle, deferred or standalone), resolved through the
+/// registry so a carried module is found. `None` otherwise. The caller must
+/// additionally verify that the module is deferred or standalone.
 #[must_use]
-fn parse_single_module_filename(filename: &str) -> Option<&'static str> {
+fn parse_single_module_filename(
+    filename: &str,
+    registry: &IntegrationRegistry,
+) -> Option<&'static str> {
     let stem = filename
         .strip_prefix("tsjs-")
         .and_then(|s| s.strip_suffix(".min.js").or_else(|| s.strip_suffix(".js")))?;
 
-    trusted_server_js::all_module_ids()
-        .into_iter()
-        .find(|&id| id == stem)
+    registry.js_module_id(stem)
 }
 
 /// Parameters for processing response streaming.
@@ -6797,7 +6802,12 @@ mod tests {
     use crate::auction::orchestrator::OrchestrationResult;
     use crate::auction::types::AuctionResponse;
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
-    use crate::integrations::IntegrationRegistry;
+    use crate::integrations::registry_test_support::{
+        PROBE_JS, PROBE_JS_SHA256, carried_probe_registration, validate_nothing,
+    };
+    use crate::integrations::{
+        CarriedJsModule, IntegrationBuilder, IntegrationRegistration, IntegrationRegistry,
+    };
     use crate::permissions::{Permission, PermissionSet};
     use crate::platform::test_support::{
         NoopSecretStore, StubHttpClient, build_services_with_http_client,
@@ -15601,37 +15611,64 @@ mod tests {
 
     #[test]
     fn parse_single_module_filename_extracts_known_id() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+
         assert_eq!(
-            parse_single_module_filename("tsjs-sourcepoint.min.js"),
-            Some("sourcepoint"),
-            "should extract sourcepoint from minified filename"
+            parse_single_module_filename("tsjs-prebid.min.js", &registry),
+            Some("prebid"),
+            "should extract prebid from minified filename"
         );
         assert_eq!(
-            parse_single_module_filename("tsjs-sourcepoint.js"),
-            Some("sourcepoint"),
-            "should extract sourcepoint from unminified filename"
+            parse_single_module_filename("tsjs-prebid.js", &registry),
+            Some("prebid"),
+            "should extract prebid from unminified filename"
+        );
+    }
+
+    #[test]
+    fn parse_single_module_filename_resolves_a_carried_module_id() {
+        let settings = create_test_settings();
+        let extra = [IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            carried_probe_registration,
+            validate_nothing,
+        )];
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build a registry with a carried module");
+
+        assert_eq!(
+            parse_single_module_filename("tsjs-probe.min.js", &registry),
+            Some("probe"),
+            "should resolve a module id trusted-server-js has never heard of"
         );
     }
 
     #[test]
     fn parse_single_module_filename_rejects_unknown_ids() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+
         assert_eq!(
-            parse_single_module_filename("tsjs-evil.min.js"),
+            parse_single_module_filename("tsjs-evil.min.js", &registry),
             None,
             "should reject unknown module names"
         );
         assert_eq!(
-            parse_single_module_filename("tsjs-core.min.js"),
-            Some("core"),
-            "should accept any known module ID (deferred check happens in caller)"
+            parse_single_module_filename("tsjs-core.min.js", &registry),
+            None,
+            "should not resolve core, which is only ever served inside the bundle"
         );
         assert_eq!(
-            parse_single_module_filename("prebid.min.js"),
+            parse_single_module_filename("prebid.min.js", &registry),
             None,
             "should reject without tsjs- prefix"
         );
         assert_eq!(
-            parse_single_module_filename("tsjs-sourcepoint.txt"),
+            parse_single_module_filename("tsjs-prebid.txt", &registry),
             None,
             "should reject non-js extension"
         );
@@ -15769,6 +15806,163 @@ mod tests {
         assert!(
             response.headers().get("surrogate-control").is_none(),
             "Cloudflare requests should not emit Fastly's edge cache header"
+        );
+    }
+
+    fn body_text(response: http::Response<EdgeBody>) -> String {
+        let bytes = response
+            .into_body()
+            .into_bytes()
+            .expect("should read the tsjs response body")
+            .to_vec();
+        String::from_utf8(bytes).expect("should serve UTF-8 JavaScript")
+    }
+
+    fn cache_control_text(response: &http::Response<EdgeBody>) -> String {
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn carried_deferred_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("probe")
+                .with_js_module(CarriedJsModule {
+                    source: PROBE_JS,
+                    sha256: PROBE_JS_SHA256,
+                })
+                .with_deferred_js()
+                .build(),
+        ))
+    }
+
+    #[test]
+    fn tsjs_dynamic_serves_a_carried_module_in_the_unified_bundle_under_the_composed_hash() {
+        let settings = create_test_settings();
+        let extra = [IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            carried_probe_registration,
+            validate_nothing,
+        )];
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build a registry with a carried module");
+        let parts = registry.js_parts_immediate();
+        let expected_hash = crate::tsjs_bundle::compose_hash(&parts);
+        let request = build_request(
+            Method::GET,
+            &format!("https://publisher.example/static/tsjs=tsjs-unified.min.js?v={expected_hash}"),
+        );
+
+        let response = handle_tsjs_dynamic(&request, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should handle tsjs request");
+
+        assert_eq!(response.status(), StatusCode::OK, "should serve the bundle");
+        assert!(
+            cache_control_text(&response).contains("immutable"),
+            "should treat the composed hash as the matching version"
+        );
+        let body = body_text(response);
+        let core = trusted_server_js::module_bundle("core").expect("should have compiled core in");
+        assert!(
+            body.starts_with(core),
+            "should put the compile-time core first in the bundle"
+        );
+        assert!(
+            body.contains("window.__probe=1"),
+            "should serve the carried module inside the unified bundle"
+        );
+    }
+
+    #[test]
+    fn tsjs_dynamic_serves_a_carried_deferred_module_standalone() {
+        let settings = create_test_settings();
+        let extra = [IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            carried_deferred_probe_registration,
+            validate_nothing,
+        )];
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build a registry with a carried deferred module");
+        let request = build_request(
+            Method::GET,
+            &format!("https://publisher.example/static/tsjs=tsjs-probe.min.js?v={PROBE_JS_SHA256}"),
+        );
+
+        let response = handle_tsjs_dynamic(&request, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should handle tsjs request");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should serve a carried deferred module as its own file"
+        );
+        assert!(
+            cache_control_text(&response).contains("immutable"),
+            "should treat the carried module's own hash as the matching version"
+        );
+        assert_eq!(
+            body_text(response),
+            PROBE_JS,
+            "should serve the carried source verbatim"
+        );
+    }
+
+    #[test]
+    fn tsjs_dynamic_serves_a_standalone_module_by_registration_flag_not_by_name() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+            .expect("should insert gpt_diagnostics config");
+        settings
+            .integrations
+            .insert_config(
+                "lockr",
+                &serde_json::json!({ "enabled": true, "app_id": "test-app-id" }),
+            )
+            .expect("should insert lockr config");
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        assert!(
+            registry.js_module_ids_immediate().contains(&"lockr"),
+            "fixture should put lockr in the unified bundle"
+        );
+
+        let standalone = handle_tsjs_dynamic(
+            &build_request(
+                Method::GET,
+                "https://publisher.example/static/tsjs=tsjs-gpt_diagnostics.min.js",
+            ),
+            &registry,
+            EdgeCacheHeader::SMaxageFallback,
+        )
+        .expect("should handle tsjs request");
+        assert_eq!(
+            standalone.status(),
+            StatusCode::OK,
+            "should serve a module its registration marks standalone"
+        );
+
+        let bundled_only = handle_tsjs_dynamic(
+            &build_request(
+                Method::GET,
+                "https://publisher.example/static/tsjs=tsjs-lockr.min.js",
+            ),
+            &registry,
+            EdgeCacheHeader::SMaxageFallback,
+        )
+        .expect("should handle tsjs request");
+        assert_eq!(
+            bundled_only.status(),
+            StatusCode::NOT_FOUND,
+            "should not serve a bundle-only module as a single file"
         );
     }
 

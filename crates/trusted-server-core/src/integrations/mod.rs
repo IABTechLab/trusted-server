@@ -25,6 +25,8 @@ pub mod osano;
 pub mod permutive;
 pub mod prebid;
 mod registry;
+#[cfg(test)]
+pub(crate) use registry::test_support as registry_test_support;
 pub mod sourcepoint;
 pub mod testlight;
 

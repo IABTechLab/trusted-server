@@ -14,7 +14,9 @@ use lol_html::{
 };
 
 use crate::integrations::datadome::{DATADOME_INTEGRATION_ID, DataDomeClientTagSuppressed};
-use crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision;
+use crate::integrations::gpt_diagnostics::{
+    GPT_DIAGNOSTICS_INTEGRATION_ID, GptDiagnosticsRequestDecision,
+};
 use crate::integrations::{
     AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationDocumentState,
     IntegrationHtmlContext, IntegrationHtmlPostProcessor, IntegrationRegistry,
@@ -458,24 +460,27 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         snippet.push_str(&bootstrap);
                     }
                     // Main bundle: core + non-deferred integrations (synchronous).
-                    let immediate_ids = integrations.js_module_ids_immediate();
+                    let immediate_parts = integrations.js_parts_immediate();
                     let script_attributes = integrations.tsjs_script_tag_attributes();
                     snippet.push_str(&tsjs::tsjs_script_tag_with_attributes(
-                        &immediate_ids,
+                        &immediate_parts,
                         &script_attributes,
                     ));
                     // Active diagnostics loads synchronously after core so its
                     // GPT listeners precede publisher scripts in the origin head.
+                    // The decision says whether to inject; the registry's part
+                    // says what to inject. Nothing is injected without a part.
                     if let Some(module_tag) = gpt_diagnostics
                         .as_ref()
-                        .and_then(GptDiagnosticsRequestDecision::module_script_tag)
+                        .zip(integrations.js_part(GPT_DIAGNOSTICS_INTEGRATION_ID))
+                        .and_then(|(decision, part)| decision.module_script_tag(&part))
                     {
                         snippet.push_str(&module_tag);
                     }
                     // Deferred bundles: large modules like prebid loaded after
                     // HTML parsing completes. Empty when none are enabled.
-                    let deferred_ids = integrations.js_module_ids_deferred();
-                    snippet.push_str(&tsjs::tsjs_deferred_script_tags(&deferred_ids));
+                    let deferred_parts = integrations.js_parts_deferred();
+                    snippet.push_str(&tsjs::tsjs_deferred_script_tags(&deferred_parts));
                     el.prepend(&snippet, ContentType::Html);
                     injected_tsjs.set(true);
                 }

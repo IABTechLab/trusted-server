@@ -220,7 +220,9 @@ async fn tsjs_route_prefix_is_handled_not_5xx() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tsjs_route_matching_hash_uses_s_maxage_fallback() {
     let mut svc = make_service();
-    let src = trusted_server_core::tsjs::tsjs_script_src(&["creative"]);
+    let src = trusted_server_core::tsjs::tsjs_script_src(
+        &trusted_server_core::tsjs_bundle::compile_time_parts(&["creative"]),
+    );
     let req = Request::builder()
         .method("GET")
         .uri(src)
