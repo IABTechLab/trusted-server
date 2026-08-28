@@ -1,4 +1,11 @@
-import type { GptDiagnosticsApi, GptDiagnosticsExportV1 } from '../../core/types';
+import type {
+  GptDiagnosticsApi,
+  GptDiagnosticsCreativeFailure,
+  GptDiagnosticsExportV1,
+  GptDiagnosticsRecorder,
+  GptDiagnosticsSlotHandle,
+  GptDiagnosticsTrustedServerOpportunity,
+} from '../../core/types';
 import { DiagnosticsSubscriberLimitError } from '../../core/trace';
 
 import type { GptDiagnosticsBindingManager } from './binding';
@@ -7,6 +14,20 @@ import type { GptDiagnosticsStoreSnapshot } from './store';
 interface ApiStore {
   snapshot(): GptDiagnosticsStoreSnapshot;
   subscribeCommits(listener: () => void): () => void;
+  recordTrustedServerOpportunity(
+    slot: GptDiagnosticsSlotHandle,
+    auctionSlotId: string,
+    opportunity: GptDiagnosticsTrustedServerOpportunity,
+    trustedServerAuctionId?: string,
+    requestedSlotSizes?: ReadonlyArray<readonly [number, number]>
+  ): void;
+  recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
+  recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;
+  recordTrustedServerCreativeResponse(attemptId: number): void;
+  recordTrustedServerCreativeFailure(
+    attemptId: number,
+    reason: GptDiagnosticsCreativeFailure
+  ): void;
 }
 
 interface ApiBindingManager {
@@ -42,45 +63,6 @@ interface PendingNotification {
 function scheduleTask(callback: () => void): () => void {
   const handle = globalThis.setTimeout(callback, 0);
   return () => globalThis.clearTimeout(handle);
-}
-
-function cloneExportSnapshot(snapshot: GptDiagnosticsExportV1): GptDiagnosticsExportV1 {
-  return {
-    version: snapshot.version,
-    capturedAt: snapshot.capturedAt,
-    page: { ...snapshot.page },
-    slots: snapshot.slots.map((slot) => ({
-      ...slot,
-      binding: { ...slot.binding },
-      requests: slot.requests.map((cycle) => ({
-        ...cycle,
-        durations: { ...cycle.durations },
-        requestedSlotSizes: cycle.requestedSlotSizes?.map((size) => [...size]),
-        size: cycle.size ? [...cycle.size] : undefined,
-        observedSlotSize: cycle.observedSlotSize ? [...cycle.observedSlotSize] : undefined,
-        adManager: cycle.adManager
-          ? {
-              ...cycle.adManager,
-              yieldGroupIds: cycle.adManager.yieldGroupIds
-                ? [...cycle.adManager.yieldGroupIds]
-                : undefined,
-              companyIds: cycle.adManager.companyIds ? [...cycle.adManager.companyIds] : undefined,
-            }
-          : undefined,
-        trustedServerCreativeFailures: cycle.trustedServerCreativeFailures
-          ? [...cycle.trustedServerCreativeFailures]
-          : undefined,
-      })),
-    })),
-    callbackIssues: snapshot.callbackIssues.map((issue) => ({ ...issue })),
-    ...(snapshot.attributionIssues === undefined
-      ? {}
-      : { attributionIssues: snapshot.attributionIssues.map((issue) => ({ ...issue })) }),
-    coverage: Object.fromEntries(
-      Object.entries(snapshot.coverage).map(([kind, counters]) => [kind, { ...counters }])
-    ) as GptDiagnosticsExportV1['coverage'],
-    metadata: { ...snapshot.metadata },
-  };
 }
 
 function safelyRecord(action: () => void): void {
@@ -217,6 +199,9 @@ export class GptDiagnosticsApiController {
     const callbackIssues = Object.freeze(
       store.callbackIssues.map((issue) => Object.freeze({ ...issue }))
     );
+    const attributionIssues = Object.freeze(
+      store.attributionIssues.map((issue) => Object.freeze({ ...issue }))
+    );
     const coverage = Object.freeze(
       Object.fromEntries(
         Object.entries(store.coverage).map(([kind, counters]) => [
@@ -234,6 +219,7 @@ export class GptDiagnosticsApiController {
       }),
       slots,
       callbackIssues,
+      attributionIssues,
       coverage,
       metadata: Object.freeze({ ...store.metadata }),
     }) as GptDiagnosticsExportV1;

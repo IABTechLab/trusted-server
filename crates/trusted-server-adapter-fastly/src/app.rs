@@ -142,6 +142,7 @@ use trusted_server_core::request_signing::{
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
+use trusted_server_core::trace_cookie::handle_trace_mode;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
@@ -213,10 +214,16 @@ pub(crate) async fn dispatch_reserved_for_state(
     )
 }
 
-pub(crate) fn load_settings_from_config_store() -> Result<Settings, Report<TrustedServerError>> {
-    let store_name = default_config_store_name();
-    let config_key = default_config_key();
-    get_settings_from_config_store(&FastlyPlatformConfigStore, &store_name, &config_key)
+pub(crate) fn load_settings_from_config_store(
+    stores: &RuntimeStoreConfig,
+) -> Result<Settings, Report<TrustedServerError>> {
+    get_settings_from_config_store(
+        &FastlyPlatformConfigStore,
+        &FastlyPlatformSecretStore,
+        &stores.config_store_name,
+        &stores.config_key,
+        &stores.secret_store_name,
+    )
 }
 
 pub(crate) fn build_state_from_settings(
@@ -224,8 +231,10 @@ pub(crate) fn build_state_from_settings(
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     warn_if_certificate_check_disabled(&settings);
 
-    let orchestrator = build_orchestrator(&settings)?;
-    let registry = IntegrationRegistry::new(&settings)?;
+    let plan = Arc::new(compile_auction_plan(&settings)?);
+    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
+    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
@@ -677,6 +686,7 @@ async fn run_named_route(
         }
         NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
+        NamedRouteHandler::TraceMode => handle_trace_mode(&state.settings, req.uri().query()),
         NamedRouteHandler::Auction => {
             // The auction reads consent data, so the consent KV store must be
             // available — fail closed with 503 when it is configured but
@@ -1096,6 +1106,7 @@ enum NamedRouteHandler {
     Identify,
     SetTester,
     ClearTester,
+    TraceMode,
     Auction,
     PageBids,
     FirstPartyProxy,
@@ -1195,6 +1206,11 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/clear-tester",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::ClearTester,
+    },
+    NamedRoute {
+        path: "/_ts/trace",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::TraceMode,
     },
     NamedRoute {
         path: "/auction",
@@ -1365,8 +1381,8 @@ mod tests {
     #[cfg(feature = "aps-runner-proxy-integration-test")]
     use super::dispatch_reserved_for_state;
     use super::{
-        AppState, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_PATH, TrustedServerApp,
-        build_state_from_settings, startup_error_router,
+        AppState, EnvConfig, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_PATH, RuntimeStoreConfig,
+        TrustedServerApp, build_state_from_settings, startup_error_router,
     };
     use base64::Engine as _;
     use bytes::Bytes;
@@ -1767,8 +1783,27 @@ mod tests {
 
     #[test]
     fn startup_registers_aps_renderer_route() {
-        let mut settings = test_settings();
-        settings.auction.providers.clear();
+        let mut settings = Settings::from_toml(
+            r#"
+                [[handlers]]
+                path = "^/_ts/admin"
+                username = "admin"
+                password = "admin-password"
+
+                [publisher]
+                domain = "publisher.example"
+                cookie_domain = ".publisher.example"
+                origin_url = "https://origin.publisher.example"
+                proxy_secret = "fictional-proxy-secret"
+
+                [ec]
+                passphrase = "fictional-secret-key-32-bytes-minimum"
+
+                [auction]
+                enabled = true
+            "#,
+        )
+        .expect("should parse APS startup settings");
         settings.auction.providers.insert(
             "aps-main".parse().expect("should parse APS provider ID"),
             trusted_server_core::auction::ProviderConfig {
@@ -1785,11 +1820,10 @@ mod tests {
         let state = build_state_from_settings(settings)
             .expect("Fastly startup should register APS renderer");
         assert!(
-            state.registry.has_route(
-                &edgezero_core::http::Method::GET,
-                "/integrations/aps/renderer"
-            ),
-            "Fastly startup registry should expose the APS renderer"
+            state
+                .registry
+                .has_reserved_path("/integrations/aps/renderer/v2"),
+            "Fastly startup registry should reserve the APS v2 renderer"
         );
     }
 

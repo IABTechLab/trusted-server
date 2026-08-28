@@ -344,7 +344,7 @@ fn corpus(runtime_id: &str) -> Vec<CorpusCase> {
             b"next".to_vec(),
         ),
     ];
-    if runtime_id == "cloudflare" {
+    if matches!(runtime_id, "cloudflare" | "spin") {
         cases.insert(
             cases.len() - 1,
             CorpusCase {
@@ -352,11 +352,31 @@ fn corpus(runtime_id: &str) -> Vec<CorpusCase> {
                     Duration::from_secs(4) + Duration::from_millis(750),
                 ),
                 ..CorpusCase::failure(
-                    "Cloudflare first-byte timeout is distinct from the total timeout",
+                    "first-byte timeout is distinct from the total timeout",
                     FictionalResponse::raw(vec![ResponseWrite::after(
                         Duration::from_millis(4_500),
                         b"HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
                     )]),
+                )
+            },
+        );
+    }
+    if runtime_id == "spin" {
+        cases.insert(
+            cases.len() - 1,
+            CorpusCase {
+                maximum_elapsed: Some(Duration::from_secs(1)),
+                ..CorpusCase::failure(
+                    "Spin between-bytes timeout is distinct from the total timeout",
+                    FictionalResponse::raw(vec![
+                        ResponseWrite::now(
+                            b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/javascript\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n".to_vec(),
+                        ),
+                        ResponseWrite::after(
+                            Duration::from_millis(750),
+                            b"0\r\n\r\n".to_vec(),
+                        ),
+                    ]),
                 )
             },
         );

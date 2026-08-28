@@ -9,7 +9,11 @@ import {
 type Command = () => void;
 
 function createReadyGoogletag(
-  options: { readonly deferCommands?: boolean; readonly initialLoadDisabled?: boolean } = {}
+  options: {
+    readonly deferCommands?: boolean;
+    readonly initialLoadDisabled?: boolean;
+    readonly servicesEnabled?: boolean;
+  } = {}
 ) {
   const commands: Command[] = [];
   const display = vi.fn();
@@ -25,6 +29,7 @@ function createReadyGoogletag(
       initialLoad.disabled = true;
       return 'legacy-result';
     }),
+    enableSingleRequest: vi.fn(() => true),
     getSlots: vi.fn<() => object[]>(() => []),
     refresh: vi.fn(),
     removeEventListener: vi.fn((type: string, listener: (event: unknown) => void) => {
@@ -33,7 +38,7 @@ function createReadyGoogletag(
   };
   const googletag = {
     apiReady: true,
-    pubadsReady: true,
+    pubadsReady: options.servicesEnabled !== false,
     cmd: {
       push: vi.fn((command: Command): number => {
         if (options.deferCommands) commands.push(command);
@@ -44,6 +49,9 @@ function createReadyGoogletag(
     defineSlot: vi.fn(),
     destroySlots: vi.fn(),
     display,
+    enableServices: vi.fn(() => {
+      googletag.pubadsReady = true;
+    }),
     getConfig: vi.fn((key: string) =>
       key === 'disableInitialLoad' ? { disableInitialLoad: initialLoad.disabled } : {}
     ),
@@ -2840,6 +2848,25 @@ describe('browser googletag adapter readiness', () => {
     expect(ready.pubads.refresh).toHaveBeenCalledWith([slot], { changeCorrelator: false });
     expect(ready.pubads.removeEventListener).toHaveBeenCalledTimes(1);
     expect(targeting.has('hb_adid')).toBe(false);
+  });
+
+  it('enables SRA before GPT services and does not reconfigure an enabled publisher service', async () => {
+    const disabled = createReadyGoogletag({ servicesEnabled: false });
+    const order: string[] = [];
+    disabled.pubads.enableSingleRequest.mockImplementation(() => {
+      order.push('sra');
+      return true;
+    });
+    disabled.googletag.enableServices.mockImplementation(() => {
+      order.push('services');
+      disabled.googletag.pubadsReady = true;
+    });
+    const adapter = createBrowserGoogletagAdapter({ googletag: disabled.googletag });
+
+    await expect(adapter.run((gpt) => gpt.enableServices()).result).resolves.toBeUndefined();
+    await expect(adapter.run((gpt) => gpt.enableServices()).result).resolves.toBeUndefined();
+
+    expect(order).toEqual(['sra', 'services']);
   });
 
   it('exposes one reversible publisher-call observer without changing ordinary calls', () => {

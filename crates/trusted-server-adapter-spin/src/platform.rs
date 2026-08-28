@@ -456,13 +456,8 @@ struct SpinPendingResponse {
 /// `StubHttpClient` driver records the one-send 3xx behavior while adapter tests
 /// cover request/response policy around that single boundary.
 ///
-/// # Known MVP limits
-///
-/// **No configurable outbound timeout.** `spin_sdk::http::send` does not
-/// expose per-request timeout control, and [`PlatformBackendSpec::first_byte_timeout`]
-/// is ignored by [`NoopBackend`]. A slow or hung origin will block the Spin
-/// invocation for whatever default the Spin runtime imposes. Operators requiring
-/// deterministic timeout behaviour should use the Fastly adapter.
+/// Per-request raw-proxy calls lower the core connect, first-byte, and
+/// between-byte deadlines into WASI HTTP [`RequestOptions`].
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub struct SpinPlatformHttpClient;
 
@@ -681,25 +676,42 @@ impl SpinPlatformHttpClient {
             })?;
         }
 
-        let timeout_nanos = policy.total_timeout.as_nanos().try_into().map_err(|_| {
+        let connect_timeout_nanos = policy.total_timeout.as_nanos().try_into().map_err(|_| {
             Report::new(PlatformError::HttpClient)
-                .attach("raw proxy timeout exceeds WASI HTTP duration range")
+                .attach("raw proxy connect timeout exceeds WASI HTTP duration range")
         })?;
+        let first_byte_timeout_nanos =
+            policy
+                .first_byte_timeout
+                .as_nanos()
+                .try_into()
+                .map_err(|_| {
+                    Report::new(PlatformError::HttpClient)
+                        .attach("raw proxy first-byte timeout exceeds WASI HTTP duration range")
+                })?;
+        let between_bytes_timeout_nanos = policy
+            .blocking_read_timeout
+            .as_nanos()
+            .try_into()
+            .map_err(|_| {
+                Report::new(PlatformError::HttpClient)
+                    .attach("raw proxy between-bytes timeout exceeds WASI HTTP duration range")
+            })?;
         let options = RequestOptions::new();
         options
-            .set_connect_timeout(Some(timeout_nanos))
+            .set_connect_timeout(Some(connect_timeout_nanos))
             .map_err(|_| {
                 Report::new(PlatformError::Unsupported)
                     .attach("Spin raw proxy connect timeout is unavailable")
             })?;
         options
-            .set_first_byte_timeout(Some(timeout_nanos))
+            .set_first_byte_timeout(Some(first_byte_timeout_nanos))
             .map_err(|_| {
                 Report::new(PlatformError::Unsupported)
                     .attach("Spin raw proxy first-byte timeout is unavailable")
             })?;
         options
-            .set_between_bytes_timeout(Some(timeout_nanos))
+            .set_between_bytes_timeout(Some(between_bytes_timeout_nanos))
             .map_err(|_| {
                 Report::new(PlatformError::Unsupported)
                     .attach("Spin raw proxy between-bytes timeout is unavailable")

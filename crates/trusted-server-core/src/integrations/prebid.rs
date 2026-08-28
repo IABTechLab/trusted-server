@@ -41,6 +41,10 @@ use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
     IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
+    html_script_nonce_attribute,
+};
+#[cfg(test)]
+use crate::integrations::{
     ensure_integration_backend_with_timeout, predict_integration_backend_name,
 };
 #[cfg(test)]
@@ -358,20 +362,122 @@ pub struct LegacyPrebidServerConfig {
     pub suppress_nurl_bidders: Vec<String>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PrebidBrowserConfigV1<'a> {
-    account_id: &'a str,
-    timeout: u32,
-    debug: bool,
-    bidders: &'a [String],
-    #[serde(skip_serializing_if = "<[String]>::is_empty")]
-    client_side_bidders: &'a [String],
-    #[serde(skip_serializing_if = "<[String]>::is_empty")]
-    excluded_gam_ad_unit_path_suffixes: &'a [String],
+#[cfg(test)]
+impl IntegrationConfig for LegacyPrebidServerConfig {
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
 }
 
-fn remove_aps_bidders(config: &mut PrebidIntegrationConfig) {
+/// CLI build inputs retained in app config but ignored safely by the runtime.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrebidBundleBuildConfig {
+    /// Prebid.js bidder adapters included by `ts prebid bundle`.
+    #[serde(default)]
+    pub adapters: Vec<String>,
+    /// Optional Prebid.js user ID modules included by `ts prebid bundle`.
+    #[serde(default)]
+    pub user_id_modules: Option<Vec<String>>,
+}
+
+/// Browser-only Prebid integration settings.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct PrebidIntegrationConfig {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u32,
+    #[serde(default)]
+    pub debug: bool,
+    #[serde(
+        default = "default_script_patterns",
+        deserialize_with = "crate::settings::vec_from_seq_or_map"
+    )]
+    pub script_patterns: Vec<String>,
+    #[serde(default)]
+    #[validate(custom(function = "validate_external_bundle_url"))]
+    pub external_bundle_url: Option<String>,
+    #[serde(default)]
+    #[validate(regex(
+        path = *EXTERNAL_BUNDLE_SHA256_PATTERN,
+        message = "external_bundle_sha256 must be a 64-character hex SHA-256"
+    ))]
+    pub external_bundle_sha256: Option<String>,
+    #[serde(default)]
+    #[validate(custom(function = "validate_external_bundle_sri"))]
+    pub external_bundle_sri: Option<String>,
+    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    pub client_side_bidders: Vec<String>,
+    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    #[validate(custom(function = "validate_excluded_gam_ad_unit_path_suffixes"))]
+    pub excluded_gam_ad_unit_path_suffixes: Vec<String>,
+    /// CLI-only external bundle build inputs; runtime registration ignores these fields.
+    #[serde(default)]
+    pub bundle: PrebidBundleBuildConfig,
+}
+
+impl Default for PrebidIntegrationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_enabled(),
+            account_id: None,
+            timeout_ms: default_timeout_ms(),
+            debug: false,
+            script_patterns: default_script_patterns(),
+            external_bundle_url: None,
+            external_bundle_sha256: None,
+            external_bundle_sri: None,
+            client_side_bidders: Vec::new(),
+            excluded_gam_ad_unit_path_suffixes: Vec::new(),
+            bundle: PrebidBundleBuildConfig::default(),
+        }
+    }
+}
+
+impl IntegrationConfig for PrebidIntegrationConfig {
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+#[cfg(test)]
+impl From<&LegacyPrebidServerConfig> for PrebidIntegrationConfig {
+    fn from(config: &LegacyPrebidServerConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            account_id: config.account_id.clone(),
+            timeout_ms: config.timeout_ms,
+            debug: config.debug,
+            script_patterns: config.script_patterns.clone(),
+            external_bundle_url: config.external_bundle_url.clone(),
+            external_bundle_sha256: config.external_bundle_sha256.clone(),
+            external_bundle_sri: config.external_bundle_sri.clone(),
+            client_side_bidders: config.client_side_bidders.clone(),
+            excluded_gam_ad_unit_path_suffixes: config.excluded_gam_ad_unit_path_suffixes.clone(),
+            bundle: PrebidBundleBuildConfig::default(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrebidBrowserConfigV1 {
+    account_id: String,
+    timeout: u32,
+    debug: bool,
+    bidders: Vec<String>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    client_side_bidders: Vec<String>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    excluded_gam_ad_unit_path_suffixes: Vec<String>,
+}
+
+#[cfg(test)]
+fn remove_aps_bidders(config: &mut LegacyPrebidServerConfig) {
     for (field, bidders) in [
         ("bidders", &mut config.bidders),
         ("client_side_bidders", &mut config.client_side_bidders),
@@ -733,7 +839,6 @@ fn validate_external_bundle_config(
 
 pub struct PrebidIntegration {
     config: PrebidIntegrationConfig,
-    planned_head_inserts: Option<Vec<String>>,
     #[cfg(test)]
     legacy_config: Option<LegacyPrebidServerConfig>,
     #[cfg(test)]
@@ -746,7 +851,6 @@ impl PrebidIntegration {
         let engine = Arc::new(BidParamOverrideEngine::try_from_config(&config)?);
         Ok(Arc::new(Self {
             config: PrebidIntegrationConfig::from(&config),
-            planned_head_inserts: None,
             legacy_config: Some(config),
             engine,
         }))
@@ -757,17 +861,31 @@ impl PrebidIntegration {
         Self::try_new(config).expect("should compile prebid bid param overrides")
     }
 
-    fn browser_config_v1(&self) -> PrebidBrowserConfigV1<'_> {
+    fn for_browser_plan(config: &PrebidIntegrationConfig) -> Arc<Self> {
+        Arc::new(Self {
+            config: config.clone(),
+            #[cfg(test)]
+            legacy_config: None,
+            #[cfg(test)]
+            engine: Arc::new(BidParamOverrideEngine::default()),
+        })
+    }
+
+    fn browser_config_v1(&self, bidders: Vec<String>) -> PrebidBrowserConfigV1 {
         PrebidBrowserConfigV1 {
-            account_id: self.config.account_id.as_deref().unwrap_or_default(),
+            account_id: self.config.account_id.clone().unwrap_or_default(),
             timeout: self.config.timeout_ms,
             debug: self.config.debug,
-            bidders: &self.config.bidders,
-            client_side_bidders: &self.config.client_side_bidders,
-            excluded_gam_ad_unit_path_suffixes: &self.config.excluded_gam_ad_unit_path_suffixes,
+            bidders,
+            client_side_bidders: self.config.client_side_bidders.clone(),
+            excluded_gam_ad_unit_path_suffixes: self
+                .config
+                .excluded_gam_ad_unit_path_suffixes
+                .clone(),
         }
     }
 
+    #[cfg(test)]
     fn auction_provider(&self) -> PrebidAuctionProvider {
         PrebidAuctionProvider {
             config: self
@@ -861,53 +979,12 @@ impl PrebidIntegration {
         Ok(response)
     }
 
-    fn external_bundle_script_tag(&self) -> String {
+    fn external_bundle_script_tag(&self, csp_nonce: Option<&str>) -> String {
         external_bundle_script_tag(
             self.config.external_bundle_sha256.as_deref(),
             self.config.external_bundle_sri.as_deref(),
+            csp_nonce,
         )
-    }
-
-    /// Build the prepared browser injection from browser settings and validated routes.
-    pub(crate) fn head_inserts_for_plan(
-        &self,
-        browser_config: &PrebidIntegrationConfig,
-        plan: &AuctionPlan,
-    ) -> Vec<String> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct InjectedBrowserConfig<'a> {
-            account_id: &'a str,
-            timeout: u32,
-            debug: bool,
-            server_side_bidders: Vec<&'a str>,
-            #[serde(skip_serializing_if = "<[String]>::is_empty")]
-            client_side_bidders: &'a [String],
-            #[serde(skip_serializing_if = "<[String]>::is_empty")]
-            excluded_gam_ad_unit_path_suffixes: &'a [String],
-        }
-
-        let payload = InjectedBrowserConfig {
-            account_id: browser_config.account_id.as_deref().unwrap_or_default(),
-            timeout: browser_config.timeout_ms,
-            debug: browser_config.debug,
-            server_side_bidders: if plan.enabled() {
-                plan.browser_bidder_codes().collect()
-            } else {
-                Vec::new()
-            },
-            client_side_bidders: &browser_config.client_side_bidders,
-            excluded_gam_ad_unit_path_suffixes: &browser_config.excluded_gam_ad_unit_path_suffixes,
-        };
-        let config_json = serialize_injected_prebid_config(&payload);
-
-        vec![
-            injected_prebid_config_script(&config_json),
-            external_bundle_script_tag(
-                browser_config.external_bundle_sha256.as_deref(),
-                browser_config.external_bundle_sri.as_deref(),
-            ),
-        ]
     }
 
     fn is_managed_external(&self) -> bool {
@@ -1083,13 +1160,18 @@ fn external_bundle_script_src(sha256: Option<&str>) -> String {
     }
 }
 
-fn external_bundle_script_tag(sha256: Option<&str>, sri: Option<&str>) -> String {
+fn external_bundle_script_tag(
+    sha256: Option<&str>,
+    sri: Option<&str>,
+    csp_nonce: Option<&str>,
+) -> String {
     let src = external_bundle_script_src(sha256);
+    let nonce_attribute = html_script_nonce_attribute(csp_nonce).unwrap_or_default();
     let integrity = sri
         .map(|value| format!(" integrity=\"{}\"", escape_html_attr(value)))
         .unwrap_or_default();
 
-    format!("<script src=\"{src}\"{integrity} defer></script>")
+    format!("<script{nonce_attribute} src=\"{src}\"{integrity} defer></script>")
 }
 
 #[cfg(test)]
@@ -1142,13 +1224,19 @@ pub fn register_for_plan(
     config.excluded_gam_ad_unit_path_suffixes = canonical;
     validate_browser_config_for_startup(&config, &settings.proxy.allowed_domains)?;
     validate_browser_bidder_ownership(&config, plan)?;
-    let integration = PrebidIntegration::for_browser_plan(&config, plan);
+    let integration = PrebidIntegration::for_browser_plan(&config);
+    let browser_config = integration.browser_config_v1(if plan.enabled() {
+        plan.browser_bidder_codes().map(str::to_string).collect()
+    } else {
+        Vec::new()
+    });
     Ok(Some(
         IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration.clone())
             .with_head_injector(integration)
             .with_deferred_js()
+            .with_browser_config_v1(&browser_config)?
             .build(),
     ))
 }
@@ -1162,7 +1250,12 @@ pub fn register(
         return Ok(None);
     };
 
-    let browser_config = integration.browser_config_v1();
+    let legacy_config = integration.legacy_config.as_ref().ok_or_else(|| {
+        Report::new(TrustedServerError::Prebid {
+            message: "legacy test registration requires legacy config".to_string(),
+        })
+    })?;
+    let browser_config = integration.browser_config_v1(legacy_config.bidders.clone());
 
     Ok(Some(
         IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
@@ -1247,29 +1340,13 @@ impl IntegrationAttributeRewriter for PrebidIntegration {
     }
 }
 
-fn serialize_injected_prebid_config(payload: &impl Serialize) -> String {
-    // Escape `</` to prevent breaking out of the script tag.
-    serde_json::to_string(payload)
-        .unwrap_or_else(|error| {
-            log::warn!("Prebid: failed to serialize client config: {error}");
-            "{}".to_string()
-        })
-        .replace("</", "<\\/")
-}
-
-fn injected_prebid_config_script(config_json: &str) -> String {
-    format!(
-        r#"<script>window.pbjs=window.pbjs||{{}};window.pbjs.que=window.pbjs.que||[];window.pbjs.cmd=window.pbjs.cmd||[];window.__tsjs_prebid={config_json};</script>"#
-    )
-}
-
 impl IntegrationHeadInjector for PrebidIntegration {
     fn integration_id(&self) -> &'static str {
         PREBID_INTEGRATION_ID
     }
 
-    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        vec![self.external_bundle_script_tag()]
+    fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        vec![self.external_bundle_script_tag(ctx.csp_nonce)]
     }
 }
 
@@ -2054,6 +2131,9 @@ fn parse_planned_prebid_bid(
 
     Ok(AuctionBid {
         slot_id,
+        candidate_id: None,
+        candidate_provider: None,
+        renderer_reservation_id: None,
         price: Some(price),
         currency: DEFAULT_CURRENCY.to_string(),
         creative,
@@ -3362,7 +3442,13 @@ mod tests {
     }
 
     fn browser_config_json(integration: &PrebidIntegration) -> String {
-        serde_json::to_string(&integration.browser_config_v1())
+        let bidders = integration
+            .legacy_config
+            .as_ref()
+            .expect("should retain legacy config for browser projection tests")
+            .bidders
+            .clone();
+        serde_json::to_string(&integration.browser_config_v1(bidders))
             .expect("browser-safe Prebid config should serialize")
     }
 
@@ -4660,8 +4746,7 @@ external_bundle_sri = "sha384-AAAA"
 
     #[test]
     #[allow(clippy::field_reassign_with_default)]
-    fn prepared_browser_injection_uses_only_plan_routes_and_browser_timeout_debug() {
-        let integration = PrebidIntegration::new(base_config());
+    fn browser_projection_uses_only_plan_routes_and_browser_timeout_debug() {
         let mut browser_config = PrebidIntegrationConfig::default();
         browser_config.account_id = Some("browser-account".to_string());
         browser_config.timeout_ms = 1750;
@@ -4715,25 +4800,38 @@ external_bundle_sri = "sha384-AAAA"
         })
         .expect("should compile plan while browser integration is not part of compilation");
 
-        let inserts = integration.head_inserts_for_plan(&browser_config, &plan);
-        let script = &inserts[0];
+        let integration = PrebidIntegration::for_browser_plan(&browser_config);
+        let product = serde_json::to_string(
+            &integration
+                .browser_config_v1(plan.browser_bidder_codes().map(str::to_string).collect()),
+        )
+        .expect("should serialize planned Prebid browser config");
 
-        assert!(script.contains(r#""timeout":1750,"debug":false"#));
+        assert!(product.contains(r#""timeout":1750,"debug":false"#));
         assert!(
-            script.contains(r#""serverSideBidders":["primaryRoute","secondaryRoute"]"#),
-            "should inject deterministic browser route codes: {script}"
+            product.contains(r#""bidders":["primaryRoute","secondaryRoute"]"#),
+            "should project deterministic browser route codes: {product}"
         );
-        assert!(!script.contains("pbs-primary"));
-        assert!(!script.contains("pbs-secondary"));
-        assert!(!script.contains("3000"));
-        assert!(!script.contains("4000"));
+        assert!(!product.contains("pbs-primary"));
+        assert!(!product.contains("pbs-secondary"));
+        assert!(!product.contains("3000"));
+        assert!(!product.contains("4000"));
 
         let disabled_plan = plan.clone().with_enabled(false);
-        let disabled_inserts = integration.head_inserts_for_plan(&browser_config, &disabled_plan);
+        let disabled_product =
+            serde_json::to_string(&integration.browser_config_v1(if disabled_plan.enabled() {
+                disabled_plan
+                    .browser_bidder_codes()
+                    .map(str::to_string)
+                    .collect()
+            } else {
+                Vec::new()
+            }))
+            .expect("should serialize disabled Prebid browser config");
         assert!(
-            disabled_inserts[0].contains(r#""serverSideBidders":[]"#),
+            disabled_product.contains(r#""bidders":[]"#),
             "auction kill switch should suppress browser server-side bidders: {}",
-            disabled_inserts[0]
+            disabled_product
         );
     }
 
@@ -4790,6 +4888,7 @@ external_bundle_sri = "sha384-AAAA"
             request_host: "pub.example",
             request_scheme: "https",
             origin_host: "origin.example",
+            csp_nonce: Some("response-nonce_123="),
             document_state: &document_state,
         };
 
@@ -4811,6 +4910,11 @@ external_bundle_sri = "sha384-AAAA"
             inserts[0]
         );
         assert!(
+            inserts[0].contains("nonce=\"response-nonce_123=\""),
+            "bundle script should propagate the response CSP nonce: {}",
+            inserts[0]
+        );
+        assert!(
             !inserts[0].contains("crossorigin"),
             "same-origin bundle script should not include crossorigin: {}",
             inserts[0]
@@ -4828,6 +4932,7 @@ external_bundle_sri = "sha384-AAAA"
             request_host: "pub.example",
             request_scheme: "https",
             origin_host: "origin.example",
+            csp_nonce: None,
             document_state: &document_state,
         };
 

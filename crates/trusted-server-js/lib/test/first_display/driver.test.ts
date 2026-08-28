@@ -178,6 +178,9 @@ function harness() {
     gptBatch,
     getGptCallbacks: () => gptCallbacks!,
     renderer,
+    setCapturedCycle: (cycle: FirstDisplayGptHandoffCycleV1) => {
+      cycleOwner.value = cycle;
+    },
     getRenderTerminal: () => renderTerminal!,
     terminals,
   };
@@ -296,6 +299,36 @@ describe('projected first-display driver', () => {
     expect(h.driver.detachCommittedArtifacts()).toBe(true);
     expect(h.gptBatch.detachCommittedSlots).toHaveBeenCalledWith(['slot-1']);
     expect(h.renderer.detachCommittedArtifacts).toHaveBeenCalledOnce();
+  });
+
+  it('captures live publisher ownership and a hydration replacement from late GPT handoff', () => {
+    const h = harness();
+    h.getGptCallbacks()[0](h.cycle);
+    h.getGptCallbacks()[2]();
+    h.getGptCallbacks()[3](h.cycle, 'nonempty_gam');
+    h.getRenderTerminal()('accepted', null);
+    h.driver.sealTsAdmission();
+    const replacement = document.createElement('div');
+    replacement.id = 'slot-1-hydrated';
+    document.body.append(replacement);
+    h.setCapturedCycle(
+      Object.freeze([
+        h.cycle[0],
+        replacement,
+        h.cycle[2],
+        'publisher',
+        h.cycle[4],
+        h.cycle[5],
+        h.cycle[6],
+        h.cycle[7],
+        Object.freeze([]),
+      ])
+    );
+
+    expect(h.driver.closeIngress()).toBe(true);
+    const captured = h.driver.captureHandoff();
+    expect(captured?.cycles[0]?.[1]).toBe(replacement);
+    expect(captured?.cycles[0]?.[3]).toBe('publisher');
   });
 
   it('rejects an action list that does not exactly match the immutable batch', () => {

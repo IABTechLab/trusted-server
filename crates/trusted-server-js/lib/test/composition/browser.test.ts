@@ -319,6 +319,7 @@ function synchronousGptAdapter(initialSlots: readonly object[] = []) {
       if (key === undefined) values?.clear();
       else values?.delete(key);
     }),
+    enableServices: () => undefined,
     transactionalDefine,
     display,
     getTargeting: vi.fn((slot: object, key: string) =>

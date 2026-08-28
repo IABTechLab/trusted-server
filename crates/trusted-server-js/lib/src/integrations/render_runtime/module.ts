@@ -75,6 +75,13 @@ import {
 import type { SlotRecord, SlotService } from '../../services/slots';
 import { trustedDocumentHttpOrigin } from '../../shared/origin';
 
+import {
+  createPrebidSelectionCoordinator,
+  publishPrebidBid,
+  type PrebidBidPublicationInput,
+  type PrebidSelectionCoordinator,
+} from './prebid_selection';
+
 interface AcceptedBoot {
   readonly auctionProjection: unknown;
   readonly diagnostics: Readonly<{
@@ -1117,6 +1124,36 @@ export function createRenderRuntimeIntegrationRegistration(
       bootstrapNonces,
       hostPositions,
       createAttempt,
+      createPrebidSelectionCoordinator: (): PrebidSelectionCoordinator =>
+        createPrebidSelectionCoordinator({
+          activateAttempt: ({ attempt, owner, preparedBid }): boolean => {
+            if (!active) return false;
+            const registrar = pucGamAttemptRegistrar;
+            if (!registrar) return false;
+            try {
+              return (
+                registrar(
+                  Object.freeze({
+                    artifact: Object.freeze({
+                      kind: 'puc' as const,
+                      attemptId: attempt.id,
+                      slot: attempt.slot,
+                      navigationGeneration: attempt.navigationGeneration,
+                      dispose: () => undefined,
+                    }),
+                    attempt,
+                    owner,
+                    reservationId: preparedBid.bid.adId,
+                  })
+                ) === true
+              );
+            } catch {
+              return false;
+            }
+          },
+          createAttempt,
+          reservations,
+        }),
       createSlotOperation,
       commitPageBids: (
         owner: NavigationSession,
@@ -1136,6 +1173,8 @@ export function createRenderRuntimeIntegrationRegistration(
       rendererNonces,
       reservations,
       publisherOrigin: origin,
+      publishPrebidBid: (input: Omit<PrebidBidPublicationInput, 'navigation' | 'reservations'>) =>
+        publishPrebidBid({ ...input, navigation, reservations }),
       registerRenderer: (type: RegisteredRenderSource, renderer: RegisteredRenderer) => {
         if (!active) throw new TypeError('render source provider is inactive');
         if (type !== 'aps' || typeof renderer !== 'function' || registeredRenderers.has(type)) {

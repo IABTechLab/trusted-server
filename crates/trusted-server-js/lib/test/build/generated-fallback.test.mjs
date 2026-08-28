@@ -14,11 +14,15 @@ const artifactById = new Map(manifest.artifacts.map((artifact) => [artifact.id, 
 const selectedSrc = `/static/tsjs=tsjs-first-display.min.js?m=0001&v=${'c'.repeat(64)}`;
 const selectedGptSrc = `/static/tsjs=tsjs-first-display.min.js?m=0081&v=${'c'.repeat(64)}`;
 const runtimeSrc = `/static/tsjs=tsjs-unified.min.js?v=${'d'.repeat(64)}`;
+const runtimeBody = ['core', 'render_runtime']
+  .map((id) => readFileSync(path.join(dist, artifactById.get(id).file), 'utf8'))
+  .join(';\n');
 const EMPTY_INTEGRATION_CONFIGS = Object.freeze({ version: 1, entries: Object.freeze([]) });
 const EMPTY_INTEGRATION_CONFIG_DIGEST = createHash('sha256')
   .update(JSON.stringify(EMPTY_INTEGRATION_CONFIGS))
   .digest('hex');
 const plain = (value) => JSON.parse(JSON.stringify(value));
+const setCurrentScriptByDom = new WeakMap();
 
 function createDocument(firstDisplaySrc = selectedSrc) {
   const dom = new JSDOM(
@@ -40,11 +44,22 @@ function createDocument(firstDisplaySrc = selectedSrc) {
     },
   });
   const selected = dom.window.document.querySelector('script#trustedserver-js');
-  Object.defineProperty(dom.window.document, 'currentScript', {
+  let currentScript = selected;
+  Object.defineProperty(dom.window.Document.prototype, 'currentScript', {
     configurable: true,
-    value: selected,
+    get: () => currentScript,
   });
-  return { animationFrames, dom, selected };
+  setCurrentScriptByDom.set(dom, (script) => {
+    currentScript = script;
+  });
+  return {
+    animationFrames,
+    dom,
+    selected,
+    setCurrentScript: (script) => {
+      currentScript = script;
+    },
+  };
 }
 
 function boot() {
@@ -144,6 +159,7 @@ function evaluateTransport(dom, value) {
   dom.window.eval(
     `const __TSJS_SERVER_BOOT_TRANSPORT_V1__=${JSON.stringify(JSON.stringify(value))};${source}`
   );
+  setCurrentScriptByDom.get(dom)?.(null);
 }
 
 function evaluateWithInput(dom) {
@@ -164,6 +180,35 @@ test('generated bootstrap bytes are stamped exactly once and expose no callable 
   dom.window.close();
 });
 
+test('generated bootstrap seals the TSJS namespace handoff without mutating currentScript', () => {
+  const { dom, selected, setCurrentScript } = createDocument();
+  const target = {};
+  dom.window.tsjs = target;
+  selected.src = runtimeSrc;
+  const directBoot = boot();
+  directBoot.manifest.firstDisplay = null;
+  directBoot.manifest.integrations = [{ id: 'render_runtime', phase: 'takeover' }];
+
+  evaluateTransport(dom, transport(directBoot, null));
+  setCurrentScript(null);
+
+  assert.equal(Object.getOwnPropertyDescriptor(dom.window.document, 'currentScript'), undefined);
+  const descriptor = Object.getOwnPropertyDescriptor(dom.window, 'tsjs');
+  assert.equal(descriptor?.configurable, false);
+  assert.equal(descriptor?.enumerable, true);
+  assert.equal(typeof descriptor?.get, 'function');
+  assert.throws(() =>
+    Object.defineProperty(dom.window, 'tsjs', {
+      configurable: true,
+      value: { publisher: 'replacement' },
+    })
+  );
+  assert.equal(dom.window.tsjs, target);
+  assert.equal(typeof selected._claimRuntimeV1, 'function');
+  assert.equal(selected._claimRuntimeV1(selected), undefined);
+  dom.window.close();
+});
+
 test('generated bootstrap leaves the namespace untouched without exact server input', () => {
   for (const input of ['', 'const __TSJS_SERVER_BOOT_TRANSPORT_V1__={};']) {
     const { dom } = createDocument();
@@ -179,7 +224,7 @@ test('generated bootstrap leaves the namespace untouched without exact server in
 });
 
 test('generated bootstrap transfers the direct persistent watchdog to the selected runtime', () => {
-  const { dom, selected } = createDocument();
+  const { dom, selected, setCurrentScript } = createDocument();
   selected.src = runtimeSrc;
   const target = { que: [] };
   dom.window.tsjs = target;
@@ -187,19 +232,130 @@ test('generated bootstrap transfers the direct persistent watchdog to the select
   directBoot.manifest.firstDisplay = null;
 
   evaluateTransport(dom, transport(directBoot, null));
+  setCurrentScript(selected);
 
+  const claim = selected._claimRuntimeV1;
+  const originalQuerySelectorAll = dom.window.document.querySelectorAll;
+  let nestedResult;
+  let nestedCancelCalls = 0;
+  let reentered = false;
+  dom.window.document.querySelectorAll = function (...args) {
+    if (!reentered) {
+      reentered = true;
+      nestedResult = claim(selected);
+    }
+    return Reflect.apply(originalQuerySelectorAll, this, args);
+  };
   const cancel = () => assert.fail('committed direct runtime must not be cancelled');
-  const complete = target._claimDirectRuntime(selected, cancel);
+  const claimed = claim(selected);
+  assert.equal(nestedResult, undefined);
+  assert.equal(nestedCancelCalls, 0);
+  assert.equal(claimed.mode, 'direct');
+  const complete = claimed.bind(cancel);
   assert.equal(typeof complete, 'function');
   complete('kernel');
-  assert.equal(Object.hasOwn(target, '_claimDirectRuntime'), false);
+  assert.equal(selected._claimRuntimeV1(selected), undefined);
   assert.equal(Object.hasOwn(target, '_internal'), false);
   assert.equal(target.boot.manifest.firstDisplay, null);
   dom.window.close();
 });
 
+test('generated runtime reserves the node claim before mutable realm initializers can reenter', () => {
+  const { dom, selected, setCurrentScript } = createDocument();
+  selected.src = runtimeSrc;
+  const target = { que: [] };
+  dom.window.tsjs = target;
+  const directBoot = boot();
+  directBoot.manifest.firstDisplay = null;
+  directBoot.manifest.integrations = [{ id: 'render_runtime', phase: 'takeover' }];
+
+  evaluateTransport(dom, transport(directBoot, null));
+  setCurrentScript(selected);
+  const claim = selected._claimRuntimeV1;
+  const nativeGetOwnPropertyDescriptor = dom.window.Object.getOwnPropertyDescriptor;
+  const nativeReflectApply = dom.window.Reflect.apply;
+  let descriptorReentry;
+  let applyReentry;
+  dom.window.Object.getOwnPropertyDescriptor = function (...args) {
+    descriptorReentry ??= claim(selected);
+    return nativeGetOwnPropertyDescriptor(...args);
+  };
+  dom.window.Reflect.apply = function (targetFunction, thisArgument, argumentsList) {
+    applyReentry ??= claim(selected);
+    return nativeReflectApply(targetFunction, thisArgument, argumentsList);
+  };
+
+  dom.window.eval(runtimeBody);
+
+  assert.equal(descriptorReentry, undefined);
+  assert.equal(applyReentry, undefined);
+  assert.equal(target._internal.state, 'kernel');
+  dom.window.close();
+});
+
+test('generated takeover claim reserves authentication against publisher reentry', () => {
+  const { animationFrames, dom, setCurrentScript } = createDocument();
+  const target = { que: [] };
+  dom.window.tsjs = target;
+
+  evaluateWithInput(dom);
+  const nativeFreeze = dom.window.Object.freeze;
+  const nativeDefineProperty = dom.window.Object.defineProperty;
+  let capabilityRecordExposed = false;
+  let claimDescriptorExposed = false;
+  dom.window.Object.freeze = function (value) {
+    if (
+      value &&
+      typeof value === 'object' &&
+      Object.prototype.hasOwnProperty.call(value, 'bind') &&
+      Object.prototype.hasOwnProperty.call(value, 'complete')
+    ) {
+      capabilityRecordExposed = true;
+    }
+    return nativeFreeze(value);
+  };
+  dom.window.Object.defineProperty = function (owner, key, descriptor) {
+    if (key === '_claimRuntimeV1' && typeof descriptor?.value === 'function') {
+      claimDescriptorExposed = true;
+    }
+    return nativeDefineProperty(owner, key, descriptor);
+  };
+  while (animationFrames.length > 0) animationFrames.shift()(dom.window.performance.now());
+
+  const runtime = dom.window.document.querySelector('script#trustedserver-js-runtime');
+  const claim = runtime._claimRuntimeV1;
+  assert.equal(typeof claim, 'function');
+  setCurrentScript(runtime);
+  const originalQuerySelectorAll = dom.window.document.querySelectorAll;
+  let nestedResult;
+  let maliciousFinalizeCalls = 0;
+  let reentered = false;
+  dom.window.document.querySelectorAll = function (...args) {
+    if (!reentered) {
+      reentered = true;
+      nestedResult = claim(runtime);
+    }
+    return Reflect.apply(originalQuerySelectorAll, this, args);
+  };
+  const claimed = claim(runtime);
+  assert.equal(claimed.mode, 'takeover');
+  let outerFinalizeCalls = 0;
+  assert.throws(() =>
+    claimed.bind(() => {
+      outerFinalizeCalls += 1;
+      return undefined;
+    })
+  );
+  assert.equal(nestedResult, undefined);
+  assert.equal(maliciousFinalizeCalls, 0);
+  assert.equal(outerFinalizeCalls, 1);
+  assert.equal(capabilityRecordExposed, false);
+  assert.equal(claimDescriptorExposed, false);
+  dom.window.close();
+});
+
 test('generated bootstrap classifies a rejected claimed boot as an ABI mismatch', () => {
-  const { dom, selected } = createDocument();
+  const { dom, selected, setCurrentScript } = createDocument();
   selected.src = runtimeSrc;
   const target = { que: [] };
   dom.window.tsjs = target;
@@ -207,8 +363,9 @@ test('generated bootstrap classifies a rejected claimed boot as an ABI mismatch'
   directBoot.manifest.firstDisplay = null;
 
   evaluateTransport(dom, transport(directBoot, null));
+  setCurrentScript(selected);
 
-  const claim = target._claimBootSnapshot;
+  const claim = selected._claimRuntimeV1;
   assert.equal(typeof claim, 'function');
   const claimed = claim(selected);
   assert.equal(claimed.boot, target.boot);
@@ -226,7 +383,7 @@ test('generated bootstrap classifies a rejected claimed boot as an ABI mismatch'
 });
 
 test('generated bootstrap reserves the boot claim across reentrant DOM authentication', () => {
-  const { dom, selected } = createDocument();
+  const { dom, selected, setCurrentScript } = createDocument();
   selected.src = runtimeSrc;
   const target = { que: [] };
   dom.window.tsjs = target;
@@ -234,8 +391,9 @@ test('generated bootstrap reserves the boot claim across reentrant DOM authentic
   directBoot.manifest.firstDisplay = null;
 
   evaluateTransport(dom, transport(directBoot, null));
+  setCurrentScript(selected);
 
-  const claim = target._claimBootSnapshot;
+  const claim = selected._claimRuntimeV1;
   const querySelectorAll = dom.window.document.querySelectorAll;
   let nested;
   let reentered = false;
@@ -268,7 +426,7 @@ test('generated bootstrap reserves the boot claim across reentrant DOM authentic
 });
 
 test('generated bootstrap completes a claimed boot without a reentrant realm callback', () => {
-  const { dom, selected } = createDocument();
+  const { dom, selected, setCurrentScript } = createDocument();
   selected.src = runtimeSrc;
   const target = { que: [] };
   dom.window.tsjs = target;
@@ -276,8 +434,9 @@ test('generated bootstrap completes a claimed boot without a reentrant realm cal
   directBoot.manifest.firstDisplay = null;
 
   evaluateTransport(dom, transport(directBoot, null));
+  setCurrentScript(selected);
 
-  const claimed = target._claimBootSnapshot(selected);
+  const claimed = selected._claimRuntimeV1(selected);
   const includes = dom.window.Array.prototype.includes;
   let reentered = false;
   Object.defineProperty(dom.window.Array.prototype, 'includes', {
@@ -307,7 +466,7 @@ test('generated bootstrap completes a claimed boot without a reentrant realm cal
 });
 
 test('generated base-only takeover failure leaves terminal fallback ownership with bootstrap', () => {
-  const { animationFrames, dom } = createDocument();
+  const { animationFrames, dom, setCurrentScript } = createDocument();
   const target = { que: [] };
   dom.window.tsjs = target;
   evaluateWithInput(dom);
@@ -318,11 +477,8 @@ test('generated base-only takeover failure leaves terminal fallback ownership wi
   while (animationFrames.length > 0) animationFrames.shift()(dom.window.performance.now());
   const runtime = dom.window.document.querySelector('script#trustedserver-js-runtime');
   assert.ok(runtime, 'the bootstrap-owned base must reach protected paint without a marker');
-  Object.defineProperty(dom.window.document, 'currentScript', {
-    configurable: true,
-    value: runtime,
-  });
-  const claimed = target._claimBootSnapshot(runtime);
+  setCurrentScript(runtime);
+  const claimed = runtime._claimRuntimeV1(runtime);
   assert.equal(claimed.boot, target.boot);
   claimed.complete('bundle_partial');
 
@@ -340,8 +496,50 @@ test('generated base-only takeover failure leaves terminal fallback ownership wi
   dom.window.close();
 });
 
+test('generated bootstrap admits the exact post-paint runtime through one private Trusted Types policy', () => {
+  const { animationFrames, dom, setCurrentScript } = createDocument();
+  const target = { que: [] };
+  const policies = [];
+  Object.defineProperty(dom.window, 'trustedTypes', {
+    configurable: true,
+    value: {
+      createPolicy(name, rules) {
+        assert.equal(name, 'trusted-server#tsjs-v1');
+        if (policies.length !== 0) throw new TypeError('duplicate policy');
+        policies.push({ name, rules });
+        return { createScriptURL: rules.createScriptURL };
+      },
+    },
+  });
+  dom.window.tsjs = target;
+
+  evaluateWithInput(dom);
+  while (animationFrames.length > 0) animationFrames.shift()(dom.window.performance.now());
+
+  assert.equal(policies.length, 1);
+  assert.equal(policies[0].name, 'trusted-server#tsjs-v1');
+  assert.throws(() => policies[0].rules.createScriptURL('https://attacker.example/core.js'));
+  const runtime = dom.window.document.querySelector('script#trustedserver-js-runtime');
+  assert.equal(runtime?.src, new URL(runtimeSrc, dom.window.location.origin).href);
+  assert.equal(Object.hasOwn(runtime, '_tsjsTrustedTypesPolicyV1'), false);
+  const takeover = runtime._claimRuntimeV1;
+  assert.equal(typeof takeover, 'function');
+  const attacker = dom.window.document.createElement('script');
+  attacker.id = 'publisher-script';
+  dom.window.document.head.append(attacker);
+  setCurrentScript(attacker);
+  let finalizeCalls = 0;
+  assert.equal(takeover(runtime), undefined);
+  assert.equal(finalizeCalls, 0);
+  assert.equal(target._claimRuntimeV1, undefined);
+  assert.equal(runtime._claimRuntimeV1, takeover);
+  setCurrentScript(runtime);
+  runtime._claimRuntimeV1(runtime).complete('bundle_partial');
+  dom.window.close();
+});
+
 test('generated bootstrap stops optional activation after a component installer fails', () => {
-  const { dom, selected } = createDocument(selectedGptSrc);
+  const { dom, selected, setCurrentScript } = createDocument(selectedGptSrc);
   const target = { que: [] };
   const events = [];
   let bindingKeys;
@@ -351,6 +549,7 @@ test('generated bootstrap stops optional activation after a component installer 
   bootValue.integrations = { version: 1, entries: [{ id: 'gpt', config: {} }] };
   dom.window.tsjs = target;
   evaluateTransport(dom, transport(bootValue, outlineValue));
+  setCurrentScript(selected);
 
   const gpt = Object.freeze([
     1,
@@ -370,6 +569,50 @@ test('generated bootstrap stops optional activation after a component installer 
   dom.window.close();
 });
 
+test('generated first-display registration reserves authentication against DOM reentry', () => {
+  const { dom, selected, setCurrentScript } = createDocument(selectedGptSrc);
+  const target = { que: [] };
+  const bootValue = boot();
+  const outlineValue = outline();
+  selectGpt(bootValue, outlineValue);
+  bootValue.integrations = { version: 1, entries: [{ id: 'gpt', config: {} }] };
+  dom.window.tsjs = target;
+  evaluateTransport(dom, transport(bootValue, outlineValue));
+  setCurrentScript(selected);
+
+  const maliciousInstall = () => assert.fail('a reentrant installer must never activate');
+  let genuineInstallCalls = 0;
+  const genuineInstall = () => {
+    genuineInstallCalls += 1;
+  };
+  const originalQuerySelectorAll = dom.window.document.querySelectorAll;
+  let nestedResult;
+  let reentered = false;
+  dom.window.document.querySelectorAll = function (...args) {
+    if (!reentered) {
+      reentered = true;
+      nestedResult = target._registerFirstDisplay.call(
+        target,
+        Object.freeze([1, 'gpt_initial', manifest.releaseId, maliciousInstall]),
+        selected
+      );
+    }
+    return Reflect.apply(originalQuerySelectorAll, this, args);
+  };
+
+  const accepted = target._registerFirstDisplay.call(
+    target,
+    Object.freeze([1, 'gpt_initial', manifest.releaseId, genuineInstall]),
+    selected
+  );
+
+  assert.equal(nestedResult, false);
+  assert.equal(accepted, false);
+  assert.equal(genuineInstallCalls, 1);
+  assert.equal(Object.getOwnPropertyDescriptor(target, '_internal')?.value.reason, 'abi_mismatch');
+  dom.window.close();
+});
+
 test('generated optional slices receive their exact parser-time browser bindings', () => {
   const fixtures = [
     ['datadome_initial', {}],
@@ -385,7 +628,7 @@ test('generated optional slices receive their exact parser-time browser bindings
     const bootValue = boot();
     const outlineValue = outline();
     const { body, src } = selectInitialSlice(bootValue, outlineValue, id, config);
-    const { dom } = createDocument(src);
+    const { dom, selected, setCurrentScript } = createDocument(src);
     const callback = () => undefined;
     if (id === 'lockr_initial') dom.window.identityLockr = { host: 'vendor.example' };
     if (id === 'osano_initial') {
@@ -427,6 +670,7 @@ test('generated optional slices receive their exact parser-time browser bindings
     dom.window.tsjs = { que: [] };
 
     evaluateTransport(dom, transport(bootValue, outlineValue));
+    setCurrentScript(selected);
     dom.window.eval(body);
 
     assert.equal(
@@ -468,7 +712,7 @@ test('generated optional slices receive their exact parser-time browser bindings
 });
 
 test('generated bootstrap commits one non-rendering terminal shell after registration failure', async () => {
-  const { dom, selected } = createDocument(selectedGptSrc);
+  const { dom, selected, setCurrentScript } = createDocument(selectedGptSrc);
   const drained = [];
   const target = {
     que: [
@@ -483,6 +727,7 @@ test('generated bootstrap commits one non-rendering terminal shell after registr
   const outlineValue = outline();
   selectGpt(bootValue, outlineValue);
   evaluateTransport(dom, transport(bootValue, outlineValue));
+  setCurrentScript(selected);
   assert.equal(dom.window.tsjs._registerFirstDisplay.call(target, {}, selected), false);
 
   assert.deepEqual(Object.keys(target).sort(), [
@@ -564,7 +809,7 @@ test('generated bootstrap commits one non-rendering terminal shell after registr
 });
 
 test('generated bootstrap does not overwrite a conflicting non-configurable namespace field', () => {
-  const { dom, selected } = createDocument(selectedGptSrc);
+  const { dom, selected, setCurrentScript } = createDocument(selectedGptSrc);
   const target = { que: [] };
   const publisherApi = () => undefined;
   Object.defineProperty(target, 'publisherApi', {
@@ -579,6 +824,7 @@ test('generated bootstrap does not overwrite a conflicting non-configurable name
   const outlineValue = outline();
   selectGpt(bootValue, outlineValue);
   evaluateTransport(dom, transport(bootValue, outlineValue));
+  setCurrentScript(selected);
   assert.equal(dom.window.tsjs._registerFirstDisplay.call(target, {}, selected), false);
 
   assert.equal(target.publisherApi, publisherApi);

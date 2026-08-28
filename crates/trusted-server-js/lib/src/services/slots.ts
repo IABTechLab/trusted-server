@@ -120,11 +120,17 @@ export interface SlotRequestInput {
   readonly operation: 'display' | 'refresh';
   readonly registeredSlotId: string;
   readonly requestClass: string;
+  /** Immutable auction evidence captured by the exact request-producing operation. */
+  readonly trustedServerOpportunity?: TrustedServerRequestOpportunity;
 }
 
-/** Refresh-only input accepted by one shared GPT SRA operation. */
-export type SlotBatchRequestInput = Omit<SlotRequestInput, 'operation'> &
-  Readonly<{ operation: 'refresh' }>;
+export interface TrustedServerRequestOpportunity {
+  readonly requestedSlotSizes: readonly (readonly [number, number])[];
+  readonly trustedServerAuctionId: string;
+}
+
+/** Input admitted atomically into one shared GPT SRA operation. */
+export type SlotBatchRequestInput = SlotRequestInput;
 
 export interface SlotRequestHandle {
   readonly status: 'active' | 'queued' | 'terminal';
@@ -243,6 +249,13 @@ export interface SlotServiceOptions {
   ) => void;
   readonly googletag: GoogletagAdapter;
   readonly now?: () => number;
+  readonly onTrustedServerRequest?: (
+    input: Readonly<{
+      opportunity?: TrustedServerRequestOpportunity;
+      registeredSlotId: string;
+      slot: object;
+    }>
+  ) => void;
   readonly reconciliation?: SlotReconciliationBoundary;
   readonly warnPublisherHandoffMismatch?: (
     message: string,
@@ -550,6 +563,51 @@ function ownData(event: unknown, key: PropertyKey): unknown {
   } catch {
     return undefined;
   }
+}
+
+function snapshotTrustedServerOpportunity(
+  candidate: unknown
+): TrustedServerRequestOpportunity | undefined {
+  if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)) return;
+  const trustedServerAuctionId = ownData(candidate, 'trustedServerAuctionId');
+  const sizes = ownData(candidate, 'requestedSlotSizes');
+  if (
+    typeof trustedServerAuctionId !== 'string' ||
+    !validSlotIdentity(trustedServerAuctionId) ||
+    !Array.isArray(sizes) ||
+    sizes.length === 0 ||
+    sizes.length > 16
+  ) {
+    return;
+  }
+  const requestedSlotSizes: Array<readonly [number, number]> = [];
+  for (let index = 0; index < sizes.length; index += 1) {
+    const size = sizes[index];
+    if (
+      !Array.isArray(size) ||
+      size.length !== 2 ||
+      !Number.isInteger(size[0]) ||
+      !Number.isInteger(size[1]) ||
+      size[0] < 1 ||
+      size[0] > 4_096 ||
+      size[1] < 1 ||
+      size[1] > 4_096
+    ) {
+      return;
+    }
+    requestedSlotSizes.push(Object.freeze([size[0], size[1]]));
+  }
+  if (
+    Object.isFrozen(candidate) &&
+    Object.isFrozen(sizes) &&
+    sizes.every((size) => Object.isFrozen(size))
+  ) {
+    return candidate as unknown as TrustedServerRequestOpportunity;
+  }
+  return Object.freeze({
+    requestedSlotSizes: Object.freeze(requestedSlotSizes),
+    trustedServerAuctionId,
+  });
 }
 
 function copyReplacementSizes(sizes: unknown): unknown | undefined {
@@ -1458,13 +1516,31 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
           return;
         }
         const state = gpt.serviceState();
+        const publishRequest = (): void => {
+          try {
+            options.onTrustedServerRequest?.(
+              Object.freeze({
+                ...(intent.input.trustedServerOpportunity === undefined
+                  ? {}
+                  : { opportunity: intent.input.trustedServerOpportunity }),
+                registeredSlotId: record.view.registeredSlotId,
+                slot: physical.slot,
+              })
+            );
+          } catch {
+            // Diagnostics request-intent publication cannot alter the admitted GPT request.
+          }
+        };
+        if (!state.pubadsReady) gpt.enableServices();
         if (intent.input.operation === 'display' && state.initialLoadDisabled) {
           gpt.display(physical.slot);
           if (intent.terminal || physical.activeCycle) return;
+          publishRequest();
           armRequestDeadline(intent);
           gpt.refresh([physical.slot], Object.freeze({ changeCorrelator: false }));
           return;
         }
+        publishRequest();
         armRequestDeadline(intent);
         if (intent.input.operation === 'display') gpt.display(physical.slot);
         else gpt.refresh([physical.slot], Object.freeze({ changeCorrelator: false }));
@@ -2488,10 +2564,20 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         reconciliation: undefined,
         reconciliationSuccesses: 0,
       } as InternalSlotRecord);
+    const trustedServerOpportunity = snapshotTrustedServerOpportunity(
+      input.trustedServerOpportunity
+    );
+    const intentInput: SlotRequestInput =
+      trustedServerOpportunity === input.trustedServerOpportunity
+        ? input
+        : Object.freeze({
+            ...input,
+            ...(trustedServerOpportunity === undefined ? {} : { trustedServerOpportunity }),
+          });
     const intent: RequestIntent = {
       completionTimer: undefined,
       completionDeadlineAt: undefined,
-      input,
+      input: intentInput,
       invocation: undefined,
       requestDeadlineAt: undefined,
       requestStartedAt: undefined,
@@ -2623,16 +2709,20 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
           return Object.freeze([]);
         }
         const intentId = ownData(input, 'intentId');
+        const expectedSlot = ownData(input, 'expectedSlot');
         const navigationGeneration = ownData(input, 'navigationGeneration');
         const operation = ownData(input, 'operation');
         const registeredSlotId = ownData(input, 'registeredSlotId');
         const requestClass = ownData(input, 'requestClass');
+        const trustedServerOpportunity = snapshotTrustedServerOpportunity(
+          ownData(input, 'trustedServerOpportunity')
+        );
         if (
           typeof intentId !== 'string' ||
           intentId.length === 0 ||
           typeof navigationGeneration !== 'object' ||
           navigationGeneration === null ||
-          operation !== 'refresh' ||
+          (operation !== 'display' && operation !== 'refresh') ||
           typeof registeredSlotId !== 'string' ||
           registeredSlotId.length === 0 ||
           typeof requestClass !== 'string' ||
@@ -2658,6 +2748,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
           physical.state !== 'live' ||
           physical.activeCycle ||
           physical.publisherAdmissions.length > 0 ||
+          (expectedSlot !== undefined && expectedSlot !== physical.slot) ||
           setHasValue(admittedRecords, record) ||
           setHasValue(admittedPhysicalSlots, physical.slot)
         ) {
@@ -2667,11 +2758,13 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         addSetValue(admittedRecords, record);
         addSetValue(admittedPhysicalSlots, physical.slot);
         preparedInputs[preparedInputs.length] = Object.freeze({
+          ...(expectedSlot === undefined ? {} : { expectedSlot }),
           intentId,
           navigationGeneration,
           operation,
           registeredSlotId,
           requestClass,
+          ...(trustedServerOpportunity === undefined ? {} : { trustedServerOpportunity }),
         });
       }
     } catch {
@@ -2777,12 +2870,70 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
                   if (!allIntentsAdmitted()) {
                     throw new Error('SRA admission changed before invocation');
                   }
+                  const serviceState = gpt.serviceState();
+                  if (!serviceState.pubadsReady) gpt.enableServices();
+                  const publishRequest = (intent: RequestIntent): void => {
+                    const physical = intent.record.physical;
+                    if (!physical || intent.terminal) return;
+                    try {
+                      options.onTrustedServerRequest?.(
+                        Object.freeze({
+                          ...(intent.input.trustedServerOpportunity === undefined
+                            ? {}
+                            : { opportunity: intent.input.trustedServerOpportunity }),
+                          registeredSlotId: intent.record.view.registeredSlotId,
+                          slot: physical.slot,
+                        })
+                      );
+                    } catch {
+                      // Diagnostics request publication cannot alter the admitted GPT batch.
+                    }
+                  };
+                  if (serviceState.initialLoadDisabled) {
+                    for (let index = 0; index < intents.length; index += 1) {
+                      const intent = intents[index];
+                      const physical = intent?.record.physical;
+                      if (
+                        !intent ||
+                        intent.terminal ||
+                        intent.input.operation !== 'display' ||
+                        !physical
+                      ) {
+                        continue;
+                      }
+                      gpt.display(physical.slot);
+                    }
+                  }
+                  const refreshSlots: object[] = [];
                   for (let index = 0; index < intents.length; index += 1) {
                     const intent = intents[index];
-                    if (!intent) continue;
-                    if (!intent.terminal) armRequestDeadline(intent);
+                    const physical = intent?.record.physical;
+                    if (!intent || intent.terminal || !physical || physical.activeCycle) continue;
+                    publishRequest(intent);
+                    armRequestDeadline(intent);
+                    if (serviceState.initialLoadDisabled || intent.input.operation === 'refresh') {
+                      refreshSlots[refreshSlots.length] = physical.slot;
+                    }
                   }
-                  gpt.refresh(slots, Object.freeze({ changeCorrelator: false }));
+                  if (!serviceState.initialLoadDisabled) {
+                    for (let index = 0; index < intents.length; index += 1) {
+                      const intent = intents[index];
+                      const physical = intent?.record.physical;
+                      if (
+                        !intent ||
+                        intent.terminal ||
+                        intent.input.operation !== 'display' ||
+                        !physical ||
+                        physical.activeCycle
+                      ) {
+                        continue;
+                      }
+                      gpt.display(physical.slot);
+                    }
+                  }
+                  if (refreshSlots.length > 0) {
+                    gpt.refresh(refreshSlots, Object.freeze({ changeCorrelator: false }));
+                  }
                 });
               } catch (error) {
                 for (let index = 0; index < intents.length; index += 1) {

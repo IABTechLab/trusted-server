@@ -102,6 +102,7 @@ function handoff(overrides: Record<string, unknown> = {}): Record<string, unknow
           capturedAtMs: 12,
           elementId: 'div-1',
           adUnitPath: '/123/home',
+          requestedSlotSizes: null,
           isEmpty: false,
           renderedSize: [300, 250],
           isBackfill: false,

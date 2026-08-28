@@ -8,11 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lol_html::{
-    EndTagHandler, Settings as RewriterSettings, doc_comments, element, end,
+    EndTagHandler, Settings as RewriterSettings, element, end,
     html_content::{ContentType, EndTag},
     text,
 };
 
+use crate::integrations::datadome::{DATADOME_INTEGRATION_ID, DataDomeClientTagSuppressed};
 use crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision;
 use crate::integrations::{
     AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationDocumentState,
@@ -52,6 +53,7 @@ struct HtmlWithPostProcessing {
     origin_host: String,
     request_host: String,
     request_scheme: String,
+    csp_nonce: Option<String>,
     document_state: IntegrationDocumentState,
 }
 
@@ -106,6 +108,7 @@ impl StreamProcessor for HtmlWithPostProcessing {
             request_host: &self.request_host,
             request_scheme: &self.request_scheme,
             origin_host: &self.origin_host,
+            csp_nonce: self.csp_nonce.as_deref(),
             document_state: &self.document_state,
         };
 
@@ -198,6 +201,12 @@ pub struct HtmlProcessorConfig {
     pub body_close: BodyCloseInjection,
     /// Server-owned request-scoped render-trace overlay decision.
     pub render_trace_overlay: bool,
+    /// Whether to omit Trusted Server's automatic `DataDome` client-side tag.
+    pub suppress_datadome_client_side_tag: bool,
+    /// Set when publisher markup contains a response-bound CSP nonce.
+    pub csp_nonce_observed: Option<Arc<AtomicBool>>,
+    /// Unique nonce admitted by the response's enforcing CSP headers, if any.
+    pub csp_nonce: Option<String>,
 }
 
 impl HtmlProcessorConfig {
@@ -221,6 +230,9 @@ impl HtmlProcessorConfig {
             gpt_diagnostics: None,
             body_close: BodyCloseInjection::None,
             render_trace_overlay: false,
+            suppress_datadome_client_side_tag: false,
+            csp_nonce_observed: None,
+            csp_nonce: None,
         }
     }
 
@@ -260,10 +272,31 @@ impl HtmlProcessorConfig {
         self
     }
 
+    /// Watch publisher markup for response-bound CSP nonces before template storage.
+    #[must_use]
+    pub fn with_csp_nonce_observer(mut self, observed: Option<Arc<AtomicBool>>) -> Self {
+        self.csp_nonce_observed = observed;
+        self
+    }
+
+    /// Attach the exact response-header CSP nonce to Trusted Server script tags.
+    #[must_use]
+    pub fn with_csp_nonce(mut self, nonce: Option<String>) -> Self {
+        self.csp_nonce = nonce;
+        self
+    }
+
     /// Attach the server-owned request-scoped render-trace overlay decision.
     #[must_use]
     pub fn with_render_trace_overlay(mut self, active: bool) -> Self {
         self.render_trace_overlay = active;
+        self
+    }
+
+    /// Attach the request-scoped `DataDome` client-tag suppression decision.
+    #[must_use]
+    pub fn with_datadome_client_tag_suppression(mut self, suppress: bool) -> Self {
+        self.suppress_datadome_client_side_tag = suppress;
         self
     }
 }
@@ -278,6 +311,9 @@ impl HtmlProcessorConfig {
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
     let post_processors = config.integrations.html_post_processors();
     let document_state = IntegrationDocumentState::default();
+    if config.suppress_datadome_client_side_tag {
+        document_state.get_or_insert_with(DATADOME_INTEGRATION_ID, || DataDomeClientTagSuppressed);
+    }
 
     // Simplified URL patterns structure - stores only core data and generates variants on-demand
     struct UrlPatterns {
@@ -350,6 +386,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let gpt_diagnostics = config.gpt_diagnostics.clone();
     let body_close = config.body_close.clone();
     let render_trace_overlay = config.render_trace_overlay;
+    let csp_nonce = config.csp_nonce.clone();
 
     // No source-comment neutralization here: rewriting a publisher comment that happens
     // to match the reserved marker would change publisher content bytes. Collisions are
@@ -381,6 +418,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let ad_bids_state = ad_bids_state.clone();
             let gpt_diagnostics = gpt_diagnostics.clone();
             let body_close = body_close.clone();
+            let csp_nonce = csp_nonce.clone();
             move |el| {
                 if !injected_tsjs.get() {
                     // A shared C2 template must contain no request-scoped boot
@@ -389,20 +427,21 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     if matches!(body_close, BodyCloseInjection::Marker(_)) {
                         return Ok(());
                     }
-                    let mut snippet = String::new();
+                    let mut interstitial = String::new();
                     // The server has already interpreted and removed the reserved
                     // directive. This request-scoped inline cleanup only updates the
                     // browser-visible URL and must run before publisher/core code.
                     if let Some(cleanup_tag) = gpt_diagnostics
                         .as_ref()
-                        .and_then(GptDiagnosticsRequestDecision::url_cleanup_script_tag)
+                        .and_then(|decision| decision.url_cleanup_script_tag(csp_nonce.as_deref()))
                     {
-                        snippet.push_str(&cleanup_tag);
+                        interstitial.push_str(&cleanup_tag);
                     }
                     let ctx = IntegrationHtmlContext {
                         request_host: &patterns.request_host,
                         request_scheme: &patterns.request_scheme,
                         origin_host: &patterns.origin_host,
+                        csp_nonce: csp_nonce.as_deref(),
                         document_state: &document_state,
                     };
                     let diagnostics_requested = gpt_diagnostics
@@ -442,15 +481,15 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         None => (None, tsjs::EMPTY_AUCTION_PROJECTION_JSON_V1),
                     };
                     if let Some(debug_comment) = debug_comment {
-                        snippet.push_str(debug_comment);
-                        snippet.push('\n');
+                        interstitial.push_str(debug_comment);
+                        interstitial.push('\n');
                     }
                     // Non-TSJS vendor tags remain ordinary integration head inserts.
                     for insert in integrations.head_inserts(&ctx) {
-                        snippet.push_str(&insert);
+                        interstitial.push_str(&insert);
                     }
                     let publisher_origin = patterns.replacement_url();
-                    let boot = tsjs::tsjs_bootstrap_fragment_v1(
+                    let boot = tsjs::tsjs_bootstrap_fragment_with_nonce_and_interstitial_v1(
                         tsjs::TsjsBootScriptConfigV1 {
                             module_ids: &manifest_ids,
                             integration_configs: &integration_configs,
@@ -460,10 +499,12 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             gpt_diagnostics_active: diagnostics_active,
                         },
                         &publisher_origin,
+                        csp_nonce.as_deref(),
+                        &interstitial,
                     )
                     .or_else(|error| {
                         log::error!("invalid TSJS document boot projection: {error:?}");
-                        tsjs::tsjs_bootstrap_fragment_v1(
+                        tsjs::tsjs_bootstrap_fragment_with_nonce_and_interstitial_v1(
                             tsjs::TsjsBootScriptConfigV1 {
                                 module_ids: &manifest_ids,
                                 integration_configs: &integration_configs,
@@ -473,11 +514,12 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                                 gpt_diagnostics_active: diagnostics_active,
                             },
                             &publisher_origin,
+                            csp_nonce.as_deref(),
+                            &interstitial,
                         )
                     })
                     .unwrap_or_default();
-                    snippet.push_str(&boot);
-                    el.prepend(&snippet, ContentType::Html);
+                    el.prepend(&boot, ContentType::Html);
                     injected_tsjs.set(true);
                 }
                 Ok(())
@@ -793,6 +835,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         origin_host: config.origin_host,
         request_host: config.request_host,
         request_scheme: config.request_scheme,
+        csp_nonce: config.csp_nonce,
         document_state,
     }
 }
@@ -818,6 +861,7 @@ mod tests {
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_owned(),
             request_host: "test.example.com".to_owned(),
@@ -828,6 +872,7 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             render_trace_overlay: false,
+            suppress_datadome_client_side_tag: false,
         }
     }
 
@@ -886,7 +931,7 @@ mod tests {
     }
 
     #[test]
-    fn integration_head_injector_prepends_after_tsjs_once() {
+    fn controller_precedes_live_head_inserts_which_precede_selected_runtime() {
         struct TestHeadInjector;
 
         impl IntegrationHeadInjector for TestHeadInjector {
@@ -894,14 +939,18 @@ mod tests {
                 "test"
             }
 
-            fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-                vec!["<script>window.__testHeadInjector=true;</script>".to_owned()]
+            fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+                let nonce = ctx.csp_nonce.expect("should receive response CSP nonce");
+                vec![format!(
+                    "<script nonce=\"{nonce}\">window.__testHeadInjector=true;</script>"
+                )]
             }
         }
 
         let html = "<html><head><title>Test</title></head><body></body></html>";
 
         let mut config = create_test_config();
+        config.csp_nonce = Some("response-nonce_123=".to_owned());
         config.integrations = IntegrationRegistry::from_rewriters_with_head_injectors(
             Vec::new(),
             Vec::new(),
@@ -923,7 +972,9 @@ mod tests {
         let processed = String::from_utf8(output).expect("output should be valid UTF-8");
 
         let tsjs_marker = "id=\"trustedserver-js\"";
+        let controller_marker = "const __TSJS_SERVER_BOOT_TRANSPORT_V1__=";
         let head_marker = "window.__testHeadInjector=true";
+        let nonce_marker = "<script nonce=\"response-nonce_123=\">window.__testHeadInjector=true";
 
         assert_eq!(
             processed.matches(tsjs_marker).count(),
@@ -935,6 +986,10 @@ mod tests {
             1,
             "should inject head snippet once"
         );
+        assert!(
+            processed.contains(nonce_marker),
+            "server-generated integration scripts must share the response CSP nonce"
+        );
 
         let tsjs_index = processed
             .find(tsjs_marker)
@@ -942,13 +997,20 @@ mod tests {
         let head_index = processed
             .find(head_marker)
             .expect("should include head snippet");
+        let controller_index = processed
+            .find(controller_marker)
+            .expect("should include the bootstrap controller");
         let title_index = processed
             .find("<title>")
             .expect("should keep existing head content");
 
         assert!(
+            controller_index < head_index,
+            "the authenticated controller must run before any live integration insert"
+        );
+        assert!(
             head_index < tsjs_index,
-            "should inject config before tsjs bundle so auto-init can read it"
+            "live upstream tags must remain before the selected parser runtime"
         );
         assert!(
             tsjs_index < title_index,
@@ -1042,12 +1104,8 @@ mod tests {
             .find(bundle_marker)
             .expect("should include the selected TSJS artifact");
         assert!(
-            cleanup_index < bundle_index && bundle_index < diagnostics_index,
-            "cleanup must be an external CSP-compatible script before publisher/core work"
-        );
-        assert!(
-            !processed.contains("history.replaceState"),
-            "URL cleanup behavior must remain in its external request-scoped asset"
+            cleanup_index < bundle_index,
+            "request-scoped URL cleanup must run before publisher/core work"
         );
         assert_eq!(transport["boot"]["diagnostics"]["gpt"]["active"], true);
     }
@@ -1085,6 +1143,8 @@ mod tests {
                       diagnostics: Option<GptDiagnosticsRequestDecision>,
                       render_trace_overlay: bool| {
             let config = HtmlProcessorConfig {
+                csp_nonce_observed: None,
+                csp_nonce: None,
                 body_close: BodyCloseInjection::Marker(MARKER.to_string()),
                 origin_host: "origin.example.com".to_string(),
                 request_host: "example.com".to_string(),
@@ -1550,6 +1610,7 @@ mod tests {
             origin_host: String::new(),
             request_host: String::new(),
             request_scheme: String::new(),
+            csp_nonce: None,
             document_state: IntegrationDocumentState::default(),
         };
 
@@ -1592,6 +1653,7 @@ mod tests {
             origin_host: String::new(),
             request_host: String::new(),
             request_scheme: String::new(),
+            csp_nonce: None,
             document_state: IntegrationDocumentState::default(),
         };
 
@@ -1649,6 +1711,7 @@ mod tests {
             origin_host: String::new(),
             request_host: String::new(),
             request_scheme: String::new(),
+            csp_nonce: None,
             document_state: IntegrationDocumentState::default(),
         };
 
@@ -1697,6 +1760,7 @@ mod tests {
             origin_host: String::new(),
             request_host: String::new(),
             request_scheme: String::new(),
+            csp_nonce: None,
             document_state: IntegrationDocumentState::default(),
         };
 
@@ -1747,6 +1811,7 @@ mod tests {
             origin_host: String::new(),
             request_host: String::new(),
             request_scheme: String::new(),
+            csp_nonce: None,
             document_state: IntegrationDocumentState::default(),
         };
 
@@ -1787,6 +1852,7 @@ mod tests {
     fn ignores_the_removed_legacy_ad_slots_transport() {
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1800,6 +1866,7 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             render_trace_overlay: false,
+            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1864,6 +1931,8 @@ mod tests {
     fn injects_exact_boot_projection_before_core_without_legacy_slot_or_bid_surfaces() {
         let projection = r#"{"version":1,"auction":{"version":1,"auctionId":"auction-1","results":[{"slot":"slot-a","outcome":"no_bid"}]},"slots":[],"bids":[]}"#;
         let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
+            csp_nonce: None,
             origin_host: "origin.example.com".to_owned(),
             request_host: "example.com".to_owned(),
             request_scheme: "https".to_owned(),
@@ -1876,6 +1945,7 @@ mod tests {
             gpt_diagnostics: None,
             body_close: BodyCloseInjection::None,
             render_trace_overlay: false,
+            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1917,6 +1987,8 @@ mod tests {
         let projection = r#"{"version":1,"auction":{"version":1,"auctionId":"auction-body","results":[]},"slots":[],"bids":[]}"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(projection.to_owned())));
         let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1929,6 +2001,7 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             render_trace_overlay: false,
+            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1955,6 +2028,8 @@ mod tests {
         let projection = r#"{"version":1,"auction":{"version":1,"auctionId":"auction-many-bodies","results":[]},"bids":[]}"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(projection.to_owned())));
         let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1967,6 +2042,7 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             render_trace_overlay: false,
+            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         // Malformed HTML with two <body> elements (common in CMS template pages)
@@ -2000,6 +2076,7 @@ mod tests {
         let request_host = "proxy.test-publisher.example.com";
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.test-publisher.example.com".to_string(),
             request_host: request_host.to_string(),
@@ -2010,6 +2087,7 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             render_trace_overlay: false,
+            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -2051,6 +2129,8 @@ mod tests {
     fn injects_safe_empty_projection_when_auction_returned_nothing() {
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2063,6 +2143,7 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             render_trace_overlay: false,
+            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -2087,6 +2168,7 @@ mod tests {
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2097,6 +2179,7 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             render_trace_overlay: false,
+            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -2115,6 +2198,7 @@ mod tests {
     fn marker_mode_config(marker: &str, observer: Option<Arc<AtomicBool>>) -> HtmlProcessorConfig {
         HtmlProcessorConfig {
             csp_nonce_observed: observer,
+            csp_nonce: None,
             body_close: BodyCloseInjection::Marker(marker.to_string()),
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2125,6 +2209,7 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            render_trace_overlay: false,
         }
     }
 
@@ -2251,6 +2336,7 @@ mod tests {
         const MARKER: &str = "<!--reserved-template-cache-seam-->";
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::Marker(MARKER.to_string()),
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),

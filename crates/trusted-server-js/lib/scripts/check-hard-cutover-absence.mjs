@@ -54,7 +54,11 @@ const shippedTsjsFiles = collect(path.join(packageRoot, 'src'));
 const productionTsjsFiles = shippedTsjsFiles.filter(
   (file) => !/(?:_test|\.test)\.[cm]?[jt]sx?$/u.test(file)
 );
-const generatedTsjsFiles = collect(path.join(packageRoot, 'dist'));
+export function generatedTsjsArtifactFiles(root = packageRoot) {
+  return collect(path.resolve(root, '../dist'));
+}
+
+const generatedTsjsFiles = generatedTsjsArtifactFiles();
 const currentGuideFiles = collect(path.join(repositoryRoot, 'docs/guide'));
 const browserTestFiles = collect(
   path.join(repositoryRoot, 'crates/trusted-server-integration-tests/browser')
@@ -403,7 +407,7 @@ for (const file of forbiddenFiles) {
 
 const requiredReplacements = [
   ['crates/trusted-server-core/src/tsjs.rs', 'IntegrationConfigsV1'],
-  ['crates/trusted-server-js/lib/src/core/index.ts', '_claimBootSnapshot'],
+  ['crates/trusted-server-js/lib/src/core/index.ts', '_claimRuntimeV1'],
   ['crates/trusted-server-js/lib/src/integrations/didomi/module.ts', 'proxyPath'],
   ['crates/trusted-server-js/lib/src/integrations/prebid/module.ts', 'clientSideBidders'],
   ['crates/trusted-server-js/lib/src/integrations/sourcepoint/module.ts', 'rewriteSdk'],

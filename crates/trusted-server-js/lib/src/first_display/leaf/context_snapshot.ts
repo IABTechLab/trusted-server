@@ -8,8 +8,6 @@ export interface FirstDisplayContextRouteRuleV1 {
   readonly rewrite: (url: string) => string;
 }
 
-type ContextContributor = () => Readonly<Record<string, unknown>> | undefined;
-
 const CONFIG_FIELDS = [
   'apiHost',
   'apiProtocol',
@@ -20,6 +18,8 @@ const CONFIG_FIELDS = [
 ] as const;
 const SCRIPT_KINDS = new Set<FirstDisplayContextRouteKindV1>(['script', 'preload', 'prefetch']);
 const MAX_SEGMENTS = 100;
+const MAX_SEGMENT_LENGTH = 256;
+const MAX_SERIALIZED_SEGMENTS_LENGTH = 4_096;
 
 type ConfigField = (typeof CONFIG_FIELDS)[number];
 type PermutiveConfig = Record<ConfigField, string>;
@@ -36,7 +36,6 @@ interface PermutiveInitialBindings {
   readonly origin: string;
   readonly protocol: 'http:' | 'https:';
   readonly readStorage: (key: string) => string | null;
-  readonly registerContext: (contributor: ContextContributor) => () => void;
   readonly registerRoute: (rule: FirstDisplayContextRouteRuleV1) => () => void;
   readonly setTimer: (callback: () => void, delayMs: number) => unknown;
 }
@@ -80,7 +79,6 @@ function snapshotBindings(candidate: unknown): PermutiveInitialBindings | undefi
     'origin',
     'protocol',
     'readStorage',
-    'registerContext',
     'registerRoute',
     'setTimer',
   ]);
@@ -96,7 +94,6 @@ function snapshotBindings(candidate: unknown): PermutiveInitialBindings | undefi
     typeof fields.origin !== 'string' ||
     !['http:', 'https:'].includes(fields.protocol as string) ||
     typeof fields.readStorage !== 'function' ||
-    typeof fields.registerContext !== 'function' ||
     typeof fields.registerRoute !== 'function' ||
     typeof fields.setTimer !== 'function'
   ) {
@@ -117,7 +114,12 @@ function normalizedSegments(candidate: unknown): readonly string[] {
   const values: string[] = [];
   for (let index = 0; index < candidate.length && values.length < MAX_SEGMENTS; index += 1) {
     const value = candidate[index];
-    if (typeof value === 'string' || typeof value === 'number') values.push(String(value));
+    if (typeof value !== 'string' && typeof value !== 'number') continue;
+    const normalized = String(value);
+    if (normalized.length === 0 || normalized.length > MAX_SEGMENT_LENGTH) continue;
+    const candidateValues = [...values, normalized];
+    if (JSON.stringify(candidateValues).length > MAX_SERIALIZED_SEGMENTS_LENGTH) break;
+    values.push(normalized);
   }
   return Object.freeze(values);
 }
@@ -188,19 +190,15 @@ export function installPermutiveInitial(
   if (typeof releaseRoute !== 'function') throw new TypeError('invalid Permutive route disposer');
   own(releaseRoute);
 
-  const releaseContext = bindings.registerContext(() => {
-    let segments: readonly string[];
-    try {
-      segments = snapshotPermutiveInitialSegments(bindings.readStorage('permutive-app'));
-    } catch {
-      return undefined;
-    }
-    return segments.length === 0 ? undefined : Object.freeze({ permutive_segments: segments });
-  });
-  if (typeof releaseContext !== 'function') {
-    throw new TypeError('invalid Permutive context disposer');
+  let initialSegments: readonly string[] = Object.freeze([]);
+  try {
+    initialSegments = snapshotPermutiveInitialSegments(bindings.readStorage('permutive-app'));
+  } catch {
+    // Hostile storage is equivalent to no initial Permutive context.
   }
-  own(releaseContext);
+  if (initialSegments.length > 0) {
+    bindings.observe('segments', JSON.stringify(initialSegments));
+  }
 
   let active = true;
   let timer: unknown;

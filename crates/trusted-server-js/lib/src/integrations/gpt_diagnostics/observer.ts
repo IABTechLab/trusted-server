@@ -1,11 +1,38 @@
 import type { GoogletagDiagnosticsFact } from '../../adapters/googletag';
 import { log } from '../../core/log';
-import type { GptDiagnosticsAdManagerIdentity, Size, TsjsApi } from '../../core/types';
+import type { Size } from '../../core/types';
+import type { GptDiagnosticsOpportunityFact } from '../../shared/gpt_diagnostics';
 
 import type { GptDiagnosticsSlotLike, GptRenderFacts } from './store';
 
+export type GptDiagnosticsFact = GoogletagDiagnosticsFact | GptDiagnosticsOpportunityFact;
+
+function renderFacts(fact: Readonly<GoogletagDiagnosticsFact>): GptRenderFacts {
+  const adManager = fact.adManager;
+  return {
+    isEmpty: fact.isEmpty,
+    size: fact.size ? ([...fact.size] as Size) : undefined,
+    isBackfill: fact.isBackfill,
+    slotContentChanged: fact.slotContentChanged,
+    adManager: adManager
+      ? {
+          ...adManager,
+          yieldGroupIds: adManager.yieldGroupIds ? [...adManager.yieldGroupIds] : undefined,
+          companyIds: adManager.companyIds ? [...adManager.companyIds] : undefined,
+        }
+      : undefined,
+  };
+}
+
 export interface GptDiagnosticsObserverStore {
   markGptObserved(): void;
+  recordTrustedServerOpportunity(
+    slot: GptDiagnosticsSlotLike,
+    auctionSlotId: string,
+    opportunity: 'renderable_candidate' | 'unrenderable_candidate' | 'no_candidate',
+    trustedServerAuctionId?: string,
+    requestedSlotSizes?: ReadonlyArray<Size>
+  ): void;
   recordSlotRequested(slot: GptDiagnosticsSlotLike, timestampMs?: number): void;
   recordSlotResponseReceived(slot: GptDiagnosticsSlotLike, timestampMs?: number): void;
   recordSlotRenderEnded(
@@ -47,8 +74,20 @@ export class GptDiagnosticsObserver {
     this.started = true;
   }
 
-  consume(fact: Readonly<GoogletagDiagnosticsFact>): void {
+  consume(fact: Readonly<GptDiagnosticsFact>): void {
     this.start();
+    if (fact.kind === 'trustedServerOpportunity') {
+      this.handle(fact.kind, () =>
+        this.store.recordTrustedServerOpportunity(
+          fact.slot,
+          fact.auctionSlotId,
+          fact.opportunity,
+          fact.trustedServerAuctionId,
+          fact.requestedSlotSizes
+        )
+      );
+      return;
+    }
     if (!this.observed) {
       this.observed = true;
       this.handle('observation', () => this.store.markGptObserved());
@@ -76,22 +115,8 @@ export class GptDiagnosticsObserver {
       case 'slotRenderEnded':
         this.handle(fact.kind, () =>
           observedAtMs === undefined
-            ? this.store.recordSlotRenderEnded(slot, {
-                isEmpty: fact.isEmpty,
-                size: fact.size ? ([...fact.size] as Size) : undefined,
-                isBackfill: fact.isBackfill,
-                slotContentChanged: fact.slotContentChanged,
-              })
-            : this.store.recordSlotRenderEnded(
-                slot,
-                {
-                  isEmpty: fact.isEmpty,
-                  size: fact.size ? ([...fact.size] as Size) : undefined,
-                  isBackfill: fact.isBackfill,
-                  slotContentChanged: fact.slotContentChanged,
-                },
-                observedAtMs
-              )
+            ? this.store.recordSlotRenderEnded(slot, renderFacts(fact))
+            : this.store.recordSlotRenderEnded(slot, renderFacts(fact), observedAtMs)
         );
         return;
       case 'slotOnload':
@@ -124,10 +149,7 @@ export class GptDiagnosticsObserver {
     }
   }
 
-  private handle(
-    kind: GoogletagDiagnosticsFact['kind'] | 'observation',
-    callback: () => void
-  ): void {
+  private handle(kind: GptDiagnosticsFact['kind'] | 'observation', callback: () => void): void {
     try {
       callback();
     } catch (error) {
@@ -137,45 +159,5 @@ export class GptDiagnosticsObserver {
         // Diagnostics logging cannot escape into adapter fact delivery.
       }
     }
-  }
-
-  private installRefreshObserver(pubads: GptPubAdsService): void {
-    if (
-      typeof pubads.refresh !== 'function' ||
-      (pubads as GptPubAdsService & { [REFRESH_OBSERVER_INSTALLED]?: boolean })[
-        REFRESH_OBSERVER_INSTALLED
-      ]
-    ) {
-      return;
-    }
-    const originalRefresh = pubads.refresh;
-    const { store, window: observerWindow } = this;
-    pubads.refresh = function (this: unknown, ...args: unknown[]): unknown {
-      try {
-        if (
-          !(
-            observerWindow.tsjs?.adInitRefreshInProgress ||
-            observerWindow.tsjs?.prebidRefreshDispatchInProgress
-          )
-        ) {
-          // GPT treats a missing or null `slots` argument as "refresh every
-          // slot", and `refresh(null, opts)` is the documented way to pass
-          // options while doing so.
-          const rawSlots = args.length === 0 || args[0] == null ? pubads.getSlots?.() : args[0];
-          const slots = Array.isArray(rawSlots)
-            ? rawSlots.filter(
-                (slot): slot is GptDiagnosticsSlotLike => typeof slot === 'object' && slot !== null
-              )
-            : [];
-          if (slots.length > 0) store.recordPublisherRefresh(slots);
-        }
-      } catch {
-        // Diagnostics must not affect the original refresh.
-      }
-      return Reflect.apply(originalRefresh, this, args);
-    };
-    (pubads as GptPubAdsService & { [REFRESH_OBSERVER_INSTALLED]?: boolean })[
-      REFRESH_OBSERVER_INSTALLED
-    ] = true;
   }
 }

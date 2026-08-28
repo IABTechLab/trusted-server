@@ -137,6 +137,7 @@ export async function installGptStub(page: Page): Promise<void> {
               emit("slotRenderEnded", slot, {
                 isEmpty: false,
                 responseIdentifier: "fictional-response-1",
+                size: [300, 250],
               });
             }
           }

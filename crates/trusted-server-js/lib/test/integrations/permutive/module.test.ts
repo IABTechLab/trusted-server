@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { createPermutiveRuntime } from '../../../src/integrations/permutive/module';
+import {
+  createPermutiveIntegrationRegistration,
+  createPermutiveRuntime,
+} from '../../../src/integrations/permutive/module';
+import type { RuntimeCapabilityV1 } from '../../../src/kernel/runtime';
+
+const RELEASE_ID = 'a'.repeat(64);
 
 describe('transactional Permutive integration module', () => {
   afterEach(() => vi.useRealTimers());
@@ -32,6 +38,60 @@ describe('transactional Permutive integration module', () => {
     release();
     release();
     expect(order).toEqual(['guard:install', 'context:register', 'context:release', 'guard:reset']);
+  });
+
+  it('uses the adopted parser-time segments for the first persistent auction', () => {
+    localStorage.removeItem('permutive-app');
+    let contributor: (() => Readonly<Record<string, unknown>> | undefined) | undefined;
+    const runtime = Object.freeze({
+      registerAuctionContext: (_id: string, candidate: typeof contributor) => {
+        contributor = candidate;
+        return vi.fn();
+      },
+    }) as unknown as RuntimeCapabilityV1;
+    const preparationDisposers: Array<() => void> = [];
+    const activationDisposers: Array<() => void> = [];
+    const controller = new AbortController();
+    const registration = createPermutiveIntegrationRegistration(RELEASE_ID);
+    if (registration.phase !== 'takeover') throw new TypeError('Expected takeover registration');
+    const prepared = registration.prepareSync({
+      config: Object.freeze({}),
+      interfaces: Object.freeze({ 'runtime.v1': runtime }),
+      signal: controller.signal,
+      onDispose: (callback: () => void) => preparationDisposers.push(callback),
+    });
+    const adoption = Object.freeze({
+      version: 1 as const,
+      adoptInitialDisplay: true as const,
+      handoff: Object.freeze({
+        slices: Object.freeze(['first_display', 'permutive_initial']),
+        parserState: Object.freeze([
+          Object.freeze({
+            sliceId: 'permutive_initial',
+            observations: Object.freeze(['segments']),
+            values: Object.freeze([
+              Object.freeze(['segments', JSON.stringify(['initial-one', 'initial-two'])] as const),
+            ]),
+          }),
+        ]),
+      }),
+      identities: Object.freeze([]),
+    });
+
+    prepared.activate({
+      adoption,
+      afterCommit: vi.fn(),
+      signal: controller.signal,
+      onDispose: (callback: () => void) => activationDisposers.push(callback),
+    });
+
+    expect(contributor?.()).toEqual({
+      permutive_segments: ['initial-one', 'initial-two'],
+    });
+    expect(contributor?.()).toBeUndefined();
+
+    activationDisposers.reverse().forEach((release) => release());
+    preparationDisposers.reverse().forEach((release) => release());
   });
 
   it('bounds a context-service segment snapshot even when an injected reader overproduces', () => {

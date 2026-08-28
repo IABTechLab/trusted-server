@@ -36,6 +36,7 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::{
     default_config_key, default_config_store_name, get_settings_from_config_store,
 };
+use trusted_server_core::trace_cookie::handle_trace_mode;
 
 use trusted_server_core::platform::RuntimeServices;
 
@@ -81,8 +82,10 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let orchestrator = build_orchestrator(&settings)?;
-    let registry = IntegrationRegistry::new(&settings)?;
+    let plan = Arc::new(compile_auction_plan(&settings)?);
+    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
+    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -366,6 +369,7 @@ enum NamedRouteHandler {
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
+    TraceMode,
     Auction,
     PageBids,
     FirstPartyProxy,
@@ -450,6 +454,11 @@ fn named_routes() -> [NamedRoute; 17] {
             path: "/admin/keys/deactivate",
             primary_methods: LEGACY_ADMIN_DENY_METHODS,
             handler: NamedRouteHandler::LegacyAdminDenied,
+        },
+        NamedRoute {
+            path: "/_ts/trace",
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::TraceMode,
         },
         NamedRoute {
             path: "/auction",
@@ -541,6 +550,9 @@ fn named_route_handler(
                         handle_admin_eids_lookup(&partner_registry, &req)
                     }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
+                    NamedRouteHandler::TraceMode => {
+                        handle_trace_mode(&state.settings, req.uri().query())
+                    }
                     NamedRouteHandler::Auction => {
                         // Build the geo-aware EC context so the auction consent
                         // gate sees the caller's jurisdiction — `EcContext::default()`

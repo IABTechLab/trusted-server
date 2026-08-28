@@ -9,10 +9,11 @@ use async_trait::async_trait;
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, header};
 use error_stack::{Report, ResultExt as _};
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
-    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    PlatformSecretStore, PlatformSelectResult, ProxyHeaderEvidenceV1, ProxyResponseEvidenceV1,
-    RawProxyPolicyV1, RawProxyResponseV1, RuntimeServices, StoreId, StoreName,
+    BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec,
+    PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
+    PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
+    ProxyHeaderEvidenceV1, ProxyResponseEvidenceV1, RawProxyPolicyV1, RawProxyResponseV1,
+    RuntimeServices, StoreId, StoreName,
 };
 
 // ---------------------------------------------------------------------------

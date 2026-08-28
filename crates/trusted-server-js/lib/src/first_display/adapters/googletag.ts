@@ -172,8 +172,10 @@ interface FirstDisplayDiagnosticCycleRecord {
 interface ActiveCycle {
   readonly bindingState: { current: boolean };
   readonly diagnosticRecords: FirstDisplayDiagnosticCycleRecord[];
-  readonly elementId: string;
+  elementId: string;
+  readonly initialLoadDisabled: boolean;
   readonly operations: readonly ('display' | 'refresh')[];
+  ownership: 'publisher' | 'trusted_server';
   readonly publicCycle: FirstDisplayGptBoundCycleV1;
   readonly requestOperation: 0 | 1;
   readonly runtimeSlotNumber: number;
@@ -183,6 +185,8 @@ interface ActiveCycle {
   requested: boolean;
   requestTimer?: unknown;
   settled: boolean;
+  suppressPublisherDisplay: boolean;
+  suppressPublisherRefresh: boolean;
   unknownPriorCycle: boolean;
 }
 
@@ -370,6 +374,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
   private diagnosticFactDrops = 0;
   private nextTraceTokenOrdinal = 1;
   private readonly targetingWrites: TargetingWrite[] = [];
+  private trustedServerCall: readonly [receiver: ExternalObject, key: string] | undefined;
 
   public constructor(private readonly options: FirstDisplayGoogletagBatchOptions) {}
 
@@ -499,7 +504,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
           Object.freeze([
             cycle.publicCycle[6],
             cycle.elementId,
-            cycle.publicCycle[3],
+            cycle.ownership,
             Object.freeze(this.sealedTargetingOwnership.get(cycle.publicCycle[4]) ?? []),
             cycle.publicCycle[7],
             cycle.publicCycle[4],
@@ -668,7 +673,11 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       const slot =
         publisherSlot ??
         physicalSlot(
-          call(binding, 'defineSlot', [placement.gamUnitPath, placement.formats, element.id])
+          this.callTrustedServer(binding, 'defineSlot', [
+            placement.gamUnitPath,
+            placement.formats,
+            element.id,
+          ])
         );
       if (!slot) {
         callbacks[1](placement.slot, SLOT_UNRESOLVED);
@@ -710,7 +719,9 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         bindingState,
         diagnosticRecords: [],
         elementId: element.id,
+        initialLoadDisabled: disabled,
         operations: plan.operations,
+        ownership,
         publicCycle,
         requestOperation: plan.requestOperation,
         runtimeSlotNumber: traceTokenOrdinal,
@@ -718,6 +729,8 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         requestInvoked: false,
         requested: false,
         settled: false,
+        suppressPublisherDisplay: false,
+        suppressPublisherRefresh: false,
         unknownPriorCycle: ownership === 'publisher',
       };
       this.cycleMap.set(slot, cycle);
@@ -728,28 +741,65 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       }
     }
 
+    const armRequest = (candidate: ActiveCycle): void => {
+      if (candidate.requestInvoked) return;
+      candidate.requestInvoked = true;
+      candidate.requestTimer = this.timer(
+        () => this.failCycle(candidate, callbacks, 'gpt_request_timeout'),
+        this.options.protocol.deadlines.requestStartMs
+      );
+      candidate.completionTimer = this.timer(
+        () => this.failCycle(candidate, callbacks, 'gpt_completion_timeout'),
+        this.options.protocol.deadlines.completionMs
+      );
+    };
+    const synchronousSraCycles = [...this.cycleMap.values()].filter(
+      (candidate) =>
+        !candidate.settled &&
+        candidate.requestOperation === 0 &&
+        candidate.operations[0] === 'display'
+    );
     for (const cycle of this.cycleMap.values()) {
       if (this.disposed || cycle.settled) continue;
       try {
         for (let index = 0; index < cycle.operations.length; index += 1) {
           const operation = cycle.operations[index];
           if (index === cycle.requestOperation) {
-            cycle.requestInvoked = true;
-            cycle.requestTimer = this.timer(
-              () => this.failCycle(cycle, callbacks, 'gpt_request_timeout'),
-              this.options.protocol.deadlines.requestStartMs
-            );
-            cycle.completionTimer = this.timer(
-              () => this.failCycle(cycle, callbacks, 'gpt_completion_timeout'),
-              this.options.protocol.deadlines.completionMs
-            );
+            if (operation === 'display' && cycle.requestOperation === 0) {
+              for (const candidate of synchronousSraCycles) armRequest(candidate);
+            } else {
+              armRequest(cycle);
+            }
             if (!this.firstAction) {
               this.firstAction = true;
-              if (!callbacks[2]()) throw new TypeError('tsjs');
+              if (!callbacks[2]()) {
+                for (const active of this.cycleMap.values()) {
+                  this.failCycle(active, callbacks, GPT_REQUEST_FAILED);
+                }
+                return;
+              }
+              if (member(binding, 'pubadsReady') !== true) {
+                try {
+                  call(service, 'enableSingleRequest', []);
+                  call(binding, 'enableServices', []);
+                } catch {
+                  for (const active of this.cycleMap.values()) {
+                    this.failCycle(active, callbacks, GPT_REQUEST_FAILED);
+                  }
+                  return;
+                }
+              }
             }
+            if (cycle.settled) break;
           }
-          if (operation === 'display') call(binding, 'display', [cycle.elementId]);
-          else call(service, 'refresh', [[cycle.publicCycle[4]], { changeCorrelator: false }]);
+          if (operation === 'display') {
+            this.callTrustedServer(binding, 'display', [cycle.elementId]);
+          } else {
+            this.callTrustedServer(service, 'refresh', [
+              [cycle.publicCycle[4]],
+              { changeCorrelator: false },
+            ]);
+          }
         }
       } catch {
         if (cycle.settled) continue;
@@ -947,6 +997,147 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     });
   }
 
+  private replacementSizesEqual(
+    candidate: unknown,
+    expected: readonly (readonly [number, number])[]
+  ): boolean {
+    if (!Array.isArray(candidate)) return false;
+    const values =
+      candidate.length === 2 && candidate.every((value) => typeof value === 'number')
+        ? [candidate]
+        : candidate;
+    if (values.length !== expected.length) return false;
+    return values.every(
+      (value, index) =>
+        Array.isArray(value) &&
+        value.length === 2 &&
+        value[0] === expected[index]?.[0] &&
+        value[1] === expected[index]?.[1]
+    );
+  }
+
+  private claimPublisherSlot(arguments_: readonly unknown[]): ActiveCycle | undefined {
+    if (arguments_.length !== 3 || typeof arguments_[2] !== 'string') return undefined;
+    const elementId = arguments_[2];
+    const exact: ActiveCycle[] = [];
+    const hydration: ActiveCycle[] = [];
+    for (const cycle of this.cycleMap.values()) {
+      if (cycle.ownership !== 'trusted_server' || !cycle.bindingState.current) continue;
+      if (cycle.elementId === elementId) {
+        exact.push(cycle);
+        continue;
+      }
+      const placement = cycle.publicCycle[5];
+      const oldElement = this.options.document.getElementById(cycle.elementId);
+      const replacement = this.options.document.getElementById(elementId);
+      if (
+        elementId.startsWith(placement.divId) &&
+        (!oldElement || !oldElement.isConnected) &&
+        replacement?.isConnected === true &&
+        arguments_[0] === placement.gamUnitPath &&
+        this.replacementSizesEqual(arguments_[1], placement.formats)
+      ) {
+        hydration.push(cycle);
+      }
+    }
+    const matches = exact.length > 0 ? exact : hydration;
+    if (matches.length !== 1) return undefined;
+    const cycle = matches[0];
+    if (!cycle) return undefined;
+    const slot = cycle.publicCycle[4];
+    try {
+      this.observePublisherTargeting(slot);
+    } catch {
+      return undefined;
+    }
+    for (const [key, installed] of targetingEntries(cycle.publicCycle[0], cycle.publicCycle[5])) {
+      this.targetingRestorers.push({ installed, key, prior: Object.freeze([]), slot, valid: true });
+    }
+    if (exact.length === 1) {
+      const placement = cycle.publicCycle[5];
+      const formatsMismatch = !this.replacementSizesEqual(arguments_[1], placement.formats);
+      const pathMismatch = arguments_[0] !== placement.gamUnitPath;
+      if (formatsMismatch || pathMismatch) {
+        try {
+          this.options.document.defaultView?.console.warn(
+            'GPT publisher handoff metadata mismatch',
+            {
+              formatsMismatch,
+              pathMismatch,
+            }
+          );
+        } catch {
+          // A bounded local diagnostic cannot block exact publisher ownership transfer.
+        }
+      }
+    }
+    cycle.ownership = 'publisher';
+    cycle.elementId = elementId;
+    cycle.suppressPublisherDisplay = true;
+    cycle.suppressPublisherRefresh = this.binding
+      ? initialLoadDisabled(this.binding)
+      : cycle.initialLoadDisabled;
+    this.createdSlots.delete(slot);
+    return cycle;
+  }
+
+  private publisherCycleForTarget(target: unknown): ActiveCycle | undefined {
+    const slot = physicalSlot(target);
+    if (slot) return this.cycleMap.get(slot);
+    if (typeof target !== 'string') return undefined;
+    const matches = [...this.cycleMap.values()].filter((cycle) => cycle.elementId === target);
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+
+  private mediatePublisherRequest(
+    key: string,
+    arguments_: readonly unknown[]
+  ):
+    | Readonly<{ action: 'forward'; arguments: readonly unknown[] }>
+    | Readonly<{ action: 'suppress' }> {
+    if (key === 'display' && arguments_.length === 1) {
+      const cycle = this.publisherCycleForTarget(arguments_[0]);
+      if (cycle?.suppressPublisherDisplay) {
+        cycle.suppressPublisherDisplay = false;
+        return Object.freeze({ action: 'suppress' });
+      }
+    }
+    if (key !== 'refresh' || arguments_.length > 2) {
+      return Object.freeze({ action: 'forward', arguments: arguments_ });
+    }
+    let requested: readonly unknown[];
+    if (arguments_[0] === undefined) {
+      const all = this.service ? call(this.service, 'getSlots', []) : undefined;
+      if (!Array.isArray(all)) return Object.freeze({ action: 'forward', arguments: arguments_ });
+      requested = all;
+    } else if (Array.isArray(arguments_[0])) {
+      requested = arguments_[0];
+    } else {
+      return Object.freeze({ action: 'forward', arguments: arguments_ });
+    }
+    const forwarded: object[] = [];
+    let suppressed = false;
+    for (const candidate of requested) {
+      const slot = physicalSlot(candidate);
+      const cycle = slot ? this.cycleMap.get(slot) : undefined;
+      if (cycle?.suppressPublisherRefresh) {
+        cycle.suppressPublisherRefresh = false;
+        suppressed = true;
+      } else if (slot) {
+        forwarded.push(slot);
+      }
+    }
+    if (!suppressed) return Object.freeze({ action: 'forward', arguments: arguments_ });
+    if (forwarded.length === 0) return Object.freeze({ action: 'suppress' });
+    return Object.freeze({
+      action: 'forward',
+      arguments: Object.freeze([
+        Object.freeze(forwarded),
+        ...(arguments_.length === 2 ? [arguments_[1]] : []),
+      ]),
+    });
+  }
+
   private observePublisherCalls(
     binding: ExternalObject,
     service: ExternalObject,
@@ -972,11 +1163,41 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
           destroyed: readonly ActiveCycle[]
         ): void =>
           this.invalidateCyclesForPublisherCall(key, arguments_, result, destroyed, callbacks);
+        const invalidateRequest = (arguments_: readonly unknown[]): void =>
+          this.invalidateCyclesForPublisherRequest(key, arguments_, callbacks);
+        const claimPublisherSlot = (arguments_: readonly unknown[]): ActiveCycle | undefined =>
+          this.claimPublisherSlot(arguments_);
+        const mediatePublisherRequest = (arguments_: readonly unknown[]) =>
+          this.mediatePublisherRequest(key, arguments_);
+        const trustedServer = (): boolean => {
+          const current = this.trustedServerCall;
+          if (!current || current[0] !== receiver || current[1] !== key) return false;
+          this.trustedServerCall = undefined;
+          return true;
+        };
         const wrapper = function (this: unknown, ...arguments_: unknown[]): unknown {
+          const trusted = this === receiver && trustedServer();
           const destroyed = this === receiver ? snapshotDestroy(arguments_) : Object.freeze([]);
-          const result = Reflect.apply(original, this, arguments_);
-          if (this === receiver) {
-            invalidate(arguments_, result, destroyed);
+          let forwardedArguments: readonly unknown[] = arguments_;
+          if (this === receiver && !trusted) {
+            if (key === 'defineSlot') {
+              const claimed = claimPublisherSlot(arguments_);
+              if (claimed) {
+                notify();
+                return claimed.publicCycle[4];
+              }
+            }
+            const mediation = mediatePublisherRequest(arguments_);
+            if (mediation.action === 'suppress') {
+              notify();
+              return undefined;
+            }
+            forwardedArguments = mediation.arguments;
+            invalidateRequest(forwardedArguments);
+          }
+          const result = Reflect.apply(original, this, forwardedArguments);
+          if (this === receiver && !trusted) {
+            invalidate(forwardedArguments, result, destroyed);
             notify();
           }
           return result;
@@ -1078,6 +1299,58 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       }
     } catch {
       // The publisher call already completed; observation cannot alter its result.
+    }
+  }
+
+  private invalidateCyclesForPublisherRequest(
+    key: string,
+    arguments_: readonly unknown[],
+    callbacks: FirstDisplayGoogletagBatchCallbacks
+  ): void {
+    try {
+      const cycles: ActiveCycle[] = [];
+      if (key === 'display') {
+        const requested = arguments_[0];
+        const slot = physicalSlot(requested);
+        const exactCycle = slot ? this.cycleMap.get(slot) : undefined;
+        if (exactCycle) cycles.push(exactCycle);
+        else if (typeof requested === 'string') {
+          for (const cycle of this.cycleMap.values()) {
+            if (cycle.elementId === requested) cycles.push(cycle);
+          }
+        }
+      } else if (key === 'refresh') {
+        const requested = arguments_[0];
+        if (requested === undefined) cycles.push(...this.cycleMap.values());
+        else if (Array.isArray(requested)) {
+          for (const candidate of requested) {
+            const slot = physicalSlot(candidate);
+            const cycle = slot ? this.cycleMap.get(slot) : undefined;
+            if (cycle && !cycles.includes(cycle)) cycles.push(cycle);
+          }
+        }
+      }
+      for (const cycle of cycles) {
+        if (cycle.settled) this.retireCycle(cycle, callbacks);
+        else this.failCycle(cycle, callbacks, 'cycle_unattributable');
+      }
+    } catch {
+      // Publisher calls remain pass-through even if competition observation fails.
+    }
+  }
+
+  private callTrustedServer(
+    receiver: ExternalObject,
+    key: string,
+    arguments_: readonly unknown[]
+  ): unknown {
+    if (this.trustedServerCall) throw new TypeError('tsjs');
+    const marker = Object.freeze([receiver, key] as const);
+    this.trustedServerCall = marker;
+    try {
+      return call(receiver, key, arguments_);
+    } finally {
+      if (this.trustedServerCall === marker) this.trustedServerCall = undefined;
     }
   }
 
@@ -1231,6 +1504,14 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       return typeof value === 'boolean' ? value : null;
     };
     const visibility = member(event, 'inViewPercentage');
+    const requestedSlotSizes =
+      eventType === SLOT_REQUESTED && disposition === 'matched' && !cycle.settled
+        ? Object.freeze(
+            cycle.publicCycle[5].formats
+              .slice(0, 16)
+              .map((size) => Object.freeze([size[0], size[1]] as const))
+          )
+        : null;
     const fact: Readonly<FirstDisplayGptFactV1> = Object.freeze({
       version: 1,
       event: eventType,
@@ -1242,6 +1523,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       capturedAtMs: observedAtMs,
       elementId: cycle.elementId,
       adUnitPath: cycle.publicCycle[5].gamUnitPath,
+      requestedSlotSizes,
       isEmpty: eventType === SLOT_RENDER_ENDED ? optionalBoolean('isEmpty') : null,
       renderedSize,
       isBackfill: eventType === SLOT_RENDER_ENDED ? optionalBoolean('isBackfill') : null,

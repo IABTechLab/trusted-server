@@ -36,20 +36,6 @@ interface BadgeOptions {
   scheduleFrame?: ((callback: () => void) => () => void) | undefined;
 }
 
-function defaultScheduleFrame(callback: () => void): () => void {
-  if (typeof requestAnimationFrame === 'function' && typeof cancelAnimationFrame === 'function') {
-    const frame = requestAnimationFrame(() => callback());
-    return () => cancelAnimationFrame(frame);
-  }
-  let active = true;
-  queueMicrotask(() => {
-    if (active) callback();
-  });
-  return () => {
-    active = false;
-  };
-}
-
 function intersectsViewport(rectangle: DOMRect, window: Window): boolean {
   return (
     rectangle.width > 0 &&
@@ -117,10 +103,6 @@ function deliveryLabel(cycle: GptDiagnosticsRequestCycle): string | undefined {
     default:
       return unhandledCase(cycle.delivery);
   }
-}
-
-function formatSizes(sizes: ReadonlyArray<readonly [number, number]>): string {
-  return sizes.map((size) => `${size[0]}×${size[1]}`).join(', ');
 }
 
 /** Format one observed GPT request cycle for both badge and accessible text surfaces. */
@@ -191,7 +173,8 @@ export class GptDiagnosticsBadgeManager {
       options.window ??
       (this.document.defaultView as unknown as BadgeWindow | null) ??
       (window as unknown as BadgeWindow);
-    this.scheduleFrame = options.scheduleFrame ?? defaultScheduleFrame;
+    this.scheduleFrame =
+      options.scheduleFrame ?? ((callback) => scheduleFrame(this.window, callback));
     this.refreshSlotElementIds();
     this.unsubscribeStore = this.store.subscribe(() => {
       this.refreshSlotElementIds();

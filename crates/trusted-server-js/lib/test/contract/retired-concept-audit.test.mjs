@@ -33,7 +33,7 @@ const historicalPerformanceFixturePath = path.join(
   'crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json'
 );
 const mainAuditSha = 'f6a2fb85ce623bf8a574e3941e1ee349acc3412d';
-const rcBaselineSha = 'f0825604ec6740111e99dd8a178e3b880e7d772b';
+const rcBaselineSha = '985ff22987d80cc729f45f702e0c3548e429b2cf';
 const parsedAuditFixture = JSON.parse(readFileSync(auditFixturePath, 'utf8'));
 const auditedClassifications = Array.isArray(parsedAuditFixture)
   ? parsedAuditFixture
@@ -457,8 +457,8 @@ test('rc-baseline authority and final pass-gap classifications are pinned', () =
   });
   assertRetiredConceptAudit(result);
   assert.deepEqual(result.rcBaseline.classificationCounts, {
-    baselineOwned: 18,
-    implementationGap: 5,
+    baselineOwned: 19,
+    implementationGap: 4,
   });
   assert.deepEqual(
     result.rcBaseline.classifications.map(({ id }) => id).sort(),
@@ -554,7 +554,7 @@ git mv crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs crat
 
 test('the implementation plan contains no executable retired-source command', () => {
   const planSource = readFileSync(planPath, 'utf8');
-  assert.equal(countExecutableShellFences(planSource), 61);
+  assert.equal(countExecutableShellFences(planSource), 62);
   assert.deepEqual(auditRetiredPlanCommands(planSource), []);
 
   const mutatedPlanSource = planSource.replace(

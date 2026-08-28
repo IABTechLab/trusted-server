@@ -102,7 +102,7 @@ describe('tsjs-prebid shim artifact', () => {
     // the shim size; retain a margin above the normal compact shim output.
     expect(bundleCode.length).toBeGreaterThan(200_000);
     expect(shimCode.length).toBeLessThan(30_000);
-    expect(shimCode).toContain('markWinningBidAsUsed');
+    expect(shimCode).toContain('registerTrustedServerBidder');
   });
 });
 

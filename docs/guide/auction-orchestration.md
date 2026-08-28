@@ -699,7 +699,7 @@ Each proxied URL includes a `tstoken` HMAC signature for tamper protection. See 
 
 ### Full example
 
-```toml
+````toml
 [auction]
 enabled = true
 sanitize_creatives = false     # Opt-in; blanks script-based creatives when enabled
@@ -734,9 +734,6 @@ account_id = "example-aps-account"
 debug = false
 allow_script_creatives = false
 
-[integrations.aps]
-enabled = true
-rendering_mode = "trusted_server"
 
 ### Configuration Reference
 
@@ -767,18 +764,14 @@ environment overrides to apply; see
 | `debug`          | bool     | `false`           | Enable Prebid debug mode (sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus`) |
 | `test_mode`      | bool     | `false`           | Set OpenRTB `test: 1` for non-billable test traffic                                    |
 
-#### `[integrations.aps]`
+#### APS provider profile
 
-| Field                    | Type              | Default                       | Description                                                       |
-| ------------------------ | ----------------- | ----------------------------- | ----------------------------------------------------------------- |
-| `enabled`                | bool              | `false`                       | Enable APS provider                                               |
-| `account_id`             | string or integer | —                             | APS account ID (required)                                         |
-| `endpoint`               | string            | Built-in APS OpenRTB endpoint | Optional APS OpenRTB endpoint override                            |
-| `timeout_ms`             | u32               | `800`                         | Request timeout                                                   |
-| `debug`                  | bool              | `false`                       | Include the raw APS HTTP exchange in `/auction` provider metadata |
-| `inventory_domain`       | string            | —                             | Override `site.domain` for APS-authorized inventory               |
-| `inventory_page_origin`  | string            | —                             | HTTPS origin paired with `inventory_domain` for `site.page`       |
-| `allow_script_creatives` | bool              | `false`                       | Admit script bids before APS candidate reduction                  |
+APS is enabled only by an `[auction.providers.<id>]` row with
+`profile = "aps"`. Its common `endpoint` and `timeout_ms` fields belong on that
+provider row. Put `account_id`, `debug`, `inventory_domain`,
+`inventory_page_origin`, and `allow_script_creatives` under the provider's
+`profile_config` table. The compiled plan also owns browser renderer and runner
+route registration; there is no separate browser-mode switch.
 
 #### `[integrations.adserver_mock]`
 
@@ -811,7 +804,7 @@ allowed_domains = ["assets.example.com"]
 enabled = true
 endpoint = "https://mediator.example.com/mediate"
 timeout_ms = 500
-```
+````
 
 `[auction.providers]` is a map, not a provider-name list. Each provider ID owns
 endpoint/backend correlation and telemetry. `[auction.bidders]` maps each

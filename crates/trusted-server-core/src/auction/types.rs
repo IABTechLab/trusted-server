@@ -210,6 +210,8 @@ pub struct AuctionContext<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuctionDropReason {
+    /// Configured processing rejected an ordinary creative's only render source.
+    CreativeProcessingRejected,
     /// Optional creative ID is present with an invalid type or value.
     InvalidCreativeId,
     /// Optional creative ID exceeds its UTF-8 byte bound.
@@ -272,6 +274,7 @@ impl AuctionDropReason {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::CreativeProcessingRejected => "creative_processing_rejected",
             Self::InvalidCreativeId => "invalid_creative_id",
             Self::CreativeIdTooLarge => "creative_id_too_large",
             Self::DimensionsOutOfRange => "dimensions_out_of_range",
@@ -979,6 +982,28 @@ pub struct Bid {
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
+/// Length of the hex-encoded creative trace hash.
+const ADM_TRACE_HASH_LEN: usize = 16;
+
+/// Compute the trace hash for delivered creative markup.
+#[must_use]
+pub fn adm_trace_hash(adm: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let digest = Sha256::digest(adm.as_bytes());
+    let mut hex = hex::encode(digest);
+    hex.truncate(ADM_TRACE_HASH_LEN);
+    hex
+}
+
+impl Bid {
+    /// Trace hash of this bid's creative markup, when present.
+    #[must_use]
+    pub fn creative_trace_hash(&self) -> Option<String> {
+        self.creative.as_deref().map(adm_trace_hash)
+    }
+}
+
 /// Per-provider summary included in the auction response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderSummary {
@@ -1119,6 +1144,7 @@ mod tests {
     #[test]
     fn typed_drop_reasons_use_exact_literals_in_provider_summary_metadata() {
         let reasons = [
+            AuctionDropReason::CreativeProcessingRejected,
             AuctionDropReason::InvalidCreativeId,
             AuctionDropReason::CreativeIdTooLarge,
             AuctionDropReason::DimensionsOutOfRange,

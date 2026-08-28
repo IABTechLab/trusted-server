@@ -9,6 +9,9 @@ import type { TsjsApi, TsjsBootV1 } from '../../src/core/types';
 
 const RELEASE = 'a'.repeat(64);
 const RUNTIME_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+let pendingDirectBind: ((input: unknown) => unknown) | undefined;
+let namespaceTarget: unknown;
+let namespaceSourceLive = false;
 
 function boot() {
   return snapshotTsjsBootV1(
@@ -152,7 +155,15 @@ function installRuntimeScript(): void {
   script.id = 'trustedserver-js';
   script.src = new URL(RUNTIME_SRC, window.location.origin).href;
   document.head.append(script);
-  Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
+  Object.defineProperty(window.Document.prototype, 'currentScript', {
+    configurable: true,
+    get: () => script,
+  });
+}
+
+function installNamespaceGate(target: object): void {
+  namespaceTarget = target;
+  namespaceSourceLive = true;
 }
 
 function bootIntegrity(acceptedBoot: Readonly<TsjsBootV1>) {
@@ -164,22 +175,44 @@ function bootIntegrity(acceptedBoot: Readonly<TsjsBootV1>) {
 }
 
 function installBootClaim(
-  target: object,
+  _target: object,
   acceptedBoot: Readonly<TsjsBootV1>,
   integrity = bootIntegrity(acceptedBoot)
 ): ReturnType<typeof vi.fn> {
   const completed = vi.fn();
   const claim = (source: unknown) => {
     if (source !== document.currentScript) return undefined;
-    Reflect.deleteProperty(target, '_claimBootSnapshot');
-    return Object.freeze({ boot: acceptedBoot, integrity, complete: completed });
+    const takeover = Object.getOwnPropertyDescriptor(_target, '_firstDisplayTakeover');
+    const mode = takeover ? 'takeover' : 'direct';
+    return Object.freeze({
+      source,
+      target: _target,
+      boot: acceptedBoot,
+      integrity,
+      complete: completed,
+      currentScript: () => document.currentScript,
+      mode,
+      bind:
+        mode === 'direct'
+          ? (input: unknown) => pendingDirectBind?.(input)
+          : (input: unknown) =>
+              takeover && 'value' in takeover && typeof takeover.value === 'function'
+                ? takeover.value(document.currentScript, input)
+                : undefined,
+    });
   };
-  Object.defineProperty(target, '_claimBootSnapshot', {
-    configurable: true,
+  Object.defineProperty(document.currentScript as HTMLScriptElement, '_claimRuntimeV1', {
+    configurable: false,
     enumerable: false,
     value: claim,
     writable: false,
   });
+  return completed;
+}
+
+function installDirectRuntimeClaim(_target: object): ReturnType<typeof vi.fn> {
+  const completed = vi.fn();
+  pendingDirectBind = () => completed;
   return completed;
 }
 
@@ -188,7 +221,20 @@ describe('core production bootstrap', () => {
     await vi.resetModules();
     document.head.replaceChildren();
     document.body.innerHTML = '';
-    delete (window as unknown as { tsjs?: unknown }).tsjs;
+    if (!Object.getOwnPropertyDescriptor(window, 'tsjs')) {
+      Object.defineProperty(window, 'tsjs', {
+        configurable: false,
+        enumerable: true,
+        get: () => {
+          if (!namespaceSourceLive) return namespaceTarget;
+          namespaceSourceLive = false;
+          return document.currentScript;
+        },
+      });
+    }
+    namespaceTarget = undefined;
+    namespaceSourceLive = false;
+    pendingDirectBind = undefined;
     installRuntimeScript();
   });
 
@@ -203,7 +249,8 @@ describe('core production bootstrap', () => {
       bids: { legacy: true },
     };
     installBootClaim(preload, preload.boot);
-    (window as unknown as { tsjs?: unknown }).tsjs = preload;
+    installDirectRuntimeClaim(preload);
+    installNamespaceGate(preload);
 
     await loadMinimalProductionRuntime();
     await vi.waitFor(() =>
@@ -234,7 +281,8 @@ describe('core production bootstrap', () => {
     const readyState = vi.spyOn(document, 'readyState', 'get').mockReturnValue('loading');
     const preload = { boot: boot(), que: [] };
     installBootClaim(preload, preload.boot);
-    (window as unknown as { tsjs?: unknown }).tsjs = preload;
+    installDirectRuntimeClaim(preload);
+    installNamespaceGate(preload);
 
     try {
       await loadMinimalProductionRuntime();
@@ -255,7 +303,7 @@ describe('core production bootstrap', () => {
         preload.boot,
         Object.freeze({ ...bootIntegrity(preload.boot), [field]: 'f'.repeat(64) })
       );
-      (window as unknown as { tsjs?: unknown }).tsjs = preload;
+      installNamespaceGate(preload);
 
       await loadMinimalProductionRuntime();
       await Promise.resolve();
@@ -284,7 +332,7 @@ describe('core production bootstrap', () => {
       preload.boot,
       Object.freeze({ ...bootIntegrity(preload.boot), projectionDigest: 'f'.repeat(64) })
     );
-    (window as unknown as { tsjs?: unknown }).tsjs = preload;
+    installNamespaceGate(preload);
 
     await loadMinimalProductionRuntime();
     await Promise.resolve();
@@ -326,7 +374,7 @@ describe('core production bootstrap', () => {
       });
     }
     const rejected = installBootClaim(preload, candidate, integrity);
-    (window as unknown as { tsjs?: unknown }).tsjs = preload;
+    installNamespaceGate(preload);
     const { startProductionRuntime } = await import('../../src/core/index');
     const createComposition = vi.fn(() => ({
       runtime: { start: vi.fn(() => true) },
@@ -349,7 +397,7 @@ describe('core production bootstrap', () => {
       enumerable: true,
       value: () => preload.boot,
     });
-    (window as unknown as { tsjs?: unknown }).tsjs = preload;
+    installNamespaceGate(preload);
 
     await import('../../src/composition/runtime_transport');
     await Promise.resolve();
@@ -357,6 +405,27 @@ describe('core production bootstrap', () => {
     expect(preload).toHaveProperty('_claimBootSnapshot');
     expect(preload).not.toHaveProperty('_internal');
     expect(preload).not.toHaveProperty('requestAds');
+  });
+
+  it('disposes prepared runtime state and completes abi_mismatch when the direct claim rejects', async () => {
+    const preload = { boot: boot(), que: [] };
+    const rejected = installBootClaim(preload, preload.boot);
+    pendingDirectBind = () => undefined;
+    installNamespaceGate(preload);
+    const { startProductionRuntime } = await import('../../src/core/index');
+    const dispose = vi.fn();
+    const start = vi.fn(() => true);
+    const createComposition = vi.fn(() => ({
+      runtime: { dispose, start },
+    })) as unknown as Parameters<typeof startProductionRuntime>[0];
+
+    startProductionRuntime(createComposition);
+
+    expect(createComposition).toHaveBeenCalledOnce();
+    expect(start).not.toHaveBeenCalled();
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(rejected).toHaveBeenCalledOnce();
+    expect(rejected).toHaveBeenCalledWith('abi_mismatch');
   });
 
   it('does not publish a fallback API over a non-configurable boot claim', async () => {
@@ -367,7 +436,7 @@ describe('core production bootstrap', () => {
       value: () => preload.boot,
       writable: false,
     });
-    (window as unknown as { tsjs?: unknown }).tsjs = preload;
+    installNamespaceGate(preload);
 
     await import('../../src/composition/runtime_transport');
     await Promise.resolve();

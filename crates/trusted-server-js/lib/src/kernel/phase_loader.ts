@@ -222,6 +222,8 @@ export interface DeferredPhaseLoader {
 
 export interface DeferredPhaseLoaderOptions {
   readonly runtimeScript: HTMLScriptElement;
+  /** Bootstrap-captured native current-script observation for registration authentication. */
+  readonly currentScript?: () => HTMLScriptElement | null;
   readonly document: Document;
   readonly prepare: (
     registration: DeferredIntegrationRegistration,
@@ -234,6 +236,7 @@ export interface DeferredPhaseLoaderOptions {
   readonly manifest: BootManifestV1;
   readonly releaseId: string;
   readonly scheduler?: Pick<PhaseScheduler, 'clearTimeout' | 'setTimeout'>;
+  readonly trustedScriptUrl?: (value: string) => unknown;
 }
 
 interface DeferredTransaction {
@@ -310,6 +313,16 @@ export function createDeferredPhaseLoader(
   let disposed = false;
   let privatePolicy: Readonly<{ createScriptURL: (value: string) => unknown }> | null | undefined;
   const exactUrls = new Set(transactions.map(({ expectedUrl }) => expectedUrl));
+  const trustedCurrentScript = (): HTMLScriptElement | null => {
+    try {
+      if (options.currentScript) return options.currentScript();
+      const candidate = options.document.currentScript;
+      const Script = options.document.defaultView?.HTMLScriptElement;
+      return Script && candidate instanceof Script ? candidate : null;
+    } catch {
+      return null;
+    }
+  };
 
   const removeNode = (transaction: DeferredTransaction): void => {
     const script = transaction.script;
@@ -461,6 +474,10 @@ export function createDeferredPhaseLoader(
     if (privatePolicy !== undefined) return privatePolicy;
     privatePolicy = null;
     try {
+      if (options.trustedScriptUrl) {
+        privatePolicy = Object.freeze({ createScriptURL: options.trustedScriptUrl });
+        return privatePolicy;
+      }
       const trustedTypes = options.document.defaultView as
         | (Window & {
             trustedTypes?: {
@@ -545,19 +562,14 @@ export function createDeferredPhaseLoader(
         return false;
       }
       const transaction = byId.get(registration.id);
-      if (!transaction || transaction.state !== 'loading' || transaction.registration) {
-        if (transaction) settleUnavailable(transaction, 'registration_rejected');
+      if (!transaction) return false;
+      const currentScript = trustedCurrentScript();
+      if (currentScript !== transaction.script) return false;
+      if (transaction.state !== 'loading' || transaction.registration) {
+        settleUnavailable(transaction, 'registration_rejected');
         return false;
       }
-      const currentScript = options.document.currentScript;
-      const Script = options.document.defaultView?.HTMLScriptElement;
-      if (
-        !Script ||
-        !(currentScript instanceof Script) ||
-        currentScript !== transaction.script ||
-        !currentScript.isConnected ||
-        currentScript.src !== transaction.expectedUrl
-      ) {
+      if (!currentScript.isConnected || currentScript.src !== transaction.expectedUrl) {
         settleUnavailable(transaction, 'registration_rejected');
         return false;
       }

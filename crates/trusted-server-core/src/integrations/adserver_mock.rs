@@ -954,8 +954,8 @@ mod tests {
         );
         assert_eq!(
             bid.bid_id.as_deref(),
-            Some("mediated-bid-001"),
-            "should carry the mediated OpenRTB bid id so hb_adid always has a source"
+            Some("source-bid-id"),
+            "should preserve the source provider's upstream bid id"
         );
         assert_eq!(
             bid.ad_id.as_deref(),
@@ -986,9 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_mediation_response_falls_back_to_original_bid_id() {
-        // A mediator that omits the per-bid `id` must not strand a pass-through
-        // bid whose only hb_adid source is its OpenRTB bid id.
+    fn parse_mediation_response_preserves_source_bid_id_when_selection_id_is_absent() {
         let provider = AdServerMockProvider::new(AdServerMockConfig::default());
         let mediation_response = json!({
             "id": "test-auction-123",
@@ -997,23 +995,21 @@ mod tests {
                 "bid": [{
                     "impid": "header-banner",
                     "price": 0.20,
-                    "adm": "<div>Mediated Ad</div>",
                     "w": 728,
                     "h": 90,
-                    "crid": "example-bidder-creative"
+                    "ext": {"trusted_server": {"candidate_id": "AAAAAAAAAAAA"}}
                 }]
             }],
             "cur": "USD"
         });
         let mut bid_index = BidIndex::new();
         bid_index.insert(
-            (
-                "prebid".to_string(),
-                "header-banner".to_string(),
-                "example-bidder".to_string(),
-            ),
+            "AAAAAAAAAAAA".to_string(),
             Bid {
                 slot_id: "header-banner".to_string(),
+                candidate_id: Some("AAAAAAAAAAAA".to_string()),
+                candidate_provider: Some("prebid".to_string()),
+                renderer_reservation_id: None,
                 price: Some(0.20),
                 currency: "USD".to_string(),
                 creative: Some("<div>Original Ad</div>".to_string()),
@@ -1038,10 +1034,12 @@ mod tests {
         let auction_response =
             provider.parse_mediation_response(&mediation_response, 42, &bid_index);
 
+        assert_eq!(auction_response.status, BidStatus::Success);
+        assert_eq!(auction_response.bids.len(), 1);
         assert_eq!(
             auction_response.bids[0].bid_id.as_deref(),
             Some("019f7e2a-b45b-70b0-a2d1-b651c430700b"),
-            "should restore the original SSP bid id when the mediator omits one"
+            "should preserve the source provider's upstream bid id"
         );
     }
 

@@ -669,11 +669,15 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
     this.disposeNativeMutationIngress();
     try {
       this.productionBatch?.[5]();
+    } catch {
+      // Every owned subsystem must still receive its independent disposal attempt.
+    }
+    try {
       this.options.production?.renderer?.[9]();
-      this.bound.clear();
     } catch {
       // Disposal is generation-latched; physical cleanup failure cannot restore authority.
     }
+    this.bound.clear();
   }
 
   private installNativeMutationIngress(): void {
@@ -841,13 +845,12 @@ export function prepareFirstDisplayBase(
         throw new TypeError('tsjs');
       }
       const installed = install(transported[0], own, transported[1]);
-      if (protocolId && SLICE_PROTOCOLS.includes(protocolId)) {
-        if (!fullProtocolIdentity(installed, protocolId)) {
-          throw new TypeError('tsjs');
-        }
-        if (AUCTION_PROTOCOLS.includes(protocolId as FirstDisplayAuctionProtocolId)) {
-          if (!protocolIdentity(installed, protocolId)) throw new TypeError('tsjs');
-        }
+      if (
+        protocolId &&
+        SLICE_PROTOCOLS.includes(protocolId) &&
+        !protocolIdentity(installed, protocolId)
+      ) {
+        throw new TypeError('tsjs');
       }
     },
   });

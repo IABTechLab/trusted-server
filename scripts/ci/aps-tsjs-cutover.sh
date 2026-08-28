@@ -45,6 +45,7 @@ run_browser_matrix() {
     tests/shared/aps-renderer.spec.ts \
     tests/shared/aps-puc-lifecycle.spec.ts \
     tests/shared/tsjs-runtime.spec.ts \
+    tests/shared/tsjs-policy.spec.ts \
     tests/shared/creative-sandbox.spec.ts \
     tests/nextjs/gpt-diagnostics.spec.ts \
     tests/nextjs/navigation.spec.ts \

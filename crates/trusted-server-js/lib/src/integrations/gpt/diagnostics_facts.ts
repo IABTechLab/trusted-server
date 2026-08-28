@@ -3,10 +3,17 @@ import type {
   GptTraceCycleOrdinalV1,
   GoogletagAdapter,
   GoogletagDiagnosticsFact,
-  GoogletagDiagnosticsObserver,
   GoogletagDiagnosticsSlotSnapshot,
 } from '../../adapters/googletag';
+import {
+  createTrustedServerOpportunityFact,
+  isTrustedServerOpportunityFact,
+  type GptDiagnosticsOpportunityFact,
+} from '../../shared/gpt_diagnostics';
 import type { FirstDisplayGptDiagnosticsV1, FirstDisplayGptFactV1 } from '../../shared/takeover';
+import type { BrowserAuctionProjectionV1 } from '../../core/types';
+
+export { createTrustedServerOpportunityFact, type GptDiagnosticsOpportunityFact };
 
 const MAX_BUFFERED_FACTS = 512;
 const DIAGNOSTICS_ONLY_EVENTS = Object.freeze([
@@ -28,13 +35,92 @@ export interface GptDiagnosticsFactBufferOptions {
   readonly onOverflow?: (droppedFacts: number) => void;
 }
 
+export type GptDiagnosticsFact = GoogletagDiagnosticsFact | GptDiagnosticsOpportunityFact;
+export type GptDiagnosticsFactObserver = (fact: Readonly<GptDiagnosticsFact>) => void;
+
+/** Publish immutable request evidence captured by the exact request-producing operation. */
+export function publishTrustedServerOpportunityFact(input: {
+  readonly adapter: Pick<GoogletagAdapter, 'diagnosticsIdentity'>;
+  readonly buffer: Pick<GptDiagnosticsFactBuffer, 'publish'>;
+  readonly physicalSlot: object;
+  readonly registeredSlotId: string;
+  readonly opportunity: Readonly<{
+    requestedSlotSizes: readonly (readonly [number, number])[];
+    trustedServerAuctionId: string;
+  }>;
+}): boolean {
+  try {
+    const identity = input.adapter.diagnosticsIdentity(input.physicalSlot);
+    if (!identity) return false;
+    const fact = createTrustedServerOpportunityFact({
+      auctionSlotId: input.registeredSlotId,
+      opportunity: 'renderable_candidate',
+      requestedSlotSizes: input.opportunity.requestedSlotSizes,
+      slot: identity,
+      trustedServerAuctionId: input.opportunity.trustedServerAuctionId,
+    });
+    return fact ? input.buffer.publish(fact) : false;
+  } catch {
+    return false;
+  }
+}
+
+/** Publish the exact projected Trusted Server winner immediately before its GPT request. */
+export function publishTrustedServerRequestFact(input: {
+  readonly adapter: Pick<GoogletagAdapter, 'diagnosticsIdentity'>;
+  readonly buffer: Pick<GptDiagnosticsFactBuffer, 'publish'>;
+  readonly physicalSlot: object;
+  readonly projection: Readonly<{
+    auction: Readonly<{
+      auctionId: string;
+      results: readonly Readonly<BrowserAuctionProjectionV1['auction']['results'][number]>[];
+    }>;
+    bids: readonly Readonly<BrowserAuctionProjectionV1['bids'][number]>[];
+    slots: readonly Readonly<BrowserAuctionProjectionV1['slots'][number]>[];
+  }>;
+  readonly registeredSlotId: string;
+}): boolean {
+  try {
+    const placements = input.projection.slots.filter(
+      (placement) => placement.slot === input.registeredSlotId
+    );
+    const decisions = input.projection.auction.results.filter(
+      (decision) => decision.slot === input.registeredSlotId
+    );
+    if (placements.length !== 1 || decisions.length !== 1) return false;
+    const placement = placements[0];
+    const decision = decisions[0];
+    if (!placement || decision?.outcome !== 'winner') return false;
+    const bids = input.projection.bids.filter(
+      (bid) => bid.slot === input.registeredSlotId && bid.candidateId === decision.candidateId
+    );
+    if (bids.length !== 1) return false;
+    return publishTrustedServerOpportunityFact({
+      adapter: input.adapter,
+      buffer: input.buffer,
+      physicalSlot: input.physicalSlot,
+      registeredSlotId: input.registeredSlotId,
+      opportunity: Object.freeze({
+        requestedSlotSizes: placement.formats,
+        trustedServerAuctionId: input.projection.auction.auctionId,
+      }),
+    });
+  } catch {
+    return false;
+  }
+}
+
 export interface GptDiagnosticsFactBuffer {
   readonly adoptFirstDisplay: (
     diagnostics: Readonly<FirstDisplayGptDiagnosticsV1>,
-    resolveSlot?: (traceToken: string) => Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined
+    resolveSlot?: (traceToken: string) => Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined,
+    resolveOpportunity?: (
+      traceToken: string,
+      slot: Readonly<GoogletagDiagnosticsSlotSnapshot>
+    ) => Readonly<GptDiagnosticsOpportunityFact> | undefined
   ) => boolean;
-  readonly publish: (fact: Readonly<GoogletagDiagnosticsFact>) => boolean;
-  readonly activate: (consumer: GoogletagDiagnosticsObserver) => (() => void) | undefined;
+  readonly publish: (fact: Readonly<GptDiagnosticsFact>) => boolean;
+  readonly activate: (consumer: GptDiagnosticsFactObserver) => (() => void) | undefined;
   readonly dispose: () => void;
 }
 
@@ -80,9 +166,12 @@ export function projectGptTraceFact(
   }
 }
 
-function validFact(fact: unknown): fact is Readonly<GoogletagDiagnosticsFact> {
+function validFact(fact: unknown): fact is Readonly<GptDiagnosticsFact> {
   if (typeof fact !== 'object' || fact === null || !Object.isFrozen(fact)) return false;
   const kind = Object.getOwnPropertyDescriptor(fact, 'kind');
+  if (kind && 'value' in kind && kind.value === 'trustedServerOpportunity') {
+    return isTrustedServerOpportunityFact(fact);
+  }
   const slot = Object.getOwnPropertyDescriptor(fact, 'slot');
   return (
     ((kind !== undefined &&
@@ -107,6 +196,7 @@ const FIRST_DISPLAY_FACT_KEYS = Object.freeze([
   'capturedAtMs',
   'elementId',
   'adUnitPath',
+  'requestedSlotSizes',
   'isEmpty',
   'renderedSize',
   'isBackfill',
@@ -153,6 +243,7 @@ function validTransferredFact(candidate: unknown): candidate is Readonly<FirstDi
   const disposition = fields.disposition;
   const issueReason = fields.issueReason;
   const renderedSize = fields.renderedSize;
+  const requestedSlotSizes = fields.requestedSlotSizes;
   return (
     fields.version === 1 &&
     ALL_DIAGNOSTIC_EVENTS.has(event as string) &&
@@ -177,6 +268,22 @@ function validTransferredFact(candidate: unknown): candidate is Readonly<FirstDi
       (typeof fields.elementId === 'string' && fields.elementId.length > 0)) &&
     (fields.adUnitPath === null ||
       (typeof fields.adUnitPath === 'string' && fields.adUnitPath.length > 0)) &&
+    (requestedSlotSizes === null ||
+      (event === 'slotRequested' &&
+        disposition === 'matched' &&
+        Array.isArray(requestedSlotSizes) &&
+        Object.isFrozen(requestedSlotSizes) &&
+        requestedSlotSizes.length >= 1 &&
+        requestedSlotSizes.length <= 16 &&
+        requestedSlotSizes.every(
+          (size) =>
+            Array.isArray(size) &&
+            Object.isFrozen(size) &&
+            size.length === 2 &&
+            size.every(
+              (dimension) => Number.isInteger(dimension) && dimension >= 1 && dimension <= 4096
+            )
+        ))) &&
     (fields.isEmpty === null || typeof fields.isEmpty === 'boolean') &&
     (renderedSize === null ||
       (Array.isArray(renderedSize) &&
@@ -197,8 +304,12 @@ function validTransferredFact(candidate: unknown): candidate is Readonly<FirstDi
 
 function rawFirstDisplayFacts(
   diagnostics: Readonly<FirstDisplayGptDiagnosticsV1>,
-  resolveSlot?: (traceToken: string) => Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined
-): readonly Readonly<GoogletagDiagnosticsFact>[] | undefined {
+  resolveSlot?: (traceToken: string) => Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined,
+  resolveOpportunity?: (
+    traceToken: string,
+    slot: Readonly<GoogletagDiagnosticsSlotSnapshot>
+  ) => Readonly<GptDiagnosticsOpportunityFact> | undefined
+): readonly Readonly<GptDiagnosticsFact>[] | undefined {
   const fields = exactFrozenRecord(diagnostics, ['facts', 'overflowCount', 'dropCount']);
   if (
     !fields ||
@@ -214,12 +325,19 @@ function rawFirstDisplayFacts(
   ) {
     return undefined;
   }
-  const slotByTraceToken = new Map<string, Readonly<GoogletagDiagnosticsSlotSnapshot>>();
-  const facts: Array<Readonly<GoogletagDiagnosticsFact>> = [];
+  const physicalByTraceToken = new Map<
+    string,
+    Readonly<{
+      runtimeSlotNumber: number;
+      token: object;
+      traceToken: GptSlotTokenV1;
+    }>
+  >();
+  const facts: Array<Readonly<GptDiagnosticsFact>> = [];
   for (const candidate of fields.facts) {
     if (!validTransferredFact(candidate)) return undefined;
-    let slot = slotByTraceToken.get(candidate.token);
-    if (!slot) {
+    let physical = physicalByTraceToken.get(candidate.token);
+    if (!physical) {
       let resolved: Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined;
       try {
         resolved = resolveSlot?.(candidate.token);
@@ -235,17 +353,34 @@ function rawFirstDisplayFacts(
       ) {
         return undefined;
       }
-      slot = Object.freeze({
+      physical = Object.freeze({
         token: resolved?.token ?? Object.freeze(Object.create(null) as object),
         traceToken: candidate.token as GptSlotTokenV1,
         runtimeSlotNumber: candidate.runtimeSlotNumber,
-        ...(candidate.cycleOrdinal === null
-          ? {}
-          : { cycleOrdinal: candidate.cycleOrdinal as GptTraceCycleOrdinalV1 }),
-        ...(candidate.elementId === null ? {} : { elementId: candidate.elementId }),
-        ...(candidate.adUnitPath === null ? {} : { adUnitPath: candidate.adUnitPath }),
       });
-      slotByTraceToken.set(candidate.token, slot);
+      physicalByTraceToken.set(candidate.token, physical);
+    }
+    if (physical.runtimeSlotNumber !== candidate.runtimeSlotNumber) return undefined;
+    const slot: Readonly<GoogletagDiagnosticsSlotSnapshot> = Object.freeze({
+      token: physical.token,
+      traceToken: physical.traceToken,
+      runtimeSlotNumber: physical.runtimeSlotNumber,
+      ...(candidate.cycleOrdinal === null
+        ? {}
+        : { cycleOrdinal: candidate.cycleOrdinal as GptTraceCycleOrdinalV1 }),
+      ...(candidate.elementId === null ? {} : { elementId: candidate.elementId }),
+      ...(candidate.adUnitPath === null ? {} : { adUnitPath: candidate.adUnitPath }),
+    });
+    if (candidate.requestedSlotSizes !== null) {
+      if (!resolveOpportunity) return undefined;
+      let opportunity: Readonly<GptDiagnosticsOpportunityFact> | undefined;
+      try {
+        opportunity = resolveOpportunity(candidate.token, slot);
+      } catch {
+        opportunity = undefined;
+      }
+      if (!opportunity || !validFact(opportunity)) return undefined;
+      facts.push(opportunity);
     }
     facts.push(
       Object.freeze({
@@ -271,8 +406,8 @@ function rawFirstDisplayFacts(
 export function createGptDiagnosticsFactBuffer(
   options: GptDiagnosticsFactBufferOptions = {}
 ): GptDiagnosticsFactBuffer {
-  const pending: Readonly<GoogletagDiagnosticsFact>[] = [];
-  let consumer: GoogletagDiagnosticsObserver | undefined;
+  const pending: Readonly<GptDiagnosticsFact>[] = [];
+  let consumer: GptDiagnosticsFactObserver | undefined;
   let consumerGeneration = 0;
   let replaying = false;
   let disposed = false;
@@ -294,14 +429,14 @@ export function createGptDiagnosticsFactBuffer(
       // Overflow reporting is diagnostics-only.
     }
   };
-  const enqueue = (fact: Readonly<GoogletagDiagnosticsFact>): void => {
+  const enqueue = (fact: Readonly<GptDiagnosticsFact>): void => {
     if (pending.length >= MAX_BUFFERED_FACTS) {
       pending.shift();
       reportOverflow();
     }
     pending.push(fact);
   };
-  const deliver = (fact: Readonly<GoogletagDiagnosticsFact>): void => {
+  const deliver = (fact: Readonly<GptDiagnosticsFact>): void => {
     const current = consumer;
     if (!current) return;
     try {
@@ -314,9 +449,13 @@ export function createGptDiagnosticsFactBuffer(
   return Object.freeze({
     adoptFirstDisplay: (
       diagnostics: Readonly<FirstDisplayGptDiagnosticsV1>,
-      resolveSlot?: (traceToken: string) => Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined
+      resolveSlot?: (traceToken: string) => Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined,
+      resolveOpportunity?: (
+        traceToken: string,
+        slot: Readonly<GoogletagDiagnosticsSlotSnapshot>
+      ) => Readonly<GptDiagnosticsOpportunityFact> | undefined
     ): boolean => {
-      const facts = rawFirstDisplayFacts(diagnostics, resolveSlot);
+      const facts = rawFirstDisplayFacts(diagnostics, resolveSlot, resolveOpportunity);
       if (disposed || !adoptionOpen || pending.length !== 0 || consumer !== undefined || !facts) {
         return false;
       }
@@ -325,14 +464,14 @@ export function createGptDiagnosticsFactBuffer(
       adoptionOpen = false;
       return true;
     },
-    publish: (fact: Readonly<GoogletagDiagnosticsFact>): boolean => {
+    publish: (fact: Readonly<GptDiagnosticsFact>): boolean => {
       adoptionOpen = false;
       if (disposed || !validFact(fact)) return false;
       if (replaying || !consumer) enqueue(fact);
       else deliver(fact);
       return true;
     },
-    activate: (nextConsumer: GoogletagDiagnosticsObserver): (() => void) | undefined => {
+    activate: (nextConsumer: GptDiagnosticsFactObserver): (() => void) | undefined => {
       adoptionOpen = false;
       if (disposed || consumer || typeof nextConsumer !== 'function') return undefined;
       consumer = nextConsumer;
@@ -445,7 +584,7 @@ export function activateGptDiagnosticsEventListeners(
 /** Connect the sole GPT adapter stream and only the four diagnostics-only listeners. */
 export function activateGptDiagnosticsFactCapture(
   adapter: Pick<GoogletagAdapter, 'observeDiagnostics' | 'run'>,
-  buffer: Pick<GptDiagnosticsFactBuffer, 'publish'>
+  buffer: Readonly<{ publish: (fact: Readonly<GoogletagDiagnosticsFact>) => boolean }>
 ): (() => void) | undefined {
   let disposed = false;
   const observerRelease = adapter.observeDiagnostics((fact) => {

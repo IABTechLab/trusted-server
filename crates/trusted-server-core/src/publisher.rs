@@ -21,6 +21,7 @@
 //! into any [`Write`] (a `Vec<u8>` for buffered routes, a streaming writer for
 //! the streaming route). It is not a content-rewriting concern.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,7 +40,11 @@ use crate::auction::endpoints::{
 use crate::auction::formats::{
     coordinated_cutover_v1::CanonicalBrowserAuctionProjectionV1, sanitize_publisher_page_url,
 };
-use crate::auction::orchestrator::{AuctionOrchestrator, DispatchedAuction, OrchestrationResult};
+use crate::auction::orchestrator::{
+    AuctionOrchestrator, DispatchedAuction, ERROR_TYPE_ALL, ERROR_TYPE_HTTP_STATUS,
+    ERROR_TYPE_LAUNCH_FAILED, ERROR_TYPE_PARSE_RESPONSE, ERROR_TYPE_TIMEOUT, ERROR_TYPE_TRANSPORT,
+    OrchestrationResult, ResolvedDispatchOutcome,
+};
 use crate::auction::telemetry::{
     AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
     emit_auction_events_best_effort_lazy,
@@ -51,7 +56,9 @@ use crate::auction::types::{
     DeviceInfo, PublisherInfo, SiteInfo, SlotAuctionDecisionV1, SystemAuctionIdentityGenerator,
     UserInfo, mint_response_unique_base64url_identity,
 };
-use crate::cache_policy::{EdgeCacheHeader, cache_control_headers_are_private_or_no_store};
+use crate::cache_policy::{
+    CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
+};
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
@@ -63,7 +70,6 @@ use crate::error::TrustedServerError;
 use crate::html_processor::BodyCloseInjection;
 use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
 use crate::integrations::IntegrationRegistry;
-use crate::integrations::aps::ApsConfig;
 use crate::platform::{
     GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, VarySpec,
     contains_publisher_esi_directive,
@@ -569,7 +575,7 @@ pub fn handle_tsjs_dynamic(
         else {
             return Ok(tsjs_not_found_response());
         };
-        let mut resp = serve_precomputed_tsjs_artifact(artifact, req);
+        let mut resp = serve_precomputed_tsjs_artifact(artifact, req, edge_header);
         strip_tsjs_head_body(&mut resp, req.method());
         apply_tsjs_success_headers(&mut resp);
         return Ok(resp);
@@ -583,7 +589,7 @@ pub fn handle_tsjs_dynamic(
         let Some(artifact) = integration_registry.tsjs_static_artifact(requested_hash) else {
             return Ok(tsjs_not_found_response());
         };
-        let mut resp = serve_precomputed_tsjs_artifact(artifact, req);
+        let mut resp = serve_precomputed_tsjs_artifact(artifact, req, edge_header);
         strip_tsjs_head_body(&mut resp, req.method());
         apply_tsjs_success_headers(&mut resp);
         return Ok(resp);
@@ -663,6 +669,7 @@ fn apply_tsjs_success_headers(response: &mut Response<EdgeBody>) {
 fn serve_precomputed_tsjs_artifact(
     artifact: &crate::tsjs::TsjsStaticArtifactV1,
     req: &Request<EdgeBody>,
+    edge_header: EdgeCacheHeader,
 ) -> Response<EdgeBody> {
     let etag = format!("\"sha256-{}\"", artifact.hash());
     let not_modified = req
@@ -671,28 +678,26 @@ fn serve_precomputed_tsjs_artifact(
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value == etag);
     let builder = Response::builder()
-        .header(
-            header::CACHE_CONTROL,
-            "public, max-age=300, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400",
-        )
-        .header("surrogate-control", "max-age=300")
         .header(header::ETAG, etag)
         .header(header::VARY, "Accept-Encoding");
-    if not_modified {
-        return builder
+    let mut response = if not_modified {
+        builder
             .status(StatusCode::NOT_MODIFIED)
             .body(EdgeBody::empty())
-            .expect("should build 304 TSJS response");
-    }
-
-    builder
-        .status(StatusCode::OK)
-        .header(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )
-        .body(EdgeBody::from_bytes(artifact.body().clone()))
-        .expect("should build TSJS response")
+            .expect("should build 304 TSJS response")
+    } else {
+        builder
+            .status(StatusCode::OK)
+            .header(
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            )
+            .body(EdgeBody::from_bytes(artifact.body().clone()))
+            .expect("should build TSJS response")
+    };
+    CachePolicy::public_immutable(Duration::from_secs(31_536_000))
+        .apply_to_headers(response.headers_mut(), edge_header);
+    response
 }
 
 /// Extract a catalogued deferred module ID from its only admitted filename.
@@ -727,10 +732,13 @@ struct ProcessResponseParams<'a> {
     integration_registry: &'a IntegrationRegistry,
     ad_slots_script: Option<&'a str>,
     ad_bids_state: &'a Arc<Mutex<Option<String>>>,
+    suppress_datadome_client_side_tag: bool,
     gpt_diagnostics:
         Option<&'a crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
     render_trace_overlay: bool,
     shared_template_authorized: bool,
+    csp_nonce_observed: Option<&'a Arc<AtomicBool>>,
+    csp_nonce: Option<&'a str>,
 }
 
 struct PublisherBodyProcessor {
@@ -754,13 +762,16 @@ impl PublisherBodyProcessor {
                 settings,
                 integration_registry,
                 ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
-                ad_bids_state: Arc::clone(&params.ad_bids_state),
+                ad_bids_state: Arc::clone(params.ad_bids_state.script_cell()),
+                suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
                 gpt_diagnostics: params.gpt_diagnostics.clone(),
                 render_trace_overlay: params.render_trace_overlay,
                 assembly_mode: effective_assembly_mode(
                     settings,
                     params.template_cache_key.is_some(),
                 ),
+                csp_nonce_observed: params.csp_nonce_observed.clone(),
+                csp_nonce: response_csp_nonce(&params.policy_headers),
             })?)
         } else if is_rsc_flight {
             Box::new(RscFlightUrlRewriter::new(
@@ -838,12 +849,15 @@ fn process_response_streaming<W: Write>(
             integration_registry: params.integration_registry,
             ad_slots_script: params.ad_slots_script.map(str::to_string),
             ad_bids_state: params.ad_bids_state.clone(),
+            suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
             gpt_diagnostics: params.gpt_diagnostics.cloned(),
             render_trace_overlay: params.render_trace_overlay,
             assembly_mode: effective_assembly_mode(
                 params.settings,
                 params.shared_template_authorized,
             ),
+            csp_nonce_observed: params.csp_nonce_observed.cloned(),
+            csp_nonce: params.csp_nonce.map(str::to_owned),
         })?;
         StreamingPipeline::new(config, processor)
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
@@ -1071,6 +1085,8 @@ impl Drop for DispatchedAuctionGuard {
 
 /// The single inert marker stored in a reader-neutral C2 template.
 pub const AD_ASSEMBLY_SEAM: &str = "<!--ts-ad-seam-->";
+/// Transform-owned placeholder replaced only after collision and nonce checks.
+pub(crate) const TEMPLATE_SEAM_PLACEHOLDER: &str = "<!--ts-seam-slot-->";
 
 fn configured_assembly_mode(settings: &Settings) -> AssemblyMode {
     settings
@@ -1103,7 +1119,7 @@ fn effective_assembly_mode(settings: &Settings, shared_template_authorized: bool
 fn template_injection(mode: AssemblyMode) -> BodyCloseInjection {
     match mode {
         AssemblyMode::Inline => BodyCloseInjection::None,
-        AssemblyMode::Esi => BodyCloseInjection::Marker(AD_ASSEMBLY_SEAM.to_string()),
+        AssemblyMode::Esi => BodyCloseInjection::Marker(TEMPLATE_SEAM_PLACEHOLDER.to_string()),
     }
 }
 
@@ -1127,9 +1143,12 @@ struct HtmlStreamProcessorParams<'a> {
     integration_registry: &'a IntegrationRegistry,
     ad_slots_script: Option<String>,
     ad_bids_state: Arc<Mutex<Option<String>>>,
+    suppress_datadome_client_side_tag: bool,
     gpt_diagnostics: Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
     render_trace_overlay: bool,
     assembly_mode: AssemblyMode,
+    csp_nonce_observed: Option<Arc<AtomicBool>>,
+    csp_nonce: Option<String>,
 }
 
 fn create_html_stream_processor(
@@ -1148,6 +1167,12 @@ fn create_html_stream_processor(
     .with_gpt_diagnostics(params.gpt_diagnostics)
     .with_body_close(template_injection(params.assembly_mode))
     .with_render_trace_overlay(params.render_trace_overlay)
+    .with_csp_nonce_observer(
+        matches!(params.assembly_mode, AssemblyMode::Esi)
+            .then_some(params.csp_nonce_observed)
+            .flatten(),
+    )
+    .with_csp_nonce(params.csp_nonce)
     .with_datadome_client_tag_suppression(params.suppress_datadome_client_side_tag);
 
     Ok(create_html_processor(config))
@@ -1339,11 +1364,28 @@ pub struct OwnedProcessResponseParams {
     pub(crate) dispatched_auction: Option<DispatchedAuction>,
     /// Price granularity used to bucket bids in the browser auction projection.
     pub(crate) price_granularity: PriceGranularity,
+    /// Whether to omit Trusted Server's automatic `DataDome` client-side tag.
+    pub(crate) suppress_datadome_client_side_tag: bool,
     /// Request-scoped conditional diagnostics delivery decision.
     pub(crate) gpt_diagnostics:
         Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
     /// Server-owned request-scoped render-trace overlay decision.
     pub(crate) render_trace_overlay: bool,
+    /// Set by the transform when publisher markup carries a response-bound CSP nonce.
+    pub(crate) csp_nonce_observed: Option<Arc<AtomicBool>>,
+}
+
+/// Response-authorized template cache insert inputs.
+pub(crate) struct AuthorizedTemplateStore {
+    reservation: crate::platform::TemplateCacheReservation,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TemplateStoreOutcome {
+    Stored,
+    Expired,
+    Error,
 }
 
 /// Buffers a [`PublisherResponse`] into a single [`Response`], collecting the
@@ -1463,7 +1505,7 @@ pub async fn buffer_publisher_response_async(
                 let payload: Cow<'_, str> = if shared_response_authorized {
                     Cow::Borrowed(AD_ASSEMBLY_SEAM)
                 } else {
-                    Cow::Owned(seam_script_for(&params))
+                    Cow::Owned(seam_script_for(&params, settings, integration_registry))
                 };
                 match replace_seam_placeholder(bytes, payload.as_bytes()) {
                     Ok(bytes) => bytes,
@@ -1522,15 +1564,19 @@ pub async fn buffer_publisher_response_async(
                     },
                 );
             }
-            let (bytes, assembly_state) = assemble_if_shared(
-                was_authorized,
-                !contains_publisher_esi,
-                settings,
-                integration_registry,
-                &params,
-                services,
-                bytes,
-            )?;
+            let (bytes, assembly_state) = if bypasses_shared_template {
+                (bytes, Some(AssemblyResponseState::ByteSeamFallback))
+            } else {
+                assemble_if_shared(
+                    shared_response_authorized,
+                    shared_response_authorized,
+                    settings,
+                    integration_registry,
+                    &params,
+                    services,
+                    bytes,
+                )?
+            };
             if let Some(state) = assembly_state {
                 set_assembly_response_state(&mut response, state);
             }
@@ -1702,17 +1748,6 @@ fn response_carries_a_seam_marker(was_authorized: bool, settings: &Settings) -> 
     was_authorized && mode_emits_seam_marker(configured_assembly_mode(settings))
 }
 
-/// Whether bytes contain an ESI directive that came from publisher content.
-///
-/// TS's stored seam is an inert HTML comment, so any `<esi:` sequence is outside the
-/// cache schema. The conservative scan also rejects the sequence inside scripts and
-/// comments: bypassing an optimization is safer than sharing edge instructions.
-fn contains_esi_directive(bytes: &[u8]) -> bool {
-    bytes
-        .windows(b"<esi:".len())
-        .any(|window| window.eq_ignore_ascii_case(b"<esi:"))
-}
-
 /// Build the complete hard-cutover boot fragment inserted into a reader-neutral
 /// C2 template. The template contains neither request projection nor runtime
 /// bytes; both arrive atomically at this one per-reader seam.
@@ -1756,37 +1791,11 @@ fn seam_script_for(
         }
     };
     let publisher_origin = request_origin(&params.request_scheme, &params.request_host);
-    let boot = crate::tsjs::tsjs_bootstrap_fragment_v1(
-        crate::tsjs::TsjsBootScriptConfigV1 {
-            module_ids: &module_ids,
-            integration_configs: &integration_configs,
-            auction_projection_json: projection_json,
-            creative,
-            render_trace_overlay: params.render_trace_overlay,
-            gpt_diagnostics_active: diagnostics_active,
-        },
-        &publisher_origin,
-    )
-    .or_else(|error| {
-        log::error!("invalid C2 TSJS boot projection: {error:?}");
-        crate::tsjs::tsjs_bootstrap_fragment_v1(
-            crate::tsjs::TsjsBootScriptConfigV1 {
-                module_ids: &module_ids,
-                integration_configs: &integration_configs,
-                auction_projection_json: crate::tsjs::EMPTY_AUCTION_PROJECTION_JSON_V1,
-                creative,
-                render_trace_overlay: params.render_trace_overlay,
-                gpt_diagnostics_active: diagnostics_active,
-            },
-            &publisher_origin,
-        )
-    })
-    .unwrap_or_default();
-
-    let mut seam = String::new();
+    let csp_nonce = response_csp_nonce(&params.policy_headers);
+    let mut interstitial = String::new();
     if let Some(debug_comment) = debug_comment {
-        seam.push_str(debug_comment);
-        seam.push('\n');
+        interstitial.push_str(debug_comment);
+        interstitial.push('\n');
     }
     let document_state = crate::integrations::IntegrationDocumentState::default();
     let fallback_origin_host = settings.publisher.origin_host();
@@ -1798,13 +1807,42 @@ fn seam_script_for(
         } else {
             &params.origin_host
         },
+        csp_nonce: csp_nonce.as_deref(),
         document_state: &document_state,
     };
     for insert in integration_registry.head_inserts(&context) {
-        seam.push_str(&insert);
+        interstitial.push_str(&insert);
     }
-    seam.push_str(&boot);
-    seam
+    crate::tsjs::tsjs_bootstrap_fragment_with_nonce_and_interstitial_v1(
+        crate::tsjs::TsjsBootScriptConfigV1 {
+            module_ids: &module_ids,
+            integration_configs: &integration_configs,
+            auction_projection_json: projection_json,
+            creative,
+            render_trace_overlay: params.render_trace_overlay,
+            gpt_diagnostics_active: diagnostics_active,
+        },
+        &publisher_origin,
+        csp_nonce.as_deref(),
+        &interstitial,
+    )
+    .or_else(|error| {
+        log::error!("invalid C2 TSJS boot projection: {error:?}");
+        crate::tsjs::tsjs_bootstrap_fragment_with_nonce_and_interstitial_v1(
+            crate::tsjs::TsjsBootScriptConfigV1 {
+                module_ids: &module_ids,
+                integration_configs: &integration_configs,
+                auction_projection_json: crate::tsjs::EMPTY_AUCTION_PROJECTION_JSON_V1,
+                creative,
+                render_trace_overlay: params.render_trace_overlay,
+                gpt_diagnostics_active: diagnostics_active,
+            },
+            &publisher_origin,
+            csp_nonce.as_deref(),
+            &interstitial,
+        )
+    })
+    .unwrap_or_default()
 }
 
 /// Builds the injection state a cached template needs on the way out.
@@ -2364,6 +2402,21 @@ fn response_carries_body(method: &Method, status: StatusCode) -> bool {
         && status != StatusCode::NOT_MODIFIED
 }
 
+/// Prevent shared caches from replaying tag-suppressed HTML to other clients.
+fn apply_datadome_client_tag_cache_privacy(
+    response: &mut Response<EdgeBody>,
+    method: &Method,
+    suppress_datadome_client_side_tag: bool,
+    content_type: &str,
+) {
+    if suppress_datadome_client_side_tag
+        && response_carries_body(method, response.status())
+        && is_html_content_type(content_type)
+    {
+        enforce_synthesized_html_cache_privacy(response);
+    }
+}
+
 /// Drop a bodiless response's body and correct its framing headers.
 ///
 /// The response keeps no body, and its `Content-Length` is corrected where the
@@ -2469,6 +2522,7 @@ pub fn stream_publisher_body<W: Write>(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
 ) -> Result<(), Report<TrustedServerError>> {
+    let csp_nonce = response_csp_nonce(&params.policy_headers);
     let borrowed = ProcessResponseParams {
         content_encoding: &params.content_encoding,
         origin_host: &params.origin_host,
@@ -2479,10 +2533,13 @@ pub fn stream_publisher_body<W: Write>(
         content_type: &params.content_type,
         integration_registry,
         ad_slots_script: params.ad_slots_script.as_deref(),
-        ad_bids_state: &params.ad_bids_state,
+        ad_bids_state: params.ad_bids_state.script_cell(),
+        suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
         gpt_diagnostics: params.gpt_diagnostics.as_ref(),
         render_trace_overlay: params.render_trace_overlay,
         shared_template_authorized: params.template_cache_key.is_some(),
+        csp_nonce_observed: params.csp_nonce_observed.as_ref(),
+        csp_nonce: csp_nonce.as_deref(),
     };
     let input_compression = Compression::from_content_encoding(&params.content_encoding);
     let output_compression = if params.template_cache_key.is_some() {
@@ -2647,6 +2704,16 @@ pub(crate) fn is_prefetch_request(req: &Request<EdgeBody>) -> bool {
 
 /// Returns true only when the publisher request should run the full
 /// server-side ad stack: auction dispatch plus initial ad-slot injection.
+fn is_server_side_ad_eligible_navigation(
+    is_get: bool,
+    is_navigation: bool,
+    is_prefetch: bool,
+    is_bot: bool,
+    consent_allows_auction: bool,
+) -> bool {
+    is_get && is_navigation && !is_prefetch && !is_bot && consent_allows_auction
+}
+
 pub(crate) fn should_run_server_side_ad_stack(
     is_get: bool,
     is_navigation: bool,
@@ -2656,12 +2723,13 @@ pub(crate) fn should_run_server_side_ad_stack(
     consent_allows_auction: bool,
     auction_enabled: bool,
 ) -> bool {
-    is_get
-        && is_navigation
-        && !is_prefetch
-        && !is_bot
-        && has_active_matched_slots
-        && consent_allows_auction
+    is_server_side_ad_eligible_navigation(
+        is_get,
+        is_navigation,
+        is_prefetch,
+        is_bot,
+        consent_allows_auction,
+    ) && has_active_matched_slots
         && auction_enabled
 }
 /// Write winning bids from an auction result into the shared `ad_bids_state` lock.
@@ -2715,6 +2783,17 @@ impl AdBidsState {
             None => *state = Some(comment.to_string()),
         }
     }
+}
+
+fn mint_browser_auction_id(
+    identity_generator: &dyn AuctionIdentityGenerator,
+) -> Result<String, Report<TrustedServerError>> {
+    mint_response_unique_base64url_identity(identity_generator, &mut HashSet::new(), "a1_", 9, 8)
+        .ok_or_else(|| {
+            Report::new(TrustedServerError::Auction {
+                message: "Failed to mint browser auction identity".to_string(),
+            })
+        })
 }
 
 /// Write the one exact initial browser projection into the pre-core boot state.
@@ -3177,10 +3256,6 @@ async fn collect_non_html_auction(
     services: &RuntimeServices,
     settings: &Settings,
 ) {
-    let auction_id = telemetry
-        .auction_request
-        .as_ref()
-        .and_then(|_| diagnostics_auction_id(settings));
     let placeholder = mediator_placeholder_request();
     let result = orchestrator
         .collect_dispatched_auction(
@@ -3315,9 +3390,7 @@ pub async fn handle_publisher_request(
     let gpt_diagnostics =
         crate::integrations::gpt_diagnostics::prepare_request(settings, &mut req)?;
     let render_trace_overlay = crate::trace_cookie::render_trace_overlay_active(&req);
-    let aps_enabled = settings
-        .integration_config::<ApsConfig>("aps")?
-        .is_some_and(|config| config.enabled);
+    let aps_enabled = auction.orchestrator.is_enabled() && auction.orchestrator.has_profile("aps");
 
     // Prebid.js requests are not intercepted here anymore. The HTML processor removes
     // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
@@ -3463,6 +3536,14 @@ pub async fn handle_publisher_request(
         .as_ref()
         .map(|co| co.price_granularity)
         .unwrap_or_default();
+    let browser_slots_json = should_run_ad_stack
+        .then(|| {
+            settings
+                .creative_opportunities
+                .as_ref()
+                .map(|config| build_browser_slots_json(&matched_slots, config, &request_path))
+        })
+        .flatten();
 
     // Dispatch SSP bid requests while req still has the original client headers
     // (User-Agent, x-forwarded-for, cookies, etc.).  The borrow ends when
@@ -3524,13 +3605,80 @@ pub async fn handle_publisher_request(
                 provider_responses: None,
                 services,
             };
-            let dispatched = auction
+            let dispatch_outcome = auction
                 .orchestrator
                 .dispatch_auction(&auction_request, &auction_context)
                 .await;
-            auction_request_for_telemetry = Some(auction_request);
-            auction_observation = Some(observation);
-            Some(dispatched)
+            match auction
+                .orchestrator
+                .resolve_dispatch_outcome(&auction_request, dispatch_outcome)
+            {
+                Ok(ResolvedDispatchOutcome::InFlight(dispatched)) => {
+                    auction_request_for_telemetry = Some(auction_request);
+                    auction_observation = Some(observation);
+                    Some(*dispatched)
+                }
+                Ok(ResolvedDispatchOutcome::Complete(result)) => {
+                    let result = *result;
+                    let delivered_winner_slots = write_projection_to_state(
+                        &result,
+                        price_granularity,
+                        &ad_bids_state,
+                        settings,
+                        &request_origin(request_scheme, request_host),
+                        browser_slots_json.as_deref(),
+                    );
+                    emit_auction_events_best_effort_lazy(services, || {
+                        build_auction_events(
+                            observation,
+                            AuctionTerminalOutcome::Completed {
+                                request: &auction_request,
+                                result: &result,
+                                delivered_winner_slots: Some(&delivered_winner_slots),
+                            },
+                        )
+                    })
+                    .await;
+                    if settings.debug.auction_html_comment {
+                        prepend_auction_debug_comment(
+                            "dispatch",
+                            &result,
+                            &ad_bids_state,
+                            &settings.debug.auction_html_comment_options,
+                        );
+                    }
+                    None
+                }
+                Err(error) => {
+                    log::warn!("server-side auction dispatch failed: {error:?}");
+                    let elapsed_ms = observation.elapsed_ms();
+                    emit_auction_events_best_effort_lazy(services, || {
+                        build_auction_events(
+                            observation,
+                            AuctionTerminalOutcome::ExecutionFailed {
+                                request: Some(&auction_request),
+                                provider_responses: &[],
+                                reason: "dispatch_failed",
+                                elapsed_ms,
+                            },
+                        )
+                    })
+                    .await;
+                    let result = OrchestrationResult::no_bid(
+                        &auction_request,
+                        AuctionSlotFailureReason::InternalError,
+                    );
+                    write_projection_to_state(
+                        &result,
+                        price_granularity,
+                        &ad_bids_state,
+                        settings,
+                        &request_origin(request_scheme, request_host),
+                        browser_slots_json.as_deref(),
+                    );
+                    None
+                }
+            }
         } else {
             let skip_reason = if !auction.orchestrator.is_enabled() {
                 "auction_disabled"
@@ -3609,7 +3757,7 @@ pub async fn handle_publisher_request(
     let datadome_suppression_requires_origin = suppress_datadome_client_side_tag;
     let datadome_suppression_requires_full_body =
         suppress_datadome_client_side_tag && is_html_document_request(&req);
-    let request_requires_origin = request_bypasses_template_cache(req.headers())
+    let request_requires_origin = request_bypasses_c2(req.headers())
         || gpt_diagnostics.requires_private_no_store()
         || datadome_suppression_requires_origin;
     let reader_compression = negotiate_reader_compression(req.headers());
@@ -3700,14 +3848,6 @@ pub async fn handle_publisher_request(
 
     // Exact ordered placements are request state. Inline processing carries
     // them in the head boot; C2 carries the same JSON in its per-reader seam.
-    let browser_slots_json = should_run_ad_stack
-        .then(|| {
-            settings
-                .creative_opportunities
-                .as_ref()
-                .map(|config| build_browser_slots_json(&matched_slots, config, &request_path))
-        })
-        .flatten();
     let seam_ad_slots = browser_slots_json.clone();
 
     // Template-cache lookup happens before the origin fetch — the whole point is to skip it.
@@ -3814,6 +3954,7 @@ pub async fn handle_publisher_request(
     // sets the flag unconditionally and tolerates buffered fallback): adapters
     // without streaming support may reject the flag outright rather than
     // silently buffering, which would fail every publisher fetch.
+    let request_method = req.method().clone();
     let mut platform_request = PlatformHttpRequest::new(req, backend_name);
     if services.http_client().supports_streaming_responses() {
         platform_request = platform_request.with_stream_response();
@@ -3868,6 +4009,7 @@ pub async fn handle_publisher_request(
             })?;
         crate::integrations::gpt_diagnostics::finalize_response(&gpt_diagnostics, &mut response);
         append_aps_publisher_frame_policy(&mut response, aps_enabled);
+        enforce_terminal_private_cache_privacy(&mut response);
         return Ok(PublisherResponse::Buffered(response));
     }
 
@@ -3918,7 +4060,7 @@ pub async fn handle_publisher_request(
             }
         }
     } else {
-        Vec::new()
+        runtime_policy_headers(response.headers())
     };
     if template_cache_response_state == Some(TemplateCacheResponseState::MissReserved)
         && template_cache_key.is_none()
@@ -3976,16 +4118,16 @@ pub async fn handle_publisher_request(
     if is_html_content_type(origin_content_type) || is_not_modified {
         if should_run_ad_stack || assembled_response_must_be_private {
             enforce_synthesized_html_cache_privacy(&mut response);
-        } else if is_get && response.status().is_success() {
-            // Server-side ad templates are inactive for this response, so the
-            // document carries no per-navigation auction state and stays
-            // cacheable — unless the origin already marked it private.
-            if !response_cache_control_is_private_or_no_store(&response) {
-                response.headers_mut().insert(
-                    header::CACHE_CONTROL,
-                    HeaderValue::from_static("max-age=60"),
-                );
-            }
+        } else if is_server_side_ad_eligible_navigation(
+            is_get,
+            is_navigation,
+            is_prefetch,
+            is_bot,
+            consent_allows_auction,
+        ) && (response.status() == StatusCode::OK || is_not_modified)
+            && !cache_control_forbids_shared_storage(response.headers())
+        {
+            apply_inactive_ad_stack_browser_cache_policy(&mut response);
         }
     }
 
@@ -4126,6 +4268,7 @@ pub async fn handle_publisher_request(
                     auction_request: auction_request_for_telemetry,
                     dispatched_auction,
                     price_granularity,
+                    suppress_datadome_client_side_tag,
                     gpt_diagnostics: Some(gpt_diagnostics),
                     render_trace_overlay,
                 }),
@@ -4387,6 +4530,18 @@ pub(crate) mod coordinated_cutover_v1 {
                 });
                 continue;
             };
+            if upstream_bid_id.is_empty()
+                || upstream_bid_id.len() > 64
+                || upstream_bid_id
+                    .bytes()
+                    .any(|byte| byte <= 0x1f || byte == 0x7f)
+            {
+                projected_results.push(SlotAuctionDecisionV1::Failed {
+                    slot: slot.clone(),
+                    reason: AuctionSlotFailureReason::WinnerNotRenderable,
+                });
+                continue;
+            }
             let Some(render_source) = project_render_source(bid, settings, request_origin) else {
                 projected_results.push(SlotAuctionDecisionV1::Failed {
                     slot: slot.clone(),
@@ -4433,7 +4588,9 @@ pub(crate) mod coordinated_cutover_v1 {
                 version: 1,
                 auction: crate::auction::types::AuctionDecisionSetV1 {
                     version: 1,
-                    auction_id: result.decision_set.auction_id.clone(),
+                    auction_id: browser_auction_id
+                        .unwrap_or(&result.decision_set.auction_id)
+                        .to_string(),
                     results: projected_results,
                 },
                 slots: Vec::new(),
@@ -4895,6 +5052,78 @@ fn replayable_policy_headers(
     Ok(captured)
 }
 
+fn runtime_policy_headers(headers: &edgezero_core::http::HeaderMap) -> Vec<(String, String)> {
+    let mut captured = Vec::new();
+    for name in crate::platform::REPLAYABLE_POLICY_HEADERS {
+        for value in headers.get_all(*name) {
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            captured.push(((*name).to_string(), value.to_string()));
+        }
+    }
+    captured
+}
+
+fn valid_csp_nonce_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'_' | b'-' | b'=')
+        })
+}
+
+/// Select one nonce admitted by every nonce-bearing enforcing CSP policy.
+/// Ambiguous or disjoint policy sets fail closed by returning no nonce.
+fn response_csp_nonce(policy_headers: &[(String, String)]) -> Option<String> {
+    let mut admitted: Option<std::collections::BTreeSet<String>> = None;
+    for (name, policy) in policy_headers {
+        if !name.eq_ignore_ascii_case("content-security-policy") {
+            continue;
+        }
+        let mut script_src_elem: Option<&str> = None;
+        let mut script_src: Option<&str> = None;
+        let mut default_src: Option<&str> = None;
+        for directive in policy.split(';') {
+            let mut fields = directive.split_whitespace();
+            let Some(name) = fields.next() else {
+                continue;
+            };
+            let values = directive[name.len()..].trim();
+            match name.to_ascii_lowercase().as_str() {
+                "script-src-elem" if script_src_elem.is_none() => script_src_elem = Some(values),
+                "script-src" if script_src.is_none() => script_src = Some(values),
+                "default-src" if default_src.is_none() => default_src = Some(values),
+                _ => {}
+            }
+        }
+        let Some(effective) = script_src_elem.or(script_src).or(default_src) else {
+            continue;
+        };
+        let nonces = effective
+            .split_whitespace()
+            .filter_map(|token| {
+                let body = token.strip_prefix('\'')?.strip_suffix('\'')?;
+                let prefix = body.get(..6)?;
+                let value = body.get(6..)?;
+                (prefix.eq_ignore_ascii_case("nonce-") && valid_csp_nonce_value(value))
+                    .then(|| value.to_string())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        if nonces.is_empty() {
+            continue;
+        }
+        admitted = Some(match admitted {
+            None => nonces,
+            Some(existing) => existing.intersection(&nonces).cloned().collect(),
+        });
+    }
+    let admitted = admitted?;
+    (admitted.len() == 1)
+        .then(|| admitted.into_iter().next())
+        .flatten()
+}
+
 fn c2_cache_ttl(
     mode: AssemblyMode,
     request_had_authorization: bool,
@@ -5067,20 +5296,6 @@ fn normalize_page_bids_path(raw: &str) -> String {
         path.to_string()
     } else {
         format!("/{path}")
-    }
-}
-
-/// Normalize the page path and query retained in the upstream auction context.
-///
-/// Fragments never reach an HTTP server and are discarded if a client includes
-/// one explicitly. Unlike [`normalize_page_bids_path`], the query is preserved
-/// for the `OpenRTB` `site.page` URL and is not used for slot matching.
-fn normalize_page_bids_path_and_query(raw: &str) -> String {
-    let path_and_query = raw.split('#').next().unwrap_or("");
-    if path_and_query.starts_with('/') {
-        path_and_query.to_string()
-    } else {
-        format!("/{path_and_query}")
     }
 }
 
@@ -5307,6 +5522,8 @@ pub async fn handle_page_bids(
                 .await
             {
                 Ok(result) => {
+                    let browser_auction_id =
+                        mint_browser_auction_id(&SystemAuctionIdentityGenerator)?;
                     let projection = coordinated_cutover_v1::build_browser_auction_projection_v1(
                         &result,
                         co_config.price_granularity,
@@ -5431,6 +5648,7 @@ mod tests {
     use crate::auction::orchestrator::OrchestrationResult;
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
     use crate::auction::types::{AuctionDecisionSetV1, AuctionDropReason, AuctionResponse};
+    use crate::auction_config_types::{NotificationConfig, ProviderConfig, RoutingMode};
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::{
         NoopSecretStore, StubHttpClient, build_services_with_http_client,
@@ -5443,6 +5661,63 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use http::{Method, Request as HttpRequest, StatusCode, header};
     use std::sync::Arc;
+
+    #[test]
+    fn enforcing_csp_selects_one_nonce_from_the_effective_script_directive() {
+        let headers = vec![(
+            "Content-Security-Policy".to_owned(),
+            "default-src 'nonce-default'; script-src 'nonce-script'; script-src-elem 'nonce-element' https:".to_owned(),
+        )];
+        assert_eq!(response_csp_nonce(&headers).as_deref(), Some("element"));
+    }
+
+    #[test]
+    fn enforcing_csp_nonce_selection_intersects_policies_and_fails_closed() {
+        let common = vec![
+            (
+                "content-security-policy".to_owned(),
+                "script-src 'nonce-shared' 'nonce-first'".to_owned(),
+            ),
+            (
+                "CONTENT-SECURITY-POLICY".to_owned(),
+                "script-src-elem 'nonce-shared' 'nonce-second'".to_owned(),
+            ),
+        ];
+        assert_eq!(response_csp_nonce(&common).as_deref(), Some("shared"));
+
+        let ambiguous = vec![(
+            "content-security-policy".to_owned(),
+            "script-src 'nonce-one' 'nonce-two'".to_owned(),
+        )];
+        assert_eq!(response_csp_nonce(&ambiguous), None);
+
+        let disjoint = vec![
+            (
+                "content-security-policy".to_owned(),
+                "script-src 'nonce-one'".to_owned(),
+            ),
+            (
+                "content-security-policy".to_owned(),
+                "script-src 'nonce-two'".to_owned(),
+            ),
+        ];
+        assert_eq!(response_csp_nonce(&disjoint), None);
+    }
+
+    #[test]
+    fn report_only_and_malformed_nonce_sources_do_not_authorize_emission() {
+        let headers = vec![
+            (
+                "content-security-policy-report-only".to_owned(),
+                "script-src 'nonce-report'".to_owned(),
+            ),
+            (
+                "content-security-policy".to_owned(),
+                "script-src 'nonce-bad\"value'".to_owned(),
+            ),
+        ];
+        assert_eq!(response_csp_nonce(&headers), None);
+    }
 
     fn make_test_bid_with_creative(creative: &str) -> Bid {
         Bid {
@@ -5469,6 +5744,22 @@ mod tests {
             cache_path: None,
             metadata: Default::default(),
         }
+    }
+
+    fn enable_aps_auction_plan(settings: &mut Settings) {
+        settings.auction.enabled = true;
+        settings.auction.providers = std::collections::BTreeMap::from([(
+            "aps-main".parse().expect("should parse APS provider ID"),
+            ProviderConfig {
+                protocol: "openrtb-2.6".to_string(),
+                profile: "aps".to_string(),
+                endpoint: "https://aps.example/e/pb/bid".to_string(),
+                timeout_ms: None,
+                routing: RoutingMode::AllEligible,
+                notifications: NotificationConfig::default(),
+                profile_config: serde_json::json!({"account_id":"test-account"}),
+            },
+        )]);
     }
 
     fn boot_auction_id(html: &str) -> String {
@@ -5538,6 +5829,7 @@ mod tests {
                 creative: None,
                 adomain: None,
                 bidder: "example_bidder".to_string(),
+                returned_seat: None,
                 width: 300,
                 height: 250,
                 nurl: None,
@@ -5689,9 +5981,12 @@ mod tests {
                 .expect("should store projection JSON");
             let projection: serde_json::Value =
                 serde_json::from_str(&stored).expect("should store the exact projection shape");
-            assert_eq!(
-                projection["auction"]["auctionId"],
-                result.decision_set.auction_id
+            let auction_id = projection["auction"]["auctionId"]
+                .as_str()
+                .expect("browser auction id should be a string");
+            assert!(
+                auction_id.starts_with("a1_") && auction_id != result.decision_set.auction_id,
+                "initial HTML should use a fresh browser auction identity"
             );
             assert_eq!(projection["slots"][0]["slot"], "slot-1");
             assert_eq!(projection["slots"][0]["gamUnitPath"], "/123/slot-1");
@@ -6920,6 +7215,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: Default::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
             render_trace_overlay: false,
         }
     }
@@ -7160,7 +7456,11 @@ mod tests {
         services: &RuntimeServices,
         req: Request<EdgeBody>,
     ) -> PublisherResponse {
-        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let plan = Arc::new(
+            crate::auction::compile_auction_plan(settings)
+                .expect("should compile the publisher test auction plan"),
+        );
+        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
         let mut ec_context =
             EcContext::read_from_request(settings, &req, services).expect("should read EC context");
         handle_publisher_request(
@@ -7192,6 +7492,16 @@ mod tests {
         uri: &str,
         cookie: Option<&str>,
     ) -> TsConsolePipelineResult {
+        run_ts_console_pipeline_with_origin_policies(method, destination, uri, cookie, &[]).await
+    }
+
+    async fn run_ts_console_pipeline_with_origin_policies(
+        method: Method,
+        destination: &str,
+        uri: &str,
+        cookie: Option<&str>,
+        enforcing_policies: &[&str],
+    ) -> TsConsolePipelineResult {
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -7202,10 +7512,19 @@ mod tests {
             .insert_config("gpt", &serde_json::json!({}))
             .expect("should enable the GPT event provider");
         let stub = Arc::new(StubHttpClient::new());
+        let mut origin_headers = vec![(
+            "content-type".to_owned(),
+            "text/html; charset=utf-8".to_owned(),
+        )];
+        origin_headers.extend(
+            enforcing_policies
+                .iter()
+                .map(|policy| ("content-security-policy".to_owned(), (*policy).to_owned())),
+        );
         stub.push_response_with_headers(
             200,
             b"<html><head><script>publisher()</script></head><body>origin</body></html>".to_vec(),
-            vec![("content-type", "text/html; charset=utf-8")],
+            origin_headers,
         );
         let services = build_services_with_http_client(
             Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
@@ -7248,6 +7567,76 @@ mod tests {
                 .next()
                 .expect("should forward one origin request"),
             outbound_cookie,
+        }
+    }
+
+    #[tokio::test]
+    async fn response_csp_nonce_flows_through_the_real_publisher_html_pipeline() {
+        let nonce = "response-nonce_123=";
+        let result = run_ts_console_pipeline_with_origin_policies(
+            Method::GET,
+            "document",
+            "https://publisher.example/article?ts_console=1",
+            None,
+            &["default-src 'none'; script-src 'nonce-response-nonce_123='"],
+        )
+        .await;
+        let html = response_body_string(result.response);
+
+        assert!(
+            html.contains(&format!(
+                r#"<script nonce="{nonce}">try{{history.replaceState"#
+            )),
+            "request-scoped diagnostics cleanup must carry the response nonce"
+        );
+        assert!(
+            html.contains(&format!(
+                r#"<script nonce="{nonce}">const __TSJS_SERVER_BOOT_TRANSPORT_V1__="#
+            )),
+            "the inline TSJS controller must carry the response nonce"
+        );
+        assert!(
+            html.contains(&format!(
+                r#"<script nonce="{nonce}" src="/static/tsjs=tsjs-first-display.min.js"#
+            )) || html.contains(&format!(
+                r#"<script nonce="{nonce}" src="/static/tsjs=tsjs-unified.min.js"#
+            )),
+            "the selected TSJS artifact must carry the response nonce"
+        );
+        assert!(
+            html.contains(&format!(
+                r#"<script nonce="{nonce}" src="/integrations/prebid/bundle.js"#
+            )),
+            "the live Prebid head insert must carry the response nonce"
+        );
+        assert_eq!(
+            html.matches(&format!(r#"nonce="{nonce}""#)).count(),
+            4,
+            "only the four Trusted Server executable tags should receive the nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_or_disjoint_response_csp_nonces_emit_no_nonce() {
+        for policies in [
+            vec!["script-src 'nonce-one' 'nonce-two'"],
+            vec!["script-src 'nonce-one'", "script-src 'nonce-two'"],
+        ] {
+            let result = run_ts_console_pipeline_with_origin_policies(
+                Method::GET,
+                "document",
+                "https://publisher.example/article?ts_console=1",
+                None,
+                &policies,
+            )
+            .await;
+            let html = response_body_string(result.response);
+            assert!(html.contains("const __TSJS_SERVER_BOOT_TRANSPORT_V1__="));
+            assert!(html.contains("history.replaceState"));
+            assert!(
+                !html.contains(" nonce="),
+                "ambiguous/disjoint policies must not choose an arbitrary nonce: {policies:?}"
+            );
         }
     }
 
@@ -8136,7 +8525,7 @@ mod tests {
         use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
         use crate::platform::test_support::{
-            NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend,
+            NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend, StubHttpClient,
         };
         use crate::platform::{
             ClientInfo, PlatformError, PlatformHttpClient, PlatformPendingRequest,
@@ -8296,7 +8685,8 @@ mod tests {
 
         fn settings_with_dispatching_provider() -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = true\nproviders = [\"{UNEXPECTED_304_PROVIDER}\"]\n\n\
+                "{}\n[auction]\nenabled = true\n\n\
+                 [auction.providers.{UNEXPECTED_304_PROVIDER}]\nprotocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = \"https://bidder.example/bid\"\nrouting = \"all_eligible\"\n\n\
                  [creative_opportunities]\nenabled = true\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
@@ -8733,8 +9123,8 @@ mod tests {
                     .headers
                     .get(header::CACHE_CONTROL)
                     .and_then(|value| value.to_str().ok()),
-                Some("max-age=60"),
-                "disabled template delivery should use the inactive HTML policy"
+                Some("private, max-age=60"),
+                "disabled template delivery should preserve a private origin policy"
             );
             assert_eq!(
                 response_head.headers.get(header::ETAG),
@@ -9377,13 +9767,7 @@ mod tests {
     #[tokio::test]
     async fn aps_enabled_publisher_response_appends_an_independent_frame_policy() {
         let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "aps",
-                &serde_json::json!({ "enabled": true, "account_id": "test-account" }),
-            )
-            .expect("should enable APS");
+        enable_aps_auction_plan(&mut settings);
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             200,
@@ -9434,13 +9818,8 @@ mod tests {
     #[tokio::test]
     async fn aps_disabled_publisher_response_does_not_add_a_frame_policy() {
         let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "aps",
-                &serde_json::json!({ "enabled": false, "account_id": "test-account" }),
-            )
-            .expect("should configure disabled APS");
+        enable_aps_auction_plan(&mut settings);
+        settings.auction.enabled = false;
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             200,
@@ -10948,12 +11327,15 @@ mod tests {
         let settings = create_test_settings();
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
-        let module_ids = registry.js_module_ids_immediate();
-        let hash = trusted_server_js::concatenated_hash(&module_ids);
-        let request = build_request(
-            Method::GET,
-            &format!("https://publisher.example/static/tsjs=tsjs-unified.min.js?v={hash}"),
-        );
+        let selection = registry
+            .tsjs_static_transport_selections(false)
+            .pop()
+            .expect("should expose one transport selection");
+        let src = registry
+            .tsjs_takeover_artifact(selection)
+            .expect("should precompute selected takeover artifact")
+            .src();
+        let request = build_request(Method::GET, &format!("https://publisher.example{src}"));
 
         let response = handle_tsjs_dynamic(&request, &registry, EdgeCacheHeader::SurrogateControl)
             .expect("should handle tsjs request");
@@ -10982,12 +11364,15 @@ mod tests {
         let settings = create_test_settings();
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
-        let module_ids = registry.js_module_ids_immediate();
-        let hash = trusted_server_js::concatenated_hash(&module_ids);
-        let request = build_request(
-            Method::GET,
-            &format!("https://publisher.example/static/tsjs=tsjs-unified.min.js?v={hash}"),
-        );
+        let selection = registry
+            .tsjs_static_transport_selections(false)
+            .pop()
+            .expect("should expose one transport selection");
+        let src = registry
+            .tsjs_takeover_artifact(selection)
+            .expect("should precompute selected takeover artifact")
+            .src();
+        let request = build_request(Method::GET, &format!("https://publisher.example{src}"));
 
         let response = handle_tsjs_dynamic(
             &request,
@@ -11011,7 +11396,7 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_dynamic_keeps_short_cache_for_mismatched_hash() {
+    fn tsjs_dynamic_rejects_mismatched_hash_without_caching() {
         let settings = create_test_settings();
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
@@ -11022,25 +11407,13 @@ mod tests {
 
         let response = handle_tsjs_dynamic(&request, &registry, EdgeCacheHeader::SurrogateControl)
             .expect("should handle tsjs request");
-        let cache_control = response
-            .headers()
-            .get(header::CACHE_CONTROL)
-            .and_then(|value| value.to_str().ok())
-            .expect("should set cache-control");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(
-            cache_control.contains("max-age=300") && !cache_control.contains("immutable"),
-            "mismatched hash should retain the short, mutable cache policy"
-        );
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(
-            response
-                .headers()
-                .get("surrogate-control")
-                .and_then(|value| value.to_str().ok()),
-            Some("max-age=300, stale-while-revalidate=60, stale-if-error=86400"),
-            "mismatched hash should retain the short Fastly edge TTL"
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store")),
+            "a mismatched content address must fail closed without caching"
         );
+        assert!(!response.headers().contains_key("surrogate-control"));
     }
 
     #[tokio::test]
@@ -11121,6 +11494,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
             render_trace_overlay: false,
         };
 
@@ -11180,6 +11554,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
             render_trace_overlay: false,
         };
 
@@ -11228,6 +11603,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
             render_trace_overlay: false,
         };
         let body = EdgeBody::from_stream(futures::stream::iter(vec![Ok::<_, io::Error>(
@@ -11354,6 +11730,7 @@ mod tests {
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
+                suppress_datadome_client_side_tag: false,
                 render_trace_overlay: false,
             };
             let body = EdgeBody::stream(futures::stream::iter(vec![
@@ -11418,6 +11795,7 @@ mod tests {
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
+                suppress_datadome_client_side_tag: false,
                 render_trace_overlay: false,
             };
             let compressed =
@@ -11485,6 +11863,7 @@ mod tests {
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
+                suppress_datadome_client_side_tag: false,
                 render_trace_overlay: false,
             };
             let compressed =
@@ -11552,6 +11931,7 @@ mod tests {
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
+                suppress_datadome_client_side_tag: false,
                 render_trace_overlay: false,
             };
             let compressed =
@@ -11619,6 +11999,7 @@ mod tests {
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
+                suppress_datadome_client_side_tag: false,
                 render_trace_overlay: false,
             };
             let compressed =
@@ -11668,6 +12049,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
             render_trace_overlay: false,
         }
     }
@@ -11892,6 +12274,7 @@ mod tests {
                 )),
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
+                suppress_datadome_client_side_tag: false,
                 render_trace_overlay: false,
             };
             let body = EdgeBody::stream(futures::stream::iter(vec![
@@ -11974,6 +12357,7 @@ mod tests {
                 )),
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
+                suppress_datadome_client_side_tag: false,
                 render_trace_overlay: false,
             };
             // The document tail lives in the SECOND gzip member. This buffered
@@ -12053,6 +12437,7 @@ mod tests {
                 )),
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
+                suppress_datadome_client_side_tag: false,
                 render_trace_overlay: false,
             };
             let body = EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
@@ -12121,6 +12506,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
             render_trace_overlay: false,
         };
         let publisher_response = PublisherResponse::Stream {
@@ -12277,6 +12663,7 @@ mod tests {
             dispatched_auction,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
             render_trace_overlay: false,
         }
     }
@@ -12694,6 +13081,7 @@ mod tests {
                 )),
                 price_granularity: PriceGranularity::default(),
                 gpt_diagnostics: None,
+                suppress_datadome_client_side_tag: false,
                 render_trace_overlay: false,
             }
         };
@@ -12883,6 +13271,7 @@ mod tests {
             )),
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
             render_trace_overlay: false,
         };
         let publisher_response = PublisherResponse::Stream {
@@ -12968,6 +13357,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
             render_trace_overlay: false,
         };
         let mut output = Vec::new();
@@ -13029,6 +13419,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
             render_trace_overlay: false,
         };
 
@@ -13148,6 +13539,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
             render_trace_overlay: false,
         };
         let mut output = Vec::new();
@@ -13216,6 +13608,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
             render_trace_overlay: false,
         };
 
@@ -13504,109 +13897,11 @@ mod tests {
 
     mod page_bids_no_match_tests {
         use super::super::*;
-        use super::build_services_with_http_client;
         use crate::auction::AuctionOrchestrator;
-        use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
-        use crate::auction::types::{AuctionRequest, AuctionResponse, Bid};
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
-        use crate::platform::test_support::{StubHttpClient, noop_services};
-        use crate::platform::{PlatformHttpRequest, PlatformResponse};
+        use crate::platform::test_support::noop_services;
         use crate::test_support::tests::crate_test_settings_str;
-        use error_stack::{Report, ResultExt};
         use http::Method;
-        use std::sync::{Arc, Mutex};
-
-        const AUCTION_ID_TEST_PROVIDER: &str = "auction_id_test_provider";
-        const AUCTION_ID_TEST_BACKEND: &str = "auction-id-test-backend";
-
-        struct AuctionIdTestProvider {
-            captured_request: Arc<Mutex<Option<AuctionRequest>>>,
-            winning_bid: bool,
-        }
-
-        #[async_trait::async_trait(?Send)]
-        impl AuctionProvider for AuctionIdTestProvider {
-            fn provider_name(&self) -> &str {
-                AUCTION_ID_TEST_PROVIDER
-            }
-
-            async fn request_bids(
-                &self,
-                request: &AuctionRequest,
-                context: &AuctionContext<'_>,
-            ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-                *self
-                    .captured_request
-                    .lock()
-                    .expect("should lock captured auction request") = Some(request.clone());
-                let request = PlatformHttpRequest::new(
-                    Request::builder()
-                        .method(Method::POST)
-                        .uri("https://bidder.example.test/bids")
-                        .body(EdgeBody::empty())
-                        .expect("should build test bidder request"),
-                    AUCTION_ID_TEST_BACKEND,
-                );
-                context
-                    .services
-                    .http_client()
-                    .send_async(request)
-                    .await
-                    .change_context(TrustedServerError::Auction {
-                        message: "test bidder launch failed".to_string(),
-                    })
-                    .map(ProviderRequestOutcome::pending)
-            }
-
-            async fn parse_response(
-                &self,
-                _response: PlatformResponse,
-                response_time_ms: u64,
-            ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-                let bids = if self.winning_bid {
-                    vec![Bid {
-                        slot_id: "atf".to_string(),
-                        price: Some(1.50),
-                        currency: "USD".to_string(),
-                        creative: None,
-                        adomain: None,
-                        bidder: AUCTION_ID_TEST_PROVIDER.to_string(),
-                        returned_seat: None,
-                        width: 300,
-                        height: 250,
-                        nurl: None,
-                        burl: None,
-                        bid_id: None,
-                        creative_id: None,
-                        renderer: None,
-                        ad_id: Some("winner-123".to_string()),
-                        cache_id: None,
-                        cache_host: None,
-                        cache_path: None,
-                        metadata: Default::default(),
-                    }]
-                } else {
-                    Vec::new()
-                };
-                Ok(AuctionResponse::success(
-                    AUCTION_ID_TEST_PROVIDER,
-                    bids,
-                    response_time_ms,
-                ))
-            }
-
-            fn timeout_ms(&self) -> u32 {
-                100
-            }
-
-            fn backend_name(
-                &self,
-                _services: &RuntimeServices,
-                _timeout_ms: u32,
-            ) -> Option<String> {
-                Some(AUCTION_ID_TEST_BACKEND.to_string())
-            }
-        }
 
         fn settings_with_co() -> Settings {
             let toml = format!(
@@ -14206,7 +14501,8 @@ mod tests {
 
         fn settings_with_capturing_provider() -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = true\nproviders = [\"{CAPTURING_PROVIDER}\"]\n\n\
+                "{}\n[auction]\nenabled = true\n\n\
+                 [auction.providers.{CAPTURING_PROVIDER}]\nprotocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = \"https://capture.example/bid\"\nrouting = \"all_eligible\"\n\n\
                  [creative_opportunities]\nenabled = true\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );

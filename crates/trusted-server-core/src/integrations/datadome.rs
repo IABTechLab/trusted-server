@@ -75,6 +75,7 @@ use crate::integrations::{
     IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, IntegrationRequestFilter,
     RequestFilterDecision, RequestFilterInput, UPSTREAM_SDK_MAX_RESPONSE_BYTES,
     collect_body_bounded, collect_response_bounded, ensure_integration_backend,
+    html_script_nonce_attribute,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::redacted::Redacted;
@@ -89,7 +90,15 @@ pub use protection_scope::{
 
 use protection_scope::ProtectionScope;
 
-pub(super) const DATADOME_INTEGRATION_ID: &str = "datadome";
+pub(crate) const DATADOME_INTEGRATION_ID: &str = "datadome";
+pub(super) const MIN_TEST_BYPASS_CREDENTIAL_BYTES: usize = 32;
+/// Fixed request header used by the configuration-gated protection test bypass.
+pub(crate) const HEADER_DATADOME_TEST_BYPASS: &str = "x-ts-datadome-bypass";
+
+/// Request marker indicating that Trusted Server should omit its automatic
+/// `DataDome` client-side tag for the current response.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DataDomeClientTagSuppressed;
 
 /// Regex pattern for matching and rewriting `DataDome` URLs in script content.
 ///
@@ -112,6 +121,28 @@ static DATADOME_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(['"])(https?:)?(//)?(api-)?js\.datadome\.co(/[^'"]*)?(['"])"#)
         .expect("DataDome URL rewrite regex should compile")
 });
+
+/// Temporary static-header bypass for server-side `DataDome` protection.
+///
+/// This is intended only for an access-controlled test environment. A
+/// matching `x-ts-datadome-bypass` header bypasses the server-side Protection
+/// API and is removed before the publisher origin receives the request. The
+/// credential itself is loaded from the Secret Store at runtime.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtectionTestBypassConfig {
+    /// Enables the bypass. Defaults to disabled when the section is present.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Deprecated feature-specific store selector accepted for migration only.
+    #[serde(default)]
+    pub credential_secret_store: Option<String>,
+
+    /// Secret reference containing at least 32 bytes of high-entropy bypass material.
+    #[serde(default)]
+    pub credential_secret_name: Option<Redacted<String>>,
+}
 
 /// Configuration for `DataDome` integration.
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -195,6 +226,10 @@ pub struct DataDomeConfig {
     )]
     pub protection_exclusion_rules: Vec<ProtectionExclusionRuleConfig>,
 
+    /// Temporary static-header bypass for access-controlled tests.
+    #[serde(default)]
+    pub protection_test_bypass: Option<ProtectionTestBypassConfig>,
+
     /// Reserved flag for future GraphQL payload extraction.
     #[serde(default)]
     pub enable_graphql_support: bool,
@@ -238,14 +273,6 @@ fn default_rewrite_sdk() -> bool {
 
 fn default_protection_api_origin() -> String {
     "https://api-fastly.datadome.co".to_string()
-}
-
-fn default_server_side_key_secret_store() -> String {
-    "ts_secrets".to_string()
-}
-
-fn default_server_side_key_secret_name() -> String {
-    "datadome_server_side_key".to_string()
 }
 
 fn default_timeout_ms() -> u32 {
@@ -325,6 +352,7 @@ impl Default for DataDomeConfig {
             protection_excluded_ip_cidr_sources: Vec::new(),
             protection_ip_list_cache_ttl_seconds: default_protection_ip_list_cache_ttl_seconds(),
             protection_exclusion_rules: default_protection_exclusion_rules(),
+            protection_test_bypass: None,
             enable_graphql_support: false,
             client_side_key: String::new(),
             inject_client_side_tag: default_inject_client_side_tag(),
@@ -372,6 +400,18 @@ impl DataDomeIntegration {
             });
         config.protection_api_origin = config.protection_api_origin.trim().to_string();
         config.client_side_tag_url = config.client_side_tag_url.trim().to_string();
+        if let Some(bypass) = &mut config.protection_test_bypass {
+            if bypass.credential_secret_store.take().is_some() {
+                log::warn!(
+                    "DataDome credential_secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
+                );
+            }
+            bypass.credential_secret_name =
+                bypass.credential_secret_name.take().and_then(|value| {
+                    let value = value.expose().trim().to_string();
+                    (!value.is_empty()).then(|| Redacted::new(value))
+                });
+        }
 
         if config.enable_protection {
             if config.server_side_key_secret_name.is_none() {
@@ -381,6 +421,7 @@ impl DataDomeIntegration {
             }
             Self::validate_protection_api_origin(&config.protection_api_origin)?;
         }
+        Self::validate_protection_test_bypass(&config, validate_resolved_secrets)?;
 
         if config.inject_client_side_tag {
             Self::validate_client_side_tag_url(&config.client_side_tag_url)?;
@@ -425,6 +466,63 @@ impl DataDomeIntegration {
             return Err(Report::new(Self::error(
                 "protection_api_origin must be an origin URL without path, query, or fragment",
             )));
+        }
+
+        Ok(())
+    }
+
+    /// Validates `DataDome` configuration before runtime registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when protection, bypass, or client-tag configuration is
+    /// invalid.
+    pub(crate) fn validate_config_for_startup(
+        config: DataDomeConfig,
+    ) -> Result<(), Report<TrustedServerError>> {
+        Self::try_new(config).map(|_| ())
+    }
+
+    pub(crate) fn validate_config_for_deploy(
+        config: DataDomeConfig,
+    ) -> Result<(), Report<TrustedServerError>> {
+        Self::try_new_with_secret_validation(config, false).map(|_| ())
+    }
+
+    fn active_protection_test_bypass(&self) -> Option<&ProtectionTestBypassConfig> {
+        self.config
+            .protection_test_bypass
+            .as_ref()
+            .filter(|bypass| bypass.enabled)
+    }
+
+    fn validate_protection_test_bypass(
+        config: &DataDomeConfig,
+        validate_resolved_secret: bool,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let Some(bypass) = config
+            .protection_test_bypass
+            .as_ref()
+            .filter(|bypass| bypass.enabled)
+        else {
+            return Ok(());
+        };
+
+        if !config.enable_protection {
+            return Err(Report::new(Self::error(
+                "protection_test_bypass requires enable_protection to be true",
+            )));
+        }
+        let Some(credential) = bypass.credential_secret_name.as_ref() else {
+            return Err(Report::new(Self::error(
+                "protection_test_bypass credential_secret_name is required when enabled",
+            )));
+        };
+        if validate_resolved_secret && credential.expose().len() < MIN_TEST_BYPASS_CREDENTIAL_BYTES
+        {
+            return Err(Report::new(Self::error(format!(
+                "protection_test_bypass credential_secret_name must resolve to at least {MIN_TEST_BYPASS_CREDENTIAL_BYTES} bytes"
+            ))));
         }
 
         Ok(())
@@ -778,7 +876,15 @@ impl IntegrationHeadInjector for DataDomeIntegration {
         DATADOME_INTEGRATION_ID
     }
 
-    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+    fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        if ctx
+            .document_state
+            .get::<DataDomeClientTagSuppressed>(DATADOME_INTEGRATION_ID)
+            .is_some()
+        {
+            return Vec::new();
+        }
+
         if !self.config.inject_client_side_tag || self.config.client_side_key.trim().is_empty() {
             return Vec::new();
         }
@@ -796,9 +902,10 @@ impl IntegrationHeadInjector for DataDomeIntegration {
                 "{}".to_string()
             })
             .replace("</", "<\\/");
+        let nonce_attribute = html_script_nonce_attribute(ctx.csp_nonce).unwrap_or_default();
 
         vec![format!(
-            "<script>window.ddjskey={key};window.ddoptions={options};</script><script src=\"{tag_url}\" async></script>"
+            "<script{nonce_attribute}>window.ddjskey={key};window.ddoptions={options};</script><script{nonce_attribute} src=\"{tag_url}\" async></script>"
         )]
     }
 }
@@ -853,13 +960,21 @@ fn build(
         return Ok(None);
     };
 
+    let integration = DataDomeIntegration::try_new(config)?;
+    let protection_test_bypass_active = integration.active_protection_test_bypass().is_some();
     log::info!(
-        "[datadome] Registering integration (sdk_origin: {}, rewrite_sdk: {})",
-        config.sdk_origin,
-        config.rewrite_sdk
+        "[datadome] Registering integration (sdk_origin: {}, rewrite_sdk: {}, enable_protection: {}, protection_test_bypass: {})",
+        integration.config.sdk_origin,
+        integration.config.rewrite_sdk,
+        integration.config.enable_protection,
+        if protection_test_bypass_active {
+            "active"
+        } else {
+            "disabled"
+        },
     );
 
-    Ok(Some(DataDomeIntegration::try_new(config)?))
+    Ok(Some(integration))
 }
 
 /// Register the `DataDome` integration with Trusted Server.
@@ -1086,6 +1201,7 @@ mod tests {
             request_host: "publisher.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",
+            csp_nonce: None,
             document_state,
         }
     }
@@ -1094,11 +1210,79 @@ mod tests {
     fn protection_secrets_are_absent_by_default() {
         let config = DataDomeConfig::default();
 
-        assert_eq!(config.server_side_key_secret_store, "ts_secrets");
-        assert_eq!(
-            config.server_side_key_secret_name,
-            "datadome_server_side_key"
+        assert!(config.server_side_key_secret_store.is_none());
+        assert!(config.server_side_key_secret_name.is_none());
+        assert!(
+            config.protection_test_bypass.is_none(),
+            "the temporary test bypass should be disabled by default"
         );
+    }
+
+    #[test]
+    fn protection_test_bypass_deserializes_nested_configuration() {
+        let config: DataDomeConfig = toml::from_str(
+            r#"
+            enabled = true
+            enable_protection = true
+
+            [protection_test_bypass]
+            enabled = true
+            credential_secret_store = "ts_secrets"
+            credential_secret_name = "datadome_test_bypass"
+            "#,
+        )
+        .expect("should deserialize DataDome test bypass configuration");
+        let bypass = config
+            .protection_test_bypass
+            .expect("should deserialize the nested test bypass configuration");
+
+        assert!(bypass.enabled, "should retain the enabled flag");
+        assert_eq!(
+            bypass.credential_secret_store.as_deref(),
+            Some("ts_secrets"),
+            "should accept the deprecated credential Secret Store"
+        );
+        assert_eq!(
+            bypass
+                .credential_secret_name
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("datadome_test_bypass"),
+            "should retain the configured credential secret reference"
+        );
+    }
+
+    #[test]
+    fn protection_test_bypass_requires_protection_and_resolved_credential() {
+        for (enable_protection, credential, expected_message) in [
+            (
+                false,
+                Some("test-bypass-credential-at-least-32-bytes"),
+                "requires enable_protection",
+            ),
+            (true, None, "credential_secret_name"),
+            (true, Some("short"), "at least 32 bytes"),
+        ] {
+            let mut config = test_config();
+            config.enable_protection = enable_protection;
+            config.server_side_key_secret_name =
+                Some(Redacted::new("resolved-server-key".to_string()));
+            config.protection_test_bypass = Some(ProtectionTestBypassConfig {
+                enabled: true,
+                credential_secret_store: None,
+                credential_secret_name: credential.map(|value| Redacted::new(value.to_string())),
+            });
+
+            let err = match DataDomeIntegration::try_new(config) {
+                Ok(_) => panic!("should reject invalid protection test bypass configuration"),
+                Err(err) => err,
+            };
+            assert!(
+                format!("{err:?}").contains(expected_message),
+                "should explain the invalid protection test bypass configuration"
+            );
+        }
     }
 
     #[test]
@@ -1226,7 +1410,10 @@ mod tests {
         config.client_side_configuration = serde_json::json!({ "ajaxListenerPath": true });
         let integration = DataDomeIntegration::new(config);
         let document_state = crate::integrations::IntegrationDocumentState::default();
-        let ctx = html_context_for_tests(&document_state);
+        let ctx = IntegrationHtmlContext {
+            csp_nonce: Some("response-nonce_123="),
+            ..html_context_for_tests(&document_state)
+        };
 
         let inserts = integration.head_inserts(&ctx);
 
@@ -1240,13 +1427,33 @@ mod tests {
             "should serialize DataDome client-side options"
         );
         assert!(
-            inserts[0].contains("<script src=\"/integrations/datadome/tags.js\" async></script>"),
+            inserts[0].contains(
+                "<script nonce=\"response-nonce_123=\" src=\"/integrations/datadome/tags.js\" async></script>"
+            ),
             "should load the configured DataDome tag URL"
+        );
+        assert!(
+            inserts[0].starts_with("<script nonce=\"response-nonce_123=\">"),
+            "should propagate the response nonce to DataDome inline configuration"
         );
     }
 
     #[test]
     fn head_injector_omits_client_side_tag_when_disabled_or_blank() {
+        let mut suppressed = test_config();
+        suppressed.client_side_key = "test-client-key".to_string();
+        let suppressed_integration = DataDomeIntegration::new(suppressed);
+        let suppressed_state = crate::integrations::IntegrationDocumentState::default();
+        suppressed_state
+            .get_or_insert_with(DATADOME_INTEGRATION_ID, || DataDomeClientTagSuppressed);
+        let suppressed_ctx = html_context_for_tests(&suppressed_state);
+        assert!(
+            suppressed_integration
+                .head_inserts(&suppressed_ctx)
+                .is_empty(),
+            "should omit the tag when the request is IP-excluded"
+        );
+
         let mut blank_key = test_config();
         blank_key.client_side_key = " ".to_string();
         let integration = DataDomeIntegration::new(blank_key);

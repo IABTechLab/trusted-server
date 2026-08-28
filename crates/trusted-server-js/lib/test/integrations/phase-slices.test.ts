@@ -275,7 +275,10 @@ describe('canonical takeover and deferred product slices', () => {
     ).toBe(false);
     expect(
       [...coreSources].filter((source) => source.startsWith('src/integrations/')).sort()
-    ).toEqual(['src/integrations/render_runtime/module.ts']);
+    ).toEqual([
+      'src/integrations/render_runtime/module.ts',
+      'src/integrations/render_runtime/prebid_selection.ts',
+    ]);
 
     for (const [, request] of DEFERRED_FACTORIES) {
       const entry = `${request.replace('../../', 'src/').replace(/^src\/src\//, 'src/')}.ts`;
@@ -285,6 +288,14 @@ describe('canonical takeover and deferred product slices', () => {
         [...sources].some((source) => /composition\/browser(?:_test)?\.ts$/.test(source))
       ).toBe(false);
       expect([...sources].some((source) => source.endsWith('kernel/runtime.ts'))).toBe(false);
+    }
+  });
+
+  it('keeps the shared parser route owner in bootstrap instead of duplicating it in product slices', () => {
+    const routeOwner = 'src/first_display/leaf/browser_route_owner.ts';
+    expect(transitiveSources('src/core/bootstrap.ts')).toContain(routeOwner);
+    for (const slice of ['datadome', 'google_tag_manager', 'lockr', 'permutive', 'sourcepoint']) {
+      expect(transitiveSources(`src/first_display/slices/${slice}.ts`)).not.toContain(routeOwner);
     }
   });
 });

@@ -110,6 +110,8 @@ export interface RuntimeOptions {
   readonly catalog?: readonly IntegrationCatalogEntry[];
   readonly document?: Document;
   readonly phaseScheduler?: PhaseScheduler;
+  readonly trustedScriptUrl?: (value: string) => unknown;
+  readonly currentScript?: () => HTMLScriptElement | null;
   readonly boot?: unknown;
   readonly now?: () => number;
   readonly getBindings?: (id: string) => IntegrationBindings;
@@ -284,7 +286,9 @@ class RuntimeOwner implements Runtime {
       if (!canClaimRuntimeTarget(this.options.target)) return false;
       const runtimeDocument = this.runtimeDocument();
       const Script = runtimeDocument?.defaultView?.HTMLScriptElement;
-      const currentScript = runtimeDocument?.currentScript;
+      const currentScript = this.options.currentScript
+        ? this.options.currentScript()
+        : runtimeDocument?.currentScript;
       this.selectedScript = Script && currentScript instanceof Script ? currentScript : undefined;
       const takeoverMode = this.options.coordinateTakeover !== undefined;
       const capturedRuntimeSrc =
@@ -420,6 +424,7 @@ class RuntimeOwner implements Runtime {
                 ? ('trustedserver-js-runtime' as const)
                 : ('trustedserver-js' as const),
               document: runtimeDocument,
+              ...(this.options.currentScript ? { currentScript: this.options.currentScript } : {}),
             }
           : {}),
         startedAtMs,
@@ -740,6 +745,7 @@ class RuntimeOwner implements Runtime {
     if (runtimeScript) {
       this.phaseLoader = createDeferredPhaseLoader({
         runtimeScript,
+        ...(this.options.currentScript ? { currentScript: this.options.currentScript } : {}),
         document: runtimeDocument,
         gate: gate.ready,
         manifest,
@@ -748,6 +754,9 @@ class RuntimeOwner implements Runtime {
             activate: () => undefined,
           },
         releaseId: EMBEDDED_RELEASE_ID,
+        ...(this.options.trustedScriptUrl
+          ? { trustedScriptUrl: this.options.trustedScriptUrl }
+          : {}),
         ...(this.options.phaseScheduler
           ? {
               scheduler: {

@@ -1,17 +1,18 @@
 import { installDataDomeInitial } from '../leaf/route_guard';
-import { registerFirstDisplayBrowserRoute } from '../leaf/browser_route_owner';
 import { registerCurrentFirstDisplayComponent } from '../registration_client';
 
 import type { InitialSliceInstaller } from './definition';
 
-export const installDataDomeInitialSlice: InitialSliceInstaller = (candidate, own) =>
-  installDataDomeInitial(
+export const installDataDomeInitialSlice: InitialSliceInstaller = (candidate, own) => {
+  const bindings = candidate as Readonly<{ observe: unknown; register: unknown }>;
+  return installDataDomeInitial(
     Object.freeze({
-      observe: (candidate as Readonly<{ observe: unknown }>).observe,
+      observe: bindings.observe,
       origin: location.origin,
-      register: registerFirstDisplayBrowserRoute,
+      register: bindings.register,
     }),
     own
   );
+};
 
 registerCurrentFirstDisplayComponent('datadome_initial', installDataDomeInitialSlice);

@@ -64,6 +64,8 @@ function runFrame(frames: Array<() => void>): void {
   frame();
 }
 
+const gptDiagnosticsBadgeTextForTest = formatGptDiagnosticsBadgeText;
+
 function queueFrame(frames: Array<() => void>): (callback: () => void) => () => void {
   return (callback) => {
     frames.push(callback);
@@ -279,7 +281,7 @@ describe('GptDiagnosticsBadgeManager', () => {
       'Filled · Req 728×90, 970×250 · Fill 728×90 · Box 980×270\nResponse 276 ms · Render 42 ms\nViewable after 1 s'
     );
     expect(
-      gptDiagnosticsBadgeTextForTest({
+      formatGptDiagnosticsBadgeText({
         requestNumber: 1,
         isEmpty: false,
         requestedSlotSizes: [
@@ -293,7 +295,7 @@ describe('GptDiagnosticsBadgeManager', () => {
       })
     ).toBe('Filled · Req 300×250, 320×50, 728×90 +1');
     expect(
-      formatGptDiagnosticsBadgeText({
+      gptDiagnosticsBadgeTextForTest({
         requestNumber: 1,
         isEmpty: true,
         incompleteSequence: false,

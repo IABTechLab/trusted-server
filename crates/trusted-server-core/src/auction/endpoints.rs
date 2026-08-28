@@ -273,13 +273,19 @@ pub async fn handle_auction(
             winning_bids: HashMap::new(),
             total_time_ms: 0,
             metadata: HashMap::new(),
+            decision_set: AuctionDecisionSetV1::failed(
+                &auction_request,
+                AuctionSlotFailureReason::AuctionDisabled,
+            ),
         };
-        return convert_to_openrtb_response(
+        return Ok(exact_auction_response_v1(
             &empty_result,
             settings,
             &auction_request,
+            &request_origin,
             ec_context.ec_allowed(),
-        );
+        )?
+        .response);
     }
 
     // Server-side auction consent gate. The publisher-navigation and
@@ -686,7 +692,7 @@ mod tests {
         NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, noop_services,
     };
     use crate::platform::{ClientInfo, PlatformResponse};
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use serde_json::json;
@@ -810,21 +816,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_creative_opportunities_do_not_disable_direct_auction() {
-        let mut settings = create_test_settings();
-        settings.creative_opportunities = Some(
-            toml::from_str("enabled = false\ngam_network_id = \"12345\"\n")
-                .expect("should build disabled creative opportunity config"),
+    async fn direct_auction_remains_available_when_templates_are_disabled() {
+        let settings_toml = format!(
+            "{}\n[auction]\nenabled = true\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
+            crate_test_settings_str()
         );
-        let config = AuctionConfig {
-            enabled: true,
-            providers: vec!["call_recording_provider".to_string()],
-            timeout_ms: 2_000,
-            mediator: None,
-            ..Default::default()
-        };
+        let mut settings = Settings::from_toml(&settings_toml)
+            .expect("should parse settings with disabled templates");
+        settings.auction.providers =
+            crate::auction::AuctionConfig::legacy_provider_map(&["call_recording_provider"]);
         let called = Arc::new(Mutex::new(false));
-        let mut orchestrator = AuctionOrchestrator::new(config);
+        let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
         orchestrator.register_provider(Arc::new(CallRecordingProvider {
             called: Arc::clone(&called),
         }));

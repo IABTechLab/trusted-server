@@ -12,7 +12,6 @@ import type {
   GptDiagnosticsRequestCycle,
   GptDiagnosticsRequestPath,
   GptDiagnosticsResponseClass,
-  GptDiagnosticsSlotHandle,
   GptDiagnosticsTrustedServerOpportunity,
   Size,
 } from '../../core/types';
@@ -55,6 +54,7 @@ export interface GptRenderFacts {
   size?: Size | undefined;
   isBackfill?: boolean | undefined;
   slotContentChanged?: boolean | undefined;
+  adManager?: GptDiagnosticsAdManagerIdentity | undefined;
 }
 
 export interface GptDiagnosticsStoreSlotSnapshot {
@@ -99,6 +99,8 @@ interface MutableSlotRecord {
 interface StoreOptions {
   now?: (() => number) | undefined;
   schedule?: ((callback: () => void) => void) | undefined;
+  /** Deferred marker cleanup and diagnostic-window re-notification. */
+  defer?: ((callback: () => void, delayMs: number) => void) | undefined;
 }
 
 type RequestIntentSource = 'trusted_server_direct' | 'prebid_refresh' | 'publisher_refresh';
@@ -119,16 +121,19 @@ type AttemptStatus = 'live' | 'completed' | 'expired' | 'evicted';
 
 interface CreativeAttemptRecord {
   id: number;
-  cycle?: MutableRequestCycle;
-  runtimeSlotNumber?: number;
-  slotElementId?: string;
+  cycle?: MutableRequestCycle | undefined;
+  runtimeSlotNumber?: number | undefined;
+  slotElementId?: string | undefined;
   requestedAtMs: number;
   expiresAtMs: number;
   provisionalBeforeRender: boolean;
   status: AttemptStatus;
 }
 
-type AttributionIdentity = Partial<Pick<MutableSlotRecord, 'runtimeSlotNumber' | 'slotElementId'>>;
+interface AttributionIdentity {
+  readonly runtimeSlotNumber?: number | undefined;
+  readonly slotElementId?: string | undefined;
+}
 
 type StoreListener = () => void;
 
@@ -217,10 +222,12 @@ function normalizedRequestedSlotSizes(value: unknown): ReadonlyArray<Size> | und
       candidate.length !== 2 ||
       typeof candidate[0] !== 'number' ||
       typeof candidate[1] !== 'number' ||
-      !Number.isFinite(candidate[0]) ||
-      !Number.isFinite(candidate[1]) ||
-      candidate[0] <= 0 ||
-      candidate[1] <= 0
+      !Number.isInteger(candidate[0]) ||
+      !Number.isInteger(candidate[1]) ||
+      candidate[0] < 1 ||
+      candidate[0] > 4_096 ||
+      candidate[1] < 1 ||
+      candidate[1] > 4_096
     ) {
       continue;
     }
@@ -349,6 +356,7 @@ export class GptDiagnosticsStore {
       return;
     }
 
+    const identity = slot.token ?? slot;
     this.trustedServerSlots.delete(auctionSlotId);
     this.trustedServerSlots.set(auctionSlotId, slot);
     while (this.trustedServerSlots.size > MAX_TRUSTED_SERVER_ASSOCIATIONS) {
@@ -357,7 +365,7 @@ export class GptDiagnosticsStore {
       this.trustedServerSlots.delete(oldest);
     }
 
-    this.recordRequestIntentSource(slot, 'trusted_server_direct', {
+    this.recordRequestIntentSource(identity, 'trusted_server_direct', {
       trustedServerOpportunity: opportunity,
       trustedServerAuctionId: normalizedAuctionId(trustedServerAuctionId),
       requestedSlotSizes: normalizedRequestedSlotSizes(requestedSlotSizes),
@@ -400,7 +408,7 @@ export class GptDiagnosticsStore {
     }
 
     const identity = this.attributionIdentity(slot);
-    const runtimeSlotNumber = this.slotNumbers.get(slot);
+    const runtimeSlotNumber = this.slotNumbers.get(slot.token ?? slot);
     const record = runtimeSlotNumber === undefined ? undefined : this.slots.get(runtimeSlotNumber);
     if (!record || record.requests.length === 0) {
       this.reportAttributionIssue('creative_request_without_cycle', timestampMs, identity);
@@ -598,6 +606,9 @@ export class GptDiagnosticsStore {
     const identity = slot.token ?? slot;
     const requestNumber = (this.requestNumbers.get(identity) ?? 0) + 1;
     this.requestNumbers.set(identity, requestNumber);
+    const intent = this.consumeRequestIntent(identity, timestampMs);
+    const trustedServerEvidence = intent?.sources.get('trusted_server_direct');
+    const requestPath = this.requestPath(intent);
     record.requests.push({
       requestNumber,
       requestedAtMs: timestampMs,
@@ -724,7 +735,9 @@ export class GptDiagnosticsStore {
     }
 
     const record = this.slots.get(runtimeSlotNumber);
-    const cycle = record?.requests.find((candidate) => candidate.requestNumber === requestNumber);
+    if (!record) return;
+
+    const cycle = record.requests.find((candidate) => candidate.requestNumber === requestNumber);
     if (
       !record ||
       !cycle ||
@@ -752,7 +765,8 @@ export class GptDiagnosticsStore {
       'slotOnload',
       slot,
       timestampMs,
-      (cycle) => cycle.responseAtMs !== undefined && cycle.loadAtMs === undefined,
+      (cycle) =>
+        cycle.responseAtMs !== undefined && cycle.isEmpty !== true && cycle.loadAtMs === undefined,
       (record, cycle) => {
         cycle.loadAtMs = timestampMs;
         if (cycle.renderAtMs === undefined) {
@@ -861,6 +875,187 @@ export class GptDiagnosticsStore {
       ) as Record<GptDiagnosticsCallbackKind, GptDiagnosticsCoverageCounters>,
       metadata: { ...this.metadata },
     };
+  }
+
+  private attributionIdentity(slot: GptDiagnosticsSlotLike & object): AttributionIdentity {
+    const identity = slot.token ?? slot;
+    const runtimeSlotNumber = this.slotNumbers.get(identity);
+    const record = runtimeSlotNumber === undefined ? undefined : this.slots.get(runtimeSlotNumber);
+    const slotElementId =
+      record?.slotElementId ??
+      (typeof slot.elementId === 'string' && slot.elementId.length > 0
+        ? slot.elementId
+        : undefined) ??
+      optionalNonEmptyString(
+        typeof slot.getSlotElementId === 'function' ? slot.getSlotElementId.bind(slot) : undefined
+      );
+    return {
+      ...(runtimeSlotNumber !== undefined ? { runtimeSlotNumber } : {}),
+      ...(slotElementId !== undefined ? { slotElementId } : {}),
+    };
+  }
+
+  private addAttributionIssue(
+    reason: GptDiagnosticsAttributionIssueReason,
+    timestampMs: number,
+    identity: AttributionIdentity = {}
+  ): void {
+    if (this.attributionIssues.length >= MAX_ATTRIBUTION_ISSUES) {
+      this.attributionIssues.shift();
+      this.metadata.droppedAttributionIssues += 1;
+    }
+
+    this.attributionIssues.push({
+      reason,
+      timestampMs,
+      ...(identity.runtimeSlotNumber !== undefined && identity.runtimeSlotNumber > 0
+        ? { runtimeSlotNumber: identity.runtimeSlotNumber }
+        : {}),
+      ...(identity.slotElementId !== undefined ? { slotElementId: identity.slotElementId } : {}),
+    });
+  }
+
+  private reportAttributionIssue(
+    reason: GptDiagnosticsAttributionIssueReason,
+    timestampMs: number,
+    identity: AttributionIdentity = {}
+  ): void {
+    this.addAttributionIssue(reason, timestampMs, identity);
+    this.notify();
+  }
+
+  private expireCreativeAttempts(timestampMs: number): void {
+    for (const attempt of this.creativeAttempts.values()) {
+      if (attempt.status !== 'live' || timestampMs < attempt.expiresAtMs) continue;
+      attempt.status = 'expired';
+      attempt.cycle = undefined;
+    }
+  }
+
+  private evictCreativeAttempt(cycle: MutableRequestCycle): void {
+    const attemptId = this.attemptIdsByCycle.get(cycle);
+    if (attemptId === undefined) return;
+    const attempt = this.creativeAttempts.get(attemptId);
+    if (!attempt || attempt.status !== 'live') return;
+    attempt.status = 'evicted';
+    attempt.cycle = undefined;
+  }
+
+  private ensureCreativeAttemptCapacity(): boolean {
+    if (this.creativeAttempts.size < MAX_CREATIVE_ATTEMPTS) return true;
+
+    for (const [attemptId, attempt] of this.creativeAttempts) {
+      if (attempt.status === 'live') continue;
+      this.creativeAttempts.delete(attemptId);
+      return true;
+    }
+    return false;
+  }
+
+  /** Record one source's evidence for the slot's next GPT request. */
+  private recordRequestIntentSource(
+    slot: object,
+    source: RequestIntentSource,
+    facts: Pick<
+      PendingSourceEvidence,
+      'trustedServerOpportunity' | 'trustedServerAuctionId' | 'requestedSlotSizes'
+    > = {}
+  ): void {
+    const observedAtMs = this.now();
+    let intent = this.pendingRequestIntents.get(slot);
+    if (intent) {
+      this.expireRequestIntentSources(intent, observedAtMs);
+      if (intent.sources.size === 0) intent = undefined;
+    }
+    if (!intent) {
+      intent = { intentId: this.nextRequestIntentId, sources: new Map() };
+      this.nextRequestIntentId += 1;
+      this.pendingRequestIntents.set(slot, intent);
+    }
+    intent.sources.set(source, { observedAtMs, ...facts });
+  }
+
+  private expireRequestIntentSources(intent: PendingRequestIntent, timestampMs: number): void {
+    for (const [source, evidence] of intent.sources) {
+      if (timestampMs - evidence.observedAtMs >= REQUEST_PATH_ATTRIBUTION_WINDOW_MS) {
+        intent.sources.delete(source);
+      }
+    }
+  }
+
+  private consumeRequestIntent(
+    slot: object,
+    timestampMs: number
+  ): PendingRequestIntent | undefined {
+    const intent = this.pendingRequestIntents.get(slot);
+    this.pendingRequestIntents.delete(slot);
+    if (!intent) return undefined;
+    this.expireRequestIntentSources(intent, timestampMs);
+    return intent.sources.size > 0 ? intent : undefined;
+  }
+
+  /** Keep at most one outstanding delivery-evidence boundary timer. */
+  private scheduleDeliveryBoundaryNotification(
+    delayMs: number = TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS
+  ): void {
+    if (this.deliveryBoundaryScheduled) return;
+    this.deliveryBoundaryScheduled = true;
+    this.defer(() => {
+      this.deliveryBoundaryScheduled = false;
+      this.notify();
+      const nextDelayMs = this.nextDeliveryBoundaryDelayMs();
+      if (nextDelayMs !== undefined) this.scheduleDeliveryBoundaryNotification(nextDelayMs);
+    }, delayMs);
+  }
+
+  private nextDeliveryBoundaryDelayMs(): number | undefined {
+    const nowMs = this.now();
+    let earliestDeadlineMs: number | undefined;
+    for (const record of this.slots.values()) {
+      for (const cycle of record.requests) {
+        if (
+          cycle.renderAtMs === undefined ||
+          cycle.isEmpty !== false ||
+          (cycle.trustedServerOpportunity !== 'renderable_candidate' &&
+            cycle.trustedServerOpportunity !== 'unrenderable_candidate')
+        ) {
+          continue;
+        }
+        const deadlineMs = cycle.renderAtMs + TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS;
+        if (deadlineMs <= nowMs) continue;
+        if (earliestDeadlineMs === undefined || deadlineMs < earliestDeadlineMs) {
+          earliestDeadlineMs = deadlineMs;
+        }
+      }
+    }
+    return earliestDeadlineMs === undefined ? undefined : earliestDeadlineMs - nowMs;
+  }
+
+  private requestPath(intent: PendingRequestIntent | undefined): GptDiagnosticsRequestPath {
+    if (!intent) return 'unattributed';
+    if (intent.sources.size > 1) return 'competing';
+    const source = intent.sources.keys().next().value as RequestIntentSource | undefined;
+    return source ?? 'unattributed';
+  }
+
+  private recordReplacement(record: MutableSlotRecord, cycle: MutableRequestCycle): void {
+    const currentIndex = record.requests.indexOf(cycle);
+    if (currentIndex <= 0) return;
+    const previous = record.requests
+      .slice(0, currentIndex)
+      .reverse()
+      .find((candidate) => candidate.isEmpty === false && candidate.renderAtMs !== undefined);
+    if (!previous) return;
+    cycle.replacedRequestNumber = previous.requestNumber;
+    cycle.previousRenderToRequestMs = validDuration(previous.renderAtMs, cycle.requestedAtMs);
+    const previousCreativeId =
+      previous.adManager?.creativeId ?? previous.adManager?.sourceAgnosticCreativeId;
+    const currentCreativeId =
+      cycle.adManager?.creativeId ?? cycle.adManager?.sourceAgnosticCreativeId;
+    if (previousCreativeId !== undefined) cycle.previousCreativeId = previousCreativeId;
+    if (previousCreativeId !== undefined && currentCreativeId !== undefined) {
+      cycle.creativeChanged = previousCreativeId !== currentCreativeId;
+    }
   }
 
   private timestamp(observedAtMs?: number): number {

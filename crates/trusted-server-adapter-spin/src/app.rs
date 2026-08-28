@@ -13,9 +13,11 @@ use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, he
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::auction::{
+    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
+};
 use trusted_server_core::cache_policy::EdgeCacheHeader;
-#[cfg(all(feature = "aps-runner-proxy-integration-test", target_arch = "wasm32"))]
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
@@ -43,6 +45,7 @@ use trusted_server_core::request_signing::{
 use trusted_server_core::settings::Settings;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::settings_data::{default_config_key, default_secret_store_name};
+use trusted_server_core::trace_cookie::handle_trace_mode;
 
 use crate::middleware::{
     AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware, SanitizeRequestMiddleware,
@@ -78,6 +81,40 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     build_state_with_settings(settings)
 }
 
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
+    let config_store_name = StoreName::from(SPIN_DEFAULT_CONFIG_STORE);
+    let config_key = default_config_key();
+    let config_store =
+        futures::executor::block_on(SpinConfigStore::open(config_store_name.as_ref().to_owned()))
+            .map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: "failed to open Spin Trusted Server config store".to_string(),
+            })
+            .attach(error.to_string())
+        })?;
+    let config_handle = ConfigStoreHandle::new(Arc::new(config_store));
+    let config_adapter = ConfigStoreHandleAdapter(config_handle);
+    let raw_envelope = config_adapter
+        .get(&config_store_name, &config_key)
+        .map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: "failed to read Spin Trusted Server app-config blob".to_string(),
+            })
+            .attach(error.to_string())
+        })?;
+    let secret_store = SpinSecretStoreAdapter;
+    settings_from_config_blob(&raw_envelope, &secret_store, &default_secret_store_name())
+}
+
+#[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
+fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
+    Err(Report::new(TrustedServerError::Configuration {
+        message: "Spin startup settings require the production config store".to_string(),
+    })
+    .attach("use TrustedServerApp::routes_with_settings for host tests"))
+}
+
 #[cfg(all(feature = "aps-runner-proxy-integration-test", target_arch = "wasm32"))]
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let envelope =
@@ -101,8 +138,10 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let orchestrator = build_orchestrator(&settings)?;
-    let registry = IntegrationRegistry::new(&settings)?;
+    let plan = Arc::new(compile_auction_plan(&settings)?);
+    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Spin)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
+    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -234,6 +273,7 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
         ("/_ts/admin/eids", &[Method::GET]),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
+        ("/_ts/trace", &[Method::GET]),
         ("/auction", &[Method::POST]),
         (PAGE_BIDS_PATH, &[Method::GET, Method::OPTIONS]),
         ("/__ts/page-bids", LEGACY_ADMIN_DENY_METHODS),
@@ -837,6 +877,17 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         };
         let legacy_admin_deny =
             |_ctx: RequestContext| async { Ok::<Response, EdgeError>(legacy_admin_alias_denied()) };
+        let s = Arc::clone(&state);
+        let trace_mode_handler = move |ctx: RequestContext| {
+            let s = Arc::clone(&s);
+            async move {
+                let req = ctx.into_request();
+                Ok::<Response, EdgeError>(
+                    handle_trace_mode(&s.settings, req.uri().query())
+                        .unwrap_or_else(|error| http_error(&error)),
+                )
+            }
+        };
 
         let mut builder = RouterService::builder()
             // Outermost middleware: strips the configured trusted-client-IP
@@ -979,11 +1030,10 @@ mod tests {
         let state =
             build_state_with_settings(settings).expect("Spin startup should register APS renderer");
         assert!(
-            state.registry.has_route(
-                &edgezero_core::http::Method::GET,
-                "/integrations/aps/renderer"
-            ),
-            "Spin startup registry should expose the APS renderer"
+            state
+                .registry
+                .has_reserved_path("/integrations/aps/renderer/v2"),
+            "Spin startup registry should reserve the APS v2 renderer"
         );
     }
 

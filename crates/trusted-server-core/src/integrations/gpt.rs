@@ -77,11 +77,6 @@ pub struct GptConfig {
     #[validate(url)]
     pub script_url: String,
 
-    /// Cache TTL for proxied GPT scripts in seconds (default: 3600 = 1 hour).
-    #[serde(default = "default_cache_ttl")]
-    #[validate(range(min = 60, max = 86400))]
-    pub cache_ttl_seconds: u32,
-
     /// Whether to rewrite GPT script URLs in publisher HTML.
     #[serde(default = "default_rewrite_script")]
     pub rewrite_script: bool,
@@ -145,6 +140,7 @@ impl GptIntegration {
     ) -> ProxyRequestConfig<'a> {
         let mut config = ProxyRequestConfig::new(target_url)
             .with_streaming()
+            .with_cache_bypass()
             .without_forward_headers();
         config.follow_redirects = false;
         config.forward_ec_id = false;
@@ -196,8 +192,6 @@ impl GptIntegration {
         let status = parts.status;
         let content_type = parts.headers.get(header::CONTENT_TYPE).cloned();
         let content_encoding = parts.headers.get(header::CONTENT_ENCODING).cloned();
-        let etag = parts.headers.get(header::ETAG).cloned();
-        let last_modified = parts.headers.get(header::LAST_MODIFIED).cloned();
         let upstream_vary = parts
             .headers
             .get(header::VARY)
@@ -216,16 +210,6 @@ impl GptIntegration {
                 .insert(header::CONTENT_TYPE, content_type);
         }
 
-        if let Some(etag) = etag {
-            finalized.headers_mut().insert(header::ETAG, etag);
-        }
-
-        if let Some(last_modified) = last_modified {
-            finalized
-                .headers_mut()
-                .insert(header::LAST_MODIFIED, last_modified);
-        }
-
         if let Some(content_encoding) = content_encoding {
             finalized
                 .headers_mut()
@@ -242,11 +226,7 @@ impl GptIntegration {
         if status.is_success() {
             finalized.headers_mut().insert(
                 header::CACHE_CONTROL,
-                http::HeaderValue::from_str(&format!(
-                    "public, max-age={}",
-                    self.config.cache_ttl_seconds
-                ))
-                .expect("should build GPT Cache-Control header"),
+                http::HeaderValue::from_static("private, no-store"),
             );
         }
 
@@ -504,10 +484,6 @@ fn default_script_url() -> String {
     "https://securepubads.g.doubleclick.net/tag/js/gpt.js".to_string()
 }
 
-fn default_cache_ttl() -> u32 {
-    3600
-}
-
 fn default_rewrite_script() -> bool {
     true
 }
@@ -525,7 +501,6 @@ mod tests {
             enabled: true,
             gam_attribution_enabled: false,
             script_url: default_script_url(),
-            cache_ttl_seconds: 3600,
             rewrite_script: true,
             slim_prebid_url: None,
         }
@@ -762,6 +737,10 @@ mod tests {
             !config.follow_redirects,
             "should keep GPT asset proxying on the original single-hop trust boundary"
         );
+        assert!(
+            config.bypass_cache,
+            "should always fetch live GPT bytes through the platform"
+        );
     }
 
     #[test]
@@ -911,21 +890,13 @@ mod tests {
             Some("application/javascript; charset=utf-8"),
             "should preserve upstream content type for GPT assets"
         );
-        assert_eq!(
-            response
-                .headers()
-                .get(header::ETAG)
-                .and_then(|value| value.to_str().ok()),
-            Some("\"gpt-etag\""),
-            "should preserve upstream ETag validators for GPT assets"
+        assert!(
+            response.headers().get(header::ETAG).is_none(),
+            "should strip upstream ETag validators from live GPT relays"
         );
-        assert_eq!(
-            response
-                .headers()
-                .get(header::LAST_MODIFIED)
-                .and_then(|value| value.to_str().ok()),
-            Some("Thu, 13 Mar 2025 08:00:00 GMT"),
-            "should preserve upstream Last-Modified validators for GPT assets"
+        assert!(
+            response.headers().get(header::LAST_MODIFIED).is_none(),
+            "should strip upstream Last-Modified validators from live GPT relays"
         );
         assert_eq!(
             response
@@ -948,8 +919,8 @@ mod tests {
                 .headers()
                 .get(header::CACHE_CONTROL)
                 .and_then(|value| value.to_str().ok()),
-            Some("public, max-age=3600"),
-            "should add cache headers for successful GPT asset responses"
+            Some("private, no-store"),
+            "should make every live GPT relay response uncacheable"
         );
         assert!(
             response.headers().get(header::SET_COOKIE).is_none(),
@@ -1056,7 +1027,6 @@ mod tests {
                 &serde_json::json!({
                     "enabled": true,
                     "script_url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
-                    "cache_ttl_seconds": 3600,
                     "rewrite_script": true
                 }),
             )
@@ -1163,6 +1133,7 @@ mod tests {
             request_host: "edge.example.com",
             request_scheme: "https",
             origin_host: "example.com",
+            csp_nonce: None,
             document_state: &doc_state,
         };
 

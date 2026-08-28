@@ -5,9 +5,14 @@ import {
   type FirstDisplayAgent,
   type FirstDisplayAgentRegistrationHostV1,
 } from '../first_display/agent';
+import {
+  registerFirstDisplayBrowserRoute,
+  type FirstDisplayBrowserRouteRuleV1,
+} from '../first_display/leaf/browser_route_owner';
 import type { InitialSliceInstaller } from '../first_display/slices/definition';
 import type { FirstDisplaySliceId } from '../kernel/release_catalog';
 import type { FirstDisplaySliceActivationContext } from '../shared/first_display_transaction';
+import type { FirstDisplayAgentCaptureFinalizerV1 } from '../shared/first_display_handoff';
 import type { ClaimedFirstDisplayTakeoverV1, FirstDisplayTakeoverClaim } from '../shared/takeover';
 
 import {
@@ -178,11 +183,55 @@ function publishFallback(
 function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSnapshotV1): void {
   const ingress = prepareIngress(target);
   const firstDisplay = boot.manifest.firstDisplay;
+  const NativeHtmlScriptElement = window.HTMLScriptElement;
+  const nativeArrayIsArray = Array.isArray;
+  const nativeObjectDefineProperty = Object.defineProperty;
+  const nativeObjectFreeze = Object.freeze;
+  const nativeObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+  const nativeObjectIsFrozen = Object.isFrozen;
+  const nativeReflectApply = Reflect.apply;
+  const nativeReflectOwnKeys = Reflect.ownKeys;
+  const nativeCurrentScriptGetter = (() => {
+    try {
+      const constructor = document.defaultView?.Document;
+      const descriptor = constructor
+        ? nativeObjectGetOwnPropertyDescriptor(constructor.prototype, 'currentScript')
+        : undefined;
+      return typeof descriptor?.get === 'function' ? descriptor.get : undefined;
+    } catch {
+      return undefined;
+    }
+  })();
+  const currentScript = (): HTMLScriptElement | null => {
+    if (!nativeCurrentScriptGetter) return null;
+    try {
+      const value = nativeReflectApply(nativeCurrentScriptGetter, document, []);
+      return value instanceof NativeHtmlScriptElement ? value : null;
+    } catch {
+      return null;
+    }
+  };
+  let runtimeReadSource: HTMLScriptElement | undefined;
+  let runtimeReadLive = false;
+  let runtimeNamespaceSealed = false;
+  const sealRuntimeNamespace = (): void => {
+    if (runtimeNamespaceSealed) return;
+    nativeObjectDefineProperty(window, 'tsjs', {
+      configurable: false,
+      enumerable: true,
+      get: () => {
+        if (!runtimeReadLive || currentScript() !== runtimeReadSource) return target;
+        runtimeReadLive = false;
+        return runtimeReadSource;
+      },
+    });
+    runtimeNamespaceSealed = true;
+  };
   const trustedOrigin = (): string | undefined => {
     try {
       if (/^https?:\/\//.test(location.origin)) return location.origin;
       if (location.origin !== 'null') return undefined;
-      const stamp = Object.getOwnPropertyDescriptor(window, '__tsCreativeOrigin');
+      const stamp = nativeObjectGetOwnPropertyDescriptor(window, '__tsCreativeOrigin');
       if (
         !stamp ||
         stamp.configurable ||
@@ -227,16 +276,6 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
   let bootClaimState: 'available' | 'claiming' | 'claimed' = 'available';
   let bootClaimCompleted = false;
   let completeClaimedBoot: ((outcome: BootClaimOutcome) => void) | undefined;
-  const removeBootClaim = (): void => {
-    try {
-      const descriptor = Object.getOwnPropertyDescriptor(target, '_claimBootSnapshot');
-      if (descriptor?.configurable && 'value' in descriptor && descriptor.value === claimBoot) {
-        Reflect.deleteProperty(target, '_claimBootSnapshot');
-      }
-    } catch {
-      // The closure-retained snapshot remains authoritative after hostile replacement.
-    }
-  };
   const completeBootClaim = (outcome: BootClaimOutcome): void => {
     const acceptedOutcome =
       outcome === 'kernel' || outcome === 'abi_mismatch' || outcome === 'bundle_partial';
@@ -253,7 +292,12 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
     completeClaimedBoot = undefined;
     complete(outcome);
   };
-  const claimedBoot = Object.freeze({ boot, integrity, complete: completeBootClaim });
+  const claimedBoot = nativeObjectFreeze({
+    boot,
+    integrity,
+    complete: completeBootClaim,
+    currentScript,
+  });
   const claimBoot = (source: unknown): Readonly<typeof claimedBoot> | undefined => {
     if (bootClaimState !== 'available') return undefined;
     bootClaimState = 'claiming';
@@ -261,8 +305,8 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
     try {
       const expectedId = firstDisplay === null ? 'trustedserver-js' : 'trustedserver-js-runtime';
       accepted =
-        source instanceof HTMLScriptElement &&
-        document.currentScript === source &&
+        source instanceof NativeHtmlScriptElement &&
+        currentScript() === source &&
         authentic(source, boot.manifest.runtimeSrc, expectedId);
     } catch {
       // The claim stays reserved only until this authentication attempt fails.
@@ -272,40 +316,53 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
       return undefined;
     }
     bootClaimState = 'claimed';
-    removeBootClaim();
     return claimedBoot;
   };
-  const installBootClaim = (): void => {
-    Object.defineProperty(target, '_claimBootSnapshot', {
-      configurable: true,
+  const installRuntimeClaim = (
+    script: HTMLScriptElement,
+    mode: 'direct' | 'takeover',
+    bind: (input: unknown) => unknown
+  ): boolean => {
+    if (nativeObjectGetOwnPropertyDescriptor(script, '_claimRuntimeV1')) return false;
+    let live = true;
+    const claim = (source: unknown): Readonly<Record<string, unknown>> | undefined => {
+      if (!live) return undefined;
+      live = false;
+      const claimed = claimBoot(source);
+      if (!claimed) {
+        live = true;
+        return undefined;
+      }
+      return nativeObjectFreeze({ ...claimed, target, source, mode, bind });
+    };
+    nativeObjectDefineProperty(script, '_claimRuntimeV1', {
+      configurable: false,
       enumerable: false,
-      value: claimBoot,
+      value: claim,
       writable: false,
     });
+    runtimeReadSource = script;
+    runtimeReadLive = true;
+    return true;
   };
   if (firstDisplay === null) {
     let terminal = false;
     let cancelRuntime: (() => void) | undefined;
+    let directClaimState: 'available' | 'claiming' | 'claimed' = 'available';
+    let claimObserver: MutationObserver | undefined;
     let timer: number | undefined;
-    const removeClaim = (): void => {
-      try {
-        const descriptor = Object.getOwnPropertyDescriptor(target, '_claimDirectRuntime');
-        if (descriptor?.configurable) Reflect.deleteProperty(target, '_claimDirectRuntime');
-      } catch {
-        // A hostile replacement cannot make the captured claim callable again.
-      }
-    };
     const fallback = (reason: BootFailureReason = 'bundle_partial'): void => {
       if (terminal) return;
       terminal = true;
+      runtimeReadLive = false;
       if (timer !== undefined) window.clearTimeout(timer);
       try {
         cancelRuntime?.();
       } catch {
         // Continue to the terminal shell after releasing the persistent owner.
       }
-      removeClaim();
-      removeBootClaim();
+      claimObserver?.disconnect();
+      claimObserver = undefined;
       publishFallback(target, ingress, fallbackFields(boot, reason, false));
     };
     completeClaimedBoot = (outcome) => {
@@ -315,16 +372,23 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
       source: unknown,
       cancel: unknown
     ): ((outcome: 'kernel' | 'runtime_fallback' | 'failed_start') => void) | undefined => {
-      if (
-        terminal ||
-        !(source instanceof HTMLScriptElement) ||
-        document.currentScript !== source ||
-        !authentic(source, boot.manifest.runtimeSrc, 'trustedserver-js') ||
-        typeof cancel !== 'function' ||
-        cancelRuntime
-      ) {
+      if (terminal || directClaimState !== 'available') return undefined;
+      directClaimState = 'claiming';
+      let accepted = false;
+      try {
+        accepted =
+          source instanceof NativeHtmlScriptElement &&
+          currentScript() === source &&
+          authentic(source, boot.manifest.runtimeSrc, 'trustedserver-js') &&
+          typeof cancel === 'function';
+      } catch {
+        // The reservation rolls back only when this authentication attempt fails.
+      }
+      if (!accepted) {
+        directClaimState = 'available';
         return undefined;
       }
+      directClaimState = 'claimed';
       cancelRuntime = cancel as () => void;
       return (outcome): void => {
         if (terminal) return;
@@ -334,23 +398,52 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
         }
         terminal = true;
         if (timer !== undefined) window.clearTimeout(timer);
-        removeClaim();
+        claimObserver?.disconnect();
+        claimObserver = undefined;
       };
     };
+    const installDirectClaims = (script: HTMLScriptElement): boolean => {
+      try {
+        if (
+          terminal ||
+          !authentic(script, boot.manifest.runtimeSrc, 'trustedserver-js') ||
+          !installRuntimeClaim(script, 'direct', (cancel) => claim(script, cancel))
+        ) {
+          return false;
+        }
+        claimObserver?.disconnect();
+        claimObserver = undefined;
+        return true;
+      } catch {
+        return false;
+      }
+    };
     try {
-      Object.defineProperty(target, 'boot', {
+      sealRuntimeNamespace();
+      nativeObjectDefineProperty(target, 'boot', {
         configurable: true,
         enumerable: true,
         value: boot,
         writable: false,
       });
-      installBootClaim();
-      Object.defineProperty(target, '_claimDirectRuntime', {
-        configurable: true,
-        enumerable: false,
-        value: claim,
-        writable: false,
+      claimObserver = new MutationObserver((records) => {
+        for (const record of records) {
+          for (const node of record.addedNodes) {
+            if (
+              node instanceof NativeHtmlScriptElement &&
+              node.id === 'trustedserver-js' &&
+              installDirectClaims(node)
+            ) {
+              return;
+            }
+          }
+        }
       });
+      claimObserver.observe(document.documentElement, { childList: true, subtree: true });
+      const existing = document.querySelectorAll('script#trustedserver-js');
+      if (existing.length === 1 && existing[0] instanceof NativeHtmlScriptElement) {
+        installDirectClaims(existing[0]);
+      }
       performance.mark('tsjs:bids-script');
       timer = window.setTimeout(fallback, 10_000);
     } catch {
@@ -369,6 +462,7 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
   let agent: FirstDisplayAgent | undefined;
   let agentScript: HTMLScriptElement | undefined;
   let runtimeScript: HTMLScriptElement | undefined;
+  let takeoverClaim: FirstDisplayTakeoverClaim | undefined;
   let bootstrapTimer: number | undefined;
   let takeoverTimer: number | undefined;
   let takeoverStartedAt = 0;
@@ -378,7 +472,7 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
   };
   const removePrivate = (key: string): void => {
     try {
-      const descriptor = Object.getOwnPropertyDescriptor(target, key);
+      const descriptor = nativeObjectGetOwnPropertyDescriptor(target, key);
       if (descriptor?.configurable) Reflect.deleteProperty(target, key);
     } catch {
       // Generation invalidation makes an unremovable private field inert.
@@ -401,11 +495,11 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
     if (terminal) return;
     const initialDisplayCommitted = agent?.initialDisplayCommitted ?? false;
     terminal = true;
+    runtimeReadLive = false;
     current = false;
     clear(bootstrapTimer);
     clear(takeoverTimer);
-    removePrivate('_firstDisplayTakeover');
-    removeBootClaim();
+    takeoverClaim = undefined;
     if (runtimeScript) {
       runtimeScript.onload = null;
       runtimeScript.onerror = null;
@@ -419,21 +513,73 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
   };
   const now = (): number => performance.now();
   const startedAtMs = now();
+  let runtimeScriptPolicy:
+    Readonly<{ createScriptURL: (value: string) => unknown }> | null | undefined;
+  const admittedScriptUrls = new Set<string>([
+    new URL(boot.manifest.runtimeSrc, location.origin).href,
+    ...boot.manifest.integrations.flatMap((entry) =>
+      entry.phase === 'deferred' ? [new URL(entry.src, location.origin).href] : []
+    ),
+  ]);
+  const trustedRuntimeScriptUrl = (expectedUrl: string): unknown => {
+    if (runtimeScriptPolicy === undefined) {
+      runtimeScriptPolicy = null;
+      try {
+        const trustedTypes = (
+          window as Window & {
+            trustedTypes?: {
+              createPolicy: (
+                name: string,
+                rules: Readonly<{ createScriptURL: (value: string) => string }>
+              ) => Readonly<{ createScriptURL: (value: string) => unknown }>;
+            };
+          }
+        ).trustedTypes;
+        if (trustedTypes) {
+          runtimeScriptPolicy = trustedTypes.createPolicy('trusted-server#tsjs-v1', {
+            createScriptURL: (value: string) => {
+              if (!admittedScriptUrls.has(value)) throw new TypeError('tsjs');
+              return value;
+            },
+          });
+        }
+      } catch {
+        runtimeScriptPolicy = null;
+      }
+    }
+    return runtimeScriptPolicy ? runtimeScriptPolicy.createScriptURL(expectedUrl) : expectedUrl;
+  };
   const bridge = (selected: FirstDisplayAgent): void => {
     agent = selected;
-    let live = true;
+    let claimState: 'available' | 'claiming' | 'claimed' = 'available';
     const claim: FirstDisplayTakeoverClaim = (
+      source,
       finalize
     ): ClaimedFirstDisplayTakeoverV1 | undefined => {
-      if (!live) return undefined;
-      live = false;
+      if (claimState !== 'available') return undefined;
+      claimState = 'claiming';
+      let accepted = false;
+      try {
+        accepted =
+          source === runtimeScript &&
+          currentScript() === source &&
+          source instanceof NativeHtmlScriptElement &&
+          authentic(source, boot.manifest.runtimeSrc, 'trustedserver-js-runtime');
+      } catch {
+        // The reservation rolls back only when this authentication attempt fails.
+      }
+      if (!accepted) {
+        claimState = 'available';
+        return undefined;
+      }
+      claimState = 'claimed';
       try {
         if (terminal || !current || selected.state !== 'painted') {
           throw new TypeError('tsjs');
         }
         const finalized = selected.finalizeHandoff(finalize);
         if (!finalized) throw new TypeError('tsjs');
-        return Object.freeze([
+        return nativeObjectFreeze([
           finalized,
           outline,
           () => current && !terminal && now() - takeoverStartedAt < 10_000,
@@ -453,20 +599,17 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
             } catch {
               // The committed persistent owner remains terminal if timer cleanup fails.
             }
-            removePrivate('_firstDisplayTakeover');
           },
+          trustedRuntimeScriptUrl,
+          currentScript,
         ]);
       } catch (error) {
         commitFallback('bundle_partial');
         throw error;
       }
     };
-    Object.defineProperty(target, '_firstDisplayTakeover', {
-      configurable: true,
-      enumerable: false,
-      value: claim,
-      writable: false,
-    });
+    if (takeoverClaim) throw new TypeError('tsjs');
+    takeoverClaim = claim;
   };
   const protectedPaint = (): void => {
     try {
@@ -475,11 +618,24 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
       }
       takeoverStartedAt = now();
       takeoverTimer = window.setTimeout(() => commitFallback('bundle_partial'), 10_000);
+      sealRuntimeNamespace();
       const script = document.createElement('script');
       script.id = 'trustedserver-js-runtime';
       script.async = true;
+      if (!takeoverClaim) throw new TypeError('tsjs');
+      if (
+        !installRuntimeClaim(script, 'takeover', (finalize) => {
+          const claim = takeoverClaim;
+          takeoverClaim = undefined;
+          return claim?.(script, finalize as FirstDisplayAgentCaptureFinalizerV1);
+        })
+      ) {
+        throw new TypeError('tsjs');
+      }
       if (agentScript?.nonce) script.nonce = agentScript.nonce;
-      script.src = new URL(boot.manifest.runtimeSrc, location.origin).href;
+      const expectedUrl = new URL(boot.manifest.runtimeSrc, location.origin).href;
+      script.src = trustedRuntimeScriptUrl(expectedUrl) as string;
+      if (script.src !== expectedUrl) throw new TypeError('tsjs');
       script.onerror = () => commitFallback('bundle_partial');
       runtimeScript = script;
       (document.head ?? document.documentElement).append(script);
@@ -500,23 +656,32 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
   ): readonly [bindings: unknown, config: unknown] => {
     let bindings: unknown;
     if (id === 'gpt_initial') {
-      bindings = Object.freeze({ browser: window, observe, register });
+      bindings = nativeObjectFreeze({ browser: window, observe, register });
     } else if (id === 'render_owner_initial') {
-      bindings = Object.freeze({ observe, register });
+      bindings = nativeObjectFreeze({ observe, register });
     } else if (id === 'aps_initial') {
-      bindings = Object.freeze({
+      bindings = nativeObjectFreeze({
         observe,
         publisherOrigin: location.origin,
         register,
       });
     } else if (id === 'creative_initial') {
-      bindings = Object.freeze({
-        location: Object.freeze({ href: location.href, origin: location.origin }),
+      bindings = nativeObjectFreeze({ observe });
+    } else if (id === 'google_tag_manager_initial') {
+      bindings = nativeObjectFreeze({
         observe,
-        register: () => () => undefined,
+        register: (rule: FirstDisplayBrowserRouteRuleV1) =>
+          registerFirstDisplayBrowserRoute(rule, true),
       });
+    } else if (
+      id === 'datadome_initial' ||
+      id === 'lockr_initial' ||
+      id === 'permutive_initial' ||
+      id === 'sourcepoint_initial'
+    ) {
+      bindings = nativeObjectFreeze({ observe, register: registerFirstDisplayBrowserRoute });
     } else if (id === 'testlight_initial') {
-      bindings = Object.freeze({
+      bindings = nativeObjectFreeze({
         enqueue: (callback: () => void) => {
           ingress.push(callback);
         },
@@ -524,14 +689,16 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
         target: window,
       });
     } else {
-      bindings = register ? Object.freeze({ observe, register }) : Object.freeze({ observe });
+      bindings = register
+        ? nativeObjectFreeze({ observe, register })
+        : nativeObjectFreeze({ observe });
     }
     const product = id.endsWith('_initial') ? id.slice(0, -'_initial'.length) : '';
     let config: unknown =
       id === 'creative_initial'
         ? boot.creative
         : id === 'render_owner_initial'
-          ? Object.freeze({})
+          ? nativeObjectFreeze({})
           : undefined;
     if (config === undefined && product !== '') {
       for (const entry of boot.integrations.entries) {
@@ -541,18 +708,18 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
         }
       }
     }
-    return Object.freeze([bindings, config]);
+    return nativeObjectFreeze([bindings, config]);
   };
-  const host: FirstDisplayAgentRegistrationHostV1 = Object.freeze({
-    options: Object.freeze({
-      batch: Object.freeze({
+  const host: FirstDisplayAgentRegistrationHostV1 = nativeObjectFreeze({
+    options: nativeObjectFreeze({
+      batch: nativeObjectFreeze({
         version: 1,
         projectionDigest: outline.projectionDigest,
         projection: boot.auctionProjection,
       }),
       startedAtMs,
       performance,
-      paint: Object.freeze({
+      paint: nativeObjectFreeze({
         hidden: () => document.visibilityState === 'hidden',
         requestFrame: (callback: () => void) => window.requestAnimationFrame(() => callback()),
         scheduleHidden: (callback: () => void) => window.setTimeout(callback, 0),
@@ -560,14 +727,14 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
       onProtectedPaint: protectedPaint,
       onSettled: () => clear(bootstrapTimer),
       onFailure: commitFallback,
-      gptInput: Object.freeze([
+      gptInput: nativeObjectFreeze([
         window,
         (handle: unknown) => window.clearTimeout(handle as number),
         document,
         (callback: () => void, delayMs: number) => window.setTimeout(callback, delayMs),
         boot.diagnostics.gpt.active,
       ] as const),
-      handoff: Object.freeze({
+      handoff: nativeObjectFreeze({
         releaseId: RELEASE,
         generation: outline.generation,
         integrationConfigDigest: outline.integrationConfigDigest,
@@ -589,7 +756,7 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
     let afterActivate: (() => void) | undefined;
     let ownershipOpen = true;
     try {
-      const context: FirstDisplaySliceActivationContext = Object.freeze({
+      const context: FirstDisplaySliceActivationContext = nativeObjectFreeze({
         own: (dispose: () => void) => {
           if (!ownershipOpen || terminal || typeof dispose !== 'function') {
             throw new TypeError('tsjs');
@@ -615,30 +782,63 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
     if (terminal || !current) return false;
     return Boolean(agent && !terminal);
   };
-  const register = function (this: unknown, candidate: unknown, source: unknown): boolean {
+  let registrationOpen = true;
+  let registrationClaiming = false;
+  const register = function (this: unknown, candidate: unknown, _source?: unknown): boolean {
+    if (!registrationOpen || registrationClaiming) return false;
+    registrationClaiming = true;
     try {
       const expectedId = firstDisplay.slices[registrations.length + 1];
+      const source = currentScript();
       if (
         terminal ||
         this !== target ||
-        !(source instanceof HTMLScriptElement) ||
-        document.currentScript !== source ||
+        !(source instanceof NativeHtmlScriptElement) ||
         (agentScript && source !== agentScript) ||
         !authentic(source, firstDisplay.src, 'trustedserver-js') ||
-        !Array.isArray(candidate) ||
-        !Object.isFrozen(candidate) ||
-        candidate.length !== 4
+        !nativeArrayIsArray(candidate)
       ) {
+        registrationClaiming = false;
         return fail();
       }
       if (terminal || !current) return false;
-      const fields = candidate as readonly unknown[];
+      const keys = nativeReflectOwnKeys(candidate);
+      const length = nativeObjectGetOwnPropertyDescriptor(candidate, 'length');
+      if (
+        keys.length !== 5 ||
+        keys[0] !== '0' ||
+        keys[1] !== '1' ||
+        keys[2] !== '2' ||
+        keys[3] !== '3' ||
+        keys[4] !== 'length' ||
+        !length ||
+        !('value' in length) ||
+        length.value !== 4
+      ) {
+        registrationClaiming = false;
+        return fail();
+      }
+      const fields: unknown[] = [];
+      for (let index = 0; index < 4; index += 1) {
+        const descriptor = nativeObjectGetOwnPropertyDescriptor(candidate, String(index));
+        if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) {
+          registrationClaiming = false;
+          return fail();
+        }
+        fields.push(descriptor.value);
+      }
       if (
         fields[0] !== 1 ||
         fields[1] !== expectedId ||
         fields[2] !== RELEASE ||
         typeof fields[3] !== 'function'
       ) {
+        registrationClaiming = false;
+        return fail();
+      }
+      nativeObjectFreeze(candidate);
+      if (!nativeObjectIsFrozen(candidate)) {
+        registrationClaiming = false;
         return fail();
       }
       agentScript = source;
@@ -646,22 +846,24 @@ function installBootstrap({ target, boot, integrity, outline }: BootstrapInputSn
         id: fields[1] as Exclude<FirstDisplaySliceId, 'first_display'>,
         install: fields[3] as InitialSliceInstaller,
       });
+      registrationClaiming = false;
       if (registrations.length !== firstDisplay.slices.length - 1) return true;
+      registrationOpen = false;
       return activateComponents();
     } catch {
+      registrationClaiming = false;
       return fail();
     }
   };
 
   try {
-    Object.defineProperty(target, 'boot', {
+    nativeObjectDefineProperty(target, 'boot', {
       configurable: true,
       enumerable: true,
       value: boot,
       writable: false,
     });
-    installBootClaim();
-    Object.defineProperty(target, '_registerFirstDisplay', {
+    nativeObjectDefineProperty(target, '_registerFirstDisplay', {
       configurable: true,
       enumerable: false,
       value: register,

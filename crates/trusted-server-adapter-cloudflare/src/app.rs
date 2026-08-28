@@ -38,6 +38,7 @@ use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
+use trusted_server_core::trace_cookie::handle_trace_mode;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
 use crate::platform::build_runtime_services;
@@ -141,8 +142,10 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let orchestrator = build_orchestrator(&settings)?;
-    let registry = IntegrationRegistry::new(&settings)?;
+    let plan = Arc::new(compile_auction_plan(&settings)?);
+    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Cloudflare)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
+    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -570,10 +573,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
             })
             .get(
-                "/_ts/admin/eids",
+                "/_ts/trace",
                 make_handler(Arc::clone(&state), |s, _services, req| async move {
-                    let partner_registry = PartnerRegistry::from_config(&s.settings.ec.partners)?;
-                    handle_admin_eids_lookup(&partner_registry, &req)
+                    handle_trace_mode(&s.settings, req.uri().query())
                 }),
             )
             // Render-trace toggle: arms/disarms the ts-trace cookie and
@@ -732,11 +734,10 @@ mod tests {
         let state = build_state_with_settings(aps_profile_settings())
             .expect("Cloudflare startup should register APS renderer");
         assert!(
-            state.registry.has_route(
-                &edgezero_core::http::Method::GET,
-                "/integrations/aps/renderer"
-            ),
-            "Cloudflare startup registry should expose the APS renderer"
+            state
+                .registry
+                .has_reserved_path("/integrations/aps/renderer/v2"),
+            "Cloudflare startup registry should reserve the APS v2 renderer"
         );
     }
 

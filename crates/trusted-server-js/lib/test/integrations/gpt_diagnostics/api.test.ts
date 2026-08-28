@@ -41,6 +41,41 @@ function readBlob(blob: Blob): Promise<string> {
   });
 }
 
+function emptyCoverage() {
+  return {
+    slotRequested: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+    slotResponseReceived: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+    slotRenderEnded: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+    slotOnload: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+    impressionViewable: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+    slotVisibilityChanged: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+  };
+}
+
+function fakeApiStore() {
+  return {
+    snapshot: vi.fn(() => ({
+      gptObserved: false,
+      slots: [],
+      callbackIssues: [],
+      attributionIssues: [],
+      coverage: emptyCoverage(),
+      metadata: {
+        droppedCallbacks: 0,
+        droppedAttributionIssues: 0,
+        evictedSlots: 0,
+        evictedRequestCycles: 0,
+      },
+    })),
+    subscribeCommits: vi.fn(() => () => undefined),
+    recordTrustedServerOpportunity: vi.fn(),
+    recordPrebidRefresh: vi.fn(),
+    recordTrustedServerCreativeRequest: vi.fn((_auctionSlotId: string) => 41),
+    recordTrustedServerCreativeResponse: vi.fn(),
+    recordTrustedServerCreativeFailure: vi.fn(),
+  };
+}
+
 function scheduleInto(tasks: Array<() => void>): (callback: () => void) => () => void {
   return (callback) => {
     tasks.push(callback);

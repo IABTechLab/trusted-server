@@ -96,14 +96,12 @@ describe('GPT first-display diagnostics adoption', () => {
   });
 
   it('restores diagnostics facts only when the diagnostics owner is selected', () => {
-    const adoptFirstDisplay = vi.fn(
-      (_diagnostics: unknown, _resolve?: (token: string) => unknown) => true
-    );
+    const adoptFirstDisplay = vi.fn((..._arguments: unknown[]) => true);
     const physicalSlot = {};
     const diagnosticsToken = Object.freeze(Object.create(null) as object);
     const fact = Object.freeze({
       version: 1 as const,
-      event: 'slotRenderEnded' as const,
+      event: 'slotRequested' as const,
       token: 'gt1_1',
       runtimeSlotNumber: 1,
       cycleOrdinal: 1,
@@ -112,10 +110,11 @@ describe('GPT first-display diagnostics adoption', () => {
       capturedAtMs: 5,
       elementId: 'slot-1',
       adUnitPath: '/123/slot-1',
-      isEmpty: false,
-      renderedSize: Object.freeze([300, 250] as const),
-      isBackfill: false,
-      slotContentChanged: true,
+      requestedSlotSizes: Object.freeze([Object.freeze([300, 250] as const)]),
+      isEmpty: null,
+      renderedSize: null,
+      isBackfill: null,
+      slotContentChanged: null,
       visibilityPercent: null,
     });
     const diagnostics = Object.freeze({
@@ -139,19 +138,42 @@ describe('GPT first-display diagnostics adoption', () => {
       adoptInitialDisplay: true as const,
       handoff: Object.freeze({
         artifacts: Object.freeze([]),
-        cycles: Object.freeze([Object.freeze({ token: 'gt1_1' })]),
+        cycles: Object.freeze([Object.freeze({ slotId: 'slot-1', token: 'gt1_1' })]),
         gptDiagnostics: diagnostics,
+        slots: Object.freeze([
+          Object.freeze({ id: 'slot-1', formats: Object.freeze([Object.freeze([300, 250])]) }),
+        ]),
       }),
       identities: Object.freeze([physicalSlot]),
     });
 
-    expect(adoptInitialGptFactsFromHandoff(adoption, { adoptFirstDisplay }, adapter)).toBe(
-      adoption
+    const projection = Object.freeze({
+      auction: Object.freeze({ auctionId: 'initial-auction' }),
+    }) as unknown as Readonly<BrowserAuctionProjectionV1>;
+    expect(
+      adoptInitialGptFactsFromHandoff(adoption, { adoptFirstDisplay }, adapter, projection)
+    ).toBe(adoption);
+    expect(adoptFirstDisplay).toHaveBeenCalledWith(
+      diagnostics,
+      expect.any(Function),
+      expect.any(Function)
     );
-    expect(adoptFirstDisplay).toHaveBeenCalledWith(diagnostics, expect.any(Function));
     const resolve = adoptFirstDisplay.mock.calls[0]?.[1] as (token: string) => unknown;
     expect(resolve('gt1_1')).toMatchObject({ token: diagnosticsToken, runtimeSlotNumber: 1 });
-    expect(adoptInitialGptFactsFromHandoff(adoption, undefined, adapter)).toBeUndefined();
+    const resolveOpportunity = adoptFirstDisplay.mock.calls[0]?.[2] as (
+      token: string,
+      slot: Readonly<object>
+    ) => unknown;
+    expect(resolveOpportunity('gt1_1', resolve('gt1_1') as Readonly<object>)).toMatchObject({
+      kind: 'trustedServerOpportunity',
+      auctionSlotId: 'slot-1',
+      opportunity: 'renderable_candidate',
+      requestedSlotSizes: [[300, 250]],
+      trustedServerAuctionId: 'initial-auction',
+    });
+    expect(
+      adoptInitialGptFactsFromHandoff(adoption, undefined, adapter, projection)
+    ).toBeUndefined();
   });
 
   it('transfers only lifecycle-ticket tombstones to the persistent PUC owner', () => {
@@ -1573,14 +1595,17 @@ describe('transactional GPT integration module', () => {
           : undefined,
     });
     const physical = new Map<string, object>();
-    const request = vi.fn(() =>
+    const requestHandle = () =>
       Object.freeze({
         status: 'active' as const,
         result: Promise.resolve(
           Object.freeze({ status: 'failed' as const, reason: 'gpt_request_failed' as const })
         ),
         dispose: vi.fn(),
-      })
+      });
+    const request = vi.fn(requestHandle);
+    const requestBatch = vi.fn((inputs: readonly unknown[]) =>
+      Object.freeze(inputs.map(() => requestHandle()))
     );
     const slots = Object.freeze({
       adoptGptSlot: (
@@ -1595,6 +1620,7 @@ describe('transactional GPT integration module', () => {
         physical.get(registeredSlotId) === slot,
       recordPublisherDestruction: vi.fn(() => true),
       request,
+      requestBatch,
     });
     const targeting = Object.freeze({
       observePublisherMutations: () =>
@@ -1631,6 +1657,7 @@ describe('transactional GPT integration module', () => {
       expect(Object.isFrozen(latches)).toBe(true);
       expect(latches).toHaveLength(2);
       expect(request).not.toHaveBeenCalled();
+      expect(requestBatch).not.toHaveBeenCalled();
       protectedLatches = latches;
       return true;
     });
@@ -1665,7 +1692,19 @@ describe('transactional GPT integration module', () => {
     });
 
     expect(protect).toHaveBeenCalledOnce();
-    expect(request).toHaveBeenCalledTimes(2);
+    expect(request).not.toHaveBeenCalled();
+    expect(requestBatch).toHaveBeenCalledOnce();
+    const requestInputs = requestBatch.mock.calls[0]?.[0] as readonly Readonly<{
+      operation: string;
+      registeredSlotId: string;
+    }>[];
+    expect(Object.isFrozen(requestInputs)).toBe(true);
+    expect(
+      requestInputs.map(({ operation, registeredSlotId }) => [registeredSlotId, operation])
+    ).toEqual([
+      ['slot-1', 'display'],
+      ['slot-2', 'display'],
+    ]);
     await Promise.allSettled([...(protectedLatches ?? [])]);
     artifacts.dispose();
     reservations.dispose();
@@ -2121,6 +2160,7 @@ describe('ordered GPT winner publication', () => {
     const facade: GoogletagFacade = Object.freeze({
       bindingToken: () => Object.freeze({}),
       clearTargeting: (target: object, key?: string) => (target as typeof slot).clearTargeting(key),
+      enableServices: () => undefined,
       transactionalDefine: () => Object.freeze({ status: 'discarded' as const }),
       display: vi.fn(),
       getTargeting: (target: object, key: string) => (target as typeof slot).getTargeting(key),
@@ -2160,7 +2200,17 @@ describe('ordered GPT winner publication', () => {
       }),
       request: vi.fn((input: unknown) => {
         order.push('request');
-        expect(input).toMatchObject({ registeredSlotId: bid.slot });
+        expect(input).toMatchObject({
+          registeredSlotId: bid.slot,
+          trustedServerOpportunity: {
+            requestedSlotSizes: [[300, 250]],
+            trustedServerAuctionId: 'gpt-publication',
+          },
+        });
+        const opportunity = (input as { trustedServerOpportunity: object })
+          .trustedServerOpportunity;
+        expect(Object.isFrozen(opportunity)).toBe(true);
+        expect(Object.isFrozen(Reflect.get(opportunity, 'requestedSlotSizes'))).toBe(true);
         expect(harness.reservations.recognize(RESERVATION_ID)).toMatchObject({
           recognized: true,
           state: 'renderable',

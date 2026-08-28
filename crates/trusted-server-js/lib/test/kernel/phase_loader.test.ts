@@ -298,6 +298,41 @@ describe('authenticated deferred module loading', () => {
     expect(loader.register(registration)).toBe(false);
   });
 
+  it('ignores a publisher currentScript shadow and still admits the genuine deferred artifact', async () => {
+    const prepare = vi.fn<DeferredPhaseLoaderOptions['prepare']>(() =>
+      Object.freeze({ activate: () => undefined })
+    );
+    let trustedCurrentScript: HTMLScriptElement | null = null;
+    const loader = createDeferredPhaseLoader({
+      runtimeScript: document.createElement('script'),
+      currentScript: () => trustedCurrentScript,
+      document,
+      prepare,
+      gate: Promise.resolve(),
+      manifest: deferredManifest(['gpt_later']),
+      releaseId: RELEASE_ID,
+    });
+    await Promise.resolve();
+    const expected = document.head.querySelector('script');
+    expect(expected).not.toBeNull();
+    Object.defineProperty(document, 'currentScript', {
+      configurable: true,
+      value: expected,
+    });
+    const publisherPrepare = vi.fn(() => Object.freeze({ activate: () => undefined }));
+
+    expect(loader.register(deferredRegistration('gpt_later', publisherPrepare))).toBe(false);
+    expect(loader.state('gpt_later')).toBe('loading');
+    expect(loader.reason('gpt_later')).toBeUndefined();
+    expect(publisherPrepare).not.toHaveBeenCalled();
+
+    trustedCurrentScript = expected;
+    expect(loader.register(deferredRegistration('gpt_later'))).toBe(true);
+    expected?.dispatchEvent(new Event('load'));
+    await vi.waitFor(() => expect(loader.state('gpt_later')).toBe('ready'));
+    expect(prepare).toHaveBeenCalledOnce();
+  });
+
   it('isolates a failed module while a sibling reaches ready', async () => {
     const prepare = vi.fn(async (registration: { readonly id: string }) => {
       if (registration.id === 'gpt_later') throw new Error('fictional module failure');
@@ -387,7 +422,7 @@ describe('authenticated deferred module loading', () => {
     const expected = document.head.querySelector('script');
     const replacement = document.createElement('script');
     expected?.replaceWith(replacement);
-    Object.defineProperty(document, 'currentScript', { configurable: true, value: replacement });
+    Object.defineProperty(document, 'currentScript', { configurable: true, value: expected });
 
     expect(loader.register(deferredRegistration('gpt_later'))).toBe(false);
     expect(loader.reason('gpt_later')).toBe('registration_rejected');
@@ -537,6 +572,33 @@ describe('authenticated deferred module loading', () => {
     );
     const rules = createPolicy.mock.calls[0]?.[1];
     expect(() => rules?.createScriptURL('https://attacker.example/x.js')).toThrow();
+  });
+
+  it('reuses the bootstrap Trusted Types capability without creating the fixed policy twice', async () => {
+    const runtimeScript = document.createElement('script');
+    const createScriptURL = vi.fn((value: string) => value);
+    const createPolicy = vi.fn(() => {
+      throw new TypeError('duplicate policy');
+    });
+    Object.defineProperty(window, 'trustedTypes', {
+      configurable: true,
+      value: Object.freeze({ createPolicy }),
+    });
+    createDeferredPhaseLoader({
+      runtimeScript,
+      document,
+      prepare: vi.fn(),
+      gate: Promise.resolve(),
+      manifest: deferredManifest(['gpt_later']),
+      releaseId: RELEASE_ID,
+      trustedScriptUrl: createScriptURL,
+    });
+    await Promise.resolve();
+
+    expect(createPolicy).not.toHaveBeenCalled();
+    expect(createScriptURL).toHaveBeenCalledWith(
+      `${window.location.origin}/static/tsjs=tsjs-gpt_later.min.js?v=${HASH}`
+    );
   });
 
   it('copies no nonce when the takeover script has no nonempty nonce', async () => {

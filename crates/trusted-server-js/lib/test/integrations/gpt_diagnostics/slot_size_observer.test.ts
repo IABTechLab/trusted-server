@@ -90,10 +90,10 @@ describe('GptDiagnosticsSlotSizeObserver', () => {
       scheduleFrame: (callback) => callback(),
     });
 
-    expect(store.recordObservedSlotSize).toHaveBeenCalledWith(1, 1, [728, 90]);
+    expect(store.recordObservedSlotSize).toHaveBeenCalledWith(1, 1, [728, 91]);
     expect(requests[0]!.size).toEqual([1, 1]);
 
-    getBoundingClientRect.mockReturnValue({ width: 970, height: 250 } as DOMRect);
+    getBoundingClientRect.mockReturnValue({ width: 969.6, height: 250.2 } as DOMRect);
     ResizeObserverMock.instances[ResizeObserverMock.instances.length - 1]!.emit(element);
     expect(store.recordObservedSlotSize).toHaveBeenLastCalledWith(1, 1, [970, 250]);
     observer.destroy();

@@ -10,7 +10,7 @@
 
 **Goal:** Finish the APS render fix and resilient TSJS hard cutover on the exact
 `rc/202608` base, preserving all affected rc behavior while closing every remaining
-revision-43 contract gap.
+revision-44 contract gap.
 
 **Architecture:** Keep the already-landed single-runtime/first-display architecture
 and complete it rather than replaying its historical implementation. The browser
@@ -32,24 +32,25 @@ checked-in shell/Node CI scripts.
 
 The sole design authority is
 `docs/superpowers/specs/2026-08-04-aps-render-fix-and-tsjs-resilience-design.md`
-revision 43. This is the sole implementation plan for that design.
+revision 44. This is the sole implementation plan for that design.
 
-The implementation branch is `feature/aps-tsjs-resilience-rc202608`. Its first
-parent is the fetched `origin/rc/202608` commit
-`f0825604ec6740111e99dd8a178e3b880e7d772b`; the previously reviewed feature history
-at `ecd78a9d11680deece4d4ec13f84be04fdae6b0d` is its second parent through merge
-commit `95b562ea820268d6f16da08863dfa9f71076e4d2`. That integrated history already
+The implementation branch is `feature/aps-tsjs-resilience-rc202608`. It is created
+directly from fetched `origin/rc/202608` commit
+`985ff22987d80cc729f45f702e0c3548e429b2cf`. Previously reviewed feature and merge
+SHAs are historical review references only; their approved changes were replayed
+and reconciled onto this exact base and are not parent or implementation authority.
+That replayed history already
 implements the descriptor/projection contract, proxy route, core runtime, first-
 display split, integration catalog, hard cutover, package upgrade, and most
 verification surfaces. Those commits are implementation history, not evidence that
-revision 43 is complete.
+revision 44 is complete.
 
 The final Task 17 refresh fetched and integrated `origin/rc/202608` at
-`d4cd2cc823718d64ae73bcb068e5eab03ecd901a` on 2026-08-21. Its rc-owned package and
+`985ff22987d80cc729f45f702e0c3548e429b2cf` on 2026-08-28. Its rc-owned package and
 operator-document changes are retained. Its raw-global GAM-attribution transport is
 superseded by the typed immutable GPT configuration carrier and sole parser-time GPT
 owner, and its mutable publisher-native APS experiment is superseded by the single
-Trusted Server renderer owner required by revision 43.
+Trusted Server renderer owner required by revision 44.
 
 `origin/rc/202608` is the behavior, API, dependency, CI, and performance baseline.
 Do not merge `main` separately. Before final verification, fetch the release branch;
@@ -1510,6 +1511,87 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
       lifecycle proof, complete JS/Rust quality scripts, exact performance sample,
       and clean-worktree checks before committing and pushing one replacement SHA.
 
+### Task 15D: Seal runtime admission and preserve the publisher script-policy chain
+
+**Files:**
+
+- Modify: `crates/trusted-server-js/lib/build-all.mjs`
+- Modify: `crates/trusted-server-js/lib/src/core/{bootstrap,index}.ts`
+- Modify: `crates/trusted-server-js/lib/src/first_display/registration_client.ts`
+- Modify: `crates/trusted-server-js/lib/src/kernel/phase_loader.ts`
+- Modify: `crates/trusted-server-core/src/{html_processor,publisher,tsjs}.rs`
+- Modify: `crates/trusted-server-core/src/integrations/{registry,datadome,prebid}.rs`
+- Modify: `crates/trusted-server-core/benches/html_processor_bench.rs`
+- Modify: `crates/trusted-server-js/lib/test/core/{index,request}.test.ts`
+- Modify: `crates/trusted-server-js/lib/test/build/{generated-fallback,release-v1}.test.mjs`
+- Modify: `crates/trusted-server-js/lib/test/kernel/phase_loader.test.ts`
+- Create: `crates/trusted-server-integration-tests/browser/tests/shared/tsjs-policy.spec.ts`
+- Modify: `crates/trusted-server-integration-tests/browser/tests/shared/tsjs-runtime.spec.ts`
+- Modify: `scripts/ci/aps-tsjs-cutover.sh`
+- Modify: `.github/workflows/integration-tests.yml`
+
+- [ ] **Step 1: Add RED admission-boundary tests.** Require the generated persistent
+      artifact's first expression to consume a one-read, non-configurable
+      `window.tsjs` gate and the selected script node's own non-configurable
+      `_claimRuntimeV1` before any core or module initializer. The exact frozen claim
+      is `{boot,integrity,complete,currentScript,source,target,mode,bind}`. Cover
+      replay, reentrant DOM authentication, wrong/disconnected/replaced source,
+      mutable/wrong-shape candidates, wrong mode, corrupted public
+      `document.currentScript`, and publisher/upstream mutation of realm intrinsics.
+      Prove ordinary namespace reads always retain the original target and only the
+      exact selected runtime task receives the script node once. Replace every test
+      harness that still reconstructs `_claimBootSnapshot`/`_claimDirectRuntime`.
+
+      For optional first-display slices, require one raw dense
+      `[1,id,releaseId,install]` carrier. Bootstrap must use its captured native
+      current-script/descriptor/array intrinsics, reserve registration before a
+      reentrant getter can run, authenticate the exact connected parser script,
+      freeze the carrier, retain only validated values, and reject wrong order,
+      duplicate, late, accessor, sparse, custom, or replayed registration.
+
+- [ ] **Step 2: Add RED server ordering and response-CSP tests.** Parse only
+      enforcing response headers using `script-src-elem` → `script-src` →
+      `default-src` precedence and select only one bounded nonce in the intersection
+      of nonce-bearing policies. Report-only, malformed, ambiguous, disjoint, and
+      meta-only values authorize no nonce. Thread the selected value through both
+      streaming and buffered HTML contexts. Prove exact output order
+      controller → live integration head inserts → selected TSJS artifact and the
+      same nonce on every Trusted Server executable tag, including DataDome's inline
+      plus external tags, Prebid's external tag, and request-scoped diagnostics.
+      Invalid input must emit no partial/escaped nonce attribute.
+
+- [ ] **Step 3: Add the RED-to-GREEN browser policy matrix.** In Chromium prove
+      direct self-source, matching response nonce, nonce-only, `strict-dynamic`, a
+      permitted named `trusted-server#tsjs-v1` policy, one exact-preserving default
+      policy fallback, mutation/throw/full block, missing deferred nonce, and
+      removed/replaced nodes. Prove the agent path creates the named policy only once
+      and leases it from persistent insertion to deferred loading. In all three
+      engines assert real first-display takeover, request/insertion outcomes, no
+      unauthorized diagnostics panel, and survival of the same committed kernel.
+      Keep exact `policy_blocked`/`load_error`/`registration_rejected` classification
+      in unit tests; do not add a production browser test seam for private enums.
+
+- [ ] **Step 4: Keep workflow behavior in checked-in scripts and run focused GREEN.**
+      Workflow YAML may select engines and invoke `scripts/ci/aps-tsjs-cutover.sh`;
+      policy setup, server lifecycle, and Playwright commands remain in repository
+      script files.
+
+  ```bash
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" controller_precedes_live_head_inserts_which_precede_selected_runtime
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" response_csp_nonce
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" head_injector_emits_external_bundle_script_with_hash_and_integrity
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" head_injector_emits_client_side_tag_when_key_configured
+  npm --prefix crates/trusted-server-js/lib test -- --run test/core/index.test.ts test/core/request.test.ts test/kernel/phase_loader.test.ts
+  npm --prefix crates/trusted-server-js/lib run build
+  npm --prefix crates/trusted-server-js/lib run test:release
+  npm --prefix crates/trusted-server-js/lib run check:hard-cutover-absence
+  TS_BROWSER_PROJECTS=chromium,firefox,webkit npx --prefix crates/trusted-server-integration-tests/browser playwright test tests/shared/tsjs-policy.spec.ts --project=chromium --project=firefox --project=webkit
+  ```
+
+- [ ] **Step 5: Commit the admission and policy chain.** Stage only the literal
+      files above after reviewing `git diff --check`; do not commit generated docs
+      temp/cache output.
+
 ### Task 16: Enforce hard-cutover absence and supply-chain boundaries
 
 **Files:**
@@ -1575,7 +1657,7 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
   ```
 
   If already an ancestor, abort the empty merge and record the no-op. If advanced,
-  resolve conflicts in favor of revision 43 where it explicitly supersedes rc and
+  resolve conflicts in favor of revision 44 where it explicitly supersedes rc and
   otherwise in favor of rc. Do not merge `main` separately.
 
 - [ ] **Step 2: Produce an overlap inventory before committing.** For every
@@ -1583,7 +1665,7 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
       integration config, build, or CI, name the final owner and focused test. Keep
       EdgeZero and other excluded features unchanged.
 
-  Final refresh inventory for `d4cd2cc823718d64ae73bcb068e5eab03ecd901a`:
+  Final refresh inventory for `985ff22987d80cc729f45f702e0c3548e429b2cf`:
 
   | Rc overlap                                                   | Final disposition and owner                                                                                                                                                                                                                              | Focused proof                                                                                                        |
   | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
@@ -1595,10 +1677,10 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
   | Structural ad-template slot generation                       | Preserve rc's structural TOML update, contiguous provider tables, line-ending safeguards, and unmanaged-field check; add the required `enabled = true` only when the generator creates a hard-cutover section.                                           | focused `slot_toml` and CLI configuration suites                                                                     |
   | GAM cohort attribution                                       | Preserve the configuration and reporting concept; supersede rc raw globals and the activation attribute with the frozen GPT config carrier and sole parser-time GPT owner.                                                                               | GPT Rust config tests, `tsjs.rs` selection tests, first-display GPT adapter/slice tests, persistent GPT module tests |
   | GPT diagnostics correlation guide                            | Preserve the rc correlation evidence, rewritten to the immutable initial projection and navigation-internal page-bids projection.                                                                                                                        | GPT diagnostics store/API/data/overlay suites and docs format/build                                                  |
-  | Retired GPT bootstrap, request runtime, and legacy GPT tests | Keep the revision-43 deletions; no second runtime or compatibility file returns.                                                                                                                                                                         | hard-cutover scan, architecture test, release graph test                                                             |
+  | Retired GPT bootstrap, request runtime, and legacy GPT tests | Keep the revision-44 deletions; no second runtime or compatibility file returns.                                                                                                                                                                         | hard-cutover scan, architecture test, release graph test                                                             |
   | Docs TypeScript-ESLint update                                | Preserve rc package and lockfile ownership.                                                                                                                                                                                                              | docs install, lint, format, and build                                                                                |
   | GPT operator wording and example config                      | Preserve rc's provider-neutral environment-overlay wording; do not add EdgeZero feature work.                                                                                                                                                            | docs format/build and config tests                                                                                   |
-  | Rc GAM review plan/spec artifacts                            | Preserve as release-branch documentation; they do not override revision 43's TSJS architecture.                                                                                                                                                          | docs format/build and plan-integrity scan                                                                            |
+  | Rc GAM review plan/spec artifacts                            | Preserve as release-branch documentation; they do not override revision 44's TSJS architecture.                                                                                                                                                          | docs format/build and plan-integrity scan                                                                            |
 
 - [ ] **Step 3: Update every rc-baseline row and rerun its exact proof.** No stale
       SHA or prior pass satisfies the gate.
@@ -1687,6 +1769,9 @@ and rerun this task from the start.
   bash scripts/ci/aps-tsjs-cutover.sh run-browser
   ```
 
+  The checked-in browser command includes `tests/shared/tsjs-policy.spec.ts`; no
+  multiline policy/server implementation is embedded in workflow YAML.
+
 - [ ] **Step 7: Push the exact locally verified candidate before remote gates.**
       Require a clean worktree, confirm `origin/rc/202608` is the audited base, push
       local HEAD to the named feature branch, and prove the remote ref equals local
@@ -1748,10 +1833,17 @@ validate-inputs` and `run`; it tests PUC 1.17.2 in Chromium, Firefox, and WebKit
 **Files:** no new implementation files.
 
 - [ ] **Step 1: Use `superpowers:requesting-code-review`.** Review the complete diff
-      against the exact PR base, design revision 43, this plan, the rc adoption
+      against the exact PR base, design revision 44, this plan, the rc adoption
       ledger, security protocol, lifecycle ownership, no-vendoring boundary, and
       verification evidence. Resolve every blocking finding test-first and rerun the
       affected task plus Task 18.
+
+      Before changing branch/PR wiring, record that the focused APS proxy, projection,
+      bootstrap transport, runtime admission, first-display/takeover, GPT/Prebid,
+      creative, diagnostics, remaining-integration, static-route, policy-browser,
+      architecture, bundle, and no-vendoring suites are already green. The final
+      branch operation may integrate the audited rc tip but must not introduce new
+      behavior while switching refs.
 
 - [ ] **Step 2: Use `superpowers:verification-before-completion`.** Confirm fresh
       command output rather than relying on earlier runs.
@@ -1773,7 +1865,7 @@ validate-inputs` and `run`; it tests PUC 1.17.2 in Chromium, Firefox, and WebKit
 
 ## Completion checklist
 
-- [ ] Design revision 43 and this one plan agree on `rc/202608` authority.
+- [ ] Design revision 44 and this one plan agree on `rc/202608` authority.
 - [ ] All 23 concept rows have fresh final rc-baseline classifications.
 - [ ] No backward-compatibility path or second runtime remains.
 - [ ] No APS runner, GPT, or PUC bytes are vendored, pinned, cached, or stored.
@@ -1783,6 +1875,12 @@ validate-inputs` and `run`; it tests PUC 1.17.2 in Chromium, Firefox, and WebKit
       modules receive attenuated values only.
 - [ ] Production boot uses one server-sealed canonical JSON lexical transport;
       bootstrap does not bundle the full object-form projection/config validators.
+- [ ] Bootstrap seals one authenticated runtime admission through the selected
+      script's `_claimRuntimeV1`; no retired two-claim harness or mutable namespace
+      admission remains.
+- [ ] One response-header CSP nonce, when uniquely admitted, covers every
+      Trusted Server executable tag and is copied only through the authenticated
+      runtime chain; the named Trusted Types policy is created at most once per path.
 - [ ] `ServerBootIntegrityV1` is always present; direct runtime and takeover both
       recompute projection/config digests before effects, and takeover requires exact
       integrity/outline/handoff equality.

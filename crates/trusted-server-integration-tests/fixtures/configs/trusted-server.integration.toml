@@ -85,7 +85,6 @@ rewrite_sdk = true
 [integrations.gpt]
 enabled = true
 script_url = "https://ads.example.com/gpt.js"
-cache_ttl_seconds = 3600
 rewrite_script = true
 
 [integrations.gpt_diagnostics]

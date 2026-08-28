@@ -1,4 +1,6 @@
 // Sole production bootstrap for the resilient TSJS runtime.
+declare const __TSJS_RUNTIME_CLAIMED_V1__: unknown;
+
 export type {
   AddAdUnitsResult,
   GptDiagnosticsApi,
@@ -19,7 +21,7 @@ import {
   coordinatePreparedFirstDisplayTakeoverV1,
   finalizeFirstDisplayAgentCaptureV1,
 } from '../shared/first_display_handoff';
-import { consumeFirstDisplayTakeoverTransport } from '../shared/takeover';
+import type { ClaimedFirstDisplayTakeoverV1 } from '../shared/takeover';
 
 import { ownDataObject } from './contracts/auction_projection';
 import { snapshotFrozenTsjsBootV1 } from './contracts/boot';
@@ -36,9 +38,14 @@ type BootstrapTarget = object & {
 type DirectRuntimeCompletion = (outcome: 'kernel' | 'runtime_fallback' | 'failed_start') => void;
 
 interface ClaimedServerBootV1 {
+  readonly source: object;
+  readonly target: BootstrapTarget;
   readonly boot: Readonly<TsjsBootV1>;
   readonly integrity: Readonly<ServerBootIntegrityV1>;
   readonly complete: (outcome: 'kernel' | 'abi_mismatch' | 'bundle_partial') => void;
+  readonly currentScript: () => HTMLScriptElement | null;
+  readonly mode: 'direct' | 'takeover';
+  readonly bind: (input: unknown) => unknown;
 }
 
 function retainServerBoot(candidate: unknown, releaseId: string): Readonly<TsjsBootV1> | undefined {
@@ -59,73 +66,37 @@ function retainServerBoot(candidate: unknown, releaseId: string): Readonly<TsjsB
   }
 }
 
-function directRuntimeClaim(
-  target: BootstrapTarget
-): ((source: unknown, cancel: unknown) => DirectRuntimeCompletion | undefined) | null | undefined {
-  try {
-    const descriptor = Object.getOwnPropertyDescriptor(target, '_claimDirectRuntime');
-    if (!descriptor) return undefined;
-    if (
-      !descriptor.configurable ||
-      descriptor.enumerable ||
-      descriptor.writable ||
-      !('value' in descriptor) ||
-      typeof descriptor.value !== 'function'
-    ) {
-      return null;
-    }
-    return descriptor.value as (
-      source: unknown,
-      cancel: unknown
-    ) => DirectRuntimeCompletion | undefined;
-  } catch {
-    return null;
-  }
-}
-
 export type BrowserRuntimeCompositionFactory = (
   runtimeOptions: RuntimeOptions,
   compositionOptions: Readonly<Record<string, never>>
 ) => Readonly<{ runtime: Runtime }>;
 
-function bootstrapTarget(): BootstrapTarget | undefined {
-  try {
-    const current = (window as unknown as { tsjs?: unknown }).tsjs;
-    if ((typeof current === 'object' || typeof current === 'function') && current !== null) {
-      return current as BootstrapTarget;
-    }
-    const target: BootstrapTarget = {};
-    (window as unknown as { tsjs?: unknown }).tsjs = target;
-    return target;
-  } catch {
-    return undefined;
+function claimedRuntimeCandidate(): unknown {
+  if (typeof __TSJS_RUNTIME_CLAIMED_V1__ !== 'undefined') {
+    return __TSJS_RUNTIME_CLAIMED_V1__;
   }
-}
-
-function bootSnapshotClaim(
-  target: BootstrapTarget
-): ((source: unknown) => Readonly<ClaimedServerBootV1> | undefined) | null | undefined {
   try {
-    const descriptor = Object.getOwnPropertyDescriptor(target, '_claimBootSnapshot');
-    if (!descriptor) return undefined;
-    if (
-      !descriptor.configurable ||
-      descriptor.enumerable ||
-      descriptor.writable ||
-      !('value' in descriptor) ||
-      typeof descriptor.value !== 'function'
-    ) {
-      return null;
-    }
-    return descriptor.value as (source: unknown) => Readonly<ClaimedServerBootV1> | undefined;
+    const source = (window as unknown as { tsjs?: unknown }).tsjs;
+    if ((typeof source !== 'object' && typeof source !== 'function') || source === null) return;
+    const claim = (source as { _claimRuntimeV1?: unknown })._claimRuntimeV1;
+    return typeof claim === 'function' ? claim(source) : undefined;
   } catch {
-    return null;
+    return;
   }
 }
 
 function retainClaimedServerBootV1(candidate: unknown): ClaimedServerBootV1 | undefined {
   try {
-    const fields = ownDataObject(candidate, ['boot', 'integrity', 'complete']);
+    const fields = ownDataObject(candidate, [
+      'boot',
+      'integrity',
+      'complete',
+      'currentScript',
+      'source',
+      'target',
+      'mode',
+      'bind',
+    ]);
     if (!fields || !Object.isFrozen(candidate)) return undefined;
     const boot = retainServerBoot(fields['boot'], EMBEDDED_RELEASE_ID);
     const integrity = fields['integrity'];
@@ -138,7 +109,14 @@ function retainClaimedServerBootV1(candidate: unknown): ClaimedServerBootV1 | un
       !boot ||
       !acceptedIntegrity ||
       !Object.isFrozen(integrity) ||
-      typeof fields['complete'] !== 'function'
+      typeof fields['complete'] !== 'function' ||
+      typeof fields['currentScript'] !== 'function' ||
+      (typeof fields['source'] !== 'object' && typeof fields['source'] !== 'function') ||
+      fields['source'] === null ||
+      (typeof fields['target'] !== 'object' && typeof fields['target'] !== 'function') ||
+      fields['target'] === null ||
+      (fields['mode'] !== 'direct' && fields['mode'] !== 'takeover') ||
+      typeof fields['bind'] !== 'function'
     ) {
       return undefined;
     }
@@ -158,7 +136,16 @@ function retainClaimedServerBootV1(candidate: unknown): ClaimedServerBootV1 | un
 }
 
 function claimedBootCompletion(candidate: unknown): ClaimedServerBootV1['complete'] | undefined {
-  const fields = ownDataObject(candidate, ['boot', 'integrity', 'complete']);
+  const fields = ownDataObject(candidate, [
+    'boot',
+    'integrity',
+    'complete',
+    'currentScript',
+    'source',
+    'target',
+    'mode',
+    'bind',
+  ]);
   return fields && typeof fields['complete'] === 'function'
     ? (fields['complete'] as ClaimedServerBootV1['complete'])
     : undefined;
@@ -166,12 +153,7 @@ function claimedBootCompletion(candidate: unknown): ClaimedServerBootV1['complet
 
 /** Claim the browser namespace and start the injected sole composition root. */
 export function startProductionRuntime(createComposition: BrowserRuntimeCompositionFactory): void {
-  const target = bootstrapTarget();
-  if (!target) return;
-  const claimBoot = bootSnapshotClaim(target);
-  if (!claimBoot) return;
-  const source = document.currentScript;
-  const candidate = claimBoot(source);
+  const candidate = claimedRuntimeCandidate();
   const completeBoot = claimedBootCompletion(candidate);
   const claimed = retainClaimedServerBootV1(candidate);
   if (!claimed) {
@@ -182,12 +164,34 @@ export function startProductionRuntime(createComposition: BrowserRuntimeComposit
     }
     return;
   }
+  const source = claimed.source;
+  const target = claimed.target;
+  let authenticatedSource: HTMLScriptElement | null;
+  try {
+    authenticatedSource = claimed.currentScript();
+  } catch {
+    authenticatedSource = null;
+  }
+  if (authenticatedSource !== source) {
+    try {
+      claimed.complete('abi_mismatch');
+    } catch {
+      // The authenticated bootstrap watchdog remains the terminal fallback owner.
+    }
+    return;
+  }
   const { boot } = claimed;
-  const takeover = consumeFirstDisplayTakeoverTransport(target);
-  if (takeover.status === 'invalid') return;
-  let takeoverClaim = takeover.status === 'accepted' ? takeover.claim : undefined;
-  const claimDirect = takeover.status === 'absent' ? directRuntimeClaim(target) : undefined;
-  if (claimDirect === null) return;
+  const directMode = boot.manifest.firstDisplay === null;
+  if ((directMode && claimed.mode !== 'direct') || (!directMode && claimed.mode !== 'takeover')) {
+    try {
+      claimed.complete('abi_mismatch');
+    } catch {
+      // The authenticated bootstrap watchdog remains the terminal fallback owner.
+    }
+    return;
+  }
+  let trustedScriptUrl: ((value: string) => unknown) | undefined;
+  let trustedCurrentScript: (() => HTMLScriptElement | null) | undefined = claimed.currentScript;
   const composition = createComposition(
     {
       target,
@@ -196,13 +200,19 @@ export function startProductionRuntime(createComposition: BrowserRuntimeComposit
       knownIntegrationIds: EMBEDDED_INTEGRATION_IDS,
       catalog: EMBEDDED_RUNTIME_CATALOG,
       boot,
-      ...(takeoverClaim
+      currentScript: () => trustedCurrentScript?.() ?? null,
+      ...(!directMode
         ? {
+            trustedScriptUrl: (value: string) => {
+              if (!trustedScriptUrl) throw new TypeError('tsjs');
+              return trustedScriptUrl(value);
+            },
             coordinateTakeover: (prepared) => {
-              const claim = takeoverClaim;
-              takeoverClaim = undefined;
-              const leased = claim?.(finalizeFirstDisplayAgentCaptureV1);
+              const leased = claimed.bind(finalizeFirstDisplayAgentCaptureV1) as
+                ClaimedFirstDisplayTakeoverV1 | undefined;
               if (!leased) throw new TypeError('tsjs');
+              trustedScriptUrl = leased[9];
+              trustedCurrentScript = leased[10];
               if (
                 !coordinatePreparedFirstDisplayTakeoverV1({
                   prepared,
@@ -243,8 +253,22 @@ export function startProductionRuntime(createComposition: BrowserRuntimeComposit
     },
     {}
   );
-  const completeDirect = claimDirect?.(document.currentScript, () => composition.runtime.dispose());
-  if (claimDirect && !completeDirect) return;
+  const completeDirect = directMode
+    ? (claimed.bind(() => composition.runtime.dispose()) as DirectRuntimeCompletion | undefined)
+    : undefined;
+  if (directMode && !completeDirect) {
+    try {
+      composition.runtime.dispose();
+    } catch {
+      // Completion still commits the independently authenticated terminal fallback.
+    }
+    try {
+      claimed.complete('abi_mismatch');
+    } catch {
+      // The authenticated bootstrap watchdog remains the terminal fallback owner.
+    }
+    return;
+  }
   if (!composition.runtime.start()) {
     completeDirect?.('failed_start');
   }

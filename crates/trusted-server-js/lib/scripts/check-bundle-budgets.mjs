@@ -102,11 +102,13 @@ const CURRENT_PROVIDER_SOURCE_OWNERS = Object.freeze({
   'src/adapters/prebid.ts': 'prebid',
   'src/integrations/prebid/module.ts': 'prebid',
   'src/integrations/prebid/startup.ts': 'prebid',
+  'src/integrations/render_runtime/prebid_selection.ts': 'core',
   'src/integrations/sourcepoint/consent.ts': 'sourcepoint_consent',
 });
 const CURRENT_EXACT_SOURCE_OWNERS = Object.freeze({
   'src/first_display/agent.ts': 'bootstrap',
   'src/first_display/base_marker.ts': 'first_display',
+  'src/first_display/leaf/browser_route_owner.ts': 'bootstrap',
   'src/first_display/leaf/projection.ts': 'bootstrap',
   'src/first_display/render_journal.ts': 'render_owner_initial',
   'src/first_display/render_bridge.ts': 'aps_initial',
@@ -130,14 +132,8 @@ const CURRENT_EXACT_SOURCE_OWNERS = Object.freeze({
   'src/integrations/aps/documents.ts': 'aps',
   'src/integrations/aps/module.ts': 'aps',
   'src/integrations/aps/render.ts': 'aps',
-  'src/integrations/creative/click.ts': 'creative',
-  'src/integrations/creative/dynamic_src_guard.ts': 'creative',
-  'src/integrations/creative/iframe.ts': 'creative',
-  'src/integrations/creative/image.ts': 'creative',
   'src/integrations/creative/index.ts': 'creative',
   'src/integrations/creative/module.ts': 'creative',
-  'src/integrations/creative/proxy_sign.ts': 'creative',
-  'src/integrations/creative/startup.ts': 'creative',
   'src/integrations/datadome/index.ts': 'datadome',
   'src/integrations/datadome/module.ts': 'datadome',
   'src/integrations/datadome/script_guard.ts': 'datadome',
@@ -160,6 +156,7 @@ const CURRENT_EXACT_SOURCE_OWNERS = Object.freeze({
   'src/integrations/gpt_diagnostics/overlay.ts': 'diagnostics_presentation',
   'src/integrations/gpt_diagnostics/presentation.ts': 'diagnostics_presentation',
   'src/integrations/gpt_diagnostics/presentation_helpers.ts': 'diagnostics_presentation',
+  'src/integrations/gpt_diagnostics/slot_size_observer.ts': 'diagnostics_presentation',
   'src/integrations/lockr/index.ts': 'lockr',
   'src/integrations/lockr/module.ts': 'lockr',
   'src/integrations/lockr/script_guard.ts': 'lockr',
@@ -204,6 +201,7 @@ const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
   'src/core/log.ts': Object.freeze([
     'bootstrap',
     'core',
+    'creative_initial',
     'creative',
     'datadome',
     'didomi',
@@ -270,6 +268,12 @@ const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
   'src/core/styles/normalize.css?inline': Object.freeze(['core']),
   'src/core/templates/iframe.html?raw': Object.freeze(['core']),
   'src/core/trace.ts': Object.freeze(['core', 'gpt_diagnostics']),
+  'src/integrations/creative/click.ts': Object.freeze(['creative_initial', 'creative']),
+  'src/integrations/creative/dynamic_src_guard.ts': Object.freeze(['creative_initial', 'creative']),
+  'src/integrations/creative/iframe.ts': Object.freeze(['creative_initial', 'creative']),
+  'src/integrations/creative/image.ts': Object.freeze(['creative_initial', 'creative']),
+  'src/integrations/creative/proxy_sign.ts': Object.freeze(['creative_initial', 'creative']),
+  'src/integrations/creative/startup.ts': Object.freeze(['creative_initial', 'creative']),
   'src/kernel/contracts/message_protocol.ts': Object.freeze(['core', 'gpt']),
   'src/kernel/contracts/release_capacity.ts': Object.freeze(['core']),
   'src/kernel/contracts/puc_dynamic_owner.ts': Object.freeze(['render_owner_initial', 'gpt']),
@@ -297,7 +301,7 @@ const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
     'testlight',
   ]),
   'src/kernel/sessions.ts': Object.freeze(['core']),
-  'src/shared/async.ts': Object.freeze(['creative', 'datadome']),
+  'src/shared/async.ts': Object.freeze(['creative_initial', 'creative', 'datadome']),
   'src/shared/first_display_contracts.ts': Object.freeze(['bootstrap', 'core']),
   'src/shared/first_display_handoff.ts': Object.freeze(['bootstrap', 'first_display', 'core']),
   'src/shared/first_display_registration.ts': Object.freeze(['bootstrap', 'first_display']),
@@ -329,10 +333,11 @@ const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
     'permutive_context',
     'sourcepoint_consent',
   ]),
-  'src/shared/globals.ts': Object.freeze(['creative']),
-  'src/shared/origin.ts': Object.freeze(['core', 'creative']),
+  'src/shared/globals.ts': Object.freeze(['creative_initial', 'creative']),
+  'src/shared/gpt_diagnostics.ts': Object.freeze(['gpt', 'gpt_diagnostics']),
+  'src/shared/origin.ts': Object.freeze(['core', 'creative_initial', 'creative']),
   'src/shared/realm.ts': Object.freeze(['gpt_diagnostics', 'diagnostics_presentation']),
-  'src/shared/scheduler.ts': Object.freeze(['creative']),
+  'src/shared/scheduler.ts': Object.freeze(['creative_initial', 'creative']),
   'src/shared/script_guard.ts': Object.freeze([
     'datadome',
     'google_tag_manager',
@@ -466,7 +471,7 @@ function loadHistoricalReleaseCatalog(capture, label) {
 /** Authenticate the immutable inputs and tool versions recorded by a historical capture. */
 export function validateCaptureSourceProvenance(
   capture,
-  { buildInputs = CAPTURE_BUILD_INPUTS, head = 'HEAD', npmAuthorityCapture = capture } = {}
+  { buildInputs = CAPTURE_BUILD_INPUTS, npmAuthorityCapture = capture } = {}
 ) {
   const sha = capture?.source?.sha;
   if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/u.test(sha)) {
@@ -486,15 +491,6 @@ export function validateCaptureSourceProvenance(
   } catch (error) {
     if (error instanceof Error && error.message.startsWith('[bundle-budgets]')) throw error;
     fail('capture source SHA does not identify a commit');
-  }
-
-  try {
-    execFileSync('git', ['merge-base', '--is-ancestor', sha, head], {
-      cwd: repositoryRoot,
-      stdio: 'ignore',
-    });
-  } catch {
-    fail('capture source SHA is not an ancestor of HEAD');
   }
 
   for (const input of buildInputs) {

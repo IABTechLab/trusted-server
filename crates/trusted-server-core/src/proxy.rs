@@ -341,6 +341,8 @@ pub struct ProxyRequestConfig<'a> {
     pub copy_request_headers: bool,
     /// When true, stream the origin response without HTML/CSS rewrites.
     pub stream_passthrough: bool,
+    /// Whether every outbound hop must bypass the platform response cache.
+    pub bypass_cache: bool,
     /// Domains allowed for the initial request and any redirects.
     ///
     /// **Open mode** (`&[]`): every host is permitted. Most integration proxies pass
@@ -369,6 +371,7 @@ impl<'a> ProxyRequestConfig<'a> {
             headers: Vec::new(),
             copy_request_headers: true,
             stream_passthrough: false,
+            bypass_cache: false,
             allowed_domains: &[],
             require_https: false,
         }
@@ -399,6 +402,13 @@ impl<'a> ProxyRequestConfig<'a> {
     #[must_use]
     pub fn with_streaming(mut self) -> Self {
         self.stream_passthrough = true;
+        self
+    }
+
+    /// Bypass the platform response cache for the initial request and redirects.
+    #[must_use]
+    pub fn with_cache_bypass(mut self) -> Self {
+        self.bypass_cache = true;
         self
     }
 
@@ -733,6 +743,7 @@ struct ProxyRequestHeaders<'a> {
 struct ProxyRedirectPolicy<'a> {
     follow_redirects: bool,
     stream_passthrough: bool,
+    bypass_cache: bool,
     allowed_domains: &'a [String],
     require_https: bool,
 }
@@ -761,6 +772,7 @@ pub async fn proxy_request(
         headers,
         copy_request_headers,
         stream_passthrough,
+        bypass_cache,
         allowed_domains,
         require_https,
     } = config;
@@ -788,6 +800,7 @@ pub async fn proxy_request(
         ProxyRedirectPolicy {
             follow_redirects,
             stream_passthrough,
+            bypass_cache,
             allowed_domains,
             require_https,
         },
@@ -1329,10 +1342,14 @@ async fn proxy_with_redirects(
                     message: "failed to build proxy request".to_string(),
                 })?;
 
+        let mut platform_request = PlatformHttpRequest::new(edge_req, backend_name);
+        if redirect_policy.bypass_cache {
+            platform_request = platform_request.with_cache_bypass();
+        }
         let platform_resp = request_headers
             .services
             .http_client()
-            .send(PlatformHttpRequest::new(edge_req, backend_name))
+            .send(platform_request)
             .await
             .change_context(TrustedServerError::Proxy {
                 message: "Failed to proxy".to_string(),
@@ -1490,6 +1507,7 @@ pub async fn handle_first_party_proxy(
             headers: Vec::new(),
             copy_request_headers: true,
             stream_passthrough: false,
+            bypass_cache: false,
             allowed_domains: &settings.proxy.allowed_domains,
             require_https: false,
         },
@@ -3671,6 +3689,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: false,
                     stream_passthrough: false,
+                    bypass_cache: false,
                     allowed_domains: &[],
                     require_https: false,
                 },
@@ -3712,6 +3731,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: false,
                     stream_passthrough: false,
+                    bypass_cache: false,
                     allowed_domains: &[],
                     require_https: false,
                 },
@@ -3758,6 +3778,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: false,
                     stream_passthrough: false,
+                    bypass_cache: false,
                     allowed_domains: &[],
                     require_https: false,
                 },
@@ -3807,6 +3828,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: true,
                     stream_passthrough: false,
+                    bypass_cache: false,
                     allowed_domains: &[],
                     require_https: false,
                 },
@@ -3872,6 +3894,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: false,
                     stream_passthrough: false,
+                    bypass_cache: false,
                     allowed_domains: &[],
                     require_https: false,
                 },

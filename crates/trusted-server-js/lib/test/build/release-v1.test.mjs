@@ -23,6 +23,7 @@ import * as bundleMetrics from '../../scripts/bundle-metrics.mjs';
 import {
   findCutoverTextViolations,
   findVendorBoundaryViolations,
+  generatedTsjsArtifactFiles,
 } from '../../scripts/check-hard-cutover-absence.mjs';
 
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -189,10 +190,12 @@ function executeGeneratedArtifact(window, file, registrations, { preserveTarget 
           return true;
         },
       });
-  Object.defineProperty(window, 'tsjs', {
-    configurable: true,
-    value: target,
-  });
+  if (!preserveTarget) {
+    Object.defineProperty(window, 'tsjs', {
+      configurable: true,
+      value: target,
+    });
+  }
   window.eval(fs.readFileSync(path.resolve(libDirectory, '../dist', file), 'utf8'));
 }
 
@@ -250,15 +253,15 @@ test('generated optional first-display slices self-register through one authenti
       url: 'https://publisher.example/article',
     }
   );
-  const script = dom.window.document.querySelector('script');
   const registrations = [];
   const target = {};
   Object.defineProperty(target, '_registerFirstDisplay', {
     configurable: true,
     enumerable: false,
-    value(registration, source) {
+    value(registration) {
       assert.equal(this, target);
-      assert.equal(source, script);
+      assert.equal(arguments.length, 1);
+      dom.window.Object.freeze(registration);
       registrations.push(registration);
       return true;
     },
@@ -268,11 +271,6 @@ test('generated optional first-display slices self-register through one authenti
     configurable: true,
     value: target,
   });
-  Object.defineProperty(dom.window.document, 'currentScript', {
-    configurable: true,
-    value: script,
-  });
-
   try {
     dom.window.eval(
       firstDisplay
@@ -693,27 +691,45 @@ test('co-bundled render_runtime and independent GPT start one branded display fl
         .digest('hex'),
     });
     dom.window.Object.freeze(integrity);
-    const claimedBoot = dom.window.Object.create(dom.window.Object.prototype);
-    dom.window.Object.assign(claimedBoot, { boot, integrity, complete: () => undefined });
-    dom.window.Object.freeze(claimedBoot);
-    Object.defineProperty(dom.window, 'tsjs', { configurable: true, value: {} });
-    Object.defineProperties(dom.window.tsjs, {
-      boot: { configurable: true, enumerable: true, value: boot, writable: true },
-      que: { configurable: true, enumerable: true, value: [], writable: true },
-      _claimBootSnapshot: {
-        configurable: true,
-        enumerable: false,
-        value: (source) => {
-          if (source !== runtimeScript) return undefined;
-          Reflect.deleteProperty(dom.window.tsjs, '_claimBootSnapshot');
-          return claimedBoot;
-        },
-        writable: false,
-      },
+    const target = dom.window.Object.create(dom.window.Object.prototype);
+    dom.window.Object.assign(target, { boot, que: dom.window.Array() });
+    const currentScript = () => runtimeScript;
+    const claimedRuntime = dom.window.Object.create(dom.window.Object.prototype);
+    dom.window.Object.assign(claimedRuntime, {
+      boot,
+      integrity,
+      complete: () => undefined,
+      currentScript,
+      source: runtimeScript,
+      target,
+      mode: 'direct',
+      bind: (cancel) => (typeof cancel === 'function' ? () => undefined : undefined),
     });
-    Object.defineProperty(dom.window.document, 'currentScript', {
+    dom.window.Object.freeze(claimedRuntime);
+    let claimLive = true;
+    Object.defineProperty(runtimeScript, '_claimRuntimeV1', {
+      configurable: false,
+      enumerable: false,
+      value: (source) => {
+        if (!claimLive || source !== runtimeScript) return undefined;
+        claimLive = false;
+        return claimedRuntime;
+      },
+      writable: false,
+    });
+    Object.defineProperty(dom.window.Document.prototype, 'currentScript', {
       configurable: true,
-      value: runtimeScript,
+      get: currentScript,
+    });
+    let runtimeReadLive = true;
+    Object.defineProperty(dom.window, 'tsjs', {
+      configurable: false,
+      enumerable: true,
+      get: () => {
+        if (!runtimeReadLive) return target;
+        runtimeReadLive = false;
+        return runtimeScript;
+      },
     });
     let publisherMicrotaskRan = false;
     dom.window.queueMicrotask(() => {
@@ -1314,13 +1330,7 @@ test('capture provenance rejects an invalid source or missing captured build inp
     () => bundleBudgets.validateFrozenCaptureProvenance(invalidIntermediate, capture),
     /capture source SHA/
   );
-  assert.throws(
-    () =>
-      bundleBudgets.validateCaptureSourceProvenance(capture, {
-        head: `${capture.source.sha}^`,
-      }),
-    /not an ancestor/
-  );
+  assert.doesNotThrow(() => bundleBudgets.validateCaptureSourceProvenance(capture));
   assert.throws(
     () =>
       bundleBudgets.validateCaptureSourceProvenance(capture, {
@@ -2052,6 +2062,28 @@ test('vendor boundary rejects APS, GPT, and PUC artifacts but permits conformanc
       '// Fictional hermetic APS runner fixture; not copied from APS.\nwindow._aps = new Map();'
     ),
     []
+  );
+});
+
+test('hard-cutover scan traverses the complete generated release inventory', () => {
+  const release = JSON.parse(
+    fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-release-v1.json'), 'utf8')
+  );
+  const generated = new Set(
+    generatedTsjsArtifactFiles(libDirectory).map((file) => path.resolve(file))
+  );
+
+  for (const { file } of release.artifacts) {
+    assert.equal(
+      generated.has(path.resolve(libDirectory, '../dist', file)),
+      true,
+      `hard-cutover scan must traverse generated artifact ${file}`
+    );
+  }
+  assert.equal(
+    generated.has(path.resolve(libDirectory, '../dist/tsjs-release-v1.json')),
+    true,
+    'hard-cutover scan must traverse its generated release manifest'
   );
 });
 

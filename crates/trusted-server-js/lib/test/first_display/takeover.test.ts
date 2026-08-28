@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   coordinatePreparedFirstDisplayTakeoverV1,
@@ -7,6 +7,10 @@ import {
   type FinalizedFirstDisplayHandoffV1,
 } from '../../src/shared/first_display_handoff';
 import { snapshotOutlinedFirstDisplayHandoffV1 } from '../../src/shared/first_display_contracts';
+import {
+  consumeFirstDisplayTakeoverTransport,
+  installFirstDisplayTakeoverTransport,
+} from '../../src/shared/takeover';
 
 const RELEASE_ID = 'a'.repeat(64);
 const DIGEST = 'b'.repeat(64);
@@ -166,6 +170,33 @@ function finalized(
 }
 
 describe('atomic first-display takeover', () => {
+  it('uses a non-replaceable one-shot rendezvous on the runtime script', () => {
+    const runtimeScript = {};
+    const lease = Object.freeze([]);
+    const claim = vi.fn(() => lease);
+    const release = installFirstDisplayTakeoverTransport(runtimeScript, claim as never);
+
+    expect(release).toBeTypeOf('function');
+    expect(Object.getOwnPropertyDescriptor(runtimeScript, '_firstDisplayTakeover')).toMatchObject({
+      configurable: false,
+      enumerable: false,
+      writable: false,
+    });
+    expect(() =>
+      Object.defineProperty(runtimeScript, '_firstDisplayTakeover', {
+        configurable: true,
+        value: () => undefined,
+      })
+    ).toThrow();
+
+    const transport = consumeFirstDisplayTakeoverTransport(runtimeScript);
+    expect(transport.status).toBe('accepted');
+    if (transport.status !== 'accepted') throw new Error('should accept transport');
+    expect(transport.claim({}, (() => undefined) as never)).toBe(lease);
+    expect(transport.claim({}, (() => undefined) as never)).toBeUndefined();
+    expect(claim).toHaveBeenCalledOnce();
+  });
+
   it('binds the exact handoff and one-use identities to the prepared persistent barrier', () => {
     const physicalSlot = {};
     const artifact = {};

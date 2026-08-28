@@ -299,22 +299,22 @@ function resolveSafeNavigationUrl(url: string): string | null {
   return null;
 }
 
-// Longest rebuild URL we will navigate to. Fastly Compute rejects request URLs
-// over 8192 bytes before the handler runs, and a signed click with many
-// tracking parameters can exceed that once nested inside another query string.
-// The margin covers percent-encoding growth and the request line's own overhead.
+// Fastly rejects request URLs over 8192 bytes before the handler runs. Leave
+// room for request-line overhead and percent-encoding expansion.
 const MAX_REBUILD_URL_LENGTH = 7000;
-
 const REBUILD_PATH = '/first-party/proxy-rebuild';
 
-// Navigate the rebuild as a form POST rather than a GET URL.
-//
-// The click is too long to nest in a query string, but a request body has no
-// such bound, and a form submission is a navigation — so it is not subject to
-// the CORS rules that rule out `fetch` from an opaque origin. The sandbox grants
-// `allow-forms`, and the endpoint answers a form-encoded POST with the same 302
-// it gives a GET. Only ever called from a click handler: submitting outside a
-// user gesture would navigate the frame on its own.
+function isRebuildNavigationUrl(url: string): boolean {
+  try {
+    return new URL(url, TRUSTED_BASE_URL).pathname === REBUILD_PATH;
+  } catch {
+    return false;
+  }
+}
+
+// An opaque-origin creative cannot use the JSON fetch path. For a recovery URL
+// too long to navigate as GET, submit the same fields in a form body; this stays
+// a user-initiated navigation and therefore does not require CORS.
 function submitRebuildNavigation(anchor: AnchorLike, rebuildUrl: string): boolean {
   try {
     if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
@@ -325,6 +325,7 @@ function submitRebuildNavigation(anchor: AnchorLike, rebuildUrl: string): boolea
     form.method = 'POST';
     form.action = parsed.origin + parsed.pathname;
     form.target = anchor.getAttribute('target') || '_self';
+    form.rel = 'noopener noreferrer';
     form.style.display = 'none';
     for (const field of ['tsclick', 'add', 'del']) {
       const value = parsed.searchParams.get(field);
@@ -352,12 +353,10 @@ function submitRebuildNavigation(anchor: AnchorLike, rebuildUrl: string): boolea
 function navigate(a: AnchorLike, url: string, isMiddle: boolean): void {
   const resolved = resolveSafeNavigationUrl(url);
   if (!resolved) return;
-  // An over-long recovery URL would be rejected by the platform before the
-  // handler runs, losing the click entirely. Carry it in a form body instead.
   if (
     !isMiddle &&
     resolved.length > MAX_REBUILD_URL_LENGTH &&
-    resolved.includes(REBUILD_PATH) &&
+    isRebuildNavigationUrl(resolved) &&
     submitRebuildNavigation(a, resolved)
   ) {
     return;
@@ -375,6 +374,15 @@ function navigate(a: AnchorLike, url: string, isMiddle: boolean): void {
 // compare against — is only updated when the value is itself a signed
 // /first-party/click URL. Writing the GET proxy-rebuild fallback there would
 // make every later canonicalization fail and lose subsequent mutations.
+function canonicalClickValue(resolved: string): string {
+  try {
+    const url = new URL(resolved, TRUSTED_BASE_URL);
+    return `${url.pathname}${url.search}`;
+  } catch {
+    return resolved;
+  }
+}
+
 function persistRebuiltClick(
   anchor: AnchorLike,
   finalUrl: string,

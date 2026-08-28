@@ -1,23 +1,22 @@
 # APS Render Fix and TSJS Resilience Architecture — Design
 
-- **Status:** revision 43 — hard-cutover contract with a lean first-display owner,
+- **Status:** revision 44 — hard-cutover contract with a lean first-display owner,
   atomic persistent-runtime takeover, an `rc/202608` implementation base,
   retired-branch concept-gap coverage, rc behavior reconciliation, and
   merge-blocking pre-action transfer remediation
 - **Date:** 2026-08-04
 - **Implementation baseline:** fetched `origin/rc/202608` at
-  `f0825604ec6740111e99dd8a178e3b880e7d772b` on 2026-08-18. The implementation
-  branch is created directly from that commit. Existing feature history at
-  `ecd78a9d11680deece4d4ec13f84be04fdae6b0d` is integrated as the second parent
-  of merge commit `95b562ea820268d6f16da08863dfa9f71076e4d2`.
+  `985ff22987d80cc729f45f702e0c3548e429b2cf` on 2026-08-28. The implementation
+  branch is created directly from that commit. Earlier feature and merge SHAs are
+  historical review references only; their approved changes were replayed and
+  reconciled onto this base, and they are not parents or implementation authority.
   `origin/main` at the same fetch was
   `2e85a1cdcfe3d23814bab5b2215dd6b096f871eb` and is already an ancestor of the
   rc baseline; it is not a competing implementation authority.
 - **Final release-branch refresh:** fetched `origin/rc/202608` at
-  `d4cd2cc823718d64ae73bcb068e5eab03ecd901a` on 2026-08-21. The final overlap
+  `985ff22987d80cc729f45f702e0c3548e429b2cf` on 2026-08-28. The final overlap
   audit and performance comparison use that exact tip. It already contains the
-  `main` ancestry selected by the release branch, so `main` is not merged
-  separately.
+  `main` ancestry selected by the release branch, so `main` is not merged separately.
 - **Retired-branch evidence:** the immutable historical snapshot
   `905984e62a0858c53d9f0ff6dd3a1bf190cf311d` from retired `rc/july` is only a
   finite TSJS concept-gap checklist. It is not a baseline, merge source, API
@@ -122,9 +121,10 @@ Any new analytics contract requires a separate design.
 
 The exact `origin/rc/202608` commit recorded above is the normative starting point.
 Its source, behavior, tests, APIs, CI, dependency state, and performance shape are
-the baseline. The implementation branch has that rc commit as its first parent and
-the previously reviewed APS/TSJS feature history as its second parent. A conflict
-resolution is not itself behavioral evidence: every overlapping rc behavior must be
+the baseline. The implementation branch was created directly from that exact rc
+commit; approved feature changes were replayed and reconciled rather than made a
+second-parent authority. A conflict resolution is not itself behavioral evidence:
+every overlapping rc behavior must be
 identified, assigned an owner, and proved after reconciliation. Unless this design
 explicitly supersedes an rc behavior, the rc behavior wins.
 
@@ -2577,11 +2577,17 @@ without enabled APS configuration is invalid rather than a reason to select the
 render owner, and `render_owner_initial` has no independently routable production
 asset; its bytes exist only inside the selected first-display composition.
 
-Every slice registers into the bootstrap's release-private first-display sink from
-the expected parser-inserted artifact and `document.currentScript`. The build fixes
-their order, interfaces, and allowed imports; there is no public service locator or
+Every optional slice submits one raw dense four-item carrier
+`[1,id,releaseId,install]` to the bootstrap's release-private first-display sink
+during the expected parser-inserted artifact task. The slice does not supply or
+retain script identity. Bootstrap authenticates the exact connected script with the
+closure-captured native `Document.prototype.currentScript` getter, reserves a
+private `registrationClaiming` state before any mutable realm access, exact-data
+validates the carrier with captured intrinsics, freezes it, and copies only the
+validated id/install values into its closure-private registry. The build fixes their
+order, interfaces, and allowed imports; there is no public service locator or
 third-party extension surface. The agent rejects an unknown, duplicate, omitted,
-misordered, wrong-release, accessor-backed, or late slice before effects. Agent
+misordered, wrong-release, accessor-backed, reentrant, or late slice before effects. Agent
 activation is one synchronous transaction with reverse-order rollback, the same
 inert-prepare/effectful-activate discipline used by the persistent catalog, and the
 same ten-second bootstrap deadline. All agent-owned timers, listeners, wrappers,
@@ -3053,6 +3059,18 @@ any mutable DOM or realm authentication surface and rolls back only after a fail
 authentication. Its completion capability admits outcomes through primitive string
 comparisons, consumes its one-use guard before invoking the selected handler, and
 therefore remains one-shot under reentrant claim and completion attempts.
+The generated persistent artifact starts with a build-owned banner whose first
+expression directly reads the sealed `window.tsjs` admission gate, directly reads
+the returned script node's own non-configurable `_claimRuntimeV1`, and calls it
+before core or any co-bundled module initializer runs. For exactly that authenticated
+runtime task, the non-configurable namespace getter returns the selected script node
+once; every ordinary or later read returns the retained bootstrap target. The claim
+returns one frozen exact record containing
+`{boot,integrity,complete,currentScript,source,target,mode,bind}`. Core rejects any
+other shape, source/current-script mismatch, mode mismatch, mutable record, or
+replayed claim before effects. The controller captured the native current-script
+getter and required object/array/descriptor intrinsics before any live upstream
+script could run; later mutation of public realm properties cannot forge admission.
 The compact fallback does not import either public request validator. Both public
 operations refuse as unavailable without reading publisher input; full validation
 belongs only to a successfully committed kernel.
@@ -3175,16 +3193,20 @@ defined here and must reload; the retained prior _binary_ in §8 is solely the w
 deployment rollback artifact. After rollback, that binary again serves its own
 release. This accepted stale-page break is not a cache or compatibility project.
 
-Upstream-library loading is orthogonal to TSJS bundling. After the bootstrap
-controller, the server may emit the existing fixed/configured live GPT tag as a non-
-parser-blocking fetch early enough to overlap the first-display TSJS request when GPT is
-required for the first projected display. When Prebid integration is enabled, its
-external artifact tag is always emitted through that early overlap path because the
-rc-baseline client readiness, bidder/user-ID/EID configuration, publisher queue, and
-initial auction contract are required before the first action. It remains
-an external script, never a TSJS source input or TSJS generated artifact. Its adapter installs
-and owns all request-capable actions only after the agent transaction commits, so
-an early library load cannot race a TS-owned display before correctness listeners.
+Upstream-library loading is orthogonal to TSJS bundling. The exact server emission
+order is the inline bootstrap controller, any enabled live integration head inserts,
+and then the one selected parser-blocking first-display or persistent TSJS artifact.
+The controller therefore captures its native intrinsics and installs all admission
+sinks before publisher/upstream code can run, while the upstream fetch can still
+overlap the selected TSJS request. The server may emit the existing fixed/configured
+live GPT tag through this interstitial path when GPT is required for the first
+projected display. When Prebid integration is enabled, its external artifact tag is
+always emitted there because the rc-baseline client readiness, bidder/user-ID/EID
+configuration, publisher queue, and initial auction contract are required before
+the first action. It remains an external script, never a TSJS source input or TSJS
+generated artifact. Its adapter installs and owns all request-capable actions only
+after the agent transaction commits, so an early library load cannot race a TS-owned
+display before correctness listeners.
 An optional/later upstream script follows its owning deferred module's trigger and
 cannot be prefetched by this path. The APS runner is never boot-preloaded: only a
 winning APS renderer document loads it through the live fixed-target proxy specified
@@ -3384,21 +3406,37 @@ consume another module's deadline or delay its fetch, preparation, or activation
 
 Deferred insertion preserves the publisher's script policy; it never rewrites a
 Content-Security-Policy header or meta element and never adds `unsafe-inline`,
-`unsafe-eval`, a source host, or a default Trusted Types policy. The parser-inserted
-bootstrap and parser-inserted first-display/runtime tags remain subject to the publisher's existing CSP and are
-a deployment precondition just as TSJS injection is on the rc baseline. When those
-tags carry a CSP nonce, they must carry the same response-local value, and core
-copies the authenticated parser-inserted element's `nonce` IDL value to the runtime
-and every deferred script before
-insertion. This supports nonce-only policies and preserves the trusted-root chain
-under `strict-dynamic`; an absent nonce is never synthesized or copied from an
-unrelated publisher element.
+`unsafe-eval`, a source host, or a default Trusted Types policy. Before HTML
+transformation, the server examines only enforcing response
+`Content-Security-Policy` headers, applies `script-src-elem` → `script-src` →
+`default-src` precedence within each policy, validates bounded base64/base64url nonce
+tokens, and selects a nonce only when the intersection of nonce-bearing policies is
+one exact value. Report-only headers, malformed values, multiple candidates, and
+disjoint policies authorize no nonce. A nonce introduced only by publisher markup or
+a meta-delivered policy is unavailable before injection and is not inferred.
+
+When one response-header nonce is admitted, the server places that same value on
+every Trusted Server-generated executable tag in order: inline bootstrap controller,
+request-scoped inline diagnostics cleanup, live integration head inserts (including
+their inline and external script elements), and the selected parser-inserted
+first-display/runtime tag. Invalid or absent authority produces no `nonce`
+attribute. The parser-inserted tags remain subject to the publisher's effective CSP
+and are a deployment precondition just as TSJS injection is on the rc baseline. The
+controller/core copies only the authenticated parser-inserted element's `nonce` IDL
+value to the post-paint runtime and every deferred script before insertion. This
+supports nonce-only policies and preserves the trusted-root chain under
+`strict-dynamic`; an absent nonce is never synthesized or copied from an unrelated
+publisher element.
 
 `HTMLScriptElement.src` is a Trusted Types script-URL sink. When the browser exposes
-`trustedTypes`, core attempts once per document runtime to create the closure-private
-policy `trusted-server#tsjs-v1`. Its `createScriptURL` callback returns its canonical
+`trustedTypes`, the direct core path attempts once per document runtime to create the
+closure-private policy `trusted-server#tsjs-v1`. On an agent path, bootstrap creates
+that policy at most once for the post-paint persistent insertion and leases the same
+closure-private URL constructor to core for all deferred insertions; core never
+creates a competing policy. Its `createScriptURL` callback returns its canonical
 absolute argument only when that value is exact membership in the frozen absolute
-deferred URL set; it rejects every other string and is never exposed. If publisher CSP does
+runtime/deferred URL set for the owning path; it rejects every other string and is
+never exposed. If publisher CSP does
 not permit that policy name or the name is unavailable, core may assign the raw
 manifest string so a publisher's existing default policy or a non-enforcing browser
 can process it, but it immediately verifies that the element's resolved `src` is
@@ -3478,9 +3516,14 @@ unclaimed -> installing -> agent -> transferring -> kernel
                      \-> failed --------------------> fallback
 ```
 
-Initial namespace capture is field-wise and does not replace a publisher-created
-`window.tsjs` object: `window.tsjs ||= {}; tsjs.que ||= []; tsjs.boot ||= {}`. The
-kernel remains externally inert and commits ownership only after all takeover
+Bootstrap retains an existing non-null object/function `window.tsjs` target or
+creates and assigns one only when the existing value is falsy; a conflicting truthy
+primitive fails closed. It normalizes only that target's queue/boot fields and does
+not replace a publisher-created object. Before the direct persistent task, or at
+protected paint before an agent creates the persistent task, bootstrap permanently
+seals `window.tsjs` as the one-read admission getter described above. Normal reads
+continue to return the exact retained target, so the public namespace identity does
+not change. The kernel remains externally inert and commits ownership only after all takeover
 integration modules prepare and synchronously activate in order. The agent also
 leaves the public runtime surface uncommitted. Deferred modules are not part of the
 bootstrap/takeover transaction. Before first-display or takeover module work, bootstrap
@@ -5011,7 +5054,7 @@ After that upgrade, the lockfile compiler is the authority. CI runs a checked-in
 the deferred loader uses only authenticated classic same-origin script elements as
 specified in §5.2.
 
-The first complete paired run on candidate
+The historical first complete paired run on candidate
 `a0d8c0631a9774b5c8da8b25794a8836aa2e62f5` against exact rc base
 `d4cd2cc823718d64ae73bcb068e5eab03ecd901a` proved that correctness, load ordering,
 heap, GPT first-action timing, and every APS absolute action/completion/paint deadline
@@ -5020,8 +5063,9 @@ was 92,931 raw / 28,802 gzip / 25,779 Brotli bytes against 70,943 / 21,571 / 18,
 the APS interval was 128,769 / 39,645 / 34,758 against the allowed rc × 1.10 values
 78,659.9 / 24,098.8 / 21,006.7. APS first-action p90 was 616.3 ms against an allowed
 562.0 ms, while its 900 ms absolute action ceiling and every downstream deadline
-passed. This is immutable diagnostic evidence, not authority to change a comparator,
-membership rule, fixture, threshold, or baseline.
+passed. This predecessor-run record is immutable diagnostic evidence, not the current
+baseline and not authority to change a comparator, membership rule, fixture, or
+threshold. Final release evidence uses the 2026-08-28 base recorded above.
 
 Revision 43 closes that demonstrated source-graph gap without changing network
 semantics:
@@ -5692,11 +5736,13 @@ Tests must cover at least:
 - CSP/Trusted Types browser fixtures for same-origin allowlisting, matching nonce,
   nonce-only policy, `strict-dynamic`, allowed `trusted-server#tsjs-v1`, rejected
   named policy with an exact-preserving publisher default, and full policy block;
-  mutation by a default policy, a disallowed URL, or a synchronous policy throw
-  produces no insertion/request and settles only the affected deferred module as
+  the unit phase-loader layer asserts the exact internal reasons: mutation by a
+  default policy, a disallowed URL, or a synchronous policy throw is
   `policy_blocked`; missing/invalid nonce or CSP source rejection after insertion is
-  `load_error`, while node removal/replacement may have initiated a request but
-  cannot register and becomes `registration_rejected` unless load failure wins;
+  `load_error`; and node removal/replacement is `registration_rejected` unless load
+  failure wins. Browser fixtures do not expose those private enums: they prove the
+  corresponding distinct environmental cause, insertion/request outcome, absence of
+  an unauthorized diagnostics panel, and survival of the same committed kernel;
 - exact kernel/fallback `TsjsApi` own surfaces; semantic version and release-id
   equality; boot deep-copy/freeze and malformed-field safe fallback; exact ordered
   integration-config id inclusion, manifest/product matching, attenuated per-module
@@ -5908,10 +5954,11 @@ boolean and exposes no legacy alias or omitted-field compatibility path.
 
 Binary rollback restores Trusted Server code but cannot restore older live APS runner
 bytes. If the proxied runner becomes unavailable, incompatible, or produces suspect
-completion results, the emergency containment action is to disable
-`[integrations.aps]`; this stops new APS admission and makes both reserved APS routes
-return their local `404 no-store` response. APS remains disabled until controlled
-real-browser conformance passes again.
+completion results, the emergency containment action is to remove or disable every
+`[auction.providers.<id>]` instance whose `profile = "aps"` (or disable `[auction]`
+when auction-wide containment is intended). This stops new APS admission and makes
+both reserved APS routes return their local `404 no-store` response. APS remains
+disabled until controlled real-browser conformance passes again.
 
 This document does not prescribe new rollout telemetry. If existing operational
 signals are insufficient for a deployment decision, that blocks rollout and is

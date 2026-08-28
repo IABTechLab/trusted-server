@@ -64,6 +64,7 @@ function createGptHarness(
     orphanOnReplace?: object;
     returnOldOnReplace?: boolean;
     synchronousRun?: boolean;
+    servicesEnabled?: boolean;
   } = {}
 ) {
   const listeners = new Map<string, Set<(event: unknown) => void>>();
@@ -92,6 +93,7 @@ function createGptHarness(
   const facade: GoogletagFacade = Object.freeze({
     bindingToken: () => bindingToken,
     clearTargeting: vi.fn(),
+    enableServices: vi.fn(),
     transactionalDefine: () => Object.freeze({ status: 'discarded' as const }),
     display,
     getTargeting: vi.fn(() => []),
@@ -103,7 +105,7 @@ function createGptHarness(
       Object.freeze({
         apiReady: true,
         initialLoadDisabled: options.initialLoadDisabled === true,
-        pubadsReady: true,
+        pubadsReady: options.servicesEnabled !== false,
       }),
     setTargeting: vi.fn(),
     slotElementId: () => undefined,
@@ -544,6 +546,92 @@ describe('slot registry', () => {
     await Promise.resolve();
     expect(current.status).toBe('active');
     expect(gpt.display).toHaveBeenCalledExactlyOnceWith(slot);
+  });
+
+  it('publishes the exact TS request intent before GPT starts and isolates observer failure', async () => {
+    const gpt = createGptHarness();
+    const observed = vi.fn((input: Readonly<{ registeredSlotId: string; slot: object }>) => {
+      expect(input).toEqual({ registeredSlotId: 'slot', slot });
+      expect(Object.isFrozen(input)).toBe(true);
+      expect(gpt.display).not.toHaveBeenCalled();
+      throw new Error('fictional diagnostics failure');
+    });
+    const service = createSlotService({
+      googletag: gpt.adapter,
+      onTrustedServerRequest: observed,
+    });
+    const navigation = createNavigation();
+    const slot = bindTrustedSlot(service, navigation);
+    service.activate();
+
+    const request = service.request({
+      expectedSlot: slot,
+      intentId: 'diagnostic-publication',
+      navigationGeneration: navigation.generation,
+      operation: 'display',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(observed).toHaveBeenCalledExactlyOnceWith({ registeredSlotId: 'slot', slot });
+    expect(gpt.display).toHaveBeenCalledExactlyOnceWith(slot);
+    expect(request.status).toBe('active');
+  });
+
+  it('does not publish a request fact when disabled-load display is claimed synchronously', async () => {
+    const gpt = createGptHarness({ initialLoadDisabled: true });
+    const observed = vi.fn();
+    const service = createSlotService({
+      googletag: gpt.adapter,
+      onTrustedServerRequest: observed,
+    });
+    const navigation = createNavigation();
+    const slot = bindTrustedSlot(service, navigation);
+    service.activate();
+    gpt.display.mockImplementationOnce(() => gpt.emit('slotRequested', { slot }));
+
+    const request = service.request({
+      expectedSlot: slot,
+      intentId: 'synchronous-publisher-claim',
+      navigationGeneration: navigation.generation,
+      operation: 'display',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+    await expect(request.result).resolves.toEqual({
+      status: 'failed',
+      reason: 'cycle_unattributable',
+    });
+
+    expect(observed).not.toHaveBeenCalled();
+    expect(gpt.refresh).not.toHaveBeenCalled();
+  });
+
+  it('enables GPT services at the shared request boundary before display', async () => {
+    const gpt = createGptHarness({ servicesEnabled: false });
+    const service = createSlotService({ googletag: gpt.adapter });
+    const navigation = createNavigation();
+    const slot = bindTrustedSlot(service, navigation);
+    service.activate();
+
+    const request = service.request({
+      expectedSlot: slot,
+      intentId: 'enable-services-before-display',
+      navigationGeneration: navigation.generation,
+      operation: 'display',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(gpt.facade.enableServices).toHaveBeenCalledOnce();
+    expect(vi.mocked(gpt.facade.enableServices).mock.invocationCallOrder[0]).toBeLessThan(
+      gpt.display.mock.invocationCallOrder[0]!
+    );
+    expect(request.status).toBe('active');
   });
 
   it('recognizes the exact live GPT binding regardless of who defined the slot', () => {
@@ -2641,40 +2729,54 @@ describe('physical GPT cycles', () => {
     ]);
   });
 
-  it('rejects display batches at the type and runtime boundaries before mutation', () => {
+  it('arms every display intent before a synchronous SRA request can emit sibling events', async () => {
     const harness = createGptHarness();
     const service = createSlotService({ googletag: harness.adapter });
     const navigation = createNavigation();
-    bindTrustedSlot(service, navigation);
+    const first = bindTrustedSlot(service, navigation, 'display-first');
+    const second = bindTrustedSlot(service, navigation, 'display-second');
+    harness.display.mockImplementation(() => {
+      harness.emit('slotRequested', { slot: first });
+      harness.emit('slotRequested', { slot: second });
+      harness.emit('slotRenderEnded', {
+        isEmpty: false,
+        responseIdentifier: 'display-first-response',
+        slot: first,
+      });
+      harness.emit('slotRenderEnded', {
+        isEmpty: false,
+        responseIdentifier: 'display-second-response',
+        slot: second,
+      });
+    });
     const displayBatch = [
       {
-        intentId: 'valid-before-display',
+        expectedSlot: first,
+        intentId: 'display-first-intent',
         navigationGeneration: navigation.generation,
-        operation: 'refresh' as const,
-        registeredSlotId: 'slot',
+        operation: 'display' as const,
+        registeredSlotId: 'display-first',
         requestClass: 'primary',
       },
       {
-        intentId: 'display-batch',
+        expectedSlot: second,
+        intentId: 'display-second-intent',
         navigationGeneration: navigation.generation,
         operation: 'display' as const,
-        registeredSlotId: 'slot',
+        registeredSlotId: 'display-second',
         requestClass: 'primary',
       },
     ] as const;
-    const compileOnly = (): void => {
-      // @ts-expect-error requestBatch is refresh-only; single request retains display support.
-      service.requestBatch(displayBatch);
-    };
-    expect(compileOnly).toBeTypeOf('function');
-    const inventory = service.snapshotForTest();
     const runtimeRequestBatch = service.requestBatch as unknown as (
-      inputs: readonly object[]
-    ) => unknown;
+      inputs: typeof displayBatch
+    ) => readonly ReturnType<SlotService['request']>[];
 
-    expect(runtimeRequestBatch(displayBatch)).toEqual([]);
-    expect(service.snapshotForTest()).toEqual(inventory);
-    expect(harness.display).not.toHaveBeenCalled();
+    const requests = runtimeRequestBatch(displayBatch);
+    await expect(Promise.all(requests.map(({ result }) => result))).resolves.toEqual([
+      { responseIdentifier: 'display-first-response', status: 'rendered' },
+      { responseIdentifier: 'display-second-response', status: 'rendered' },
+    ]);
+    expect(harness.display).toHaveBeenCalledOnce();
     expect(harness.refresh).not.toHaveBeenCalled();
   });
 

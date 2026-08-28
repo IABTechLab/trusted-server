@@ -112,37 +112,27 @@ describe('creative/click.ts', () => {
     });
 
     expect(anchor.getAttribute('href')).toBe(absolute(PROXY_RESPONSE));
-    // data-tsclick keeps the server's root-relative shape: it is echoed back as
-    // the rebuild payload's `tsclick`, which the server parses as a click path.
     expect(anchor.getAttribute('data-tsclick')).toBe(PROXY_RESPONSE);
   });
 
   it('sends a root-relative tsclick on a second rebuild after a successful one', async () => {
-    // Regression: persisting an absolute canonical click made the next rebuild
-    // POST a value the server rejects as an invalid click path, so the second
-    // mutation was silently lost on non-opaque consumers.
     vi.useFakeTimers();
-
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({ href: PROXY_RESPONSE }),
     });
     global.fetch = fetchMock as unknown as typeof fetch;
-
     const anchor = document.createElement('a');
     anchor.setAttribute('data-tsclick', FIRST_PARTY_CLICK);
     anchor.setAttribute('href', FIRST_PARTY_CLICK);
     document.body.appendChild(anchor);
 
-    await importCreativeModule();
-
+    await activateCreativeRuntime();
     anchor.setAttribute('href', MUTATED_CLICK);
     await Promise.resolve();
     await vi.runAllTimersAsync();
-
     expect(anchor.getAttribute('data-tsclick')).toBe(PROXY_RESPONSE);
 
-    // A second mutation now diffs against the rebuilt canonical click.
     anchor.setAttribute('href', 'https://example.com/landing?baz=3');
     await Promise.resolve();
     await vi.runAllTimersAsync();
@@ -151,11 +141,9 @@ describe('creative/click.ts', () => {
     const payloads = fetchMock.mock.calls.map(
       (call) => JSON.parse(call[1]?.body as string) as { tsclick: string }
     );
-    // Every payload must carry the server's root-relative click form: an
-    // absolute one is rejected as an invalid click path.
-    for (const payload of payloads) {
-      expect(payload.tsclick.startsWith('/first-party/click?')).toBe(true);
-    }
+    expect(payloads.every((payload) => payload.tsclick.startsWith('/first-party/click?'))).toBe(
+      true
+    );
     expect(payloads.some((payload) => payload.tsclick === PROXY_RESPONSE)).toBe(true);
   });
 
@@ -347,6 +335,82 @@ describe('creative/click.ts', () => {
       } else {
         delete (window as { origin?: string }).origin;
       }
+    }
+  });
+
+  it('navigates an over-long opaque-origin rebuild through a form POST', async () => {
+    vi.useFakeTimers();
+    const originDescriptor = Object.getOwnPropertyDescriptor(window, 'origin');
+    Object.defineProperty(window, 'origin', { value: 'null', configurable: true });
+    global.fetch = undefined as unknown as typeof fetch;
+    const submits: HTMLFormElement[] = [];
+    const originalSubmit = HTMLFormElement.prototype.submit;
+    HTMLFormElement.prototype.submit = function patched(this: HTMLFormElement) {
+      submits.push(this);
+    };
+
+    try {
+      const filler = 'a'.repeat(6800);
+      const longClick = `/first-party/click?tsurl=https%3A%2F%2Fexample.com%2Flanding&foo=1&pad=${filler}&tstoken=token123`;
+      const anchor = document.createElement('a');
+      anchor.setAttribute('data-tsclick', longClick);
+      anchor.setAttribute('href', longClick);
+      document.body.appendChild(anchor);
+
+      await activateCreativeRuntime();
+      anchor.setAttribute('href', `https://example.com/landing?pad=${filler}&bar=2`);
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+      anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+
+      expect(submits.length).toBeGreaterThan(0);
+      const form = submits[0];
+      expect(form?.method.toLowerCase()).toBe('post');
+      expect(form?.action).toContain('/first-party/proxy-rebuild');
+      expect(form?.rel).toBe('noopener noreferrer');
+      expect(form?.querySelector<HTMLInputElement>('input[name="tsclick"]')?.value).toBe(longClick);
+      expect(form?.querySelector<HTMLInputElement>('input[name="add"]')?.value).toContain('bar');
+    } finally {
+      HTMLFormElement.prototype.submit = originalSubmit;
+      if (originDescriptor) {
+        Object.defineProperty(window, 'origin', originDescriptor);
+      } else {
+        delete (window as { origin?: string }).origin;
+      }
+    }
+  });
+
+  it('does not form-submit a long non-rebuild URL containing the rebuild path', async () => {
+    vi.useFakeTimers();
+    const submits: HTMLFormElement[] = [];
+    const originalSubmit = HTMLFormElement.prototype.submit;
+    HTMLFormElement.prototype.submit = function patched(this: HTMLFormElement) {
+      submits.push(this);
+    };
+    const openMock = vi.fn();
+    const originalOpen = window.open;
+    window.open = openMock as unknown as typeof window.open;
+
+    try {
+      const targetUrl = `/first-party/landing?next=/first-party/proxy-rebuild&tsclick=fictional&pad=${'a'.repeat(7000)}`;
+      const anchor = document.createElement('a');
+      anchor.setAttribute('data-tsclick', targetUrl);
+      anchor.setAttribute('href', targetUrl);
+      anchor.setAttribute('target', '_blank');
+      document.body.appendChild(anchor);
+
+      await activateCreativeRuntime();
+      anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+
+      expect(submits).toHaveLength(0);
+      expect(openMock).toHaveBeenCalledWith(absolute(targetUrl), '_blank', 'noopener,noreferrer');
+    } finally {
+      HTMLFormElement.prototype.submit = originalSubmit;
+      window.open = originalOpen;
     }
   });
 

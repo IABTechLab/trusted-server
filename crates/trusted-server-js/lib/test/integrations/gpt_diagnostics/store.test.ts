@@ -10,7 +10,6 @@ import {
   MAX_REQUESTED_SLOT_SIZES,
   MAX_REQUEST_CYCLES_PER_SLOT,
   MAX_TRUSTED_SERVER_ASSOCIATIONS,
-  REQUEST_PATH_ATTRIBUTION_WINDOW_MS,
   TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS,
   type GptDiagnosticsSlotLike,
 } from '../../../src/integrations/gpt_diagnostics/store';
@@ -28,32 +27,6 @@ function associateSlot(
   auctionSlotId: string
 ): void {
   store.recordTrustedServerOpportunity(slot, auctionSlotId, 'renderable_candidate');
-}
-
-function recordCompletedAttempts(
-  store: GptDiagnosticsStore,
-  count: number,
-  prefix: string
-): number[] {
-  const attemptIds: number[] = [];
-  let remaining = count;
-
-  for (let slotIndex = 0; remaining > 0; slotIndex += 1) {
-    const slot = fakeSlot(`${prefix}-slot-${slotIndex}`);
-    const auctionSlotId = `${prefix}-auction-${slotIndex}`;
-    associateSlot(store, slot, auctionSlotId);
-    const cycles = Math.min(MAX_REQUEST_CYCLES_PER_SLOT, remaining);
-    for (let cycleIndex = 0; cycleIndex < cycles; cycleIndex += 1) {
-      store.recordSlotRequested(slot);
-      const attemptId = store.recordTrustedServerCreativeRequest(auctionSlotId);
-      expect(attemptId).toEqual(expect.any(Number));
-      attemptIds.push(attemptId!);
-      store.recordTrustedServerCreativeResponse(attemptId!);
-      remaining -= 1;
-    }
-  }
-
-  return attemptIds;
 }
 
 function assertCoverageEquation(store: GptDiagnosticsStore): void {
@@ -517,7 +490,7 @@ describe('GptDiagnosticsStore', () => {
     expect(() => store.recordPublisherRefresh([null, 7, undefined, slot] as never)).not.toThrow();
 
     store.recordSlotRequested(slot);
-    expect(store.snapshot().slots[0].requests[0].requestPath).toBe('publisher_refresh');
+    expect(store.snapshot().slots[0]!.requests[0]!.requestPath).toBe('publisher_refresh');
     expect(store.snapshot().slots).toHaveLength(1);
   });
 
@@ -577,7 +550,7 @@ describe('GptDiagnosticsStore', () => {
     now = 1;
     record(store, slot);
 
-    expect(store.snapshot().slots[0].requests[0].incompleteSequence).toBe(true);
+    expect(store.snapshot().slots[0]!.requests[0]!.incompleteSequence).toBe(true);
     expect(store.snapshot().callbackIssues).toContainEqual(
       expect.objectContaining({ kind, disposition: 'matched', reason: 'invalid_event_order' })
     );
@@ -594,8 +567,8 @@ describe('GptDiagnosticsStore', () => {
       store.recordSlotVisibilityChanged(slot, percentage);
 
       const snapshot = store.snapshot();
-      expect(snapshot.slots[0].currentVisibilityPercentage).toBeUndefined();
-      expect(snapshot.slots[0].maximumVisibilityPercentage).toBeUndefined();
+      expect(snapshot.slots[0]!.currentVisibilityPercentage).toBeUndefined();
+      expect(snapshot.slots[0]!.maximumVisibilityPercentage).toBeUndefined();
       expect(snapshot.callbackIssues).toContainEqual(
         expect.objectContaining({
           kind: 'slotVisibilityChanged',
@@ -615,7 +588,7 @@ describe('GptDiagnosticsStore', () => {
 
     store.recordTrustedServerCreativeFailure(4242, 'cache_fetch_failed');
 
-    expect(store.snapshot().slots[0].requests[0].trustedServerCreativeFailures).toBeUndefined();
+    expect(store.snapshot().slots[0]!.requests[0]!.trustedServerCreativeFailures).toBeUndefined();
     expect(last(store.snapshot().attributionIssues)?.reason).toBe('creative_attempt_unknown');
   });
 
@@ -649,7 +622,7 @@ describe('GptDiagnosticsStore', () => {
     deferred.shift()!.callback();
     expect(deferred, 'no boundary remains once every candidate crossed it').toHaveLength(0);
     for (const slot of store.snapshot().slots) {
-      expect(slot.requests[0].delivery).toBe('candidate_unconfirmed');
+      expect(slot.requests[0]!.delivery).toBe('candidate_unconfirmed');
     }
   });
 
@@ -683,6 +656,36 @@ describe('GptDiagnosticsStore', () => {
     expect(cycles[1]?.requestedSlotSizes).toBeUndefined();
   });
 
+  it('correlates release-private snapshots through their shared opaque slot token', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+    const token = Object.freeze(Object.create(null) as object);
+    const opportunitySlot = Object.freeze({
+      token,
+      elementId: 'token-correlated-slot',
+      adUnitPath: '/example/token-correlated-slot',
+    });
+    const callbackSlot = Object.freeze({
+      token,
+      elementId: 'token-correlated-slot',
+      adUnitPath: '/example/token-correlated-slot',
+    });
+
+    store.recordTrustedServerOpportunity(
+      opportunitySlot,
+      'auction-slot',
+      'renderable_candidate',
+      'fictional-auction',
+      [[300, 250]]
+    );
+    store.recordSlotRequested(callbackSlot, 11);
+
+    expect(store.snapshot().slots[0]?.requests[0]).toMatchObject({
+      requestedSlotSizes: [[300, 250]],
+      trustedServerAuctionId: 'fictional-auction',
+      trustedServerOpportunity: 'renderable_candidate',
+    });
+  });
+
   it('bounds and validates requested sizes before retaining them', () => {
     const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
     const slot = fakeSlot('validated-requested-sizes');
@@ -692,6 +695,8 @@ describe('GptDiagnosticsStore', () => {
     );
     formats[0] = [0, 250];
     formats[1] = [300, Number.NaN];
+    formats[2] = [1.5, 250];
+    formats[3] = [4_097, 250];
 
     store.recordTrustedServerOpportunity(
       slot,
@@ -703,9 +708,11 @@ describe('GptDiagnosticsStore', () => {
     store.recordSlotRequested(slot);
 
     const requested = store.snapshot().slots[0]!.requests[0]!.requestedSlotSizes;
-    expect(requested).toHaveLength(MAX_REQUESTED_SLOT_SIZES - 2);
+    expect(requested).toHaveLength(MAX_REQUESTED_SLOT_SIZES - 4);
     expect(requested).not.toContainEqual([0, 250]);
     expect(requested).not.toContainEqual([300, Number.NaN]);
+    expect(requested).not.toContainEqual([1.5, 250]);
+    expect(requested).not.toContainEqual([4_097, 250]);
     expect(requested).not.toContainEqual([MAX_REQUESTED_SLOT_SIZES + 1, 250]);
   });
 });

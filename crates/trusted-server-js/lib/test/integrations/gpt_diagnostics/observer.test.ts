@@ -7,19 +7,19 @@ import type {
 import {
   GptDiagnosticsObserver,
   type GptDiagnosticsObserverStore,
-  type GptObserverWindow,
 } from '../../../src/integrations/gpt_diagnostics/observer';
+import type { GptDiagnosticsFact } from '../../../src/integrations/gpt/diagnostics_facts';
 
 function fakeStore(): GptDiagnosticsObserverStore {
   return {
     markGptObserved: vi.fn(),
+    recordTrustedServerOpportunity: vi.fn(),
     recordSlotRequested: vi.fn(),
     recordSlotResponseReceived: vi.fn(),
     recordSlotRenderEnded: vi.fn(),
     recordSlotOnload: vi.fn(),
     recordImpressionViewable: vi.fn(),
     recordSlotVisibilityChanged: vi.fn(),
-    recordPublisherRefresh: vi.fn(),
   };
 }
 
@@ -40,6 +40,31 @@ function fact(
 }
 
 describe('GptDiagnosticsObserver', () => {
+  it('records requested-size evidence without claiming a GPT callback observation', () => {
+    const store = fakeStore();
+    const observer = new GptDiagnosticsObserver(store);
+    const slot = fakeSlot();
+    const opportunity = Object.freeze({
+      kind: 'trustedServerOpportunity' as const,
+      auctionSlotId: 'fictional-slot',
+      opportunity: 'renderable_candidate' as const,
+      requestedSlotSizes: Object.freeze([Object.freeze([300, 250] as const)]),
+      slot,
+      trustedServerAuctionId: 'fictional-auction',
+    });
+
+    observer.consume(opportunity as Readonly<GptDiagnosticsFact>);
+
+    expect(store.markGptObserved).not.toHaveBeenCalled();
+    expect(store.recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      slot,
+      'fictional-slot',
+      'renderable_candidate',
+      'fictional-auction',
+      [[300, 250]]
+    );
+  });
+
   it('does not claim GPT observation merely because the diagnostics module activated', () => {
     const store = fakeStore();
     const observer = new GptDiagnosticsObserver(store);

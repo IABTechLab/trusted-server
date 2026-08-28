@@ -775,6 +775,7 @@ function snapshotGptFact(value: unknown): Readonly<FirstDisplayGptFactV1> | unde
     'capturedAtMs',
     'elementId',
     'adUnitPath',
+    'requestedSlotSizes',
     'isEmpty',
     'renderedSize',
     'isBackfill',
@@ -814,6 +815,27 @@ function snapshotGptFact(value: unknown): Readonly<FirstDisplayGptFactV1> | unde
     }
     return Object.freeze([dimensions[0] as number, dimensions[1] as number] as const);
   })();
+  const requestedSlotSizes = (() => {
+    if (fields.requestedSlotSizes === null) return null;
+    const values = exactArray(fields.requestedSlotSizes, 16);
+    if (!values || values.length === 0) return undefined;
+    const sizes: Array<readonly [number, number]> = [];
+    for (const value of values) {
+      const dimensions = exactArray(value, 2);
+      if (
+        !dimensions ||
+        dimensions.length !== 2 ||
+        !isU32(dimensions[0], false) ||
+        !isU32(dimensions[1], false) ||
+        dimensions[0] > 4096 ||
+        dimensions[1] > 4096
+      ) {
+        return undefined;
+      }
+      sizes.push(Object.freeze([dimensions[0], dimensions[1]]));
+    }
+    return Object.freeze(sizes);
+  })();
   const tokenOrdinal =
     typeof fields.token === 'string' && /^gt1_[1-9a-z][0-9a-z]{0,6}$/.test(fields.token)
       ? Number.parseInt(fields.token.slice(4), 36)
@@ -831,6 +853,8 @@ function snapshotGptFact(value: unknown): Readonly<FirstDisplayGptFactV1> | unde
     !finiteNonnegative(fields.capturedAtMs) ||
     (fields.elementId !== null && !boundedString(fields.elementId, 256)) ||
     (fields.adUnitPath !== null && !boundedString(fields.adUnitPath, 256)) ||
+    requestedSlotSizes === undefined ||
+    (requestedSlotSizes !== null && (event !== 'slotRequested' || disposition !== 'matched')) ||
     (fields.isEmpty !== null && typeof fields.isEmpty !== 'boolean') ||
     (fields.renderedSize !== null && !renderedSize) ||
     (fields.isBackfill !== null && typeof fields.isBackfill !== 'boolean') ||
@@ -865,6 +889,7 @@ function snapshotGptFact(value: unknown): Readonly<FirstDisplayGptFactV1> | unde
     capturedAtMs: fields.capturedAtMs as number,
     elementId: fields.elementId as string | null,
     adUnitPath: fields.adUnitPath as string | null,
+    requestedSlotSizes,
     isEmpty: fields.isEmpty as boolean | null,
     renderedSize: fields.renderedSize === null ? null : renderedSize!,
     isBackfill: fields.isBackfill as boolean | null,

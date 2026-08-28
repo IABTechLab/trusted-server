@@ -59,23 +59,38 @@ function installRuntimeScript(): void {
 }
 
 function installBootClaim(target: object, acceptedBoot: Readonly<TsjsBootV1>): void {
-  Object.defineProperty(target, '_claimBootSnapshot', {
-    configurable: true,
+  const source = document.currentScript as HTMLScriptElement;
+  Object.defineProperty(source, '_claimRuntimeV1', {
+    configurable: false,
     enumerable: false,
-    value: (source: unknown) => {
-      if (source !== document.currentScript) return undefined;
-      Reflect.deleteProperty(target, '_claimBootSnapshot');
+    value: (candidate: unknown) => {
+      if (candidate !== source || candidate !== document.currentScript) return undefined;
       return Object.freeze({
+        source,
+        target,
         boot: acceptedBoot,
         complete: () => undefined,
+        currentScript: () => document.currentScript,
         integrity: Object.freeze({
           version: 1,
           projectionDigest: sha256HexUtf8V1(JSON.stringify(acceptedBoot.auctionProjection)),
           integrationConfigDigest: canonicalIntegrationConfigDigestV1(acceptedBoot.integrations),
         }),
+        mode: 'direct',
+        bind: () => () => undefined,
       });
     },
     writable: false,
+  });
+  let sourceLive = true;
+  Object.defineProperty(window, 'tsjs', {
+    configurable: true,
+    enumerable: true,
+    get: () => {
+      if (!sourceLive) return target;
+      sourceLive = false;
+      return source;
+    },
   });
 }
 
@@ -95,7 +110,6 @@ describe('hard-cutover requestAds API', () => {
       requestAds: legacyCallback,
     };
     installBootClaim(preload, preload.boot);
-    (window as unknown as { tsjs?: unknown }).tsjs = preload;
 
     await loadMinimalProductionRuntime();
     await vi.waitFor(() =>

@@ -2544,6 +2544,10 @@ pub struct DebugConfig {
     /// un-sanitized creative for diagnostics, so never enable in production.
     #[serde(default)]
     pub inject_adm_for_testing: bool,
+
+    /// Enable the host-only render-trace debug cookie route at `GET /_ts/trace`.
+    #[serde(default)]
+    pub trace_route_enabled: bool,
 }
 
 /// Metadata keys safe to surface in the `ts-debug` auction comment.
@@ -3224,6 +3228,13 @@ impl Settings {
             }
         }
         Ok(patterns)
+    }
+
+    /// Returns whether `path` is within the reserved Trusted Server admin
+    /// namespace.
+    #[must_use]
+    pub(crate) fn is_admin_path(path: &str) -> bool {
+        path == "/_ts/admin" || path.starts_with("/_ts/admin/")
     }
 
     /// Known admin endpoint paths that must be covered by a handler.

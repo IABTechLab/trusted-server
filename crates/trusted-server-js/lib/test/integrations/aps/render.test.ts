@@ -10,20 +10,6 @@ import {
   validateApsRenderer,
 } from '../../../src/integrations/aps/render';
 
-function nativeRunnerState(frame: HTMLIFrameElement): {
-  runner: HTMLScriptElement;
-  event: CustomEvent<{ aaxResponse: string; seatBidId: string }>;
-} {
-  const runner = frame.contentDocument?.querySelector<HTMLScriptElement>('script');
-  const frameWindow = frame.contentWindow as unknown as {
-    _aps: Map<string, { queue: Array<CustomEvent<{ aaxResponse: string; seatBidId: string }>> }>;
-  };
-  const account = frameWindow._aps.get('example-account-id');
-  expect(runner).not.toBeNull();
-  expect(account?.queue).toHaveLength(1);
-  return { runner: runner!, event: account!.queue[0] };
-}
-
 function encodeBytes(bytes: Uint8Array): string {
   let binary = '';
   for (const byte of bytes) binary += String.fromCharCode(byte);

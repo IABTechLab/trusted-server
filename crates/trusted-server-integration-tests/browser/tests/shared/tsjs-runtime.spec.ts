@@ -13,7 +13,8 @@ const FALLBACK_FIXTURE = runtimeTsjsFixture([]);
 const FIRST_DISPLAY_SLOT = "first-display-owner-slot";
 const FIRST_DISPLAY_FIXTURE = firstDisplayTsjsFixture({
   firstDisplayIds: ["first_display", "render_owner_initial", "gpt_initial"],
-  takeoverIds: ["render_runtime", "gpt"],
+  takeoverIds: ["render_runtime", "gpt", "gpt_diagnostics"],
+  deferredIds: ["diagnostics_presentation"],
   auctionProjection: {
     version: 1,
     auction: {
@@ -67,6 +68,11 @@ const FIRST_DISPLAY_FIXTURE = firstDisplayTsjsFixture({
         },
       },
     ],
+  },
+  diagnostics: {
+    version: 1,
+    renderTraceOverlay: true,
+    gpt: { active: true },
   },
 });
 
@@ -200,10 +206,14 @@ test.describe("TSJS hard-cutover runtime", () => {
       FIRST_DISPLAY_FIXTURE.runtimeSrc,
       "https://runtime.test",
     ).toString();
+    const deferredUrls = FIRST_DISPLAY_FIXTURE.deferred.map((resource) =>
+      new URL(resource.src, "https://runtime.test").toString(),
+    );
     const firstDisplayRequests: string[] = [];
     const allRequests: string[] = [];
     const pageErrors: string[] = [];
     const consoleMessages: string[] = [];
+    const deferredRegistrationAttack = `window.__deferredRegistrationAttack={attempted:false,prepareCalled:false,registrationAccepted:false};const __deferredRegistrationObserver=new MutationObserver(records=>{for(const record of records){for(const node of record.addedNodes){if(!(node instanceof HTMLScriptElement)||!node.src.includes("tsjs-diagnostics_presentation.min.js"))continue;__deferredRegistrationObserver.disconnect();window.__deferredRegistrationAttack.attempted=true;try{Object.defineProperty(document,"currentScript",{configurable:true,value:node});}catch{}const forged=Object.freeze({abi:1,id:"diagnostics_presentation",phase:"deferred",releaseId:${JSON.stringify(FIRST_DISPLAY_FIXTURE.releaseId)},prepare:()=>{window.__deferredRegistrationAttack.prepareCalled=true;return Object.freeze({activate:()=>undefined});}});window.__deferredRegistrationAttack.registrationAccepted=window.tsjs._registerIntegration(forged);}}});__deferredRegistrationObserver.observe(document,{childList:true,subtree:true});`;
     page.on("request", (request) => allRequests.push(request.url()));
     page.on("pageerror", (error) => pageErrors.push(error.message));
     page.on("console", (message) =>
@@ -226,11 +236,23 @@ test.describe("TSJS hard-cutover runtime", () => {
         body: FIRST_DISPLAY_FIXTURE.runtimeBody,
       }),
     );
+    for (const resource of FIRST_DISPLAY_FIXTURE.deferred) {
+      await page.route(
+        new URL(resource.src, "https://runtime.test").toString(),
+        (route) =>
+          route.fulfill({
+            status: 200,
+            contentType: "application/javascript; charset=utf-8",
+            headers: { "x-content-type-options": "nosniff" },
+            body: resource.body,
+          }),
+      );
+    }
     await page.route("https://runtime.test/first-display-owner", (route) =>
       route.fulfill({
         status: 200,
         contentType: "text/html; charset=utf-8",
-        body: `<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><script>window.tsjs={que:[]};window.__gptDiagnosticsStub.emitRequestStartOnDisplay();const __TSJS_SERVER_BOOT_TRANSPORT_V1__=${serverBootTransportLiteralV1(FIRST_DISPLAY_FIXTURE.boot, FIRST_DISPLAY_FIXTURE.outline)};${FIRST_DISPLAY_FIXTURE.bootstrapBody}</script></head><body><div id="${FIRST_DISPLAY_SLOT}"></div><script src="${FIRST_DISPLAY_FIXTURE.firstDisplaySrc}" id="trustedserver-js"></script><script>window.__firstDisplayParserObservation={async:document.querySelector("script#trustedserver-js").async,defer:document.querySelector("script#trustedserver-js").defer,firstAction:performance.getEntriesByName("tsjs:first-display","mark").length};window.__gptDiagnosticsStub.emit("slotRenderEnded",${JSON.stringify(FIRST_DISPLAY_SLOT)},{isEmpty:true,responseIdentifier:"fictional-empty-gam"});</script></body></html>`,
+        body: `<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><script>window.tsjs={que:[]};window.__takeoverAttack={claimExposed:false,currentScriptShadowed:false,namespaceReplacementBlocked:false,replacementBlocked:false};const __takeoverObserver=new MutationObserver(records=>{for(const record of records){for(const node of record.addedNodes){if(!(node instanceof HTMLScriptElement)||node.id!=="trustedserver-js-runtime")continue;__takeoverObserver.disconnect();const original=node._claimRuntimeV1;if(typeof original!=="function")continue;try{Object.defineProperty(node,"_claimRuntimeV1",{configurable:true,value:()=>undefined});}catch{window.__takeoverAttack.replacementBlocked=true;}try{Object.defineProperty(document,"currentScript",{configurable:true,value:node});window.__takeoverAttack.currentScriptShadowed=document.currentScript===node;}catch{}window.__takeoverAttack.claimExposed||=original(node)!==undefined;try{const retainedTarget=window.tsjs;Object.defineProperty(window,"tsjs",{configurable:true,get(){window.__takeoverAttack.claimExposed||=original(node)!==undefined;return retainedTarget;}});}catch{window.__takeoverAttack.namespaceReplacementBlocked=true;}}}});__takeoverObserver.observe(document,{childList:true,subtree:true});${deferredRegistrationAttack}window.__gptDiagnosticsStub.emitRequestStartOnDisplay();const __TSJS_SERVER_BOOT_TRANSPORT_V1__=${serverBootTransportLiteralV1(FIRST_DISPLAY_FIXTURE.boot, FIRST_DISPLAY_FIXTURE.outline)};${FIRST_DISPLAY_FIXTURE.bootstrapBody}</script></head><body><div id="${FIRST_DISPLAY_SLOT}"></div><script src="${FIRST_DISPLAY_FIXTURE.firstDisplaySrc}" id="trustedserver-js"></script><script>window.__firstDisplayParserObservation={async:document.querySelector("script#trustedserver-js").async,defer:document.querySelector("script#trustedserver-js").defer,firstAction:performance.getEntriesByName("tsjs:first-display","mark").length};window.__gptDiagnosticsStub.emit("slotRenderEnded",${JSON.stringify(FIRST_DISPLAY_SLOT)},{isEmpty:true,responseIdentifier:"fictional-empty-gam"});</script></body></html>`,
       }),
     );
 
@@ -295,6 +317,25 @@ test.describe("TSJS hard-cutover runtime", () => {
         }>;
       };
       return {
+        deferredRegistrationAttack: (
+          browserWindow as unknown as {
+            __deferredRegistrationAttack: Readonly<{
+              attempted: boolean;
+              prepareCalled: boolean;
+              registrationAccepted: boolean;
+            }>;
+          }
+        ).__deferredRegistrationAttack,
+        takeoverAttack: (
+          browserWindow as unknown as {
+            __takeoverAttack: Readonly<{
+              claimExposed: boolean;
+              currentScriptShadowed: boolean;
+              namespaceReplacementBlocked: boolean;
+              replacementBlocked: boolean;
+            }>;
+          }
+        ).__takeoverAttack,
         parser: browserWindow.__firstDisplayParserObservation,
         loaderCallsBeforePaint: browserWindow
           .__firstDisplayResourceProbe()
@@ -310,6 +351,25 @@ test.describe("TSJS hard-cutover runtime", () => {
         creativeFrames: document.querySelectorAll(
           `#${slotId} > iframe[title="Ad content"]`,
         ).length,
+        tracePanels: document.querySelectorAll("#ts-render-trace-panel").length,
+        diagnosticRequests: (
+          window as unknown as {
+            tsjs: {
+              diagnostics: {
+                gpt: {
+                  snapshot(): {
+                    slots: Array<{
+                      slotElementId?: string;
+                      requests: Array<Record<string, unknown>>;
+                    }>;
+                  };
+                };
+              };
+            };
+          }
+        ).tsjs.diagnostics.gpt
+          .snapshot()
+          .slots.find((slot) => slot.slotElementId === slotId)?.requests,
       };
     }, FIRST_DISPLAY_SLOT);
 
@@ -318,6 +378,7 @@ test.describe("TSJS hard-cutover runtime", () => {
       "https://runtime.test/first-display-owner",
       firstDisplayUrl,
       runtimeUrl,
+      ...deferredUrls,
     ]);
     expect(
       allRequests.filter((url) => /tsjs-render_owner_initial/u.test(url)),
@@ -327,10 +388,33 @@ test.describe("TSJS hard-cutover runtime", () => {
       defer: false,
       firstAction: 1,
     });
+    expect(observation.takeoverAttack).toEqual({
+      claimExposed: false,
+      currentScriptShadowed: true,
+      namespaceReplacementBlocked: true,
+      replacementBlocked: true,
+    });
+    expect(observation.deferredRegistrationAttack).toEqual({
+      attempted: true,
+      prepareCalled: false,
+      registrationAccepted: false,
+    });
     expect(observation.loaderCallsBeforePaint).toEqual([]);
-    expect(observation.loaderCallsAfterPaint).toEqual(["create:script"]);
+    expect(observation.loaderCallsAfterPaint).toEqual([
+      "create:script",
+      "create:script",
+    ]);
     expect(observation.firstDisplayScripts).toBe(1);
     expect(observation.creativeFrames).toBe(1);
+    expect(observation.tracePanels).toBe(1);
+    expect(observation.diagnosticRequests).toEqual([
+      expect.objectContaining({
+        isEmpty: true,
+        requestedSlotSizes: [[300, 250]],
+        trustedServerAuctionId: "browser-first-display-owner",
+        trustedServerOpportunity: "renderable_candidate",
+      }),
+    ]);
   });
 
   test("generated bootstrap transfers one direct-runtime watchdog to the persistent owner", async ({

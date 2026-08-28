@@ -77,7 +77,7 @@ import {
   createPrebidSelectionCoordinator,
   publishPrebidBid,
   type PrebidSelectionCoordinator,
-} from '../integrations/prebid/module';
+} from '../integrations/render_runtime/prebid_selection';
 import {
   createPrebidRefreshPolicy,
   createPrebidSyntheticRefreshRunner,

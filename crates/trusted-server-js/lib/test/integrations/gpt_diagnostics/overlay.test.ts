@@ -62,6 +62,19 @@ function runNextFrame(frames: Array<() => void>): void {
   frame();
 }
 
+function requireAttempt(attemptId: number | undefined): number {
+  if (attemptId === undefined) throw new Error('Missing Trusted Server creative attempt');
+  return attemptId;
+}
+
+function slotArticle(root: ShadowRoot, slotElementId: string): HTMLElement {
+  const article = Array.from(root.querySelectorAll<HTMLElement>('.tsgd-slot')).find((candidate) =>
+    candidate.textContent?.includes(slotElementId)
+  );
+  if (!article) throw new Error(`Missing ${slotElementId} diagnostics article`);
+  return article;
+}
+
 function queueFrame(frames: Array<() => void>): (callback: () => void) => () => void {
   return (callback) => {
     frames.push(callback);
@@ -232,7 +245,7 @@ describe('GptDiagnosticsOverlay', () => {
 
     let root: ShadowRoot | undefined;
     const overlay = new GptDiagnosticsOverlay(store, bindings, {
-      scheduleFrame: (callback) => frames.push(callback),
+      scheduleFrame: queueFrame(frames),
       onShadowRoot: (createdRoot) => {
         root = createdRoot;
       },
@@ -372,7 +385,7 @@ describe('GptDiagnosticsOverlay', () => {
 
     let root: ShadowRoot | undefined;
     const overlay = new GptDiagnosticsOverlay(store, new FakeBindings(), {
-      scheduleFrame: (callback) => frames.push(callback),
+      scheduleFrame: queueFrame(frames),
       onShadowRoot: (createdRoot) => {
         root = createdRoot;
       },

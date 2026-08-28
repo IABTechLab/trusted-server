@@ -23,6 +23,9 @@ const metricsFile = 'tsjs-build-metrics-v1.json';
 const releaseFile = 'tsjs-release-v1.json';
 const catalogFile = 'tsjs-catalog-v1.json';
 const bootstrapFile = 'tsjs-bootstrap.js';
+const runtimeClaimBanner =
+  '(()=>{const __TSJS_RUNTIME_CLAIMED_V1__=(()=>{try{const source=window.tsjs,claim=source&&source._claimRuntimeV1;return typeof claim==="function"?claim(source):undefined}catch{return undefined}})();';
+const runtimeClaimFooter = '})();';
 
 // Closure-private implementation names used only inside the inline artifact.
 // Registration, takeover, handoff, and public API protocol keys are excluded.
@@ -51,7 +54,7 @@ const firstDisplayApsPrivateProperties =
 // These names are private to the GPT initial IIFE and never cross its protocol
 // receipt or handoff boundary. Keep the cross-artifact protocol keys authored.
 const firstDisplayGptPrivateProperties =
-  /^(?:options|clearTimer|setTimer|projection|diagnosticsActive|onNativeMutation|binding|command|cycleMap|createdSlots|diagnosticFacts|diagnosticListeners|targetingObservers|targetingRestorers|publisherCallRestorers|timers|service|started|disposed|ingressClosed|firstAction|commandQueue|commandQueueIndex|createdBinding|renderListener|requestedListener|committedSlotsDetached|detachedSlots|diagnosticFactOverflow|diagnosticFactDrops|targetingWriteDepth|ensureBinding|restoreCreatedBinding|activate|installListeners|removeListener|removePendingCommand|failCycle|failRows|journalPublisherTargeting|observePublisherTargeting|observePublisherCalls|restorePublisherCalls|restoreTargetingObservers|restorePublisherTargeting|notifyNativeMutation|captureDiagnosticFact|clearOwnedTimer|incrementDiagnosticDrops|writeTargeting|invalidateTargeting|sealedTargetingOwnership|targetingWrites|ingressClosing|diagnosticRecords|nextDiagnosticCycleOrdinal|publicCycle|requestTimer|completionTimer|requestOperation|requestInvoked|bindingState|operations|requested|settled|elementId|runtimeSlotNumber|current|valid|consumed|operation|protocol|restore|handle|fired|deadlines|externalReadyMs|requestStartMs|completionMs|requestPlan|classifyRenderEnded|encodedBytes|readPhysicalElementId|retireCycle|snapshotDestroyedCycles|invalidateCyclesForElement|invalidateCyclesForPublisherCall|consumeTargetingWrite|invalidateStaleTargetingObservers|captureRetainedTargeting|targetingOwnership|cycles|facts|nextTraceTokenOrdinal|overflowCount|dropCount|nextCycleOrdinal|quarantines|records|responseIdentifier|seen|state|unknownPriorCycle|ordinal|timer|start|closeIngress|captureHandoff|captureDiagnosticsHandoff|detachCommittedSlots|dispose)$/;
+  /^(?:options|clearTimer|setTimer|projection|diagnosticsActive|onNativeMutation|binding|command|cycleMap|createdSlots|diagnosticFacts|diagnosticListeners|targetingObservers|targetingRestorers|publisherCallRestorers|timers|service|started|disposed|ingressClosed|firstAction|commandQueue|commandQueueIndex|createdBinding|renderListener|requestedListener|committedSlotsDetached|detachedSlots|diagnosticFactOverflow|diagnosticFactDrops|targetingWriteDepth|ensureBinding|restoreCreatedBinding|activate|installListeners|removeListener|removePendingCommand|failCycle|failRows|journalPublisherTargeting|observePublisherTargeting|observePublisherCalls|restorePublisherCalls|restoreTargetingObservers|restorePublisherTargeting|notifyNativeMutation|captureDiagnosticFact|clearOwnedTimer|incrementDiagnosticDrops|writeTargeting|invalidateTargeting|sealedTargetingOwnership|targetingWrites|ingressClosing|diagnosticRecords|nextDiagnosticCycleOrdinal|publicCycle|requestTimer|completionTimer|requestOperation|requestInvoked|bindingState|operations|requested|settled|current|valid|consumed|operation|protocol|restore|handle|fired|deadlines|externalReadyMs|requestStartMs|completionMs|requestPlan|classifyRenderEnded|encodedBytes|readPhysicalElementId|retireCycle|snapshotDestroyedCycles|invalidateCyclesForElement|invalidateCyclesForPublisherCall|consumeTargetingWrite|invalidateStaleTargetingObservers|captureRetainedTargeting|targetingOwnership|cycles|facts|nextTraceTokenOrdinal|overflowCount|dropCount|nextCycleOrdinal|quarantines|records|responseIdentifier|seen|state|unknownPriorCycle|ordinal|timer|start|closeIngress|captureHandoff|captureDiagnosticsHandoff|detachCommittedSlots|dispose)$/;
 
 fs.rmSync(distributionDirectory, { recursive: true, force: true });
 fs.mkdirSync(distributionDirectory, { recursive: true });
@@ -248,6 +251,9 @@ async function buildArtifact(artifact) {
           entryFileNames: artifact.file,
           extend: false,
           name: `tsjs_${artifact.id}`,
+          ...(artifact.id === 'core'
+            ? { banner: runtimeClaimBanner, footer: runtimeClaimFooter }
+            : {}),
         },
       },
     },

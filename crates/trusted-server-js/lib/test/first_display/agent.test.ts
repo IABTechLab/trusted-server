@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 
 import {
   createFirstDisplayAgent,
+  prepareFirstDisplayBase,
   type FirstDisplayAgentOptions,
+  type FirstDisplayAgentRegistrationHostV1,
   type FirstDisplayBatchOutcomeV1,
   type FirstDisplayDriver,
   type FirstDisplayTerminalResult,
@@ -343,6 +345,38 @@ function production(
 }
 
 describe('bounded first-display agent', () => {
+  it.each(['gpt', 'render_owner'] as const)(
+    'accepts the exact two-field %s installer receipt after registering its full protocol',
+    (protocolId) => {
+      const sliceId = `${protocolId}_initial` as const;
+      const releases: Array<() => void> = [];
+      const prepared = prepareFirstDisplayBase({
+        options: {
+          handoff: { slices: [sliceId] },
+        },
+        sliceBindings: (
+          _id: string,
+          _observe: (key: unknown, value: unknown) => void,
+          register: ((protocol: unknown) => () => void) | undefined
+        ) => Object.freeze([Object.freeze({ register }), undefined]),
+      } as unknown as FirstDisplayAgentRegistrationHostV1);
+
+      expect(() =>
+        prepared.sliceHost.activate(
+          sliceId,
+          (release) => releases.push(release),
+          (bindings) => {
+            const register = (bindings as Readonly<{ register: (protocol: unknown) => () => void }>)
+              .register;
+            releases.push(register(Object.freeze([1, protocolId, Object.freeze({})] as const)));
+            return Object.freeze([1, protocolId] as const);
+          }
+        )
+      ).not.toThrow();
+      expect(releases).toHaveLength(1);
+    }
+  );
+
   it('derives the protected action from the immutable projection and rejects outcome summaries', () => {
     const accepted = harness();
     const received: FirstDisplayBatchOutcomeV1[][] = [];
@@ -662,6 +696,62 @@ describe('bounded first-display agent', () => {
     revision.frames.shift()?.();
     expect(revisionAgent.observeNativeMutation()).toBe(false);
     expect(revision.failures).toEqual(['bundle_partial']);
+  });
+
+  it('runs every independent driver disposer when an earlier disposer throws', () => {
+    const h = harness();
+    const cleanup: string[] = [];
+    const gpt: FirstDisplayGptProtocolV1 = Object.freeze([
+      1,
+      'gpt',
+      () =>
+        Object.freeze([
+          (callbacks: FirstDisplayGoogletagBatchCallbacks) => callbacks[2](),
+          () => true,
+          () => undefined,
+          () => undefined,
+          () => true,
+          () => {
+            cleanup.push('gpt');
+            throw new Error('fictional GPT cleanup failure');
+          },
+        ] as const),
+    ]);
+    const renderer: FirstDisplayRenderBridgeCapabilityV1 = Object.freeze([
+      () => true,
+      () => true,
+      () => true,
+      () => true,
+      () => 0,
+      () => undefined,
+      () => true,
+      () => undefined,
+      () => true,
+      () => cleanup.push('renderer'),
+    ]);
+    const agent = createFirstDisplayAgent({
+      batch: batch(['gpt_adm']),
+      ...h.owner,
+      production: Object.freeze({
+        gpt,
+        gptInput: Object.freeze([
+          window,
+          (handle: unknown) => window.clearTimeout(handle as number),
+          document,
+          (callback: () => void, delayMs: number) => window.setTimeout(callback, delayMs),
+        ] as const),
+        renderer,
+      }),
+      performance: h.performance,
+      paint: h.paint,
+      onProtectedPaint: () => undefined,
+      onFailure: (reason) => h.failures.push(reason),
+    });
+
+    expect(agent.start()).toBe(true);
+    expect(() => agent.dispose()).not.toThrow();
+    expect(cleanup).toEqual(['gpt', 'renderer']);
+    expect(agent.state).toBe('disposed');
   });
 
   it('mints the final immutable handoff only after paint and closes ingress before capture', () => {

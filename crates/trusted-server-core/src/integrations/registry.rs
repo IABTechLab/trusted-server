@@ -1,4 +1,4 @@
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -546,7 +546,26 @@ pub struct IntegrationHtmlContext<'a> {
     pub request_host: &'a str,
     pub request_scheme: &'a str,
     pub origin_host: &'a str,
+    /// Response-authenticated CSP nonce for server-generated executable tags.
+    pub csp_nonce: Option<&'a str>,
     pub document_state: &'a IntegrationDocumentState,
+}
+
+/// Build a safe nonce attribute for a server-generated executable tag.
+pub(crate) fn html_script_nonce_attribute(csp_nonce: Option<&str>) -> Option<String> {
+    match csp_nonce {
+        Some(nonce)
+            if !nonce.is_empty()
+                && nonce.len() <= 256
+                && nonce.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'_' | b'-' | b'=')
+                }) =>
+        {
+            Some(format!(r#" nonce="{nonce}""#))
+        }
+        Some(_) => None,
+        None => Some(String::new()),
+    }
 }
 
 /// Trait for integration-provided HTML post-processors.
@@ -1061,6 +1080,7 @@ pub struct ProxyDispatchInput<'a> {
 pub struct IntegrationRegistry {
     inner: Arc<IntegrationRegistryInner>,
     creative_boot: crate::tsjs::CreativeBootConfigV1,
+    plan: Option<Arc<AuctionPlan>>,
 }
 
 impl Default for IntegrationRegistry {
@@ -1071,6 +1091,7 @@ impl Default for IntegrationRegistry {
         Self {
             inner: Arc::new(inner),
             creative_boot,
+            plan: None,
         }
     }
 }
@@ -1101,50 +1122,58 @@ impl IntegrationRegistry {
         plan: Arc<AuctionPlan>,
     ) -> Result<Self, Report<TrustedServerError>> {
         let mut inner = IntegrationRegistryInner::default();
+        let mut registrations = Vec::new();
         let mut integration_configs_v1 = Vec::new();
         let creative_boot = crate::tsjs::creative_boot_config_v1(settings)?;
         let aps_proxy: Arc<dyn IntegrationProxy> =
-            Arc::new(super::aps::ApsV1Integration::from_settings(settings)?);
+            Arc::new(super::aps::ApsV1Integration::from_plan(&plan));
         inner
             .reserved_proxies
             .push(("/integrations/aps", aps_proxy));
 
+        if let Some(registration) = crate::integrations::prebid::register_for_plan(settings, &plan)?
+        {
+            registrations.push(registration);
+        }
+        if let Some(registration) = crate::integrations::aps::register_for_plan(settings, &plan)? {
+            registrations.push(registration);
+        }
         for builder in crate::integrations::builders() {
             if let Some(registration) = (builder.build)(settings)? {
                 debug_assert_eq!(
                     registration.integration_id, builder.id,
                     "integration builder ID should match registration ID"
                 );
-                inner
-                    .enabled_integration_ids
-                    .push(registration.integration_id);
-                match (
-                    crate::tsjs::is_integration_config_product_v1(registration.integration_id),
-                    registration.browser_config_v1.clone(),
-                ) {
-                    (true, Some(config)) => {
-                        integration_configs_v1.push((registration.integration_id, config));
-                    }
-                    (true, None) => {
-                        return Err(Report::new(TrustedServerError::Configuration {
-                            message: format!(
-                                "Integration {} is missing its browser config projection",
-                                registration.integration_id
-                            ),
-                        }));
-                    }
-                    (false, Some(_)) => {
-                        return Err(Report::new(TrustedServerError::Configuration {
-                            message: format!(
-                                "Integration {} cannot emit a generic browser config",
-                                registration.integration_id
-                            ),
-                        }));
-                    }
-                    (false, None) => {}
-                }
+                registrations.push(registration);
+            }
+        }
 
         for registration in registrations {
+            match (
+                crate::tsjs::is_integration_config_product_v1(registration.integration_id),
+                registration.browser_config_v1.clone(),
+            ) {
+                (true, Some(config)) => {
+                    integration_configs_v1.push((registration.integration_id, config));
+                }
+                (true, None) => {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "Integration {} is missing its browser config projection",
+                            registration.integration_id
+                        ),
+                    }));
+                }
+                (false, Some(_)) => {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "Integration {} cannot emit a generic browser config",
+                            registration.integration_id
+                        ),
+                    }));
+                }
+                (false, None) => {}
+            }
             inner
                 .enabled_integration_ids
                 .push(registration.integration_id);
@@ -1223,7 +1252,16 @@ impl IntegrationRegistry {
         Ok(Self {
             inner: Arc::new(inner),
             creative_boot,
+            plan: Some(plan),
         })
+    }
+
+    /// Return whether this registry and another consumer share the same plan allocation.
+    #[must_use]
+    pub fn shares_plan(&self, plan: &Arc<AuctionPlan>) -> bool {
+        self.plan
+            .as_ref()
+            .is_some_and(|owned| Arc::ptr_eq(owned, plan))
     }
 
     fn reserved_proxy(&self, path: &str) -> Option<&Arc<dyn IntegrationProxy>> {
@@ -1687,6 +1725,7 @@ impl IntegrationRegistry {
         Self {
             inner: Arc::new(inner),
             creative_boot,
+            plan: None,
         }
     }
 
@@ -1722,6 +1761,7 @@ impl IntegrationRegistry {
         Self {
             inner: Arc::new(inner),
             creative_boot,
+            plan: None,
         }
     }
 
@@ -1758,6 +1798,7 @@ impl IntegrationRegistry {
         Self {
             inner: Arc::new(inner),
             creative_boot,
+            plan: None,
         }
     }
 
@@ -1790,6 +1831,7 @@ impl IntegrationRegistry {
         Self {
             inner: Arc::new(inner),
             creative_boot,
+            plan: None,
         }
     }
 
@@ -1862,6 +1904,7 @@ impl IntegrationRegistry {
         Self {
             inner: Arc::new(inner),
             creative_boot,
+            plan: None,
         }
     }
 }
@@ -1996,6 +2039,7 @@ mod tests {
             request_host: "proxy.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",
+            csp_nonce: None,
             document_state: &document_state,
         };
 
@@ -2055,22 +2099,111 @@ mod tests {
         assert!(registry.has_reserved_path("/integrations/aps/malformed/path"));
         assert!(!registry.has_reserved_path("/integrations/apsx/runner.js"));
         assert!(!registry.has_reserved_path("/integrations/aps-legacy"));
+        assert!(
+            !registry
+                .registered_integrations()
+                .iter()
+                .any(|integration| integration.id == "aps"),
+            "a plan without an APS profile must not register APS"
+        );
 
-        let request = Request::builder()
+        for path in [
+            "/integrations/aps/renderer/v2",
+            "/integrations/aps/runner.js",
+        ] {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .header(HEADER_X_TS_EC.clone(), "caller-controlled")
+                .body(EdgeBody::empty())
+                .expect("should build reserved APS request");
+            let response = futures::executor::block_on(registry.handle_reserved_proxy(
+                &settings,
+                &noop_services(),
+                request,
+            ))
+            .expect("reserved family should be handled")
+            .expect("disabled APS response should be local");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        }
+    }
+
+    #[test]
+    fn aps_profile_alone_registers_and_activates_reserved_routes() {
+        let settings = create_test_settings();
+        assert!(
+            settings
+                .integration_config::<crate::integrations::aps::ApsConfig>("aps")
+                .expect("APS browser config lookup should succeed")
+                .is_none(),
+            "the activation proof must not depend on integrations.aps"
+        );
+        let plan = crate::auction::AuctionPlan::compile(crate::auction::plan::AuctionPlanConfig {
+            timeout_ms: 1_000,
+            providers: BTreeMap::from([(
+                "aps-profile-only"
+                    .parse()
+                    .expect("should parse APS provider ID"),
+                crate::auction::plan::ProviderConfig {
+                    protocol: "openrtb-2.6".to_string(),
+                    profile: "aps".to_string(),
+                    endpoint: "https://aps.example/bid".to_string(),
+                    timeout_ms: None,
+                    routing: crate::auction::plan::RoutingMode::AllEligible,
+                    notifications: crate::auction::plan::NotificationConfig::default(),
+                    profile_config: serde_json::json!({
+                        "account_id": "example-account"
+                    }),
+                },
+            )]),
+            ..crate::auction::plan::AuctionPlanConfig::default()
+        })
+        .expect("APS-only plan should compile");
+        let registry = IntegrationRegistry::with_plan(&settings, Arc::new(plan))
+            .expect("APS-only registry should build");
+
+        assert!(
+            registry
+                .registered_integrations()
+                .iter()
+                .any(|integration| integration.id == "aps"),
+            "planned APS registration must be retained"
+        );
+
+        let renderer_request = Request::builder()
             .method(Method::GET)
             .uri("/integrations/aps/renderer/v2")
-            .header(HEADER_X_TS_EC.clone(), "caller-controlled")
             .body(EdgeBody::empty())
-            .expect("should build reserved APS request");
-        let response = futures::executor::block_on(registry.handle_reserved_proxy(
+            .expect("should build APS renderer request");
+        let renderer_response = futures::executor::block_on(registry.handle_reserved_proxy(
             &settings,
             &noop_services(),
-            request,
+            renderer_request,
         ))
-        .expect("reserved family should be handled")
-        .expect("disabled APS response should be local");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        .expect("reserved renderer should be handled")
+        .expect("profile-only APS renderer should respond locally");
+        assert_eq!(renderer_response.status(), StatusCode::OK);
+        assert_eq!(
+            renderer_response.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+
+        let runner_request = Request::builder()
+            .method(Method::POST)
+            .uri("/integrations/aps/runner.js")
+            .body(EdgeBody::empty())
+            .expect("should build APS runner request");
+        let runner_response = futures::executor::block_on(registry.handle_reserved_proxy(
+            &settings,
+            &noop_services(),
+            runner_request,
+        ))
+        .expect("reserved runner should be handled")
+        .expect("enabled APS runner should reject invalid methods locally");
+        assert_eq!(runner_response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(runner_response.headers()[header::ALLOW], "GET");
+        assert_eq!(runner_response.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     #[test]
@@ -2717,14 +2850,27 @@ mod tests {
             .integrations
             .insert_config("gpt", &serde_json::json!({}))
             .expect("should enable GPT");
-        settings
-            .integrations
-            .insert_config(
-                "aps",
-                &serde_json::json!({ "enabled": true, "account_id": "test-account" }),
-            )
-            .expect("should enable APS");
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let plan = crate::auction::AuctionPlan::compile(crate::auction::plan::AuctionPlanConfig {
+            timeout_ms: 1_000,
+            providers: BTreeMap::from([(
+                "aps-mask".parse().expect("should parse APS provider ID"),
+                crate::auction::plan::ProviderConfig {
+                    protocol: "openrtb-2.6".to_string(),
+                    profile: "aps".to_string(),
+                    endpoint: "https://aps.example/bid".to_string(),
+                    timeout_ms: None,
+                    routing: crate::auction::plan::RoutingMode::AllEligible,
+                    notifications: crate::auction::plan::NotificationConfig::default(),
+                    profile_config: serde_json::json!({
+                        "account_id": "test-account"
+                    }),
+                },
+            )]),
+            ..crate::auction::plan::AuctionPlanConfig::default()
+        })
+        .expect("should compile APS mask plan");
+        let registry = IntegrationRegistry::with_plan(&settings, Arc::new(plan))
+            .expect("should create registry");
         let masks = registry.tsjs_first_display_masks();
 
         let catalog = trusted_server_js::all_first_display_ids();
@@ -2749,6 +2895,7 @@ mod tests {
                 fixed | owner | aps | gpt,
                 fixed | gpt | prebid,
                 fixed | owner | gpt | prebid,
+                fixed | owner | aps | gpt | prebid,
             ],
             "registry should enumerate every configuration-reachable mask admitted by the fixed transfer ceiling"
         );
@@ -2992,9 +3139,7 @@ mod tests {
             (
                 "aps",
                 serde_json::json!({
-                    "enabled": true,
-                    "account_id": "private-aps-account",
-                    "endpoint": "https://private-aps.example/bid"
+                    "enabled": true
                 }),
             ),
             (
@@ -3039,10 +3184,8 @@ mod tests {
                 "prebid",
                 serde_json::json!({
                     "enabled": true,
-                    "server_url": "https://private-pbs.example/openrtb2/auction",
                     "account_id": "browser-account",
-                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
-                    "bidders": ["mocktioneer"]
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
                 }),
             ),
             (
@@ -3066,7 +3209,27 @@ mod tests {
                 .expect("test integration config should insert");
         }
 
-        let registry = IntegrationRegistry::new(&settings).expect("registry should build");
+        let plan = crate::auction::AuctionPlan::compile(crate::auction::plan::AuctionPlanConfig {
+            timeout_ms: 1_000,
+            providers: BTreeMap::from([(
+                "aps-private".parse().expect("should parse APS provider ID"),
+                crate::auction::plan::ProviderConfig {
+                    protocol: "openrtb-2.6".to_string(),
+                    profile: "aps".to_string(),
+                    endpoint: "https://private-aps.example/bid".to_string(),
+                    timeout_ms: None,
+                    routing: crate::auction::plan::RoutingMode::AllEligible,
+                    notifications: crate::auction::plan::NotificationConfig::default(),
+                    profile_config: serde_json::json!({
+                        "account_id": "private-aps-account"
+                    }),
+                },
+            )]),
+            ..crate::auction::plan::AuctionPlanConfig::default()
+        })
+        .expect("should compile browser projection plan");
+        let registry = IntegrationRegistry::with_plan(&settings, Arc::new(plan))
+            .expect("registry should build");
         let module_ids = registry.tsjs_catalog_module_ids(TsjsCatalogSelectionV1::default());
         let carrier = registry
             .tsjs_integration_configs_v1(&module_ids)
@@ -3090,7 +3253,6 @@ mod tests {
             "private-lockr-app",
             "private-org",
             "private-workspace",
-            "private-pbs.example",
             "private_sourcepoint_cookie",
             "private-testlight.example",
         ] {

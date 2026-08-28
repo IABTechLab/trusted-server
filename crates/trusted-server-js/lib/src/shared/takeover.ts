@@ -30,6 +30,7 @@ export interface FirstDisplayGptFactV1 {
   readonly capturedAtMs: number;
   readonly elementId: string | null;
   readonly adUnitPath: string | null;
+  readonly requestedSlotSizes: readonly (readonly [number, number])[] | null;
   readonly isEmpty: boolean | null;
   readonly renderedSize: readonly [number, number] | null;
   readonly isBackfill: boolean | null;
@@ -281,9 +282,12 @@ export type ClaimedFirstDisplayTakeoverV1 = readonly [
   disposeAgent: () => void,
   onFailure: (reason: BootFailureReason) => void,
   onCommit: () => void,
+  trustedScriptUrl: (value: string) => unknown,
+  currentScript: () => HTMLScriptElement | null,
 ];
 
 export type FirstDisplayTakeoverClaim = (
+  source: unknown,
   finalize: FirstDisplayAgentCaptureFinalizerV1
 ) => ClaimedFirstDisplayTakeoverV1 | undefined;
 
@@ -303,28 +307,31 @@ export function installFirstDisplayTakeoverTransport(
   ) {
     return undefined;
   }
+  let live = true;
+  const installed: FirstDisplayTakeoverClaim = (source, finalize) => {
+    if (!live) return undefined;
+    try {
+      const result = claim(source, finalize);
+      if (result !== undefined) live = false;
+      return result;
+    } catch (error) {
+      live = false;
+      throw error;
+    }
+  };
   try {
     Object.defineProperty(target, FIRST_DISPLAY_TAKEOVER_FIELD, {
-      configurable: true,
+      configurable: false,
       enumerable: false,
-      value: claim,
+      value: installed,
       writable: false,
     });
   } catch {
     return undefined;
   }
-  let live = true;
   return (): void => {
     if (!live) return;
     live = false;
-    try {
-      const descriptor = Object.getOwnPropertyDescriptor(target, FIRST_DISPLAY_TAKEOVER_FIELD);
-      if (descriptor && 'value' in descriptor && descriptor.value === claim) {
-        Reflect.deleteProperty(target, FIRST_DISPLAY_TAKEOVER_FIELD);
-      }
-    } catch {
-      // Generation invalidation makes a hostile replacement inert.
-    }
   };
 }
 
@@ -336,15 +343,12 @@ export function consumeFirstDisplayTakeoverTransport(
     const descriptor = Object.getOwnPropertyDescriptor(target, FIRST_DISPLAY_TAKEOVER_FIELD);
     if (!descriptor) return Object.freeze({ status: 'absent' });
     if (
-      !descriptor.configurable ||
+      descriptor.configurable ||
       descriptor.enumerable ||
       descriptor.writable ||
       !('value' in descriptor) ||
       typeof descriptor.value !== 'function'
     ) {
-      return Object.freeze({ status: 'invalid' });
-    }
-    if (!Reflect.deleteProperty(target, FIRST_DISPLAY_TAKEOVER_FIELD)) {
       return Object.freeze({ status: 'invalid' });
     }
     return Object.freeze({

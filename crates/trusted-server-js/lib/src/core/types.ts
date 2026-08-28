@@ -134,14 +134,14 @@ export interface GptDiagnosticsDurations {
  * Manager delivered; they claim nothing about which demand source supplied it.
  */
 export interface GptDiagnosticsAdManagerIdentity {
-  lineItemId?: number;
-  creativeId?: number;
-  campaignId?: number;
-  advertiserId?: number;
-  sourceAgnosticLineItemId?: number;
-  sourceAgnosticCreativeId?: number;
-  yieldGroupIds?: number[];
-  companyIds?: number[];
+  lineItemId?: number | undefined;
+  creativeId?: number | undefined;
+  campaignId?: number | undefined;
+  advertiserId?: number | undefined;
+  sourceAgnosticLineItemId?: number | undefined;
+  sourceAgnosticCreativeId?: number | undefined;
+  yieldGroupIds?: number[] | undefined;
+  companyIds?: number[] | undefined;
 }
 
 /**
@@ -149,31 +149,19 @@ export interface GptDiagnosticsAdManagerIdentity {
  * facts GPT reported.
  */
 export type GptDiagnosticsResponseClass =
-  | 'empty'
-  | 'backfill'
-  | 'reservation'
-  | 'unclassified_non_empty';
+  'empty' | 'backfill' | 'reservation' | 'unclassified_non_empty';
 
 /** The request path observed for a GPT request cycle. */
 export type GptDiagnosticsRequestPath =
-  | 'trusted_server_direct'
-  | 'prebid_refresh'
-  | 'publisher_refresh'
-  | 'competing'
-  | 'unattributed';
+  'trusted_server_direct' | 'prebid_refresh' | 'publisher_refresh' | 'competing' | 'unattributed';
 
 /** The Trusted Server creative opportunity observed for a request. */
 export type GptDiagnosticsTrustedServerOpportunity =
-  | 'renderable_candidate'
-  | 'unrenderable_candidate'
-  | 'no_candidate';
+  'renderable_candidate' | 'unrenderable_candidate' | 'no_candidate';
 
 /** A safe failure category observed while obtaining or posting creative markup. */
 export type GptDiagnosticsCreativeFailure =
-  | 'missing_render_source'
-  | 'cache_fetch_failed'
-  | 'invalid_cache_payload'
-  | 'response_post_failed';
+  'missing_render_source' | 'cache_fetch_failed' | 'invalid_cache_payload' | 'response_post_failed';
 
 /** Delivery evidence derived for a GPT request cycle. */
 export type GptDiagnosticsDelivery =
@@ -206,23 +194,23 @@ export interface GptDiagnosticsRequestCycle {
   isBackfill?: boolean | undefined;
   slotContentChanged?: boolean | undefined;
   incompleteSequence: boolean;
-  adManager?: GptDiagnosticsAdManagerIdentity;
-  responseClass?: GptDiagnosticsResponseClass;
-  requestPath?: GptDiagnosticsRequestPath;
-  requestIntentId?: number;
-  trustedServerAuctionId?: string;
-  opportunityToRequestMs?: number;
-  replacedRequestNumber?: number;
-  previousRenderToRequestMs?: number;
-  creativeChanged?: boolean;
-  previousCreativeId?: GptDiagnosticsAdManagerIdentity['creativeId'];
-  loadObservedBeforeRender?: boolean;
-  trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity;
-  trustedServerCreativeRequestAtMs?: number;
-  trustedServerCreativeResponseAtMs?: number;
-  trustedServerCreativeFailures?: GptDiagnosticsCreativeFailure[];
+  adManager?: GptDiagnosticsAdManagerIdentity | undefined;
+  responseClass?: GptDiagnosticsResponseClass | undefined;
+  requestPath?: GptDiagnosticsRequestPath | undefined;
+  requestIntentId?: number | undefined;
+  trustedServerAuctionId?: string | undefined;
+  opportunityToRequestMs?: number | undefined;
+  replacedRequestNumber?: number | undefined;
+  previousRenderToRequestMs?: number | undefined;
+  creativeChanged?: boolean | undefined;
+  previousCreativeId?: GptDiagnosticsAdManagerIdentity['creativeId'] | undefined;
+  loadObservedBeforeRender?: boolean | undefined;
+  trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity | undefined;
+  trustedServerCreativeRequestAtMs?: number | undefined;
+  trustedServerCreativeResponseAtMs?: number | undefined;
+  trustedServerCreativeFailures?: GptDiagnosticsCreativeFailure[] | undefined;
   /** Derived on every snapshot; absent only on a cycle read before derivation. */
-  delivery?: GptDiagnosticsDelivery;
+  delivery?: GptDiagnosticsDelivery | undefined;
 }
 
 export interface GptDiagnosticsSlotExport {
@@ -285,7 +273,7 @@ export interface GptDiagnosticsExportV1 {
   >;
   readonly metadata: Readonly<{
     droppedCallbacks: number;
-    droppedAttributionIssues?: number;
+    droppedAttributionIssues: number;
     evictedSlots: number;
     evictedRequestCycles: number;
   }>;
@@ -312,7 +300,8 @@ export interface GptDiagnosticsRecorder {
     slot: GptDiagnosticsSlotHandle,
     auctionSlotId: string,
     opportunity: GptDiagnosticsTrustedServerOpportunity,
-    trustedServerAuctionId?: string
+    trustedServerAuctionId?: string,
+    requestedSlotSizes?: ReadonlyArray<Size>
   ): void;
   recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
   recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;

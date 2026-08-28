@@ -510,6 +510,52 @@ pub fn tsjs_bootstrap_fragment_v1(
     config: TsjsBootScriptConfigV1<'_>,
     publisher_origin: &str,
 ) -> Result<String, Report<TrustedServerError>> {
+    tsjs_bootstrap_fragment_with_nonce_v1(config, publisher_origin, None)
+}
+
+/// Serialize the production bootstrap transport with one response-authenticated CSP nonce.
+///
+/// # Errors
+///
+/// Returns an error when the nonce is not a bounded CSP `base64-value`, or when
+/// the ordinary production projection and catalog validation fails.
+pub(crate) fn tsjs_bootstrap_fragment_with_nonce_v1(
+    config: TsjsBootScriptConfigV1<'_>,
+    publisher_origin: &str,
+    csp_nonce: Option<&str>,
+) -> Result<String, Report<TrustedServerError>> {
+    tsjs_bootstrap_fragment_with_nonce_and_interstitial_v1(config, publisher_origin, csp_nonce, "")
+}
+
+/// Serialize the controller first, followed by live upstream markup and the selected runtime.
+///
+/// The caller owns `interstitial_html`; it contains only server-generated diagnostics and
+/// integration tags. Keeping that markup between the controller and selected artifact lets the
+/// controller capture its authenticated browser boundary before any live upstream script while
+/// preserving upstream-before-agent ordering.
+pub(crate) fn tsjs_bootstrap_fragment_with_nonce_and_interstitial_v1(
+    config: TsjsBootScriptConfigV1<'_>,
+    publisher_origin: &str,
+    csp_nonce: Option<&str>,
+    interstitial_html: &str,
+) -> Result<String, Report<TrustedServerError>> {
+    let nonce_attribute = match csp_nonce {
+        Some(nonce)
+            if !nonce.is_empty()
+                && nonce.len() <= 256
+                && nonce.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'_' | b'-' | b'=')
+                }) =>
+        {
+            format!(r#" nonce="{nonce}""#)
+        }
+        Some(_) => {
+            return Err(boot_manifest_error(
+                "CSP nonce is not a bounded base64-value",
+            ));
+        }
+        None => String::new(),
+    };
     let selected = selected_metadata(config.module_ids)?;
     config
         .integration_configs
@@ -707,13 +753,13 @@ pub fn tsjs_bootstrap_fragment_v1(
         ));
     }
     let controller = format!(
-        "<script>const __TSJS_SERVER_BOOT_TRANSPORT_V1__={transport_literal};{bootstrap}</script>"
+        "<script{nonce_attribute}>const __TSJS_SERVER_BOOT_TRANSPORT_V1__={transport_literal};{bootstrap}</script>"
     );
     let selected_src = agent
         .as_ref()
         .map_or(runtime_src.as_str(), |artifact| artifact.src());
     Ok(format!(
-        r#"{controller}<script src="{selected_src}" id="trustedserver-js"></script>"#
+        r#"{controller}{interstitial_html}<script{nonce_attribute} src="{selected_src}" id="trustedserver-js"></script>"#
     ))
 }
 
@@ -1504,6 +1550,41 @@ mod tests {
     }
 
     #[test]
+    fn production_bootstrap_applies_one_validated_nonce_to_both_script_tags() {
+        let configs = IntegrationConfigsV1::new(vec![("aps", serde_json::json!({}))])
+            .expect("APS browser projection should be admitted");
+        let config = || TsjsBootScriptConfigV1 {
+            module_ids: &["render_runtime", "aps"],
+            integration_configs: &configs,
+            auction_projection_json: VALID_BROWSER_AUCTION_PROJECTION_JSON,
+            creative: CreativeBootConfigV1 {
+                enabled: false,
+                click_guard: false,
+                render_guard: false,
+            },
+            render_trace_overlay: false,
+            gpt_diagnostics_active: false,
+        };
+
+        let script = tsjs_bootstrap_fragment_with_nonce_v1(
+            config(),
+            PERFORMANCE_ORIGIN,
+            Some("response-nonce_123="),
+        )
+        .expect("a bounded CSP base64-value should be admitted");
+        assert_eq!(script.matches(r#" nonce="response-nonce_123=""#).count(), 2);
+        assert_eq!(script.matches("<script").count(), 2);
+
+        for invalid in ["", "contains space", r#"quote\""#, "semicolon;"] {
+            assert!(
+                tsjs_bootstrap_fragment_with_nonce_v1(config(), PERFORMANCE_ORIGIN, Some(invalid),)
+                    .is_err(),
+                "invalid nonce text must fail closed: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
     fn production_bootstrap_centrally_escapes_integration_config_markup() {
         let configs = IntegrationConfigsV1::new(vec![(
             "prebid",
@@ -2062,15 +2143,6 @@ mod tests {
             tsjs_unified_script_tag(),
             format!(r#"<script src="{src}" id="trustedserver-js"></script>"#),
             "should wrap the unified source in a trusted server script tag"
-        );
-    }
-
-    #[test]
-    fn tsjs_script_src_differs_for_different_module_sets() {
-        assert_ne!(
-            tsjs_script_src(&["lockr"]),
-            tsjs_script_src(&["lockr", "permutive"]),
-            "should bust the cache when the module set content changes"
         );
     }
 

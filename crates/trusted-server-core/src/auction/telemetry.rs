@@ -1123,6 +1123,10 @@ mod tests {
             provider_responses: vec![provider],
             mediator_response: None,
             winning_bids: HashMap::from([("slot-1".to_owned(), aps_bid.clone())]),
+            decision_set: crate::auction::types::AuctionDecisionSetV1::failed(
+                &request,
+                crate::auction::types::AuctionSlotFailureReason::WinnerNotRenderable,
+            ),
             total_time_ms: 12,
             metadata: HashMap::new(),
         };
@@ -1159,6 +1163,10 @@ mod tests {
             )],
             mediator_response: None,
             winning_bids: HashMap::from([("slot-1".to_owned(), fallback_bid)]),
+            decision_set: crate::auction::types::AuctionDecisionSetV1::failed(
+                &request,
+                crate::auction::types::AuctionSlotFailureReason::WinnerNotRenderable,
+            ),
             total_time_ms: 12,
             metadata: HashMap::new(),
         };
@@ -1191,6 +1199,10 @@ mod tests {
             provider_responses: vec![provider],
             mediator_response: Some(mediator),
             winning_bids: HashMap::from([("slot-1".to_owned(), aps_bid.clone())]),
+            decision_set: crate::auction::types::AuctionDecisionSetV1::failed(
+                &request,
+                crate::auction::types::AuctionSlotFailureReason::WinnerNotRenderable,
+            ),
             total_time_ms: 15,
             metadata: HashMap::new(),
         };

@@ -18,6 +18,13 @@ use crate::platform::{
 };
 use crate::request_signing::{RequestSigner, SigningParams};
 
+use super::openrtb::{
+    OpenRtbBuildOutcome, RequestFinalization, apply_notification_policy, build_request,
+    extract_standard_response, unused_bidder_params_count,
+};
+use super::plan::ProviderPlan;
+use super::profile::CompiledOpenRtbProfile;
+use super::routing::{ProviderAuctionInput, RoutedAuction};
 use super::types::{
     AuctionContext, AuctionRequest, AuctionResponse, AuctionSlotFailureReason, Bid,
 };

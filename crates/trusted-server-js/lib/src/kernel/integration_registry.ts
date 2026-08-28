@@ -137,6 +137,7 @@ export interface IntegrationRegistryOptions {
   readonly takeoverScript?: HTMLScriptElement;
   readonly takeoverScriptId?: 'trustedserver-js' | 'trustedserver-js-runtime';
   readonly document?: Document;
+  readonly currentScript?: () => HTMLScriptElement | null;
   readonly startedAtMs: number;
   readonly now?: () => number;
   readonly signal?: AbortSignal;
@@ -622,6 +623,7 @@ class IntegrationRegistryOwner {
   private readonly catalog: readonly IntegrationCatalogEntry[];
   private readonly takeoverScript: HTMLScriptElement | undefined;
   private readonly takeoverScriptId: 'trustedserver-js' | 'trustedserver-js-runtime';
+  private readonly currentScript: (() => HTMLScriptElement | null) | undefined;
   private readonly document: Document | undefined;
   private readonly registrations = new Map<string, TakeoverIntegrationRegistration>();
   private readonly capabilities = new Map<string, Readonly<Record<string, unknown>>>();
@@ -655,6 +657,7 @@ class IntegrationRegistryOwner {
     this.releaseId = options.releaseId;
     this.takeoverScript = options.takeoverScript;
     this.takeoverScriptId = options.takeoverScriptId ?? 'trustedserver-js';
+    this.currentScript = options.currentScript;
     this.document = options.document;
     this.startedAtMs = options.startedAtMs;
     this.now = options.now ?? (() => performance.now());
@@ -817,7 +820,9 @@ class IntegrationRegistryOwner {
         script.isConnected &&
         matches.length === 1 &&
         matches[0] === script &&
-        document.currentScript === script &&
+        (this.currentScript
+          ? this.currentScript() === script
+          : document.currentScript === script) &&
         expected.origin === origin &&
         expected.hash === '' &&
         `${expected.pathname}${expected.search}` === manifest.runtimeSrc &&

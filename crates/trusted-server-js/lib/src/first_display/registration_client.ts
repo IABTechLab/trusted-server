@@ -8,14 +8,11 @@ export function registerCurrentFirstDisplayComponent(
   install: FirstDisplayComponentRegistrationV1['install']
 ): boolean {
   try {
-    const browser = (globalThis as unknown as { window: Window }).window;
-    const target = Object.getOwnPropertyDescriptor(browser, 'tsjs')?.value;
-    const sink = Object.getOwnPropertyDescriptor(target, '_registerFirstDisplay')?.value;
+    const target = window.tsjs as unknown as {
+      _registerFirstDisplay?: (candidate: readonly unknown[]) => boolean;
+    };
     return (
-      Reflect.apply(sink, target, [
-        Object.freeze([1, id, __TSJS_EMBEDDED_RELEASE_ID_V1__, install]),
-        browser.document.currentScript,
-      ]) === true
+      target._registerFirstDisplay?.([1, id, __TSJS_EMBEDDED_RELEASE_ID_V1__, install]) === true
     );
   } catch {
     return false;

@@ -27,6 +27,7 @@ mod registry;
 pub mod sourcepoint;
 pub mod testlight;
 
+pub(crate) use registry::html_script_nonce_attribute;
 pub use registry::{
     AttributeRewriteAction, AttributeRewriteOutcome, HeaderMutation, HeaderMutationMode,
     IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationDocumentState,

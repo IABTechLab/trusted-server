@@ -25,7 +25,6 @@ import type {
 import type { FirstDisplaySliceActivationContext } from '../../src/shared/first_display_transaction';
 import type { FirstDisplayRouteRuleV1 } from '../../src/first_display/leaf/route_guard';
 import { installDidomiInitial } from '../../src/first_display/leaf/config_guard';
-import type { FirstDisplayCreativeGuardV1 } from '../../src/first_display/leaf/creative_guard';
 import {
   installApsInitial,
   type FirstDisplayApsProtocolV1,
@@ -56,7 +55,6 @@ import {
   type FirstDisplayComponentRegistrationV1,
 } from '../../src/shared/first_display_registration';
 import { createDidomiRuntime } from '../../src/integrations/didomi/module';
-import { shouldProxyExternalUrl } from '../../src/integrations/creative/proxy_sign';
 import { getPermutiveSegments } from '../../src/integrations/permutive/segments';
 import { mirrorSourcepointConsent } from '../../src/integrations/sourcepoint/consent_mirror';
 import {
@@ -813,22 +811,17 @@ describe('first-display initial slice definitions', () => {
     };
     const previous = { ...sdk.config };
     const disposers: Array<() => void> = [];
-    let contributor: (() => Readonly<Record<string, unknown>> | undefined) | undefined;
     let route: FirstDisplayContextRouteRuleV1 | undefined;
-    const unregisterContext = vi.fn();
     const unregisterRoute = vi.fn();
+    const observations: Array<readonly [string, string | number]> = [];
     const bindings = Object.freeze({
       clearTimer: () => undefined,
       getSdk: () => sdk,
       host: 'publisher.example',
-      observe: () => undefined,
+      observe: (name: string, value: string | number) => observations.push([name, value]),
       origin: 'https://publisher.example',
       protocol: 'https:',
       readStorage: (key: string) => localStorage.getItem(key),
-      registerContext: (candidate: typeof contributor) => {
-        contributor = candidate;
-        return unregisterContext;
-      },
       registerRoute: (candidate: FirstDisplayContextRouteRuleV1) => {
         route = candidate;
         return unregisterRoute;
@@ -855,10 +848,10 @@ describe('first-display initial slice definitions', () => {
       })
     );
 
-    expect(contributor?.()).toEqual({
-      permutive_segments: getPermutiveSegments(),
-    });
-    expect((contributor?.()?.permutive_segments as readonly string[]).length).toBe(100);
+    const segmentObservation = observations.find(([name]) => name === 'segments');
+    expect(segmentObservation).toBeDefined();
+    expect(JSON.parse(String(segmentObservation?.[1]))).toEqual(getPermutiveSegments());
+    expect(JSON.parse(String(segmentObservation?.[1]))).toHaveLength(100);
     expect(route?.matches('script', 'https://cdn.permutive.com/example-web.js')).toBe(true);
     expect(
       route?.matches('script', 'https://cdn.permutive.com.attacker.example/example-web.js')
@@ -881,7 +874,6 @@ describe('first-display initial slice definitions', () => {
 
     disposers.reverse().forEach((release) => release());
     expect(sdk.config).toEqual(previous);
-    expect(unregisterContext).toHaveBeenCalledOnce();
     expect(unregisterRoute).toHaveBeenCalledOnce();
     localStorage.clear();
   });
@@ -1030,7 +1022,6 @@ describe('first-display initial slice definitions', () => {
 
     const timers: Array<() => void> = [];
     const disposers: Array<() => void> = [];
-    const unregisterContext = vi.fn();
     const unregisterRoute = vi.fn();
     installPermutiveInitial(
       Object.freeze({
@@ -1044,7 +1035,6 @@ describe('first-display initial slice definitions', () => {
         origin: 'https://publisher.example',
         protocol: 'https:',
         readStorage: () => raw,
-        registerContext: () => unregisterContext,
         registerRoute: () => unregisterRoute,
         setTimer: (callback: () => void) => {
           timers.push(callback);
@@ -1057,7 +1047,6 @@ describe('first-display initial slice definitions', () => {
 
     disposers.reverse().forEach((release) => release());
     expect(timers).toEqual([]);
-    expect(unregisterContext).toHaveBeenCalledOnce();
     expect(unregisterRoute).toHaveBeenCalledOnce();
   });
 
@@ -1123,11 +1112,15 @@ describe('first-display initial slice definitions', () => {
     expect(document.cookie).toBe('');
   });
 
-  it('registers the exact creative parser guard policy and owns its rollback', () => {
-    const release = vi.fn();
+  it('installs the selected creative parser guards and owns their rollback', () => {
     const observations: Array<readonly [string, number]> = [];
-    let guard: FirstDisplayCreativeGuardV1 | undefined;
     const disposers: Array<() => void> = [];
+    const clickHandle = Object.freeze({ dispose: vi.fn(), scan: vi.fn() });
+    const imageHandle = Object.freeze({ dispose: vi.fn(), scan: vi.fn() });
+    const iframeHandle = Object.freeze({ dispose: vi.fn(), scan: vi.fn() });
+    const installClickGuard = vi.fn(() => clickHandle);
+    const installDynamicImageProxy = vi.fn(() => imageHandle);
+    const installDynamicIframeProxy = vi.fn(() => iframeHandle);
     const bindings = Object.freeze({
       config: Object.freeze({
         version: 1,
@@ -1135,15 +1128,11 @@ describe('first-display initial slice definitions', () => {
         clickGuard: true,
         renderGuard: true,
       }),
-      location: Object.freeze({
-        href: 'https://publisher.example/page',
-        origin: 'https://publisher.example',
-      }),
+      document,
+      installClickGuard,
+      installDynamicIframeProxy,
+      installDynamicImageProxy,
       observe: (name: string, value: number) => observations.push([name, value]),
-      register: (candidate: FirstDisplayCreativeGuardV1) => {
-        guard = candidate;
-        return release;
-      },
     });
     const host = Object.freeze({
       activate: (
@@ -1164,34 +1153,18 @@ describe('first-display initial slice definitions', () => {
         afterActivate: () => undefined,
       })
     );
-    expect(guard).toBeDefined();
-    expect(guard).toMatchObject({
-      clickGuard: true,
-      id: 'creative',
-      renderGuard: true,
-      version: 1,
-    });
-    expect(Object.isFrozen(guard)).toBe(true);
-    expect(guard?.normalizeNavigation('/landing')).toBe('https://publisher.example/landing');
-    expect(guard?.normalizeNavigation('javascript:alert(1)')).toBeUndefined();
-    expect(guard?.normalizeNavigation('https://user:pass@example.com/')).toBeUndefined();
-    expect(guard?.shouldProxyResource('https://cdn.example/pixel.gif')).toBe(true);
-    expect(guard?.shouldProxyResource('/publisher.png')).toBe(false);
-    expect(guard?.shouldProxyResource('data:image/gif;base64,a')).toBe(false);
-    for (const url of [
-      'https://cdn.example/pixel.gif',
-      'https://user:pass@cdn.example/pixel.gif',
-      'data:image/gif;base64,a',
-      'javascript:alert(1)',
-      'blob:https://publisher.example/id',
-      'not a valid URL',
-    ]) {
-      expect(guard?.shouldProxyResource(url)).toBe(shouldProxyExternalUrl(url));
-    }
+    expect(installClickGuard).toHaveBeenCalledOnce();
+    expect(installDynamicImageProxy).toHaveBeenCalledOnce();
+    expect(installDynamicIframeProxy).toHaveBeenCalledOnce();
+    expect(clickHandle.scan).not.toHaveBeenCalled();
+    expect(imageHandle.scan).not.toHaveBeenCalled();
+    expect(iframeHandle.scan).not.toHaveBeenCalled();
     expect(observations).toEqual([['guard_count', 3]]);
 
     disposers.reverse().forEach((dispose) => dispose());
-    expect(release).toHaveBeenCalledOnce();
+    expect(clickHandle.dispose).toHaveBeenCalledOnce();
+    expect(imageHandle.dispose).toHaveBeenCalledOnce();
+    expect(iframeHandle.dispose).toHaveBeenCalledOnce();
   });
 
   it('rejects malformed creative config before installing any initial guard', () => {
@@ -1206,7 +1179,7 @@ describe('first-display initial slice definitions', () => {
         extra: true,
       }),
     ]) {
-      const register = vi.fn();
+      const installClickGuard = vi.fn();
       const host = Object.freeze({
         activate: (
           _id: string,
@@ -1216,12 +1189,11 @@ describe('first-display initial slice definitions', () => {
           install?.(
             Object.freeze({
               config,
-              location: Object.freeze({
-                href: 'https://publisher.example/page',
-                origin: 'https://publisher.example',
-              }),
+              document,
+              installClickGuard,
+              installDynamicIframeProxy: vi.fn(),
+              installDynamicImageProxy: vi.fn(),
               observe: () => undefined,
-              register,
             }),
             own,
             config
@@ -1234,7 +1206,7 @@ describe('first-display initial slice definitions', () => {
           Object.freeze({ own: () => undefined, afterActivate: () => undefined })
         )
       ).toThrow();
-      expect(register).not.toHaveBeenCalled();
+      expect(installClickGuard).not.toHaveBeenCalled();
     }
   });
 

@@ -40,8 +40,17 @@ fn test_settings() -> trusted_server_core::settings::Settings {
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
 
-            [integrations.aps]
+            [auction]
             enabled = true
+            timeout_ms = 1000
+
+            [auction.providers.aps-main]
+            protocol = "openrtb-2.6"
+            profile = "aps"
+            endpoint = "https://aps.example/e/pb/bid"
+            routing = "all_eligible"
+
+            [auction.providers.aps-main.profile_config]
             account_id = "route-test-aps-account"
             allow_script_creatives = true
         "#,
@@ -87,7 +96,7 @@ fn assert_route_registered(method: &str, path: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn aps_profile_serves_renderer_through_adapter_fallback() {
+async fn aps_profile_serves_canonical_renderer_through_reserved_dispatcher() {
     let mut settings = test_settings();
     settings.auction.providers.insert(
         "aps-main".parse().expect("should parse APS provider ID"),
@@ -103,22 +112,19 @@ async fn aps_profile_serves_renderer_through_adapter_fallback() {
                 .expect("should parse APS profile config"),
         },
     );
-    let router = TrustedServerApp::routes_with_settings(settings)
-        .expect("should build router with APS profile");
-    let mut service = EdgeZeroAxumService::new(router);
     let request = Request::builder()
         .method("GET")
-        .uri("/integrations/aps/renderer")
+        .uri("/integrations/aps/renderer/v2")
         .body(AxumBody::empty())
         .expect("should build APS renderer request");
-
-    let response = service
-        .ready()
+    let request = edgezero_adapter_axum::request::into_core_request(request)
         .await
-        .expect("should be ready")
-        .call(request)
-        .await
-        .expect("should serve APS renderer");
+        .expect("should convert APS renderer request");
+    let response =
+        trusted_server_adapter_axum::app::dispatch_reserved_with_settings(settings, request)
+            .await
+            .expect("should build reserved APS dispatcher")
+            .expect("APS renderer should be reserved");
     assert_eq!(response.status().as_u16(), 200);
 }
 

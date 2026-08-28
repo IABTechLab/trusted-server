@@ -45,6 +45,11 @@ export interface FirstDisplayTsjsFixture {
   firstDisplaySrc: string;
   runtimeBody: string;
   runtimeSrc: string;
+  deferred: readonly Readonly<{
+    id: string;
+    body: string;
+    src: string;
+  }>[];
   boot: Readonly<Record<string, unknown>>;
   outline: Readonly<Record<string, unknown>>;
 }
@@ -56,6 +61,7 @@ interface FirstDisplayTsjsFixtureInput {
   readonly diagnostics?: Readonly<Record<string, unknown>>;
   readonly firstDisplayIds: readonly string[];
   readonly takeoverIds: readonly string[];
+  readonly deferredIds?: readonly string[];
 }
 
 const FIRST_DISPLAY_IDS = Object.freeze([
@@ -212,12 +218,34 @@ export function firstDisplayTsjsFixture(
     .toString(16)
     .padStart(4, "0")}&v=${firstDisplayHash}`;
   const runtime = runtimeTsjsFixture(input.takeoverIds);
+  const deferred = (input.deferredIds ?? []).map((id) => {
+    const artifact = exactArtifact(release, id);
+    if (artifact.phase !== "deferred") {
+      throw new Error(`TSJS fixture module ${artifact.id} is not deferred`);
+    }
+    const body = readFileSync(resolve(dist, artifact.file), "utf8");
+    const hash = createHash("sha256").update(body, "utf8").digest("hex");
+    return Object.freeze({
+      id,
+      body,
+      src: `/static/tsjs=tsjs-${id}.min.js?v=${hash}`,
+    });
+  });
   const manifest = {
     ...runtime.manifest,
     firstDisplay: {
       src: firstDisplaySrc,
       slices: [...input.firstDisplayIds],
     },
+    integrations: [
+      ...runtime.manifest.integrations,
+      ...deferred.map(({ id, src }) => ({
+        id,
+        phase: "deferred" as const,
+        trigger: "first_display_or_idle" as const,
+        src,
+      })),
+    ],
   };
   const creative = input.creative ?? {
     version: 1,
@@ -272,6 +300,7 @@ export function firstDisplayTsjsFixture(
     firstDisplaySrc,
     runtimeBody: runtime.runtimeBody,
     runtimeSrc: runtime.runtimeSrc,
+    deferred,
     boot,
     outline,
   };

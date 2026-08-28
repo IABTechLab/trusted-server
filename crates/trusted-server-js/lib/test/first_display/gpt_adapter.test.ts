@@ -250,6 +250,7 @@ describe('first-display GPT adapter', () => {
       removeEventListener: () => undefined,
     };
     const binding = {
+      pubadsReady: true,
       cmd: { push: (command: () => void) => command() },
       defineSlot: vi.fn(() => slot),
       destroySlots: vi.fn(() => true),
@@ -325,6 +326,10 @@ describe('first-display GPT adapter', () => {
       addEventListener: vi.fn((name: string, listener: (event: unknown) => void) => {
         listeners.set(name, listener);
       }),
+      enableSingleRequest: vi.fn(() => {
+        events.push('sra');
+        return true;
+      }),
       getSlots: vi.fn(() => []),
       refresh: vi.fn(() => events.push('refresh')),
       removeEventListener: vi.fn(),
@@ -332,9 +337,11 @@ describe('first-display GPT adapter', () => {
     Object.defineProperty(dom.window, 'googletag', {
       configurable: true,
       value: {
+        pubadsReady: false,
         cmd: { push: (command: () => void) => command() },
         defineSlot: vi.fn(() => slot),
         display: vi.fn(() => events.push('display')),
+        enableServices: vi.fn(() => events.push('services')),
         getConfig: vi.fn(() => ({ disableInitialLoad: false })),
         pubads: vi.fn(() => service),
       },
@@ -380,6 +387,8 @@ describe('first-display GPT adapter', () => {
       'target:hb_pb',
       'target:placement',
       'first-action',
+      'sra',
+      'services',
       'display',
     ]);
     expect(slot.setTargeting.mock.calls).toEqual([
@@ -398,6 +407,144 @@ describe('first-display GPT adapter', () => {
       'slotRequested',
       'slotRenderEnded',
     ]);
+  });
+
+  it.each(['enableSingleRequest', 'enableServices'] as const)(
+    'fails the entire batch without a request when %s throws',
+    (failure) => {
+      const dom = new JSDOM('<!doctype html><div id="slot-1"></div><div id="slot-2"></div>', {
+        url: 'https://publisher.example/',
+      });
+      const slots = new Map<string, object>();
+      const display = vi.fn();
+      const refresh = vi.fn();
+      const service = {
+        addEventListener: vi.fn(),
+        enableSingleRequest: vi.fn(() => {
+          if (failure === 'enableSingleRequest') throw new Error('fictional SRA failure');
+          return true;
+        }),
+        getSlots: () => [],
+        refresh,
+        removeEventListener: vi.fn(),
+      };
+      const binding = {
+        pubadsReady: false,
+        cmd: { push: (command: () => void) => command() },
+        defineSlot: (_path: string, _sizes: unknown, elementId: string) => {
+          const targeting = new Map<string, string[]>();
+          const slot = {
+            addService: () => slot,
+            clearTargeting: (key: string) => targeting.delete(key),
+            getTargeting: (key: string) => targeting.get(key) ?? [],
+            setTargeting: (key: string, value: string) => {
+              targeting.set(key, [value]);
+              return slot;
+            },
+          };
+          slots.set(elementId, slot);
+          return slot;
+        },
+        display,
+        enableServices: () => {
+          if (failure === 'enableServices') throw new Error('fictional service failure');
+        },
+        getConfig: () => ({ disableInitialLoad: false }),
+        pubads: () => service,
+      };
+      Object.defineProperty(dom.window, 'googletag', { configurable: true, value: binding });
+      const failures: unknown[] = [];
+      const firstAction = vi.fn(() => true);
+      const batch = snapshotFirstDisplayBatchV1(twoSlotFixture())!;
+      const adapter = createFirstDisplayGoogletagBatch({
+        browser: dom.window as unknown as Window,
+        clearTimer: () => undefined,
+        document: dom.window.document,
+        projection: batch.projection,
+        protocol: protocol(),
+        setTimer: (callback) => callback,
+      });
+
+      startAdapter(adapter, {
+        onBound: () => undefined,
+        onFailure: (slotId, reason) => failures.push([slotId, reason]),
+        onFirstAction: firstAction,
+        onRenderEnded: () => undefined,
+      });
+
+      expect(firstAction).toHaveBeenCalledOnce();
+      expect(failures).toEqual([
+        ['slot-1', 'gpt_request_failed'],
+        ['slot-2', 'gpt_request_failed'],
+      ]);
+      expect(display).not.toHaveBeenCalled();
+      expect(refresh).not.toHaveBeenCalled();
+    }
+  );
+
+  it('arms every synchronous SRA display cycle before the first display requests all slots', () => {
+    const dom = new JSDOM('<!doctype html><div id="slot-1"></div><div id="slot-2"></div>', {
+      url: 'https://publisher.example/',
+    });
+    const listeners = new Map<string, (event: unknown) => void>();
+    const slots: object[] = [];
+    const service = {
+      addEventListener: (name: string, listener: (event: unknown) => void) =>
+        listeners.set(name, listener),
+      getSlots: () => [],
+      refresh: vi.fn(),
+      removeEventListener: vi.fn(),
+    };
+    const display = vi.fn(() => {
+      for (const slot of slots) listeners.get('slotRequested')?.({ slot });
+      for (const slot of slots) listeners.get('slotRenderEnded')?.({ slot, isEmpty: false });
+    });
+    const binding = {
+      pubadsReady: true,
+      cmd: { push: (command: () => void) => command() },
+      defineSlot: (_path: string, _sizes: unknown, _elementId: string) => {
+        const targeting = new Map<string, string[]>();
+        const slot = {
+          addService: () => slot,
+          clearTargeting: (key: string) => targeting.delete(key),
+          getTargeting: (key: string) => targeting.get(key) ?? [],
+          setTargeting: (key: string, value: string) => {
+            targeting.set(key, [value]);
+            return slot;
+          },
+        };
+        slots.push(slot);
+        return slot;
+      },
+      display,
+      getConfig: () => ({ disableInitialLoad: false }),
+      pubads: () => service,
+    };
+    Object.defineProperty(dom.window, 'googletag', { configurable: true, value: binding });
+    const rendered: string[] = [];
+    const failures: unknown[] = [];
+    const firstAction = vi.fn(() => true);
+    const batch = snapshotFirstDisplayBatchV1(twoSlotFixture())!;
+    const adapter = createFirstDisplayGoogletagBatch({
+      browser: dom.window as unknown as Window,
+      clearTimer: () => undefined,
+      document: dom.window.document,
+      projection: batch.projection,
+      protocol: protocol(),
+      setTimer: (callback) => callback,
+    });
+
+    startAdapter(adapter, {
+      onBound: () => undefined,
+      onFailure: (slotId, reason) => failures.push([slotId, reason]),
+      onFirstAction: firstAction,
+      onRenderEnded: (cycle) => rendered.push(cycle[6]),
+    });
+
+    expect(display).toHaveBeenCalledOnce();
+    expect(firstAction).toHaveBeenCalledOnce();
+    expect(rendered).toEqual(['slot-1', 'slot-2']);
+    expect(failures).toEqual([]);
   });
 
   it('invalidates the delayed-owner binding when a publisher replaces the physical slot', () => {
@@ -430,6 +577,7 @@ describe('first-display GPT adapter', () => {
       return true;
     });
     const binding = {
+      pubadsReady: true,
       cmd: { push: (command: () => void) => command() },
       defineSlot,
       destroySlots,
@@ -545,6 +693,7 @@ describe('first-display GPT adapter', () => {
     Object.defineProperty(dom.window, 'googletag', {
       configurable: true,
       value: {
+        pubadsReady: true,
         cmd: { push: (command: () => void) => command() },
         defineSlot,
         display,
@@ -588,6 +737,204 @@ describe('first-display GPT adapter', () => {
     expect(targeting.has('hb_adid')).toBe(false);
   });
 
+  it.each(['reentrant_refresh', 'slot_object_display'] as const)(
+    'does not attribute a competing publisher %s to the pending TS request',
+    (competition) => {
+      const dom = new JSDOM('<!doctype html><div id="slot-1"></div>', {
+        url: 'https://publisher.example/',
+      });
+      const listeners = new Map<string, (event: unknown) => void>();
+      const slot = {
+        getSlotElementId: () => 'slot-1',
+        getTargeting: () => [],
+        setTargeting: () => slot,
+        clearTargeting: () => slot,
+      };
+      let reentered = false;
+      const refresh = vi.fn((_slots?: readonly object[]) => {
+        if (competition === 'reentrant_refresh' && !reentered) {
+          reentered = true;
+          service.refresh([slot]);
+        }
+      });
+      const service = {
+        addEventListener: (name: string, listener: (event: unknown) => void) =>
+          listeners.set(name, listener),
+        getSlots: () => [slot],
+        refresh,
+        removeEventListener: () => undefined,
+      };
+      const display = vi.fn((_slot?: unknown) => undefined);
+      const binding = {
+        pubadsReady: true,
+        cmd: { push: (command: () => void) => command() },
+        defineSlot: () => undefined,
+        display,
+        getConfig: () => ({ disableInitialLoad: false }),
+        pubads: () => service,
+      };
+      Object.defineProperty(dom.window, 'googletag', {
+        configurable: true,
+        value: binding,
+      });
+      const batch = snapshotFirstDisplayBatchV1(fixture())!;
+      const failure = vi.fn();
+      const adapter = createFirstDisplayGoogletagBatch({
+        browser: dom.window as unknown as Window,
+        clearTimer: () => undefined,
+        diagnosticsActive: true,
+        document: dom.window.document,
+        projection: batch.projection,
+        protocol: protocol(),
+        setTimer: (callback) => callback,
+      });
+      startAdapter(adapter, {
+        onBound: () => undefined,
+        onFailure: failure,
+        onFirstAction: () => true,
+        onRenderEnded: () => undefined,
+      });
+
+      if (competition === 'slot_object_display') binding.display(slot as never);
+      listeners.get('slotRequested')?.({ slot });
+
+      expect(refresh).toHaveBeenCalledTimes(competition === 'reentrant_refresh' ? 2 : 1);
+      expect(display).toHaveBeenCalledTimes(competition === 'slot_object_display' ? 1 : 0);
+      expect(failure).toHaveBeenCalledWith('slot-1', 'cycle_unattributable');
+      expect(adapter.closeIngress([])).toBe(true);
+      expect(adapter.captureDiagnosticsHandoff()?.[1][0]).toMatchObject({
+        event: 'slotRequested',
+        requestedSlotSizes: null,
+      });
+      adapter.dispose();
+    }
+  );
+
+  it.each(['exact', 'hydration'] as const)(
+    'hands off a %s late publisher definition without creating a second GPT slot',
+    (mode) => {
+      const dom = new JSDOM('<!doctype html><div id="slot-1"></div>', {
+        url: 'https://publisher.example/',
+      });
+      const warning = vi.spyOn(dom.window.console, 'warn').mockImplementation(() => undefined);
+      const listeners = new Map<string, (event: unknown) => void>();
+      const targeting = new Map<string, string[]>();
+      const slot = {
+        addService: () => slot,
+        clearTargeting: (key: string) => targeting.delete(key),
+        getAdUnitPath: () => '/123/example',
+        getSlotElementId: () => 'slot-1',
+        getTargeting: (key: string) => targeting.get(key) ?? [],
+        setTargeting: (key: string, value: string | readonly string[]) => {
+          targeting.set(key, typeof value === 'string' ? [value] : [...value]);
+          return slot;
+        },
+      };
+      let defined = false;
+      let disabled = false;
+      const refresh = vi.fn((_slots?: readonly object[], _options?: unknown) => undefined);
+      const service = {
+        addEventListener: (name: string, listener: (event: unknown) => void) =>
+          listeners.set(name, listener),
+        getSlots: () => (defined ? [slot] : []),
+        refresh,
+        removeEventListener: () => undefined,
+      };
+      const defineSlot = vi.fn((_path?: unknown, _sizes?: unknown, _elementId?: unknown) => {
+        defined = true;
+        return slot;
+      });
+      const display = vi.fn((_target?: unknown) => undefined);
+      const binding = {
+        pubadsReady: true,
+        cmd: { push: (command: () => void) => command() },
+        defineSlot,
+        destroySlots: vi.fn(() => true),
+        display,
+        getConfig: () => ({ disableInitialLoad: disabled }),
+        pubads: () => service,
+      };
+      Object.defineProperty(dom.window, 'googletag', {
+        configurable: true,
+        value: binding,
+      });
+      const batch = snapshotFirstDisplayBatchV1(fixture())!;
+      const adapter = createFirstDisplayGoogletagBatch({
+        browser: dom.window as unknown as Window,
+        clearTimer: () => undefined,
+        document: dom.window.document,
+        projection: batch.projection,
+        protocol: protocol(),
+        setTimer: (callback) => callback,
+      });
+      startAdapter(adapter, {
+        onBound: () => undefined,
+        onFailure: () => undefined,
+        onFirstAction: () => true,
+        onRenderEnded: () => undefined,
+      });
+      listeners.get('slotRequested')?.({ slot });
+      listeners.get('slotRenderEnded')?.({ slot, isEmpty: false });
+      disabled = true;
+
+      let elementId = 'slot-1';
+      let path: string = '/publisher/mismatch';
+      let sizes: readonly (readonly [number, number])[] = [[728, 90]];
+      if (mode === 'hydration') {
+        dom.window.document.getElementById('slot-1')?.remove();
+        const replacement = dom.window.document.createElement('div');
+        replacement.id = 'slot-1-hydrated';
+        dom.window.document.body.append(replacement);
+        elementId = replacement.id;
+        path = '/123/example';
+        sizes = [[300, 250]];
+      }
+      expect(binding.defineSlot(path, sizes, elementId)).toBe(slot);
+      expect(defineSlot).toHaveBeenCalledTimes(1);
+      if (mode === 'exact') {
+        expect(warning).toHaveBeenCalledExactlyOnceWith('GPT publisher handoff metadata mismatch', {
+          formatsMismatch: true,
+          pathMismatch: true,
+        });
+        slot.setTargeting('hb_pb', 'publisher');
+      } else {
+        expect(warning).not.toHaveBeenCalled();
+      }
+
+      const displayCalls = display.mock.calls.length;
+      const refreshCalls = refresh.mock.calls.length;
+      binding.display(elementId);
+      service.refresh([slot], { changeCorrelator: false } as never);
+      expect(display).toHaveBeenCalledTimes(displayCalls);
+      expect(refresh).toHaveBeenCalledTimes(refreshCalls);
+      binding.display(elementId);
+      service.refresh([slot], { changeCorrelator: false } as never);
+      expect(display).toHaveBeenCalledTimes(displayCalls + 1);
+      expect(refresh).toHaveBeenCalledTimes(refreshCalls + 1);
+
+      expect(adapter.closeIngress(['slot-1'])).toBe(true);
+      expect(adapter.captureHandoff()?.[0]?.slice(0, 3)).toEqual([
+        'slot-1',
+        elementId,
+        'publisher',
+      ]);
+      expect(adapter.captureHandoff()?.[0]?.[3]).toEqual(
+        mode === 'exact'
+          ? [
+              { installed: RESERVATION_ID, key: 'hb_adid', prior: [] },
+              { installed: 'article', key: 'placement', prior: [] },
+            ]
+          : [
+              { installed: RESERVATION_ID, key: 'hb_adid', prior: [] },
+              { installed: '1.25', key: 'hb_pb', prior: [] },
+              { installed: 'article', key: 'placement', prior: [] },
+            ]
+      );
+      adapter.dispose();
+      expect(binding.destroySlots).not.toHaveBeenCalled();
+    }
+  );
+
   it('rejects targeting handoff after a publisher replaces an observed method', () => {
     const dom = new JSDOM('<!doctype html><div id="slot-1"></div>', {
       url: 'https://publisher.example/',
@@ -613,6 +960,7 @@ describe('first-display GPT adapter', () => {
     Object.defineProperty(dom.window, 'googletag', {
       configurable: true,
       value: {
+        pubadsReady: true,
         cmd: { push: (command: () => void) => command() },
         defineSlot: () => undefined,
         display: () => undefined,
@@ -684,6 +1032,7 @@ describe('first-display GPT adapter', () => {
       Object.defineProperty(dom.window, 'googletag', {
         configurable: true,
         value: {
+          pubadsReady: true,
           cmd: { push: (command: () => void) => command() },
           defineSlot: () => undefined,
           display: () => undefined,
@@ -766,6 +1115,7 @@ describe('first-display GPT adapter', () => {
       Object.defineProperty(dom.window, 'googletag', {
         configurable: true,
         value: {
+          pubadsReady: true,
           cmd: { push: (command: () => void) => command() },
           defineSlot: () => undefined,
           display: () => undefined,
@@ -836,6 +1186,7 @@ describe('first-display GPT adapter', () => {
     Object.defineProperty(dom.window, 'googletag', {
       configurable: true,
       value: {
+        pubadsReady: true,
         cmd: { push: (command: () => void) => command() },
         defineSlot: () => undefined,
         display: () => undefined,
@@ -906,6 +1257,7 @@ describe('first-display GPT adapter', () => {
     Object.defineProperty(dom.window, 'googletag', {
       configurable: true,
       value: {
+        pubadsReady: true,
         cmd: { push: (command: () => void) => command() },
         defineSlot: () => failedSlot,
         destroySlots,
@@ -989,6 +1341,7 @@ describe('first-display GPT adapter', () => {
     Object.defineProperty(dom.window, 'googletag', {
       configurable: true,
       value: {
+        pubadsReady: true,
         cmd: { push: (command: () => void) => command() },
         defineSlot: () => undefined,
         display: () => undefined,
@@ -1052,6 +1405,7 @@ describe('first-display GPT adapter', () => {
     Object.defineProperty(dom.window, 'googletag', {
       configurable: true,
       value: {
+        pubadsReady: true,
         cmd: { push: (command: () => void) => command() },
         defineSlot: () => slot,
         display: () => events.push('display'),
@@ -1140,6 +1494,7 @@ describe('first-display GPT adapter', () => {
     Object.defineProperty(dom.window, 'googletag', {
       configurable: true,
       value: {
+        pubadsReady: true,
         cmd: { push: (command: () => void) => command() },
         defineSlot: () => slot,
         display: () => undefined,
@@ -1194,6 +1549,7 @@ describe('first-display GPT adapter', () => {
     Object.defineProperty(dom.window, 'googletag', {
       configurable: true,
       value: {
+        pubadsReady: true,
         cmd: { push: (command: () => void) => command() },
         defineSlot,
         display,
@@ -1246,6 +1602,7 @@ describe('first-display GPT adapter', () => {
     Object.defineProperty(dom.window, 'googletag', {
       configurable: true,
       value: {
+        pubadsReady: true,
         cmd: { push: (command: () => void) => command() },
         defineSlot: () => slot,
         destroySlots,
@@ -1303,6 +1660,7 @@ describe('first-display GPT adapter', () => {
     Object.defineProperty(dom.window, 'googletag', {
       configurable: true,
       value: {
+        pubadsReady: true,
         cmd: { push: (command: () => void) => command() },
         defineSlot: () => slot,
         display: () => undefined,
@@ -1390,6 +1748,7 @@ describe('first-display GPT adapter', () => {
       capturedAtMs: 12.5,
       elementId: 'slot-1',
       adUnitPath: '/123/example',
+      requestedSlotSizes: [[300, 250]],
       isEmpty: null,
       renderedSize: null,
       isBackfill: null,
@@ -1398,6 +1757,7 @@ describe('first-display GPT adapter', () => {
     });
     expect(diagnostics?.[1][2]).toMatchObject({
       event: 'slotRenderEnded',
+      requestedSlotSizes: null,
       isEmpty: false,
       renderedSize: [300, 250],
       isBackfill: false,

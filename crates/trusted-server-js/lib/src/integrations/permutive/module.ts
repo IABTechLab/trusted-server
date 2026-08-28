@@ -7,7 +7,11 @@ import type { IntegrationLifecycleRuntime } from '../../kernel/lifecycle_module'
 import { isEmptyIntegrationConfigV1 } from '../../shared/integration_config_validators';
 import type { RuntimeCapabilityV1 } from '../../kernel/runtime';
 import { log } from '../../core/log';
-import { validatePersistentFirstDisplaySliceAdoptionV1 } from '../../shared/takeover';
+import {
+  snapshotPersistentFirstDisplaySliceStateV1,
+  validatePersistentFirstDisplaySliceAdoptionV1,
+  type PersistentFirstDisplaySliceStateV1,
+} from '../../shared/takeover';
 
 import { installPermutiveGuard, resetGuardState } from './script_guard';
 import { getPermutiveSegments } from './segments';
@@ -71,6 +75,54 @@ function snapshotSegments(candidate: readonly string[]): readonly string[] {
     return Object.freeze([]);
   }
   return Object.freeze(segments);
+}
+
+function snapshotAdoptedSegments(
+  state: Readonly<PersistentFirstDisplaySliceStateV1>
+): readonly string[] | undefined {
+  const row = state.values.find(([key]) => key === 'segments');
+  if (!row || typeof row[1] !== 'string' || row[1].length > 4_096) return undefined;
+  try {
+    const parsed = JSON.parse(row[1]);
+    if (!Array.isArray(parsed) || parsed.length === 0 || parsed.length > 100) return undefined;
+    const segments = snapshotSegments(parsed);
+    if (
+      segments.length !== parsed.length ||
+      segments.some((segment) => segment.length === 0 || segment.length > 256) ||
+      JSON.stringify(segments) !== row[1]
+    ) {
+      return undefined;
+    }
+    return segments;
+  } catch {
+    return undefined;
+  }
+}
+
+function validatePermutiveAdoptionState(
+  state: Readonly<PersistentFirstDisplaySliceStateV1>
+): boolean {
+  if (state.values.length > 2) return false;
+  let hasSegments = false;
+  let hasReadiness = false;
+  for (const [key, value] of state.values) {
+    if (key === 'segments') {
+      if (hasSegments || !snapshotAdoptedSegments(state)) return false;
+      hasSegments = true;
+      continue;
+    }
+    if (
+      hasReadiness ||
+      !(
+        (key === 'sdk_config' && typeof value === 'string' && value.length > 0) ||
+        (key === 'readiness_timeout' && value === 50)
+      )
+    ) {
+      return false;
+    }
+    hasReadiness = true;
+  }
+  return true;
 }
 
 /** Own the Permutive guard, auction context, SDK readiness timer, and rewritten config. */
@@ -232,6 +284,7 @@ export function createPermutiveIntegrationRegistration(release: string): Integra
       resetGuard: () => undefined,
     });
     let takeoverActive = false;
+    let adoptedSegments: readonly string[] | undefined;
     let releaseContext: (() => void) | undefined;
     let lifecycleRelease: (() => void) | undefined;
     const capability: PermutiveContextCapabilityV1 = Object.freeze({
@@ -270,23 +323,24 @@ export function createPermutiveIntegrationRegistration(release: string): Integra
         if (takeoverActive) throw new Error('Permutive context is already active');
         if (
           adoption !== undefined &&
-          !validatePersistentFirstDisplaySliceAdoptionV1(adoption, 'permutive_initial', (state) => {
-            const row = state.values[0];
-            return (
-              state.values.length === 0 ||
-              (state.values.length === 1 &&
-                (row?.[0] === 'sdk_config'
-                  ? typeof row[1] === 'string' && row[1].length > 0
-                  : row?.[0] === 'readiness_timeout' && row[1] === 50))
-            );
-          })
+          !validatePersistentFirstDisplaySliceAdoptionV1(
+            adoption,
+            'permutive_initial',
+            validatePermutiveAdoptionState
+          )
         ) {
           throw new TypeError('Permutive first-display parser state is invalid');
         }
+        const adoptedState = snapshotPersistentFirstDisplaySliceStateV1(
+          adoption,
+          'permutive_initial'
+        );
+        adoptedSegments = adoptedState ? snapshotAdoptedSegments(adoptedState) : undefined;
         try {
           installPermutiveGuard();
           releaseContext = runtime.registerAuctionContext(PERMUTIVE_INTEGRATION_ID, () => {
-            const segments = snapshotSegments(getPermutiveSegments());
+            const segments = adoptedSegments ?? snapshotSegments(getPermutiveSegments());
+            adoptedSegments = undefined;
             return segments.length === 0
               ? undefined
               : Object.freeze({ permutive_segments: segments });
@@ -300,6 +354,7 @@ export function createPermutiveIntegrationRegistration(release: string): Integra
         takeoverActive = true;
         onActivationDispose(() => {
           takeoverActive = false;
+          adoptedSegments = undefined;
           const release = releaseContext;
           releaseContext = undefined;
           release?.();

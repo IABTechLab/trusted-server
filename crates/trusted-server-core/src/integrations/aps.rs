@@ -1,8 +1,8 @@
 //! Amazon Publisher Services (APS/TAM) `OpenRTB` integration.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
 #[cfg(test)]
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,7 +11,7 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::header::HeaderName;
 use http::{HeaderMap, Method, StatusCode, header};
-use serde::de::{self, Visitor};
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use url::Url;
@@ -27,15 +27,15 @@ use crate::auction::routing::ProviderAuctionInput;
 #[cfg(test)]
 use crate::auction::types::{AdSlot, AuctionContext, AuctionRequest};
 use crate::auction::types::{
-    AdSlot, ApsRendererV1, ApsRendererValidationResult, ApsTagType, AuctionContext,
-    AuctionDropReason, AuctionDropReasons, AuctionRequest, AuctionResponse, Bid, BidRenderSourceV1,
-    MediaType, RENDER_DIMENSION_MAX, classify_aps_renderer_v1, record_auction_drop,
+    ApsRendererV1, ApsRendererValidationResult, ApsTagType, AuctionDropReason, AuctionDropReasons,
+    AuctionResponse, Bid, BidRenderSourceV1, MediaType, RENDER_DIMENSION_MAX,
+    classify_aps_renderer_v1, record_auction_drop,
 };
 use crate::error::TrustedServerError;
 use crate::integrations::ensure_integration_backend_with_transport_timeouts;
 use crate::integrations::{
-    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
-    IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
+    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
 };
 #[cfg(test)]
 use crate::integrations::{
@@ -96,6 +96,7 @@ const APS_RENDERER_V2_DOCUMENT: &str = include_str!("generated/aps_renderer_boot
 /// Configuration for the APS `OpenRTB` integration.
 #[cfg(test)]
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 #[validate(schema(function = "validate_inventory_identity_override"))]
 pub struct LegacyApsProviderConfig {
     /// Whether APS integration is enabled.
@@ -122,9 +123,6 @@ pub struct LegacyApsProviderConfig {
     /// Whether APS script creatives are eligible before winner selection.
     #[serde(default)]
     pub allow_script_creatives: bool,
-    /// Rendering owner for selected APS bids.
-    #[serde(default)]
-    pub rendering_mode: ApsRenderingMode,
     /// APS-authorized inventory domain used instead of the deployment hostname.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(custom(function = "validate_inventory_domain"))]
@@ -139,52 +137,15 @@ fn deserialize_account_id<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    struct AccountIdVisitor;
-
-    impl Visitor<'_> for AccountIdVisitor {
-        type Value = String;
-
-        fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            formatter.write_str("a non-empty string or integer for account_id")
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<String, E>
-        where
-            E: de::Error,
-        {
-            let value = value.trim();
-            if value.is_empty() {
-                return Err(E::custom("account_id must not be empty"));
-            }
-            if value.len() > MAX_ACCOUNT_ID_BYTES {
-                return Err(E::custom("account_id is too large"));
-            }
-            Ok(value.to_string())
-        }
-
-        fn visit_string<E>(self, value: String) -> Result<String, E>
-        where
-            E: de::Error,
-        {
-            self.visit_str(&value)
-        }
-
-        fn visit_i64<E>(self, value: i64) -> Result<String, E>
-        where
-            E: de::Error,
-        {
-            Ok(value.to_string())
-        }
-
-        fn visit_u64<E>(self, value: u64) -> Result<String, E>
-        where
-            E: de::Error,
-        {
-            Ok(value.to_string())
-        }
+    let value = String::deserialize(deserializer)?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(D::Error::custom("account_id must not be empty"));
     }
-
-    deserializer.deserialize_any(AccountIdVisitor)
+    if value.len() > MAX_ACCOUNT_ID_BYTES {
+        return Err(D::Error::custom("account_id is too large"));
+    }
+    Ok(value.to_string())
 }
 
 #[cfg(test)]
@@ -313,7 +274,6 @@ impl Default for LegacyApsProviderConfig {
             timeout_ms: default_timeout_ms(),
             debug: false,
             allow_script_creatives: false,
-            rendering_mode: ApsRenderingMode::TrustedServer,
             inventory_domain: None,
             inventory_page_origin: None,
         }
@@ -327,9 +287,6 @@ pub struct ApsConfig {
     /// Whether browser-side APS integration behavior is enabled.
     #[serde(default)]
     pub enabled: bool,
-    /// Rendering owner for selected APS bids.
-    #[serde(default)]
-    pub rendering_mode: ApsRenderingMode,
 }
 
 #[cfg(test)]
@@ -444,7 +401,7 @@ struct PlannedApsResponsePolicy<'a> {
     account_id: &'a str,
     debug: bool,
     allow_script_creatives: bool,
-    publisher_domain: &'a str,
+    publisher_origin: &'a str,
 }
 
 fn aps_debug_headers(headers: &HeaderMap) -> BTreeMap<String, Vec<String>> {
@@ -526,7 +483,7 @@ fn attach_planned_aps_metadata(
 fn planned_aps_renderer(
     policy: &PlannedApsResponsePolicy<'_>,
     input: ApsRendererInput<'_>,
-) -> Option<BidRenderer> {
+) -> Result<BidRenderSourceV1, AuctionDropReason> {
     let tag_type_value = match input.tag_type {
         ApsTagType::Iframe => "iframe",
         ApsTagType::Script => "script",
@@ -545,11 +502,12 @@ fn planned_aps_renderer(
             }]
         }]
     });
-    let serialized = serde_json::to_vec(&envelope).ok()?;
+    let serialized =
+        serde_json::to_vec(&envelope).map_err(|_| AuctionDropReason::InvalidProviderResponse)?;
     if serialized.len() > MAX_RENDER_ENVELOPE_BYTES {
-        return None;
+        return Err(AuctionDropReason::RenderPayloadTooLarge);
     }
-    Some(BidRenderer::Aps(ApsRendererV1 {
+    let renderer = BidRenderSourceV1::Aps(ApsRendererV1 {
         version: 1,
         account_id: policy.account_id.to_string(),
         bid_id: input.bid_id.to_string(),
@@ -559,10 +517,18 @@ fn planned_aps_renderer(
         aax_response: BASE64_STANDARD.encode(serialized),
         width: input.width,
         height: input.height,
-    }))
+    });
+    let value =
+        serde_json::to_value(&renderer).map_err(|_| AuctionDropReason::InvalidProviderResponse)?;
+    if classify_aps_renderer_v1(&value, policy.publisher_origin)
+        != ApsRendererValidationResult::Accepted
+    {
+        return Err(AuctionDropReason::InvalidProviderResponse);
+    }
+    Ok(renderer)
 }
 
-fn planned_aps_valid_creative_url(value: &str, publisher_domain: &str) -> bool {
+fn planned_aps_valid_creative_url(value: &str, publisher_origin: &str) -> bool {
     if value.len() > MAX_CREATIVE_URL_BYTES {
         return false;
     }
@@ -570,11 +536,10 @@ fn planned_aps_valid_creative_url(value: &str, publisher_domain: &str) -> bool {
         return false;
     };
     parsed.scheme() == "https"
-        && parsed
-            .host_str()
-            .is_some_and(|host| !host.eq_ignore_ascii_case(publisher_domain))
+        && parsed.host_str().is_some()
         && parsed.username().is_empty()
         && parsed.password().is_none()
+        && parsed.origin().ascii_serialization() != publisher_origin
 }
 
 fn planned_aps_parse_bid(
@@ -582,68 +547,91 @@ fn planned_aps_parse_bid(
     value: &Json,
     slots: &HashMap<&str, HashSet<(u32, u32)>>,
     returned_seat: Option<&str>,
-) -> Result<Bid, &'static str> {
-    let bid_id = value
-        .get("id")
-        .and_then(Json::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or("missing_render_source")?;
+    duplicate_ids: &HashSet<String>,
+) -> Result<Bid, AuctionDropReason> {
+    let object = value.as_object().ok_or(AuctionDropReason::MalformedBid)?;
+    let Some(bid_id_value) = object.get("id") else {
+        return Err(AuctionDropReason::MissingUpstreamBidId);
+    };
+    let bid_id = bid_id_value
+        .as_str()
+        .ok_or(AuctionDropReason::InvalidUpstreamBidId)?;
+    if bid_id.is_empty() {
+        return Err(AuctionDropReason::MissingUpstreamBidId);
+    }
+    if bid_id.len() > MAX_BID_ID_BYTES {
+        return Err(AuctionDropReason::UpstreamBidIdTooLarge);
+    }
+    if bid_id.bytes().any(|byte| byte <= 0x1f || byte == 0x7f) {
+        return Err(AuctionDropReason::InvalidUpstreamBidId);
+    }
+    if duplicate_ids.contains(bid_id) {
+        return Err(AuctionDropReason::DuplicateUpstreamBidId);
+    }
     let slot_id = value
         .get("impid")
         .and_then(Json::as_str)
-        .ok_or("unknown_impid")?;
-    let dimensions = slots.get(slot_id).ok_or("unknown_impid")?;
+        .ok_or(AuctionDropReason::UnknownImpression)?;
+    let dimensions = slots
+        .get(slot_id)
+        .ok_or(AuctionDropReason::UnknownImpression)?;
     let price = value
         .get("price")
         .and_then(Json::as_f64)
         .filter(|price| price.is_finite() && *price >= 0.0)
-        .ok_or("invalid_price")?;
+        .ok_or(AuctionDropReason::InvalidPrice)?;
     if value
         .get("mtype")
         .is_some_and(|mtype| mtype.as_i64() != Some(1))
     {
-        return Err("unsupported_media_type");
+        return Err(AuctionDropReason::UnsupportedMediaType);
     }
-    let width = value
-        .get("w")
-        .and_then(Json::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or("invalid_dimensions")?;
-    let height = value
-        .get("h")
-        .and_then(Json::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or("invalid_dimensions")?;
-    if width == 0 || height == 0 || !dimensions.contains(&(width, height)) {
-        return Err("invalid_dimensions");
+    let parse_dimension = |field: &str| {
+        let number = value
+            .get(field)
+            .and_then(Json::as_f64)
+            .filter(|number| number.is_finite() && number.fract() == 0.0 && *number > 0.0)
+            .ok_or(AuctionDropReason::InvalidDimensions)?;
+        if number > RENDER_DIMENSION_MAX as f64 {
+            return Err(AuctionDropReason::DimensionsOutOfRange);
+        }
+        u32::try_from(number as u64).map_err(|_| AuctionDropReason::DimensionsOutOfRange)
+    };
+    let width = parse_dimension("w")?;
+    let height = parse_dimension("h")?;
+    if !dimensions.contains(&(width, height)) {
+        return Err(AuctionDropReason::InvalidDimensions);
     }
     let ext = value
         .get("ext")
         .and_then(Json::as_object)
-        .ok_or("missing_render_source")?;
-    let creative_url = ext
-        .get("creativeurl")
-        .and_then(Json::as_str)
-        .ok_or("missing_render_source")?;
-    if !planned_aps_valid_creative_url(creative_url, policy.publisher_domain) {
-        return Err("invalid_creative_url");
+        .ok_or(AuctionDropReason::MissingCreativeUrl)?;
+    let Some(creative_url_value) = ext.get("creativeurl") else {
+        return Err(AuctionDropReason::MissingCreativeUrl);
+    };
+    let creative_url = creative_url_value
+        .as_str()
+        .ok_or(AuctionDropReason::InvalidCreativeUrl)?;
+    if !planned_aps_valid_creative_url(creative_url, policy.publisher_origin) {
+        return Err(AuctionDropReason::InvalidCreativeUrl);
     }
     let tag_type = match ext.get("tagtype").and_then(Json::as_str) {
         Some("iframe") => ApsTagType::Iframe,
         Some("script") if policy.allow_script_creatives => ApsTagType::Script,
-        Some("script") => return Err("script_rendering_disabled"),
-        _ => return Err("unsupported_tagtype"),
+        Some("script") => return Err(AuctionDropReason::ScriptRenderingDisabled),
+        _ => return Err(AuctionDropReason::InvalidTagType),
     };
-    let creative_id = value
-        .get("crid")
-        .and_then(Json::as_str)
-        .filter(|creative_id| !creative_id.is_empty())
-        .map(str::to_string);
+    let creative_id = match value.get("crid") {
+        None => None,
+        Some(Json::String(creative_id)) if creative_id.is_empty() => None,
+        Some(Json::String(creative_id)) => Some(creative_id.clone()),
+        Some(_) => return Err(AuctionDropReason::InvalidCreativeId),
+    };
     if creative_id
         .as_ref()
         .is_some_and(|creative_id| creative_id.len() > MAX_CREATIVE_ID_BYTES)
     {
-        return Err("creative_id_too_large");
+        return Err(AuctionDropReason::CreativeIdTooLarge);
     }
     let renderer = planned_aps_renderer(
         policy,
@@ -656,8 +644,7 @@ fn planned_aps_parse_bid(
             width,
             height,
         },
-    )
-    .ok_or("render_payload_too_large")?;
+    )?;
     let adomain = value
         .get("adomain")
         .and_then(Json::as_array)
@@ -671,6 +658,9 @@ fn planned_aps_parse_bid(
 
     Ok(Bid {
         slot_id: slot_id.to_string(),
+        candidate_id: None,
+        candidate_provider: None,
+        renderer_reservation_id: None,
         price: Some(price),
         currency: DEFAULT_CURRENCY.to_string(),
         creative: None,
@@ -692,10 +682,6 @@ fn planned_aps_parse_bid(
     })
 }
 
-fn increment_planned_aps_reason(reasons: &mut BTreeMap<String, u64>, reason: &'static str) {
-    *reasons.entry(reason.to_string()).or_default() += 1;
-}
-
 fn parse_planned_aps_value(
     value: &Json,
     response_time_ms: u64,
@@ -703,7 +689,6 @@ fn parse_planned_aps_value(
     policy: &PlannedApsResponsePolicy<'_>,
 ) -> AuctionResponse {
     if !value.is_object()
-        || value.get("contextual").is_some()
         || value
             .get("cur")
             .is_some_and(|currency| !currency.is_string())
@@ -713,15 +698,15 @@ fn parse_planned_aps_value(
     {
         return AuctionResponse::error(policy.provider_id, response_time_ms)
             .with_metadata("error_type", json!("parse_response"))
-            .with_metadata("drop_reasons", json!({"unexpected_response_shape": 1}));
+            .with_drop_reason(AuctionDropReason::InvalidProviderResponse);
     }
     if value
         .get("cur")
         .and_then(Json::as_str)
         .is_some_and(|currency| !currency.eq_ignore_ascii_case(DEFAULT_CURRENCY))
     {
-        return AuctionResponse::no_bid(policy.provider_id, response_time_ms)
-            .with_metadata("drop_reasons", json!({"unsupported_currency": 1}));
+        return AuctionResponse::error(policy.provider_id, response_time_ms)
+            .with_drop_reason(AuctionDropReason::InvalidProviderResponse);
     }
 
     let slots = input
@@ -740,9 +725,38 @@ fn parse_planned_aps_value(
         .collect::<HashMap<_, _>>();
     let seatbids = value.get("seatbid").and_then(Json::as_array);
     let seatbid_count = seatbids.map_or(0, Vec::len);
-    let mut reasons = BTreeMap::new();
+    let mut reasons = AuctionDropReasons::new();
     let mut selected: HashMap<String, Bid> = HashMap::new();
     let mut dropped = 0_u64;
+    let mut invalid_slots = HashSet::new();
+    let mut global_invalid = false;
+
+    if value.get("contextual").is_some() {
+        dropped += 1;
+        global_invalid = true;
+        record_auction_drop(&mut reasons, AuctionDropReason::InvalidProviderResponse);
+    }
+
+    let mut id_counts = HashMap::<&str, usize>::new();
+    for candidate in seatbids
+        .into_iter()
+        .flatten()
+        .filter_map(|seatbid| seatbid.get("bid").and_then(Json::as_array))
+        .flatten()
+    {
+        if let Some(bid_id) = candidate.get("id").and_then(Json::as_str)
+            && !bid_id.is_empty()
+            && bid_id.len() <= MAX_BID_ID_BYTES
+            && !bid_id.bytes().any(|byte| byte <= 0x1f || byte == 0x7f)
+        {
+            *id_counts.entry(bid_id).or_default() += 1;
+        }
+    }
+    let duplicate_ids = id_counts
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(bid_id, _)| bid_id.to_string())
+        .collect::<HashSet<_>>();
 
     for seatbid in seatbids.into_iter().flatten() {
         let returned_seat = seatbid
@@ -751,11 +765,11 @@ fn parse_planned_aps_value(
             .filter(|seat| !seat.is_empty());
         let Some(bids) = seatbid.get("bid").and_then(Json::as_array) else {
             dropped += 1;
-            increment_planned_aps_reason(&mut reasons, "empty_seatbid_bids");
+            record_auction_drop(&mut reasons, AuctionDropReason::EmptySeatBidBids);
             continue;
         };
         for value in bids {
-            match planned_aps_parse_bid(policy, value, &slots, returned_seat) {
+            match planned_aps_parse_bid(policy, value, &slots, returned_seat, &duplicate_ids) {
                 Ok(candidate) => {
                     let replace = selected.get(&candidate.slot_id).is_none_or(|current| {
                         let candidate_price = candidate.price.unwrap_or_default();
@@ -771,42 +785,66 @@ fn parse_planned_aps_value(
                             .is_some()
                         {
                             dropped += 1;
-                            increment_planned_aps_reason(&mut reasons, "lost_to_higher_bid");
+                            record_auction_drop(&mut reasons, AuctionDropReason::LostToHigherBid);
                         }
                     } else {
                         dropped += 1;
-                        increment_planned_aps_reason(&mut reasons, "lost_to_higher_bid");
+                        record_auction_drop(&mut reasons, AuctionDropReason::LostToHigherBid);
                     }
                 }
                 Err(reason) => {
                     dropped += 1;
-                    increment_planned_aps_reason(&mut reasons, reason);
+                    if let Some(slot_id) = value
+                        .get("impid")
+                        .and_then(Json::as_str)
+                        .filter(|slot_id| slots.contains_key(*slot_id))
+                    {
+                        invalid_slots.insert(slot_id.to_string());
+                    } else {
+                        global_invalid = true;
+                    }
+                    record_auction_drop(&mut reasons, reason);
                 }
             }
         }
     }
 
     if seatbid_count == 0 {
-        increment_planned_aps_reason(&mut reasons, "empty_seatbid");
+        record_auction_drop(&mut reasons, AuctionDropReason::EmptySeatBid);
     }
     let accepted = selected.len();
     let metadata = [
         ("seatbid_count".to_string(), json!(seatbid_count)),
         ("accepted_bid_count".to_string(), json!(accepted)),
         ("dropped_bid_count".to_string(), json!(dropped)),
-        ("drop_reasons".to_string(), json!(reasons)),
+        (
+            "invalid_slots".to_string(),
+            json!(
+                invalid_slots
+                    .into_iter()
+                    .map(|slot| (slot, "invalid_provider_response"))
+                    .collect::<HashMap<_, _>>()
+            ),
+        ),
+        (
+            "global_invalid_provider_response".to_string(),
+            json!(global_invalid),
+        ),
     ];
-    let mut response = if selected.is_empty() {
+    let mut response = if selected.is_empty() && global_invalid {
+        AuctionResponse::error(policy.provider_id, response_time_ms)
+    } else if selected.is_empty() {
         AuctionResponse::no_bid(policy.provider_id, response_time_ms)
     } else {
-        AuctionResponse::success(
-            policy.provider_id,
-            selected.into_values().collect(),
-            response_time_ms,
-        )
+        let bids = input
+            .slots()
+            .iter()
+            .filter_map(|slot| selected.remove(&slot.slot().id))
+            .collect();
+        AuctionResponse::success(policy.provider_id, bids, response_time_ms)
     };
     response.metadata.extend(metadata);
-    response
+    response.with_drop_reasons(&reasons)
 }
 
 /// Parse one APS-profile response using only provider-local routed state.
@@ -819,13 +857,21 @@ pub(crate) async fn parse_planned_aps_response(
     response_time_ms: u64,
     debug_request: Option<ApsDebugRequest>,
 ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+    let publisher_origin = input
+        .common_request()
+        .publisher
+        .page_url
+        .as_deref()
+        .and_then(|page_url| Url::parse(page_url).ok())
+        .map(|page_url| page_url.origin().ascii_serialization())
+        .unwrap_or_else(|| format!("https://{}", input.common_request().publisher.domain));
     let policy = PlannedApsResponsePolicy {
         provider_id,
         endpoint,
         account_id: &profile.account_id,
         debug: profile.debug,
         allow_script_creatives: profile.allow_script_creatives,
-        publisher_domain: &input.common_request().publisher.domain,
+        publisher_origin: &publisher_origin,
     };
     let response = response.response;
     let status = response.status();
@@ -892,7 +938,7 @@ pub(crate) async fn parse_planned_aps_response(
             log::warn!("Failed to parse APS profile {provider_id} response JSON: {error}");
             let parsed = AuctionResponse::error(provider_id, response_time_ms)
                 .with_metadata("error_type", json!("parse_response"))
-                .with_metadata("drop_reasons", json!({"unexpected_response_shape": 1}));
+                .with_drop_reason(AuctionDropReason::InvalidProviderResponse);
             return Ok(attach_planned_aps_metadata(
                 parsed,
                 &policy,
@@ -1857,12 +1903,10 @@ impl ApsV1Integration {
         response
     }
 
-    pub(crate) fn from_settings(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
-        Ok(Self {
-            enabled: settings
-                .integration_config::<ApsConfig>(APS_INTEGRATION_ID)?
-                .is_some(),
-        })
+    pub(crate) fn from_plan(plan: &crate::auction::AuctionPlan) -> Self {
+        Self {
+            enabled: plan.enabled() && plan.has_profile(APS_INTEGRATION_ID),
+        }
     }
 
     fn local_status(
@@ -2034,6 +2078,8 @@ impl ApsV1Integration {
             .method(Method::GET)
             .uri(APS_RUNNER_UPSTREAM_URL)
             .header(header::ACCEPT_ENCODING, "identity")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::PRAGMA, "no-cache")
             .body(EdgeBody::empty())
             .map_err(|_| "request_build_failed")?;
         let backend = ensure_integration_backend_with_transport_timeouts(
@@ -2047,7 +2093,7 @@ impl ApsV1Integration {
         let response = services
             .http_client()
             .send_raw_proxy_v1(
-                PlatformHttpRequest::new(outbound_request, backend),
+                PlatformHttpRequest::new(outbound_request, backend).with_cache_bypass(),
                 RawProxyPolicyV1 {
                     total_timeout: APS_RUNNER_TOTAL_TIMEOUT,
                     first_byte_timeout: APS_RUNNER_FIRST_BYTE_TIMEOUT,
@@ -2124,22 +2170,10 @@ pub fn register_for_plan(
     settings: &Settings,
     plan: &crate::auction::AuctionPlan,
 ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
-    if !plan.has_profile(APS_INTEGRATION_ID) {
+    if !plan.enabled() || !plan.has_profile(APS_INTEGRATION_ID) {
         return Ok(None);
     }
-    let rendering_mode = settings
-        .integration_config::<ApsConfig>(APS_INTEGRATION_ID)?
-        .map(|config| config.rendering_mode)
-        .unwrap_or_default();
-    let integration = Arc::new(ApsRendererIntegration { rendering_mode });
-    let registration = IntegrationRegistration::builder(APS_INTEGRATION_ID)
-        .without_js()
-        .with_head_injector(integration.clone());
-    let registration = if rendering_mode == ApsRenderingMode::TrustedServer {
-        registration.with_proxy(integration)
-    } else {
-        registration
-    };
+    let _browser_config = settings.integration_config::<ApsConfig>(APS_INTEGRATION_ID)?;
     Ok(Some(
         IntegrationRegistration::builder(APS_INTEGRATION_ID)
             .without_js()
@@ -2158,19 +2192,15 @@ pub fn register_for_plan(
 pub fn register(
     settings: &Settings,
 ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
-    let Some(config) =
+    let Some(_config) =
         settings.integration_config::<LegacyApsProviderConfig>(APS_INTEGRATION_ID)?
     else {
         return Ok(None);
     };
     let mut browser_settings = settings.clone();
-    browser_settings.integrations.insert_config(
-        APS_INTEGRATION_ID,
-        &ApsConfig {
-            enabled: true,
-            rendering_mode: config.rendering_mode,
-        },
-    )?;
+    browser_settings
+        .integrations
+        .insert_config(APS_INTEGRATION_ID, &ApsConfig { enabled: true })?;
     register_for_plan(
         &browser_settings,
         &crate::auction::AuctionPlan::compile(AuctionPlanConfig {
@@ -2209,11 +2239,6 @@ pub fn register_providers(
             "APS debug mode is ON — raw request and response data, including creative markup, will be included in client-visible /auction responses"
         );
     }
-    if config.rendering_mode == ApsRenderingMode::PublisherNative && config.allow_script_creatives {
-        log::warn!(
-            "APS publisher-native rendering with script creatives is ON; selected bidder scripts execute with publisher-origin privileges"
-        );
-    }
     Ok(vec![Arc::new(ApsAuctionProvider::new(config))])
 }
 
@@ -2222,17 +2247,14 @@ mod tests {
     use super::*;
     use crate::auction::test_support::canonical_parity_auction_request;
     use crate::auction::types::{
-        AdFormat, AdSlot, AuctionContext, AuctionDropReason, AuctionRequest, BidStatus, DeviceInfo,
+        AdFormat, AdSlot, AuctionContext, AuctionDropReason, AuctionRequest, BidStatus,
         PublisherInfo, UserInfo,
     };
-    use crate::consent::ConsentContext;
-    use crate::openrtb::{Eid, Uid};
     use crate::platform::test_support::{
         StubHttpClient, build_services_with_http_client, noop_services,
     };
     use crate::platform::{
-        GeoInfo, ProxyHeaderEvidenceV1, ProxyResponseEvidenceV1, RawProxyPolicyV1,
-        RawProxyResponseV1,
+        ProxyHeaderEvidenceV1, ProxyResponseEvidenceV1, RawProxyPolicyV1, RawProxyResponseV1,
     };
     use crate::test_support::tests::create_test_settings;
     use serde_json::json;
@@ -2245,7 +2267,6 @@ mod tests {
             timeout_ms: 800,
             debug: false,
             allow_script_creatives: false,
-            rendering_mode: ApsRenderingMode::TrustedServer,
             inventory_domain: None,
             inventory_page_origin: None,
         }
@@ -2725,26 +2746,45 @@ mod tests {
     }
 
     #[test]
-    fn config_accepts_canonical_string_and_integer_ids() {
-        let canonical: ApsConfig = serde_json::from_value(json!({
+    fn profile_config_accepts_only_canonical_string_account_id() {
+        let canonical: ApsProfileConfig = serde_json::from_value(json!({
             "account_id": "  example-account  "
         }))
         .expect("should parse canonical account ID");
-        let integer: ApsConfig =
-            serde_json::from_value(json!({"account_id": 1234})).expect("should parse integer ID");
-        let debug: ApsConfig = serde_json::from_value(json!({
+        let integer = serde_json::from_value::<ApsProfileConfig>(json!({"account_id": 1234}));
+        let legacy_alias = serde_json::from_value::<ApsProfileConfig>(json!({
+            "pub_id": "legacy-account"
+        }));
+        let debug: ApsProfileConfig = serde_json::from_value(json!({
             "account_id": "example-account",
             "debug": true
         }))
         .expect("should parse debug flag");
         assert_eq!(canonical.account_id, "example-account");
-        assert_eq!(integer.account_id, "1234");
-        assert!(!canonical.enabled);
+        assert!(
+            integer.is_err(),
+            "integer account IDs must fail the hard cutover"
+        );
+        assert!(legacy_alias.is_err(), "pub_id must fail the hard cutover");
         assert!(!canonical.debug);
         assert!(debug.debug);
         assert!(!canonical.allow_script_creatives);
-        assert_eq!(canonical.rendering_mode, ApsRenderingMode::TrustedServer);
-        assert!(canonical.endpoint.ends_with("/e/pb/bid"));
+    }
+
+    #[test]
+    fn browser_config_rejects_provider_fields() {
+        let enabled: ApsConfig = serde_json::from_value(json!({"enabled": true}))
+            .expect("should accept the browser enablement toggle");
+        assert!(enabled.enabled);
+
+        assert!(
+            serde_json::from_value::<ApsConfig>(json!({
+                "enabled": true,
+                "account_id": "legacy-account"
+            }))
+            .is_err(),
+            "removed APS provider fields must fail the hard cutover"
+        );
     }
 
     #[test]
@@ -2805,7 +2845,7 @@ mod tests {
             ["pub", "id"].join("_"),
             json!("two"),
         )]));
-        assert!(serde_json::from_value::<ApsConfig>(legacy_alias).is_err());
+        assert!(serde_json::from_value::<LegacyApsProviderConfig>(legacy_alias).is_err());
         for endpoint in [
             "http://aps.example/e/pb/bid",
             "https://",
@@ -3892,77 +3932,51 @@ mod tests {
     }
 
     #[test]
-    fn publisher_native_config_registers_runner_mode_without_renderer_route() {
+    fn disabled_auction_plan_does_not_register_or_expose_aps_routes() {
         let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                APS_INTEGRATION_ID,
-                &json!({
-                    "enabled": true,
-                    "account_id": "example-account",
-                    "rendering_mode": "publisher_native"
-                }),
-            )
-            .expect("should insert native APS config");
+        settings.auction.enabled = false;
+        settings.auction.providers.insert(
+            "aps-main".parse().expect("should parse APS provider ID"),
+            ProviderConfig {
+                protocol: "openrtb-2.6".to_string(),
+                profile: APS_INTEGRATION_ID.to_string(),
+                endpoint: default_endpoint(),
+                timeout_ms: None,
+                routing: RoutingMode::AllEligible,
+                notifications: NotificationConfig::default(),
+                profile_config: json!({"account_id": "example-account"}),
+            },
+        );
+        let plan = crate::auction::compile_auction_plan(&settings)
+            .expect("disabled APS auction plan should compile");
 
-        let registration = register(&settings)
-            .expect("should register APS")
-            .expect("should return enabled registration");
         assert!(
-            registration.proxies.is_empty(),
-            "should not register the static renderer"
+            plan.has_profile(APS_INTEGRATION_ID),
+            "compiled plan should retain configured profile identity"
         );
-        assert_eq!(registration.head_injectors.len(), 1);
-
-        let integration = ApsRendererIntegration {
-            rendering_mode: ApsRenderingMode::PublisherNative,
-        };
         assert!(
-            integration.routes().is_empty(),
-            "should expose no renderer route"
+            register_for_plan(&settings, &plan)
+                .expect("disabled APS registration should be evaluated")
+                .is_none(),
+            "global auction kill switch should suppress APS registration"
         );
-        let document_state = IntegrationDocumentState::default();
-        let context = IntegrationHtmlContext {
-            request_host: "publisher.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-        assert!(
-            integration.head_inserts(&context).is_empty(),
-            "should not inject a forgeable native-mode marker"
-        );
-        assert_eq!(
-            integration.tsjs_script_tag_attributes(),
-            vec![("data-ts-aps-rendering-mode", "publisher_native")],
-            "should authorize native mode on the publisher bundle tag"
-        );
-    }
 
-    #[test]
-    fn publisher_native_script_creatives_remain_available_for_controlled_validation() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                APS_INTEGRATION_ID,
-                &json!({
-                    "enabled": true,
-                    "account_id": "example-account",
-                    "allow_script_creatives": true,
-                    "rendering_mode": "publisher_native"
-                }),
-            )
-            .expect("should insert native APS script config");
-
-        let providers = register_providers(&settings).expect("should register APS provider");
-
-        assert_eq!(
-            providers.len(),
-            1,
-            "should retain the controlled experiment"
-        );
+        let integration = ApsV1Integration::from_plan(&plan);
+        for path in [APS_RENDERER_V2_ROUTE, APS_RUNNER_ROUTE] {
+            let request = http::Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(EdgeBody::empty())
+                .expect("should build disabled APS request");
+            let response = futures::executor::block_on(integration.handle(
+                &settings,
+                &noop_services(),
+                request,
+            ))
+            .expect("disabled APS route should fail closed locally");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "path={path}");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        }
     }
 
     #[test]
@@ -4224,6 +4238,7 @@ mod tests {
         );
         assert_eq!(response.headers()["x-content-type-options"], "nosniff");
         assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        assert!(response.headers().get(header::CACHE_CONTROL).is_none());
         assert_eq!(response.headers().len(), 5);
         let returned = futures::executor::block_on(
             response
@@ -4236,14 +4251,28 @@ mod tests {
         assert_eq!(stub.recorded_backend_names(), vec!["stub-backend"]);
         assert_eq!(stub.recorded_request_uris(), vec![APS_RUNNER_UPSTREAM_URL]);
         assert_eq!(stub.recorded_request_methods(), vec!["GET"]);
-        assert_eq!(
-            stub.recorded_request_headers(),
-            vec![vec![(
-                "accept-encoding".to_string(),
-                "identity".to_string()
-            )]]
-        );
+        let request_headers = stub.recorded_request_headers();
+        let request_headers = request_headers
+            .first()
+            .expect("should record the runner request headers");
+        for expected in [
+            ("accept-encoding", "identity"),
+            ("cache-control", "no-cache"),
+            ("pragma", "no-cache"),
+        ] {
+            assert!(
+                request_headers
+                    .iter()
+                    .any(|(name, value)| name == expected.0 && value == expected.1),
+                "should force live runner cache bypass for {expected:?}: {request_headers:?}"
+            );
+        }
         assert_eq!(stub.recorded_request_bodies(), vec![Vec::<u8>::new()]);
+        assert_eq!(
+            stub.recorded_cache_bypass_flags(),
+            vec![true],
+            "APS runner relay must bypass the platform cache"
+        );
         assert_eq!(APS_RUNNER_TOTAL_TIMEOUT, Duration::from_secs(5));
         assert_eq!(
             stub.recorded_raw_proxy_policies(),

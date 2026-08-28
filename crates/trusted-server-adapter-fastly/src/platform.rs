@@ -19,12 +19,13 @@ use trusted_server_core::integrations::aps::{
 };
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
-    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerCrop,
-    PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions, PlatformImageOptimizerParams,
-    PlatformImageOptimizerRegion, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
-    PlatformSecretStore, PlatformSelectResult, ProxyHeaderEvidenceV1, ProxyResponseEvidenceV1,
-    RawProxyPolicyV1, RawProxyResponseV1, StoreId, StoreName,
+    BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec,
+    PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
+    PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
+    PlatformImageOptimizerParams, PlatformImageOptimizerRegion, PlatformKvStore,
+    PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
+    ProxyHeaderEvidenceV1, ProxyResponseEvidenceV1, RawProxyPolicyV1, RawProxyResponseV1, StoreId,
+    StoreName,
 };
 use trusted_server_core::settings::TrustedClientIpConfig;
 

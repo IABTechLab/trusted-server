@@ -3,7 +3,7 @@
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::Request;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::sync::Arc;
 use web_time::Instant;
 
@@ -12,20 +12,26 @@ use crate::platform::{PlatformPendingRequest, RuntimeServices};
 
 #[cfg(test)]
 use super::config::AuctionConfig;
+use super::openrtb::unused_bidder_params_count;
+use super::plan::AuctionPlan;
 use super::provider::{
-    AuctionProvider, ProviderParseState, ProviderRequestOutcome, ProviderSlotDisposition,
-    ProviderSlotOutcome,
+    AuctionProvider, GenericOpenRtbProvider, ProviderParseState, ProviderRequestOutcome,
+    ProviderSlotDisposition, ProviderSlotOutcome,
 };
+use super::routing::{RoutedAuction, route_auction};
 use super::telemetry::AbandonedProviderCall;
 use super::types::{
     AuctionContext, AuctionDecisionSetV1, AuctionDropReason, AuctionIdentityGenerator,
     AuctionRequest, AuctionResponse, AuctionSlotFailureReason, Bid, BidStatus,
     SlotAuctionDecisionV1, SystemAuctionIdentityGenerator, mint_response_unique_base64url_identity,
 };
+use crate::request_signing::RequestSigner;
 
 const CANDIDATE_ID_BYTES: usize = 9;
 const CANDIDATE_ID_COLLISION_RETRIES: usize = 8;
 const MAX_UPSTREAM_BID_ID_BYTES: usize = 64;
+
+type EligibleSlotsByProvider = HashMap<String, HashSet<String>>;
 
 struct NormalizedProviderResponses {
     outcomes: Vec<ProviderSlotOutcome>,
@@ -53,6 +59,7 @@ pub struct DispatchedAuction {
     planned_unused_bidder_params: HashMap<String, u32>,
     planned_unroutable_bidder_count: u32,
     planned_provider_order: HashMap<String, usize>,
+    eligible_slots_by_provider: EligibleSlotsByProvider,
 }
 
 struct ProviderLaunchState {
@@ -63,6 +70,38 @@ struct ProviderLaunchState {
     parse_state: Option<ProviderParseState>,
 }
 
+/// Outcome of attempting to dispatch split-phase auction provider requests.
+#[allow(clippy::large_enum_variant)]
+pub enum DispatchAuctionOutcome {
+    /// No provider request was started and no provider failure was observed.
+    NotStarted,
+    /// No provider request could be launched, but launch failures were observed.
+    DispatchFailed {
+        /// Original auction request.
+        request: AuctionRequest,
+        /// Provider launch-failure responses.
+        provider_responses: Vec<AuctionResponse>,
+        /// Fatal admission error that synchronous execution must propagate.
+        ///
+        /// Split publisher dispatch records the failure and continues without
+        /// attempting provider network I/O.
+        fatal_admission_error: Option<Report<TrustedServerError>>,
+        /// Auction-level metadata materialized before the failure.
+        metadata: HashMap<String, serde_json::Value>,
+        /// Elapsed dispatch time.
+        elapsed_ms: u64,
+        /// Exact provider-to-slot eligibility established during routing.
+        eligible_slots_by_provider: EligibleSlotsByProvider,
+    },
+    /// One or more providers produced an immediate response or started a request.
+    Dispatched(DispatchedAuction),
+}
+
+/// A dispatch attempt either has in-flight transport to collect or is already terminal.
+pub(crate) enum ResolvedDispatchOutcome {
+    InFlight(Box<DispatchedAuction>),
+    Complete(Box<OrchestrationResult>),
+}
 impl DispatchedAuction {
     /// Consume the dispatch token without collecting provider responses.
     #[must_use]
@@ -116,6 +155,7 @@ impl DispatchedAuction {
             planned_unused_bidder_params: HashMap::new(),
             planned_unroutable_bidder_count: 0,
             planned_provider_order: HashMap::new(),
+            eligible_slots_by_provider: HashMap::new(),
         }
     }
 }
@@ -195,6 +235,13 @@ fn provider_timeout_response(provider_name: &str, response_time_ms: u64) -> Auct
         .with_metadata("message", serde_json::json!("Provider request timed out"))
 }
 
+fn provider_skipped_response(provider_name: &str) -> AuctionResponse {
+    AuctionResponse::no_bid(provider_name, 0).with_metadata(
+        "routing",
+        serde_json::json!({"skipped_no_eligible_slots": true}),
+    )
+}
+
 fn canonical_provider_response(
     expected_provider: &str,
     response: AuctionResponse,
@@ -250,6 +297,23 @@ fn routing_metadata(unroutable_bidder_count: u32) -> HashMap<String, serde_json:
         "routing".to_string(),
         serde_json::json!({"unroutable_bidder_count": unroutable_bidder_count}),
     )])
+}
+
+fn routed_eligible_slots(routed: &RoutedAuction) -> EligibleSlotsByProvider {
+    routed
+        .inputs()
+        .iter()
+        .map(|input| {
+            (
+                input.provider_id().as_str().to_string(),
+                input
+                    .slots()
+                    .iter()
+                    .map(|slot| slot.slot().id.clone())
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 /// Attach only the count derived from the routed provider input at dispatch.
@@ -313,6 +377,7 @@ pub(crate) struct AuctionOrchestratorHarness {
     plan: Arc<AuctionPlan>,
     providers: Vec<Arc<GenericOpenRtbProvider>>,
     mediator: Option<Arc<dyn AuctionProvider>>,
+    identity_generator: Arc<dyn AuctionIdentityGenerator>,
 }
 
 struct PlannedLaunchState {
@@ -343,7 +408,16 @@ impl AuctionOrchestratorHarness {
             plan,
             providers,
             mediator,
+            identity_generator: Arc::new(SystemAuctionIdentityGenerator),
         }
+    }
+
+    pub(crate) fn with_identity_generator(
+        mut self,
+        identity_generator: Arc<dyn AuctionIdentityGenerator>,
+    ) -> Self {
+        self.identity_generator = identity_generator;
+        self
     }
 
     pub(crate) fn provider_count(&self) -> usize {
@@ -615,12 +689,21 @@ impl AuctionOrchestratorHarness {
                 .unwrap_or(usize::MAX)
         });
 
+        let helper = AuctionOrchestrator::with_identity_generator(
+            AuctionConfig::default(),
+            Arc::clone(&self.identity_generator),
+        );
+        let eligible_slots_by_provider = routed_eligible_slots(routed);
+        let normalized = helper.normalize_provider_responses_with_eligibility(
+            original_request,
+            &mut responses,
+            &eligible_slots_by_provider,
+        );
         let floor_prices = original_request
             .slots
             .iter()
             .filter_map(|slot| slot.floor_price.map(|floor| (slot.id.clone(), floor)))
             .collect::<HashMap<_, _>>();
-        let helper = AuctionOrchestrator::new(AuctionConfig::default());
         let local_winners = || helper.select_winning_bids(&responses, &floor_prices);
         let (mediator_response, winning_bids) = if let Some(mediator) = &self.mediator {
             let remaining_ms = remaining_budget_ms(auction_start, context.timeout_ms);
@@ -640,10 +723,17 @@ impl AuctionOrchestratorHarness {
                         "Planned mediator transport budget canonicalized to zero; using local ranking"
                     );
                     let winning_bids = local_winners();
+                    let decision_set = helper.build_decision_set(
+                        original_request,
+                        &normalized.outcomes,
+                        &winning_bids,
+                        true,
+                    );
                     return Ok(OrchestrationResult {
                         provider_responses: responses,
                         mediator_response: None,
                         winning_bids,
+                        decision_set,
                         total_time_ms: auction_start.elapsed().as_millis() as u64,
                         metadata: routing_metadata(routed.diagnostics().unroutable_bidder_count()),
                     });
@@ -746,10 +836,18 @@ impl AuctionOrchestratorHarness {
             "Auction routing diagnostics: unroutable_bidder_count={}",
             unroutable_bidder_count
         );
+        let mediation_failed = self.mediator.is_some() && mediator_response.is_none();
+        let decision_set = helper.build_decision_set(
+            original_request,
+            &normalized.outcomes,
+            &winning_bids,
+            mediation_failed,
+        );
         Ok(OrchestrationResult {
             provider_responses: responses,
             mediator_response,
             winning_bids,
+            decision_set,
             total_time_ms: auction_start.elapsed().as_millis() as u64,
             metadata: routing_metadata(unroutable_bidder_count),
         })
@@ -784,18 +882,6 @@ impl AuctionOrchestrator {
         }
     }
 
-    #[cfg(test)]
-    fn with_identity_generator(
-        config: AuctionConfig,
-        identity_generator: Arc<dyn AuctionIdentityGenerator>,
-    ) -> Self {
-        Self {
-            config,
-            providers: HashMap::new(),
-            identity_generator,
-        }
-    }
-
     /// Create the live orchestrator from one shared compiled auction plan.
     #[must_use]
     pub fn from_plan(plan: Arc<AuctionPlan>, mediator: Option<Arc<dyn AuctionProvider>>) -> Self {
@@ -816,13 +902,30 @@ impl AuctionOrchestrator {
             config: AuctionConfig::default(),
             #[cfg(test)]
             providers: HashMap::new(),
+            identity_generator: Arc::new(SystemAuctionIdentityGenerator),
         }
+    }
+
+    #[cfg(test)]
+    fn with_identity_generator(
+        config: AuctionConfig,
+        identity_generator: Arc<dyn AuctionIdentityGenerator>,
+    ) -> Self {
+        let mut orchestrator = Self::new(config);
+        orchestrator.identity_generator = identity_generator;
+        orchestrator
     }
 
     /// Return whether this orchestrator and another plan consumer share the same plan allocation.
     #[must_use]
     pub fn shares_plan(&self, plan: &Arc<AuctionPlan>) -> bool {
         Arc::ptr_eq(&self.plan, plan)
+    }
+
+    /// Return whether the compiled plan contains the named provider profile.
+    #[must_use]
+    pub fn has_profile(&self, profile_id: &str) -> bool {
+        self.plan.has_profile(profile_id)
     }
 
     /// Register an auction provider in the legacy parity harness.
@@ -844,15 +947,32 @@ impl AuctionOrchestrator {
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
     ) -> Result<OrchestrationResult, Report<TrustedServerError>> {
-        match self.dispatch_auction(request, context).await {
-            DispatchAuctionOutcome::Dispatched(dispatched) => Ok(self
-                .collect_dispatched_auction(dispatched, context.services, context)
+        match self
+            .resolve_dispatch_outcome(request, self.dispatch_auction(request, context).await)?
+        {
+            ResolvedDispatchOutcome::InFlight(dispatched) => Ok(self
+                .collect_dispatched_auction(*dispatched, context.services, context)
                 .await),
+            ResolvedDispatchOutcome::Complete(result) => Ok(*result),
+        }
+    }
+
+    /// Normalize a split dispatch result without starting any additional transport.
+    pub(crate) fn resolve_dispatch_outcome(
+        &self,
+        request: &AuctionRequest,
+        outcome: DispatchAuctionOutcome,
+    ) -> Result<ResolvedDispatchOutcome, Report<TrustedServerError>> {
+        match outcome {
+            DispatchAuctionOutcome::Dispatched(dispatched) => {
+                Ok(ResolvedDispatchOutcome::InFlight(Box::new(dispatched)))
+            }
             DispatchAuctionOutcome::DispatchFailed {
-                provider_responses,
+                mut provider_responses,
                 fatal_admission_error,
                 metadata,
                 elapsed_ms,
+                eligible_slots_by_provider,
                 ..
             } => {
                 if let Some(error) = fatal_admission_error {
@@ -860,17 +980,33 @@ impl AuctionOrchestrator {
                         message: "Planned auction admission failed".to_string(),
                     }));
                 }
-                Ok(OrchestrationResult {
-                    provider_responses,
-                    mediator_response: None,
-                    winning_bids: HashMap::new(),
-                    total_time_ms: elapsed_ms,
-                    metadata,
-                })
+                let normalized = self.normalize_provider_responses_with_eligibility(
+                    request,
+                    &mut provider_responses,
+                    &eligible_slots_by_provider,
+                );
+                let winning_bids = HashMap::new();
+                let decision_set =
+                    self.build_decision_set(request, &normalized.outcomes, &winning_bids, false);
+                Ok(ResolvedDispatchOutcome::Complete(Box::new(
+                    OrchestrationResult {
+                        provider_responses,
+                        mediator_response: None,
+                        winning_bids,
+                        decision_set,
+                        total_time_ms: elapsed_ms,
+                        metadata,
+                    },
+                )))
             }
             DispatchAuctionOutcome::NotStarted => {
                 if self.planned_providers.is_empty() {
-                    Ok(OrchestrationResult::no_bid())
+                    Ok(ResolvedDispatchOutcome::Complete(Box::new(
+                        OrchestrationResult::no_bid(
+                            request,
+                            AuctionSlotFailureReason::SlotNotEligible,
+                        ),
+                    )))
                 } else {
                     Err(Report::new(TrustedServerError::Auction {
                         message: "No planned provider request was started".to_string(),
@@ -880,6 +1016,7 @@ impl AuctionOrchestrator {
         }
     }
 
+    #[cfg(test)]
     fn provider_is_eligible_for_slot(
         &self,
         provider_name: &str,
@@ -894,6 +1031,7 @@ impl AuctionOrchestrator {
         })
     }
 
+    #[cfg(test)]
     fn eligible_slot_ids(&self, provider_name: &str, request: &AuctionRequest) -> HashSet<String> {
         request
             .slots
@@ -950,10 +1088,36 @@ impl AuctionOrchestrator {
         None
     }
 
+    #[cfg(test)]
     fn normalize_provider_responses(
         &self,
         request: &AuctionRequest,
         responses: &mut [AuctionResponse],
+    ) -> NormalizedProviderResponses {
+        let eligible_slots_by_provider = self
+            .config
+            .providers
+            .keys()
+            .map(super::plan::ProviderId::as_str)
+            .map(|provider| {
+                (
+                    provider.to_string(),
+                    self.eligible_slot_ids(provider, request),
+                )
+            })
+            .collect();
+        self.normalize_provider_responses_with_eligibility(
+            request,
+            responses,
+            &eligible_slots_by_provider,
+        )
+    }
+
+    fn normalize_provider_responses_with_eligibility(
+        &self,
+        request: &AuctionRequest,
+        responses: &mut [AuctionResponse],
+        eligible_slots_by_provider: &EligibleSlotsByProvider,
     ) -> NormalizedProviderResponses {
         let requested_slots: HashMap<&str, &super::types::AdSlot> = request
             .slots
@@ -965,7 +1129,10 @@ impl AuctionOrchestrator {
         let mut outcomes = Vec::new();
 
         for response in responses {
-            let eligible_slots = self.eligible_slot_ids(&response.provider, request);
+            let eligible_slots = eligible_slots_by_provider
+                .get(&response.provider)
+                .cloned()
+                .unwrap_or_default();
             let response_failure = Self::response_failure_reason(response);
             let mut upstream_counts = HashMap::<String, usize>::new();
             for bid in &response.bids {
@@ -1005,12 +1172,7 @@ impl AuctionOrchestrator {
                     slot.formats.iter().any(|format| {
                         format.width == bid.width
                             && format.height == bid.height
-                            && self
-                                .providers
-                                .get(&response.provider)
-                                .is_some_and(|provider| {
-                                    provider.supports_media_type(&format.media_type)
-                                })
+                            && format.media_type == super::types::MediaType::Banner
                     })
                 });
                 let upstream_id = bid.bid_id.as_deref();
@@ -1126,11 +1288,9 @@ impl AuctionOrchestrator {
                     );
                 }
 
-                let eligible_provider_count = self
-                    .config
-                    .provider_names()
+                let eligible_provider_count = outcomes
                     .iter()
-                    .filter(|provider| self.provider_is_eligible_for_slot(provider, slot))
+                    .filter(|outcome| outcome.slot == slot.id)
                     .count();
                 if eligible_provider_count == 0 {
                     return SlotAuctionDecisionV1::Failed {
@@ -1256,7 +1416,10 @@ impl AuctionOrchestrator {
         context: &AuctionContext<'_>,
     ) -> Result<OrchestrationResult, Report<TrustedServerError>> {
         if !self.enabled {
-            return Ok(OrchestrationResult::no_bid());
+            return Ok(OrchestrationResult::no_bid(
+                request,
+                AuctionSlotFailureReason::AuctionDisabled,
+            ));
         }
         #[cfg(not(test))]
         return self.run_planned_auction(request, context).await;
@@ -1267,21 +1430,8 @@ impl AuctionOrchestrator {
         #[cfg(test)]
         let start_time = Instant::now();
 
-        if !self.config.enabled {
-            return Ok(OrchestrationResult {
-                provider_responses: Vec::new(),
-                mediator_response: None,
-                winning_bids: HashMap::new(),
-                decision_set: AuctionDecisionSetV1::failed(
-                    request,
-                    AuctionSlotFailureReason::AuctionDisabled,
-                ),
-                total_time_ms: 0,
-                metadata: HashMap::new(),
-            });
-        }
-
-        // Auto-detect strategy based on mediator configuration
+        // Auto-detect strategy based on mediator configuration.
+        #[cfg(test)]
         let (strategy_name, result) = if self.config.has_mediator() {
             (
                 "parallel_mediation",
@@ -1336,44 +1486,64 @@ impl AuctionOrchestrator {
                     mediator.provider_name()
                 );
                 let remaining_ms = remaining_budget_ms(mediation_start, context.timeout_ms);
-                if remaining_ms == 0 {
+                let logical_budget_ms = remaining_ms.min(mediator.timeout_ms());
+                let transport_timeout_ms = context
+                    .services
+                    .backend()
+                    .canonicalize_transport_timeout_ms(logical_budget_ms, mediator.timeout_ms());
+                if logical_budget_ms == 0 || transport_timeout_ms == 0 {
                     log::warn!("Auction timeout exhausted during bidding phase; skipping mediator");
                     mediation_failed = true;
                 } else {
                     let mediator_context = AuctionContext {
                         settings: context.settings,
                         request: context.request,
-                        timeout_ms: context
-                            .services
-                            .backend()
-                            .canonicalize_transport_timeout_ms(remaining_ms, mediator.timeout_ms()),
+                        timeout_ms: logical_budget_ms,
+                        transport_timeout_ms,
                         provider_responses: Some(&provider_responses),
                         services: context.services,
                     };
                     let start_time = Instant::now();
                     let raw_response = match mediator.request_bids(request, &mediator_context).await
                     {
-                        Ok(ProviderRequestOutcome::Immediate(response)) => Some(response),
+                        Ok(ProviderRequestOutcome::Immediate(response)) => Some(
+                            canonical_provider_response(mediator.provider_name(), response),
+                        ),
                         Ok(ProviderRequestOutcome::Pending {
                             request: pending,
                             parse_state,
                         }) => match mediator_context.services.http_client().wait(pending).await {
-                            Ok(platform_response) => mediator
-                                .parse_response_with_context_and_state(
-                                    platform_response,
-                                    start_time.elapsed().as_millis() as u64,
-                                    request,
-                                    &mediator_context,
-                                    parse_state.as_deref(),
-                                )
-                                .await
-                                .inspect_err(|error| {
-                                    log::warn!(
-                                        "Mediator '{}' parse failed: {error:?}",
-                                        mediator.provider_name()
-                                    );
-                                })
-                                .ok(),
+                            Ok(platform_response) => {
+                                let response_time_ms = start_time.elapsed().as_millis() as u64;
+                                if AuctionDeadlinePolicy::for_runtime(context.services)
+                                    .rejects_late_completion(mediation_start, context.timeout_ms)
+                                {
+                                    None
+                                } else {
+                                    mediator
+                                        .parse_response_with_context_and_state(
+                                            platform_response,
+                                            response_time_ms,
+                                            request,
+                                            &mediator_context,
+                                            parse_state.as_deref(),
+                                        )
+                                        .await
+                                        .inspect_err(|error| {
+                                            log::warn!(
+                                                "Mediator '{}' parse failed: {error:?}",
+                                                mediator.provider_name()
+                                            );
+                                        })
+                                        .ok()
+                                        .map(|response| {
+                                            canonical_provider_response(
+                                                mediator.provider_name(),
+                                                response,
+                                            )
+                                        })
+                                }
+                            }
                             Err(error) => {
                                 log::warn!(
                                     "Mediator '{}' request failed: {error:?}",
@@ -1518,7 +1688,6 @@ impl AuctionOrchestrator {
         let mut backend_to_provider: HashMap<String, ProviderLaunchState> = HashMap::new();
         let mut pending_requests: Vec<PlatformPendingRequest> = Vec::new();
         let mut responses = Vec::new();
-
         for provider_name in &provider_names {
             let provider = match self.providers.get(*provider_name) {
                 Some(p) => p,
@@ -1553,17 +1722,19 @@ impl AuctionOrchestrator {
                 continue;
             }
 
-            // Immediate providers have no backend name and must remain eligible
-            // to return a synchronous result. Pending providers are still
-            // guarded before dispatch when their name can be predicted.
-            let predicted_backend_name = provider.backend_name(context.services, effective_timeout);
-            if let Some(backend_name) = predicted_backend_name.as_ref()
-                && backend_to_provider.contains_key(backend_name)
+            // Pre-launch guard: `request_bids` fires the outbound send, and
+            // discarding the returned pending handle afterwards does not retract
+            // it. If another provider this auction already claimed the predicted
+            // backend name, skip *before* dispatching so a duplicate never hits
+            // the wire. The post-launch check below stays as a defense for a
+            // provider that resolves to an unexpected name.
+            if let Some(predicted) = provider.backend_name(context.services, effective_timeout)
+                && backend_to_provider.contains_key(&predicted)
             {
                 log::warn!(
                     "Provider '{}' predicted backend name '{}' already belongs to another provider; skipping launch",
                     provider.provider_name(),
-                    backend_name,
+                    predicted,
                 );
                 responses.push(provider_launch_failed_response(provider.provider_name(), 0));
                 continue;
@@ -1591,14 +1762,13 @@ impl AuctionOrchestrator {
                     parse_state,
                 }) => {
                     let request_backend_name = pending.backend_name().map(str::to_string).or_else(|| {
-                        if let Some(backend_name) = predicted_backend_name.as_ref() {
+                        provider.backend_name(context.services, effective_timeout).inspect(|name| {
                             log::warn!(
                                 "Provider '{}' pending request returned no backend name; using predicted name '{}'",
                                 provider.provider_name(),
-                                backend_name,
+                                name,
                             );
-                        }
-                        predicted_backend_name.clone()
+                        })
                     });
                     let Some(request_backend_name) = request_backend_name else {
                         log::warn!(
@@ -1611,6 +1781,10 @@ impl AuctionOrchestrator {
                         ));
                         continue;
                     };
+                    // Post-launch defense: a resolved backend name already
+                    // claimed by another provider would misattribute that
+                    // provider's response, so fail this launch attributably
+                    // instead of overwriting the correlation entry.
                     if backend_to_provider.contains_key(&request_backend_name) {
                         log::warn!(
                             "Provider '{}' resolved backend name '{}' already belongs to another provider; skipping launch",
@@ -1682,7 +1856,7 @@ impl AuctionOrchestrator {
         // some adapters, buffers the selected response body before returning.
         // Backend first-byte and between-bytes timeouts are capped to the
         // remaining auction budget in Phase 1. They are transport timers, not
-        // absolute wall-clock limits, so connection setup and byte-trickling
+        // absolute wall-clock limits, so connection setup and byte trickling
         // remain bounded operational risks rather than strict deadline proof.
         let mut remaining = pending_requests;
 
@@ -1934,6 +2108,231 @@ impl AuctionOrchestrator {
             .collect()
     }
 
+    async fn dispatch_planned_auction(
+        &self,
+        request: &AuctionRequest,
+        context: &AuctionContext<'_>,
+    ) -> DispatchAuctionOutcome {
+        let plan = &self.plan;
+        if self.planned_providers.is_empty() {
+            return DispatchAuctionOutcome::NotStarted;
+        }
+        if self.planned_providers.len() > 1
+            && !context.services.http_client().supports_concurrent_fanout()
+        {
+            log::warn!(
+                "{} planned auction providers configured on a runtime without concurrent fanout",
+                self.planned_providers.len()
+            );
+            return DispatchAuctionOutcome::NotStarted;
+        }
+
+        let auction_start = Instant::now();
+        let routed = route_auction(
+            request.clone(),
+            context.request,
+            plan,
+            context.services.client_info().client_ip,
+        );
+        let eligible_slots_by_provider = routed_eligible_slots(&routed);
+        let planned_unused_bidder_params = routed
+            .inputs()
+            .iter()
+            .map(|input| {
+                (
+                    input.provider_id().as_str().to_string(),
+                    unused_bidder_params_count(
+                        &plan
+                            .provider(input.provider_id())
+                            .expect("should find routed provider in compiled plan")
+                            .profile,
+                        input,
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let planned_unroutable_bidder_count = routed.diagnostics().unroutable_bidder_count();
+        // A zero request budget is terminal before signing admission. In the
+        // split path, signer initialization would otherwise read config and
+        // secret stores even though every provider is materialized as timeout.
+        let signer_result = if context.timeout_ms == 0 {
+            Ok(None)
+        } else {
+            plan.signing_enabled()
+                .then(|| RequestSigner::from_services(context.services))
+                .transpose()
+        };
+        let signer = match signer_result {
+            Ok(signer) => signer,
+            Err(error) => {
+                log::warn!("Planned auction signer initialization failed: {error:?}");
+                let mut provider_responses = routed
+                    .skipped_no_eligible_provider_ids()
+                    .iter()
+                    .map(|id| provider_skipped_response(id.as_str()))
+                    .chain(routed.inputs().iter().map(|input| {
+                        materialize_planned_response(
+                            provider_launch_failed_response(input.provider_id().as_str(), 0),
+                            unused_bidder_params_count(
+                                &plan
+                                    .provider(input.provider_id())
+                                    .expect("should find routed provider in compiled plan")
+                                    .profile,
+                                input,
+                            ),
+                        )
+                    }))
+                    .collect::<Vec<_>>();
+                let provider_order = plan
+                    .providers()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, provider)| (provider.id.as_str(), index))
+                    .collect::<HashMap<_, _>>();
+                provider_responses.sort_by_key(|response| {
+                    provider_order
+                        .get(response.provider.as_str())
+                        .copied()
+                        .unwrap_or(usize::MAX)
+                });
+                return DispatchAuctionOutcome::DispatchFailed {
+                    request: request.clone(),
+                    provider_responses,
+                    fatal_admission_error: Some(error),
+                    metadata: routing_metadata(planned_unroutable_bidder_count),
+                    elapsed_ms: auction_start.elapsed().as_millis() as u64,
+                    eligible_slots_by_provider,
+                };
+            }
+        };
+        let mut completed_responses = routed
+            .skipped_no_eligible_provider_ids()
+            .iter()
+            .map(|id| provider_skipped_response(id.as_str()))
+            .collect::<Vec<_>>();
+        let planned_provider_order = plan
+            .providers()
+            .iter()
+            .enumerate()
+            .map(|(index, provider)| (provider.id.as_str().to_string(), index))
+            .collect::<HashMap<_, _>>();
+        let mut pending_requests = Vec::new();
+        let mut planned_backend_to_provider = HashMap::new();
+        let mut reserved_backend_names = HashSet::new();
+        let mut immediate_response_count = 0usize;
+
+        for input in routed.inputs() {
+            let Some(provider) = self
+                .planned_providers
+                .iter()
+                .find(|provider| provider.provider_name() == input.provider_id().as_str())
+                .cloned()
+            else {
+                completed_responses.push(provider_launch_failed_response(
+                    input.provider_id().as_str(),
+                    0,
+                ));
+                continue;
+            };
+            let logical_budget_ms =
+                remaining_budget_ms(auction_start, context.timeout_ms).min(provider.timeout_ms());
+            if logical_budget_ms == 0 {
+                completed_responses.push(provider_timeout_response(provider.provider_name(), 0));
+                continue;
+            }
+            let transport_timeout_ms = context
+                .services
+                .backend()
+                .canonicalize_transport_timeout_ms(logical_budget_ms, provider.timeout_ms());
+            if transport_timeout_ms == 0 {
+                completed_responses.push(provider_timeout_response(provider.provider_name(), 0));
+                continue;
+            }
+            let started_at = Instant::now();
+            match provider
+                .request_bids_routed(
+                    input,
+                    &routed,
+                    logical_budget_ms,
+                    transport_timeout_ms,
+                    signer.as_ref(),
+                    context.services,
+                    &mut reserved_backend_names,
+                )
+                .await
+            {
+                Ok(ProviderRequestOutcome::Pending {
+                    request: pending,
+                    parse_state,
+                }) => {
+                    let Some(backend_name) = pending.backend_name().map(str::to_string) else {
+                        completed_responses.push(provider_launch_failed_response(
+                            provider.provider_name(),
+                            started_at.elapsed().as_millis() as u64,
+                        ));
+                        continue;
+                    };
+                    match planned_backend_to_provider.entry(backend_name.clone()) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(PlannedLaunchState {
+                                provider,
+                                started_at,
+                                parse_state,
+                            });
+                            pending_requests.push(pending.with_backend_name(backend_name));
+                        }
+                        Entry::Occupied(_) => {
+                            completed_responses.push(provider_launch_failed_response(
+                                provider.provider_name(),
+                                started_at.elapsed().as_millis() as u64,
+                            ))
+                        }
+                    }
+                }
+                Ok(ProviderRequestOutcome::Immediate(response)) => {
+                    immediate_response_count += 1;
+                    completed_responses.push(canonical_provider_response(
+                        provider.provider_name(),
+                        response,
+                    ));
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Planned provider '{}' failed to dispatch: {error:?}",
+                        provider.provider_name()
+                    );
+                    completed_responses.push(provider_launch_failed_response(
+                        provider.provider_name(),
+                        started_at.elapsed().as_millis() as u64,
+                    ));
+                }
+            }
+        }
+
+        if pending_requests.is_empty()
+            && immediate_response_count == 0
+            && completed_responses.is_empty()
+        {
+            return DispatchAuctionOutcome::NotStarted;
+        }
+
+        DispatchAuctionOutcome::Dispatched(DispatchedAuction {
+            pending_requests,
+            backend_to_provider: HashMap::new(),
+            planned_backend_to_provider,
+            completed_responses,
+            auction_start,
+            timeout_ms: context.timeout_ms,
+            floor_prices: self.floor_prices_by_slot(request),
+            provider_request_context: Box::new(snapshot_context_request(context.request)),
+            request: request.clone(),
+            planned_unused_bidder_params,
+            planned_unroutable_bidder_count,
+            planned_provider_order,
+            eligible_slots_by_provider,
+        })
+    }
+
     /// Dispatch SSP bid requests without blocking WASM.
     ///
     /// Calls each enabled provider's [`AuctionProvider::request_bids`] (which
@@ -1950,22 +2349,45 @@ impl AuctionOrchestrator {
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
-    ) -> DispatchedAuction {
-        let provider_names = self.config.provider_names();
-        let auction_start = Instant::now();
-        let mut backend_to_provider: HashMap<String, ProviderLaunchState> = HashMap::new();
-        let mut pending_requests: Vec<PlatformPendingRequest> = Vec::new();
-        let mut completed_responses: Vec<AuctionResponse> = Vec::new();
-        let mut immediate_response_count = 0usize;
+    ) -> DispatchAuctionOutcome {
+        if !self.enabled {
+            return DispatchAuctionOutcome::NotStarted;
+        }
+        if !cfg!(test) || self.plan_backed {
+            return self.dispatch_planned_auction(request, context).await;
+        }
+        #[cfg(test)]
+        let provider_names = self
+            .config
+            .providers
+            .keys()
+            .map(super::plan::ProviderId::as_str)
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        if provider_names.is_empty() {
+            return DispatchAuctionOutcome::NotStarted;
+        }
+        #[cfg(test)]
+        let eligible_slots_by_provider = provider_names
+            .iter()
+            .map(|provider| {
+                (
+                    (*provider).to_string(),
+                    self.eligible_slot_ids(provider, request),
+                )
+            })
+            .collect::<EligibleSlotsByProvider>();
+        #[cfg(not(test))]
+        let eligible_slots_by_provider = EligibleSlotsByProvider::new();
 
         // Mirror run_providers_parallel: reject multi-provider fan-out before
         // any request launches when the platform executes `send_async` eagerly
         // (e.g. Cloudflare Workers, Spin). Sequential execution would accrue
         // the sum of provider latencies before the origin fetch and then fail
         // collection with empty bids.
-        let fanout_supported = provider_names.len() <= 1
-            || context.services.http_client().supports_concurrent_fanout();
-        if !fanout_supported {
+        #[cfg(test)]
+        if provider_names.len() > 1 && !context.services.http_client().supports_concurrent_fanout()
+        {
             log::warn!(
                 "{} auction providers configured, but this platform's HTTP client \
                  executes requests sequentially — skipping initial-page auction \
@@ -1973,20 +2395,46 @@ impl AuctionOrchestrator {
                  concurrent fan-out support",
                 provider_names.len(),
             );
-            completed_responses.extend(
-                provider_names
+            return DispatchAuctionOutcome::DispatchFailed {
+                request: request.clone(),
+                provider_responses: provider_names
                     .iter()
-                    .map(|provider| provider_launch_failed_response(provider, 0)),
-            );
+                    .map(|provider| provider_launch_failed_response(provider, 0))
+                    .collect(),
+                fatal_admission_error: None,
+                metadata: HashMap::new(),
+                elapsed_ms: 0,
+                eligible_slots_by_provider,
+            };
         }
 
-        for provider_name in provider_names.iter().filter(|_| fanout_supported) {
-            let provider = match self.providers.get(provider_name) {
+        let auction_start = Instant::now();
+        #[cfg(test)]
+        let mut backend_to_provider: HashMap<String, ProviderLaunchState> = HashMap::new();
+        #[cfg(not(test))]
+        let backend_to_provider: HashMap<String, ProviderLaunchState> = HashMap::new();
+        #[cfg(test)]
+        let mut pending_requests: Vec<PlatformPendingRequest> = Vec::new();
+        #[cfg(not(test))]
+        let pending_requests: Vec<PlatformPendingRequest> = Vec::new();
+        #[cfg(test)]
+        let mut completed_responses: Vec<AuctionResponse> = Vec::new();
+        #[cfg(not(test))]
+        let completed_responses: Vec<AuctionResponse> = Vec::new();
+        #[cfg(test)]
+        let mut immediate_response_count = 0usize;
+        #[cfg(not(test))]
+        let immediate_response_count = 0usize;
+
+        #[cfg(test)]
+        for provider_name in &provider_names {
+            let provider = match self.providers.get(*provider_name) {
                 Some(p) => p,
                 None => {
                     // lgtm[rust/cleartext-logging]
                     // The provider name is a static config identifier (e.g. "prebid"), not a secret.
                     log::warn!("Provider '{}' not registered, skipping", provider_name);
+                    completed_responses.push(provider_launch_failed_response(provider_name, 0));
                     continue;
                 }
             };
@@ -2020,17 +2468,17 @@ impl AuctionOrchestrator {
                 continue;
             }
 
-            // Do not require a backend name before dispatch: an immediate
-            // provider intentionally has none. Guard predicted names when
-            // available; pending requests without either name fail below.
-            let predicted_backend_name = provider.backend_name(context.services, effective_timeout);
-            if let Some(backend_name) = predicted_backend_name.as_ref()
-                && backend_to_provider.contains_key(backend_name)
+            // Pre-launch guard: skip before `request_bids` fires the outbound
+            // send when another provider this auction already claimed the
+            // predicted backend name (see the parallel path). Dropping the
+            // pending handle afterwards would not retract the request.
+            if let Some(predicted) = provider.backend_name(context.services, effective_timeout)
+                && backend_to_provider.contains_key(&predicted)
             {
                 log::warn!(
                     "Provider '{}' predicted backend name '{}' already belongs to another provider; skipping dispatch",
                     provider.provider_name(),
-                    backend_name,
+                    predicted,
                 );
                 completed_responses
                     .push(provider_launch_failed_response(provider.provider_name(), 0));
@@ -2052,16 +2500,10 @@ impl AuctionOrchestrator {
                     request: pending,
                     parse_state,
                 }) => {
-                    let backend_name = pending.backend_name().map(str::to_string).or_else(|| {
-                        if let Some(backend_name) = predicted_backend_name.as_ref() {
-                            log::warn!(
-                                "Provider '{}' pending request returned no backend name; using predicted name '{}'",
-                                provider.provider_name(),
-                                backend_name,
-                            );
-                        }
-                        predicted_backend_name.clone()
-                    });
+                    let backend_name = pending
+                        .backend_name()
+                        .map(str::to_string)
+                        .or_else(|| provider.backend_name(context.services, effective_timeout));
                     let Some(backend_name) = backend_name else {
                         log::warn!(
                             "Provider '{}' pending request has no backend name; response cannot be correlated",
@@ -2073,9 +2515,14 @@ impl AuctionOrchestrator {
                         ));
                         continue;
                     };
+                    // Post-launch defense: a resolved backend name already
+                    // claimed by another provider would misattribute that
+                    // provider's response, so fail this dispatch attributably
+                    // instead of overwriting the correlation entry.
                     if backend_to_provider.contains_key(&backend_name) {
                         log::warn!(
-                            "Provider '{}' resolved backend name '{}' already belongs to another provider; skipping dispatch",
+                            "Provider '{}' resolved to backend name '{}' already claimed by another \
+                             provider this auction; skipping launch to avoid response misattribution",
                             provider.provider_name(),
                             backend_name,
                         );
@@ -2125,6 +2572,21 @@ impl AuctionOrchestrator {
             }
         }
 
+        if pending_requests.is_empty() && immediate_response_count == 0 {
+            return if completed_responses.is_empty() {
+                DispatchAuctionOutcome::NotStarted
+            } else {
+                DispatchAuctionOutcome::DispatchFailed {
+                    request: request.clone(),
+                    provider_responses: completed_responses,
+                    fatal_admission_error: None,
+                    metadata: HashMap::new(),
+                    elapsed_ms: auction_start.elapsed().as_millis() as u64,
+                    eligible_slots_by_provider,
+                }
+            };
+        }
+
         log::info!(
             "Dispatched {} SSP request(s) with {} immediate response(s) (timeout: {}ms)",
             pending_requests.len(),
@@ -2132,7 +2594,7 @@ impl AuctionOrchestrator {
             context.timeout_ms
         );
 
-        DispatchedAuction {
+        DispatchAuctionOutcome::Dispatched(DispatchedAuction {
             pending_requests,
             backend_to_provider,
             planned_backend_to_provider: HashMap::new(),
@@ -2142,7 +2604,11 @@ impl AuctionOrchestrator {
             floor_prices: self.floor_prices_by_slot(request),
             provider_request_context: Box::new(snapshot_context_request(context.request)),
             request: request.clone(),
-        }
+            planned_unused_bidder_params: HashMap::new(),
+            planned_unroutable_bidder_count: 0,
+            planned_provider_order: HashMap::new(),
+            eligible_slots_by_provider,
+        })
     }
 
     /// Collect bid responses from a previously-dispatched auction.
@@ -2174,6 +2640,7 @@ impl AuctionOrchestrator {
             planned_unused_bidder_params,
             planned_unroutable_bidder_count,
             planned_provider_order,
+            eligible_slots_by_provider,
         } = dispatched;
 
         log::info!(
@@ -2265,31 +2732,45 @@ impl AuctionOrchestrator {
                             )
                             .await
                         {
-                            Ok(auction_response) => {
-                                log::info!(
-                                    "Provider '{}' returned {} bids ({}ms)",
-                                    auction_response.provider,
-                                    auction_response.bids.len(),
-                                    auction_response.response_time_ms
-                                );
-                                responses.push(canonical_provider_response(
-                                    &state.provider_name,
-                                    auction_response,
-                                ));
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "Provider '{}' parse failed: {:?}",
-                                    state.provider_name,
-                                    e
-                                );
-                                responses.push(provider_error_response(
-                                    &state.provider_name,
-                                    response_time_ms,
-                                    ERROR_TYPE_PARSE_RESPONSE,
-                                    &e,
-                                ));
-                            }
+                            Ok(auction_response) => responses.push(canonical_provider_response(
+                                &state.provider_name,
+                                auction_response,
+                            )),
+                            Err(error) => responses.push(provider_error_response(
+                                &state.provider_name,
+                                response_time_ms,
+                                ERROR_TYPE_PARSE_RESPONSE,
+                                &error,
+                            )),
+                        }
+                    } else if let Some(state) = planned_backend_to_provider.remove(&backend_name) {
+                        let response_time_ms = state.started_at.elapsed().as_millis() as u64;
+                        if deadline_policy.rejects_late_completion(auction_start, timeout_ms) {
+                            responses.push(provider_timeout_response(
+                                state.provider.provider_name(),
+                                response_time_ms,
+                            ));
+                            continue;
+                        }
+                        match state
+                            .provider
+                            .parse_response_with_state(
+                                platform_response,
+                                response_time_ms,
+                                state.parse_state.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(response) => responses.push(canonical_provider_response(
+                                state.provider.provider_name(),
+                                response,
+                            )),
+                            Err(error) => responses.push(provider_error_response(
+                                state.provider.provider_name(),
+                                response_time_ms,
+                                ERROR_TYPE_PARSE_RESPONSE,
+                                &error,
+                            )),
                         }
                     } else {
                         log::warn!(
@@ -2363,24 +2844,65 @@ impl AuctionOrchestrator {
             ));
         }
         backend_to_provider.clear();
-        let normalized = self.normalize_provider_responses(&request, &mut responses);
+        for state in planned_backend_to_provider.into_values() {
+            responses.push(provider_timeout_response(
+                state.provider.provider_name(),
+                state.started_at.elapsed().as_millis() as u64,
+            ));
+        }
+        for response in &mut responses {
+            if let Some(&count) = planned_unused_bidder_params.get(response.provider.as_str()) {
+                *response = materialize_planned_response(response.clone(), count);
+            }
+        }
+        if !planned_provider_order.is_empty() {
+            responses.sort_by_key(|response| {
+                planned_provider_order
+                    .get(response.provider.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            });
+        }
+
+        let normalized = self.normalize_provider_responses_with_eligibility(
+            &request,
+            &mut responses,
+            &eligible_slots_by_provider,
+        );
+
+        #[cfg(not(test))]
+        let mediator = self.mediator.as_ref();
+        #[cfg(test)]
+        let mediator = self.mediator.as_ref().or_else(|| {
+            self.config
+                .mediator
+                .as_ref()
+                .and_then(|name| self.providers.get(name))
+        });
         let mut mediation_failed = false;
         let mut mediator_response = None;
         let mut mediated_winners = None;
 
-        if let Some(mediator_name) = &self.config.mediator {
-            if let Some(mediator) = self.providers.get(mediator_name.as_str()) {
-                let remaining = remaining_budget_ms(auction_start, timeout_ms);
-                if remaining == 0 {
+        if let Some(mediator) = mediator {
+            let remaining = remaining_budget_ms(auction_start, timeout_ms);
+            let logical_budget_ms = remaining.min(mediator.timeout_ms());
+            if logical_budget_ms == 0 {
+                log::warn!(
+                    "A_deadline exhausted before mediator '{}' — using direct fallback",
+                    mediator.provider_name(),
+                );
+                mediation_failed = true;
+            } else {
+                let transport_timeout_ms = services
+                    .backend()
+                    .canonicalize_transport_timeout_ms(logical_budget_ms, mediator.timeout_ms());
+                if transport_timeout_ms == 0 {
                     log::warn!(
-                        "A_deadline exhausted before mediator '{}' — using direct fallback",
+                        "Mediator '{}' transport budget canonicalized to zero — using direct fallback",
                         mediator.provider_name(),
                     );
                     mediation_failed = true;
                 } else {
-                    let mediator_timeout = services
-                        .backend()
-                        .canonicalize_transport_timeout_ms(remaining, mediator.timeout_ms());
                     let mediator_start = Instant::now();
                     let placeholder = http::Request::builder()
                         .uri(crate::auction::types::MEDIATOR_PLACEHOLDER_URL)
@@ -2389,46 +2911,75 @@ impl AuctionOrchestrator {
                     let mediator_context = AuctionContext {
                         settings: context.settings,
                         request: &placeholder,
-                        timeout_ms: mediator_timeout,
+                        timeout_ms: logical_budget_ms,
+                        transport_timeout_ms,
                         provider_responses: Some(&responses),
                         services: context.services,
                     };
-                    let raw_response =
-                        match mediator.request_bids(&request, &mediator_context).await {
-                            Ok(ProviderRequestOutcome::Immediate(response)) => Some(response),
-                            Ok(ProviderRequestOutcome::Pending {
-                                request: pending,
-                                parse_state,
-                            }) => match services.http_client().wait(pending).await {
-                                Ok(platform_response) => mediator
-                                    .parse_response_with_context_and_state(
-                                        platform_response,
-                                        mediator_start.elapsed().as_millis() as u64,
-                                        &request,
-                                        &mediator_context,
-                                        parse_state.as_deref(),
-                                    )
-                                    .await
-                                    .inspect_err(|error| {
-                                        log::warn!(
-                                            "Mediator '{}' parse failed: {error:?}",
-                                            mediator.provider_name()
-                                        );
-                                    })
-                                    .ok(),
-                                Err(error) => {
-                                    log::warn!("Mediator request failed: {error:?}");
+                    let raw_response = match mediator
+                        .request_bids(&request, &mediator_context)
+                        .await
+                    {
+                        Ok(ProviderRequestOutcome::Immediate(response)) => Some(
+                            canonical_provider_response(mediator.provider_name(), response),
+                        ),
+                        Ok(ProviderRequestOutcome::Pending {
+                            request: pending,
+                            parse_state,
+                        }) => match services.http_client().wait(pending).await {
+                            Ok(platform_response) => {
+                                let response_time_ms = mediator_start.elapsed().as_millis() as u64;
+                                if deadline_policy
+                                    .rejects_late_completion(auction_start, timeout_ms)
+                                {
+                                    log::warn!(
+                                        "Mediator '{}' completed after the hard auction deadline; using direct fallback ({}ms)",
+                                        mediator.provider_name(),
+                                        response_time_ms,
+                                    );
                                     None
+                                } else {
+                                    mediator
+                                        .parse_response_with_context_and_state(
+                                            platform_response,
+                                            response_time_ms,
+                                            &request,
+                                            &mediator_context,
+                                            parse_state.as_deref(),
+                                        )
+                                        .await
+                                        .inspect_err(|error| {
+                                            log::warn!(
+                                                "Mediator '{}' parse failed: {error:?}",
+                                                mediator.provider_name(),
+                                            );
+                                        })
+                                        .ok()
+                                        .map(|response| {
+                                            canonical_provider_response(
+                                                mediator.provider_name(),
+                                                response,
+                                            )
+                                        })
                                 }
-                            },
+                            }
                             Err(error) => {
                                 log::warn!(
-                                    "Mediator '{}' failed to dispatch: {error:?}",
-                                    mediator.provider_name()
+                                    "Mediator '{}' request failed: {error:?}",
+                                    mediator.provider_name(),
                                 );
                                 None
                             }
-                        };
+                        },
+                        Err(error) => {
+                            log::warn!(
+                                "Mediator '{}' failed to dispatch: {error:?}",
+                                mediator.provider_name(),
+                            );
+                            None
+                        }
+                    };
+
                     if let Some(raw_response) = raw_response {
                         mediator_response = Some(raw_response.clone());
                         match Self::resolve_mediator_candidates(
@@ -2445,15 +2996,18 @@ impl AuctionOrchestrator {
                                     Some(self.apply_floor_prices(selected, &floor_prices));
                                 mediator_response = Some(resolved);
                             }
-                            Err(()) => mediation_failed = true,
+                            Err(()) => {
+                                log::warn!(
+                                    "Mediator '{}' returned invalid candidate provenance",
+                                    mediator.provider_name(),
+                                );
+                                mediation_failed = true;
+                            }
                         }
                     } else {
                         mediation_failed = true;
                     }
                 }
-            } else {
-                log::warn!("Mediator '{}' not registered", mediator_name);
-                mediation_failed = true;
             }
         }
 
@@ -2501,11 +3055,12 @@ pub struct OrchestrationResult {
 }
 
 impl OrchestrationResult {
-    fn no_bid() -> Self {
+    pub(crate) fn no_bid(request: &AuctionRequest, reason: AuctionSlotFailureReason) -> Self {
         Self {
             provider_responses: Vec::new(),
             mediator_response: None,
             winning_bids: HashMap::new(),
+            decision_set: AuctionDecisionSetV1::failed(request, reason),
             total_time_ms: 0,
             metadata: HashMap::new(),
         }
@@ -2543,9 +3098,14 @@ mod tests {
     use web_time::Instant;
 
     use crate::auction::config::AuctionConfig;
-    use crate::auction::provider::{
-        AuctionProvider, ProviderRequestOutcome, ProviderSlotDisposition,
+    use crate::auction::orchestrator::DispatchAuctionOutcome;
+    use crate::auction::plan::{
+        AuctionPlan, AuctionPlanConfig, NotificationConfig, ProviderConfig, ProviderId, RoutingMode,
     };
+    use crate::auction::provider::{
+        AuctionProvider, GenericOpenRtbProvider, ProviderRequestOutcome, ProviderSlotDisposition,
+    };
+    use crate::auction::routing::{RoutingDiagnostics, route_auction};
     use crate::auction::test_support::create_test_auction_context;
     use crate::auction::types::{
         AdFormat, AdSlot, ApsRendererV1, ApsTagType, AuctionContext, AuctionDropReason,
@@ -2566,11 +3126,548 @@ mod tests {
     };
     use crate::test_support::tests::crate_test_settings_str;
     use error_stack::{Report, ResultExt};
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use super::{AuctionIdentityGenerator, AuctionOrchestrator};
+    use super::{
+        AuctionIdentityGenerator, AuctionOrchestrator, AuctionOrchestratorHarness,
+        DispatchedAuction, ERROR_TYPE_TIMEOUT, OrchestrationResult,
+    };
+
+    fn expect_dispatched(outcome: DispatchAuctionOutcome) -> DispatchedAuction {
+        match outcome {
+            DispatchAuctionOutcome::Dispatched(dispatched) => dispatched,
+            DispatchAuctionOutcome::NotStarted => panic!("auction should dispatch"),
+            DispatchAuctionOutcome::DispatchFailed { .. } => {
+                panic!("auction dispatch should not fail")
+            }
+        }
+    }
+
+    fn planned_config(providers: &[(&str, RoutingMode)], signing: bool) -> AuctionPlanConfig {
+        AuctionPlanConfig {
+            timeout_ms: 777,
+            providers: providers
+                .iter()
+                .map(|(id, routing)| {
+                    (
+                        ProviderId::from_str(id).expect("should parse fictional provider ID"),
+                        ProviderConfig {
+                            protocol: "openrtb-2.6".to_string(),
+                            profile: "standard".to_string(),
+                            endpoint: "https://example.test/openrtb".to_string(),
+                            timeout_ms: Some(1_000),
+                            routing: *routing,
+                            notifications: Default::default(),
+                            profile_config: serde_json::json!({}),
+                        },
+                    )
+                })
+                .collect(),
+            bidders: BTreeMap::new(),
+            mediator: None,
+            request_signing: signing.then(|| crate::settings::RequestSigning {
+                enabled: true,
+                config_store_id: "fictional-config-store".to_string(),
+                secret_store_id: "fictional-secret-store".to_string(),
+            }),
+        }
+    }
+
+    fn planned_prebid_config(
+        providers: &[(&str, serde_json::Value, NotificationConfig)],
+    ) -> AuctionPlanConfig {
+        AuctionPlanConfig {
+            timeout_ms: 777,
+            providers: providers
+                .iter()
+                .map(|(id, profile_config, notifications)| {
+                    (
+                        ProviderId::from_str(id).expect("should parse fictional provider ID"),
+                        ProviderConfig {
+                            protocol: "openrtb-2.6".to_string(),
+                            profile: "prebid-server".to_string(),
+                            endpoint: format!("https://{id}.example.test/openrtb"),
+                            timeout_ms: Some(1_000),
+                            routing: RoutingMode::AllEligible,
+                            notifications: notifications.clone(),
+                            profile_config: profile_config.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            bidders: BTreeMap::new(),
+            mediator: None,
+            request_signing: None,
+        }
+    }
+
+    fn planned_aps_config() -> AuctionPlanConfig {
+        planned_aps_instances_config(&[(
+            "aps-instance",
+            serde_json::json!({"account_id": "example-account"}),
+            NotificationConfig::default(),
+        )])
+    }
+
+    fn planned_aps_instances_config(
+        providers: &[(&str, serde_json::Value, NotificationConfig)],
+    ) -> AuctionPlanConfig {
+        AuctionPlanConfig {
+            timeout_ms: 777,
+            providers: providers
+                .iter()
+                .map(|(id, profile_config, notifications)| {
+                    (
+                        ProviderId::from_str(id).expect("should parse fictional provider ID"),
+                        ProviderConfig {
+                            protocol: "openrtb-2.6".to_string(),
+                            profile: "aps".to_string(),
+                            endpoint: "https://aps.example/e/pb/bid".to_string(),
+                            timeout_ms: Some(1_000),
+                            routing: RoutingMode::AllEligible,
+                            notifications: notifications.clone(),
+                            profile_config: profile_config.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            bidders: BTreeMap::new(),
+            mediator: None,
+            request_signing: None,
+        }
+    }
+
+    fn planned_request() -> AuctionRequest {
+        AuctionRequest {
+            id: "fictional-auction".to_string(),
+            slots: vec![AdSlot {
+                id: "fictional-slot".to_string(),
+                formats: vec![AdFormat {
+                    media_type: MediaType::Banner,
+                    width: 300,
+                    height: 250,
+                }],
+                floor_price: Some(1.0),
+                targeting: HashMap::new(),
+                bidders: HashMap::new(),
+            }],
+            publisher: PublisherInfo {
+                domain: "publisher.example".to_string(),
+                page_url: Some("https://publisher.example/article".to_string()),
+            },
+            user: UserInfo {
+                id: None,
+                consent: None,
+                eids: None,
+            },
+            device: None,
+            site: None,
+            context: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_from_plan_is_a_no_work_kill_switch_for_sync_and_split_paths() {
+        let plan = Arc::new(
+            AuctionPlan::compile(planned_config(
+                &[("provider-a", RoutingMode::AllEligible)],
+                false,
+            ))
+            .expect("should compile plan")
+            .with_enabled(false),
+        );
+        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+        let http = Arc::new(StubHttpClient::new());
+        let services = build_services_with_http_client(Arc::clone(&http) as Arc<_>);
+        let settings = create_test_settings();
+        let inbound = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 777,
+            transport_timeout_ms: 777,
+            provider_responses: None,
+            services: &services,
+        };
+        let request = planned_request();
+
+        let result = orchestrator
+            .run_auction(&request, &context)
+            .await
+            .expect("disabled auction should complete as no-bid");
+        assert!(result.provider_responses.is_empty());
+        assert!(result.winning_bids.is_empty());
+        assert!(matches!(
+            orchestrator.dispatch_auction(&request, &context).await,
+            DispatchAuctionOutcome::NotStarted
+        ));
+        assert!(http.recorded_backend_names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn enabled_empty_plan_is_successful_no_bid_without_dispatch() {
+        let plan = Arc::new(
+            AuctionPlan::compile(planned_config(&[], false)).expect("should compile empty plan"),
+        );
+        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+        let http = Arc::new(StubHttpClient::new());
+        let services = build_services_with_http_client(Arc::clone(&http) as Arc<_>);
+        let settings = create_test_settings();
+        let inbound = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 777,
+            transport_timeout_ms: 777,
+            provider_responses: None,
+            services: &services,
+        };
+        let request = planned_request();
+
+        let result = orchestrator
+            .run_auction(&request, &context)
+            .await
+            .expect("empty auction should complete as no-bid");
+        assert!(result.provider_responses.is_empty());
+        assert!(result.winning_bids.is_empty());
+        assert!(matches!(
+            orchestrator.dispatch_auction(&request, &context).await,
+            DispatchAuctionOutcome::NotStarted
+        ));
+        assert!(http.recorded_backend_names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn all_skipped_from_plan_completes_with_routing_metadata_in_sync_and_split_paths() {
+        for split in [false, true] {
+            let plan = Arc::new(
+                AuctionPlan::compile(planned_config(&[("skipped", RoutingMode::Explicit)], false))
+                    .expect("should compile all-skipped plan"),
+            );
+            let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+            let http = Arc::new(StubHttpClient::new());
+            let services = build_services_with_http_client(Arc::clone(&http) as Arc<_>);
+            let settings = create_test_settings();
+            let inbound = http::Request::new(edgezero_core::body::Body::empty());
+            let context = AuctionContext {
+                settings: &settings,
+                request: &inbound,
+                timeout_ms: 777,
+                transport_timeout_ms: 777,
+                provider_responses: None,
+                services: &services,
+            };
+            let request = planned_request();
+
+            let result = if split {
+                let DispatchAuctionOutcome::Dispatched(dispatched) =
+                    orchestrator.dispatch_auction(&request, &context).await
+                else {
+                    panic!("all-skipped auction should produce a completed dispatch token");
+                };
+                orchestrator
+                    .collect_dispatched_auction(dispatched, &services, &context)
+                    .await
+            } else {
+                orchestrator
+                    .run_auction(&request, &context)
+                    .await
+                    .expect("all-skipped auction should complete")
+            };
+
+            assert_eq!(result.provider_responses.len(), 1);
+            assert_eq!(
+                result.provider_responses[0].metadata["routing"]["skipped_no_eligible_slots"],
+                true
+            );
+            assert!(result.metadata.contains_key("routing"));
+            assert!(http.recorded_backend_names().is_empty());
+        }
+    }
+
+    struct NamingBackend {
+        policy: BackendNamingPolicy,
+        predicted: AtomicUsize,
+        ensured: AtomicUsize,
+        specs: Mutex<Vec<PlatformBackendSpec>>,
+        fail_ensure_for: Mutex<HashSet<String>>,
+    }
+
+    impl NamingBackend {
+        fn new(policy: BackendNamingPolicy) -> Self {
+            Self {
+                policy,
+                predicted: AtomicUsize::new(0),
+                ensured: AtomicUsize::new(0),
+                specs: Mutex::new(Vec::new()),
+                fail_ensure_for: Mutex::new(HashSet::new()),
+            }
+        }
+
+        fn fail_ensure_for(&self, provider_id: &str) {
+            self.fail_ensure_for
+                .lock()
+                .expect("should lock failing provider IDs")
+                .insert(provider_id.to_string());
+        }
+
+        fn name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            self.policy
+                .predict(spec)
+                .map(|prediction| prediction.name)
+                .change_context(PlatformError::Backend)
+        }
+    }
+
+    impl PlatformBackend for NamingBackend {
+        fn naming_policy(&self) -> BackendNamingPolicy {
+            self.policy
+        }
+
+        fn predict_name(
+            &self,
+            spec: &PlatformBackendSpec,
+        ) -> Result<String, Report<PlatformError>> {
+            self.predicted.fetch_add(1, Ordering::Relaxed);
+            self.name(spec)
+        }
+
+        fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            self.ensured.fetch_add(1, Ordering::Relaxed);
+            if spec.discriminator.as_deref().is_some_and(|provider_id| {
+                self.fail_ensure_for
+                    .lock()
+                    .expect("should lock failing provider IDs")
+                    .contains(provider_id)
+            }) {
+                return Err(Report::new(PlatformError::Backend));
+            }
+            self.specs
+                .lock()
+                .expect("should lock planned backend specs")
+                .push(spec.clone());
+            self.name(spec)
+        }
+    }
+
+    struct ZeroCanonicalBackend {
+        predicted: AtomicUsize,
+        ensured: AtomicUsize,
+    }
+
+    impl ZeroCanonicalBackend {
+        fn new() -> Self {
+            Self {
+                predicted: AtomicUsize::new(0),
+                ensured: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl PlatformBackend for ZeroCanonicalBackend {
+        fn naming_policy(&self) -> BackendNamingPolicy {
+            BackendNamingPolicy::Fastly
+        }
+
+        fn predict_name(
+            &self,
+            _spec: &PlatformBackendSpec,
+        ) -> Result<String, Report<PlatformError>> {
+            self.predicted.fetch_add(1, Ordering::Relaxed);
+            Ok("zero-canonical-backend".to_string())
+        }
+
+        fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            self.ensured.fetch_add(1, Ordering::Relaxed);
+            Ok("zero-canonical-backend".to_string())
+        }
+
+        fn canonicalize_transport_timeout_ms(
+            &self,
+            _remaining_ms: u32,
+            _configured_ms: u32,
+        ) -> u32 {
+            0
+        }
+    }
+
+    struct CollidingBackend;
+
+    impl PlatformBackend for CollidingBackend {
+        fn naming_policy(&self) -> BackendNamingPolicy {
+            BackendNamingPolicy::Axum
+        }
+
+        fn predict_name(
+            &self,
+            _spec: &PlatformBackendSpec,
+        ) -> Result<String, Report<PlatformError>> {
+            Ok("colliding-backend".to_string())
+        }
+
+        fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            Ok("colliding-backend".to_string())
+        }
+    }
+
+    struct FailingCountingConfigStore {
+        reads: AtomicUsize,
+    }
+
+    impl PlatformConfigStore for FailingCountingConfigStore {
+        fn get(
+            &self,
+            _store_name: &StoreName,
+            _key: &str,
+        ) -> Result<String, Report<PlatformError>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Err(Report::new(PlatformError::ConfigStore))
+        }
+
+        fn put(
+            &self,
+            _store_id: &StoreId,
+            _key: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    struct CountingConfigStore {
+        reads: AtomicUsize,
+        current_kid: String,
+        delay: Duration,
+    }
+
+    impl PlatformConfigStore for CountingConfigStore {
+        fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            if !self.delay.is_zero() {
+                std::thread::sleep(self.delay);
+            }
+            (key == "current-kid")
+                .then(|| self.current_kid.clone())
+                .ok_or_else(|| Report::new(PlatformError::ConfigStore))
+        }
+
+        fn put(
+            &self,
+            _store_id: &StoreId,
+            _key: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    struct CountingSecretStore {
+        reads: AtomicUsize,
+        key: Vec<u8>,
+    }
+
+    impl PlatformSecretStore for CountingSecretStore {
+        fn get_bytes(
+            &self,
+            _store_name: &StoreName,
+            _key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(self.key.clone())
+        }
+
+        fn create(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    struct OuterSelectErrorHttpClient {
+        inner: StubHttpClient,
+        selected_pending: AtomicUsize,
+    }
+
+    impl OuterSelectErrorHttpClient {
+        fn new() -> Self {
+            Self {
+                inner: StubHttpClient::new(),
+                selected_pending: AtomicUsize::new(0),
+            }
+        }
+
+        fn push_response(&self, status: u16, body: Vec<u8>) {
+            self.inner.push_response(status, body);
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformHttpClient for OuterSelectErrorHttpClient {
+        async fn send(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            self.inner.send(request).await
+        }
+
+        async fn send_async(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            self.inner.send_async(request).await
+        }
+
+        async fn select(
+            &self,
+            pending_requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            self.selected_pending
+                .store(pending_requests.len(), Ordering::Relaxed);
+            Err(Report::new(PlatformError::HttpClient))
+        }
+    }
+
+    struct UnusedSecretStore;
+
+    impl PlatformSecretStore for UnusedSecretStore {
+        fn get_bytes(
+            &self,
+            _store_name: &StoreName,
+            _key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            panic!("signing key should not be read after current-kid failure")
+        }
+
+        fn create(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
 
     // ---------------------------------------------------------------------------
     // Minimal test double for AuctionProvider
@@ -2579,6 +3676,46 @@ mod tests {
     struct StubAuctionProvider {
         name: &'static str,
         backend: &'static str,
+        configured_timeout_ms: u32,
+        predicted_timeouts: Option<Arc<Mutex<Vec<u32>>>>,
+        request_timeouts: Option<Arc<Mutex<Vec<u32>>>>,
+    }
+
+    impl StubAuctionProvider {
+        fn new(name: &'static str, backend: &'static str) -> Self {
+            Self {
+                name,
+                backend,
+                configured_timeout_ms: 125,
+                predicted_timeouts: None,
+                request_timeouts: None,
+            }
+        }
+
+        fn recording(
+            name: &'static str,
+            backend: &'static str,
+            configured_timeout_ms: u32,
+            predicted_timeouts: Arc<Mutex<Vec<u32>>>,
+            request_timeouts: Arc<Mutex<Vec<u32>>>,
+        ) -> Self {
+            Self {
+                name,
+                backend,
+                configured_timeout_ms,
+                predicted_timeouts: Some(predicted_timeouts),
+                request_timeouts: Some(request_timeouts),
+            }
+        }
+
+        fn record(slot: &Option<Arc<Mutex<Vec<u32>>>>, timeout_ms: u32) {
+            if let Some(observed) = slot {
+                observed
+                    .lock()
+                    .expect("should lock observed timeouts")
+                    .push(timeout_ms);
+            }
+        }
     }
 
     #[async_trait::async_trait(?Send)]
@@ -2592,6 +3729,7 @@ mod tests {
             _request: &AuctionRequest,
             context: &AuctionContext<'_>,
         ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+            Self::record(&self.request_timeouts, context.transport_timeout_ms);
             let req = PlatformHttpRequest::new(
                 http::Request::builder()
                     .method("POST")
@@ -2643,10 +3781,11 @@ mod tests {
         }
 
         fn timeout_ms(&self) -> u32 {
-            125
+            self.configured_timeout_ms
         }
 
-        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
+        fn backend_name(&self, _services: &RuntimeServices, timeout_ms: u32) -> Option<String> {
+            Self::record(&self.predicted_timeouts, timeout_ms);
             Some(self.backend.to_string())
         }
     }
@@ -2691,9 +3830,11 @@ mod tests {
             _response: PlatformResponse,
             response_time_ms: u64,
         ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            let mut bid = auction_bid(self.name, 3.0);
+            bid.bid_id = Some(format!("{}-bid", self.name));
             Ok(AuctionResponse::success(
                 self.name,
-                vec![auction_bid(self.name, 3.0)],
+                vec![bid],
                 response_time_ms,
             ))
         }
@@ -2727,7 +3868,7 @@ mod tests {
             _request: &AuctionRequest,
             context: &AuctionContext<'_>,
         ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-            let request = PlatformHttpRequest::new(
+            let req = PlatformHttpRequest::new(
                 http::Request::builder()
                     .method("POST")
                     .uri("https://example.com/mediate")
@@ -2738,7 +3879,7 @@ mod tests {
             context
                 .services
                 .http_client()
-                .send_async(request)
+                .send_async(req)
                 .await
                 .change_context(TrustedServerError::Auction {
                     message: "pending mediator launch failed".to_string(),
@@ -2749,11 +3890,28 @@ mod tests {
         async fn parse_response(
             &self,
             _response: PlatformResponse,
-            response_time_ms: u64,
+            _response_time_ms: u64,
         ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            panic!("pending deadline mediator should parse with provider context")
+        }
+
+        async fn parse_response_with_context(
+            &self,
+            _response: PlatformResponse,
+            response_time_ms: u64,
+            _request: &AuctionRequest,
+            context: &AuctionContext<'_>,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            let mut selection = context
+                .provider_responses
+                .and_then(|responses| responses.first())
+                .and_then(|response| response.bids.first())
+                .cloned()
+                .expect("pending deadline mediator should receive one candidate");
+            selection.price = Some(9.0);
             Ok(AuctionResponse::success(
                 self.provider_name(),
-                vec![auction_bid("mediated", 9.0)],
+                vec![selection],
                 response_time_ms,
             ))
         }
@@ -2801,73 +3959,6 @@ mod tests {
 
         fn timeout_ms(&self) -> u32 {
             1_000
-        }
-    }
-
-    struct RecordingTimeoutProvider {
-        name: &'static str,
-        backend: &'static str,
-        configured_timeout_ms: u32,
-        predicted: Arc<Mutex<Vec<u32>>>,
-        requested: Arc<Mutex<Vec<u32>>>,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl AuctionProvider for RecordingTimeoutProvider {
-        fn provider_name(&self) -> &str {
-            self.name
-        }
-
-        async fn request_bids(
-            &self,
-            _request: &AuctionRequest,
-            context: &AuctionContext<'_>,
-        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-            self.requested
-                .lock()
-                .expect("should lock requested timeouts")
-                .push(context.transport_timeout_ms);
-            let request = PlatformHttpRequest::new(
-                http::Request::builder()
-                    .method("POST")
-                    .uri("https://example.com/bid")
-                    .body(edgezero_core::body::Body::empty())
-                    .expect("should build recording request"),
-                self.backend,
-            );
-            context
-                .services
-                .http_client()
-                .send_async(request)
-                .await
-                .change_context(TrustedServerError::Auction {
-                    message: "recording launch failed".to_string(),
-                })
-                .map(ProviderRequestOutcome::pending)
-        }
-
-        async fn parse_response(
-            &self,
-            _response: PlatformResponse,
-            response_time_ms: u64,
-        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            Ok(AuctionResponse::success(
-                self.name,
-                vec![],
-                response_time_ms,
-            ))
-        }
-
-        fn timeout_ms(&self) -> u32 {
-            self.configured_timeout_ms
-        }
-
-        fn backend_name(&self, _services: &RuntimeServices, timeout_ms: u32) -> Option<String> {
-            self.predicted
-                .lock()
-                .expect("should lock predicted timeouts")
-                .push(timeout_ms);
-            Some(self.backend.to_string())
         }
     }
 
@@ -2964,14 +4055,14 @@ mod tests {
         configured_timeout_ms: u32,
         predicted: &Arc<Mutex<Vec<u32>>>,
         requested: &Arc<Mutex<Vec<u32>>>,
-    ) -> RecordingTimeoutProvider {
-        RecordingTimeoutProvider {
+    ) -> StubAuctionProvider {
+        StubAuctionProvider::recording(
             name,
             backend,
             configured_timeout_ms,
-            predicted: Arc::clone(predicted),
-            requested: Arc::clone(requested),
-        }
+            Arc::clone(predicted),
+            Arc::clone(requested),
+        )
     }
 
     /// Mediator whose context-aware parse restores `nurl`/`ad_id` (mirroring
@@ -3063,33 +4154,6 @@ mod tests {
         }
     }
 
-    fn mediated_bid(nurl: Option<String>) -> Bid {
-        Bid {
-            slot_id: "header-banner".to_string(),
-            candidate_id: None,
-            candidate_provider: None,
-            renderer_reservation_id: None,
-            price: Some(2.5),
-            currency: "USD".to_string(),
-            creative: Some("<div>ad</div>".to_string()),
-            adomain: None,
-            bidder: "mediator".to_string(),
-            returned_seat: None,
-            width: 728,
-            height: 90,
-            nurl: nurl.clone(),
-            burl: nurl,
-            bid_id: None,
-            ad_id: Some("creative-123".to_string()),
-            creative_id: None,
-            renderer: None,
-            cache_id: Some("cache-abc".to_string()),
-            cache_host: None,
-            cache_path: None,
-            metadata: HashMap::new(),
-        }
-    }
-
     struct SourceBidProvider {
         nurl: &'static str,
     }
@@ -3145,6 +4209,33 @@ mod tests {
 
         fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
             Some("bidder-backend".to_string())
+        }
+    }
+
+    fn mediated_bid(nurl: Option<String>) -> Bid {
+        Bid {
+            slot_id: "header-banner".to_string(),
+            candidate_id: None,
+            candidate_provider: None,
+            renderer_reservation_id: None,
+            price: Some(2.5),
+            currency: "USD".to_string(),
+            creative: Some("<div>ad</div>".to_string()),
+            adomain: None,
+            bidder: "mediator".to_string(),
+            returned_seat: None,
+            width: 728,
+            height: 90,
+            nurl: nurl.clone(),
+            burl: nurl,
+            bid_id: None,
+            ad_id: Some("creative-123".to_string()),
+            creative_id: None,
+            renderer: None,
+            cache_id: Some("cache-abc".to_string()),
+            cache_host: None,
+            cache_path: None,
+            metadata: HashMap::new(),
         }
     }
 
@@ -3355,7 +4446,8 @@ mod tests {
             };
 
             let result = if split {
-                let dispatched = orchestrator.dispatch_auction(&request, &context).await;
+                let dispatched =
+                    expect_dispatched(orchestrator.dispatch_auction(&request, &context).await);
                 orchestrator
                     .collect_dispatched_auction(dispatched, &services, &context)
                     .await
@@ -3408,7 +4500,7 @@ mod tests {
             name: "late-two",
             backend: "late-two-backend",
         }));
-        let request = create_test_auction_request();
+        let request = one_slot_request();
         let settings = create_test_settings();
         let downstream = http::Request::new(edgezero_core::body::Body::empty());
         let context = AuctionContext {
@@ -3437,254 +4529,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn current_adapter_deadline_drains_late_responses_in_both_paths() {
-        for split in [false, true] {
-            let result = collect_deadline_test_result(split, false).await;
-            assert_eq!(result.provider_responses.len(), 2);
-            assert_eq!(result.provider_responses[0].provider, "late-one");
-            assert_eq!(result.provider_responses[0].status, BidStatus::Success);
-            assert_eq!(result.provider_responses[1].provider, "late-two");
-            assert_eq!(result.provider_responses[1].status, BidStatus::Success);
-            assert!(
-                result
-                    .provider_responses
-                    .iter()
-                    .all(|response| response.response_time_ms >= 50),
-                "late response times should retain actual elapsed duration"
-            );
-            assert_eq!(
-                result.winning_bids["slot-1"].bidder, "late-one",
-                "a completed response remains eligible after the logical deadline"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn synthetic_hard_deadline_classifies_late_responses_in_both_paths() {
-        for split in [false, true] {
-            let result = collect_deadline_test_result(split, true).await;
-            assert_eq!(result.provider_responses.len(), 2);
-            assert!(result.provider_responses.iter().all(|response| {
-                response.status == BidStatus::Error
-                    && response.metadata["error_type"] == ERROR_TYPE_TIMEOUT
-                    && response.response_time_ms >= 50
-            }));
-            assert!(result.winning_bids.is_empty());
-        }
-    }
-
-    async fn pending_mediator_deadline_test_result(
-        split: bool,
-        enforceable_total_request_deadline: bool,
-    ) -> OrchestrationResult {
-        let stub = Arc::new(StubHttpClient::new());
-        stub.set_enforceable_total_request_deadline(enforceable_total_request_deadline);
-        stub.push_response(200, b"{}".to_vec());
-        stub.push_response(200, b"{}".to_vec());
-        stub.push_select_delay(Duration::ZERO);
-        stub.push_select_delay(Duration::from_millis(50));
-        let services = build_services_with_http_client(Arc::clone(&stub) as Arc<_>);
-        let config = AuctionConfig {
-            enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["local"]),
-            mediator: Some("pending-deadline-mediator".to_string()),
-            timeout_ms: 20,
-            ..Default::default()
-        };
-        let mut orchestrator = AuctionOrchestrator::new(config);
-        orchestrator.register_provider(Arc::new(DeadlineBidProvider {
-            name: "local",
-            backend: "local-backend",
-        }));
-        orchestrator.register_provider(Arc::new(PendingDeadlineMediator));
-        let request = create_test_auction_request();
-        let settings = create_test_settings();
-        let downstream = http::Request::new(edgezero_core::body::Body::empty());
-        let context = AuctionContext {
-            settings: &settings,
-            request: &downstream,
-            timeout_ms: 20,
-            transport_timeout_ms: 20,
-            provider_responses: None,
-            services: &services,
-        };
-
-        if split {
-            let DispatchAuctionOutcome::Dispatched(dispatched) =
-                orchestrator.dispatch_auction(&request, &context).await
-            else {
-                panic!("deadline test provider should dispatch");
-            };
-            orchestrator
-                .collect_dispatched_auction(dispatched, &services, &context)
-                .await
-        } else {
-            orchestrator
-                .run_auction(&request, &context)
-                .await
-                .expect("deadline test auction should complete")
-        }
-    }
-
-    #[tokio::test]
-    async fn pending_mediator_late_completion_policy_is_equivalent_in_sync_and_split_paths() {
-        for split in [false, true] {
-            let current = pending_mediator_deadline_test_result(split, false).await;
-            let current_mediator = current
-                .mediator_response
-                .as_ref()
-                .expect("current adapters should accept completed late mediator responses");
-            assert!(
-                current_mediator.response_time_ms >= 50,
-                "mediator timing should preserve actual elapsed duration"
-            );
-            assert_eq!(current.winning_bids["slot-1"].bidder, "mediated");
-
-            let hard = pending_mediator_deadline_test_result(split, true).await;
-            assert!(hard.mediator_response.is_none());
-            assert_eq!(hard.winning_bids["slot-1"].bidder, "local");
-            assert!(
-                hard.total_time_ms >= 50,
-                "discarding a late mediator must retain actual total elapsed time"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn split_deadline_skips_mediator_and_falls_back_to_provider_winner() {
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, b"{}".to_vec());
-        stub.push_select_delay(Duration::from_millis(50));
-        let services = build_services_with_http_client(Arc::clone(&stub) as Arc<_>);
-        let launches = Arc::new(AtomicUsize::new(0));
-        let config = AuctionConfig {
-            enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["late-one"]),
-            mediator: Some("deadline-mediator".to_string()),
-            timeout_ms: 10,
-            ..Default::default()
-        };
-        let mut orchestrator = AuctionOrchestrator::new(config);
-        orchestrator.register_provider(Arc::new(DeadlineBidProvider {
-            name: "late-one",
-            backend: "late-one-backend",
-        }));
-        orchestrator.register_provider(Arc::new(DeadlineRecordingMediator {
-            launches: Arc::clone(&launches),
-            budgets: None,
-        }));
-        let request = create_test_auction_request();
-        let settings = create_test_settings();
-        let downstream = http::Request::new(edgezero_core::body::Body::empty());
-        let context = AuctionContext {
-            settings: &settings,
-            request: &downstream,
-            timeout_ms: 10,
-            transport_timeout_ms: 10,
-            provider_responses: None,
-            services: &services,
-        };
-        let DispatchAuctionOutcome::Dispatched(dispatched) =
-            orchestrator.dispatch_auction(&request, &context).await
-        else {
-            panic!("deadline test provider should dispatch");
-        };
-        let result = orchestrator
-            .collect_dispatched_auction(dispatched, &services, &context)
-            .await;
-
-        assert_eq!(launches.load(Ordering::Relaxed), 0);
-        assert!(result.mediator_response.is_none());
-        assert_eq!(result.winning_bids["slot-1"].bidder, "late-one");
-    }
-
-    #[tokio::test]
-    async fn synchronous_deadline_skips_mediator_and_falls_back_to_provider_winner() {
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, b"{}".to_vec());
-        stub.push_select_delay(Duration::from_millis(50));
-        let services = build_services_with_http_client(Arc::clone(&stub) as Arc<_>);
-        let launches = Arc::new(AtomicUsize::new(0));
-        let config = AuctionConfig {
-            enabled: true,
-            providers: AuctionConfig::legacy_provider_map(&["late-one"]),
-            mediator: Some("deadline-mediator".to_string()),
-            timeout_ms: 10,
-            ..Default::default()
-        };
-        let mut orchestrator = AuctionOrchestrator::new(config);
-        orchestrator.register_provider(Arc::new(DeadlineBidProvider {
-            name: "late-one",
-            backend: "late-one-backend",
-        }));
-        orchestrator.register_provider(Arc::new(DeadlineRecordingMediator {
-            launches: Arc::clone(&launches),
-            budgets: None,
-        }));
-        let request = create_test_auction_request();
-        let settings = create_test_settings();
-        let downstream = http::Request::new(edgezero_core::body::Body::empty());
-        let context = AuctionContext {
-            settings: &settings,
-            request: &downstream,
-            timeout_ms: 10,
-            transport_timeout_ms: 10,
-            provider_responses: None,
-            services: &services,
-        };
-        let result = orchestrator
-            .run_auction(&request, &context)
-            .await
-            .expect("synchronous deadline test should complete");
-
-        assert_eq!(launches.load(Ordering::Relaxed), 0);
-        assert!(result.mediator_response.is_none());
-        assert_eq!(result.winning_bids["slot-1"].bidder, "late-one");
-    }
-
-    fn create_test_auction_request() -> AuctionRequest {
-        AuctionRequest {
-            id: "test-auction-123".to_string(),
-            slots: vec![
-                AdSlot {
-                    id: "header-banner".to_string(),
-                    formats: vec![AdFormat {
-                        media_type: MediaType::Banner,
-                        width: 728,
-                        height: 90,
-                    }],
-                    floor_price: Some(1.50),
-                    targeting: HashMap::new(),
-                    bidders: HashMap::new(),
-                },
-                AdSlot {
-                    id: "sidebar".to_string(),
-                    formats: vec![AdFormat {
-                        media_type: MediaType::Banner,
-                        width: 300,
-                        height: 250,
-                    }],
-                    floor_price: Some(1.00),
-                    targeting: HashMap::new(),
-                    bidders: HashMap::new(),
-                },
-            ],
-            publisher: PublisherInfo {
-                domain: "test.com".to_string(),
-                page_url: Some("https://test.com/article".to_string()),
-            },
-            user: UserInfo {
-                id: Some("user-123".to_string()),
-                consent: None,
-                eids: None,
-            },
-            device: None,
-            site: None,
-            context: HashMap::new(),
-        }
-    }
-
     fn one_slot_request() -> AuctionRequest {
         let mut request = create_test_auction_request();
         request.slots = vec![AdSlot {
@@ -3704,10 +4548,7 @@ mod tests {
     fn enabled_config(providers: &[&str]) -> AuctionConfig {
         AuctionConfig {
             enabled: true,
-            providers: providers
-                .iter()
-                .map(|provider| (*provider).to_string())
-                .collect(),
+            providers: AuctionConfig::legacy_provider_map(providers),
             ..AuctionConfig::default()
         }
     }
@@ -4058,6 +4899,256 @@ mod tests {
         crate::settings::Settings::from_toml(&settings_str).expect("should parse test settings")
     }
 
+    #[tokio::test]
+    async fn current_adapter_deadline_drains_late_responses_in_both_paths() {
+        for split in [false, true] {
+            let result = collect_deadline_test_result(split, false).await;
+            assert_eq!(result.provider_responses.len(), 2);
+            assert_eq!(result.provider_responses[0].provider, "late-one");
+            assert_eq!(result.provider_responses[0].status, BidStatus::Success);
+            assert_eq!(result.provider_responses[1].provider, "late-two");
+            assert_eq!(result.provider_responses[1].status, BidStatus::Success);
+            assert!(
+                result
+                    .provider_responses
+                    .iter()
+                    .all(|response| response.response_time_ms >= 50),
+                "late response times should retain actual elapsed duration"
+            );
+            assert_eq!(
+                result.winning_bids["slot-1"].bidder, "late-one",
+                "a completed response remains eligible after the logical deadline"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn synthetic_hard_deadline_classifies_late_responses_in_both_paths() {
+        for split in [false, true] {
+            let result = collect_deadline_test_result(split, true).await;
+            assert_eq!(result.provider_responses.len(), 2);
+            assert!(result.provider_responses.iter().all(|response| {
+                response.status == BidStatus::Error
+                    && response.metadata["error_type"] == ERROR_TYPE_TIMEOUT
+                    && response.response_time_ms >= 50
+            }));
+            assert!(result.winning_bids.is_empty());
+        }
+    }
+
+    async fn pending_mediator_deadline_test_result(
+        split: bool,
+        enforceable_total_request_deadline: bool,
+    ) -> OrchestrationResult {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.set_enforceable_total_request_deadline(enforceable_total_request_deadline);
+        stub.push_response(200, b"{}".to_vec());
+        stub.push_response(200, b"{}".to_vec());
+        stub.push_select_delay(Duration::ZERO);
+        stub.push_select_delay(Duration::from_millis(50));
+        let services = build_services_with_http_client(Arc::clone(&stub) as Arc<_>);
+        let config = AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["local"]),
+            mediator: Some("pending-deadline-mediator".to_string()),
+            timeout_ms: 20,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(DeadlineBidProvider {
+            name: "local",
+            backend: "local-backend",
+        }));
+        orchestrator.register_provider(Arc::new(PendingDeadlineMediator));
+        let request = one_slot_request();
+        let settings = create_test_settings();
+        let downstream = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &downstream,
+            timeout_ms: 20,
+            transport_timeout_ms: 20,
+            provider_responses: None,
+            services: &services,
+        };
+
+        if split {
+            let DispatchAuctionOutcome::Dispatched(dispatched) =
+                orchestrator.dispatch_auction(&request, &context).await
+            else {
+                panic!("deadline test provider should dispatch");
+            };
+            orchestrator
+                .collect_dispatched_auction(dispatched, &services, &context)
+                .await
+        } else {
+            orchestrator
+                .run_auction(&request, &context)
+                .await
+                .expect("deadline test auction should complete")
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_mediator_late_completion_policy_is_equivalent_in_sync_and_split_paths() {
+        for split in [false, true] {
+            let current = pending_mediator_deadline_test_result(split, false).await;
+            let current_mediator = current
+                .mediator_response
+                .as_ref()
+                .expect("current adapters should accept completed late mediator responses");
+            assert!(
+                current_mediator.response_time_ms >= 50,
+                "mediator timing should preserve actual elapsed duration"
+            );
+            assert_eq!(current.winning_bids["slot-1"].bidder, "local");
+            assert_eq!(current.winning_bids["slot-1"].price, Some(9.0));
+
+            let hard = pending_mediator_deadline_test_result(split, true).await;
+            assert!(hard.mediator_response.is_none());
+            assert_eq!(hard.winning_bids["slot-1"].bidder, "local");
+            assert_eq!(hard.winning_bids["slot-1"].price, Some(3.0));
+            assert!(
+                hard.total_time_ms >= 50,
+                "discarding a late mediator must retain actual total elapsed time"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn split_deadline_skips_mediator_and_falls_back_to_provider_winner() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"{}".to_vec());
+        stub.push_select_delay(Duration::from_millis(50));
+        let services = build_services_with_http_client(Arc::clone(&stub) as Arc<_>);
+        let launches = Arc::new(AtomicUsize::new(0));
+        let config = AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["late-one"]),
+            mediator: Some("deadline-mediator".to_string()),
+            timeout_ms: 10,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(DeadlineBidProvider {
+            name: "late-one",
+            backend: "late-one-backend",
+        }));
+        orchestrator.register_provider(Arc::new(DeadlineRecordingMediator {
+            launches: Arc::clone(&launches),
+            budgets: None,
+        }));
+        let request = one_slot_request();
+        let settings = create_test_settings();
+        let downstream = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &downstream,
+            timeout_ms: 10,
+            transport_timeout_ms: 10,
+            provider_responses: None,
+            services: &services,
+        };
+        let DispatchAuctionOutcome::Dispatched(dispatched) =
+            orchestrator.dispatch_auction(&request, &context).await
+        else {
+            panic!("deadline test provider should dispatch");
+        };
+        let result = orchestrator
+            .collect_dispatched_auction(dispatched, &services, &context)
+            .await;
+
+        assert_eq!(launches.load(Ordering::Relaxed), 0);
+        assert!(result.mediator_response.is_none());
+        assert_eq!(result.winning_bids["slot-1"].bidder, "late-one");
+    }
+
+    #[tokio::test]
+    async fn synchronous_deadline_skips_mediator_and_falls_back_to_provider_winner() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"{}".to_vec());
+        stub.push_select_delay(Duration::from_millis(50));
+        let services = build_services_with_http_client(Arc::clone(&stub) as Arc<_>);
+        let launches = Arc::new(AtomicUsize::new(0));
+        let config = AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["late-one"]),
+            mediator: Some("deadline-mediator".to_string()),
+            timeout_ms: 10,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(DeadlineBidProvider {
+            name: "late-one",
+            backend: "late-one-backend",
+        }));
+        orchestrator.register_provider(Arc::new(DeadlineRecordingMediator {
+            launches: Arc::clone(&launches),
+            budgets: None,
+        }));
+        let request = one_slot_request();
+        let settings = create_test_settings();
+        let downstream = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &downstream,
+            timeout_ms: 10,
+            transport_timeout_ms: 10,
+            provider_responses: None,
+            services: &services,
+        };
+        let result = orchestrator
+            .run_auction(&request, &context)
+            .await
+            .expect("synchronous deadline test should complete");
+
+        assert_eq!(launches.load(Ordering::Relaxed), 0);
+        assert!(result.mediator_response.is_none());
+        assert_eq!(result.winning_bids["slot-1"].bidder, "late-one");
+    }
+
+    fn create_test_auction_request() -> AuctionRequest {
+        AuctionRequest {
+            id: "test-auction-123".to_string(),
+            slots: vec![
+                AdSlot {
+                    id: "header-banner".to_string(),
+                    formats: vec![AdFormat {
+                        media_type: MediaType::Banner,
+                        width: 728,
+                        height: 90,
+                    }],
+                    floor_price: Some(1.50),
+                    targeting: HashMap::new(),
+                    bidders: HashMap::new(),
+                },
+                AdSlot {
+                    id: "sidebar".to_string(),
+                    formats: vec![AdFormat {
+                        media_type: MediaType::Banner,
+                        width: 300,
+                        height: 250,
+                    }],
+                    floor_price: Some(1.00),
+                    targeting: HashMap::new(),
+                    bidders: HashMap::new(),
+                },
+            ],
+            publisher: PublisherInfo {
+                domain: "test.com".to_string(),
+                page_url: Some("https://test.com/article".to_string()),
+            },
+            user: UserInfo {
+                id: Some("user-123".to_string()),
+                consent: None,
+                eids: None,
+            },
+            device: None,
+            site: None,
+            context: HashMap::new(),
+        }
+    }
+
     struct ImmediateNoBidProvider;
 
     #[async_trait::async_trait(?Send)]
@@ -4193,9 +5284,11 @@ mod tests {
         let downstream = http::Request::new(edgezero_core::body::Body::empty());
         let context = immediate_test_context(&settings, &downstream, &services);
 
-        let dispatched = orchestrator
-            .dispatch_auction(&create_test_auction_request(), &context)
-            .await;
+        let dispatched = expect_dispatched(
+            orchestrator
+                .dispatch_auction(&create_test_auction_request(), &context)
+                .await,
+        );
         let result = orchestrator
             .collect_dispatched_auction(dispatched, &services, &context)
             .await;
@@ -4227,10 +5320,10 @@ mod tests {
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
             orchestrator.register_provider(Arc::new(ImmediateNoBidProvider));
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "pending",
-                backend: "pending-backend",
-            }));
+            orchestrator.register_provider(Arc::new(StubAuctionProvider::new(
+                "pending",
+                "pending-backend",
+            )));
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, b"{}".to_vec());
             let services = build_services_with_http_client(stub);
@@ -4240,7 +5333,8 @@ mod tests {
             let request = create_test_auction_request();
 
             let result = if split {
-                let dispatched = orchestrator.dispatch_auction(&request, &context).await;
+                let dispatched =
+                    expect_dispatched(orchestrator.dispatch_auction(&request, &context).await);
                 orchestrator
                     .collect_dispatched_auction(dispatched, &services, &context)
                     .await
@@ -4510,11 +5604,7 @@ mod tests {
                 .expect("should build request");
             let context = create_test_auction_context(&settings, &req, 2000);
 
-            let error = orchestrator
-                .run_auction(&request, &context)
-                .await
-                .expect_err("should fail when every provider launch fails");
-
+            let result = orchestrator.run_auction(&request, &context).await;
             let result = result.expect("should preserve launch failures as slot decisions");
             assert_eq!(
                 result.decision_set.results,
@@ -4542,14 +5632,14 @@ mod tests {
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-a",
-                backend: "shared-backend",
-            }));
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-b",
-                backend: "shared-backend",
-            }));
+            orchestrator.register_provider(Arc::new(StubAuctionProvider::new(
+                "provider-a",
+                "shared-backend",
+            )));
+            orchestrator.register_provider(Arc::new(StubAuctionProvider::new(
+                "provider-b",
+                "shared-backend",
+            )));
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, b"{}".to_vec());
             let services = build_services_with_http_client(stub);
@@ -4559,7 +5649,8 @@ mod tests {
             let request = create_test_auction_request();
 
             let result = if split {
-                let dispatched = orchestrator.dispatch_auction(&request, &context).await;
+                let dispatched =
+                    expect_dispatched(orchestrator.dispatch_auction(&request, &context).await);
                 orchestrator
                     .collect_dispatched_auction(dispatched, &services, &context)
                     .await
@@ -4690,7 +5781,7 @@ mod tests {
                     canonical_ms: 0,
                     calls,
                 }),
-                Arc::new(StubHttpClient::new()),
+                stub,
             );
             let predicted = Arc::new(Mutex::new(Vec::new()));
             let requested = Arc::new(Mutex::new(Vec::new()));
@@ -4710,6 +5801,7 @@ mod tests {
             let settings = create_test_settings();
             let downstream = http::Request::new(edgezero_core::body::Body::empty());
             let context = immediate_test_context(&settings, &downstream, &services);
+            let request = create_test_auction_request();
 
             let result = orchestrator
                 .run_auction(&request, &context)
@@ -4747,7 +5839,7 @@ mod tests {
             let requested = Arc::new(Mutex::new(Vec::new()));
             let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
                 enabled: true,
-                providers: vec!["bidder".to_string()],
+                providers: AuctionConfig::legacy_provider_map(&["bidder"]),
                 timeout_ms: 2000,
                 ..Default::default()
             });
@@ -4763,10 +5855,18 @@ mod tests {
             let context = immediate_test_context(&settings, &downstream, &services);
             let request = create_test_auction_request();
 
-            let dispatched = orchestrator.dispatch_auction(&request, &context).await;
-            let result = orchestrator
-                .collect_dispatched_auction(dispatched, &services, &context)
-                .await;
+            let outcome = orchestrator.dispatch_auction(&request, &context).await;
+            let result = match orchestrator
+                .resolve_dispatch_outcome(&request, outcome)
+                .expect("zero canonical timeout should resolve attributably")
+            {
+                super::ResolvedDispatchOutcome::InFlight(dispatched) => {
+                    orchestrator
+                        .collect_dispatched_auction(*dispatched, &services, &context)
+                        .await
+                }
+                super::ResolvedDispatchOutcome::Complete(result) => *result,
+            };
 
             assert!(predicted.lock().expect("should lock predicted").is_empty());
             assert!(requested.lock().expect("should lock requested").is_empty());
@@ -4809,10 +5909,10 @@ mod tests {
                 timeout_ms: 2000,
                 ..Default::default()
             });
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "bidder",
-                backend: "bidder-backend",
-            }));
+            orchestrator.register_provider(Arc::new(StubAuctionProvider::new(
+                "bidder",
+                "bidder-backend",
+            )));
             orchestrator.register_provider(Arc::new(recording_provider(
                 "mediator",
                 "mediator-backend",
@@ -4878,7 +5978,8 @@ mod tests {
             let context = immediate_test_context(&settings, &downstream, &services);
             let request = create_test_auction_request();
 
-            let dispatched = orchestrator.dispatch_auction(&request, &context).await;
+            let dispatched =
+                expect_dispatched(orchestrator.dispatch_auction(&request, &context).await);
             orchestrator
                 .collect_dispatched_auction(dispatched, &services, &context)
                 .await;
@@ -4984,14 +6085,22 @@ mod tests {
             let context = immediate_test_context(&settings, &downstream, &services);
             let request = create_test_auction_request();
 
-            let dispatched = orchestrator.dispatch_auction(&request, &context).await;
+            let dispatched =
+                expect_dispatched(orchestrator.dispatch_auction(&request, &context).await);
             let result = orchestrator
                 .collect_dispatched_auction(dispatched, &services, &context)
                 .await;
 
-            assert!(result.provider_responses.iter().any(|response| {
-                response.provider == "provider-a" && response.status == BidStatus::Success
-            }));
+            let provider_a = result
+                .provider_responses
+                .iter()
+                .find(|response| response.provider == "provider-a")
+                .expect("should have provider-a response");
+            assert_eq!(
+                provider_a.status,
+                BidStatus::Success,
+                "response should correlate by the resolved backend name, not the prediction"
+            );
         });
     }
 
@@ -5023,17 +6132,24 @@ mod tests {
             let context = immediate_test_context(&settings, &downstream, &services);
             let request = create_test_auction_request();
 
-            let dispatched = orchestrator.dispatch_auction(&request, &context).await;
+            let dispatched =
+                expect_dispatched(orchestrator.dispatch_auction(&request, &context).await);
             let result = orchestrator
                 .collect_dispatched_auction(dispatched, &services, &context)
                 .await;
 
-            assert!(result.provider_responses.iter().any(|response| {
-                response.provider == "provider-a" && response.status == BidStatus::Success
-            }));
-            assert!(result.provider_responses.iter().any(|response| {
-                response.provider == "provider-b" && response.status == BidStatus::Error
-            }));
+            let provider_a = result
+                .provider_responses
+                .iter()
+                .find(|response| response.provider == "provider-a")
+                .expect("should have provider-a response");
+            let provider_b = result
+                .provider_responses
+                .iter()
+                .find(|response| response.provider == "provider-b")
+                .expect("should have provider-b response");
+            assert_eq!(provider_a.status, BidStatus::Success);
+            assert_eq!(provider_b.status, BidStatus::Error);
         });
     }
 
@@ -5061,14 +6177,14 @@ mod tests {
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-a",
-                backend: "backend-a",
-            }));
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-b",
-                backend: "backend-b",
-            }));
+            orchestrator.register_provider(Arc::new(StubAuctionProvider::new(
+                "provider-a",
+                "backend-a",
+            )));
+            orchestrator.register_provider(Arc::new(StubAuctionProvider::new(
+                "provider-b",
+                "backend-b",
+            )));
 
             let request = create_test_auction_request();
             let settings = create_test_settings();
@@ -5200,10 +6316,9 @@ mod tests {
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-a",
-                backend: "backend-a",
-            }));
+            let mut provider = StubAuctionProvider::new("provider-a", "backend-a");
+            provider.configured_timeout_ms = 125;
+            orchestrator.register_provider(Arc::new(provider));
             let request = create_test_auction_request();
             let settings = create_test_settings();
             let downstream = http::Request::builder()
@@ -5219,9 +6334,11 @@ mod tests {
                 provider_responses: None,
                 services: &services,
             };
-            let dispatched = orchestrator
-                .dispatch_auction(&request, &dispatch_context)
-                .await;
+            let dispatched = expect_dispatched(
+                orchestrator
+                    .dispatch_auction(&request, &dispatch_context)
+                    .await,
+            );
             let placeholder = http::Request::builder()
                 .uri("https://placeholder.invalid/")
                 .body(edgezero_core::body::Body::empty())
@@ -5276,14 +6393,14 @@ mod tests {
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-a",
-                backend: "backend-a",
-            }));
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-b",
-                backend: "backend-b",
-            }));
+            orchestrator.register_provider(Arc::new(StubAuctionProvider::new(
+                "provider-a",
+                "backend-a",
+            )));
+            orchestrator.register_provider(Arc::new(StubAuctionProvider::new(
+                "provider-b",
+                "backend-b",
+            )));
 
             let request = create_test_auction_request();
             let settings = create_test_settings();
@@ -5352,14 +6469,14 @@ mod tests {
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-a",
-                backend: "backend-a",
-            }));
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-b",
-                backend: "backend-b",
-            }));
+            orchestrator.register_provider(Arc::new(StubAuctionProvider::new(
+                "provider-a",
+                "backend-a",
+            )));
+            orchestrator.register_provider(Arc::new(StubAuctionProvider::new(
+                "provider-b",
+                "backend-b",
+            )));
 
             let request = create_test_auction_request();
             let settings = create_test_settings();
@@ -5378,7 +6495,14 @@ mod tests {
             };
 
             // Act
-            let dispatched = orchestrator.dispatch_auction(&request, &context).await;
+            let DispatchAuctionOutcome::DispatchFailed {
+                mut provider_responses,
+                eligible_slots_by_provider,
+                ..
+            } = orchestrator.dispatch_auction(&request, &context).await
+            else {
+                panic!("sequential-platform rejection should preserve dispatch failures");
+            };
 
             // Assert: no network request launches, but every configured provider
             // remains attributable through the normal terminal decision path.
@@ -5386,9 +6510,26 @@ mod tests {
                 stub_for_assertion.recorded_backend_names().is_empty(),
                 "should not launch any provider request on a sequential platform"
             );
-            let result = orchestrator
-                .collect_dispatched_auction(dispatched, services, &context)
-                .await;
+            let normalized = orchestrator.normalize_provider_responses_with_eligibility(
+                &request,
+                &mut provider_responses,
+                &eligible_slots_by_provider,
+            );
+            let winning_bids = HashMap::new();
+            let decision_set = orchestrator.build_decision_set(
+                &request,
+                &normalized.outcomes,
+                &winning_bids,
+                false,
+            );
+            let result = OrchestrationResult {
+                provider_responses,
+                mediator_response: None,
+                winning_bids,
+                decision_set,
+                total_time_ms: 0,
+                metadata: HashMap::new(),
+            };
             assert!(result.winning_bids.is_empty());
             assert!(result.provider_responses.iter().all(|response| {
                 response.status == BidStatus::Error
@@ -5540,14 +6681,10 @@ mod tests {
                 .map(|response| response.provider.as_str()),
             Some("immediate-mediator")
         );
-        assert_eq!(
-            result.winning_bids["header-banner"].nurl.as_deref(),
-            Some("https://nurl.example/immediate")
-        );
-        assert!(
-            !result.winning_bids.contains_key("fictional-slot"),
-            "mediator output owns final selection"
-        );
+        let winner = &result.winning_bids["fictional-slot"];
+        assert_eq!(winner.bid_id.as_deref(), Some("provider"));
+        assert_eq!(winner.price, Some(2.5));
+        assert!(!result.winning_bids.contains_key("header-banner"));
     }
 
     async fn planned_pending_mediator_deadline_result(
@@ -5606,7 +6743,11 @@ mod tests {
             .as_ref()
             .expect("current adapters should accept completed late mediator responses");
         assert!(current_mediator.response_time_ms >= 50);
-        assert_eq!(current.winning_bids["slot-1"].bidder, "mediated");
+        assert_eq!(
+            current.winning_bids["fictional-slot"].bid_id.as_deref(),
+            Some("provider")
+        );
+        assert_eq!(current.winning_bids["fictional-slot"].price, Some(9.0));
 
         let hard = planned_pending_mediator_deadline_result(true).await;
         assert!(hard.mediator_response.is_none());
@@ -5832,7 +6973,8 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "seatbid": [{"seat": "aps-instance", "bid": [{
                     "id": "mediated-aps", "impid": "fictional-slot", "price": 2.0,
-                    "adm": "ignored", "w": 300, "h": 250, "crid": "aps-creative"
+                    "w": 300, "h": 250,
+                    "ext": {"trusted_server": {"candidate_id": "AAAAAAAAAAAA"}}
                 }]}]
             }))
             .expect("should serialize mediator response"),
@@ -5850,7 +6992,8 @@ mod tests {
             timeout_ms: 500,
             ..AdServerMockConfig::default()
         });
-        let orchestrator = AuctionOrchestratorHarness::new(plan, Some(Arc::new(mediator)));
+        let orchestrator = AuctionOrchestratorHarness::new(plan, Some(Arc::new(mediator)))
+            .with_identity_generator(Arc::new(FixedIdentityGenerator::new()));
         let request = planned_request();
         let settings = create_test_settings();
         let inbound = http::Request::new(edgezero_core::body::Body::empty());
@@ -6028,7 +7171,7 @@ mod tests {
         let renderer = bid
             .renderer
             .as_ref()
-            .and_then(BidRenderer::as_aps)
+            .and_then(BidRenderSourceV1::as_aps)
             .expect("should construct typed APS renderer");
         assert_eq!(renderer.account_id, "example-account");
         let decoded = base64::engine::general_purpose::STANDARD
@@ -6048,13 +7191,13 @@ mod tests {
         for reason in [
             "lost_to_higher_bid",
             "script_rendering_disabled",
-            "unknown_impid",
+            "unknown_impression",
             "invalid_dimensions",
             "invalid_price",
             "unsupported_media_type",
-            "unsupported_tagtype",
+            "invalid_tag_type",
             "creative_id_too_large",
-            "missing_render_source",
+            "missing_upstream_bid_id",
             "empty_seatbid_bids",
         ] {
             assert_eq!(response.metadata["drop_reasons"][reason], 1, "{reason}");
@@ -6210,28 +7353,28 @@ mod tests {
                 200,
                 b"not-json".to_vec(),
                 BidStatus::Error,
-                Some("unexpected_response_shape"),
+                Some("invalid_provider_response"),
                 Some("parse_response"),
             ),
             (
                 200,
                 b"[]".to_vec(),
                 BidStatus::Error,
-                Some("unexpected_response_shape"),
+                Some("invalid_provider_response"),
                 Some("parse_response"),
             ),
             (
                 200,
                 br#"{"contextual":true}"#.to_vec(),
                 BidStatus::Error,
-                Some("unexpected_response_shape"),
-                Some("parse_response"),
+                Some("invalid_provider_response"),
+                None,
             ),
             (
                 200,
                 br#"{"cur":"EUR","seatbid":[]}"#.to_vec(),
-                BidStatus::NoBid,
-                Some("unsupported_currency"),
+                BidStatus::Error,
+                Some("invalid_provider_response"),
                 None,
             ),
         ];
@@ -6383,7 +7526,7 @@ mod tests {
         let renderer = parsed.bids[0]
             .renderer
             .as_ref()
-            .and_then(BidRenderer::as_aps)
+            .and_then(BidRenderSourceV1::as_aps)
             .expect("should construct APS renderer");
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(&renderer.aax_response)

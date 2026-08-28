@@ -50,8 +50,11 @@ import {
   createBrowserSlotReconciliationBoundary,
   createSlotService,
   type GptSlotBinding,
+  type SlotRequestHandle,
+  type SlotRequestInput,
   type SlotRequestOutcome,
   type SlotService,
+  type TrustedServerRequestOpportunity,
 } from '../../services/slots';
 import type {
   TargetingBoundary,
@@ -62,7 +65,9 @@ import { createTargetingService } from '../../services/targeting';
 
 import {
   activateGptDiagnosticsEventListeners,
+  createTrustedServerOpportunityFact,
   createGptDiagnosticsFactBuffer,
+  publishTrustedServerOpportunityFact,
   projectGptTraceFact,
 } from './diagnostics_facts';
 import { installGptGuard, resetGuardState } from './script_guard';
@@ -221,7 +226,8 @@ export function adoptInitialPucTicketsFromHandoff(
 export function adoptInitialGptFactsFromHandoff(
   candidate: unknown,
   buffer: Pick<ReturnType<typeof createGptDiagnosticsFactBuffer>, 'adoptFirstDisplay'> | undefined,
-  adapter: Pick<GoogletagAdapter, 'diagnosticsIdentity'>
+  adapter: Pick<GoogletagAdapter, 'diagnosticsIdentity'>,
+  projection: Readonly<BrowserAuctionProjectionV1> | undefined
 ): PersistentFirstDisplayAdoptionV1 | undefined {
   const adoption = snapshotPersistentFirstDisplayAdoptionV1(candidate);
   if (!adoption) return undefined;
@@ -235,14 +241,55 @@ export function adoptInitialGptFactsFromHandoff(
   }
   const cycles = frozenArray(dataField(adoption.handoff, 'cycles'));
   const artifacts = frozenArray(dataField(adoption.handoff, 'artifacts'));
-  if (!cycles || !artifacts || adoption.identities.length !== cycles.length + artifacts.length) {
+  const slots = frozenArray(dataField(adoption.handoff, 'slots'));
+  if (
+    !cycles ||
+    !artifacts ||
+    !slots ||
+    adoption.identities.length !== cycles.length + artifacts.length
+  ) {
     return undefined;
   }
+  const formatsBySlot = new Map<string, readonly (readonly [number, number])[]>();
+  for (const slot of slots) {
+    const slotId = dataField(slot, 'id');
+    const formats = frozenArray(dataField(slot, 'formats'));
+    if (typeof slotId !== 'string' || formatsBySlot.has(slotId) || !formats) return undefined;
+    const copied: Array<readonly [number, number]> = [];
+    for (let index = 0; index < formats.length && index < 16; index += 1) {
+      const format = formats[index];
+      const dimensions = frozenArray(format);
+      if (
+        !dimensions ||
+        dimensions.length !== 2 ||
+        !dimensions.every(
+          (dimension) =>
+            typeof dimension === 'number' &&
+            Number.isInteger(dimension) &&
+            dimension >= 1 &&
+            dimension <= 4096
+        )
+      ) {
+        return undefined;
+      }
+      copied.push(Object.freeze([dimensions[0] as number, dimensions[1] as number] as const));
+    }
+    if (copied.length === 0) return undefined;
+    formatsBySlot.set(slotId, Object.freeze(copied));
+  }
   const identities = new Map<string, ReturnType<GoogletagAdapter['diagnosticsIdentity']>>();
+  const requestByToken = new Map<
+    string,
+    Readonly<{ formats: readonly (readonly [number, number])[]; slotId: string }>
+  >();
   for (let index = 0; index < cycles.length; index += 1) {
     const token = dataField(cycles[index], 'token');
+    const slotId = dataField(cycles[index], 'slotId');
     const physicalSlot = adoption.identities[index];
-    if (typeof token !== 'string' || !physicalSlot) return undefined;
+    const formats = typeof slotId === 'string' ? formatsBySlot.get(slotId) : undefined;
+    if (typeof token !== 'string' || typeof slotId !== 'string' || !formats || !physicalSlot) {
+      return undefined;
+    }
     let identity: ReturnType<GoogletagAdapter['diagnosticsIdentity']>;
     try {
       identity = adapter.diagnosticsIdentity(physicalSlot);
@@ -251,11 +298,27 @@ export function adoptInitialGptFactsFromHandoff(
     }
     if (!identity || identity.traceToken !== token || identities.has(token)) return undefined;
     identities.set(token, identity);
+    requestByToken.set(token, Object.freeze({ formats, slotId }));
   }
   try {
     return buffer.adoptFirstDisplay(
       diagnostics as Readonly<FirstDisplayGptDiagnosticsV1>,
-      (traceToken) => identities.get(traceToken)
+      (traceToken) => identities.get(traceToken),
+      (traceToken, slot) => {
+        const request = requestByToken.get(traceToken);
+        const trustedServerAuctionId = projection?.auction.auctionId;
+        return request &&
+          typeof trustedServerAuctionId === 'string' &&
+          trustedServerAuctionId.length > 0
+          ? createTrustedServerOpportunityFact({
+              auctionSlotId: request.slotId,
+              opportunity: 'renderable_candidate',
+              requestedSlotSizes: request.formats,
+              slot,
+              trustedServerAuctionId,
+            })
+          : undefined;
+      }
     )
       ? adoption
       : undefined;
@@ -555,6 +618,7 @@ export interface GptSlotOperationInput extends Omit<PucGamAttemptInput, 'attempt
   readonly pucBridge: Pick<PucBridge, 'recordNonemptyGam' | 'registerGamAttempt'>;
   readonly requestClass: string;
   readonly slots: Pick<SlotService, 'request'>;
+  readonly trustedServerOpportunity?: TrustedServerRequestOpportunity;
 }
 
 export type GptWinnerPublicationFailureReason = Extract<
@@ -587,10 +651,11 @@ export interface GptWinnerPublicationInput extends Omit<
   readonly targeting: Pick<TargetingService, 'observePublisherMutations' | 'own'>;
 }
 
-function currentProjectedWinner(input: GptWinnerPublicationInput): boolean {
+function currentProjectedWinner(
+  input: GptWinnerPublicationInput,
+  projection: Readonly<BrowserAuctionProjectionV1> | undefined
+): boolean {
   try {
-    const projection = input.navigation.currentAuctionProjection as
-      BrowserAuctionProjectionV1 | undefined;
     const bid = input.bid;
     const placement = input.placement;
     if (
@@ -786,10 +851,18 @@ export async function publishGptWinner(
       // Rejected publication retains no artifact authority.
     }
   };
-  if (!currentProjectedWinner(input)) {
+  const projection = input.navigation.currentAuctionProjection as
+    Readonly<BrowserAuctionProjectionV1> | undefined;
+  if (!projection || !currentProjectedWinner(input, projection)) {
     disposeArtifact();
     return failAttempt('winner_not_renderable');
   }
+  const trustedServerOpportunity: TrustedServerRequestOpportunity = Object.freeze({
+    requestedSlotSizes: Object.freeze(
+      input.placement.formats.map((size) => Object.freeze([size[0], size[1]] as const))
+    ),
+    trustedServerAuctionId: projection.auction.auctionId,
+  });
   const isStillBound = (): boolean => {
     try {
       return input.slots.isBoundGptSlot(input.navigation.generation, input.bid.slot, input.slot);
@@ -921,6 +994,7 @@ export async function publishGptWinner(
         recordNonemptyGam: (bridgeInput) => input.pucBridge.recordNonemptyGam(bridgeInput),
       },
       requestClass: input.requestClass,
+      trustedServerOpportunity,
       reservationId: input.bid.rendererReservationId,
       slots: {
         request: (requestInput) => {
@@ -956,6 +1030,12 @@ async function publishPbsCacheGptWinner(input: PbsCacheGptPublicationInput): Pro
   const projection = input.navigation.currentAuctionProjection as
     Readonly<BrowserAuctionProjectionV1> | undefined;
   if (!projection) return;
+  const trustedServerOpportunity: TrustedServerRequestOpportunity = Object.freeze({
+    requestedSlotSizes: Object.freeze(
+      input.placement.formats.map((size) => Object.freeze([size[0], size[1]] as const))
+    ),
+    trustedServerAuctionId: projection.auction.auctionId,
+  });
   const current = (): boolean => {
     try {
       if (
@@ -1027,6 +1107,7 @@ async function publishPbsCacheGptWinner(input: PbsCacheGptPublicationInput): Pro
       operation: input.binding.operation,
       registeredSlotId: input.bid.slot,
       requestClass: input.requestClass,
+      trustedServerOpportunity,
     });
     await handle.result;
   } catch (error) {
@@ -1125,6 +1206,9 @@ export function startGptSlotOperation(input: GptSlotOperationInput): SlotOperati
       operation: input.operation,
       registeredSlotId: input.attempt.slot,
       requestClass: input.requestClass,
+      ...(input.trustedServerOpportunity === undefined
+        ? {}
+        : { trustedServerOpportunity: input.trustedServerOpportunity }),
     });
   } catch {
     input.attempt.fail('gpt_request_failed');
@@ -1458,6 +1542,169 @@ interface PreparedInitialGptWinner {
   readonly terminal: Promise<unknown>;
 }
 
+interface PreparedInitialPbsCacheWinner {
+  readonly bid: PbsCacheBrowserAuctionBidV1;
+  readonly binding: Readonly<{ operation: 'display' | 'refresh'; slot: object }>;
+  readonly placement: BrowserAuctionSlotV1;
+}
+
+interface InitialGptRequestParticipant {
+  readonly complete: () => void;
+  readonly request: (input: SlotRequestInput) => SlotRequestHandle;
+}
+
+function failedBatchRequestHandle(): SlotRequestHandle {
+  const outcome = Object.freeze({
+    reason: 'gpt_request_failed' as const,
+    status: 'failed' as const,
+  });
+  return Object.freeze({
+    status: 'terminal' as const,
+    result: Promise.resolve(outcome),
+    dispose: () => undefined,
+  });
+}
+
+function createInitialGptRequestBatch(
+  slots: Pick<SlotService, 'requestBatch'>,
+  participantCount: number
+): Readonly<{ participant: () => InitialGptRequestParticipant }> {
+  interface PendingRequest {
+    readonly bind: (handle: SlotRequestHandle) => void;
+    readonly fail: () => void;
+    readonly input: SlotRequestInput;
+    readonly isDisposed: () => boolean;
+  }
+
+  const pending: PendingRequest[] = [];
+  let claimedParticipants = 0;
+  let readyParticipants = 0;
+  let flushed = false;
+  const flush = (): void => {
+    if (flushed || readyParticipants !== participantCount) return;
+    flushed = true;
+    const active = pending.filter((request) => !request.isDisposed());
+    if (active.length === 0) return;
+    let handles: readonly SlotRequestHandle[] = Object.freeze([]);
+    try {
+      const inputs = Object.freeze(active.map(({ input }) => input));
+      handles = slots.requestBatch(inputs);
+      if (!Array.isArray(handles) || handles.length !== active.length) {
+        throw new Error('GPT SRA batch admission failed');
+      }
+      for (let index = 0; index < active.length; index += 1) {
+        const request = active[index];
+        const handle = handles[index];
+        if (!request || !handle) throw new Error('GPT SRA batch result is incomplete');
+        request.bind(handle);
+      }
+    } catch {
+      for (let index = 0; index < handles.length; index += 1) {
+        try {
+          handles[index]?.dispose();
+        } catch {
+          // Continue rolling back the other partially returned handles.
+        }
+      }
+      for (let index = 0; index < active.length; index += 1) active[index]?.fail();
+    }
+  };
+
+  return Object.freeze({
+    participant: (): InitialGptRequestParticipant => {
+      if (claimedParticipants >= participantCount) {
+        return Object.freeze({
+          complete: () => undefined,
+          request: () => failedBatchRequestHandle(),
+        });
+      }
+      claimedParticipants += 1;
+      let ready = false;
+      let requested = false;
+      const markReady = (): void => {
+        if (ready) return;
+        ready = true;
+        readyParticipants += 1;
+        flush();
+      };
+      return Object.freeze({
+        complete: markReady,
+        request: (input: SlotRequestInput): SlotRequestHandle => {
+          if (requested || ready) return failedBatchRequestHandle();
+          requested = true;
+          let disposed = false;
+          let terminal = false;
+          let activeHandle: SlotRequestHandle | undefined;
+          let resolve!: (outcome: SlotRequestOutcome) => void;
+          const result = new Promise<SlotRequestOutcome>((resolveResult) => {
+            resolve = resolveResult;
+          });
+          const settleFailed = (): void => {
+            if (terminal) return;
+            terminal = true;
+            resolve(Object.freeze({ reason: 'gpt_request_failed', status: 'failed' }));
+          };
+          const settleDisposed = (): void => {
+            if (terminal) return;
+            terminal = true;
+            resolve(Object.freeze({ reason: 'superseded', status: 'cancelled' }));
+          };
+          const pendingRequest: PendingRequest = {
+            bind: (handle): void => {
+              if (terminal) {
+                try {
+                  handle.dispose();
+                } catch {
+                  // The placeholder outcome already owns terminal settlement.
+                }
+                return;
+              }
+              activeHandle = handle;
+              void handle.result.then((outcome) => {
+                if (terminal) return;
+                terminal = true;
+                resolve(outcome);
+              }, settleFailed);
+              if (disposed) {
+                try {
+                  handle.dispose();
+                } catch {
+                  settleDisposed();
+                }
+              }
+            },
+            fail: settleFailed,
+            input,
+            isDisposed: () => disposed,
+          };
+          pending[pending.length] = pendingRequest;
+          const placeholder = Object.freeze({
+            get status(): 'active' | 'queued' | 'terminal' {
+              return terminal ? 'terminal' : (activeHandle?.status ?? 'active');
+            },
+            result,
+            dispose: (): void => {
+              if (disposed) return;
+              disposed = true;
+              if (activeHandle) {
+                try {
+                  activeHandle.dispose();
+                } catch {
+                  settleDisposed();
+                }
+              } else {
+                settleDisposed();
+              }
+            },
+          });
+          markReady();
+          return placeholder;
+        },
+      });
+    },
+  });
+}
+
 /** Start one immutable initial GPT winner batch and protect every terminal latch together. */
 export async function publishInitialGptProjection(
   document: Document,
@@ -1543,7 +1790,7 @@ export async function publishInitialGptProjection(
   const batch = navigation.createAuctionBatch(`gpt:${projection.auction.auctionId}`);
   if (!batch) return;
   const prepared: PreparedInitialGptWinner[] = [];
-  const cachePublications: Promise<void>[] = [];
+  const preparedCache: PreparedInitialPbsCacheWinner[] = [];
   let winnerIndex = 0;
   for (let index = 0; index < projection.auction.results.length; index += 1) {
     const decision = projection.auction.results[index];
@@ -1555,18 +1802,7 @@ export async function publishInitialGptProjection(
     const binding = physicalBySlot.get(decision.slot);
     if (!('rendererReservationId' in bid)) {
       if (binding) {
-        cachePublications.push(
-          publishPbsCacheGptWinner({
-            bid,
-            binding,
-            googletag,
-            navigation,
-            placement,
-            requestClass: input.requestClass ?? 'initial',
-            slots,
-            targeting: input.targeting,
-          })
-        );
+        preparedCache.push(Object.freeze({ bid, binding, placement }));
       }
       continue;
     }
@@ -1586,69 +1822,100 @@ export async function publishInitialGptProjection(
       })
     );
   }
-  if (prepared.length === 0 && cachePublications.length === 0) return;
+  if (prepared.length === 0 && preparedCache.length === 0) return;
+  const requestBatch = createInitialGptRequestBatch(slots, prepared.length + preparedCache.length);
+  const cachePublications = preparedCache.map(({ bid, binding, placement }) => {
+    const participant = requestBatch.participant();
+    return Promise.resolve().then(async () => {
+      try {
+        await publishPbsCacheGptWinner({
+          bid,
+          binding,
+          googletag,
+          navigation,
+          placement,
+          requestClass: input.requestClass ?? 'initial',
+          slots: Object.freeze({
+            isBoundGptSlot: slots.isBoundGptSlot,
+            request: participant.request,
+          }),
+          targeting: input.targeting,
+        });
+      } finally {
+        participant.complete();
+      }
+    });
+  });
   input.protect(Object.freeze([...prepared.map(({ terminal }) => terminal), ...cachePublications]));
 
   await Promise.all([
     ...cachePublications,
     ...prepared.map(async ({ attempt, bid, binding, decision, owner, placement }) => {
-      if (!binding) {
-        attempt.fail('slot_unresolved');
-        return;
-      }
-      const artifact = Object.freeze({
-        kind: 'puc' as const,
-        attemptId: attempt.id,
-        slot: attempt.slot,
-        navigationGeneration: attempt.navigationGeneration,
-        dispose: () => undefined,
-      });
-      const published = await publishGptWinner({
-        artifact,
-        attempt,
-        bid,
-        createSlotOperation: render.createSlotOperation,
-        googletag,
-        navigation,
-        operation: binding.operation,
-        owner,
-        placement,
-        pucBridge: input.pucBridge,
-        requestClass: input.requestClass ?? 'initial',
-        reservations: render.reservations,
-        slot: binding.slot,
-        slots,
-        targeting: input.targeting,
-        createFallback: (parentAttemptId) => {
-          const fallbackOwner = batch.createRenderAttempt(decision.slot);
-          if (!fallbackOwner.ok) {
-            return Object.freeze({
-              ok: false as const,
-              reason:
-                fallbackOwner.reason === 'identity_generation_failed'
-                  ? ('identity_generation_failed' as const)
-                  : fallbackOwner.reason === 'stale_owner'
-                    ? ('stale_owner' as const)
-                    : ('invalid_attempt' as const),
-            });
-          }
-          const fallback = render.createAttempt(fallbackOwner.value, parentAttemptId);
-          if (!fallback.ok) return fallback;
-          if (
-            !fallback.value.admitDirectWinner(
-              bid.renderSource,
-              Object.freeze({ selectedCpm: bid.cpm })
-            )
-          ) {
-            fallback.value.fail('winner_not_renderable');
+      const participant = requestBatch.participant();
+      try {
+        if (!binding) {
+          attempt.fail('slot_unresolved');
+          return;
+        }
+        const artifact = Object.freeze({
+          kind: 'puc' as const,
+          attemptId: attempt.id,
+          slot: attempt.slot,
+          navigationGeneration: attempt.navigationGeneration,
+          dispose: () => undefined,
+        });
+        const published = await publishGptWinner({
+          artifact,
+          attempt,
+          bid,
+          createSlotOperation: render.createSlotOperation,
+          googletag,
+          navigation,
+          operation: binding.operation,
+          owner,
+          placement,
+          pucBridge: input.pucBridge,
+          requestClass: input.requestClass ?? 'initial',
+          reservations: render.reservations,
+          slot: binding.slot,
+          slots: Object.freeze({
+            isBoundGptSlot: slots.isBoundGptSlot,
+            request: participant.request,
+          }),
+          targeting: input.targeting,
+          createFallback: (parentAttemptId) => {
+            const fallbackOwner = batch.createRenderAttempt(decision.slot);
+            if (!fallbackOwner.ok) {
+              return Object.freeze({
+                ok: false as const,
+                reason:
+                  fallbackOwner.reason === 'identity_generation_failed'
+                    ? ('identity_generation_failed' as const)
+                    : fallbackOwner.reason === 'stale_owner'
+                      ? ('stale_owner' as const)
+                      : ('invalid_attempt' as const),
+              });
+            }
+            const fallback = render.createAttempt(fallbackOwner.value, parentAttemptId);
+            if (!fallback.ok) return fallback;
+            if (
+              !fallback.value.admitDirectWinner(
+                bid.renderSource,
+                Object.freeze({ selectedCpm: bid.cpm })
+              )
+            ) {
+              fallback.value.fail('winner_not_renderable');
+              return fallback;
+            }
+            if (!render.renderWinner(fallback.value)) fallback.value.fail('winner_not_renderable');
             return fallback;
-          }
-          if (!render.renderWinner(fallback.value)) fallback.value.fail('winner_not_renderable');
-          return fallback;
-        },
-      });
-      if (!published.ok && navigation.isCurrent()) {
-        log.warn('GPT projection winner publication failed', published.reason);
+          },
+        });
+        if (!published.ok && navigation.isCurrent()) {
+          log.warn('GPT projection winner publication failed', published.reason);
+        }
+      } finally {
+        participant.complete();
       }
     }),
   ]);
@@ -1704,6 +1971,14 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
     }
   );
   scope.onDispose(() => googletag.dispose());
+  const diagnosticsEnabled = gptDiagnosticsActive(runtime);
+  const diagnosticsFacts = diagnosticsEnabled
+    ? createGptDiagnosticsFactBuffer({
+        onOverflow: (droppedFacts) =>
+          log.warn('GPT diagnostics fact buffer overflow', droppedFacts),
+      })
+    : undefined;
+  if (diagnosticsFacts) scope.onDispose(diagnosticsFacts.dispose);
   const reconciliation = createBrowserSlotReconciliationBoundary(
     document,
     document.defaultView.MutationObserver
@@ -1716,20 +1991,26 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
         render.artifacts.release(artifact);
     },
     googletag,
+    ...(diagnosticsFacts
+      ? {
+          onTrustedServerRequest: ({ opportunity, registeredSlotId, slot }) => {
+            if (!opportunity) return;
+            publishTrustedServerOpportunityFact({
+              adapter: googletag,
+              buffer: diagnosticsFacts,
+              physicalSlot: slot,
+              registeredSlotId,
+              opportunity,
+            });
+          },
+        }
+      : {}),
     ...(reconciliation ? { reconciliation } : {}),
   });
   scope.onDispose(() => slots.dispose());
   const targeting = createTargetingService();
   scope.onDispose(() => targeting.dispose());
   const startup = createGptStartup({ googletag, slots: () => slots });
-  const diagnosticsEnabled = gptDiagnosticsActive(runtime);
-  const diagnosticsFacts = diagnosticsEnabled
-    ? createGptDiagnosticsFactBuffer({
-        onOverflow: (droppedFacts) =>
-          log.warn('GPT diagnostics fact buffer overflow', droppedFacts),
-      })
-    : undefined;
-  if (diagnosticsFacts) scope.onDispose(diagnosticsFacts.dispose);
   let pucBridge: PucBridge | undefined;
   let takeoverReconciliationRelease: (() => void) | undefined;
   let laterLifecycleActive = false;
@@ -1950,7 +2231,13 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
       const factAdoption =
         adoptionCandidate === undefined
           ? undefined
-          : adoptInitialGptFactsFromHandoff(adoptionCandidate, diagnosticsFacts, googletag);
+          : adoptInitialGptFactsFromHandoff(
+              adoptionCandidate,
+              diagnosticsFacts,
+              googletag,
+              auction.navigation.currentAuctionProjection as
+                Readonly<BrowserAuctionProjectionV1> | undefined
+            );
       if (adoptionCandidate !== undefined && !factAdoption) {
         throw new TypeError('GPT first-display diagnostics facts are invalid');
       }

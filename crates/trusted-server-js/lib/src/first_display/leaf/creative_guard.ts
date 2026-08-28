@@ -1,18 +1,15 @@
+import type { CreativeBootV1 } from '../../core/types';
+import {
+  createCreativeStartup,
+  type CreativeStartupOptions,
+} from '../../integrations/creative/startup';
 import type { FirstDisplaySliceActivationContext } from '../../shared/first_display_transaction';
 
-export interface FirstDisplayCreativeGuardV1 {
-  readonly version: 1;
-  readonly id: 'creative';
-  readonly clickGuard: boolean;
-  readonly renderGuard: boolean;
-  readonly normalizeNavigation: (raw: string) => string | undefined;
-  readonly shouldProxyResource: (raw: string) => boolean;
-}
-
-interface CreativeInitialBindings {
-  readonly location: Readonly<{ href: string; origin: string }>;
+interface CreativeInitialBindings extends Pick<
+  CreativeStartupOptions,
+  'document' | 'installClickGuard' | 'installDynamicIframeProxy' | 'installDynamicImageProxy'
+> {
   readonly observe: (name: 'guard_count', value: number) => void;
-  readonly register: (guard: FirstDisplayCreativeGuardV1) => () => void;
 }
 
 function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | undefined {
@@ -45,12 +42,7 @@ function exactRecord(value: unknown, keys: readonly string[]): Record<string, un
   }
 }
 
-function snapshotConfig(candidate: unknown):
-  | Readonly<{
-      clickGuard: boolean;
-      renderGuard: boolean;
-    }>
-  | undefined {
+function snapshotConfig(candidate: unknown): Readonly<CreativeBootV1> | undefined {
   const config = exactRecord(candidate, ['version', 'enabled', 'clickGuard', 'renderGuard']);
   if (
     !config ||
@@ -62,60 +54,30 @@ function snapshotConfig(candidate: unknown):
   ) {
     return undefined;
   }
-  return Object.freeze({ clickGuard: config.clickGuard, renderGuard: config.renderGuard });
+  return Object.freeze({
+    version: 1,
+    enabled: true,
+    clickGuard: config.clickGuard,
+    renderGuard: config.renderGuard,
+  });
 }
 
-function normalizeNavigation(raw: string, base: string): string | undefined {
-  try {
-    const url = new URL(String(raw), base);
-    if (
-      !['http:', 'https:'].includes(url.protocol) ||
-      url.username.length > 0 ||
-      url.password.length > 0
-    ) {
-      return undefined;
-    }
-    return url.toString();
-  } catch {
-    return undefined;
-  }
-}
-
-function shouldProxyResource(raw: string, href: string, origin: string): boolean {
-  const value = String(raw || '').trim();
-  if (!value || /^(data:|javascript:|blob:|about:)/i.test(value)) return false;
-  if (value.startsWith('/first-party/proxy')) return false;
-  try {
-    const url = new URL(value, href);
-    return url.origin !== origin && (url.protocol === 'http:' || url.protocol === 'https:');
-  } catch {
-    return false;
-  }
-}
-
-/** Register the selected parser-time creative policy with one generic provisional guard owner. */
+/** Install the selected parser-time creative guards under the agent rollback owner. */
 export function installCreativeInitial(
   candidate: unknown,
   own: FirstDisplaySliceActivationContext['own'],
   configCandidate: unknown
 ): void {
-  // The authenticated bootstrap owns bindings; only server-carried config is untrusted here.
   const bindings = candidate as CreativeInitialBindings;
   const config = snapshotConfig(configCandidate);
-  if (!config || typeof own !== 'function') {
-    throw new TypeError('tsjs');
-  }
-  const guard: FirstDisplayCreativeGuardV1 = Object.freeze({
-    version: 1,
-    id: 'creative',
-    clickGuard: config.clickGuard,
-    renderGuard: config.renderGuard,
-    normalizeNavigation: (raw: string) => normalizeNavigation(raw, bindings.location.href),
-    shouldProxyResource: (raw: string) =>
-      shouldProxyResource(raw, bindings.location.href, bindings.location.origin),
+  if (!config || typeof own !== 'function') throw new TypeError('tsjs');
+  const startup = createCreativeStartup({
+    document: bindings.document,
+    installClickGuard: bindings.installClickGuard,
+    installDynamicIframeProxy: bindings.installDynamicIframeProxy,
+    installDynamicImageProxy: bindings.installDynamicImageProxy,
   });
-  const release = bindings.register(guard);
-  if (typeof release !== 'function') throw new TypeError('tsjs');
+  const release = startup.activate(config);
   own(release);
   bindings.observe('guard_count', (config.clickGuard ? 1 : 0) + (config.renderGuard ? 2 : 0));
 }

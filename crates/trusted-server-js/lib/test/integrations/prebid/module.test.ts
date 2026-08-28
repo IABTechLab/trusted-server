@@ -8,11 +8,13 @@ import {
 } from '../../../src/adapters/prebid';
 import {
   createPrebidIntegrationRegistration,
+  type PreparedTrustedBidV1,
+} from '../../../src/integrations/prebid/module';
+import {
   createPrebidSelectionCoordinator,
   publishPrebidBid,
   type PrebidBidPublicationInput,
-  type PreparedTrustedBidV1,
-} from '../../../src/integrations/prebid/module';
+} from '../../../src/integrations/render_runtime/prebid_selection';
 import {
   createPrebidRefreshPolicy,
   createPrebidSyntheticRefreshRunner,
@@ -269,7 +271,7 @@ function initialProductionPrebidHarness(userIdModules: readonly object[]) {
         : undefined,
   });
   const artifacts = createCommittedArtifactStore();
-  const registerPucGamAttempt = vi.fn(() => true);
+  const registerPucGamAttempt = vi.fn((_input: unknown) => true);
   const createAttempt = (owner: RenderAttemptScope) =>
     createRenderAttempt({
       artifacts,
@@ -280,6 +282,32 @@ function initialProductionPrebidHarness(userIdModules: readonly object[]) {
           : undefined,
       reservations,
     });
+  const renderCapability = Object.freeze({
+    createPrebidSelectionCoordinator: () =>
+      createPrebidSelectionCoordinator({
+        activateAttempt: ({ attempt, owner, preparedBid }) =>
+          registerPucGamAttempt(
+            Object.freeze({
+              artifact: Object.freeze({
+                kind: 'puc' as const,
+                attemptId: attempt.id,
+                slot: attempt.slot,
+                navigationGeneration: attempt.navigationGeneration,
+                dispose: () => undefined,
+              }),
+              attempt,
+              owner,
+              reservationId: preparedBid.bid.adId,
+            })
+          ),
+        createAttempt,
+        reservations,
+      }),
+    navigation,
+    projection,
+    publishPrebidBid: (input: Omit<PrebidBidPublicationInput, 'navigation' | 'reservations'>) =>
+      publishPrebidBid({ ...input, navigation, reservations }),
+  });
   const preparationDisposers: Array<() => void> = [];
   const activationDisposers: Array<() => void> = [];
   const afterCommit: Array<() => void> = [];
@@ -309,13 +337,7 @@ function initialProductionPrebidHarness(userIdModules: readonly object[]) {
     interfaces: Object.freeze({
       'runtime.v1': Object.freeze({ document }),
       'slots.v1': Object.freeze({}),
-      'render.v1': Object.freeze({
-        createAttempt,
-        navigation,
-        projection,
-        registerPucGamAttempt,
-        reservations,
-      }),
+      'render.v1': renderCapability,
       'messages.v1': Object.freeze({}),
       'aps.v1': Object.freeze({}),
     }),
@@ -325,13 +347,7 @@ function initialProductionPrebidHarness(userIdModules: readonly object[]) {
       interfaces: Object.freeze({
         'runtime.v1': Object.freeze({ document }),
         'slots.v1': Object.freeze({}),
-        'render.v1': Object.freeze({
-          createAttempt,
-          navigation,
-          projection,
-          registerPucGamAttempt,
-          reservations,
-        }),
+        'render.v1': renderCapability,
         'messages.v1': Object.freeze({}),
         'aps.v1': Object.freeze({}),
       }),

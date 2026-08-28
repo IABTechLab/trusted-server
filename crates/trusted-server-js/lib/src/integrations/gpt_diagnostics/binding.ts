@@ -29,20 +29,6 @@ export interface GptDiagnosticsBindingView {
 
 type BindingListener = () => void;
 
-function defaultScheduleFrame(callback: () => void): () => void {
-  if (typeof requestAnimationFrame === 'function' && typeof cancelAnimationFrame === 'function') {
-    const frame = requestAnimationFrame(() => callback());
-    return () => cancelAnimationFrame(frame);
-  }
-  let active = true;
-  queueMicrotask(() => {
-    if (active) callback();
-  });
-  return () => {
-    active = false;
-  };
-}
-
 function isVisibleInViewport(element: HTMLElement, window: BindingWindow): boolean {
   const rectangle = element.getBoundingClientRect();
   if (rectangle.width <= 0 || rectangle.height <= 0) return false;
@@ -119,7 +105,8 @@ export class GptDiagnosticsBindingManager {
       options.window ??
       (this.document.defaultView as unknown as BindingWindow | null) ??
       (window as unknown as BindingWindow);
-    this.scheduleFrame = options.scheduleFrame ?? defaultScheduleFrame;
+    this.scheduleFrame =
+      options.scheduleFrame ?? ((callback) => scheduleFrame(this.window, callback));
     this.unsubscribeStore = this.store.subscribe(() => this.scheduleRefresh());
 
     this.window.addEventListener('scroll', this.scheduleRefresh, { passive: true });

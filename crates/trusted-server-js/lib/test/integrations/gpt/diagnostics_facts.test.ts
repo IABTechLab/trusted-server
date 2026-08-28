@@ -10,7 +10,10 @@ import {
   activateGptDiagnosticsEventListeners,
   activateGptDiagnosticsFactCapture,
   createGptDiagnosticsFactBuffer,
+  createTrustedServerOpportunityFact,
+  publishTrustedServerRequestFact,
   projectGptTraceFact,
+  type GptDiagnosticsFact,
 } from '../../../src/integrations/gpt/diagnostics_facts';
 
 function fact(index: number): Readonly<GoogletagDiagnosticsFact> {
@@ -25,6 +28,126 @@ function fact(index: number): Readonly<GoogletagDiagnosticsFact> {
 }
 
 describe('GPT diagnostics fact transport', () => {
+  it('publishes one production request-intent fact from the exact projection and slot identity', () => {
+    const physicalSlot = Object.freeze({});
+    const identity = Object.freeze({
+      token: Object.freeze({}),
+      traceToken: 'gt1_1' as never,
+      runtimeSlotNumber: 1,
+      elementId: 'slot-1',
+      adUnitPath: '/123/slot-1',
+    });
+    const publish = vi.fn(() => true);
+    const projection = Object.freeze({
+      version: 1 as const,
+      auction: Object.freeze({
+        version: 1 as const,
+        auctionId: 'auction-1',
+        results: Object.freeze([
+          Object.freeze({
+            slot: 'slot-1',
+            outcome: 'winner' as const,
+            candidateId: 'candidate001',
+          }),
+        ]),
+      }),
+      slots: Object.freeze([
+        Object.freeze({
+          slot: 'slot-1',
+          gamUnitPath: '/123/slot-1',
+          divId: 'slot-1',
+          formats: Object.freeze([
+            Object.freeze([300, 250] as const),
+            Object.freeze([728, 90] as const),
+          ]),
+          targeting: Object.freeze({}),
+        }),
+      ]),
+      bids: Object.freeze([
+        Object.freeze({
+          candidateId: 'candidate001',
+          slot: 'slot-1',
+          provider: 'gpt',
+          upstreamBidId: 'upstream-1',
+          cpm: 1,
+          currency: 'USD' as const,
+          targeting: Object.freeze({}),
+          rendererReservationId: `r1_${'a'.repeat(22)}`,
+          renderSource: Object.freeze({
+            type: 'adm' as const,
+            version: 1 as const,
+            adm: '<div>creative</div>',
+            width: 300,
+            height: 250,
+          }),
+        }),
+      ]),
+    });
+
+    expect(
+      publishTrustedServerRequestFact({
+        adapter: { diagnosticsIdentity: (slot) => (slot === physicalSlot ? identity : undefined) },
+        buffer: { publish },
+        physicalSlot,
+        projection,
+        registeredSlotId: 'slot-1',
+      })
+    ).toBe(true);
+    expect(publish).toHaveBeenCalledExactlyOnceWith({
+      kind: 'trustedServerOpportunity',
+      auctionSlotId: 'slot-1',
+      opportunity: 'renderable_candidate',
+      requestedSlotSizes: [
+        [300, 250],
+        [728, 90],
+      ],
+      slot: identity,
+      trustedServerAuctionId: 'auction-1',
+    });
+  });
+
+  it('copies and delivers exact Trusted Server requested-size evidence before GPT callbacks', () => {
+    const slot = Object.freeze({
+      token: Object.freeze(Object.create(null) as object),
+      traceToken: 'gt1_1' as never,
+      runtimeSlotNumber: 1,
+      cycleOrdinal: 1 as never,
+      elementId: 'fictional-slot',
+    });
+    const formats: Array<[number, number]> = [
+      [300, 250],
+      [728, 90],
+    ];
+    const opportunity = createTrustedServerOpportunityFact({
+      auctionSlotId: 'fictional-slot',
+      opportunity: 'renderable_candidate',
+      requestedSlotSizes: formats,
+      slot,
+      trustedServerAuctionId: 'fictional-auction',
+    });
+    formats[0]![0] = 1;
+    const received: Readonly<GptDiagnosticsFact>[] = [];
+    const buffer = createGptDiagnosticsFactBuffer();
+
+    expect(opportunity).toEqual({
+      kind: 'trustedServerOpportunity',
+      auctionSlotId: 'fictional-slot',
+      opportunity: 'renderable_candidate',
+      requestedSlotSizes: [
+        [300, 250],
+        [728, 90],
+      ],
+      slot,
+      trustedServerAuctionId: 'fictional-auction',
+    });
+    expect(Object.isFrozen(opportunity)).toBe(true);
+    expect(Object.isFrozen(opportunity?.requestedSlotSizes)).toBe(true);
+    expect(Object.isFrozen(opportunity?.requestedSlotSizes?.[0])).toBe(true);
+    expect(buffer.publish(opportunity!)).toBe(true);
+    buffer.activate((candidate) => received.push(candidate));
+    expect(received).toEqual([opportunity]);
+  });
+
   it('projects only the data-safe exact trace identity and preserves event fields', () => {
     const opaqueToken = Object.freeze(Object.create(null) as object);
     const projected = projectGptTraceFact(
@@ -134,6 +257,7 @@ describe('GPT diagnostics fact transport', () => {
       capturedAtMs: 1,
       elementId: 'slot-1',
       adUnitPath: '/example/slot-1',
+      requestedSlotSizes: Object.freeze([Object.freeze([300, 250] as const)]),
       isEmpty: null,
       renderedSize: null,
       isBackfill: null,
@@ -147,6 +271,7 @@ describe('GPT diagnostics fact transport', () => {
           ...base,
           event: 'slotRenderEnded' as const,
           capturedAtMs: 2,
+          requestedSlotSizes: null,
           isEmpty: false,
           renderedSize: Object.freeze([300, 250] as const),
           isBackfill: false,
@@ -156,25 +281,41 @@ describe('GPT diagnostics fact transport', () => {
       overflowCount: 7,
       dropCount: 3,
     });
-    const received: Readonly<GoogletagDiagnosticsFact>[] = [];
+    const received: Readonly<GptDiagnosticsFact>[] = [];
 
     expect(
-      buffer.adoptFirstDisplay(adopted, (traceToken) =>
-        traceToken === 'gt1_5'
-          ? Object.freeze({
-              token: transferredToken,
-              traceToken: 'gt1_5' as never,
-              runtimeSlotNumber: 5,
-              cycleOrdinal: 1 as never,
-              elementId: 'slot-1',
-              adUnitPath: '/example/slot-1',
-            })
-          : undefined
+      buffer.adoptFirstDisplay(
+        adopted,
+        (traceToken) =>
+          traceToken === 'gt1_5'
+            ? Object.freeze({
+                token: transferredToken,
+                traceToken: 'gt1_5' as never,
+                runtimeSlotNumber: 5,
+                cycleOrdinal: 1 as never,
+                elementId: 'slot-1',
+                adUnitPath: '/example/slot-1',
+              })
+            : undefined,
+        (traceToken, slot) =>
+          traceToken === 'gt1_5'
+            ? createTrustedServerOpportunityFact({
+                auctionSlotId: 'slot-1',
+                opportunity: 'renderable_candidate',
+                requestedSlotSizes: [[300, 250]],
+                slot,
+              })
+            : undefined
       )
     ).toBe(true);
     const release = buffer.activate((value) => received.push(value));
-    expect(received).toHaveLength(2);
-    expect(received.map((value) => projectGptTraceFact(value))).toEqual([
+    expect(received).toHaveLength(3);
+    expect(received[0]).toMatchObject({
+      kind: 'trustedServerOpportunity',
+      auctionSlotId: 'slot-1',
+      requestedSlotSizes: [[300, 250]],
+    });
+    expect(received.slice(1).map((value) => projectGptTraceFact(value as never))).toEqual([
       {
         kind: 'slotRequested',
         observedAtMs: 1,
@@ -189,6 +330,7 @@ describe('GPT diagnostics fact transport', () => {
     ]);
     expect(typeof received[0]?.slot.token).toBe('object');
     expect(received[0]?.slot.token).toBe(received[1]?.slot.token);
+    expect(received[0]?.slot.token).toBe(received[2]?.slot.token);
     expect(received[0]?.slot.token).toBe(transferredToken);
     expect(received[0]?.slot.runtimeSlotNumber).toBe(5);
     expect(Object.isFrozen(received[0])).toBe(true);
@@ -201,6 +343,83 @@ describe('GPT diagnostics fact transport', () => {
         Object.freeze({ facts: Object.freeze([]), overflowCount: 0, dropCount: 0 })
       )
     ).toBe(false);
+  });
+
+  it('rehydrates separate cycles for one transferred physical GPT slot', () => {
+    const buffer = createGptDiagnosticsFactBuffer();
+    const transferredToken = Object.freeze(Object.create(null) as object);
+    const transferredFact = (
+      cycleOrdinal: number,
+      event: 'slotRequested' | 'slotRenderEnded',
+      capturedAtMs: number
+    ) =>
+      Object.freeze({
+        version: 1 as const,
+        event,
+        token: 'gt1_5',
+        runtimeSlotNumber: 5,
+        cycleOrdinal,
+        disposition: 'matched' as const,
+        issueReason: null,
+        capturedAtMs,
+        elementId: 'slot-1',
+        adUnitPath: '/example/slot-1',
+        requestedSlotSizes:
+          event === 'slotRequested' ? Object.freeze([Object.freeze([300, 250] as const)]) : null,
+        isEmpty: event === 'slotRenderEnded' ? false : null,
+        renderedSize: event === 'slotRenderEnded' ? Object.freeze([300, 250] as const) : null,
+        isBackfill: null,
+        slotContentChanged: null,
+        visibilityPercent: null,
+      });
+    const received: Readonly<GptDiagnosticsFact>[] = [];
+
+    expect(
+      buffer.adoptFirstDisplay(
+        Object.freeze({
+          facts: Object.freeze([
+            transferredFact(1, 'slotRequested', 1),
+            transferredFact(1, 'slotRenderEnded', 2),
+            transferredFact(2, 'slotRequested', 3),
+            transferredFact(2, 'slotRenderEnded', 4),
+          ]),
+          overflowCount: 0,
+          dropCount: 0,
+        }),
+        () =>
+          Object.freeze({
+            token: transferredToken,
+            traceToken: 'gt1_5' as never,
+            runtimeSlotNumber: 5,
+            cycleOrdinal: 2 as never,
+            elementId: 'slot-1',
+            adUnitPath: '/example/slot-1',
+          }),
+        (_traceToken, slot) =>
+          createTrustedServerOpportunityFact({
+            auctionSlotId: 'slot-1',
+            opportunity: 'renderable_candidate',
+            requestedSlotSizes: [[300, 250]],
+            slot,
+          })
+      )
+    ).toBe(true);
+    buffer.activate((value) => received.push(value));
+
+    expect(
+      received.map((value) => ({
+        kind: value.kind,
+        cycleOrdinal: value.slot.cycleOrdinal,
+      }))
+    ).toEqual([
+      { kind: 'trustedServerOpportunity', cycleOrdinal: 1 },
+      { kind: 'slotRequested', cycleOrdinal: 1 },
+      { kind: 'slotRenderEnded', cycleOrdinal: 1 },
+      { kind: 'trustedServerOpportunity', cycleOrdinal: 2 },
+      { kind: 'slotRequested', cycleOrdinal: 2 },
+      { kind: 'slotRenderEnded', cycleOrdinal: 2 },
+    ]);
+    expect(received.every((value) => value.slot.token === transferredToken)).toBe(true);
   });
 
   it('rejects malformed first-display facts without consuming adoption', () => {
@@ -218,6 +437,7 @@ describe('GPT diagnostics fact transport', () => {
           capturedAtMs: 1,
           elementId: null,
           adUnitPath: null,
+          requestedSlotSizes: null,
           isEmpty: null,
           renderedSize: null,
           isBackfill: null,

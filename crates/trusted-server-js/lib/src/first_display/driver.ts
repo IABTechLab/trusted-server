@@ -274,14 +274,31 @@ export function createFirstDisplayProjectedDriver(
       );
       const cycles = gptCycles.flatMap((captured) => {
         const cycle = bound.get(captured[0]);
-        return cycle &&
-          acceptedIds.has(captured[0]) &&
-          cycle[1].id === captured[1] &&
-          cycle[3] === captured[2] &&
-          cycle[7] === captured[4] &&
-          cycle[4] === captured[5]
-          ? [Object.freeze([...cycle, captured[3]] as const)]
-          : [];
+        if (
+          !cycle ||
+          !acceptedIds.has(captured[0]) ||
+          cycle[7] !== captured[4] ||
+          cycle[4] !== captured[5]
+        ) {
+          return [];
+        }
+        const element =
+          cycle[1].id === captured[1] ? cycle[1] : options.gptInput[2].getElementById(captured[1]);
+        const ElementConstructor = options.gptInput[2].defaultView?.HTMLElement;
+        if (!ElementConstructor || !(element instanceof ElementConstructor)) return [];
+        return [
+          Object.freeze([
+            cycle[0],
+            element,
+            cycle[2],
+            captured[2],
+            cycle[4],
+            cycle[5],
+            cycle[6],
+            cycle[7],
+            captured[3],
+          ] as const),
+        ];
       });
       const diagnosticCycles = gptDiagnostics[0].filter((cycle) => acceptedIds.has(cycle[0]));
       if (
