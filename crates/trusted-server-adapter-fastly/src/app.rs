@@ -2195,13 +2195,27 @@ mod tests {
             server_region: Some("US-East".to_string()),
         });
 
-        let _ = route(&router, req);
+        let response = route(&router, req);
 
         let observed = captured
             .lock()
             .expect("should lock captured client info")
             .clone()
             .expect("request filter should have observed the entry-point ClientInfo");
+        assert_eq!(
+            observed.client_ip,
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
+            "request-scoped services should preserve the resolved client IP used by EC"
+        );
+        let finalize = response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("fallback response should carry EC finalization state");
+        assert_eq!(
+            finalize.ec_context.client_ip(),
+            Some("203.0.113.7"),
+            "EC should capture the resolved client IP from request-scoped services"
+        );
         assert_eq!(
             observed.tls_protocol.as_deref(),
             Some("TLSv1.3"),
