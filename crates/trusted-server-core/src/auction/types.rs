@@ -1,11 +1,14 @@
 //! Core types for auction requests and responses.
 
 use edgezero_core::body::Body as EdgeBody;
+use error_stack::{Report, ResultExt as _, bail, ensure};
 use http::Request;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::auction::context::ContextValue;
+use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
@@ -175,56 +178,117 @@ pub struct AuctionResponse {
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
-/// APS creative tag type accepted by the Trusted Server renderer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ApsTagType {
-    /// APS loads the creative URL in a nested iframe.
-    Iframe,
-    /// APS fetches creative HTML and executes it in its nested renderer frame.
-    Script,
-}
+/// Wire key carrying the renderer type tag.
+///
+/// A payload may not use this key, since it would collide with the tag when
+/// the descriptor is serialized flat.
+const RENDERER_TYPE_KEY: &str = "type";
 
-/// Version 1 APS renderer descriptor shared with browser clients.
+/// Browser renderer capability carried by a bid: a type tag and the payload
+/// the auction provider that produced the bid defines.
+///
+/// Serialized flat, as `{"type": "<tag>", ...payload}`, so a page receives
+/// the same bytes whether the provider lives in core or in its own crate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ApsRendererV1 {
-    /// Renderer contract version.
-    pub version: u8,
-    /// APS account identifier used to initialize the fixed runner.
-    pub account_id: String,
-    /// Selected `OpenRTB` bid identifier.
-    pub bid_id: String,
-    /// Optional `OpenRTB` creative identifier.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub creative_id: Option<String>,
-    /// APS creative delivery mode.
-    pub tag_type: ApsTagType,
-    /// HTTPS creative URL consumed by the fixed APS runner.
-    pub creative_url: String,
-    /// Base64-encoded exact one-bid APS response envelope.
-    pub aax_response: String,
-    /// Creative width.
-    pub width: u32,
-    /// Creative height.
-    pub height: u32,
-}
-
-/// Typed browser renderer capability carried by a bid.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum BidRenderer {
-    /// APS renderer version 1.
-    Aps(ApsRendererV1),
+pub struct BidRenderer {
+    #[serde(rename = "type")]
+    renderer_type: String,
+    #[serde(flatten)]
+    payload: serde_json::Map<String, serde_json::Value>,
 }
 
 impl BidRenderer {
-    /// Return the APS renderer descriptor when this is an APS renderer.
+    /// Build a descriptor from a type tag and the provider's JSON payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Auction`] when `payload` is not a JSON
+    /// object, or when it carries its own `type` key, which would collide with
+    /// the tag once the descriptor is serialized flat.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use serde_json::json;
+    /// use trusted_server_core::auction::types::BidRenderer;
+    ///
+    /// let renderer = BidRenderer::new("example", json!({ "version": 1 }))
+    ///     .expect("should accept an object payload");
+    /// assert_eq!(renderer.renderer_type(), "example");
+    /// ```
+    pub fn new(
+        renderer_type: &str,
+        payload: serde_json::Value,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let serde_json::Value::Object(payload) = payload else {
+            bail!(TrustedServerError::Auction {
+                message: format!("Renderer '{renderer_type}' payload must be a JSON object"),
+            });
+        };
+        ensure!(
+            !payload.contains_key(RENDERER_TYPE_KEY),
+            TrustedServerError::Auction {
+                message: format!(
+                    "Renderer '{renderer_type}' payload must not carry a '{RENDERER_TYPE_KEY}' key"
+                ),
+            }
+        );
+        Ok(Self {
+            renderer_type: renderer_type.to_string(),
+            payload,
+        })
+    }
+
+    /// Build a descriptor by serializing a provider's own payload type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Auction`] when `payload` cannot be
+    /// serialized, and when the serialized form is rejected by
+    /// [`new`](Self::new).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use serde::Serialize;
+    /// use trusted_server_core::auction::types::BidRenderer;
+    ///
+    /// #[derive(Serialize)]
+    /// struct ExampleRendererV1 {
+    ///     version: u8,
+    /// }
+    ///
+    /// let renderer = BidRenderer::from_typed("example", &ExampleRendererV1 { version: 1 })
+    ///     .expect("should accept a struct payload");
+    /// assert_eq!(renderer.renderer_type(), "example");
+    /// ```
+    pub fn from_typed<T: Serialize>(
+        renderer_type: &str,
+        payload: &T,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let payload =
+            serde_json::to_value(payload).change_context(TrustedServerError::Auction {
+                message: format!("Failed to serialize renderer '{renderer_type}' payload"),
+            })?;
+        Self::new(renderer_type, payload)
+    }
+
+    /// Return the renderer type tag a page reads to select its renderer.
     #[must_use]
-    pub fn as_aps(&self) -> Option<&ApsRendererV1> {
-        match self {
-            Self::Aps(renderer) => Some(renderer),
+    pub fn renderer_type(&self) -> &str {
+        &self.renderer_type
+    }
+
+    /// Deserialize the payload into the provider's own descriptor type.
+    ///
+    /// Returns `None` when the descriptor carries a different tag, and when the
+    /// payload does not match `T`.
+    #[must_use]
+    pub fn payload_as<T: DeserializeOwned>(&self, renderer_type: &str) -> Option<T> {
+        if self.renderer_type != renderer_type {
+            return None;
         }
+        serde_json::from_value(serde_json::Value::Object(self.payload.clone())).ok()
     }
 }
 
@@ -399,6 +463,7 @@ impl AuctionResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrations::aps::{APS_RENDERER_TYPE, ApsRendererV1, ApsTagType};
     use serde_json::json;
 
     fn make_bid(bidder: &str) -> Bid {
@@ -575,17 +640,21 @@ mod tests {
 
     #[test]
     fn aps_renderer_serializes_to_versioned_camel_case_contract() {
-        let renderer = BidRenderer::Aps(ApsRendererV1 {
-            version: 1,
-            account_id: "example-account-id".to_string(),
-            bid_id: "fictional-bid-id".to_string(),
-            creative_id: Some("fictional-creative-id".to_string()),
-            tag_type: ApsTagType::Iframe,
-            creative_url: "https://creative.example/render".to_string(),
-            aax_response: "base64-data".to_string(),
-            width: 300,
-            height: 250,
-        });
+        let renderer = BidRenderer::from_typed(
+            APS_RENDERER_TYPE,
+            &ApsRendererV1 {
+                version: 1,
+                account_id: "example-account-id".to_string(),
+                bid_id: "fictional-bid-id".to_string(),
+                creative_id: Some("fictional-creative-id".to_string()),
+                tag_type: ApsTagType::Iframe,
+                creative_url: "https://creative.example/render".to_string(),
+                aax_response: "base64-data".to_string(),
+                width: 300,
+                height: 250,
+            },
+        )
+        .expect("should build APS renderer descriptor");
 
         let serialized = serde_json::to_value(&renderer).expect("should serialize renderer");
 
@@ -609,23 +678,148 @@ mod tests {
 
     #[test]
     fn aps_renderer_omits_absent_creative_id() {
-        let renderer = BidRenderer::Aps(ApsRendererV1 {
-            version: 1,
-            account_id: "example-account-id".to_string(),
-            bid_id: "fictional-bid-id".to_string(),
-            creative_id: None,
-            tag_type: ApsTagType::Iframe,
-            creative_url: "https://creative.example/render".to_string(),
-            aax_response: "base64-data".to_string(),
-            width: 300,
-            height: 250,
-        });
+        let renderer = BidRenderer::from_typed(
+            APS_RENDERER_TYPE,
+            &ApsRendererV1 {
+                version: 1,
+                account_id: "example-account-id".to_string(),
+                bid_id: "fictional-bid-id".to_string(),
+                creative_id: None,
+                tag_type: ApsTagType::Iframe,
+                creative_url: "https://creative.example/render".to_string(),
+                aax_response: "base64-data".to_string(),
+                width: 300,
+                height: 250,
+            },
+        )
+        .expect("should build APS renderer descriptor");
 
         let serialized = serde_json::to_value(&renderer).expect("should serialize renderer");
 
         assert!(
             serialized.get("creativeId").is_none(),
             "should omit absent creative ID"
+        );
+    }
+
+    #[test]
+    fn the_open_renderer_serializes_to_the_same_bytes_as_the_aps_variant_did() {
+        // Literal strings captured from the closed-enum form before this
+        // change, through the same `serde_json::to_value` path production
+        // uses: `BidExt::to_ext` for the OpenRTB response extension, and
+        // `build_bid_map` for `window.tsjs.bids`. Both hand the page an object
+        // whose keys are ordered by `serde_json::Map`, so these are the bytes
+        // a browser actually receives.
+        let full = BidRenderer::from_typed(
+            APS_RENDERER_TYPE,
+            &ApsRendererV1 {
+                version: 1,
+                account_id: "example-account-id".to_string(),
+                bid_id: "fictional-bid-id".to_string(),
+                creative_id: Some("fictional-creative-id".to_string()),
+                tag_type: ApsTagType::Iframe,
+                creative_url: "https://creative.example/render".to_string(),
+                aax_response: "base64-data".to_string(),
+                width: 300,
+                height: 250,
+            },
+        )
+        .expect("should build APS renderer descriptor");
+        let absent = BidRenderer::from_typed(
+            APS_RENDERER_TYPE,
+            &ApsRendererV1 {
+                version: 1,
+                account_id: "example-account-id".to_string(),
+                bid_id: "fictional-bid-id".to_string(),
+                creative_id: None,
+                tag_type: ApsTagType::Script,
+                creative_url: "https://creative.example/render".to_string(),
+                aax_response: "base64-data".to_string(),
+                width: 300,
+                height: 250,
+            },
+        )
+        .expect("should build APS renderer descriptor");
+
+        let full_bytes = serde_json::to_string(
+            &serde_json::to_value(&full).expect("should convert renderer to a JSON value"),
+        )
+        .expect("should serialize renderer");
+        let absent_bytes = serde_json::to_string(
+            &serde_json::to_value(&absent).expect("should convert renderer to a JSON value"),
+        )
+        .expect("should serialize renderer");
+
+        assert_eq!(
+            full_bytes,
+            "{\"aaxResponse\":\"base64-data\",\"accountId\":\"example-account-id\",\"bidId\":\"fictional-bid-id\",\"creativeId\":\"fictional-creative-id\",\"creativeUrl\":\"https://creative.example/render\",\"height\":250,\"tagType\":\"iframe\",\"type\":\"aps\",\"version\":1,\"width\":300}",
+            "should serialize to the bytes the closed enum produced"
+        );
+        assert_eq!(
+            absent_bytes,
+            "{\"aaxResponse\":\"base64-data\",\"accountId\":\"example-account-id\",\"bidId\":\"fictional-bid-id\",\"creativeUrl\":\"https://creative.example/render\",\"height\":250,\"tagType\":\"script\",\"type\":\"aps\",\"version\":1,\"width\":300}",
+            "should serialize to the bytes the closed enum produced with no creative ID"
+        );
+    }
+
+    #[test]
+    fn renderer_round_trips_through_its_wire_form() {
+        let descriptor = ApsRendererV1 {
+            version: 1,
+            account_id: "example-account-id".to_string(),
+            bid_id: "fictional-bid-id".to_string(),
+            creative_id: Some("fictional-creative-id".to_string()),
+            tag_type: ApsTagType::Iframe,
+            creative_url: "https://creative.example/render".to_string(),
+            aax_response: "base64-data".to_string(),
+            width: 300,
+            height: 250,
+        };
+        let renderer = BidRenderer::from_typed(APS_RENDERER_TYPE, &descriptor)
+            .expect("should build APS renderer descriptor");
+
+        let serialized = serde_json::to_string(&renderer).expect("should serialize renderer");
+        let restored: BidRenderer =
+            serde_json::from_str(&serialized).expect("should deserialize renderer");
+
+        assert_eq!(
+            restored.renderer_type(),
+            APS_RENDERER_TYPE,
+            "should round-trip the renderer type tag"
+        );
+        assert_eq!(
+            restored
+                .payload_as::<ApsRendererV1>(APS_RENDERER_TYPE)
+                .expect("should deserialize the APS payload"),
+            descriptor,
+            "should round-trip the provider payload"
+        );
+    }
+
+    #[test]
+    fn renderer_payload_is_hidden_from_a_different_type_tag() {
+        let renderer = BidRenderer::new(APS_RENDERER_TYPE, json!({ "version": 1 }))
+            .expect("should build renderer descriptor");
+
+        assert!(
+            renderer.payload_as::<ApsRendererV1>("example").is_none(),
+            "should refuse a payload requested under a different tag"
+        );
+    }
+
+    #[test]
+    fn renderer_rejects_a_payload_that_is_not_an_object() {
+        assert!(
+            BidRenderer::new(APS_RENDERER_TYPE, json!("not-an-object")).is_err(),
+            "should reject a payload that is not a JSON object"
+        );
+    }
+
+    #[test]
+    fn renderer_rejects_a_payload_carrying_its_own_type_key() {
+        assert!(
+            BidRenderer::new(APS_RENDERER_TYPE, json!({ "type": "other", "version": 1 })).is_err(),
+            "should reject a payload that would collide with the type tag"
         );
     }
 

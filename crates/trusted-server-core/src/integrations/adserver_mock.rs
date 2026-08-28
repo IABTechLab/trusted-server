@@ -660,17 +660,27 @@ mod tests {
             bid_id: Some(bid_id.to_string()),
             ad_id: None,
             creative_id: Some(format!("creative-{bid_id}")),
-            renderer: Some(BidRenderer::Aps(ApsRendererV1 {
-                version: 1,
-                account_id: "example-account".to_string(),
-                bid_id: bid_id.to_string(),
-                creative_id: Some(format!("creative-{bid_id}")),
-                tag_type: ApsTagType::Iframe,
-                creative_url: format!("https://creative.example/{bid_id}"),
-                aax_response: format!("fictional-{bid_id}-base64"),
-                width: 728,
-                height: 90,
-            })),
+            // The mock is not APS, so it builds the neutral descriptor from
+            // the wire keys rather than from the APS descriptor type. The "aps"
+            // tag is used on purpose: these fixtures mimic an APS bid arriving
+            // at the mediator.
+            renderer: Some(
+                BidRenderer::new(
+                    "aps",
+                    json!({
+                        "version": 1,
+                        "accountId": "example-account",
+                        "bidId": bid_id,
+                        "creativeId": format!("creative-{bid_id}"),
+                        "tagType": "iframe",
+                        "creativeUrl": format!("https://creative.example/{bid_id}"),
+                        "aaxResponse": format!("fictional-{bid_id}-base64"),
+                        "width": 728,
+                        "height": 90
+                    }),
+                )
+                .expect("should build renderer descriptor"),
+            ),
             cache_id: None,
             cache_host: None,
             cache_path: None,
@@ -857,17 +867,25 @@ mod tests {
                 bid_id: Some("source-bid-id".to_string()),
                 ad_id: Some("bid-impression-id".to_string()),
                 creative_id: Some("source-creative-id".to_string()),
-                renderer: Some(BidRenderer::Aps(ApsRendererV1 {
-                    version: 1,
-                    account_id: "example-account".to_string(),
-                    bid_id: "source-bid-id".to_string(),
-                    creative_id: Some("source-creative-id".to_string()),
-                    tag_type: ApsTagType::Iframe,
-                    creative_url: "https://creative.example/render".to_string(),
-                    aax_response: "fictional-base64".to_string(),
-                    width: 728,
-                    height: 90,
-                })),
+                // Neutral descriptor with the "aps" tag: the mock mimics an
+                // APS bid here without depending on the APS descriptor type.
+                renderer: Some(
+                    BidRenderer::new(
+                        "aps",
+                        json!({
+                            "version": 1,
+                            "accountId": "example-account",
+                            "bidId": "source-bid-id",
+                            "creativeId": "source-creative-id",
+                            "tagType": "iframe",
+                            "creativeUrl": "https://creative.example/render",
+                            "aaxResponse": "fictional-base64",
+                            "width": 728,
+                            "height": 90
+                        }),
+                    )
+                    .expect("should build renderer descriptor"),
+                ),
                 cache_id: Some("cache-uuid".to_string()),
                 cache_host: Some("cache.example".to_string()),
                 cache_path: Some("/cache".to_string()),
@@ -1044,16 +1062,13 @@ mod tests {
             .first()
             .expect("should restore mediated APS winner");
         assert_eq!(winner.bid_id.as_deref(), Some("selected"));
-        assert_eq!(
-            winner
-                .renderer
-                .as_ref()
-                .expect("should restore APS renderer")
-                .as_aps()
-                .expect("should be APS renderer")
-                .bid_id,
-            "selected"
-        );
+        let renderer = winner
+            .renderer
+            .as_ref()
+            .expect("should restore APS renderer")
+            .payload_as::<serde_json::Value>("aps")
+            .expect("should carry an APS-tagged payload");
+        assert_eq!(renderer["bidId"], "selected");
         assert!(winner.creative.is_none());
     }
 

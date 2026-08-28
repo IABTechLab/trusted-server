@@ -65,6 +65,7 @@ use crate::error::TrustedServerError;
 use crate::html_processor::BodyCloseInjection;
 use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
 use crate::integrations::IntegrationRegistry;
+use crate::integrations::aps::{APS_RENDERER_TYPE, ApsRendererV1};
 use crate::permissions::PermissionState;
 use crate::platform::{
     GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, VarySpec,
@@ -5267,13 +5268,15 @@ pub(crate) fn build_bid_map_with_auction_id(
                 // OpenRTB bid ID. The latter is the last resort: it is unique per
                 // bid instance rather than a creative, but GAM echoes it verbatim
                 // so the render bridge can find the exact winning bid.
-                let renderer_bid_id = bid.renderer.as_ref().and_then(|renderer| {
-                    renderer
-                        .as_aps()
-                        .map(|renderer| renderer.bid_id.as_str())
-                });
+                let renderer_bid_id = bid
+                    .renderer
+                    .as_ref()
+                    .and_then(|renderer| {
+                        renderer.payload_as::<ApsRendererV1>(APS_RENDERER_TYPE)
+                    })
+                    .map(|renderer| renderer.bid_id);
                 let hb_adid = non_empty(bid.cache_id.as_deref())
-                    .or_else(|| renderer_bid_id.and_then(|id| non_empty(Some(id))))
+                    .or_else(|| non_empty(renderer_bid_id.as_deref()))
                     .or_else(|| non_empty(bid.ad_id.as_deref()))
                     .or_else(|| non_empty(bid.bid_id.as_deref()));
                 if let Some(id) = hb_adid {
@@ -18359,12 +18362,13 @@ mod tests {
             build_bid_map, build_bids_script, diagnostics_auction_id, html_escape_for_script,
             write_bids_to_state,
         };
-        use crate::auction::types::{ApsRendererV1, ApsTagType, Bid, BidRenderer, MediaType};
+        use crate::auction::types::{Bid, BidRenderer, MediaType};
         use crate::consent::ConsentContext;
         use crate::creative_opportunities::{
             CreativeOpportunitiesConfig, CreativeOpportunityFormat, CreativeOpportunitySlot,
         };
         use crate::http_util::RequestInfo;
+        use crate::integrations::aps::{APS_RENDERER_TYPE, ApsRendererV1, ApsTagType};
         use crate::price_bucket::PriceGranularity;
         use crate::settings::Settings;
         use std::collections::HashMap;
@@ -19533,17 +19537,23 @@ mod tests {
             bid.creative = Some("<script>reject()</script>".to_string());
             bid.nurl = None;
             bid.burl = None;
-            bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
-                version: 1,
-                account_id: "example-account".to_string(),
-                bid_id: "selected-bid".to_string(),
-                creative_id: None,
-                tag_type: ApsTagType::Iframe,
-                creative_url: "https://creative.example/render".to_string(),
-                aax_response: "fictional-base64</script>".to_string(),
-                width: 300,
-                height: 250,
-            }));
+            bid.renderer = Some(
+                BidRenderer::from_typed(
+                    APS_RENDERER_TYPE,
+                    &ApsRendererV1 {
+                        version: 1,
+                        account_id: "example-account".to_string(),
+                        bid_id: "selected-bid".to_string(),
+                        creative_id: None,
+                        tag_type: ApsTagType::Iframe,
+                        creative_url: "https://creative.example/render".to_string(),
+                        aax_response: "fictional-base64</script>".to_string(),
+                        width: 300,
+                        height: 250,
+                    },
+                )
+                .expect("should build APS renderer descriptor"),
+            );
             let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
 
             let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);

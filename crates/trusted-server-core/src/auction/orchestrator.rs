@@ -1543,10 +1543,11 @@ mod tests {
     use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
     use crate::auction::test_support::create_test_auction_context;
     use crate::auction::types::{
-        AdFormat, AdSlot, ApsRendererV1, ApsTagType, AuctionContext, AuctionRequest,
-        AuctionResponse, Bid, BidRenderer, BidStatus, MediaType, PublisherInfo, UserInfo,
+        AdFormat, AdSlot, AuctionContext, AuctionRequest, AuctionResponse, Bid, BidRenderer,
+        BidStatus, MediaType, PublisherInfo, UserInfo,
     };
     use crate::error::TrustedServerError;
+    use crate::integrations::aps::{APS_RENDERER_TYPE, ApsRendererV1, ApsTagType};
     use crate::platform::test_support::{
         StubHttpClient, build_services_with_backend_and_http_client,
         build_services_with_http_client, noop_services,
@@ -1814,17 +1815,21 @@ mod tests {
 
     fn auction_bid(bidder: &str, price: f64) -> Bid {
         let renderer = (bidder == "aps").then(|| {
-            BidRenderer::Aps(ApsRendererV1 {
-                version: 1,
-                account_id: "example-account".to_string(),
-                bid_id: "aps-selected-bid".to_string(),
-                creative_id: None,
-                tag_type: ApsTagType::Iframe,
-                creative_url: "https://creative.example/render".to_string(),
-                aax_response: "fictional-base64".to_string(),
-                width: 300,
-                height: 250,
-            })
+            BidRenderer::from_typed(
+                APS_RENDERER_TYPE,
+                &ApsRendererV1 {
+                    version: 1,
+                    account_id: "example-account".to_string(),
+                    bid_id: "aps-selected-bid".to_string(),
+                    creative_id: None,
+                    tag_type: ApsTagType::Iframe,
+                    creative_url: "https://creative.example/render".to_string(),
+                    aax_response: "fictional-base64".to_string(),
+                    width: 300,
+                    height: 250,
+                },
+            )
+            .expect("should build APS renderer descriptor")
         });
         Bid {
             slot_id: "slot-1".to_string(),
