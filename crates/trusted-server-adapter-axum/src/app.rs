@@ -194,6 +194,10 @@ where
 {
     let services = build_per_request_services(&state, &ctx);
     let mut req = ctx.into_request();
+    // The single preparation point for the adapter. Every route in the table
+    // except `/health` is registered to `named_route_handler` or
+    // `fallback_handler`, and both wrap this function, so each request has its
+    // modules' preparers run exactly once and always before routing.
     if let Err(error) = state.registry.prepare_request(&state.settings, &mut req) {
         return Ok(http_error(&error));
     }
@@ -240,16 +244,23 @@ fn build_ec_context(
 // Fallback dispatcher (tsjs / integration proxy / publisher)
 // ---------------------------------------------------------------------------
 
+/// Dispatches the fallback routes: tsjs assets, integration proxy routes, and
+/// the publisher origin.
+///
+/// The request arrives already prepared. Every route that reaches here is
+/// registered to [`fallback_handler`], which runs the request through
+/// [`execute_handler`], and [`execute_handler`] calls
+/// `registry.prepare_request` before it calls this function, so preparing
+/// again here would run each module's preparer twice for one request.
 async fn dispatch_fallback(
     state: &AppState,
     services: &RuntimeServices,
-    mut req: Request,
+    req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     if let Some(response) = deny_admin_diagnostic_fallback(&req) {
         return Ok(response);
     }
 
-    state.registry.prepare_request(&state.settings, &mut req)?;
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 

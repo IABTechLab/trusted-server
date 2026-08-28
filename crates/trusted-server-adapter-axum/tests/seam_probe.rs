@@ -72,6 +72,30 @@ fn service_with(
     EdgeZeroAxumService::new(router)
 }
 
+/// Sends one GET carrying the probe's counting header and returns the
+/// response. Each caller passes its own `token` so tests running in parallel
+/// count into separate entries.
+async fn get_counted(
+    service: &mut EdgeZeroAxumService,
+    uri: &str,
+    token: &str,
+) -> axum::response::Response {
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(seam_probe::SEAM_PROBE_COUNT_HEADER, token)
+        .body(AxumBody::empty())
+        .expect("should build request");
+
+    service
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(request)
+        .await
+        .expect("should respond")
+}
+
 /// Sends one GET and returns the response.
 async fn get(service: &mut EdgeZeroAxumService, uri: &str) -> axum::response::Response {
     let request = Request::builder()
@@ -162,12 +186,11 @@ async fn carried_module_is_served_in_the_unified_bundle_under_its_composed_hash(
 /// This is the first end-to-end proof that an adapter runs registry preparers
 /// on the request path.
 ///
-/// The run count is asserted exactly, and it is 2 rather than 1 because the
-/// Axum adapter runs the preparers twice on this path: once in
-/// `execute_handler` before the handler is called, and again at the top of
-/// `dispatch_fallback`. Pinning the number here records today's behavior, so
-/// making the adapter run them once is a deliberate change to this test rather
-/// than a silent change to what a module observes.
+/// The run count is asserted exactly, and the invariant is that a request
+/// prepares exactly once: the adapter prepares at a single point that covers
+/// every route, so a module's preparer sees each request one time and always
+/// before routing. A preparer that appends a header, counts, or emits
+/// telemetry can only be written against that guarantee.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
     let settings = settings_with(&format!(
@@ -200,8 +223,57 @@ async fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
         "the route should see the country the module's own geo provider resolved: {body}"
     );
     assert_eq!(
-        report["request_preparer_runs"], 2,
-        "the adapter should have run the module's request preparer on the request path: {body}"
+        report["request_preparer_runs"], 1,
+        "the adapter should have run the module's request preparer exactly once on the request path: {body}"
+    );
+}
+
+/// A request prepares exactly once whether it is served by a named route or by
+/// the fallback, so the invariant holds across the whole route table rather
+/// than only on the path the probe's own proxy route sits on.
+///
+/// The count comes from the probe's counter rather than the request
+/// extensions, because a named route returns a fixed response and reports
+/// nothing about the request it was given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_route_prepares_the_request_exactly_once() {
+    let settings = settings_with(PROBE_BLOCK);
+    let mut service = service_with(settings, &[seam_probe::builder()], &[]);
+
+    // `/admin/keys/rotate` is a named route (the legacy alias denied locally
+    // with a 404), reached through `named_route_handler`, and it is not
+    // covered by the `^/_ts/admin` auth handler, so the request reaches the
+    // preparer rather than being turned back with a 401.
+    let named = get_counted(&mut service, "/admin/keys/rotate", "named-route").await;
+
+    assert_eq!(
+        named.status().as_u16(),
+        404,
+        "the named route should serve the local deny, not fall through to the fallback"
+    );
+    assert_eq!(
+        seam_probe::prepare_runs_for("named-route"),
+        1,
+        "a request served by a named route should prepare exactly once"
+    );
+
+    // The probe's own proxy route is served by the fallback dispatcher.
+    let fallback = get_counted(
+        &mut service,
+        seam_probe::SEAM_PROBE_REPORT_PATH,
+        "fallback-route",
+    )
+    .await;
+
+    assert_eq!(
+        fallback.status().as_u16(),
+        200,
+        "the probe's proxy route should be dispatched by the fallback"
+    );
+    assert_eq!(
+        seam_probe::prepare_runs_for("fallback-route"),
+        1,
+        "a request served by the fallback should prepare exactly once"
     );
 }
 

@@ -14,8 +14,9 @@
 //! configuration rather than from the request. It is a development dependency
 //! of the Axum adapter only, so no adapter's production build reaches it.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
@@ -82,6 +83,52 @@ const SEAM_PROBE_AUCTION_TIMEOUT_MS: u32 = 2000;
 /// at the core ones.
 pub const SEAM_PROBE_COUNTRY_MESSAGE: &str =
     "`[integrations.seam_probe] country` must be exactly two letters";
+
+/// Request header a caller sets to have the preparer count that request.
+///
+/// The header's value is a token the caller chooses, so tests running in
+/// parallel count into separate entries.
+pub const SEAM_PROBE_COUNT_HEADER: &str = "x-seam-probe-count";
+
+/// How many times the preparer ran for each counting token.
+///
+/// Request extensions die with the request, so a route that reports nothing
+/// about them cannot say how many times its request was prepared. This
+/// counter lets a caller pin the once-per-request invariant on any route,
+/// including the named routes that return a fixed response.
+static PREPARE_COUNTS: LazyLock<Mutex<BTreeMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// How many times the preparer ran for requests carrying `token` in
+/// [`SEAM_PROBE_COUNT_HEADER`].
+///
+/// # Panics
+///
+/// Panics when the counter's lock is poisoned.
+#[must_use]
+pub fn prepare_runs_for(token: &str) -> usize {
+    PREPARE_COUNTS
+        .lock()
+        .expect("should lock the seam probe prepare counts")
+        .get(token)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Records one preparer run against the token the request carries, if any.
+fn count_prepare_run(request: &Request<EdgeBody>) {
+    let Some(token) = request
+        .headers()
+        .get(SEAM_PROBE_COUNT_HEADER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return;
+    };
+    let mut counts = PREPARE_COUNTS
+        .lock()
+        .expect("should lock the seam probe prepare counts");
+    *counts.entry(token.to_string()).or_insert(0) += 1;
+}
 
 /// Marker the request preparer inserts into the request extensions.
 ///
@@ -331,6 +378,7 @@ pub fn prepare_request(
     _settings: &Settings,
     request: &mut Request<EdgeBody>,
 ) -> Result<(), Report<TrustedServerError>> {
+    count_prepare_run(request);
     let runs = request
         .extensions()
         .get::<SeamProbePrepared>()
