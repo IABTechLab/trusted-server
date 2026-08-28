@@ -176,8 +176,9 @@ proxy = "enabled"
 # Verify TLS certs when proxying to HTTPS origins (default true; false only for
 # local self-signed dev).
 # certificate_check = true
-# Allowlist for first-party proxy redirect destinations (SSRF guard). Supports
-# exact ("example.com") and wildcard ("*.example.com", also matches apex).
+# Allowlist for first-party proxy signing, initial fetch targets, and redirect
+# targets. Supports exact ("example.com") and wildcard ("*.example.com", also
+# matches apex).
 # REQUIRED to include the Prebid external_bundle_url host when Prebid is enabled.
 # allowed_domains = ["ads.example.com", "assets.example.com", "*.cdn.example.com"]
 #
