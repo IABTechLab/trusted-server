@@ -797,7 +797,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 match handle_publisher_request(
                     AppContext {
                         settings: &state.settings,
-                        integrations: &state.registry,
+                        integration_registry: &state.registry,
                     },
                     &services,
                     None,

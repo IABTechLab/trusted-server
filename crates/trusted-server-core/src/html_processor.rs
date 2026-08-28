@@ -470,11 +470,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     // GPT listeners precede publisher scripts in the origin head.
                     // The decision says whether to inject; the registry's part
                     // says what to inject. Nothing is injected without a part.
-                    if let Some(module_tag) = gpt_diagnostics
-                        .as_ref()
-                        .zip(integrations.js_part(GPT_DIAGNOSTICS_INTEGRATION_ID))
-                        .and_then(|(decision, part)| decision.module_script_tag(&part))
-                    {
+                    if let Some(module_tag) = gpt_diagnostics.as_ref().and_then(|decision| {
+                        integrations
+                            .js_part(GPT_DIAGNOSTICS_INTEGRATION_ID)
+                            .and_then(|part| decision.module_script_tag(&part))
+                    }) {
                         snippet.push_str(&module_tag);
                     }
                     // Deferred bundles: large modules like prebid loaded after

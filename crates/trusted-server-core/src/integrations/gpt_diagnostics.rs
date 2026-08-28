@@ -109,6 +109,10 @@ impl GptDiagnosticsRequestDecision {
     /// Returns `None` when this decision is not active.
     #[must_use]
     pub fn module_script_tag(&self, module: &JsModulePart) -> Option<String> {
+        debug_assert_eq!(
+            module.id, GPT_DIAGNOSTICS_INTEGRATION_ID,
+            "should tag the diagnostics module"
+        );
         self.active.then(|| {
             format!(
                 "<script src=\"{}\"></script>",

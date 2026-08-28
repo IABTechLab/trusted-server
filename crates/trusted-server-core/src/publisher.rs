@@ -1996,11 +1996,11 @@ fn assemble_if_shared(
 /// an old template under new behavior.
 ///
 /// The module digest covers the parts this registry can actually serve, carried modules
-/// included, so a vendor crate that rebuilds its browser module moves the fingerprint and
-/// leaves behind the templates cached under its old `?v=` hash. It also narrows the module
-/// set from every module compiled into the binary to the enabled set, which is a tightening
-/// rather than a loosening, because a module no deployment serves cannot change what a
-/// template renders.
+/// included, so a vendor crate that rebuilds its browser module moves the fingerprint, and
+/// templates keyed under the previous fingerprint are no longer read. It also narrows the
+/// module set from every module compiled into the binary to the ones this deployment can
+/// serve. That is safe because a module this deployment never serves appears in no bundle
+/// hash and no injected URL, so it cannot change what a template renders.
 ///
 /// # Panics
 ///
@@ -4083,7 +4083,7 @@ pub struct AppContext<'a> {
     /// Operator configuration for this deployment.
     pub settings: &'a Settings,
     /// Integrations registered for this deployment.
-    pub integrations: &'a IntegrationRegistry,
+    pub integration_registry: &'a IntegrationRegistry,
 }
 
 /// Proxies requests to the publisher's origin server.
@@ -4111,7 +4111,7 @@ pub async fn handle_publisher_request(
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
     let AppContext {
         settings,
-        integrations: integration_registry,
+        integration_registry,
     } = app;
 
     log::debug!("Proxying request to publisher_origin");
@@ -6856,18 +6856,24 @@ mod tests {
         .page_json()
     }
 
-    /// Integration registry for a test's `settings`.
+    /// Settings parsed from `toml`, with the allowed-domain list
+    /// [`create_test_settings`] sets.
     ///
-    /// Fixtures that parse `crate_test_settings_str()` directly leave
-    /// `proxy.allowed_domains` empty, and the Prebid integration refuses to build
-    /// while the external bundle host is missing from that list, so fill it in the
-    /// same way `create_test_settings` does. Only the allowed-domain list differs
-    /// from the configuration under test, and the registry reaches
-    /// `handle_publisher_request` here solely as a fingerprint input.
+    /// The Prebid integration refuses to build while the external bundle host of
+    /// the shared fixture is missing from `proxy.allowed_domains`, so a fixture
+    /// that extends `crate_test_settings_str()` with its own sections and parses
+    /// the result itself has to carry that list over. Otherwise it describes a
+    /// configuration no deployment could run, and no registry could be built from
+    /// it.
+    fn settings_from_toml(toml: &str) -> Settings {
+        let mut settings = Settings::from_toml(toml).expect("should parse test settings");
+        settings.proxy.allowed_domains = create_test_settings().proxy.allowed_domains;
+        settings
+    }
+
+    /// Integration registry for a test's `settings`.
     fn test_registry(settings: &Settings) -> IntegrationRegistry {
-        let mut settings = settings.clone();
-        settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
-        IntegrationRegistry::new(&settings).expect("should create integration registry")
+        IntegrationRegistry::new(settings).expect("should create integration registry")
     }
 
     fn make_test_bid_with_creative(creative: &str) -> Bid {
@@ -7936,7 +7942,7 @@ mod tests {
         handle_publisher_request(
             AppContext {
                 settings,
-                integrations: &registry,
+                integration_registry: &registry,
             },
             services,
             None,
@@ -9276,7 +9282,7 @@ mod tests {
             let publisher_response = handle_publisher_request(
                 AppContext {
                     settings,
-                    integrations: &registry,
+                    integration_registry: &registry,
                 },
                 services,
                 None,
@@ -10717,7 +10723,7 @@ mod tests {
             let publisher_response = handle_publisher_request(
                 AppContext {
                     settings: &settings,
-                    integrations: &registry,
+                    integration_registry: &registry,
                 },
                 &services,
                 None,
@@ -10888,7 +10894,7 @@ mod tests {
             let publisher_response = handle_publisher_request(
                 AppContext {
                     settings: &settings,
-                    integrations: &registry,
+                    integration_registry: &registry,
                 },
                 &services,
                 None,
@@ -11957,7 +11963,7 @@ mod tests {
             let _ = handle_publisher_request(
                 AppContext {
                     settings: &settings,
-                    integrations: &registry,
+                    integration_registry: &registry,
                 },
                 &services,
                 None,
@@ -12998,7 +13004,7 @@ mod tests {
 
     #[tokio::test]
     async fn publisher_asset_cache_policy_applies_to_non_html_response() {
-        let settings = Settings::from_toml(&format!(
+        let settings = settings_from_toml(&format!(
             r#"{}
 
             [[cache.asset_rules]]
@@ -13012,8 +13018,7 @@ mod tests {
             immutable = true
         "#,
             crate_test_settings_str()
-        ))
-        .expect("should parse settings with cache rule");
+        ));
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             200,
@@ -13058,7 +13063,7 @@ mod tests {
 
     #[tokio::test]
     async fn publisher_asset_policy_response_with_cookie_is_private_after_finalization() {
-        let settings = Settings::from_toml(&format!(
+        let settings = settings_from_toml(&format!(
             r#"{}
 
             [[cache.asset_rules]]
@@ -13072,8 +13077,7 @@ mod tests {
             immutable = true
         "#,
             crate_test_settings_str()
-        ))
-        .expect("should parse settings with cache rule");
+        ));
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             200,
@@ -13119,7 +13123,7 @@ mod tests {
 
     #[tokio::test]
     async fn publisher_asset_cache_policy_skips_html_response() {
-        let settings = Settings::from_toml(&format!(
+        let settings = settings_from_toml(&format!(
             r#"{}
 
             [[cache.asset_rules]]
@@ -13133,8 +13137,7 @@ mod tests {
             fingerprint_style = "hex"
         "#,
             crate_test_settings_str()
-        ))
-        .expect("should parse settings with cache rule");
+        ));
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             200,
@@ -13328,8 +13331,7 @@ mod tests {
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
-            Settings::from_toml(&toml)
-                .expect("should parse settings with auction and creative opportunities enabled")
+            settings_from_toml(&toml)
         }
 
         fn settings_with_disabled_ad_templates() -> Settings {
@@ -13338,7 +13340,7 @@ mod tests {
                  [creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
-            Settings::from_toml(&toml).expect("should parse settings with disabled ad templates")
+            settings_from_toml(&toml)
         }
 
         fn settings_with_disabled_auction() -> Settings {
@@ -13347,12 +13349,11 @@ mod tests {
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
-            Settings::from_toml(&toml).expect("should parse settings with disabled auction")
+            settings_from_toml(&toml)
         }
 
         fn settings_without_creative_opportunities() -> Settings {
-            Settings::from_toml(&crate_test_settings_str())
-                .expect("should parse settings without creative opportunities")
+            settings_from_toml(&crate_test_settings_str())
         }
 
         fn settings_with_dispatching_provider() -> Settings {
@@ -13361,8 +13362,7 @@ mod tests {
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
-            Settings::from_toml(&toml)
-                .expect("should parse settings with the dispatching test provider")
+            settings_from_toml(&toml)
         }
 
         fn services_with_telemetry(
@@ -13509,7 +13509,7 @@ mod tests {
             handle_publisher_request(
                 AppContext {
                     settings,
-                    integrations: &registry,
+                    integration_registry: &registry,
                 },
                 services,
                 None,
@@ -14631,7 +14631,7 @@ mod tests {
         let _ = handle_publisher_request(
             AppContext {
                 settings: &settings,
-                integrations: &registry,
+                integration_registry: &registry,
             },
             &services,
             None,
@@ -16059,13 +16059,27 @@ mod tests {
         );
     }
 
+    fn carried_standalone_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("probe")
+                .with_js_module(CarriedJsModule {
+                    source: PROBE_JS,
+                    sha256: PROBE_JS_SHA256,
+                })
+                .with_standalone_js()
+                .build(),
+        ))
+    }
+
     #[test]
     fn tsjs_dynamic_serves_a_standalone_module_by_registration_flag_not_by_name() {
+        // The module the registration marks standalone is one a vendor crate
+        // carries, so nothing in the binary knows its name. A branch that named
+        // an integration instead of reading the flag could not serve it, and a
+        // reintroduced constant would fail this test rather than pass it.
         let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
-            .expect("should insert gpt_diagnostics config");
         settings
             .integrations
             .insert_config(
@@ -16073,17 +16087,29 @@ mod tests {
                 &serde_json::json!({ "enabled": true, "app_id": "test-app-id" }),
             )
             .expect("should insert lockr config");
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let extra = [IntegrationBuilder::new(
+            "probe",
+            "standalone-probe",
+            carried_standalone_probe_registration,
+            validate_nothing,
+        )];
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build a registry with a carried standalone module");
         assert!(
             registry.js_module_ids_immediate().contains(&"lockr"),
             "fixture should put lockr in the unified bundle"
+        );
+        assert!(
+            !registry.js_module_ids().contains(&"probe"),
+            "a standalone module should stay out of the bundled module ids"
         );
 
         let standalone = handle_tsjs_dynamic(
             &build_request(
                 Method::GET,
-                "https://publisher.example/static/tsjs=tsjs-gpt_diagnostics.min.js",
+                &format!(
+                    "https://publisher.example/static/tsjs=tsjs-probe.min.js?v={PROBE_JS_SHA256}"
+                ),
             ),
             &registry,
             EdgeCacheHeader::SMaxageFallback,
@@ -16093,6 +16119,29 @@ mod tests {
             standalone.status(),
             StatusCode::OK,
             "should serve a module its registration marks standalone"
+        );
+        assert!(
+            cache_control_text(&standalone).contains("immutable"),
+            "should treat the carried module's own hash as the matching version"
+        );
+        assert_eq!(
+            body_text(standalone),
+            PROBE_JS,
+            "should serve the standalone module as its own file"
+        );
+
+        let unified = handle_tsjs_dynamic(
+            &build_request(
+                Method::GET,
+                "https://publisher.example/static/tsjs=tsjs-unified.min.js",
+            ),
+            &registry,
+            EdgeCacheHeader::SMaxageFallback,
+        )
+        .expect("should handle tsjs request");
+        assert!(
+            !body_text(unified).contains(PROBE_JS),
+            "a standalone module should stay out of the unified bundle"
         );
 
         let bundled_only = handle_tsjs_dynamic(
@@ -20921,7 +20970,7 @@ mod tests {
                  [creative_opportunities]\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
-            Settings::from_toml(&toml).expect("should parse settings with a capturing provider")
+            settings_from_toml(&toml)
         }
 
         fn article_slot() -> Vec<CreativeOpportunitySlot> {
@@ -21094,7 +21143,7 @@ mod tests {
             let _ = handle_publisher_request(
                 AppContext {
                     settings: &settings,
-                    integrations: &registry,
+                    integration_registry: &registry,
                 },
                 &services,
                 None,
@@ -21182,7 +21231,7 @@ mod tests {
             let _ = handle_publisher_request(
                 AppContext {
                     settings: &settings,
-                    integrations: &registry,
+                    integration_registry: &registry,
                 },
                 &services,
                 None,

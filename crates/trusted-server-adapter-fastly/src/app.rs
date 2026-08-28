@@ -953,7 +953,7 @@ async fn dispatch_fallback(
                         match handle_publisher_request(
                             AppContext {
                                 settings: &state.settings,
-                                integrations: state.registry.as_ref(),
+                                integration_registry: state.registry.as_ref(),
                             },
                             &publisher_services,
                             ec.kv_graph.as_ref(),
