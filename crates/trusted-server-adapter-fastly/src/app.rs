@@ -113,6 +113,7 @@ use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::provider::ensure_provider_available;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
@@ -180,10 +181,24 @@ pub(crate) fn load_settings_from_config_store(
     get_settings_from_config_store(&FastlyPlatformConfigStore, &store_name, &key)
 }
 
+/// Build the application state from explicit settings.
+///
+/// # Errors
+///
+/// Returns an error when the selected Edge Cookie provider cannot be built for
+/// this adapter, or when the auction orchestrator or the integration registry
+/// fail to initialise.
 pub(crate) fn build_state_from_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     warn_if_certificate_check_disabled(&settings);
+
+    // Composition root: reject a provider selection this adapter can never
+    // supply, once, before any request is served. This adapter injects no Edge
+    // Cookie provider into `RuntimeServices`, so `None` is exactly what
+    // `EcContext` sees per request; pass the injected provider here as well
+    // once this adapter supplies one.
+    ensure_provider_available(&settings.ec, None)?;
 
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;

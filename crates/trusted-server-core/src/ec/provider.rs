@@ -327,6 +327,29 @@ pub fn build_provider(
     Ok(provider)
 }
 
+/// Checks once, at startup, that this deployment can build the provider named
+/// by the `[ec] provider` selector.
+///
+/// The composition root calls this while it builds application state, passing
+/// the same injected provider it will put into
+/// [`RuntimeServices`](crate::platform::RuntimeServices) on every request.
+/// [`build_provider`] reads no request data, so the answer is the same for
+/// every request and a selection the adapter can never supply fails at startup
+/// rather than on the first request. A stateless deployment (no selector, or
+/// `"none"`) passes.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::EdgeCookie`] when the selected provider cannot
+/// be built from the services this deployment injects.
+pub fn ensure_provider_available(
+    ec: &Ec,
+    injected: Option<Arc<dyn EdgeCookieProvider>>,
+) -> Result<(), Report<TrustedServerError>> {
+    build_provider(ec, injected)?;
+    Ok(())
+}
+
 /// Adapts an injected, shared [`EdgeCookieProvider`] to the owned `Box` that
 /// [`build_provider`] returns.
 ///
@@ -513,5 +536,32 @@ mod tests {
             err.to_string().contains("acme"),
             "the error should name the selected provider, got: {err}"
         );
+    }
+
+    #[test]
+    fn the_startup_check_rejects_an_uninjected_provider_and_allows_statelessness() {
+        // A selection the adapter cannot supply is knowable without a request,
+        // so the composition root rejects it while application state is built.
+        let selected = Ec {
+            provider: Some("acme".to_owned()),
+            ..Ec::default()
+        };
+        let err = ensure_provider_available(&selected, None)
+            .expect_err("an uninjected provider should fail the startup check");
+        assert!(
+            err.to_string().contains("acme"),
+            "the error should name the selected provider, got: {err}"
+        );
+
+        // Statelessness is a supported deployment, spelled either way, and must
+        // never be turned into a startup error.
+        ensure_provider_available(&Ec::default(), None)
+            .expect("should allow a deployment that selects no provider");
+        let explicit_none = Ec {
+            provider: Some("none".to_owned()),
+            ..Ec::default()
+        };
+        ensure_provider_available(&explicit_none, None)
+            .expect("should allow the explicit `none` selection");
     }
 }
