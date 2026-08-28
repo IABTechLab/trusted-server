@@ -697,7 +697,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl AuctionProvider for TemplateSwitchProbeProvider {
         fn provider_name(&self) -> &'static str {
-            "template_switch_probe"
+            "template-switch-probe"
         }
 
         async fn request_bids(
@@ -749,13 +749,11 @@ mod tests {
     #[tokio::test]
     async fn direct_auction_remains_available_when_templates_are_disabled() {
         let settings_toml = format!(
-            "{}\n[auction]\nenabled = true\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
+            "{}\n[auction]\nenabled = true\n\n[auction.providers.template-switch-probe]\nprotocol = \"openrtb-2.6\"\nendpoint = \"https://bidder.example/auction\"\nrouting = \"all_eligible\"\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
             crate_test_settings_str()
         );
-        let mut settings = Settings::from_toml(&settings_toml)
+        let settings = Settings::from_toml(&settings_toml)
             .expect("should parse settings with disabled templates");
-        settings.auction.providers =
-            crate::auction::AuctionConfig::legacy_provider_map(&["template_switch_probe"]);
         let calls = Arc::new(Mutex::new(0));
         let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
         orchestrator.register_provider(Arc::new(TemplateSwitchProbeProvider {
