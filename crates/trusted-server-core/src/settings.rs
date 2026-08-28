@@ -686,10 +686,17 @@ impl Ec {
     /// new location. A configuration carrying both forms is rejected so a
     /// half-edited file fails loudly instead of one form silently winning.
     ///
+    /// The deprecated key is held to the same passphrase rules as the new
+    /// `[ec.providers.hmac]` block. Derive validation runs before this
+    /// migration and the deprecated field carries no `#[validate]` attribute of
+    /// its own, so without the check here a short or empty passphrase in the old
+    /// location would start a deployment that the new location rejects.
+    ///
     /// # Errors
     ///
     /// Returns [`TrustedServerError::Configuration`] when both the deprecated
-    /// key and any part of the provider configuration are present.
+    /// key and any part of the provider configuration are present, or when the
+    /// deprecated passphrase fails [`Self::validate_passphrase`].
     pub fn migrate_legacy_ec_layout(&mut self) -> Result<(), Report<TrustedServerError>> {
         let Some(passphrase) = self.passphrase.take() else {
             return Ok(());
@@ -702,6 +709,15 @@ impl Ec {
                     .to_owned(),
             }));
         }
+        Self::validate_passphrase(&passphrase).map_err(|err| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[ec] passphrase (deprecated) is invalid ({err}): use a random secret \
+                     of at least {} bytes, placed in [ec.providers.hmac]",
+                    Self::MIN_PASSPHRASE_LENGTH,
+                ),
+            })
+        })?;
         log::warn!(
             "[ec] passphrase is deprecated; move it to [ec.providers.hmac] passphrase and \
              set [ec] provider = \"hmac\""
@@ -5055,6 +5071,68 @@ mod tests {
         assert!(
             ec.passphrase.is_none(),
             "the deprecated field should be consumed by the migration"
+        );
+    }
+
+    /// The crate test configuration with its `[ec]` section rewritten to the
+    /// deprecated single-passphrase form.
+    fn legacy_ec_settings_str(passphrase: &str) -> String {
+        let base = crate_test_settings_str();
+        let (before, rest) = base
+            .split_once("[ec]")
+            .expect("should find the [ec] section in the test settings");
+        let (_, after) = rest
+            .split_once("[request_signing]")
+            .expect("should find the [request_signing] section in the test settings");
+        let legacy =
+            format!("{before}[ec]\npassphrase = \"{passphrase}\"\n\n[request_signing]{after}");
+        assert!(
+            !legacy.contains("[ec.providers.hmac]"),
+            "the legacy configuration should carry no provider block"
+        );
+        legacy
+    }
+
+    #[test]
+    fn a_legacy_passphrase_is_held_to_the_passphrase_rules() {
+        // Derive validation runs before the migration and the deprecated field
+        // carries no `#[validate]` attribute, so the migration itself has to
+        // apply the passphrase rules. Without that, a value the new
+        // `[ec.providers.hmac]` block rejects would still start a deployment
+        // from the old location.
+        let short = Settings::from_toml(&legacy_ec_settings_str("short"))
+            .expect_err("a short legacy passphrase should be rejected");
+        assert!(
+            format!("{short:?}").contains("passphrase (deprecated) is invalid"),
+            "should name the deprecated passphrase as the fault: {short:?}"
+        );
+
+        let empty = Settings::from_toml(&legacy_ec_settings_str(""))
+            .expect_err("an empty legacy passphrase should be rejected");
+        assert!(
+            format!("{empty:?}").contains("passphrase (deprecated) is invalid"),
+            "should name the deprecated passphrase as the fault: {empty:?}"
+        );
+
+        let settings =
+            Settings::from_toml(&legacy_ec_settings_str("test-secret-key-32-bytes-minimum"))
+                .expect("a legacy passphrase of adequate length should still start");
+        assert_eq!(
+            settings.ec.provider.as_deref(),
+            Some("hmac"),
+            "an adequate legacy passphrase should still select the hmac provider"
+        );
+        assert_eq!(
+            settings
+                .ec
+                .providers
+                .hmac
+                .as_ref()
+                .expect("should configure the hmac block")
+                .passphrase
+                .expose(),
+            "test-secret-key-32-bytes-minimum",
+            "an adequate legacy passphrase should still move into the hmac block"
         );
     }
 
