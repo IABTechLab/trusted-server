@@ -1387,17 +1387,46 @@ mod tests {
     use trusted_server_core::settings::Settings;
 
     #[test]
-    fn hooks_expose_the_manifest_store_metadata_used_by_fastly_runtime_mapping() {
+    fn hooks_store_metadata_matches_edgezero_manifest() {
+        let manifest: toml::Value = toml::from_str(include_str!("../../../edgezero.toml"))
+            .expect("should parse edgezero manifest");
+        let manifest_stores = manifest
+            .get("stores")
+            .and_then(toml::Value::as_table)
+            .expect("manifest should declare stores");
         let metadata = TrustedServerApp::stores();
 
-        assert_eq!(
-            metadata.config.map(|store| store.default),
-            Some("trusted_server_config")
-        );
-        assert_eq!(
-            metadata.secrets.map(|store| store.default),
-            Some("trusted_server_secrets")
-        );
+        for (kind, runtime_store) in [
+            (
+                "config",
+                metadata.config.expect("should declare config stores"),
+            ),
+            ("kv", metadata.kv.expect("should declare KV stores")),
+            (
+                "secrets",
+                metadata.secrets.expect("should declare secret stores"),
+            ),
+        ] {
+            let manifest_store = manifest_stores
+                .get(kind)
+                .and_then(toml::Value::as_table)
+                .unwrap_or_else(|| panic!("manifest should declare {kind} stores"));
+            let manifest_default = manifest_store
+                .get("default")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| panic!("manifest {kind} stores should declare a default"));
+            let manifest_ids = manifest_store
+                .get("ids")
+                .and_then(toml::Value::as_array)
+                .unwrap_or_else(|| panic!("manifest {kind} stores should declare ids"))
+                .iter()
+                .map(toml::Value::as_str)
+                .collect::<Option<Vec<_>>>()
+                .unwrap_or_else(|| panic!("manifest {kind} store ids should be strings"));
+
+            assert_eq!(runtime_store.default, manifest_default);
+            assert_eq!(runtime_store.ids, manifest_ids);
+        }
     }
 
     #[test]
