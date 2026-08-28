@@ -145,10 +145,16 @@ APIs.
 `trusted-server.toml`.
 
 ```toml
-[integrations.prebid.bundle]
-adapters = ["rubicon", "kargo"]
-user_id_modules = ["sharedIdSystem"]
+[integrations.prebid.bundle.modules]
+bidder = ["rubiconBidAdapter", "kargoBidAdapter"]
+user_id = ["sharedIdSystem"]
+analytics = ["atsAnalyticsAdapter"]
 ```
+
+Module values are exact upstream Prebid filename stems without `.js`. The
+`bidder` list is required and cannot be empty. Omit `user_id` to use the curated
+default preset, or set it to `[]` to select none. Omitted and empty `analytics`
+lists both select no analytics adapters.
 
 Run the command after installing JS dependencies:
 
@@ -158,11 +164,14 @@ cd ../../..
 ts prebid bundle
 ```
 
-By default, generated artifacts are written to `dist/prebid/`, and the command
-updates `integrations.prebid.external_bundle_sha256` and
-`integrations.prebid.external_bundle_sri` in `trusted-server.toml`. Upload the
-generated JavaScript file yourself, set `external_bundle_url` to its HTTPS
-asset URL, and include that host (plus any redirect targets) in
+By default, generated artifacts are written to `dist/prebid/`. The versioned
+manifest records effective module selections, bidder and analytics runtime
+codes, the content-addressed filename, SHA-256, and SRI. The command copies the
+hash and SRI into `integrations.prebid` only after the generator and manifest
+both pass validation.
+
+Upload the generated JavaScript file yourself, set `external_bundle_url` to its
+HTTPS asset URL, and include that host plus any redirect targets in
 `proxy.allowed_domains` before running `ts config validate` or `ts config push`.
 
 Use custom paths when needed:
