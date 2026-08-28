@@ -1309,29 +1309,48 @@ mod tests {
     }
 
     #[test]
-    fn test_bypass_credential_requires_at_least_32_bytes() {
-        for (credential, should_succeed) in [
-            (Some("1234567890123456789012345678901"), false),
-            (Some("12345678901234567890123456789012"), true),
-            (Some(""), false),
-            (None, false),
-        ] {
-            let config = DataDomeConfig {
-                protection_test_bypass: Some(ProtectionTestBypassConfig {
-                    enabled: true,
-                    credential_secret_store: None,
-                    credential_secret_name: credential
-                        .map(|value| Redacted::new(value.to_string())),
-                }),
-                ..protection_config()
-            };
+    fn short_test_bypass_credential_is_ignored_without_failing_startup() {
+        let config = DataDomeConfig {
+            protection_test_bypass: Some(ProtectionTestBypassConfig {
+                enabled: true,
+                credential_secret_store: None,
+                credential_secret_name: Some(Redacted::new("short".to_string())),
+            }),
+            ..protection_config()
+        };
+        let integration =
+            DataDomeIntegration::try_new(config).expect("should accept short bypass credential");
+        let http_client = Arc::new(StubHttpClient::new());
+        http_client.push_response_with_headers(
+            200,
+            Vec::new(),
+            vec![(HEADER_DATADOME_RESPONSE, "200")],
+        );
+        let services =
+            build_services_with_secret_and_http_client(NoopSecretStore, http_client.clone());
+        let settings = Settings::default();
+        let mut request = request_for_filter();
+        request.headers_mut().insert(
+            super::super::HEADER_DATADOME_TEST_BYPASS,
+            edgezero_core::http::HeaderValue::from_static("short"),
+        );
 
-            assert_eq!(
-                DataDomeIntegration::try_new(config).is_ok(),
-                should_succeed,
-                "startup validation should enforce the resolved bypass credential length"
-            );
-        }
+        let decision = filter_with_staging(&integration, &settings, &services, &mut request);
+
+        assert!(matches!(decision, RequestFilterDecision::Continue(_)));
+        assert!(
+            request
+                .headers()
+                .get(super::super::HEADER_DATADOME_TEST_BYPASS)
+                .is_none(),
+            "the invalid bypass credential should not reach the publisher origin"
+        );
+        assert!(!has_client_tag_suppression_marker(&request));
+        assert_eq!(
+            http_client.recorded_backend_names().len(),
+            1,
+            "a short credential should not bypass the Protection API"
+        );
     }
 
     #[test]

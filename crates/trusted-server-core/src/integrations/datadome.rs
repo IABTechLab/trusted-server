@@ -139,7 +139,10 @@ pub struct ProtectionTestBypassConfig {
     #[serde(default)]
     pub credential_secret_store: Option<String>,
 
-    /// Secret reference containing at least 32 bytes of high-entropy bypass material.
+    /// Secret reference containing the bypass credential.
+    ///
+    /// Holds the store key name in app config and the resolved credential at
+    /// runtime. Treat it as secret material after settings are built.
     #[serde(default)]
     pub credential_secret_name: Option<Redacted<String>>,
 }
@@ -182,6 +185,9 @@ pub struct DataDomeConfig {
     pub server_side_key_secret_store: Option<String>,
 
     /// Secret reference containing the `DataDome` server-side key.
+    ///
+    /// Holds the store key name in app config and the resolved key at runtime.
+    /// Treat it as secret material after settings are built.
     #[serde(default)]
     pub server_side_key_secret_name: Option<Redacted<String>>,
 
@@ -380,14 +386,7 @@ impl DataDomeIntegration {
         Self::try_new(config).expect("should create DataDome integration")
     }
 
-    fn try_new(config: DataDomeConfig) -> Result<Arc<Self>, Report<TrustedServerError>> {
-        Self::try_new_with_secret_validation(config, true)
-    }
-
-    fn try_new_with_secret_validation(
-        mut config: DataDomeConfig,
-        validate_resolved_secrets: bool,
-    ) -> Result<Arc<Self>, Report<TrustedServerError>> {
+    fn try_new(mut config: DataDomeConfig) -> Result<Arc<Self>, Report<TrustedServerError>> {
         if config.server_side_key_secret_store.take().is_some() {
             log::warn!(
                 "DataDome server_side_key_secret_store is deprecated and ignored; static credentials resolve through the default app-config secret store"
@@ -421,7 +420,7 @@ impl DataDomeIntegration {
             }
             Self::validate_protection_api_origin(&config.protection_api_origin)?;
         }
-        Self::validate_protection_test_bypass(&config, validate_resolved_secrets)?;
+        Self::validate_protection_test_bypass(&config)?;
 
         if config.inject_client_side_tag {
             Self::validate_client_side_tag_url(&config.client_side_tag_url)?;
@@ -486,7 +485,7 @@ impl DataDomeIntegration {
     pub(crate) fn validate_config_for_deploy(
         config: DataDomeConfig,
     ) -> Result<(), Report<TrustedServerError>> {
-        Self::try_new_with_secret_validation(config, false).map(|_| ())
+        Self::try_new(config).map(|_| ())
     }
 
     fn active_protection_test_bypass(&self) -> Option<&ProtectionTestBypassConfig> {
@@ -502,7 +501,6 @@ impl DataDomeIntegration {
 
     fn validate_protection_test_bypass(
         config: &DataDomeConfig,
-        validate_resolved_secret: bool,
     ) -> Result<(), Report<TrustedServerError>> {
         let Some(bypass) = config
             .protection_test_bypass
@@ -517,16 +515,10 @@ impl DataDomeIntegration {
                 "protection_test_bypass requires enable_protection to be true",
             )));
         }
-        let Some(credential) = bypass.credential_secret_name.as_ref() else {
+        if bypass.credential_secret_name.is_none() {
             return Err(Report::new(Self::error(
                 "protection_test_bypass credential_secret_name is required when enabled",
             )));
-        };
-        if validate_resolved_secret && credential.expose().len() < MIN_TEST_BYPASS_CREDENTIAL_BYTES
-        {
-            return Err(Report::new(Self::error(format!(
-                "protection_test_bypass credential_secret_name must resolve to at least {MIN_TEST_BYPASS_CREDENTIAL_BYTES} bytes"
-            ))));
         }
 
         Ok(())
@@ -1267,15 +1259,14 @@ mod tests {
     }
 
     #[test]
-    fn protection_test_bypass_requires_protection_and_resolved_credential() {
+    fn protection_test_bypass_requires_protection_and_credential_reference() {
         for (enable_protection, credential, expected_message) in [
             (
                 false,
-                Some("test-bypass-credential-at-least-32-bytes"),
+                Some("test-bypass-credential"),
                 "requires enable_protection",
             ),
             (true, None, "credential_secret_name"),
-            (true, Some("short"), "at least 32 bytes"),
         ] {
             let mut config = test_config();
             config.enable_protection = enable_protection;
@@ -1296,6 +1287,21 @@ mod tests {
                 "should explain the invalid protection test bypass configuration"
             );
         }
+    }
+
+    #[test]
+    fn protection_test_bypass_accepts_short_resolved_credential() {
+        let mut config = test_config();
+        config.enable_protection = true;
+        config.server_side_key_secret_name = Some(Redacted::new("resolved-server-key".to_string()));
+        config.protection_test_bypass = Some(ProtectionTestBypassConfig {
+            enabled: true,
+            credential_secret_store: None,
+            credential_secret_name: Some(Redacted::new("short".to_string())),
+        });
+
+        DataDomeIntegration::try_new(config)
+            .expect("should defer bypass credential strength enforcement to requests");
     }
 
     #[test]

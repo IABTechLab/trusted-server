@@ -629,20 +629,17 @@ mod tests {
     }
 
     #[test]
-    fn runtime_validation_rejects_short_resolved_proxy_secret() {
+    fn runtime_validation_accepts_short_resolved_proxy_secret() {
         let mut settings = test_settings();
         settings.publisher.proxy_secret = Redacted::new("short_proxy".to_owned());
 
-        let err = load_settings(&envelope_json(&settings))
-            .expect_err("should reject a short resolved proxy secret");
+        let reconstructed = load_settings(&envelope_json(&settings))
+            .expect("should accept an existing short proxy secret");
 
-        assert!(
-            err.to_string().contains("at least 32 bytes"),
-            "error should indicate runtime validation: {err:?}"
-        );
-        assert!(
-            !err.to_string().contains("short_proxy"),
-            "error should not expose the secret value"
+        assert_eq!(
+            reconstructed.publisher.proxy_secret.expose(),
+            "short_proxy",
+            "should preserve the resolved proxy secret"
         );
     }
 
