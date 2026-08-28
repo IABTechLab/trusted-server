@@ -541,6 +541,9 @@ Add tests in
 - managed config creates the exact documented Prebid object;
 - unrelated publisher `userIds` entries are preserved;
 - a publisher-provided entry with a managed name is replaced, not duplicated;
+- with at least two managed names, `setConfig` and `mergeConfig` preserve
+  unrelated publisher entries, replace publisher duplicates of both managed
+  names exactly once, and append fresh managed copies in configuration order;
 - managed configuration is active before an already-queued publisher
   `requestBids` call;
 - queued publisher `setConfig` followed by `requestBids` preserves other User
