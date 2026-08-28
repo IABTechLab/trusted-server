@@ -27,10 +27,11 @@ pub struct TerminalPrivateResponse;
 /// Request marker meaning the response is personalized to this request and
 /// must not be shared through any cache or template.
 ///
-/// Any integration may set it from a request filter. Core buffers the full
-/// document, keeps the request on the origin path rather than a shared
-/// template, and enforces private caching whenever it is present, without
-/// knowing which integration asked.
+/// Any integration may set it from a request filter, and core acts on it
+/// without knowing which integration asked. Whenever it is present the request
+/// keeps to the origin path rather than a shared template. For an HTML
+/// document core also buffers the full body, and it enforces private caching
+/// on the HTML response that body produces.
 #[derive(Debug, Clone, Copy)]
 pub struct PersonalizedResponse;
 

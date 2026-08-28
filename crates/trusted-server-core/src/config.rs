@@ -177,6 +177,7 @@ fn report_to_validation_errors(report: &Report<TrustedServerError>) -> Validatio
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::auction::AuctionProvider;
@@ -684,24 +685,80 @@ password = "production-admin-password-32-bytes"
         );
     }
 
-    /// Deploy validation walks `crate::integrations::builders()`, so that set
-    /// has to be the same set the registry registers, or a builder would be
-    /// deployed without ever being validated.
+    /// Counts calls to [`record_validate_call`]. A builder holds plain fn
+    /// pointers and cannot capture, so the recording has to go through a
+    /// static.
+    static RECORDED_VALIDATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn record_validate_call(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+        RECORDED_VALIDATE_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(false)
+    }
+
+    /// Every builder handed to deploy validation has its `validate` run, and
+    /// reporting disabled does not excuse a builder from validating.
     #[test]
-    fn deploy_validation_runs_every_registered_builder() {
-        let validated_ids: HashSet<&'static str> = crate::integrations::builders()
-            .iter()
-            .map(IntegrationBuilder::id)
-            .collect();
-        let registry = crate::integrations::IntegrationRegistry::new(&valid_settings())
-            .expect("should build registry from valid settings");
-        let registered_ids: HashSet<&'static str> =
-            registry.registered_builder_ids().into_iter().collect();
+    fn deploy_validation_runs_every_builder_it_is_given() {
+        RECORDED_VALIDATE_CALLS.store(0, Ordering::SeqCst);
+        let extra_integrations = [IntegrationBuilder::new(
+            "seam-probe-integration",
+            "seam-probe-crate",
+            build_nothing,
+            record_validate_call,
+        )];
+        let extra_auction_providers = [AuctionProviderBuilder::new(
+            "seam-probe-provider",
+            "seam-probe-crate",
+            build_no_providers,
+            record_validate_call,
+        )];
+
+        validate_settings_for_deploy_with(
+            &valid_settings(),
+            &extra_integrations,
+            &extra_auction_providers,
+        )
+        .expect("should accept settings whose external builders report disabled");
 
         assert_eq!(
-            validated_ids, registered_ids,
-            "deploy validation should run every builder the registry registers"
+            RECORDED_VALIDATE_CALLS.load(Ordering::SeqCst),
+            2,
+            "both external builders should validate even though each reports disabled"
         );
+    }
+
+    /// Deploy validation reaches each built-in builder's own config type, one
+    /// id at a time, by planting a block that type cannot deserialize. Every
+    /// integration config carries a boolean `enabled`, so a string there fails
+    /// for all of them.
+    ///
+    /// This catches deploy validation ceasing to validate the built-ins, or
+    /// validating only the enabled ones. It cannot catch a builder deleted
+    /// from `BUILT_IN_BUILDERS`, because the loop below reads the same
+    /// constant the validation walks; no independent list of the built-ins
+    /// exists in the crate.
+    #[test]
+    fn deploy_validation_reaches_every_built_in_builder() {
+        for id in crate::integrations::builders()
+            .iter()
+            .map(IntegrationBuilder::id)
+            .chain(
+                crate::auction::provider_builders()
+                    .iter()
+                    .map(AuctionProviderBuilder::name),
+            )
+        {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert_config(id, &serde_json::json!({ "enabled": "not-a-boolean" }))
+                .expect("should insert the probe config");
+
+            assert!(
+                validate_settings_for_deploy(&settings).is_err(),
+                "deploy validation should reach the `{id}` builder and reject its planted config"
+            );
+        }
     }
 
     #[test]
