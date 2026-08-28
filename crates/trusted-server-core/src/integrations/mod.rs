@@ -332,7 +332,7 @@ pub const CORE_SOURCE: &str = "trusted-server-core";
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct IntegrationBuilder {
     id: &'static str,
     source: &'static str,
@@ -463,13 +463,15 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     ),
 ];
 
+/// The built-in integration builders, in hook order.
+pub(crate) fn builders() -> &'static [IntegrationBuilder] {
+    BUILT_IN_BUILDERS
+}
+
 /// Every builder the registry will consider: the built-in set followed by
 /// `extra`, in that order, so hook order for the built-ins never changes.
 pub(crate) fn all_builders(
     extra: &[IntegrationBuilder],
 ) -> impl Iterator<Item = IntegrationBuilder> + '_ {
-    BUILT_IN_BUILDERS
-        .iter()
-        .copied()
-        .chain(extra.iter().copied())
+    builders().iter().copied().chain(extra.iter().copied())
 }
