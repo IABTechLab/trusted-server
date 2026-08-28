@@ -23,6 +23,7 @@
 use std::sync::Arc;
 
 use error_stack::Report;
+use serde::{Deserialize, Serialize};
 
 use crate::consent::ConsentContext;
 use crate::error::TrustedServerError;
@@ -31,6 +32,92 @@ use crate::redacted::Redacted;
 use crate::settings::Ec;
 
 use super::generation;
+
+/// The Edge Cookie identity provider a deployment has selected.
+///
+/// Deserialized from the `[ec] provider` string, and serialized back to the
+/// same string, so the configuration surface is unchanged. Vendor keys are
+/// open-ended (a vendor crate names its own), so any key that is not a
+/// built-in becomes [`Vendor`](Self::Vendor) rather than a parse failure, and
+/// whether the deployment can actually supply it is decided by
+/// [`build_provider`].
+///
+/// This is the one place the provider keys are spelled. Everything that needs
+/// to ask which provider is selected matches on this rather than comparing
+/// string literals.
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Deserialize, Serialize)]
+#[serde(from = "String", into = "String")]
+pub enum EcProviderSelection {
+    /// Explicit statelessness, spelled `"none"`. The same meaning as omitting
+    /// the selector: no Edge Cookie is minted and no provider block may be
+    /// configured.
+    None,
+
+    /// The built-in HMAC provider, spelled `"hmac"`, configured by
+    /// `[ec.providers.hmac]`.
+    Hmac,
+
+    /// A vendor or host provider the adapter injects, named by its own key and
+    /// configured by the matching `[ec.providers.<key>]` block.
+    Vendor(String),
+}
+
+impl EcProviderSelection {
+    /// The configuration spelling of explicit statelessness.
+    pub const NONE_KEY: &'static str = "none";
+
+    /// The configuration spelling of the built-in HMAC provider, which is also
+    /// [`HmacProvider::id`]'s return value and [`HMAC_PROVIDER_CODE`]'s text.
+    pub const HMAC_KEY: &'static str = "hmac";
+
+    /// The configuration key this selection is written as.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        match self {
+            Self::None => Self::NONE_KEY,
+            Self::Hmac => Self::HMAC_KEY,
+            Self::Vendor(key) => key,
+        }
+    }
+}
+
+impl From<&str> for EcProviderSelection {
+    fn from(key: &str) -> Self {
+        match key {
+            EcProviderSelection::NONE_KEY => Self::None,
+            EcProviderSelection::HMAC_KEY => Self::Hmac,
+            other => Self::Vendor(other.to_owned()),
+        }
+    }
+}
+
+impl From<String> for EcProviderSelection {
+    fn from(key: String) -> Self {
+        match key.as_str() {
+            EcProviderSelection::NONE_KEY => Self::None,
+            EcProviderSelection::HMAC_KEY => Self::Hmac,
+            _ => Self::Vendor(key),
+        }
+    }
+}
+
+impl From<EcProviderSelection> for String {
+    fn from(selection: EcProviderSelection) -> Self {
+        match selection {
+            EcProviderSelection::None => EcProviderSelection::NONE_KEY.to_owned(),
+            EcProviderSelection::Hmac => EcProviderSelection::HMAC_KEY.to_owned(),
+            EcProviderSelection::Vendor(key) => key,
+        }
+    }
+}
+
+/// The registry code of the built-in HMAC provider.
+///
+/// The same text as [`EcProviderSelection::HMAC_KEY`], but a different role:
+/// this is the `{code}~` namespace stamped on every identifier the built-in
+/// provider mints, and it is what [`generation`] matches when it decides
+/// whether an enveloped identifier is one of its own.
+pub const HMAC_PROVIDER_CODE: ProviderCode = ProviderCode::new(EcProviderSelection::HMAC_KEY);
 
 /// The request-scoped gating context passed to [`EdgeCookieProvider::generate`].
 ///
@@ -148,7 +235,9 @@ pub fn split_provider_code(full: &str) -> (Option<&str>, &str) {
 pub fn provider_owns_id(provider: &dyn EdgeCookieProvider, full: &str) -> bool {
     match split_provider_code(full) {
         (Some(code), value) => code == provider.code().as_str() && provider.accepts_id(value),
-        (None, value) => provider.id() == "hmac" && provider.accepts_id(value),
+        (None, value) => {
+            provider.id() == EcProviderSelection::HMAC_KEY && provider.accepts_id(value)
+        }
     }
 }
 
@@ -261,11 +350,11 @@ impl HmacProvider {
 
 impl EdgeCookieProvider for HmacProvider {
     fn id(&self) -> &'static str {
-        "hmac"
+        EcProviderSelection::HMAC_KEY
     }
 
     fn code(&self) -> ProviderCode {
-        ProviderCode::new("hmac")
+        HMAC_PROVIDER_CODE
     }
 
     fn generate(
@@ -301,17 +390,17 @@ pub fn build_provider(
     ec: &Ec,
     injected: Option<Arc<dyn EdgeCookieProvider>>,
 ) -> Result<Option<Box<dyn EdgeCookieProvider>>, Report<TrustedServerError>> {
-    let Some(key) = ec.provider.as_deref() else {
+    let Some(selection) = ec.provider.as_ref() else {
         return Ok(None);
     };
-    let provider: Option<Box<dyn EdgeCookieProvider>> = match key {
+    let provider: Option<Box<dyn EdgeCookieProvider>> = match selection {
         // Explicit statelessness: the same meaning as omitting the selector.
-        "none" => None,
+        EcProviderSelection::None => None,
         // Settings validation rejects `hmac` with no block before this runs, so
         // reaching here means the two checks have drifted apart. Stopping is
         // the only safe answer: returning `Ok(None)` would run the deployment
         // stateless under a selector that says it has an identity provider.
-        "hmac" => {
+        EcProviderSelection::Hmac => {
             let config = ec.providers.hmac.as_ref().ok_or_else(|| {
                 Report::new(TrustedServerError::EdgeCookie {
                     message: "Edge Cookie provider `hmac` is selected but has no \
@@ -321,21 +410,21 @@ pub fn build_provider(
             })?;
             Some(Box::new(HmacProvider::new(config.passphrase.clone())) as _)
         }
-        // Any other key names a vendor or host provider the adapter injects
+        // A vendor key names a vendor or host provider the adapter injects
         // through [`RuntimeServices`](crate::platform::RuntimeServices), the same
         // seam the device and geo providers use, so core never names a vendor.
         // The injected provider is used when its own id matches the selected key,
         // and its `[ec.providers.<key>]` block is read by the adapter that built
         // it. A selected key with no matching injected provider is a deployment
         // error: fail loudly rather than silently running stateless.
-        other => {
+        EcProviderSelection::Vendor(key) => {
             let provider = injected
-                .filter(|provider| provider.id() == other)
+                .filter(|provider| provider.id() == key)
                 .map(|provider| Box::new(SharedProvider(provider)) as _);
             if provider.is_none() {
                 return Err(Report::new(TrustedServerError::EdgeCookie {
                     message: format!(
-                        "Edge Cookie provider `{other}` is selected but this deployment's \
+                        "Edge Cookie provider `{key}` is selected but this deployment's \
                          adapter does not provide it"
                     ),
                 }));
@@ -408,6 +497,7 @@ impl EdgeCookieProvider for SharedProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{EcProviders, HmacProviderConfig};
 
     #[test]
     fn split_provider_code_separates_coded_and_legacy_forms() {
@@ -435,6 +525,109 @@ mod tests {
             split_provider_code("AB12~x"),
             (None, "AB12~x"),
             "uppercase is outside the code alphabet"
+        );
+    }
+
+    /// A stand-in for a vendor provider an adapter injects.
+    #[derive(Debug)]
+    struct VendorProvider;
+
+    impl EdgeCookieProvider for VendorProvider {
+        fn id(&self) -> &'static str {
+            "acme"
+        }
+
+        fn code(&self) -> ProviderCode {
+            ProviderCode::new("t0ac")
+        }
+
+        fn generate(
+            &self,
+            _request_info: &dyn RequestInfo,
+            _input: &IdentityInput<'_>,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            Ok(GeneratedEdgeCookie::default())
+        }
+    }
+
+    #[test]
+    fn the_selector_round_trips_through_serialization() {
+        // The typed selector must not change the configuration surface. The
+        // same TOML has to parse to the same choice, and serializing has to
+        // write the same key back, so an existing operator configuration keeps
+        // working and a config push does not rewrite the selector.
+        for (key, expected) in [
+            (EcProviderSelection::NONE_KEY, EcProviderSelection::None),
+            (EcProviderSelection::HMAC_KEY, EcProviderSelection::Hmac),
+            ("acme", EcProviderSelection::Vendor("acme".to_owned())),
+        ] {
+            let ec: Ec = toml::from_str(&format!("provider = \"{key}\""))
+                .expect("should parse the [ec] section");
+            assert_eq!(
+                ec.provider.as_ref(),
+                Some(&expected),
+                "`{key}` should select the provider it names"
+            );
+
+            let written = toml::to_string(&ec).expect("should serialize the [ec] section");
+            assert!(
+                written.contains(&format!("provider = \"{key}\"")),
+                "`{key}` should be written back unchanged, got: {written}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_selection_builds_what_its_string_key_built_before() {
+        // `none` is stateless, exactly as omitting the selector is.
+        let none = Ec {
+            provider: Some(EcProviderSelection::None),
+            ..Ec::default()
+        };
+        assert!(
+            build_provider(&none, None)
+                .expect("explicit statelessness should build")
+                .is_none(),
+            "`none` should select no provider"
+        );
+
+        // `hmac` with its block builds the built-in provider.
+        let mut providers = EcProviders::default();
+        providers.hmac = Some(HmacProviderConfig {
+            passphrase: test_passphrase(),
+        });
+        let hmac = Ec {
+            provider: Some(EcProviderSelection::Hmac),
+            providers,
+            ..Ec::default()
+        };
+        let built = build_provider(&hmac, None)
+            .expect("the hmac selection should build")
+            .expect("the hmac selection should yield a provider");
+        assert_eq!(
+            built.id(),
+            EcProviderSelection::HMAC_KEY,
+            "`hmac` should select the built-in provider"
+        );
+        assert_eq!(
+            built.code(),
+            HMAC_PROVIDER_CODE,
+            "the built-in provider should carry the built-in code"
+        );
+
+        // An arbitrary vendor key selects the provider the adapter injected
+        // under that same key.
+        let vendor = Ec {
+            provider: Some(EcProviderSelection::Vendor("acme".to_owned())),
+            ..Ec::default()
+        };
+        let built = build_provider(&vendor, Some(Arc::new(VendorProvider)))
+            .expect("the vendor selection should build")
+            .expect("the vendor selection should yield a provider");
+        assert_eq!(
+            built.id(),
+            "acme",
+            "a vendor key should select the injected provider of that id"
         );
     }
 
@@ -545,7 +738,7 @@ mod tests {
     #[test]
     fn a_selected_but_uninjected_vendor_provider_fails_loudly() {
         let ec = Ec {
-            provider: Some("acme".to_owned()),
+            provider: Some(EcProviderSelection::from("acme")),
             ..Ec::default()
         };
 
@@ -564,7 +757,7 @@ mod tests {
         // reach the seam. If the two checks ever drift apart, `build_provider`
         // must still stop rather than hand back a stateless deployment.
         let ec = Ec {
-            provider: Some("hmac".to_owned()),
+            provider: Some(EcProviderSelection::Hmac),
             ..Ec::default()
         };
 
@@ -581,7 +774,7 @@ mod tests {
         // A selection the adapter cannot supply is knowable without a request,
         // so the composition root rejects it while application state is built.
         let selected = Ec {
-            provider: Some("acme".to_owned()),
+            provider: Some(EcProviderSelection::from("acme")),
             ..Ec::default()
         };
         let err = ensure_provider_available(&selected, None)
@@ -596,7 +789,7 @@ mod tests {
         ensure_provider_available(&Ec::default(), None)
             .expect("should allow a deployment that selects no provider");
         let explicit_none = Ec {
-            provider: Some("none".to_owned()),
+            provider: Some(EcProviderSelection::None),
             ..Ec::default()
         };
         ensure_provider_available(&explicit_none, None)

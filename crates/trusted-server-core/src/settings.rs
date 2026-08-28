@@ -20,6 +20,7 @@ use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
+use crate::ec::provider::EcProviderSelection;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
@@ -486,8 +487,12 @@ pub struct Ec {
     /// explicit `"none"` spells the same choice. Selecting a provider whose
     /// block is missing is rejected at startup by
     /// [`validate_provider_selection`](Self::validate_provider_selection).
+    ///
+    /// Typed as [`EcProviderSelection`], which reads and writes the same
+    /// string, so every check that asks which provider is selected matches on
+    /// one vocabulary rather than comparing string literals.
     #[serde(default)]
-    pub provider: Option<String>,
+    pub provider: Option<EcProviderSelection>,
 
     /// Deprecated location of the HMAC passphrase, read so a configuration
     /// written for the previous release still starts.
@@ -610,7 +615,7 @@ impl Ec {
     /// Returns [`TrustedServerError::Configuration`] when the selected provider
     /// key is unknown or its `[ec.providers.<key>]` block is absent.
     pub fn validate_provider_selection(&self) -> Result<(), Report<TrustedServerError>> {
-        let Some(key) = self.provider.as_deref() else {
+        let Some(selection) = self.provider.as_ref() else {
             if !self.providers.is_empty() {
                 return Err(Report::new(TrustedServerError::Configuration {
                     message: "[ec.providers.*] blocks are configured but no [ec] provider is \
@@ -622,27 +627,30 @@ impl Ec {
             return Ok(());
         };
 
-        // `"none"` is explicit statelessness: the same meaning as omitting
-        // the selector, spelled out. It is subject to the same rule that no
-        // provider blocks may be left configured.
-        if key == "none" {
-            if !self.providers.is_empty() {
-                return Err(Report::new(TrustedServerError::Configuration {
-                    message: "[ec] provider = \"none\" selects stateless operation, but \
-                              [ec.providers.*] blocks are configured. Remove the blocks, or \
-                              select the provider they configure"
-                        .to_owned(),
-                }));
+        let (key, configured) = match selection {
+            // `"none"` is explicit statelessness: the same meaning as omitting
+            // the selector, spelled out. It is subject to the same rule that no
+            // provider blocks may be left configured.
+            EcProviderSelection::None => {
+                if !self.providers.is_empty() {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: "[ec] provider = \"none\" selects stateless operation, but \
+                                  [ec.providers.*] blocks are configured. Remove the blocks, or \
+                                  select the provider they configure"
+                            .to_owned(),
+                    }));
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-
-        let configured = match key {
-            "hmac" => self.providers.hmac.is_some(),
+            EcProviderSelection::Hmac => {
+                (EcProviderSelection::HMAC_KEY, self.providers.hmac.is_some())
+            }
             // A vendor or host provider the adapter injects is configured when
             // its `[ec.providers.<key>]` block is present. The adapter validates
             // the block's own contents when it builds the provider.
-            other => self.providers.has_vendor(other),
+            EcProviderSelection::Vendor(vendor_key) => {
+                (vendor_key.as_str(), self.providers.has_vendor(vendor_key))
+            }
         };
 
         if !configured {
@@ -657,8 +665,8 @@ impl Ec {
         // block is almost always a mistake (a mistyped selector or a stale
         // block), and accepting it silently invites configuration drift.
         let mut unreferenced: Vec<String> = Vec::new();
-        if self.providers.hmac.is_some() && key != "hmac" {
-            unreferenced.push("hmac".to_owned());
+        if self.providers.hmac.is_some() && !matches!(selection, EcProviderSelection::Hmac) {
+            unreferenced.push(EcProviderSelection::HMAC_KEY.to_owned());
         }
         for vendor_key in self.providers.vendor_keys() {
             if vendor_key != key {
@@ -722,7 +730,7 @@ impl Ec {
             "[ec] passphrase is deprecated; move it to [ec.providers.hmac] passphrase and \
              set [ec] provider = \"hmac\""
         );
-        self.provider = Some("hmac".to_owned());
+        self.provider = Some(EcProviderSelection::Hmac);
         self.providers.hmac = Some(HmacProviderConfig { passphrase });
         Ok(())
     }
@@ -4608,8 +4616,8 @@ mod tests {
         );
         assert_eq!(settings.publisher.origin_host_header_override, None);
         assert_eq!(
-            settings.ec.provider.as_deref(),
-            Some("hmac"),
+            settings.ec.provider.as_ref(),
+            Some(&EcProviderSelection::Hmac),
             "test settings should select the hmac EC provider"
         );
         let Some(hmac) = &settings.ec.providers.hmac else {
@@ -5057,8 +5065,8 @@ mod tests {
         ec.migrate_legacy_ec_layout()
             .expect("should migrate the deprecated form");
         assert_eq!(
-            ec.provider.as_deref(),
-            Some("hmac"),
+            ec.provider.as_ref(),
+            Some(&EcProviderSelection::Hmac),
             "the deprecated passphrase should select the hmac provider"
         );
         assert_eq!(
@@ -5121,8 +5129,8 @@ mod tests {
             Settings::from_toml(&legacy_ec_settings_str("test-secret-key-32-bytes-minimum"))
                 .expect("a legacy passphrase of adequate length should still start");
         assert_eq!(
-            settings.ec.provider.as_deref(),
-            Some("hmac"),
+            settings.ec.provider.as_ref(),
+            Some(&EcProviderSelection::Hmac),
             "an adequate legacy passphrase should still select the hmac provider"
         );
         assert_eq!(
@@ -5220,7 +5228,7 @@ mod tests {
     fn legacy_passphrase_alongside_provider_config_is_rejected() {
         let mut ec = Ec {
             passphrase: Some(Redacted::new("test-secret-key-32-bytes-minimum".to_owned())),
-            provider: Some("hmac".to_owned()),
+            provider: Some(EcProviderSelection::Hmac),
             ..Ec::default()
         };
         let err = ec
@@ -5260,7 +5268,7 @@ mod tests {
     #[test]
     fn provider_none_is_explicit_stateless() {
         let ec = Ec {
-            provider: Some("none".to_owned()),
+            provider: Some(EcProviderSelection::None),
             ..Ec::default()
         };
         ec.validate_provider_selection()
@@ -5270,7 +5278,7 @@ mod tests {
     #[test]
     fn provider_none_with_configured_blocks_is_rejected() {
         let ec = Ec {
-            provider: Some("none".to_owned()),
+            provider: Some(EcProviderSelection::None),
             providers: EcProviders {
                 hmac: Some(HmacProviderConfig {
                     passphrase: Redacted::new("test-secret-key-32-bytes-minimum".to_owned()),

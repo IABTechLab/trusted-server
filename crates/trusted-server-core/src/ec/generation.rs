@@ -10,12 +10,8 @@ use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::Sha256;
 
-use crate::ec::provider::{PROVIDER_CODE_SEPARATOR, split_provider_code};
+use crate::ec::provider::{HMAC_PROVIDER_CODE, PROVIDER_CODE_SEPARATOR, split_provider_code};
 use crate::error::TrustedServerError;
-
-/// The registry code of the built-in HMAC provider, whose identifier shape
-/// this module defines.
-const HMAC_PROVIDER_CODE: &str = "hmac";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -156,7 +152,7 @@ pub fn ec_hash(ec_id: &str) -> &str {
 #[must_use]
 pub fn normalize_ec_id_for_kv(ec_id: &str) -> String {
     let (code, bare) = match split_provider_code(ec_id) {
-        (Some(code), bare) if code == HMAC_PROVIDER_CODE => (Some(code), bare),
+        (Some(code), bare) if code == HMAC_PROVIDER_CODE.as_str() => (Some(code), bare),
         (Some(_), _) => return ec_id.to_owned(),
         (None, bare) => (None, bare),
     };
@@ -203,7 +199,7 @@ pub fn is_valid_ec_hash(value: &str) -> bool {
 #[must_use]
 pub fn is_valid_ec_id(value: &str) -> bool {
     let bare = match split_provider_code(value) {
-        (Some(code), bare) if code == HMAC_PROVIDER_CODE => bare,
+        (Some(code), bare) if code == HMAC_PROVIDER_CODE.as_str() => bare,
         (Some(_), _) => return false,
         (None, bare) => bare,
     };

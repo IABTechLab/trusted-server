@@ -703,7 +703,7 @@ pub(crate) fn current_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ec::provider::ProviderCode;
+    use crate::ec::provider::{EcProviderSelection, ProviderCode};
     use crate::evidence::{OwnedRequestInfo, RequestInfo};
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
@@ -838,7 +838,7 @@ mod tests {
         const CODED_ID: &str = "t0op~AbC123opaqueEnvelopeValueXYZ";
 
         let mut settings = create_test_settings();
-        settings.ec.provider = Some("opaque".to_owned());
+        settings.ec.provider = Some(EcProviderSelection::from("opaque"));
         let cookie = format!("ts-ec={CODED_ID}");
         let req = create_test_request(&[("cookie", &cookie)]);
 
@@ -924,7 +924,7 @@ mod tests {
 
         let provider = Arc::new(EvidenceCapturingProvider::default());
         let mut settings = create_test_settings();
-        settings.ec.provider = Some("evidence".to_owned());
+        settings.ec.provider = Some(EcProviderSelection::from("evidence"));
 
         // A request carrying a query parameter and a (non-EC) cookie, with no
         // existing `ts-ec` cookie so the generate path runs.
@@ -1001,7 +1001,7 @@ mod tests {
         const OPAQUE: &str = "t0so~Opaque_EC_Value_MixedCase_123";
 
         let mut settings = create_test_settings();
-        settings.ec.provider = Some("server-opaque".to_owned());
+        settings.ec.provider = Some(EcProviderSelection::from("server-opaque"));
         let services = noop_services_with_ec_provider(Arc::new(ServerOpaqueProvider));
         let graph = KvIdentityGraph::in_memory("test-ec-store");
 
@@ -1071,7 +1071,7 @@ mod tests {
         use crate::platform::test_support::noop_services_with_ec_provider;
 
         let mut settings = create_test_settings();
-        settings.ec.provider = Some("illegal".to_owned());
+        settings.ec.provider = Some(EcProviderSelection::from("illegal"));
         let services = noop_services_with_ec_provider(Arc::new(IllegalIdProvider));
         let req = create_test_request(&[]);
         let geo = non_regulated_geo();
@@ -1131,7 +1131,7 @@ mod tests {
         use crate::platform::test_support::noop_services_with_ec_provider;
 
         let mut settings = create_test_settings();
-        settings.ec.provider = Some("canonical".to_owned());
+        settings.ec.provider = Some(EcProviderSelection::from("canonical"));
         let services = noop_services_with_ec_provider(Arc::new(CanonicalizingProvider));
         let graph = KvIdentityGraph::in_memory("test-ec-store");
         let req = create_test_request(&[]);
