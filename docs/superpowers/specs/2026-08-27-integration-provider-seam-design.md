@@ -133,8 +133,13 @@ module route `parse_single_module_filename` (`publisher.rs`), the
 `GPT_DIAGNOSTICS_INTEGRATION_ID` standalone special case, which becomes a
 registration property, and `template_fingerprint`, which must cover carried
 modules so a vendor crate rebuild invalidates the server-side template
-cache. The served script keeps its cache rule, being the `?v=<hash>` query
-matched at serve time (there is no integrity attribute on the tag today, and
+cache. The registry verifies a carried module's declared hash against its source
+when it is built, so a stale literal is a startup error rather than a
+stale script served under a valid-looking URL. Covering carried modules in
+the template cache fingerprint means the publisher entry point needs the
+registry, so it takes the configuration and the registry as one argument
+rather than two. The served script keeps its cache rule, being the
+`?v=<hash>` query matched at serve time (there is no integrity attribute on the tag today, and
 this change adds none).
 
 ### 3.3 Startup validation on the registration
@@ -317,7 +322,80 @@ single-arm match with eight test sites constructing the variant directly,
 and the wire shape `{"type":"aps", ...}` must survive byte for byte. Doing this once is what removes the per-vendor core change
 that the project pays for today, most recently in PR #1054.
 
-## 8. Sign-off
+## 8. What implementing this found
+
+A probe integration built outside `trusted-server-core` and registered
+through an adapter exercised every seam end to end. Four things surfaced
+that reading the code did not, and they are recorded here rather than left
+for each vendor to rediscover.
+
+1. **A vendor's own deploy rules do not run through the operator CLI.**
+   `ts config validate` and `ts config push` reach validation through
+   `TrustedServerAppConfig`, which supplies no builders, so a vendor's
+   `[integrations.<id>]` rules are skipped on exactly the path an operator
+   uses. The validation hook in §3.3 is only real once that path can carry
+   the builders a deployment was composed with. This needs a decision:
+   either the CLI is built per deployment with its vendor crates, or the
+   adapter validates at startup and the CLI checks only what core owns.
+2. **A carried module's hash is hand-maintained and line-ending fragile.**
+   Core's own modules get their hashes generated at build time. A vendor
+   crate keeps a literal beside its `include_str!`, and on a checkout that
+   rewrites line endings the embedded file changes and the literal stops
+   matching, which fails startup on that machine only. A generated helper
+   or a documented build-script recipe removes the trap; the probe pins the
+   file's line endings and tests the literal, which every vendor would
+   otherwise have to reinvent.
+3. **A provider is resolved more than once per request.** A proxy that
+   wants the resolved location calls the geo provider itself while the
+   request path has already called it. `CLAUDE.md`'s principle that a
+   vendor sharing one backend makes a single call per request needs a
+   per-request provider context to hang that on, which this change does not
+   introduce.
+4. **One core reader still reaches into a vendor's payload.** The
+   `hb_adid` fallback in the publisher reads the APS renderer's fields, so
+   the APS migration needs a neutral answer for it rather than only the
+   seam in §3.4.
+
+5. **Request preparation covers different routes on each host.** Every
+   adapter runs preparers before routing, but not on the same set of
+   routes: one runs them on every route but the health check, one skips a
+   batch endpoint and its admin diagnostics deliberately, one covers three
+   of its paths, and one skips its inline admin stubs. A module that strips
+   its own reserved query or cookie is therefore protected on a different
+   set of routes depending on the host it is deployed to. Making that
+   uniform means routing each adapter's hand-written handlers through one
+   wrapper, which is worth doing before a vendor depends on it.
+
+6. **A module's validate function runs nowhere in a real deployment.**
+   Building the registry calls only a builder's build function, and the
+   operator CLI calls deploy validation without the builders, so a vendor
+   whose checks live in `validate` has them enforced on no path at all. The
+   probe works around it by repeating its check inside its build function,
+   which every vendor would have to copy. Either the registry runs
+   `validate` when it builds, or the operator path carries the builders,
+   and the second is item 1. This is the same gap as item 1 seen from the
+   other side, and together they mean §3.3 is not yet delivered in
+   practice even though the hook exists.
+7. **The Fastly adapter cannot take a vendor crate at all.** Its
+   `build_state_with_registrations` is crate-private and it has no library
+   target, so composing a module into a Fastly deployment means editing the
+   adapter. The other three adapters expose both entry points. Fastly is
+   the primary deployment target, so this one decides whether the seam is
+   usable in production or only in the dev server.
+
+Items 1, 6 and 7 are the ones a vendor meets on its first day, and item 7
+decides whether any of this is reachable on the platform most deployments
+use. Item 5 is the one that produces a bug report nobody can reproduce,
+because whether it appears depends on which host the reporter runs.
+
+Taken together these say the seam is proven but not yet finished. A vendor
+can register a module, ship its browser code, declare a geo provider and
+serve a route, all from its own crate and proven end to end. It cannot yet
+do that on Fastly, and its own configuration rules are not enforced
+anywhere. Both are small changes against what this document already
+defines, and both should land before the first vendor is asked to use it.
+
+## 9. Sign-off
 
 | #   | Decision                                                                                                                                                                   | Status               |
 | --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
@@ -338,4 +416,5 @@ that the project pays for today, most recently in PR #1054.
 | 2026-08-27 | First draft, written against `split/5-response-hook-docs`.                                                                                                                                                                                                                                                                                 |
 | 2026-08-27 | Brought the bid renderer contract into scope (§3.4), so that after this change no vendor move needs a core change (§8 row 6).                                                                                                                                                                                                              |
 | 2026-08-28 | Corrected line references to `main` at b7fcb5d4c and added what mapping `main` found: composition of the served script moves into core (§3.2), registration enumeration and the auction-only `adserver_mock` case (§3.3), the duplicate-id gap (§3.1), the source-file guard and the `ts audit` vendor table (§4), the renderer risk (§7). |
+| 2026-08-28 | Recorded what implementing the seam found (§8): the operator CLI skips a vendor's deploy rules, a carried module's hash literal is fragile, providers resolve more than once per request, and one core reader still reads an APS payload. Recorded the construction-time hash check in §3.2.                                               |
 | 2026-08-28 | Adopted the #1043 review's registration shape for identity and applied its rule to geo and device, with no provider built into core (§3.6, §6 item 2, §8 rows 7 to 9). Recorded the relationship to #986 and reordered the series so this spec and its implementation come first.                                                          |
