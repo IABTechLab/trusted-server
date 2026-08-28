@@ -6,7 +6,7 @@
 
 **Initiative:** [#55 — Monetization integrations](https://github.com/IABTechLab/trusted-server/issues/55)
 
-**Status:** Implemented in draft PR; bundle-consistency guard approved
+**Status:** Draft PR implemented; bundle-consistency guard designed
 
 **Date:** 2026-08-21
 
@@ -188,22 +188,24 @@ Trade-offs: this only resolves identities visible to browser modules, and the
 CLI must deserialize the registry's vendor-neutral module/config-name schema.
 It does not add server-side HEM resolution or ATS Direct segments.
 
-### 5.2 Rejected for the first implementation: standalone LiveRamp integration
+### 5.2 Alternative boundary: standalone LiveRamp integration
 
 A new `integrations/liveramp` module could own browser and server APIs. This is
-premature because only the Prebid browser path is approved, while the ATS API
-input contract and ATS Direct product scope remain unresolved. It would also
-duplicate Prebid lifecycle and bundle validation responsibilities.
+not needed for the browser path implemented by the current PR, while the ATS
+API input contract and ATS Direct product scope remain unresolved. It would
+also duplicate Prebid lifecycle and bundle validation responsibilities if added
+before a server-side consumer is confirmed.
 
 Revisit this boundary if a future approved design adds server-to-server ATS
 resolution or a non-Prebid LiveRamp consumer.
 
-### 5.3 Rejected: RTIS callback endpoint
+### 5.3 Deferred: RTIS callback endpoint
 
 An RTIS endpoint would introduce a new unauthenticated redirect/callback
 surface and a correlation problem without improving the already-supported
 Prebid identity path. LiveRamp also requires per-endpoint configuration. It is
-not justified for the current requirement.
+not implemented by the current PR and requires explicit team confirmation
+before being treated as a follow-up requirement.
 
 ### 5.4 Deferred: native server-to-server ATS resolution
 
@@ -240,7 +242,7 @@ enabled = true
 server_url = "https://prebid.example.com/openrtb2/auction"
 external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-<sha256>.js"
 external_bundle_sha256 = "<sha256>"
-external_bundle_sri = "sha256-<base64>"
+external_bundle_sri = "sha384-<base64>"
 
 # RampID, expressed purely as operator configuration.
 [[integrations.prebid.managed_user_ids]]
@@ -307,20 +309,27 @@ into the CLI, and registry additions extend both the generator and validation.
 
 The CLI performs focused validation in this order:
 
-1. Parse the managed User ID names alongside the existing bundle inputs.
+1. Parse the managed User ID names alongside the existing bundle inputs. An
+   absent key becomes an empty list; a non-array value, non-table entry, or
+   missing, empty, or non-string `name` fails instead of being skipped.
 2. Locate the JavaScript library and load its checked-in User ID registry.
 3. Resolve every managed name to exactly one `moduleName`. Unknown or
-   ambiguously mapped names fail.
-4. Generate the external Prebid bundle normally.
-5. Deserialize `userIdModules` from the freshly generated manifest.
-6. Confirm that every resolved module appears in the manifest.
-7. Update `external_bundle_sha256` and `external_bundle_sri` only after the
+   ambiguously mapped names fail before generator invocation.
+4. Remove only the exact `<out>/manifest.json` file when it already exists. A
+   generator that returns success without writing a new manifest must not reuse
+   stale metadata from an earlier build.
+5. Generate the external Prebid bundle normally.
+6. Deserialize `userIdModules` from the newly written manifest.
+7. Confirm that every resolved module appears in the manifest.
+8. Update `external_bundle_sha256` and `external_bundle_sri` only after the
    consistency check succeeds.
 
-The failure names the managed config name, required module, and corrective TOML
-field. A failed consistency check leaves the existing config metadata unchanged.
-The browser-side warning remains as defense in depth for externally built,
-stale, or modified artifacts.
+Unknown-name errors identify the managed name and registry path. Ambiguous-name
+errors additionally list the candidate modules. Missing-manifest-module errors
+identify the managed name, its required module, and the corrective
+`integrations.prebid.bundle.user_id_modules` field. A failed consistency check
+leaves the existing config metadata unchanged. The browser-side warning remains
+as defense in depth for externally built, stale, or modified artifacts.
 
 An empty `managed_user_ids` preserves current behavior and emits no managed User
 ID configuration.
@@ -361,18 +370,19 @@ Publisher commands may already be waiting in `window.pbjs.que`, including a
 Prebid processes existing commands in insertion order, so a publisher auction
 could run before the new entry.
 
-When LiveRamp is configured, the shim instead installs narrowly scoped,
-idempotent wrappers around the public `pbjs.setConfig` and `pbjs.mergeConfig`
-APIs before calling `pbjs.processQueue()`:
+When one or more managed entries are configured, the shim instead installs
+narrowly scoped, idempotent wrappers around the public `pbjs.setConfig` and
+`pbjs.mergeConfig` APIs before calling `pbjs.processQueue()`:
 
 1. Capture and bind the real `pbjs.setConfig` and, when present,
    `pbjs.mergeConfig` implementations.
 2. Replace both public APIs with wrappers that normalize every call containing
    a `userSync` object. Calls without `userSync` pass through unchanged.
-3. For a call with an explicit `userSync.userIds`, preserve every
-   non-`identityLink` entry,
-   remove all publisher-supplied `identityLink` entries, and append exactly one
-   operator-managed entry. Preserve sibling `userSync` and top-level fields.
+3. Build a set containing every configured managed name. For a call with an
+   explicit `userSync.userIds`, preserve entries whose names are outside that
+   set, remove every publisher-supplied entry whose name is managed, and append
+   one fresh copy of each operator-managed entry in configuration order.
+   Preserve sibling `userSync` and top-level fields.
 4. Calls whose `userSync` object omits `userIds` pass through unchanged. The
    pinned generated Prebid artifact retains its effective `userIds` defaults
    across partial `setConfig` and `mergeConfig` updates, so injecting a copied
@@ -381,19 +391,20 @@ APIs before calling `pbjs.processQueue()`:
    A real-artifact characterization test protects this pinned behavior.
 5. During initial installation, read the already-effective
    `pbjs.getConfig('userSync.userIds')` value,
-   normalize its supported array/config shape, preserve its non-`identityLink`
-   entries, append the managed entry, and apply that merged list synchronously
-   through the captured function. This covers publisher configuration that ran
-   after the external Prebid bundle loaded but before the deferred TSJS shim.
-   An absent or malformed effective list degrades to an empty publisher list.
-   Complete this step before processing any existing queue entries.
+   normalize its supported array/config shape, preserve entries whose names are
+   not managed, append fresh copies of every managed entry, and apply that
+   merged list synchronously through the captured function. This covers
+   publisher configuration that ran after the external Prebid bundle loaded
+   but before the deferred TSJS shim. An absent or malformed effective list
+   degrades to an empty publisher list. Complete this step before processing
+   any existing queue entries.
 6. Call `pbjs.processQueue()`. Queued publisher `setConfig` and `mergeConfig`
    calls flow through the wrappers, so a later queued `requestBids` observes
    the managed entry.
 7. Keep the wrappers installed after queue processing so later publisher calls
    through either public configuration API cannot silently replace or delete
-   the operator-owned LiveRamp policy. Repeated TSJS installation must not
-   stack wrappers.
+   operator-owned managed entries. Repeated TSJS installation must not stack
+   wrappers.
 
 This is configuration ownership for supported Prebid API usage, not a security
 boundary against adversarial same-origin JavaScript that retained an earlier
@@ -474,8 +485,9 @@ ingestion provide reuse on later requests.
 - The implementation does not collect plaintext or hashed email and does not
   add an API for publishers to submit either value.
 - The managed configuration preserves unrelated publisher User ID entries but
-  owns the single `identityLink` entry when enabled. This prevents ambiguous
-  duplicate LiveRamp configurations.
+  owns every configured managed name. A managed `identityLink` entry therefore
+  prevents ambiguous duplicate LiveRamp configurations without special-casing
+  LiveRamp in core.
 - Existing EID size limits, source/UID validation, cookie caps, merge rules,
   and consent withdrawal behavior remain authoritative.
 - Live credentials and Placement IDs must not be committed to fixtures or
@@ -580,7 +592,13 @@ Add focused tests in `crates/trusted-server-cli/src/prebid_bundle.rs` proving:
 - multiple aliases may resolve to the same required module;
 - an unknown name fails with an actionable registry error;
 - an ambiguously mapped synthetic name fails deterministically;
+- malformed `managed_user_ids` containers, entries, and names fail instead of
+  being skipped;
+- unknown, ambiguous, and malformed-name failures occur before generator
+  invocation and leave hash/SRI metadata unchanged;
 - a missing or malformed `userIdModules` manifest field fails;
+- a pre-existing manifest is invalidated before generation, so a fake generator
+  that succeeds without writing a replacement cannot reuse stale metadata;
 - omission of `bundle.user_id_modules` works with the generated default preset;
 - failed consistency validation does not update hash/SRI config metadata;
 - the checked-in registry maps `identityLink` to `identityLinkIdSystem`.
@@ -596,7 +614,7 @@ LiveRamp-named fixture proving that a `liveramp.com` EID:
 - is ingested into the configured `liveramp.com` EC partner namespace on a
   later request.
 
-### 11.6 Live credential validation
+### 11.6 Live configuration validation
 
 Run outside CI against a LiveRamp-approved non-production origin:
 
@@ -620,10 +638,10 @@ publish live envelopes.
 
 Implementation updates:
 
-- `trusted-server.example.toml` with a commented LiveRamp example;
+- `trusted-server.example.toml` with a commented managed User ID example;
 - `docs/guide/integrations/prebid.md` with configuration, lifecycle, bundle,
   consent, troubleshooting, and verification guidance;
-- `docs/guide/configuration.md` with the typed field reference;
+- `docs/guide/configuration.md` with the vendor-neutral managed field reference;
 - optionally a short `docs/guide/integrations/liveramp.md` page if the Prebid
   guide would become difficult to navigate. The first implementation should
   avoid duplicating the authoritative Prebid flow across two pages.
@@ -638,7 +656,7 @@ The documentation must state that:
 
 ## 13. Rollout and observability
 
-1. Land configuration and tests with the subsection absent by default.
+1. Land configuration and tests with `managed_user_ids` empty by default.
 2. Generate and publish a test bundle that includes `identityLinkIdSystem`.
 3. Validate on a non-production approved origin with debug logging restricted
    to source names/counts.
@@ -650,27 +668,30 @@ The documentation must state that:
 7. Document the tested Placement/origin configuration in operator-owned,
    non-repository deployment records.
 
-No database or KV migration is required. Omitting the new subsection provides
+No database or KV migration is required. Removing the managed entries provides
 an immediate configuration rollback.
 
 ## 14. Acceptance criteria
 
 Issue #355's implementation portion is complete when:
 
-- operators can configure LiveRamp RampID through typed Trusted Server config;
+- operators can configure LiveRamp RampID through vendor-neutral Trusted Server
+  config;
 - invalid configuration fails before serving traffic;
 - managed configuration preserves non-LiveRamp publisher User ID modules and
   owns one deterministic `identityLink` entry;
-- bundle diagnostics detect a missing `identityLinkIdSystem`;
+- `ts prebid bundle` rejects unknown or ambiguous managed names and a generated
+  manifest that omits `identityLinkIdSystem` for `identityLink`;
+- runtime bundle diagnostics retain the same missing-module defense for
+  externally supplied or stale artifacts;
 - valid `liveramp.com` EIDs follow the existing browser → `/auction` → Prebid
   Server path without exposing envelope contents;
 - existing consent, validation, merge, cookie, and EC/KV behavior is preserved;
 - automated Rust and TypeScript tests pass;
 - operator documentation explains setup, timing, privacy, failure behavior,
   and live verification;
-- credential-based validation is completed, or the remaining credential block
-  is explicitly recorded with an owner and the implementation is labeled
-  “code complete, live validation pending”; and
+- live configuration validation is completed and recorded without Placement ID
+  or envelope values; and
 - the parent epic receives the explicit answer: RampID identity envelopes can
   be passed through the Prebid auction path; ATS Direct segments are not passed
   by this implementation.
