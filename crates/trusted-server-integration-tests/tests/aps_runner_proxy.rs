@@ -501,7 +501,12 @@ fn exact_renderer_method_response(response: Response) -> bool {
 }
 
 fn assert_exact_local_failure(response: Response, status: u16, allow_get: bool) {
-    assert_eq!(response.status().as_u16(), status);
+    assert_eq!(
+        response.status().as_u16(),
+        status,
+        "unexpected local failure response headers: {:?}",
+        response.headers()
+    );
     assert_eq!(response.headers()["cache-control"], "no-store");
     if allow_get {
         assert_eq!(response.headers()["allow"], "GET");

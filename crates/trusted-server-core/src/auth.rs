@@ -11,43 +11,35 @@ use crate::settings::Settings;
 
 const BASIC_AUTH_REALM: &str = r#"Basic realm="Trusted Server""#;
 
-/// Marker recording that this request's `Authorization` header was consumed and
-/// validated by a Trusted Server handler at the edge.
+/// Marks the single `Authorization` value Trusted Server validated.
 ///
-/// The shared template cache refuses every request carrying `Authorization`,
-/// because an authorized response must never become a reader-neutral template.
-/// That rule exists for credentials bound for the publisher origin, whose
-/// response content TS cannot reason about.
-///
-/// A credential this edge terminated is a different case. [`enforce_basic_auth`]
-/// runs as middleware ahead of routing, so a request that reaches a handler for a
-/// gated path has necessarily already satisfied that same handler. Every reader
-/// able to look up a template stored from such a request has authenticated
-/// against the same credential, so reuse is not a cross-reader disclosure.
-///
-/// Absence of this marker on a request that still carries `Authorization` means
-/// the credential is pass-through, and the template cache continues to refuse it.
-///
-/// # Invariants
-///
-/// The private field makes [`enforce_basic_auth`] the only code that can produce
-/// this marker. It grants shared-template eligibility to a request that would
-/// otherwise be refused, so being unforgeable outside this module is the whole
-/// point: a caller cannot assert "already authenticated" without having actually
-/// checked. [`enforce_basic_auth`] also clears any inherited marker before it
-/// decides, so the value can never outlive the check that produced it.
+/// The shared template cache may exempt this value from its normal authorization
+/// bypass. [`enforce_basic_auth`] clears any existing marker before checking and
+/// inserts a digest-bound marker only after successful authentication.
 #[derive(Debug, Clone)]
-pub(crate) struct EdgeTerminatedAuthorization(());
+pub(crate) struct EdgeTerminatedAuthorization([u8; 32]);
 
 impl EdgeTerminatedAuthorization {
+    fn digest(value: &[u8]) -> [u8; 32] {
+        Sha256::digest(value).into()
+    }
+
+    pub(crate) fn matches(&self, headers: &http::HeaderMap) -> bool {
+        let mut values = headers.get_all(header::AUTHORIZATION).iter();
+        let Some(value) = values.next() else {
+            return false;
+        };
+        values.next().is_none() && self.0 == Self::digest(value.as_bytes())
+    }
+
     /// Builds the marker without performing a credential check.
     ///
     /// Test-only. Production code obtains this marker exclusively by passing
     /// [`enforce_basic_auth`], which is what makes it meaningful.
     #[cfg(test)]
     #[must_use]
-    pub(crate) const fn for_test() -> Self {
-        Self(())
+    pub(crate) fn for_test(value: &str) -> Self {
+        Self(Self::digest(value.as_bytes()))
     }
 }
 
@@ -94,22 +86,17 @@ pub fn enforce_basic_auth(
     // nothing checked.
     req.extensions_mut().remove::<EdgeTerminatedAuthorization>();
 
-    // Scoped so the path borrow ends before the successful branch marks the
-    // request. `handler` borrows `settings`, not `req`.
-    let handler = {
-        let path = req.uri().path();
-        let Some(handler) = settings.handler_for_path(path)? else {
-            if Settings::is_admin_path(path) {
-                return Err(Report::new(TrustedServerError::Configuration {
-                    message: format!("Admin path `{path}` has no configured handler"),
-                }));
-            }
-            return Ok(None);
-        };
-        handler
+    let path = req.uri().path();
+    let Some(handler) = settings.handler_for_path(path)? else {
+        if Settings::is_admin_path(path) {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!("Admin path `{path}` has no configured handler"),
+            }));
+        }
+        return Ok(None);
     };
 
-    let Some((username, password)) = extract_credentials(req) else {
+    let Some((username, password, authorization_digest)) = extract_credentials(req) else {
         return Ok(Some(unauthorized_response()));
     };
 
@@ -128,7 +115,8 @@ pub fn enforce_basic_auth(
     if bool::from(username_match & password_match) {
         // Record that TS itself consumed this credential, so the shared template
         // cache can distinguish it from a credential meant for the origin.
-        req.extensions_mut().insert(EdgeTerminatedAuthorization(()));
+        req.extensions_mut()
+            .insert(EdgeTerminatedAuthorization(authorization_digest));
         Ok(None)
     } else {
         log::warn!("Basic auth failed for path: {}", req.uri().path());
@@ -136,12 +124,14 @@ pub fn enforce_basic_auth(
     }
 }
 
-fn extract_credentials(req: &Request<EdgeBody>) -> Option<(String, String)> {
+fn extract_credentials(req: &Request<EdgeBody>) -> Option<(String, String, [u8; 32])> {
     let mut header_values = req.headers().get_all(header::AUTHORIZATION).iter();
-    let header_value = header_values.next()?.to_str().ok()?;
+    let header_value = header_values.next()?;
     if header_values.next().is_some() {
         return None;
     }
+    let authorization_digest = EdgeTerminatedAuthorization::digest(header_value.as_bytes());
+    let header_value = header_value.to_str().ok()?;
 
     let mut parts = header_value.splitn(2, ' ');
     let scheme = parts.next()?.trim();
@@ -161,7 +151,7 @@ fn extract_credentials(req: &Request<EdgeBody>) -> Option<(String, String)> {
     let username = credentials_parts.next()?.to_owned();
     let password = credentials_parts.next()?.to_owned();
 
-    Some((username, password))
+    Some((username, password, authorization_digest))
 }
 
 fn unauthorized_response() -> Response<EdgeBody> {
@@ -232,11 +222,26 @@ mod tests {
                 .is_none(),
             "valid credentials should be admitted"
         );
+        let marker = req
+            .extensions()
+            .get::<EdgeTerminatedAuthorization>()
+            .expect("should mark a credential this edge consumed");
         assert!(
-            req.extensions()
-                .get::<EdgeTerminatedAuthorization>()
-                .is_some(),
-            "a credential this edge consumed should be marked so the template cache can share it"
+            marker.matches(req.headers()),
+            "the marker should match the unchanged validated authorization"
+        );
+
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer publisher-origin-credential"),
+        );
+        let marker = req
+            .extensions()
+            .get::<EdgeTerminatedAuthorization>()
+            .expect("should retain the marker after an unrelated mutation");
+        assert!(
+            !marker.matches(req.headers()),
+            "the marker must not match a replacement authorization value"
         );
     }
 
@@ -272,7 +277,7 @@ mod tests {
         let mut req = build_request(Method::GET, "https://example.com/open");
         set_authorization(&mut req, "Basic dXNlcjpwYXNz");
         req.extensions_mut()
-            .insert(EdgeTerminatedAuthorization::for_test());
+            .insert(EdgeTerminatedAuthorization::for_test("Basic dXNlcjpwYXNz"));
 
         assert!(
             enforce_basic_auth(&settings, &mut req)
@@ -295,7 +300,9 @@ mod tests {
         let encoded = STANDARD.encode("user:wrong-pass");
         set_authorization(&mut req, &format!("Basic {encoded}"));
         req.extensions_mut()
-            .insert(EdgeTerminatedAuthorization::for_test());
+            .insert(EdgeTerminatedAuthorization::for_test(
+                "Basic dXNlcjp3cm9uZy1wYXNz",
+            ));
 
         let response = enforce_basic_auth(&settings, &mut req)
             .expect("should evaluate auth")

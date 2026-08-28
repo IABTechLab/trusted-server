@@ -96,8 +96,9 @@ is a safety assertion about the whole store: nothing in it changed within the
 window and no writer is targeting it. Unlike the other `config` subcommands,
 `gc` never loads the typed app config; its `--no-env` flag instead ignores
 `EDGEZERO__STORES__CONFIG__<ID>__NAME` when resolving which physical store to
-sweep. On a destructive run, check the store id `gc` reports before passing
-`--yes`.
+sweep, and `--store <id>` overrides the manifest's config-store id outright.
+Both change which store gets swept, so on a destructive run check the store id
+`gc` reports before passing `--yes`.
 
 ### Diagnose ad-template configuration
 
@@ -151,9 +152,11 @@ ts serve --adapter fastly
 
 `ts deploy` accepts `--staging` (Fastly only) to build and upload a staged
 draft version cloned from the active one instead of activating a production
-deploy. Adapter passthrough arguments must follow a `--` separator; unknown
+deploy. Adapter passthrough arguments must now follow a `--` separator; unknown
 flags before `--` (including the renamed-away `--stage`) are rejected at parse
-time rather than forwarded:
+time rather than forwarded. This is a change: passthrough args previously
+worked without the separator, so existing runbooks and CI jobs that pass
+adapter flags directly need the `--` added:
 
 ```bash
 ts deploy --adapter fastly --service-id <service-id> --staging
@@ -162,30 +165,41 @@ ts deploy --adapter fastly -- --comment "release"
 
 A staged deploy only redirects the staged version's config selector at the
 `<logical-store-id>_staging` key — it does not copy the production config blob
-there. Push the staged config before probing the staged version, or it comes up
-with no config at all:
+there. Push the staged config before probing the staged version:
 
 ```bash
 ts config push --adapter fastly --staging
 ts config diff --adapter fastly --staging
 ```
 
+> **Known limitation:** Trusted Server's Fastly entry point does not yet read
+> the version-linked `edgezero_runtime_env` selectors, so a staged version
+> currently loads the **production** config blob rather than the staged one —
+> a staging healthcheck exercises the new binary against production config.
+> Selector resolution for custom entry points is tracked upstream in EdgeZero;
+> until it lands, do not rely on `--staging` to validate a config change.
+
 `--staging` on `config push` / `config diff` writes and compares the
 `<logical-store-id>_staging` key in the same store. It is mutually exclusive
 with `--key`: the staging key is derived from the store's logical id, so an
 explicit key would be written where nothing reads it.
 
-Inspect and verify deployments with the deploy lifecycle commands:
+Inspect and verify deployments with the deploy lifecycle commands. All three are
+Fastly-only — the axum, cloudflare, and spin adapters reject them:
 
 ```bash
-# Print the currently active deployment version
+# Capture the production rollback target BEFORE deploying: after a deploy this
+# prints the NEW version, and Fastly keeps no record of which version was live
+# before it, so the target is then unrecoverable.
 ts active-version --adapter fastly --service-id <service-id>
 
-# Probe a deployed version until it reports healthy
+# Probe a deployed version until it reports healthy. `<version>` is the version
+# the deploy activated; pass `--service-id` to `ts deploy` and it emits that as
+# a machine-readable `version=<N>` line.
 ts healthcheck --adapter fastly --service-id <service-id> \
   --version <version> --domain edge.example
 
-# Re-activate a previously active version
+# Re-activate the version captured before the deploy
 ts rollback --adapter fastly --service-id <service-id> \
   --version <bad-version> --rollback-to <previous-version>
 ```
@@ -317,6 +331,7 @@ exist, so the command prefers a narrow literal path over a plausible guess.
 | More than a quarter of crawled pages return no slots                                    | The run fails. That is the signature of bot protection serving challenge pages, and writing from it would silently narrow the slot set.                                                                                       |
 | Several live elements normalize onto one div-id prefix                                  | The whole group is omitted, on every page of the crawl. A prefix resolves to at most one element and the exact ids change per render; the prefix is named in a note.                                                          |
 | A per-render token sits before the placement part of a div id                           | The slot is omitted from a single observation and the family prefix is named in a note; no stable prefix identifies one element.                                                                                              |
+| A crawled page redirects off the audited origin                                         | The page is skipped on that profile, its path is named in a note, and it stops counting toward profile coverage. There is no override for generation; another site's evidence is never folded into the config.                |
 
 Every run checks that the config it produced still loads before replacing the
 file, and `--dry-run` runs the same check — a clean preview is evidence the
@@ -338,6 +353,9 @@ ts audit ad-templates generate https://publisher.example/ --max-sections 20 --ma
 # Audit exactly one page, as earlier releases did.
 ts audit ad-templates generate https://publisher.example/ --max-pages 1
 
+# Trigger lazy-loaded inventory on every crawled page.
+ts audit ad-templates generate https://publisher.example/ --scroll
+
 # Set the patterns yourself; this disables pattern inference entirely, and the
 # run fails outright if any slot's template had to borrow section_root.
 ts audit ad-templates generate https://publisher.example/ \
@@ -348,9 +366,26 @@ ts audit ad-templates generate https://publisher.example/ --dry-run
 ```
 
 Re-running merges into the existing slots: a slot seen again keeps its
-hand-tuned fields and gains this run's patterns and newly observed formats, and a hand-written
-`gam_unit_path` template is preserved. `--replace` discards existing slots
-instead, which also discards any template you wrote by hand.
+hand-tuned fields and gains this run's patterns and newly observed formats, and
+a hand-written `gam_unit_path` template is preserved. A configured `div_id` is
+matched exactly when the crawl observed that exact id; it is treated as a
+runtime prefix only when it was never observed as a literal element, so a
+configured `ad-sidebar-1` no longer absorbs a discovered `ad-sidebar-10` — the
+sibling is appended as its own slot. A prefix that does claim several
+discovered divs is named in a stderr note, because the runtime resolves a
+prefix to at most one element. `--replace` discards existing slots instead,
+which also discards any template you wrote by hand.
+
+`--scroll` performs the same deterministic stepped scroll on every page and
+device profile after the initial settle, then waits for the page to settle again
+before collecting evidence. It is opt-in because it increases crawl time, ad
+requests, and publisher-page side effects.
+
+During a normal merge, configured slots missing from the current crawl are
+preserved and named in a stderr note. Absence is not proof that a slot is stale:
+the crawl may have missed a page type, device target, or lazy-loaded placement.
+Review coverage and re-run with `--scroll` when appropriate. Only use
+`--replace` when intentionally pruning every slot the run did not rediscover.
 
 A slot that never appeared without a section segment can borrow a
 `section_root` witnessed by another slot only while its patterns are derived
@@ -445,12 +480,14 @@ note: skipped 3 slot(s) that look like one placement under a per-render div id
       that is stable across renders
 ```
 
-The detection is by evidence, not by recognising token shapes: candidates share
-an ad-unit path and formats, and what separates a fragmented placement from two
-legitimate siblings on one unit is co-occurrence — real siblings appear together
-on a page, fragments never do. The suggested prefix is a starting point only, not
-written as a `div_id`, because it reaches only as far as the observed tokens
-happen to agree.
+This particular group is detected by evidence, not by recognising token shapes:
+candidates share an ad-unit path and formats, and what separates a fragmented
+placement from two legitimate siblings on one unit is co-occurrence — real
+siblings appear together on a page, fragments never do. (A single id whose
+per-render token sits _before_ the placement part is refused on shape alone,
+from one observation, as the table above notes.) The suggested prefix is a
+starting point only, not written as a `div_id`, because it reaches only as far
+as the observed tokens happen to agree.
 
 ### Checking for a device split
 
@@ -515,14 +552,15 @@ mode. `--scroll` enables the optional second evidence phase and labels evidence
 first seen after the deterministic scroll.
 
 Browser-backed ad-template generation and verification share `--chrome`,
-`--headful`, `--browser-proxy`, `--no-assume-consent`,
-`--settle-quiet-ms`, `--settle-max-ms`, and
-`--danger-accept-invalid-certs`. Verification also accepts
-`--browser-profile desktop|mobile`; generation uses
-`--profiles desktop,mobile` to compare both profiles. `--cookie NAME=VALUE` is
-repeatable and creates host-only, root-path cookies; HTTPS targets also mark
-them Secure. Verification refuses cookies when URLs span multiple origins. The quiet settle window
-must not exceed the maximum.
+`--headful`, `--browser-proxy`, `--no-assume-consent`, `--scroll`,
+`--settle-quiet-ms`, `--settle-max-ms`, and `--danger-accept-invalid-certs`;
+`--scroll` runs the same deterministic scroll pass in both, and in verification
+it additionally labels the second evidence phase. Verification also accepts
+`--browser-profile desktop|mobile`; generation uses `--profiles desktop,mobile`
+to compare both profiles. `--cookie NAME=VALUE` is repeatable and creates
+host-only, root-path cookies; HTTPS targets also mark them Secure. Verification
+refuses cookies when URLs span multiple origins. The quiet settle window must
+not exceed the maximum.
 
 `ts audit` is not an EdgeZero adapter command. It has no `--adapter` option and
 it does not provision resources, push config, build, deploy, or contact platform

@@ -39,4 +39,5 @@ web-time = { workspace = true }
 [dev-dependencies]
 bytes = { workspace = true }
 edgezero-core = { workspace = true, features = ["test-utils"] }
+toml = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }

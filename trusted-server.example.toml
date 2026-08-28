@@ -142,6 +142,15 @@ pull_sync_concurrency = 3
 # Domains left as-is (not proxied/rewritten). Supports "*.example.com" wildcards.
 # exclude_domains = ["*.cdn.example.com"]
 
+# Trust a fronting CDN's reader IP only when the same request also supplies
+# the matching shared secret. The front door must set both headers on requests
+# it sends here and remove client-supplied copies on its other routes.
+# Fastly-only; see docs/guide/fastly.md for the required front-door setup.
+# [trusted_client_ip]
+# ip_header = "x-ts-client-ip"
+# auth_header = "x-ts-client-ip-auth"
+# shared_secret = "replace-with-a-random-shared-secret"
+
 # Tester-cookie endpoints: GET /_ts/set-tester sets ts-tester=true and
 # GET /_ts/clear-tester clears it on publisher.cookie_domain.
 # [tester_cookie]
@@ -173,8 +182,9 @@ pull_sync_concurrency = 3
 # Verify TLS certs when proxying to HTTPS origins (default true; false only for
 # local self-signed dev).
 # certificate_check = true
-# Allowlist for first-party proxy redirect destinations (SSRF guard). Supports
-# exact ("example.com") and wildcard ("*.example.com", also matches apex).
+# Allowlist for first-party proxy signing, initial fetch targets, and redirect
+# targets. Supports exact ("example.com") and wildcard ("*.example.com", also
+# matches apex).
 # REQUIRED to include the Prebid external_bundle_url host when Prebid is enabled.
 # allowed_domains = ["ads.example.com", "assets.example.com", "*.cdn.example.com"]
 #

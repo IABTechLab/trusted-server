@@ -36,7 +36,7 @@ revision 44. This is the sole implementation plan for that design.
 
 The implementation branch is `feature/aps-tsjs-resilience-rc202608`. It is created
 directly from fetched `origin/rc/202608` commit
-`985ff22987d80cc729f45f702e0c3548e429b2cf`. Previously reviewed feature and merge
+`07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`. Previously reviewed feature and merge
 SHAs are historical review references only; their approved changes were replayed
 and reconciled onto this exact base and are not parent or implementation authority.
 That replayed history already
@@ -46,11 +46,14 @@ verification surfaces. Those commits are implementation history, not evidence th
 revision 44 is complete.
 
 The final Task 17 refresh fetched and integrated `origin/rc/202608` at
-`985ff22987d80cc729f45f702e0c3548e429b2cf` on 2026-08-28. Its rc-owned package and
+`07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` on 2026-08-28. Its rc-owned package and
 operator-document changes are retained. Its raw-global GAM-attribution transport is
 superseded by the typed immutable GPT configuration carrier and sole parser-time GPT
 owner, and its mutable publisher-native APS experiment is superseded by the single
-Trusted Server renderer owner required by revision 44.
+Trusted Server renderer owner required by revision 44. The refresh also retains the
+config-first auction-provider contract, strict first-party proxy allowlist
+enforcement, edge-validated Basic-auth template eligibility, and the latest
+first-impression arbitration behavior behind the revision-44 owners.
 
 `origin/rc/202608` is the behavior, API, dependency, CI, and performance baseline.
 Do not merge `main` separately. Before final verification, fetch the release branch;
@@ -1665,11 +1668,11 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
       integration config, build, or CI, name the final owner and focused test. Keep
       EdgeZero and other excluded features unchanged.
 
-  Final refresh inventory for `985ff22987d80cc729f45f702e0c3548e429b2cf`:
+  Final refresh inventory for `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`:
 
   | Rc overlap                                                   | Final disposition and owner                                                                                                                                                                                                                              | Focused proof                                                                                                        |
   | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-  | APS provider, renderer, browser types, and guide             | Revision 43 supersedes the publisher-native experiment. `integrations/aps.rs`, `integrations/aps/render.ts`, and the shared render services retain one TS-owned renderer and the no-second-auction invariant.                                            | APS Rust tests, `test/integrations/aps/render.test.ts`, GPT/PUC ownership tests, hard-cutover scan                   |
+  | APS provider, renderer, browser types, and guide             | Revision 44 supersedes the publisher-native experiment. `integrations/aps.rs`, `integrations/aps/render.ts`, and the shared render services retain one TS-owned renderer and the no-second-auction invariant.                                            | APS Rust tests, `test/integrations/aps/render.test.ts`, GPT/PUC ownership tests, hard-cutover scan                   |
   | APS creative-frame scrollbar fix                             | Preserve the concept in the stronger proxy-owned documents: both document roots suppress overflow and the inner creative iframe is borderless, block-level, and full-size. No publisher-origin runner path is retained.                                  | APS document corpus, renderer unit suite, three-engine browser matrix                                                |
   | Initial GPT scheduling one-shot and handoff latch            | Supersede both mutable `scheduleInitialAdInit` implementations. The authenticated first-display registration transaction accepts one exact ordered batch, deletes registration ingress before activation, and transfers one frozen handoff exactly once. | first-display transaction, bootstrap, agent, takeover, and handoff suites                                            |
   | GPT diagnostics presentation review fixes                    | Preserve target-window scheduling, cancellable ownership, bounded badge size lists, shared size formatting, rounded observed boxes, destroyed-state guards, and record-currentness checks inside the data-only diagnostics owner.                        | GPT diagnostics binding, badge, overlay, slot-size, store, and public-type suites                                    |
@@ -1681,6 +1684,12 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
   | Docs TypeScript-ESLint update                                | Preserve rc package and lockfile ownership.                                                                                                                                                                                                              | docs install, lint, format, and build                                                                                |
   | GPT operator wording and example config                      | Preserve rc's provider-neutral environment-overlay wording; do not add EdgeZero feature work.                                                                                                                                                            | docs format/build and config tests                                                                                   |
   | Rc GAM review plan/spec artifacts                            | Preserve as release-branch documentation; they do not override revision 44's TSJS architecture.                                                                                                                                                          | docs format/build and plan-integrity scan                                                                            |
+  | Config-first auction providers                               | Preserve typed provider tables for direct `/auction`; do not use the test-only legacy provider map to prove production routing.                                                                                                                          | `direct_auction_remains_available_when_templates_are_disabled`                                                       |
+  | Edge-validated Basic auth and shared templates               | Preserve the rc cache behavior without adding a TSJS cache requirement. Only one unchanged authorization value marked by edge auth is reader-neutral; missing, repeated, or replaced values bypass.                                                      | auth middleware suites and `shared_template_authorization_requires_one_unchanged_edge_validated_value`               |
+  | First-party proxy allowlist enforcement                      | Preserve the server allowlist and carry its typed `blocked` result into the lifecycle-owned iframe/image guards. A policy denial never falls back to the rejected raw URL.                                                                               | proxy Rust suites and creative proxy-sign/image/iframe tests                                                         |
+  | First-impression token, refresh, and stale-creative repairs  | Supersede the mutable claim/global implementation with navigation-scoped slots, first-display GPT observation, transactional Prebid admission, pre-response attempt validation, and the authenticated nested-shell helper.                               | first-display driver/GPT/render-bridge, persistent GPT/Prebid, PUC bridge, and APS browser suites                    |
+  | Responsive/hydrated slot reconciliation                      | Supersede the standalone mutable resolver. Initial and persistent owners accept an exact element or one unambiguous non-container prefix; late handoff additionally validates path, sizes, connectivity, and exact physical replacement.                 | slot-service hydration, first-display GPT adapter/driver, and persistent GPT module tests                            |
+  | Rc secret, client-IP, CLI, and ad-template work              | Preserve the release-branch implementation and documentation unchanged except where its tests exercise the hard-cutover provider or HTML owners. No EdgeZero feature work is added.                                                                      | adapter, CLI, configuration, and full Rust gates                                                                     |
 
 - [ ] **Step 3: Update every rc-baseline row and rerun its exact proof.** No stale
       SHA or prior pass satisfies the gate.

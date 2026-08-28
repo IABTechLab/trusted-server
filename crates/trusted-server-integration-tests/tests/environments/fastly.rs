@@ -1,3 +1,5 @@
+#[cfg(feature = "aps-runner-proxy")]
+use crate::common::config::aps_runner_proxy_app_config_envelope;
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult,
 };
@@ -173,6 +175,10 @@ impl FastlyViceroy {
         let mut config: toml::Value = toml::from_str(&source)
             .change_context(TestError::RuntimeSpawn)
             .attach("failed to parse generated Viceroy config")?;
+        config["local_server"]["config_stores"]["trusted_server_config"]["contents"]["trusted_server_config"] =
+            toml::Value::String(aps_runner_proxy_app_config_envelope(
+                crate::common::runtime::origin_port(),
+            )?);
         let backends = config
             .get_mut("local_server")
             .and_then(toml::Value::as_table_mut)

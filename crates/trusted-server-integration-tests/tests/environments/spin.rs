@@ -1,4 +1,4 @@
-use crate::common::config::integration_app_config_envelope;
+use crate::common::config::aps_runner_proxy_app_config_envelope;
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
@@ -13,6 +13,28 @@ use tempfile::{NamedTempFile, TempDir};
 const APS_RUNNER_PROXY_MANIFEST: &str =
     include_str!("../../fixtures/configs/spin-aps-runner-proxy.toml");
 const WASM_PLACEHOLDER: &str = "__APS_RUNNER_PROXY_WASM__";
+const INTEGRATION_SECRET_VARIABLES: &[(&str, &str)] = &[
+    (
+        "v_trusted_x5fserver_x5fsecrets_v_integration_x5fadmin_x5fpassword",
+        "integration-admin-password-32-bytes-ok",
+    ),
+    (
+        "v_trusted_x5fserver_x5fsecrets_v_integration_x5fproxy_x5fsecret",
+        "integration-test-proxy-secret-32-bytes-ok",
+    ),
+    (
+        "v_trusted_x5fserver_x5fsecrets_v_integration_x5fec_x5fpassphrase",
+        "integration-test-ec-secret-padded-32",
+    ),
+    (
+        "v_trusted_x5fserver_x5fsecrets_v_integration_x5fpartner_x5ftoken_x5falpha",
+        "integration-test-token-alpha-32-bytes-ok",
+    ),
+    (
+        "v_trusted_x5fserver_x5fsecrets_v_integration_x5fpartner_x5ftoken_x5fbravo",
+        "integration-test-token-bravo-32-bytes-ok",
+    ),
+];
 
 pub struct SpinRuntime;
 
@@ -32,7 +54,7 @@ impl RuntimeEnvironment for SpinRuntime {
         fixture_url: &str,
     ) -> TestResult<RuntimeProcess> {
         let port = super::find_available_port()?;
-        let app_config = integration_app_config_envelope(origin_port())?;
+        let app_config = aps_runner_proxy_app_config_envelope(origin_port())?;
         let manifest = generated_manifest(wasm_path)?;
         let state_directory = tempfile::tempdir()
             .change_context(TestError::RuntimeSpawn)
@@ -56,6 +78,9 @@ impl RuntimeEnvironment for SpinRuntime {
             .args(["--listen", &listen])
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        for (name, value) in INTEGRATION_SECRET_VARIABLES {
+            command.args(["--variable", &format!("{name}={value}")]);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
@@ -170,6 +195,12 @@ mod tests {
         );
         assert!(APS_RUNNER_PROXY_MANIFEST.contains("aps_runner_proxy_test_endpoint"));
         assert!(APS_RUNNER_PROXY_MANIFEST.contains("v_trusted_x5fserver_x5fconfig"));
+        for (name, _) in INTEGRATION_SECRET_VARIABLES {
+            assert!(
+                APS_RUNNER_PROXY_MANIFEST.contains(name),
+                "manifest should declare and map `{name}`"
+            );
+        }
         assert!(!APS_RUNNER_PROXY_MANIFEST.contains("https://*:*"));
     }
 }

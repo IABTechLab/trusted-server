@@ -269,7 +269,21 @@ pub struct CreativeOpportunitiesConfig {
     /// How per-request state is delivered. Absent resolves to inline assembly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assembly_mode: Option<AssemblyMode>,
-    /// Origin request headers covered by the shared-template key.
+    /// Request headers the origin varies on, which the shared-template cache key must
+    /// cover.
+    ///
+    /// Operator-stated because a cache **lookup happens before the fetch**, so on a cold
+    /// key the origin's `Vary` is not yet known. See `VarySpec` for why the alternatives
+    /// (two-phase lookup, or storing the list and re-keying) were not taken.
+    ///
+    /// **Unset or empty means no operator-stated header is covered, so any origin
+    /// `Vary` other than structurally covered `Accept-Encoding` disqualifies the
+    /// response.** `Cookie` and `Authorization` may never be configured: their values
+    /// are not reader-neutral template dimensions. This fail-closed default prevents a
+    /// deployment that has not stated what its origin varies on from gaining a shared
+    /// cache by omission.
+    ///
+    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_cache_vary: Option<Vec<String>>,
     /// Safety ceiling for one shared transformed-template cache entry.
@@ -406,6 +420,15 @@ impl CreativeOpportunitiesConfig {
             if names.iter().any(|name| name.eq_ignore_ascii_case("cookie")) {
                 return Err(
                     "template_cache_vary must not include Cookie; shared templates are reader-neutral"
+                        .to_string(),
+                );
+            }
+            if names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("authorization"))
+            {
+                return Err(
+                    "template_cache_vary must not include Authorization; shared templates are keyed on the edge-terminated credential decision, not the header value"
                         .to_string(),
                 );
             }
@@ -1012,10 +1035,12 @@ pub enum AdStackGateName {
     ConsentAllowsAuction,
     /// The global `[auction].enabled` kill switch is on.
     AuctionEnabled,
+    /// The `[creative_opportunities].enabled` template switch is on.
+    AdTemplatesEnabled,
 }
 
 impl AdStackGateName {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::MethodGet,
         Self::Navigation,
         Self::NotPrefetch,
@@ -1023,6 +1048,7 @@ impl AdStackGateName {
         Self::MatchedSlots,
         Self::ConsentAllowsAuction,
         Self::AuctionEnabled,
+        Self::AdTemplatesEnabled,
     ];
 
     fn blocks(self, input: AdStackGateInput) -> bool {
@@ -1034,6 +1060,7 @@ impl AdStackGateName {
             Self::MatchedSlots => !input.matched_slots,
             Self::ConsentAllowsAuction => input.consent_allows_auction == Some(false),
             Self::AuctionEnabled => !input.auction_enabled,
+            Self::AdTemplatesEnabled => !input.ad_templates_enabled,
         }
     }
 }
@@ -1063,6 +1090,11 @@ pub struct AdStackGateInput {
     pub consent_allows_auction: Option<bool>,
     /// The global `[auction].enabled` kill switch.
     pub auction_enabled: bool,
+    /// The `[creative_opportunities].enabled` template switch.
+    ///
+    /// `false` whenever creative opportunities are absent from the
+    /// configuration, so an unconfigured publisher blocks here as well.
+    pub ad_templates_enabled: bool,
 }
 
 /// Result of [`evaluate_ad_stack_gate`]: the three-state expectation plus the
@@ -1092,8 +1124,8 @@ impl AdStackGateResult {
 /// `consent_allows_auction` is `None`.
 ///
 /// Gate polarity mirrors the runtime publisher path: `method_get`, `navigation`,
-/// `matched_slots`, and `auction_enabled` block when `false`; `prefetch` and
-/// `bot` block when `true`.
+/// `matched_slots`, `auction_enabled`, and `ad_templates_enabled` block when
+/// `false`; `prefetch` and `bot` block when `true`.
 #[must_use]
 pub fn evaluate_ad_stack_gate(input: AdStackGateInput) -> AdStackGateResult {
     let known_gate_blocks = !input.method_get
@@ -1102,7 +1134,8 @@ pub fn evaluate_ad_stack_gate(input: AdStackGateInput) -> AdStackGateResult {
         || input.bot
         || !input.matched_slots
         || input.consent_allows_auction == Some(false)
-        || !input.auction_enabled;
+        || !input.auction_enabled
+        || !input.ad_templates_enabled;
     let expected = if known_gate_blocks {
         RuntimeAdStackExpected::No
     } else if input.consent_allows_auction.is_none() {
@@ -1139,6 +1172,7 @@ mod tests {
             matched_slots: true,
             consent_allows_auction: Some(true),
             auction_enabled: true,
+            ad_templates_enabled: true,
         });
 
         assert_eq!(result.expected, RuntimeAdStackExpected::Yes);
@@ -1155,6 +1189,7 @@ mod tests {
             matched_slots: true,
             consent_allows_auction: Some(true),
             auction_enabled: false,
+            ad_templates_enabled: true,
         });
 
         assert_eq!(result.expected, RuntimeAdStackExpected::No);
@@ -1162,6 +1197,32 @@ mod tests {
             result
                 .blocking_gates()
                 .any(|gate| gate == AdStackGateName::AuctionEnabled)
+        );
+    }
+
+    #[test]
+    fn ad_stack_gate_blocks_disabled_ad_templates() {
+        let result = evaluate_ad_stack_gate(AdStackGateInput {
+            method_get: true,
+            navigation: true,
+            prefetch: false,
+            bot: false,
+            matched_slots: true,
+            consent_allows_auction: Some(true),
+            auction_enabled: true,
+            ad_templates_enabled: false,
+        });
+
+        assert_eq!(
+            result.expected,
+            RuntimeAdStackExpected::No,
+            "a disabled [creative_opportunities].enabled switch should block the ad stack"
+        );
+        assert!(
+            result
+                .blocking_gates()
+                .any(|gate| gate == AdStackGateName::AdTemplatesEnabled),
+            "the template switch should be named as the blocking gate"
         );
     }
 
@@ -1175,6 +1236,7 @@ mod tests {
             matched_slots: true,
             consent_allows_auction: None,
             auction_enabled: true,
+            ad_templates_enabled: true,
         });
 
         assert_eq!(result.expected, RuntimeAdStackExpected::Unknown);
@@ -1184,7 +1246,7 @@ mod tests {
     // input combination, `expected == Yes` must equal the legacy all-AND boolean.
     #[test]
     fn ad_stack_gate_with_known_consent_matches_legacy_boolean() {
-        for bits in 0u8..128 {
+        for bits in 0u16..256 {
             let input = AdStackGateInput {
                 method_get: bits & 1 != 0,
                 navigation: bits & 2 != 0,
@@ -1193,6 +1255,7 @@ mod tests {
                 matched_slots: bits & 16 != 0,
                 consent_allows_auction: Some(bits & 32 != 0),
                 auction_enabled: bits & 64 != 0,
+                ad_templates_enabled: bits & 128 != 0,
             };
             // Legacy semantics: all positive gates true, both negative gates false.
             let legacy = input.method_get
@@ -1201,7 +1264,8 @@ mod tests {
                 && !input.bot
                 && input.matched_slots
                 && input.consent_allows_auction == Some(true)
-                && input.auction_enabled;
+                && input.auction_enabled
+                && input.ad_templates_enabled;
             let got = evaluate_ad_stack_gate(input).expected == RuntimeAdStackExpected::Yes;
             assert_eq!(got, legacy, "gate mismatch for bits={bits}");
         }
@@ -1209,7 +1273,7 @@ mod tests {
 
     #[test]
     fn ad_stack_gate_with_unknown_consent_matches_known_boolean_gates() {
-        for bits in 0u8..64 {
+        for bits in 0u8..128 {
             let input = AdStackGateInput {
                 method_get: bits & 1 != 0,
                 navigation: bits & 2 != 0,
@@ -1218,13 +1282,15 @@ mod tests {
                 matched_slots: bits & 16 != 0,
                 consent_allows_auction: None,
                 auction_enabled: bits & 32 != 0,
+                ad_templates_enabled: bits & 64 != 0,
             };
             let known_gates_pass = input.method_get
                 && input.navigation
                 && !input.prefetch
                 && !input.bot
                 && input.matched_slots
-                && input.auction_enabled;
+                && input.auction_enabled
+                && input.ad_templates_enabled;
             let expected = if known_gates_pass {
                 RuntimeAdStackExpected::Unknown
             } else {
@@ -2441,6 +2507,21 @@ mod tests {
             .validate_runtime()
             .expect_err("per-cookie templates violate the reader-neutral shared-template contract");
         assert!(err.contains("Cookie"), "unexpected error: {err}");
+
+        for name in ["Authorization", "aUtHoRiZaTiOn"] {
+            let authorization_key: CreativeOpportunitiesConfig = toml::from_str(&format!(
+                r#"
+                    enabled = true
+                    gam_network_id = "99999"
+                    template_cache_vary = ["{name}"]
+                "#,
+            ))
+            .expect("shape should deserialize before runtime validation");
+            let err = authorization_key
+                .validate_runtime()
+                .expect_err("authorization must not enter shared-template cache keys");
+            assert!(err.contains("Authorization"), "unexpected error: {err}");
+        }
     }
 
     #[test]

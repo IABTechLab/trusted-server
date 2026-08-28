@@ -1376,23 +1376,30 @@ impl Hooks for TrustedServerApp {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[cfg(feature = "aps-runner-proxy-integration-test")]
     use super::dispatch_reserved_for_state;
     use super::{
-        AppState, EnvConfig, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_PATH, RuntimeStoreConfig,
-        TrustedServerApp, build_state_from_settings, startup_error_router,
+        AppState, AuctionDispatch, EcContext, EdgeCacheHeader, EnvConfig, HandlerFuture,
+        NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_PATH, RuntimeStoreConfig, TrustedServerApp,
+        build_orchestrator_with_plan, build_per_request_services, build_state_from_settings,
+        compile_auction_plan, handle_publisher_request, publisher_response_into_streaming_response,
+        startup_error_router,
     };
     use base64::Engine as _;
     use bytes::Bytes;
     use edgezero_core::app::Hooks as _;
     use edgezero_core::body::Body;
+    use edgezero_core::context::RequestContext;
     use edgezero_core::http::{Method, Response, StatusCode, header, request_builder};
     use edgezero_core::key_value_store::NoopKvStore;
+    use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::Mutex;
 
     use error_stack::Report;
     use futures::executor::block_on;
@@ -1407,22 +1414,53 @@ mod tests {
     use trusted_server_core::platform::{
         ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, PlatformHttpClient,
         PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
-        PlatformSelectResult, RuntimeServices,
+        PlatformSelectResult, PlatformTemplateCache, PlatformTemplateCacheReservation,
+        RuntimeServices, TemplateCacheError, TemplateCacheKey, TemplateCacheLookup,
+        TemplateCacheMiss, TemplateCacheReservation, TemplateEntry, TemplateMetadata,
     };
     use trusted_server_core::settings::Settings;
 
     #[test]
-    fn hooks_expose_the_manifest_store_metadata_used_by_fastly_runtime_mapping() {
+    fn hooks_store_metadata_matches_edgezero_manifest() {
+        let manifest: toml::Value = toml::from_str(include_str!("../../../edgezero.toml"))
+            .expect("should parse edgezero manifest");
+        let manifest_stores = manifest
+            .get("stores")
+            .and_then(toml::Value::as_table)
+            .expect("manifest should declare stores");
         let metadata = TrustedServerApp::stores();
 
-        assert_eq!(
-            metadata.config.map(|store| store.default),
-            Some("trusted_server_config")
-        );
-        assert_eq!(
-            metadata.secrets.map(|store| store.default),
-            Some("trusted_server_secrets")
-        );
+        for (kind, runtime_store) in [
+            (
+                "config",
+                metadata.config.expect("should declare config stores"),
+            ),
+            ("kv", metadata.kv.expect("should declare KV stores")),
+            (
+                "secrets",
+                metadata.secrets.expect("should declare secret stores"),
+            ),
+        ] {
+            let manifest_store = manifest_stores
+                .get(kind)
+                .and_then(toml::Value::as_table)
+                .unwrap_or_else(|| panic!("manifest should declare {kind} stores"));
+            let manifest_default = manifest_store
+                .get("default")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| panic!("manifest {kind} stores should declare a default"));
+            let manifest_ids = manifest_store
+                .get("ids")
+                .and_then(toml::Value::as_array)
+                .unwrap_or_else(|| panic!("manifest {kind} stores should declare ids"))
+                .iter()
+                .map(toml::Value::as_str)
+                .collect::<Option<Vec<_>>>()
+                .unwrap_or_else(|| panic!("manifest {kind} store ids should be strings"));
+
+            assert_eq!(runtime_store.default, manifest_default);
+            assert_eq!(runtime_store.ids, manifest_ids);
+        }
     }
 
     #[test]
@@ -1583,6 +1621,36 @@ mod tests {
     fn test_router() -> RouterService {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         TrustedServerApp::routes_for_state(&state)
+    }
+
+    #[test]
+    fn per_request_services_register_the_fastly_template_assembler() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = RequestContext::new(
+            empty_request(Method::GET, "/article"),
+            PathParams::default(),
+        );
+
+        let services = build_per_request_services(&state, &context);
+        let template = format!(
+            "<html><body>article{}</body></html>",
+            trusted_server_core::publisher::AD_ASSEMBLY_SEAM
+        );
+        let fragment = b"<script>reader state</script>";
+        let assembled = services
+            .template_assembler()
+            .assemble(template.as_bytes(), fragment)
+            .expect("Fastly services should provide ESI assembly");
+
+        assert_eq!(
+            assembled,
+            template
+                .replace(
+                    trusted_server_core::publisher::AD_ASSEMBLY_SEAM,
+                    std::str::from_utf8(fragment).expect("fragment should be UTF-8")
+                )
+                .into_bytes()
+        );
     }
 
     #[cfg(feature = "aps-runner-proxy-integration-test")]
@@ -2814,6 +2882,298 @@ mod tests {
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(ClientInfo::default())
             .build()
+    }
+
+    #[derive(Default)]
+    struct DispatchTemplateCache {
+        entries: Arc<Mutex<HashMap<String, TemplateEntry>>>,
+    }
+
+    struct DispatchTemplateReservation {
+        entries: Arc<Mutex<HashMap<String, TemplateEntry>>>,
+        key: TemplateCacheKey,
+    }
+
+    impl PlatformTemplateCacheReservation for DispatchTemplateReservation {
+        fn insert(
+            self: Box<Self>,
+            metadata: &TemplateMetadata,
+            body: Vec<u8>,
+            _max_age: Duration,
+        ) -> Result<(), TemplateCacheError> {
+            self.entries.lock().expect("should lock entries").insert(
+                self.key.to_cache_key(),
+                TemplateEntry {
+                    metadata: metadata.clone(),
+                    body,
+                },
+            );
+            Ok(())
+        }
+
+        fn cancel(self: Box<Self>) -> Result<(), TemplateCacheError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformTemplateCache for DispatchTemplateCache {
+        async fn lookup_or_reserve(
+            &self,
+            key: &TemplateCacheKey,
+        ) -> Result<TemplateCacheLookup, TemplateCacheError> {
+            if let Some(entry) = self
+                .entries
+                .lock()
+                .expect("should lock entries")
+                .get(&key.to_cache_key())
+                .cloned()
+            {
+                return Ok(TemplateCacheLookup::Hit(entry));
+            }
+            Ok(TemplateCacheLookup::Reserved(
+                TemplateCacheReservation::new(Box::new(DispatchTemplateReservation {
+                    entries: Arc::clone(&self.entries),
+                    key: key.clone(),
+                })),
+            ))
+        }
+
+        async fn get(&self, key: &TemplateCacheKey) -> Result<TemplateEntry, TemplateCacheMiss> {
+            self.entries
+                .lock()
+                .expect("should lock entries")
+                .get(&key.to_cache_key())
+                .cloned()
+                .ok_or(TemplateCacheMiss::NotFound)
+        }
+
+        async fn put(
+            &self,
+            key: &TemplateCacheKey,
+            metadata: &TemplateMetadata,
+            body: Vec<u8>,
+            _max_age: Duration,
+        ) -> Result<(), TemplateCacheError> {
+            self.entries.lock().expect("should lock entries").insert(
+                key.to_cache_key(),
+                TemplateEntry {
+                    metadata: metadata.clone(),
+                    body,
+                },
+            );
+            Ok(())
+        }
+
+        async fn purge_url(&self, key: &TemplateCacheKey) -> Result<(), TemplateCacheError> {
+            self.entries
+                .lock()
+                .expect("should lock entries")
+                .remove(&key.to_cache_key());
+            Ok(())
+        }
+
+        async fn purge_all(&self) -> Result<(), TemplateCacheError> {
+            self.entries.lock().expect("should lock entries").clear();
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct DispatchOriginClient {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformHttpClient for DispatchOriginClient {
+        async fn send(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let response = edgezero_core::http::response_builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .header(header::CACHE_CONTROL, "public, max-age=300")
+                .body(Body::from(
+                    b"<html><head></head><body>origin</body></html>".as_ref(),
+                ))
+                .map_err(|_| Report::new(PlatformError::HttpClient))?;
+            Ok(PlatformResponse::new(response))
+        }
+
+        async fn send_async(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        async fn select(
+            &self,
+            _pending_requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    #[test]
+    fn dispatch_edge_authenticated_esi_request_stores_then_hits_template() {
+        let settings = Arc::new(
+            Settings::from_toml(
+                r#"
+                    [[handlers]]
+                    path = "^/secure"
+                    username = "user"
+                    password = "pass"
+
+                    [[handlers]]
+                    path = "^/_ts/admin"
+                    username = "admin"
+                    password = "admin-pass"
+
+                    [publisher]
+                    domain = "test-publisher.com"
+                    cookie_domain = ".test-publisher.com"
+                    origin_url = "https://origin.test-publisher.com"
+                    proxy_secret = "unit-test-proxy-secret"
+
+                    [ec]
+                    passphrase = "test-secret-key-32-bytes-minimum"
+
+                    [auction]
+                    enabled = true
+
+                    [creative_opportunities]
+                    enabled = true
+                    gam_network_id = "99999"
+                    assembly_mode = "esi"
+
+                    [[creative_opportunities.slot]]
+                    id = "test-slot"
+                    page_patterns = ["/secure/article"]
+                    formats = [{ width = 728, height = 90 }]
+                "#,
+            )
+            .expect("should parse dispatch cache settings"),
+        );
+        let cache = Arc::new(DispatchTemplateCache::default());
+        let origin = Arc::new(DispatchOriginClient::default());
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
+            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
+            .template_cache(Arc::clone(&cache) as Arc<dyn PlatformTemplateCache>)
+            .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
+            .backend(Arc::new(FixedBackend))
+            .http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>)
+            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .client_info(ClientInfo::default())
+            .build();
+        let plan = Arc::new(compile_auction_plan(&settings).expect("should compile auction plan"));
+        let registry = Arc::new(
+            IntegrationRegistry::with_plan(&settings, Arc::clone(&plan))
+                .expect("should build integration registry"),
+        );
+        let orchestrator = Arc::new(
+            build_orchestrator_with_plan(plan, &settings)
+                .expect("should build auction orchestrator"),
+        );
+
+        let handler = {
+            let settings = Arc::clone(&settings);
+            let services = services.clone();
+            let registry = Arc::clone(&registry);
+            let orchestrator = Arc::clone(&orchestrator);
+            move |ctx: RequestContext| {
+                let settings = Arc::clone(&settings);
+                let services = services.clone();
+                let registry = Arc::clone(&registry);
+                let orchestrator = Arc::clone(&orchestrator);
+                Box::pin(async move {
+                    let request = ctx.into_request();
+                    let method = request.method().clone();
+                    let mut ec_context =
+                        match EcContext::read_from_request(&settings, &request, &services) {
+                            Ok(context) => context,
+                            Err(report) => return Ok(super::http_error(&report)),
+                        };
+                    let response = match handle_publisher_request(
+                        &settings,
+                        &services,
+                        None,
+                        &mut ec_context,
+                        AuctionDispatch {
+                            orchestrator: &orchestrator,
+                            slots: settings.creative_opportunity_slots(),
+                            registry: None,
+                        },
+                        request,
+                        EdgeCacheHeader::SurrogateControl,
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(report) => return Ok(super::http_error(&report)),
+                    };
+                    match publisher_response_into_streaming_response(
+                        response,
+                        &method,
+                        Arc::clone(&settings),
+                        &registry,
+                        orchestrator,
+                        services,
+                    )
+                    .await
+                    {
+                        Ok(response) => Ok(response),
+                        Err(report) => Ok(super::http_error(&report)),
+                    }
+                }) as HandlerFuture
+            }
+        };
+        let router = RouterService::builder()
+            .middleware(crate::middleware::AuthMiddleware::new(Arc::clone(
+                &settings,
+            )))
+            .route("/secure/article", Method::GET, handler)
+            .build();
+        let authorized_request = || {
+            request_builder()
+                .method(Method::GET)
+                .uri("https://test-publisher.com/secure/article")
+                .header(header::HOST, "test-publisher.com")
+                .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+                .header("sec-fetch-dest", "document")
+                .header("sec-fetch-mode", "navigate")
+                .body(Body::empty())
+                .expect("should build authorized navigation")
+        };
+
+        let cold = route(&router, authorized_request());
+        assert_eq!(
+            cold.headers()
+                .get("x-ts-template-cache")
+                .and_then(|value| value.to_str().ok()),
+            Some("miss-stored")
+        );
+        block_on(cold.into_body().into_bytes_bounded(1024 * 1024))
+            .expect("should drain cold response");
+
+        let warm = route(&router, authorized_request());
+        assert_eq!(
+            warm.headers()
+                .get("x-ts-template-cache")
+                .and_then(|value| value.to_str().ok()),
+            Some("hit")
+        );
+        block_on(warm.into_body().into_bytes_bounded(1024 * 1024))
+            .expect("should drain warm response");
+        assert_eq!(
+            origin.calls.load(Ordering::Relaxed),
+            1,
+            "the warm dispatch must not fetch the publisher origin"
+        );
     }
 
     #[test]

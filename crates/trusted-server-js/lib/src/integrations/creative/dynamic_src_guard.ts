@@ -1,6 +1,7 @@
 import { log } from '../../core/log';
 import { createMutationScheduler, type MutationScheduler } from '../../shared/scheduler';
 
+import type { ProxySignOutcome } from './proxy_sign';
 import type { CreativeGuardHandle } from './startup';
 
 type ElementWithSrc = Element & { src: string };
@@ -30,7 +31,7 @@ export interface DynamicSrcProxyOptions<E extends ElementWithSrc> {
   resourceName: string;
   logPrefix: string;
   shouldProxy(raw: string, element: E): boolean;
-  signProxy(raw: string, element: E): Promise<string | null>;
+  signProxy(raw: string, element: E): Promise<ProxySignOutcome>;
 }
 
 function sameDescriptor(
@@ -179,7 +180,7 @@ export function createDynamicSrcProxy<E extends ElementWithSrc>(
       }
 
       log.info(`${options.logPrefix}: signing ${options.resourceName} ${attr}`, { raw });
-      let signing: Promise<string | null>;
+      let signing: Promise<ProxySignOutcome>;
       try {
         signing = options.signProxy(raw, element);
       } catch (error) {
@@ -192,13 +193,19 @@ export function createDynamicSrcProxy<E extends ElementWithSrc>(
         return;
       }
       void signing
-        .then((signed) => {
+        .then((result) => {
           if (!active) return;
           const current = assignments.get(element);
           if (!current || current.requestId !== requestId) return;
           assignments.delete(element);
-          const finalUrl = signed || raw;
-          if (signed) {
+          if (result.outcome === 'blocked') {
+            log.warn(`${options.logPrefix}: blocked dynamic ${options.resourceName} ${attr}`, {
+              raw,
+            });
+            return;
+          }
+          const finalUrl = result.outcome === 'signed' ? result.href : raw;
+          if (result.outcome === 'signed') {
             log.info(`${options.logPrefix}: proxied dynamic ${options.resourceName}`, {
               base: raw,
               finalUrl,

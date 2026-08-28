@@ -58,7 +58,7 @@ fn audit_ad_templates_generate_parses_scroll() {
 - [ ] **Step 2: Run the focused test and verify it fails**
 
 ```bash
-HOST_TARGET="$(rustc -vV | awk '/host:/ { print $2 })"
+HOST_TARGET="$(rustc -vV | awk '/host:/ { print $2 }')"
 cargo test --package trusted-server-cli --target "$HOST_TARGET" audit_ad_templates_generate_parses_scroll
 ```
 
@@ -88,7 +88,7 @@ contextual-warning test.
 - [ ] **Step 4: Run parsing/default tests**
 
 ```bash
-HOST_TARGET="$(rustc -vV | awk '/host:/ { print $2 })"
+HOST_TARGET="$(rustc -vV | awk '/host:/ { print $2 }')"
 cargo test --package trusted-server-cli --target "$HOST_TARGET" audit_generate_subcommands_use_generation_settle_defaults
 cargo test --package trusted-server-cli --target "$HOST_TARGET" audit_ad_templates_generate_parses_scroll
 ```
@@ -149,7 +149,7 @@ lazy-slot fixtures are both covered.
 - [ ] **Step 2: Run the fixture and verify it fails**
 
 ```bash
-HOST_TARGET="$(rustc -vV | awk '/host:/ { print $2 })"
+HOST_TARGET="$(rustc -vV | awk '/host:/ { print $2 }')"
 TS_AUDIT_BROWSER_TESTS=1 cargo test --package trusted-server-cli --target "$HOST_TARGET" collects_lazy_gpt_slot_only_when_scroll_is_enabled -- --ignored --test-threads=1
 ```
 
@@ -188,7 +188,7 @@ settle timeout is a warning, not a discarded page.
 - [ ] **Step 4: Run browser tests**
 
 ```bash
-HOST_TARGET="$(rustc -vV | awk '/host:/ { print $2 })"
+HOST_TARGET="$(rustc -vV | awk '/host:/ { print $2 }')"
 cargo test --package trusted-server-cli --target "$HOST_TARGET" commands::audit::browser::tests::
 TS_AUDIT_BROWSER_TESTS=1 cargo test --package trusted-server-cli --target "$HOST_TARGET" collects_lazy_gpt_slot_only_when_scroll_is_enabled -- --ignored --test-threads=1
 ```
@@ -223,7 +223,7 @@ only diff/summary content, and preserved slots remain in candidate TOML.
 - [ ] **Step 2: Run focused tests and verify they fail**
 
 ```bash
-HOST_TARGET="$(rustc -vV | awk '/host:/ { print $2 })"
+HOST_TARGET="$(rustc -vV | awk '/host:/ { print $2 }')"
 cargo test --package trusted-server-cli --target "$HOST_TARGET" merge_reports_preserved_unobserved_slots
 cargo test --package trusted-server-cli --target "$HOST_TARGET" update_slots_reports_preserved_unobserved_slots
 ```
@@ -256,9 +256,9 @@ append their count and comma-separated IDs. End with:
 
 ```rust
 let follow_up = if request.scroll {
-    "Re-run with broader page/profile coverage; use --replace only to intentionally prune them."
+    "Re-run with broader page/profile coverage; `--replace` prunes them but also discards every hand-written field on the slots the run did rediscover."
 } else {
-    "Re-run with broader coverage or --scroll; use --replace only to intentionally prune them."
+    "Re-run with broader coverage or --scroll; `--replace` prunes them but also discards every hand-written field on the slots the run did rediscover."
 };
 ```
 
@@ -268,7 +268,7 @@ sanitization/output boundary.
 - [ ] **Step 5: Run merge and command tests**
 
 ```bash
-HOST_TARGET="$(rustc -vV | awk '/host:/ { print $2 })"
+HOST_TARGET="$(rustc -vV | awk '/host:/ { print $2 }')"
 cargo test --package trusted-server-cli --target "$HOST_TARGET" commands::audit::generate::slot_toml::tests::merge_
 cargo test --package trusted-server-cli --target "$HOST_TARGET" update_slots_reports_preserved_unobserved_slots
 ```

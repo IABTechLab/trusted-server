@@ -303,6 +303,26 @@ test.describe("TSJS hard-cutover runtime", () => {
         pageErrors,
       }),
     ).toMatchObject({ state: "kernel" });
+    await expect
+      .poll(() => [...allRequests])
+      .toEqual([
+        "https://runtime.test/first-display-owner",
+        firstDisplayUrl,
+        runtimeUrl,
+        ...deferredUrls,
+      ]);
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (
+              window as unknown as {
+                __deferredRegistrationAttack: { attempted: boolean };
+              }
+            ).__deferredRegistrationAttack.attempted,
+        ),
+      )
+      .toBe(true);
 
     const observation = await page.evaluate((slotId) => {
       const browserWindow = window as unknown as {
@@ -374,12 +394,6 @@ test.describe("TSJS hard-cutover runtime", () => {
     }, FIRST_DISPLAY_SLOT);
 
     expect(firstDisplayRequests).toEqual([firstDisplayUrl]);
-    expect(allRequests).toEqual([
-      "https://runtime.test/first-display-owner",
-      firstDisplayUrl,
-      runtimeUrl,
-      ...deferredUrls,
-    ]);
     expect(
       allRequests.filter((url) => /tsjs-render_owner_initial/u.test(url)),
     ).toEqual([]);

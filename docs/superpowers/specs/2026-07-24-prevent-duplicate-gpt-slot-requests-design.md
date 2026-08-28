@@ -52,11 +52,14 @@ request an existing slot only after it atomically claims an untouched slot.
 
 Publisher auction claims use unique, expiring registration tokens. The matching
 callback moves only its token to delivery-pending and attaches returned ad IDs.
-Overlapping auctions cannot clear each other's tokens. If TS claimed first, the GPT
-refresh wrapper filters one correlated losing publisher delivery and restores the TS
-targeting snapshot. It forwards every unaffected slot and the original refresh options
-exactly once. The one-shot state is then consumed, so later publisher refresh auctions
-remain eligible.
+Overlapping auctions cannot clear each other's tokens. Exact ad-ID delivery consumes
+only its matching registration. A code-only delivery consumes a registration only
+when exactly one current candidate matches; ambiguous ordinary deliveries run a new
+auction, while ambiguous TS-owned suppressing deliveries fail closed without deleting
+their tombstones. If TS claimed first, the GPT refresh wrapper filters one correlated
+losing publisher delivery and restores the TS targeting snapshot. It forwards every
+unaffected slot and the original refresh options exactly once. The one-shot state is
+then consumed, so later publisher refresh auctions remain eligible.
 
 If a publisher claim expires without a GPT request, `adInit()` retries only that slot
 after checking the navigation generation, DOM element identity, and ownership again.

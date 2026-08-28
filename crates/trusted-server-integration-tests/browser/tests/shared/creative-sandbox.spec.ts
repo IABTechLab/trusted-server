@@ -113,26 +113,6 @@ test.describe("Sandboxed creative iframe", () => {
     await routeRuntimeTsjsFixture(page, CREATIVE_FIXTURE);
     const bundleUrl = new URL(CREATIVE_FIXTURE.runtimeSrc, origin).toString();
 
-    // Mirrors the srcdoc document the client builds: the first-party parent
-    // stamps its own origin ahead of any creative markup, then the runtime,
-    // then the creative — here preceded by hostile markup attempting to move
-    // the stamp.
-    const creativeDocument = `<!DOCTYPE html>
-<html>
-  <head>
-    <script>
-      Object.defineProperty(window, '__tsCreativeOrigin', {
-        value: '${origin}', writable: false, configurable: false, enumerable: false,
-      });
-    </script>
-  </head>
-  <body>
-    ${HOSTILE_STAMP_OVERWRITE}
-    <script src="${bundleUrl}"></script>
-    <a id="creative-link" href="${signedClick}" data-tsclick="${signedClick}">ad</a>
-  </body>
-</html>`;
-
     const rebuildResponse = page.waitForResponse(
       (response) => response.url().includes("/first-party/proxy-rebuild"),
       { timeout: 15_000 },

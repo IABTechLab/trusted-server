@@ -2702,6 +2702,22 @@ pub(crate) fn is_prefetch_request(req: &Request<EdgeBody>) -> bool {
     header("sec-purpose") || header("purpose")
 }
 
+/// Returns whether an `Authorization` header must bypass shared-template use.
+///
+/// Only the exact single value already validated by Trusted Server's edge-auth
+/// middleware is reader-neutral. Missing markers, repeated values, and any
+/// post-auth replacement fail closed.
+fn request_authorization_disqualifies(req: &Request<EdgeBody>) -> bool {
+    match req.headers().get_all(header::AUTHORIZATION).iter().count() {
+        0 => false,
+        1 => req
+            .extensions()
+            .get::<crate::auth::EdgeTerminatedAuthorization>()
+            .is_none_or(|marker| !marker.matches(req.headers())),
+        _ => true,
+    }
+}
+
 /// Returns true only when the publisher request should run the full
 /// server-side ad stack: auction dispatch plus initial ad-slot injection.
 fn is_server_side_ad_eligible_navigation(
@@ -3714,25 +3730,10 @@ pub async fn handle_publisher_request(
         }
     );
 
-    // Recorded before the request is consumed by the origin send: the template cache gate
-    // below needs it, and an authorized response must never become a shared
-    // template.
-    //
-    // A credential this edge already terminated is exempt. Basic auth runs as
-    // middleware ahead of routing, so reaching here on a gated path means the same
-    // handler already validated the request; every reader that can look the template
-    // up has satisfied that same credential. Without the marker the credential is
-    // pass-through to the origin and still disqualifies. See
-    // [`crate::auth::EdgeTerminatedAuthorization`].
-    let authorization_value_count = req.headers().get_all(header::AUTHORIZATION).iter().count();
-    let request_had_authorization = match authorization_value_count {
-        0 => false,
-        1 => req
-            .extensions()
-            .get::<crate::auth::EdgeTerminatedAuthorization>()
-            .is_none(),
-        _ => true,
-    };
+    // Capture cache eligibility before the origin send consumes the request. One
+    // unchanged marked Authorization value passed edge auth; unmarked, replaced,
+    // or repeated values remain pass-through and bypass sharing.
+    let authorization_disqualifies = request_authorization_disqualifies(&req);
     let request_had_cookie = req.headers().contains_key(header::COOKIE);
     // Whether carrying a cookie is itself disqualifying. Computed once and used for both
     // the lookup and the store, so the two cannot drift apart.
@@ -3778,7 +3779,7 @@ pub async fn handle_publisher_request(
     let request_can_use_shared_template = method_is_cacheable
         && matches!(assembly_mode, AssemblyMode::Esi)
         && !request_host.is_empty()
-        && !request_had_authorization
+        && !authorization_disqualifies
         && !cookie_disqualifies
         && !request_requires_origin
         && reader_supports_assembly;
@@ -4029,7 +4030,7 @@ pub async fn handle_publisher_request(
     let mut template_cache_key = template_cache_reservation.and_then(|reservation| {
         match c2_cache_ttl(
             assembly_mode,
-            request_had_authorization,
+            authorization_disqualifies,
             cookie_disqualifies,
             response.status(),
             &gate_content_type,
@@ -4816,7 +4817,7 @@ impl C2CachePolicy {
 #[cfg(test)]
 pub(crate) fn c2_bypass_reason(
     mode: AssemblyMode,
-    request_had_authorization: bool,
+    authorization_disqualifies: bool,
     cookie_disqualifies: bool,
     status: StatusCode,
     content_type: &str,
@@ -4825,7 +4826,7 @@ pub(crate) fn c2_bypass_reason(
 ) -> Option<C2BypassReason> {
     c2_cache_ttl(
         mode,
-        request_had_authorization,
+        authorization_disqualifies,
         cookie_disqualifies,
         status,
         content_type,
@@ -5126,7 +5127,7 @@ fn response_csp_nonce(policy_headers: &[(String, String)]) -> Option<String> {
 
 fn c2_cache_ttl(
     mode: AssemblyMode,
-    request_had_authorization: bool,
+    authorization_disqualifies: bool,
     cookie_disqualifies: bool,
     status: StatusCode,
     content_type: &str,
@@ -5136,7 +5137,7 @@ fn c2_cache_ttl(
     if matches!(mode, AssemblyMode::Inline) {
         return Err(C2BypassReason::InlineMode);
     }
-    if request_had_authorization {
+    if authorization_disqualifies {
         return Err(C2BypassReason::AuthorizedRequest);
     }
     if cookie_disqualifies {
@@ -7638,6 +7639,56 @@ mod tests {
                 "ambiguous/disjoint policies must not choose an arbitrary nonce: {policies:?}"
             );
         }
+    }
+
+    #[test]
+    fn shared_template_authorization_requires_one_unchanged_edge_validated_value() {
+        let no_authorization = HttpRequest::builder()
+            .uri("https://publisher.example/article")
+            .body(EdgeBody::empty())
+            .expect("should build request without authorization");
+        assert!(!request_authorization_disqualifies(&no_authorization));
+
+        let pass_through = HttpRequest::builder()
+            .uri("https://publisher.example/article")
+            .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .body(EdgeBody::empty())
+            .expect("should build pass-through authorization request");
+        assert!(request_authorization_disqualifies(&pass_through));
+
+        let mut edge_validated = HttpRequest::builder()
+            .uri("https://publisher.example/article")
+            .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .body(EdgeBody::empty())
+            .expect("should build edge-validated authorization request");
+        edge_validated
+            .extensions_mut()
+            .insert(crate::auth::EdgeTerminatedAuthorization::for_test(
+                "Basic dXNlcjpwYXNz",
+            ));
+        assert!(!request_authorization_disqualifies(&edge_validated));
+
+        edge_validated.headers_mut().insert(
+            header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer publisher-origin-credential"),
+        );
+        assert!(request_authorization_disqualifies(&edge_validated));
+
+        let mut repeated = HttpRequest::builder()
+            .uri("https://publisher.example/article")
+            .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .body(EdgeBody::empty())
+            .expect("should build repeated authorization request");
+        repeated.headers_mut().append(
+            header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer publisher-origin-credential"),
+        );
+        repeated
+            .extensions_mut()
+            .insert(crate::auth::EdgeTerminatedAuthorization::for_test(
+                "Basic dXNlcjpwYXNz",
+            ));
+        assert!(request_authorization_disqualifies(&repeated));
     }
 
     mod c2_gate_tests {

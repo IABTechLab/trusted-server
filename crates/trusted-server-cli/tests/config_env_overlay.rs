@@ -48,11 +48,20 @@ fn migrated_project() -> MigratedProject {
         .parse::<DocumentMut>()
         .expect("should parse legacy integration config");
     // EdgeZero environment overlays cannot create missing TOML leaves, so a
-    // migrated config must carry every leaf that an environment variable can
-    // override.
+    // migrated config must carry every leaf whose environment override is
+    // expected to take effect.
     document["auction"]["rewrite_creatives"] = value(true);
     document["auction"]["sanitize_creatives"] = value(false);
     document["integrations"]["gpt"]["gam_attribution_enabled"] = value(false);
+    document["creative_opportunities"]["enabled"] = value(true);
+    document["creative_opportunities"]["gam_network_id"] = value("123456789");
+    document["auction"]["providers"]["pbs-main"] = toml_edit::table();
+    document["auction"]["providers"]["pbs-main"]["protocol"] = value("openrtb-2.6");
+    document["auction"]["providers"]["pbs-main"]["profile"] = value("standard");
+    document["auction"]["providers"]["pbs-main"]["endpoint"] =
+        value("https://original.example/openrtb2/auction");
+    document["auction"]["bidders"]["example-bidder"] = toml_edit::table();
+    document["auction"]["bidders"]["example-bidder"]["provider"] = value("pbs-main");
     fs::write(&config_path, document.to_string()).expect("should write migrated config");
     fs::write(&manifest_path, MANIFEST).expect("should write test manifest");
     MigratedProject {

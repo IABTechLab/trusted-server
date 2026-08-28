@@ -6,17 +6,20 @@
   merge-blocking pre-action transfer remediation
 - **Date:** 2026-08-04
 - **Implementation baseline:** fetched `origin/rc/202608` at
-  `985ff22987d80cc729f45f702e0c3548e429b2cf` on 2026-08-28. The implementation
+  `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` on 2026-08-28. The implementation
   branch is created directly from that commit. Earlier feature and merge SHAs are
   historical review references only; their approved changes were replayed and
   reconciled onto this base, and they are not parents or implementation authority.
-  `origin/main` at the same fetch was
-  `2e85a1cdcfe3d23814bab5b2215dd6b096f871eb` and is already an ancestor of the
-  rc baseline; it is not a competing implementation authority.
+  `main` is not a competing implementation authority.
 - **Final release-branch refresh:** fetched `origin/rc/202608` at
-  `985ff22987d80cc729f45f702e0c3548e429b2cf` on 2026-08-28. The final overlap
+  `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` on 2026-08-28. The final overlap
   audit and performance comparison use that exact tip. It already contains the
   `main` ancestry selected by the release branch, so `main` is not merged separately.
+  The refresh includes the config-first auction-provider contract, strict
+  first-party proxy allowlist enforcement, edge-validated Basic-auth template
+  eligibility, and the latest first-impression arbitration repairs. Their behavior
+  is preserved by the final owners named in the implementation plan; their retired
+  GPT, Prebid, first-impression, and publisher-native APS mechanics are not restored.
 - **Retired-branch evidence:** the immutable historical snapshot
   `905984e62a0858c53d9f0ff6dd3a1bf190cf311d` from retired `rc/july` is only a
   finite TSJS concept-gap checklist. It is not a baseline, merge source, API

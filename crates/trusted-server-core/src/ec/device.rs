@@ -33,6 +33,9 @@ pub struct DeviceSignals {
     /// Coarse OS family: `"mac"`, `"windows"`, `"ios"`, `"android"`,
     /// `"linux"`.
     pub platform_class: Option<String>,
+    /// Coarse browser family from the UA: `"chrome"`, `"safari"`,
+    /// `"firefox"`, `"edge"`, `"opera"`; `None` when unrecognized.
+    pub browser_family: Option<String>,
     /// SHA256 prefix (12 hex chars) of the raw H2 SETTINGS string.
     pub h2_fp_hash: Option<String>,
     /// `true` = known browser, `false` = known bot, `None` = unknown.
@@ -50,6 +53,7 @@ impl DeviceSignals {
         let is_mobile = parse_is_mobile(ua);
         let ja4_class = ja4.and_then(extract_ja4_section1);
         let platform_class = parse_platform_class(ua);
+        let browser_family = parse_browser_family(ua);
         let h2_fp_hash = h2_fp.map(compute_h2_fp_hash);
         let known_browser = evaluate_known_browser(ja4_class.as_deref(), h2_fp_hash.as_deref());
 
@@ -57,6 +61,7 @@ impl DeviceSignals {
             is_mobile,
             ja4_class,
             platform_class,
+            browser_family,
             h2_fp_hash,
             known_browser,
         }
@@ -142,6 +147,35 @@ fn parse_platform_class(ua: &str) -> Option<String> {
     }
     if ua.contains("Linux") {
         return Some("linux".to_owned());
+    }
+    None
+}
+
+/// Parses coarse browser family from the User-Agent string.
+///
+/// Order matters: Edge, Opera, and the iOS Chrome/Firefox user agents embed
+/// `Chrome` and/or `Safari` tokens, so the more specific families are matched
+/// before the generic `Chrome` and `Safari` fallbacks.
+///
+/// Returns `None` when no recognized browser pattern is found (bots, raw HTTP
+/// clients, or empty UA).
+#[must_use]
+fn parse_browser_family(ua: &str) -> Option<String> {
+    if ua.contains("Edg/") || ua.contains("EdgA/") || ua.contains("EdgiOS/") || ua.contains("Edge/")
+    {
+        return Some("edge".to_owned());
+    }
+    if ua.contains("OPR/") || ua.contains("Opera") {
+        return Some("opera".to_owned());
+    }
+    if ua.contains("Firefox/") || ua.contains("FxiOS/") {
+        return Some("firefox".to_owned());
+    }
+    if ua.contains("Chrome/") || ua.contains("CriOS/") {
+        return Some("chrome".to_owned());
+    }
+    if ua.contains("Safari/") {
+        return Some("safari".to_owned());
     }
     None
 }
@@ -302,6 +336,67 @@ mod tests {
         assert_eq!(
             parse_platform_class(CHROME_ANDROID_UA).as_deref(),
             Some("android")
+        );
+    }
+
+    #[test]
+    fn browser_family_recognized() {
+        assert_eq!(
+            parse_browser_family(CHROME_MAC_UA).as_deref(),
+            Some("chrome"),
+            "Chrome/Mac = chrome"
+        );
+        assert_eq!(
+            parse_browser_family(CHROME_ANDROID_UA).as_deref(),
+            Some("chrome"),
+            "Chrome/Android = chrome"
+        );
+        assert_eq!(
+            parse_browser_family(SAFARI_IOS_UA).as_deref(),
+            Some("safari"),
+            "Safari/iOS = safari"
+        );
+        assert_eq!(
+            parse_browser_family(SAFARI_MAC_UA).as_deref(),
+            Some("safari"),
+            "Safari/Mac = safari"
+        );
+        assert_eq!(
+            parse_browser_family(FIREFOX_MAC_UA).as_deref(),
+            Some("firefox"),
+            "Firefox/Mac = firefox"
+        );
+    }
+
+    #[test]
+    fn browser_family_edge_and_opera_win_over_chrome() {
+        let edge = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+            (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0";
+        let opera = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+            (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 OPR/120.0.0.0";
+        assert_eq!(
+            parse_browser_family(edge).as_deref(),
+            Some("edge"),
+            "Edge UA embeds Chrome/Safari but should classify as edge"
+        );
+        assert_eq!(
+            parse_browser_family(opera).as_deref(),
+            Some("opera"),
+            "Opera UA embeds Chrome/Safari but should classify as opera"
+        );
+    }
+
+    #[test]
+    fn browser_family_unknown() {
+        assert_eq!(
+            parse_browser_family(BOT_UA),
+            None,
+            "Googlebot = no browser family"
+        );
+        assert_eq!(
+            parse_browser_family(""),
+            None,
+            "empty UA = no browser family"
         );
     }
 

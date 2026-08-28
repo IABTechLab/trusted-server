@@ -237,6 +237,8 @@ fn build_page(
         matched_slots: matched,
         consent_allows_auction: None,
         auction_enabled,
+        // Absent creative opportunities block here as they do at runtime.
+        ad_templates_enabled: creative.is_some_and(|creative| creative.enabled),
     });
 
     let evidence = collected.ad_evidence.clone().unwrap_or_else(empty_evidence);
@@ -277,7 +279,11 @@ fn build_page(
         runtime_ad_stack_expected: Some(RuntimeAdStackExpectedJson::from(
             result.runtime_ad_stack_expected,
         )),
-        gates: Some(to_gates(matched, auction_enabled)),
+        gates: Some(to_gates(
+            matched,
+            auction_enabled,
+            creative.is_some_and(|creative| creative.enabled),
+        )),
         matched_slot_count: Some(expected.len()),
         slots,
         extra_evidence,
@@ -348,7 +354,7 @@ fn empty_evidence() -> BrowserAdEvidence {
     }
 }
 
-fn to_gates(matched: bool, auction_enabled: bool) -> Gates {
+fn to_gates(matched: bool, auction_enabled: bool, ad_templates_enabled: bool) -> Gates {
     let pass_if = |cond: bool| {
         if cond {
             GateState::Pass
@@ -363,6 +369,7 @@ fn to_gates(matched: bool, auction_enabled: bool) -> Gates {
         not_bot: GateState::Pass,
         matched_slots: pass_if(matched),
         auction_enabled: pass_if(auction_enabled),
+        ad_templates_enabled: pass_if(ad_templates_enabled),
         // Live consent is not provable from a browser navigation in Phase 1.
         consent_allows_auction: GateState::Unknown,
     }

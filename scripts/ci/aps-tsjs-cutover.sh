@@ -20,6 +20,7 @@ build_release() {
 }
 
 run_adapters() {
+  mkdir -p "$evidence_root"
   cd "$repository_root"
   cargo test \
     --manifest-path crates/trusted-server-integration-tests/Cargo.toml \
@@ -39,8 +40,13 @@ install_browsers() {
 }
 
 run_browser_matrix() {
+  integration_artifacts="${ARTIFACTS_DIR:-$repository_root/target/integration-test-artifacts}"
+  mkdir -p "$evidence_root"
+  ARTIFACTS_DIR="$integration_artifacts" INTEGRATION_ENABLE_AUCTION=true \
+    "$repository_root/scripts/generate-integration-viceroy-configs.sh"
   cd "$repository_root/crates/trusted-server-integration-tests/browser"
-  TS_BROWSER_PROJECTS=chromium,firefox,webkit \
+  VICEROY_CONFIG_PATH="$integration_artifacts/configs/viceroy.toml" \
+    TS_BROWSER_PROJECTS=chromium,firefox,webkit \
     npx playwright test \
     tests/shared/aps-renderer.spec.ts \
     tests/shared/aps-puc-lifecycle.spec.ts \
@@ -55,6 +61,7 @@ run_browser_matrix() {
 }
 
 run_proxy_corpus() {
+  mkdir -p "$evidence_root"
   cd "$repository_root"
   for runtime in axum fastly cloudflare spin; do
     ./scripts/integration-tests-aps-runner-proxy.sh --runtime "$runtime" \

@@ -1,3 +1,5 @@
+#[cfg(feature = "aps-runner-proxy")]
+use crate::common::config::aps_runner_proxy_app_config_envelope;
 use crate::common::config::integration_app_config_envelope;
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
@@ -77,6 +79,13 @@ impl AxumDevServer {
         let binary = self.binary_path();
         let port = super::find_available_port().unwrap_or(AXUM_DEFAULT_PORT);
 
+        #[cfg(feature = "aps-runner-proxy")]
+        let app_config = if aps_runner_fixture_url.is_some() {
+            aps_runner_proxy_app_config_envelope(origin_port())?
+        } else {
+            integration_app_config_envelope(origin_port())?
+        };
+        #[cfg(not(feature = "aps-runner-proxy"))]
         let app_config = integration_app_config_envelope(origin_port())?;
 
         let mut command = Command::new(&binary);
@@ -84,6 +93,7 @@ impl AxumDevServer {
             "TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG",
             app_config,
         );
+        command.envs(INTEGRATION_SECRET_ENV.iter().copied());
         if let Some(fixture_url) = aps_runner_fixture_url {
             command.env("TS_APS_RUNNER_PROXY_TEST_ENDPOINT", fixture_url);
         }

@@ -17,6 +17,7 @@ use futures::StreamExt as _;
 
 use crate::ad_templates::compare::BrowserAdEvidence;
 use crate::ad_templates::output::Warning;
+use crate::commands::audit::browser_scroll;
 use crate::commands::audit::collector::{
     AuditCollector, BrowserCollectRequest, BrowserOpts, BrowserProfile, CollectedPage,
     PAGE_SETTLE_MAX_MS, PAGE_SETTLE_QUIET_MS,
@@ -574,7 +575,18 @@ async fn collect_open_page(
                 });
             }
         }
-        scroll_page(page, &mut warnings).await;
+        // Mark subsequent observations as scroll-phase for the verifier's
+        // injected evidence collector before shared scrolling begins.
+        eval_discard(page, "window.__tsScrollPhase = true", &mut warnings).await;
+        warnings.extend(
+            browser_scroll::scroll_page(page)
+                .await
+                .into_iter()
+                .map(|failure| Warning {
+                    code: failure.code().to_string(),
+                    message: failure.to_string(),
+                }),
+        );
         settle(page, settle_config, &mut warnings).await;
     }
 
@@ -721,32 +733,12 @@ async fn resource_count(page: &Page) -> Result<usize, String> {
     eval_usize(page, "performance.getEntriesByType('resource').length").await
 }
 
-/// Performs a deterministic stepped scroll to trigger lazy ad loading.
-async fn scroll_page(page: &Page, warnings: &mut Vec<Warning>) {
-    // Mark subsequent observations as scroll-phase for the collector.
-    eval_discard(page, "window.__tsScrollPhase = true", warnings).await;
-    for fraction in ["0.33", "0.66", "1"] {
-        let script = format!(
-            "window.scrollTo(0, Math.floor(Math.max(document.body.scrollHeight, \
-             document.documentElement.scrollHeight) * {fraction}))"
-        );
-        eval_discard(page, script, warnings).await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    eval_discard(page, "window.scrollTo(0, 0)", warnings).await;
-}
-
 async fn eval_discard(page: &Page, expression: impl Into<String>, warnings: &mut Vec<Warning>) {
-    match tokio::time::timeout(CDP_OPERATION_TIMEOUT, page.evaluate(expression.into())).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => warnings.push(Warning {
-            code: "page_evaluation_failed".to_string(),
-            message: format!("browser page evaluation failed: {error}"),
-        }),
-        Err(_) => warnings.push(Warning {
-            code: "page_evaluation_timeout".to_string(),
-            message: "browser page evaluation timed out".to_string(),
-        }),
+    if let Err(failure) = browser_scroll::evaluate(page, expression).await {
+        warnings.push(Warning {
+            code: failure.code().to_string(),
+            message: failure.to_string(),
+        });
     }
 }
 

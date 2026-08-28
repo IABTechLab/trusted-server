@@ -1,3 +1,5 @@
+#[cfg(feature = "aps-runner-proxy")]
+use crate::common::config::cloudflare_aps_runner_proxy_config_json;
 use crate::common::config::cloudflare_config_json;
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
@@ -31,6 +33,9 @@ const GENERATED_CI_CONFIG: &str = "wrangler.integration.generated.toml";
 const TRUSTED_SERVER_CONFIG_PLACEHOLDER: &str = "TRUSTED_SERVER_CONFIG = \"{}\"";
 #[cfg(feature = "aps-runner-proxy")]
 const APS_RUNNER_PROXY_CONFIG_TEMPLATE: &str = "wrangler.aps-runner-proxy.toml";
+#[cfg(feature = "aps-runner-proxy")]
+const APS_RUNNER_PROXY_CONFIG: &str =
+    include_str!("../../../trusted-server-adapter-cloudflare/wrangler.aps-runner-proxy.toml");
 #[cfg(feature = "aps-runner-proxy")]
 const APS_RUNNER_PROXY_FIXTURE_CONFIG: &str =
     include_str!("../../fixtures/configs/cloudflare-aps-runner-proxy-fixture.toml");
@@ -128,7 +133,7 @@ fn generated_aps_runner_proxy_configs(
             "failed to read Cloudflare APS proxy config at {}",
             main_template_path.display()
         ))?;
-    let config_json = cloudflare_config_json(origin_port())?;
+    let config_json = cloudflare_aps_runner_proxy_config_json(origin_port())?;
     let main_config = inject_cloudflare_config(&main_template, &config_json)?;
 
     let placeholder_count = APS_RUNNER_PROXY_FIXTURE_CONFIG
@@ -529,6 +534,23 @@ mod tests {
             !APS_RUNNER_PROXY_FIXTURE_CONFIG.contains("https://*:*"),
             "should not grant wildcard outbound access"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "aps-runner-proxy")]
+    fn aps_main_config_provides_every_shared_fixture_secret() {
+        for key in [
+            "integration_admin_password",
+            "integration_proxy_secret",
+            "integration_ec_passphrase",
+            "integration_partner_token_alpha",
+            "integration_partner_token_bravo",
+        ] {
+            assert!(
+                APS_RUNNER_PROXY_CONFIG.contains(&format!("{key} =")),
+                "APS Worker test config should provide `{key}`"
+            );
+        }
     }
 
     #[test]

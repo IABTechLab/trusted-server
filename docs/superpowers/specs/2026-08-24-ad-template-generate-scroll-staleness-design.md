@@ -50,7 +50,7 @@ The diagnostic is explicit about the limits of negative crawl evidence. Its
 human-readable form for a non-scrolling run is equivalent to:
 
 ```text
-note: preserved 2 configured slot(s) not observed during this crawl: ad-header-0, ad-fixed_bottom-0. Re-run with broader coverage or --scroll; use --replace only to intentionally prune them.
+note: preserved 2 configured slot(s) not observed during this crawl: ad-header-0, ad-fixed_bottom-0. Re-run with broader coverage or --scroll; `--replace` prunes them but also discards every hand-written field on the slots the run did rediscover.
 ```
 
 When the current run already used `--scroll`, the follow-up omits that redundant
@@ -94,6 +94,5 @@ contracts.
 Verification will run the host CLI test suite and relevant Chrome-backed CLI
 tests, followed by the repository-required formatting and CLI lint gates. A
 manual dry run against a live publisher site may be used when a fresh
-bot-protection cookie
-and proxy are available, but network-dependent behavior is not a required CI
-test.
+bot-protection cookie and proxy are available, but network-dependent behavior
+is not a required CI test.

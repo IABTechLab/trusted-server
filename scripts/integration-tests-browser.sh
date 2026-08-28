@@ -73,7 +73,9 @@ TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
     cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 
 echo "==> Generating Viceroy configs..."
-INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" ./scripts/generate-integration-viceroy-configs.sh
+INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" \
+INTEGRATION_ENABLE_AUCTION=true \
+    ./scripts/generate-integration-viceroy-configs.sh
 GENERATED_VICEROY_CONFIG_PATH="$ARTIFACTS_DIR/configs/viceroy.toml"
 
 # --- Build Docker images ---

@@ -17,6 +17,7 @@ struct Args {
     app_config: PathBuf,
     output: PathBuf,
     origin_url: Option<String>,
+    enable_auction: bool,
 }
 
 fn main() -> Result<(), DynError> {
@@ -37,7 +38,8 @@ fn run(args: &Args) -> Result<(), DynError> {
         ))
     })?;
 
-    let envelope_json = build_app_config_envelope(&app_config, args.origin_url.as_deref())?;
+    let envelope_json =
+        build_app_config_envelope(&app_config, args.origin_url.as_deref(), args.enable_auction)?;
     let generated_config = inject_generated_config_stores(&template, &envelope_json)?;
 
     if let Some(parent) = args.output.parent() {
@@ -63,6 +65,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, DynError> 
     let mut app_config = None;
     let mut output = None;
     let mut origin_url = None;
+    let mut enable_auction = false;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -71,6 +74,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, DynError> 
             "--app-config" => app_config = Some(next_path_arg(&mut iter, "--app-config")?),
             "--output" => output = Some(next_path_arg(&mut iter, "--output")?),
             "--origin-url" => origin_url = Some(next_string_arg(&mut iter, "--origin-url")?),
+            "--enable-auction" => enable_auction = true,
             "--help" | "-h" => return Err(error_box(usage())),
             other => {
                 return Err(error_box(format!(
@@ -88,6 +92,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, DynError> 
             .ok_or_else(|| error_box(format!("missing --app-config\n\n{}", usage())))?,
         output: output.ok_or_else(|| error_box(format!("missing --output\n\n{}", usage())))?,
         origin_url,
+        enable_auction,
     })
 }
 
@@ -107,18 +112,22 @@ fn next_string_arg(
 }
 
 fn usage() -> String {
-    "usage: generate-viceroy-config --template <path> --app-config <path> --output <path> [--origin-url <url>]".to_string()
+    "usage: generate-viceroy-config --template <path> --app-config <path> --output <path> [--origin-url <url>] [--enable-auction]".to_string()
 }
 
 fn build_app_config_envelope(
     app_config_toml: &str,
     origin_url: Option<&str>,
+    enable_auction: bool,
 ) -> Result<String, DynError> {
     let app_config: TrustedServerAppConfig = toml::from_str(app_config_toml)
         .map_err(|error| error_box(format!("invalid Trusted Server app config: {error}")))?;
     let mut settings = app_config.into_settings();
     if let Some(origin_url) = origin_url {
         settings.publisher.origin_url = origin_url.to_string();
+    }
+    if enable_auction {
+        settings.auction.enabled = true;
     }
     let app_config = TrustedServerAppConfig::new(settings)
         .map_err(|report| error_box(format!("invalid Trusted Server app config: {report:?}")))?;
@@ -264,15 +273,50 @@ mod tests {
                 template: PathBuf::from("template.toml"),
                 app_config: PathBuf::from("trusted-server.toml"),
                 output: PathBuf::from("generated.toml"),
-                origin_url: Some("http://127.0.0.1:9999".to_string())
+                origin_url: Some("http://127.0.0.1:9999".to_string()),
+                enable_auction: false,
             },
             "should parse expected args"
         );
     }
 
     #[test]
+    fn browser_generation_can_enable_the_configured_auction_plan() {
+        let args = parse_args([
+            "--template".to_string(),
+            "template.toml".to_string(),
+            "--app-config".to_string(),
+            "trusted-server.toml".to_string(),
+            "--output".to_string(),
+            "generated.toml".to_string(),
+            "--enable-auction".to_string(),
+        ])
+        .expect("should parse browser auction opt-in");
+        assert!(args.enable_auction);
+
+        let envelope = build_app_config_envelope(APP_CONFIG, None, true)
+            .expect("should build browser envelope");
+        let settings = settings_from_config_blob(
+            &envelope,
+            &integration_secret_store(),
+            &StoreName::from("trusted_server_secrets"),
+        )
+        .expect("should verify browser envelope");
+
+        assert!(settings.auction.enabled);
+        assert!(
+            settings
+                .auction
+                .providers
+                .values()
+                .any(|provider| provider.profile == "aps")
+        );
+    }
+
+    #[test]
     fn generated_config_contains_blob_without_removed_rollout_flags() {
-        let envelope = build_app_config_envelope(APP_CONFIG, None).expect("should build envelope");
+        let envelope =
+            build_app_config_envelope(APP_CONFIG, None, false).expect("should build envelope");
         let generated = inject_generated_config_stores(TEMPLATE, &envelope)
             .expect("should inject generated stores");
 
@@ -296,7 +340,8 @@ mod tests {
 
     #[test]
     fn generated_config_is_valid_toml() {
-        let envelope = build_app_config_envelope(APP_CONFIG, None).expect("should build envelope");
+        let envelope =
+            build_app_config_envelope(APP_CONFIG, None, false).expect("should build envelope");
         let generated = inject_generated_config_stores(TEMPLATE, &envelope)
             .expect("should inject generated stores");
         let parsed: toml::Value = toml::from_str(&generated).expect("should parse as TOML");
@@ -312,7 +357,7 @@ mod tests {
 
     #[test]
     fn generated_blob_verifies_and_applies_origin_override() {
-        let envelope = build_app_config_envelope(APP_CONFIG, Some("http://127.0.0.1:9999"))
+        let envelope = build_app_config_envelope(APP_CONFIG, Some("http://127.0.0.1:9999"), false)
             .expect("should build envelope");
         let settings = settings_from_config_blob(
             &envelope,
@@ -329,7 +374,7 @@ mod tests {
 
     #[test]
     fn invalid_app_config_fails() {
-        let result = build_app_config_envelope("not valid toml", None);
+        let result = build_app_config_envelope("not valid toml", None, false);
 
         assert!(result.is_err(), "should reject invalid app config");
     }
@@ -338,7 +383,7 @@ mod tests {
     fn invalid_non_secret_app_config_fails_before_envelope_generation() {
         let invalid = APP_CONFIG.replace("domain = \"localhost\"", "domain = \"invalid/domain\"");
 
-        let err = build_app_config_envelope(&invalid, None)
+        let err = build_app_config_envelope(&invalid, None, false)
             .expect_err("should reject invalid non-secret config before creating an envelope");
 
         assert!(

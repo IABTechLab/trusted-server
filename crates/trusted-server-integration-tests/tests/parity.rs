@@ -47,8 +47,16 @@ fn test_settings() -> Settings {
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
 
-            [integrations.aps]
+            [auction]
             enabled = true
+
+            [auction.providers.aps-main]
+            protocol = "openrtb-2.6"
+            profile = "aps"
+            endpoint = "https://aps.example/e/pb/bid"
+            routing = "all_eligible"
+
+            [auction.providers.aps-main.profile_config]
             account_id = "parity-test-aps-account"
             allow_script_creatives = true
         "#,

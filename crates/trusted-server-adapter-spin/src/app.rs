@@ -1,11 +1,19 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+#[cfg(all(
+    feature = "spin",
+    target_arch = "wasm32",
+    not(feature = "aps-runner-proxy-integration-test")
+))]
 use edgezero_adapter_spin::config_store::SpinConfigStore;
 use edgezero_adapter_spin::context::SpinRequestContext;
 use edgezero_core::app::Hooks;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+#[cfg(all(
+    feature = "spin",
+    target_arch = "wasm32",
+    not(feature = "aps-runner-proxy-integration-test")
+))]
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
@@ -29,7 +37,11 @@ use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::RuntimeServices;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+#[cfg(all(
+    feature = "spin",
+    target_arch = "wasm32",
+    not(feature = "aps-runner-proxy-integration-test")
+))]
 use trusted_server_core::platform::{PlatformConfigStore, StoreName};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
@@ -43,23 +55,39 @@ use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
+#[cfg(all(
+    feature = "spin",
+    target_arch = "wasm32",
+    not(feature = "aps-runner-proxy-integration-test")
+))]
+use trusted_server_core::settings_data::default_config_key;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use trusted_server_core::settings_data::{default_config_key, default_secret_store_name};
+use trusted_server_core::settings_data::default_secret_store_name;
 use trusted_server_core::trace_cookie::handle_trace_mode;
 
 use crate::middleware::{
     AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware, SanitizeRequestMiddleware,
 };
-use crate::platform::build_runtime_services;
+#[cfg(all(
+    feature = "spin",
+    target_arch = "wasm32",
+    not(feature = "aps-runner-proxy-integration-test")
+))]
+use crate::platform::ConfigStoreHandleAdapter;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use crate::platform::{ConfigStoreHandleAdapter, SpinSecretStoreAdapter};
+use crate::platform::SpinSecretStoreAdapter;
+use crate::platform::build_runtime_services;
 
 // ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
 
 /// Spin auto-provides this key-value store label without runtime configuration.
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+#[cfg(all(
+    feature = "spin",
+    target_arch = "wasm32",
+    not(feature = "aps-runner-proxy-integration-test")
+))]
 const SPIN_DEFAULT_CONFIG_STORE: &str = "default";
 
 /// Application state built once at startup and shared across all requests.
@@ -81,7 +109,11 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     build_state_with_settings(settings)
 }
 
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+#[cfg(all(
+    feature = "spin",
+    target_arch = "wasm32",
+    not(feature = "aps-runner-proxy-integration-test")
+))]
 fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
     let config_store_name = StoreName::from(SPIN_DEFAULT_CONFIG_STORE);
     let config_key = default_config_key();
@@ -125,7 +157,9 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
                 })
                 .attach(error.to_string())
             })?;
-    let settings = settings_from_config_blob(&envelope)?;
+    let secret_store = SpinSecretStoreAdapter;
+    let settings =
+        settings_from_config_blob(&envelope, &secret_store, &default_secret_store_name())?;
     build_state_with_settings(settings)
 }
 
