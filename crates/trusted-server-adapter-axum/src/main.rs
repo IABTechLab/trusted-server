@@ -3,7 +3,6 @@ use std::net::SocketAddr;
 use axum::Router;
 use edgezero_adapter_axum::dev_server::AxumDevServerConfig;
 use edgezero_adapter_axum::service::EdgeZeroAxumService;
-use edgezero_core::router::RouterService;
 use tokio::net::TcpListener;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::signal;
@@ -30,8 +29,8 @@ fn main() {
     };
 
     log::info!("Listening on http://{}", config.addr);
-    let (router, server_timing_enabled) = TrustedServerApp::routes_with_server_timing_flag();
-    if let Err(err) = run(router, server_timing_enabled, config) {
+    let service = TrustedServerApp::dev_server_service();
+    if let Err(err) = run(service, config) {
         log::error!("trusted-server-adapter-axum failed: {err}");
         std::process::exit(1);
     }
@@ -56,22 +55,19 @@ fn main() {
 /// Returns an error if the Tokio runtime fails to start, the listener fails
 /// to bind, or the underlying serve loop errors.
 fn run(
-    router: RouterService,
-    server_timing_enabled: bool,
+    service: TimingService<EdgeZeroAxumService>,
     config: AxumDevServerConfig,
 ) -> std::io::Result<()> {
     let runtime = RuntimeBuilder::new_multi_thread().enable_all().build()?;
-    runtime.block_on(serve(router, server_timing_enabled, config))
+    runtime.block_on(serve(service, config))
 }
 
 async fn serve(
-    router: RouterService,
-    server_timing_enabled: bool,
+    service: TimingService<EdgeZeroAxumService>,
     config: AxumDevServerConfig,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(config.addr).await?;
 
-    let service = TimingService::new(EdgeZeroAxumService::new(router), server_timing_enabled);
     let axum_router = Router::new().fallback_service(service_fn(move |req| {
         let mut svc = service.clone();
         async move { svc.call(req).await }

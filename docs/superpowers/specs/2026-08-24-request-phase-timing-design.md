@@ -276,7 +276,8 @@ Extends the reserved `tinybird/datasources/access_logs_raw.datasource`.
 
 Kept columns: `event_ts`, `method`, `status`, `time_elapsed_ms` (defined as the
 `mark_headers_ready()` snapshot; nullable because a contended lock drop can lose the
-snapshot), `sample_rate`, `event_date`, 30-day TTL.
+snapshot), `sample_rate`, 30-day TTL. (`event_date` was later dropped for the
+`toDate(event_ts)` sorting-key expression; see section 9's schema note.)
 
 Removed: raw `path`. Route identifiers like `/_ts/admin/ec/{id}` would otherwise put
 EC identifiers into a 30-day dataset, and publisher paths carry unbounded cardinality
@@ -290,8 +291,11 @@ and user-generated content (search terms, usernames, emails in slugs). Replaced 
   `/news/*`). The auction-telemetry normalizer is explicitly not sufficient here: it
   redacts long tokens but preserves short identifiers and arbitrary slugs.
 - Rejection is whole-segment, never truncation: a segment is dropped to `/other/*`
-  when it fails the charset allowlist, exceeds 32 characters, or carries more than 7
-  ASCII digits. The character allowlist alone does not bound identity (`[a-z0-9_-]`
+  when it fails the charset allowlist, exceeds 32 characters, carries more than 7
+  ASCII digits, or is the only segment in the path. Depth is what makes a first
+  segment a section name: single-segment paths are documents (WordPress
+  `/%postname%/` puts every article at depth 1), so they reject wholesale, root
+  landing pages included. The character allowlist alone does not bound identity (`[a-z0-9_-]`
   is exactly the alphabet of UUIDs, hex ids, and reset tokens), and a truncated
   prefix of any of those is still identifying, so the length and digit bounds reject
   the segment outright.
@@ -352,7 +356,7 @@ pop, status)`. Every column carries a `json:$.<name>` path (the Events API rejec
 NDJSON into a datasource without JSONPaths, discovered live); `event_date` was
 dropped in favor of the sorting-key expression because a DEFAULT column cannot
 carry a JSONPath the producer never sends. Grafana time filtering uses `$__timeFilter(event_ts)` and every panel query
-also carries an `event_date` predicate so the primary index prunes; rollout validates
+also carries a `toDate(event_ts)` predicate so the primary index prunes; rollout validates
 the panel queries with `EXPLAIN` before the dashboard is committed. This replaces the
 reserved key `(event_date, path, status, method)`. Rollout step 4 verifies whether the
 reserved datasource was ever deployed to the remote workspace; if it was, this schema
@@ -409,8 +413,8 @@ ships as a versioned replacement datasource with a cutover, not an in-place edit
 ## 11. Dashboard and query model
 
 No endpoint pipe in v1. Grafana queries `access_logs_raw` directly through the
-ClickHouse connector with `$__timeFilter(event_ts)` plus an `event_date` predicate,
-matching the auction dashboards.
+ClickHouse connector with `$__timeFilter(event_ts)` plus a `toDate(event_ts)`
+predicate, matching the auction dashboards.
 
 Dashboard: a new standalone `grafana/dashboards/edge-performance.json` in the
 telemetry repo (`trusted-server-tinybird`), performance only, no panels shared with

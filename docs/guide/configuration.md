@@ -1846,6 +1846,19 @@ send access-telemetry rows.
 server_timing_enabled = true
 ```
 
+::: warning Client-visible latency disclosure
+The `Server-Timing` header is sent to every client on eligible responses,
+not only to operators: browsers expose the values to same-origin JavaScript
+via `PerformanceResourceTiming.serverTiming`, and any caller can read the
+raw header. Enabling it publishes measured per-phase server latency,
+including KV read timing on the public identity endpoints (`ts-kv`) and
+origin/cache behaviour on publisher pages (`ts-origin`,
+`ts-template-cache`). This is standard `Server-Timing` practice and the
+values are durations only, but treat the flag as a diagnostic aid to enable
+deliberately, not a general always-on toggle, unless disclosing those
+timings to all clients is acceptable for the deployment.
+:::
+
 **Environment Override**:
 
 ```bash

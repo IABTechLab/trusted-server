@@ -417,6 +417,19 @@ mod tests {
             seen.iter().all(|slot| *slot),
             "should cover every phases-array slot"
         );
+
+        // `HEADER_PHASES` is a second hand-synced list: a phase that gains
+        // a `header_name()` but is never added there silently renders
+        // nothing in the `Server-Timing` value.
+        let header_bearing: Vec<Phase> = phases
+            .into_iter()
+            .filter(|phase| phase.header_name().is_some())
+            .collect();
+        assert_eq!(
+            header_bearing,
+            HEADER_PHASES.to_vec(),
+            "should render every header-bearing phase, in declaration order"
+        );
     }
 
     #[test]
