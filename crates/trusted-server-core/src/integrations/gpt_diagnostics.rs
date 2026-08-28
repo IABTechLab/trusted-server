@@ -333,6 +333,19 @@ pub fn prepare_request(
     Ok(decision)
 }
 
+/// Builder hook: prepares the request and discards the decision, which stays
+/// in the request extensions for the publisher path to read.
+///
+/// # Errors
+///
+/// Returns the error from [`prepare_request`].
+pub(crate) fn prepare_request_hook(
+    settings: &Settings,
+    request: &mut Request<EdgeBody>,
+) -> Result<(), Report<TrustedServerError>> {
+    prepare_request(settings, request).map(|_| ())
+}
+
 /// Read the request decision, defaulting to inactive when not prepared.
 #[must_use]
 pub fn request_decision(request: &Request<EdgeBody>) -> GptDiagnosticsRequestDecision {

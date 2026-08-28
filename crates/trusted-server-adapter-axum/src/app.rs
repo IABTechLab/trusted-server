@@ -152,10 +152,7 @@ where
 {
     let services = build_runtime_services(&ctx, &state.settings);
     let mut req = ctx.into_request();
-    if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
-        &state.settings,
-        &mut req,
-    ) {
+    if let Err(error) = state.registry.prepare_request(&state.settings, &mut req) {
         return Ok(http_error(&error));
     }
     Ok(handler(state, services, req)
@@ -210,7 +207,7 @@ async fn dispatch_fallback(
         return Ok(response);
     }
 
-    trusted_server_core::integrations::gpt_diagnostics::prepare_request(&state.settings, &mut req)?;
+    state.registry.prepare_request(&state.settings, &mut req)?;
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 

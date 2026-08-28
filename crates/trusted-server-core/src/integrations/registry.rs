@@ -775,6 +775,8 @@ struct IntegrationRegistryInner {
     /// a registered integration, for example a module tied to the selected Edge
     /// Cookie provider. Populated in [`IntegrationRegistry::new`] from settings.
     extra_js_module_ids: Vec<&'static str>,
+    // Preparers from every builder, enabled or not, in registration order.
+    request_preparers: Vec<crate::integrations::IntegrationPrepareRequestFn>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -800,6 +802,7 @@ impl Default for IntegrationRegistryInner {
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
             extra_js_module_ids: Vec::new(),
+            request_preparers: Vec::new(),
         }
     }
 }
@@ -897,6 +900,12 @@ impl IntegrationRegistry {
                 }));
             }
             inner.builder_ids.push((builder.id(), builder.source()));
+            // Preparers are collected before the enabled check, so an
+            // integration can sanitize its own reserved query or cookie in a
+            // deployment that has it switched off.
+            if let Some(prepare) = builder.prepare_request() {
+                inner.request_preparers.push(prepare);
+            }
 
             if let Some(registration) = builder.build(settings)? {
                 debug_assert_eq!(
@@ -1036,6 +1045,27 @@ impl IntegrationRegistry {
     #[must_use]
     pub fn has_route(&self, method: &Method, path: &str) -> bool {
         self.find_route(method, path).is_some()
+    }
+
+    /// Runs every registered integration's request preparer, in registration
+    /// order, before routing.
+    ///
+    /// Preparers run whether or not their integration is enabled, so an
+    /// integration can sanitize its own reserved query or cookie in a
+    /// deployment that has it switched off.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first preparer's error.
+    pub fn prepare_request(
+        &self,
+        settings: &Settings,
+        request: &mut Request<EdgeBody>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        for prepare in &self.inner.request_preparers {
+            prepare(settings, request)?;
+        }
+        Ok(())
     }
 
     /// Run pre-routing request filters.
@@ -1485,6 +1515,7 @@ impl IntegrationRegistry {
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                request_preparers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
                 extra_js_module_ids: Vec::new(),
@@ -1518,6 +1549,7 @@ impl IntegrationRegistry {
                 html_post_processors: Vec::new(),
                 head_injectors,
                 request_filters: Vec::new(),
+                request_preparers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
                 extra_js_module_ids: Vec::new(),
@@ -1547,6 +1579,7 @@ impl IntegrationRegistry {
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters,
+                request_preparers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
                 extra_js_module_ids: Vec::new(),
@@ -1616,6 +1649,7 @@ impl IntegrationRegistry {
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                request_preparers: Vec::new(),
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
                 extra_js_module_ids: Vec::new(),
@@ -3053,5 +3087,199 @@ mod tests {
                 "should list `{expected}` exactly once in {ids:?}"
             );
         }
+    }
+
+    /// A builder function for an integration that is never enabled, so its
+    /// preparer is the only thing the registry can take from it.
+    fn never_enabled_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(None)
+    }
+
+    /// Preparers cannot capture, because a builder holds plain function
+    /// pointers, so they record the order they ran in here.
+    static PREPARER_ORDER: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+    fn record_first_preparer(
+        _settings: &Settings,
+        _request: &mut Request<EdgeBody>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        PREPARER_ORDER
+            .lock()
+            .expect("should lock the preparer order")
+            .push("first");
+        Ok(())
+    }
+
+    fn record_second_preparer(
+        _settings: &Settings,
+        _request: &mut Request<EdgeBody>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        PREPARER_ORDER
+            .lock()
+            .expect("should lock the preparer order")
+            .push("second");
+        Ok(())
+    }
+
+    /// Records whether the preparer registered after the failing one ran.
+    static PREPARER_AFTER_FAILURE: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+    const FAILING_PREPARER_MESSAGE: &str = "probe preparer refused the request";
+
+    fn failing_preparer(
+        _settings: &Settings,
+        _request: &mut Request<EdgeBody>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        Err(Report::new(TrustedServerError::Configuration {
+            message: FAILING_PREPARER_MESSAGE.to_owned(),
+        }))
+    }
+
+    fn record_after_failure_preparer(
+        _settings: &Settings,
+        _request: &mut Request<EdgeBody>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        PREPARER_AFTER_FAILURE
+            .lock()
+            .expect("should lock the after-failure record")
+            .push("after");
+        Ok(())
+    }
+
+    fn plain_request() -> Request<EdgeBody> {
+        Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example.com/article")
+            .body(EdgeBody::empty())
+            .expect("should build request")
+    }
+
+    #[test]
+    fn prepare_request_runs_every_preparer_in_registration_order_enabled_or_not() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let extra = [
+            crate::integrations::IntegrationBuilder::new(
+                "probe-first",
+                "seam-probe",
+                never_enabled_registration,
+                validate_nothing,
+            )
+            .with_request_preparer(record_first_preparer),
+            crate::integrations::IntegrationBuilder::new(
+                "probe-second",
+                "seam-probe",
+                never_enabled_registration,
+                validate_nothing,
+            )
+            .with_request_preparer(record_second_preparer),
+        ];
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build registry with request preparers");
+        assert!(
+            !registry.integration_enabled("probe-first"),
+            "should leave the first probe integration disabled"
+        );
+        assert!(
+            !registry.integration_enabled("probe-second"),
+            "should leave the second probe integration disabled"
+        );
+        PREPARER_ORDER
+            .lock()
+            .expect("should lock the preparer order")
+            .clear();
+        let mut request = plain_request();
+
+        registry
+            .prepare_request(&settings, &mut request)
+            .expect("should run every request preparer");
+
+        assert_eq!(
+            *PREPARER_ORDER
+                .lock()
+                .expect("should lock the preparer order"),
+            vec!["first", "second"],
+            "should run both preparers in registration order even though neither integration is enabled"
+        );
+    }
+
+    #[test]
+    fn prepare_request_surfaces_the_first_preparer_error() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let extra = [
+            crate::integrations::IntegrationBuilder::new(
+                "probe-failing",
+                "seam-probe",
+                never_enabled_registration,
+                validate_nothing,
+            )
+            .with_request_preparer(failing_preparer),
+            crate::integrations::IntegrationBuilder::new(
+                "probe-after-failure",
+                "seam-probe",
+                never_enabled_registration,
+                validate_nothing,
+            )
+            .with_request_preparer(record_after_failure_preparer),
+        ];
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build registry with request preparers");
+        PREPARER_AFTER_FAILURE
+            .lock()
+            .expect("should lock the after-failure record")
+            .clear();
+        let mut request = plain_request();
+
+        let error = registry
+            .prepare_request(&settings, &mut request)
+            .expect_err("should surface the failing preparer's error");
+
+        assert!(
+            error.to_string().contains(FAILING_PREPARER_MESSAGE),
+            "should keep the preparer's message intact: {error}"
+        );
+        assert!(
+            PREPARER_AFTER_FAILURE
+                .lock()
+                .expect("should lock the after-failure record")
+                .is_empty(),
+            "should not run a preparer registered after the failing one"
+        );
+    }
+
+    #[test]
+    fn prepare_request_runs_the_built_in_gpt_diagnostics_preparer() {
+        // The adapters call the registry rather than naming GPT diagnostics, so
+        // the built-in table is what attaches the sanitizing preparer. This is
+        // asserted here rather than through an adapter route test because the
+        // stripped query is only visible on the publisher HTML path, which needs
+        // a live origin the adapter test harnesses do not have.
+        let settings = crate::test_support::tests::create_test_settings();
+        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example.com/article?ts_console=1&keep=yes")
+            .header(header::COOKIE, "__Host-ts-console=1; keep-me=yes")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        registry
+            .prepare_request(&settings, &mut request)
+            .expect("should run the built-in preparers");
+
+        assert_eq!(
+            request.uri().query(),
+            Some("keep=yes"),
+            "should strip the reserved diagnostics query and keep the rest"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(header::COOKIE)
+                .map(|value| value.to_str().expect("cookie should be text")),
+            Some("keep-me=yes"),
+            "should strip the reserved diagnostics cookie and keep the rest"
+        );
     }
 }

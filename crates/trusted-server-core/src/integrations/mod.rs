@@ -407,9 +407,6 @@ impl IntegrationBuilder {
     }
 
     /// The request preparation function, when one is attached.
-    // The adapters do not yet run request preparers, so nothing in the crate
-    // calls this until that is wired up.
-    #[allow(dead_code)]
     pub(crate) fn prepare_request(&self) -> Option<IntegrationPrepareRequestFn> {
         self.prepare_request
     }
@@ -459,7 +456,8 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
         CORE_SOURCE,
         gpt_diagnostics::register,
         gpt_diagnostics::validate,
-    ),
+    )
+    .with_request_preparer(gpt_diagnostics::prepare_request_hook),
 ];
 
 /// The built-in integration builders, in hook order.

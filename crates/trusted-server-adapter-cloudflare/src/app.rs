@@ -212,10 +212,7 @@ where
         Box::pin(async move {
             let services = build_per_request_services(&s, &ctx);
             let mut req = ctx.into_request();
-            if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
-                &s.settings,
-                &mut req,
-            ) {
+            if let Err(error) = s.registry.prepare_request(&s.settings, &mut req) {
                 return Ok(http_error(&error));
             }
             Ok(f(s, services, req).await.unwrap_or_else(|e| http_error(&e)))
@@ -413,10 +410,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
             }
-            if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
-                &state.settings,
-                &mut req,
-            ) {
+            if let Err(error) = state.registry.prepare_request(&state.settings, &mut req) {
                 return Ok(http_error(&error));
             }
             let path = req.uri().path().to_owned();

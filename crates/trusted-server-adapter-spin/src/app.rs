@@ -607,12 +607,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 // OpenRTB metadata that auction signing derives from
                 // `RequestInfo::from_request` uses the trusted runtime authority.
                 let mut req = ctx.into_request();
-                if let Err(error) =
-                    trusted_server_core::integrations::gpt_diagnostics::prepare_request(
-                        &s.settings,
-                        &mut req,
-                    )
-                {
+                if let Err(error) = s.registry.prepare_request(&s.settings, &mut req) {
                     return Ok(http_error(&error));
                 }
                 // Build the geo-aware EC context so the auction consent gate sees
@@ -645,12 +640,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             async move {
                 let services = build_per_request_services(&s, &ctx);
                 let mut req = ctx.into_request();
-                if let Err(error) =
-                    trusted_server_core::integrations::gpt_diagnostics::prepare_request(
-                        &s.settings,
-                        &mut req,
-                    )
-                {
+                if let Err(error) = s.registry.prepare_request(&s.settings, &mut req) {
                     return Ok(http_error(&error));
                 }
                 // Identity could not be established (for example the selected
@@ -748,10 +738,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
             }
-            if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
-                &state.settings,
-                &mut req,
-            ) {
+            if let Err(error) = state.registry.prepare_request(&state.settings, &mut req) {
                 return Ok(http_error(&error));
             }
 
