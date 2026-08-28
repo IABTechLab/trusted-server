@@ -10,6 +10,8 @@ use toml_edit::{DocumentMut, Item, table, value};
 pub(crate) type CliResult<T> = Result<T, String>;
 
 const NODE_MODULES_MISSING_HELP: &str = "Prebid bundling dependencies are missing. Run `cd crates/trusted-server-js/lib && npm ci`, then retry `ts prebid bundle`.";
+const USER_ID_REGISTRY_RELATIVE_PATH: &str =
+    "src/integrations/prebid/user_id_modules.json";
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct PrebidBundleArgs {
@@ -124,6 +126,80 @@ struct PrebidBundleManifest {
     sha256: String,
     sri: String,
     filename: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrebidUserIdModuleRegistry {
+    modules: Vec<PrebidUserIdModuleRegistryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrebidUserIdModuleRegistryEntry {
+    module_name: String,
+    config_names: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RequiredPrebidUserIdModule {
+    config_name: String,
+    module_name: String,
+}
+
+fn load_user_id_registry(
+    js_lib_dir: &Path,
+) -> CliResult<(PathBuf, PrebidUserIdModuleRegistry)> {
+    let path = js_lib_dir.join(USER_ID_REGISTRY_RELATIVE_PATH);
+    let contents = fs::read_to_string(&path).map_err(|error| {
+        report_error(format!(
+            "failed to read Prebid User ID registry {}: {error}",
+            path.display()
+        ))
+    })?;
+    let registry = serde_json::from_str(&contents).map_err(|error| {
+        report_error(format!(
+            "failed to parse Prebid User ID registry {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok((path, registry))
+}
+
+fn resolve_managed_user_id_modules(
+    managed_names: &[String],
+    registry: &PrebidUserIdModuleRegistry,
+    registry_path: &Path,
+) -> CliResult<Vec<RequiredPrebidUserIdModule>> {
+    managed_names
+        .iter()
+        .map(|config_name| {
+            let mut candidates = registry
+                .modules
+                .iter()
+                .filter(|entry| entry.config_names.iter().any(|name| name == config_name))
+                .map(|entry| entry.module_name.clone())
+                .collect::<Vec<_>>();
+            candidates.sort();
+            candidates.dedup();
+
+            match candidates.as_slice() {
+                [] => cli_error(format!(
+                    "managed User ID name {config_name:?} is not registered in {}",
+                    registry_path.display()
+                )),
+                [module_name] => Ok(RequiredPrebidUserIdModule {
+                    config_name: config_name.clone(),
+                    module_name: module_name.clone(),
+                }),
+                _ => cli_error(format!(
+                    "managed User ID name {config_name:?} is ambiguous in {}; candidate modules: {}",
+                    registry_path.display(),
+                    candidates.join(", ")
+                )),
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn run_bundle(
@@ -760,6 +836,133 @@ adapters = ["rubicon"]
                 "should identify the malformed managed name: {error}"
             );
         }
+    }
+
+    #[test]
+    fn managed_names_resolve_aliases_to_registered_modules() {
+        let registry = PrebidUserIdModuleRegistry {
+            modules: vec![PrebidUserIdModuleRegistryEntry {
+                module_name: "sharedIdSystem".to_string(),
+                config_names: vec!["sharedId".to_string(), "pubCommonId".to_string()],
+            }],
+        };
+        let registry_path = Path::new("user_id_modules.json");
+
+        let required = resolve_managed_user_id_modules(
+            &["pubCommonId".to_string(), "sharedId".to_string()],
+            &registry,
+            registry_path,
+        )
+        .expect("should resolve aliases");
+
+        assert_eq!(
+            required,
+            [
+                RequiredPrebidUserIdModule {
+                    config_name: "pubCommonId".to_string(),
+                    module_name: "sharedIdSystem".to_string(),
+                },
+                RequiredPrebidUserIdModule {
+                    config_name: "sharedId".to_string(),
+                    module_name: "sharedIdSystem".to_string(),
+                },
+            ],
+            "should retain each managed name while allowing a shared module"
+        );
+    }
+
+    #[test]
+    fn checked_in_registry_resolves_identity_link() {
+        let current_dir = env::current_dir().expect("should read current directory");
+        let js_lib_dir = find_js_lib_dir(&current_dir).expect("should locate JS library");
+        let (registry_path, registry) =
+            load_user_id_registry(&js_lib_dir).expect("should load checked-in registry");
+
+        let required = resolve_managed_user_id_modules(
+            &["identityLink".to_string()],
+            &registry,
+            &registry_path,
+        )
+        .expect("should resolve checked-in identityLink entry");
+
+        assert_eq!(
+            required,
+            [RequiredPrebidUserIdModule {
+                config_name: "identityLink".to_string(),
+                module_name: "identityLinkIdSystem".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn unknown_managed_name_identifies_name_and_registry() {
+        let registry = PrebidUserIdModuleRegistry { modules: Vec::new() };
+        let registry_path = Path::new("registry/user_id_modules.json");
+
+        let error = resolve_managed_user_id_modules(
+            &["unknownId".to_string()],
+            &registry,
+            registry_path,
+        )
+        .expect_err("should reject unknown name");
+
+        assert!(error.contains("unknownId"), "should identify the name: {error}");
+        assert!(
+            error.contains(&registry_path.display().to_string()),
+            "should identify the registry: {error}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_managed_name_lists_sorted_candidate_modules() {
+        let registry = PrebidUserIdModuleRegistry {
+            modules: vec![
+                PrebidUserIdModuleRegistryEntry {
+                    module_name: "zetaIdSystem".to_string(),
+                    config_names: vec!["ambiguousId".to_string()],
+                },
+                PrebidUserIdModuleRegistryEntry {
+                    module_name: "alphaIdSystem".to_string(),
+                    config_names: vec!["ambiguousId".to_string()],
+                },
+                PrebidUserIdModuleRegistryEntry {
+                    module_name: "zetaIdSystem".to_string(),
+                    config_names: vec!["ambiguousId".to_string()],
+                },
+            ],
+        };
+        let registry_path = Path::new("registry/user_id_modules.json");
+
+        let error = resolve_managed_user_id_modules(
+            &["ambiguousId".to_string()],
+            &registry,
+            registry_path,
+        )
+        .expect_err("should reject ambiguous name");
+
+        assert!(error.contains("ambiguousId"), "should identify the name: {error}");
+        assert!(
+            error.contains("alphaIdSystem, zetaIdSystem"),
+            "should list sorted unique candidates: {error}"
+        );
+        assert!(
+            error.contains(&registry_path.display().to_string()),
+            "should identify the registry: {error}"
+        );
+    }
+
+    #[test]
+    fn empty_managed_names_require_no_modules() {
+        let registry = PrebidUserIdModuleRegistry { modules: Vec::new() };
+
+        let required = resolve_managed_user_id_modules(
+            &[],
+            &registry,
+            Path::new("user_id_modules.json"),
+        )
+        .expect("should accept no managed names");
+
+        assert!(required.is_empty());
     }
 
     #[test]
