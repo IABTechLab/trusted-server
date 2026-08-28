@@ -701,6 +701,8 @@ impl IntegrationRegistrationBuilder {
     #[must_use]
     pub fn with_deferred_js(mut self) -> Self {
         self.registration.js_deferred = true;
+        self.registration.js_disabled = false;
+        self.registration.js_standalone = false;
         self
     }
 
@@ -709,6 +711,7 @@ impl IntegrationRegistrationBuilder {
     pub fn without_js(mut self) -> Self {
         self.registration.js_disabled = true;
         self.registration.js_deferred = false;
+        self.registration.js_standalone = false;
         self
     }
 
@@ -721,6 +724,10 @@ impl IntegrationRegistrationBuilder {
 
     /// Serve the module standalone only; see
     /// [`IntegrationRegistration::js_standalone`].
+    ///
+    /// The three delivery flags are exclusive and the last builder call wins,
+    /// so this clears the disabled and deferred flags as those methods clear
+    /// this one.
     #[must_use]
     pub fn with_standalone_js(mut self) -> Self {
         self.registration.js_standalone = true;
@@ -847,7 +854,9 @@ impl IntegrationRegistry {
     ///
     /// # Errors
     ///
-    /// Returns an error if route registration fails due to duplicate routes or invalid paths.
+    /// Returns an error if route registration fails due to duplicate routes or
+    /// invalid paths, or when a registration carries a browser module whose
+    /// declared SHA-256 does not match its source.
     ///
     /// # Panics
     ///
@@ -862,8 +871,9 @@ impl IntegrationRegistry {
     /// # Errors
     ///
     /// Returns an error when two builders claim the same integration id, when
-    /// route registration fails due to duplicate routes or invalid paths, or
-    /// when a builder fails.
+    /// route registration fails due to duplicate routes or invalid paths, when
+    /// a builder fails, or when a registration carries a browser module whose
+    /// declared SHA-256 does not match its source.
     ///
     /// # Panics
     ///
@@ -966,11 +976,14 @@ impl IntegrationRegistry {
                 if let Some(module) = registration.js_module {
                     // The served `?v=` hash and its memo trust this value, so a
                     // stale literal is a startup error rather than a stale script.
+                    // On Fastly the registry is built per request, so this costs
+                    // one SHA-256 of each carried module per request there, and
+                    // once per process on the other adapters.
                     let actual = hex::encode(Sha256::digest(module.source.as_bytes()));
                     if actual != module.sha256 {
                         return Err(Report::new(TrustedServerError::Configuration {
                             message: format!(
-                                "integration `{}` carries a browser module whose declared SHA-256 does not match its source (declared {}, actual {actual})",
+                                "Integration `{}` carries a browser module whose declared SHA-256 does not match its source (declared {}, actual {actual})",
                                 registration.integration_id, module.sha256
                             ),
                         }));
@@ -1288,7 +1301,6 @@ impl IntegrationRegistry {
 
         for id in &self.inner.enabled_integration_ids {
             if self.js_part(id).is_some()
-                && !self.inner.disabled_js_ids.contains(id)
                 && !self.inner.standalone_js_ids.contains(id)
                 && !ids.contains(id)
             {
@@ -1309,7 +1321,8 @@ impl IntegrationRegistry {
 
     /// The module part for one id: the registration that carries it, else
     /// the compile-time module, for an enabled integration or an always-on
-    /// core module (`core`, `creative`). `None` when nothing serves that id.
+    /// core module (`core`, `creative`). `None` when nothing serves that id
+    /// or the integration registered without JS.
     ///
     /// # Examples
     ///
@@ -1323,6 +1336,9 @@ impl IntegrationRegistry {
     /// ```
     #[must_use]
     pub fn js_part(&self, id: &'static str) -> Option<crate::tsjs_bundle::JsModulePart> {
+        if self.inner.disabled_js_ids.contains(&id) {
+            return None;
+        }
         if let Some((carried_id, module)) = self
             .inner
             .carried_js
@@ -1341,15 +1357,11 @@ impl IntegrationRegistry {
         crate::tsjs_bundle::JsModulePart::compile_time(id)
     }
 
-    /// Ids of enabled modules served standalone only.
+    /// Ids of enabled modules served standalone only. Only enabled
+    /// registrations reach the construction loop, so every id here is enabled.
     #[must_use]
     pub fn js_standalone_ids(&self) -> Vec<&'static str> {
-        self.inner
-            .standalone_js_ids
-            .iter()
-            .copied()
-            .filter(|id| self.integration_enabled(id))
-            .collect()
+        self.inner.standalone_js_ids.clone()
     }
 
     /// Parts of the unified bundle: core, then every immediate module.
@@ -2773,8 +2785,8 @@ mod tests {
                 "prebid",
                 &serde_json::json!({
                     "enabled": true,
-                    "server_url": "https://test-prebid.com/openrtb2/auction",
-                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
+                    "server_url": "https://prebid.example.com/openrtb2/auction",
+                    "external_bundle_url": "https://assets.example.com/prebid/trusted-prebid.js",
                 }),
             )
             .expect("should insert prebid config");
@@ -2796,6 +2808,8 @@ mod tests {
         )
     }
 
+    const ZERO_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
     fn lying_probe_registration(
         _settings: &Settings,
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
@@ -2803,8 +2817,22 @@ mod tests {
             IntegrationRegistration::builder("probe")
                 .with_js_module(CarriedJsModule {
                     source: PROBE_JS,
-                    sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+                    sha256: ZERO_SHA256,
                 })
+                .build(),
+        ))
+    }
+
+    fn disabled_carried_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("probe")
+                .with_js_module(CarriedJsModule {
+                    source: PROBE_JS,
+                    sha256: PROBE_JS_SHA256,
+                })
+                .without_js()
                 .build(),
         ))
     }
@@ -2868,6 +2896,85 @@ mod tests {
         assert!(
             message.contains("probe") && message.contains("does not match"),
             "error should name the integration and say the hash does not match: {message}"
+        );
+        assert!(
+            message.contains(ZERO_SHA256) && message.contains(PROBE_JS_SHA256),
+            "error should quote the declared and the actual hash: {message}"
+        );
+    }
+
+    #[test]
+    fn js_part_is_none_for_an_integration_registered_without_js() {
+        // The carried lookup would answer `Some` on its own, so this proves the
+        // disabled check runs first. No built-in integration can stand in: the
+        // only `without_js` built-in with a Rust registration, `aps`, has no
+        // compile-time module either.
+        let settings = crate::test_support::tests::create_test_settings();
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            disabled_carried_probe_registration,
+            validate_nothing,
+        )];
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build registry");
+
+        assert!(
+            registry.integration_enabled("probe"),
+            "should still register the integration"
+        );
+        assert!(
+            registry.js_part("probe").is_none(),
+            "should not serve a module for an integration registered without JS"
+        );
+        assert!(
+            !registry.js_module_ids().contains(&"probe"),
+            "should keep a without-JS integration out of the bundle module ids"
+        );
+    }
+
+    #[test]
+    fn the_last_js_delivery_flag_set_on_the_builder_wins() {
+        let disabled_last = IntegrationRegistration::builder("probe")
+            .with_standalone_js()
+            .without_js()
+            .build();
+        assert!(
+            disabled_last.js_disabled && !disabled_last.js_standalone && !disabled_last.js_deferred,
+            "without_js after with_standalone_js should leave only disabled set"
+        );
+
+        let deferred_last = IntegrationRegistration::builder("probe")
+            .with_standalone_js()
+            .with_deferred_js()
+            .build();
+        assert!(
+            deferred_last.js_deferred && !deferred_last.js_standalone && !deferred_last.js_disabled,
+            "with_deferred_js after with_standalone_js should leave only deferred set"
+        );
+
+        let deferred_after_disabled = IntegrationRegistration::builder("probe")
+            .without_js()
+            .with_deferred_js()
+            .build();
+        assert!(
+            deferred_after_disabled.js_deferred
+                && !deferred_after_disabled.js_disabled
+                && !deferred_after_disabled.js_standalone,
+            "with_deferred_js after without_js should leave only deferred set"
+        );
+
+        let standalone_last = IntegrationRegistration::builder("probe")
+            .without_js()
+            .with_deferred_js()
+            .with_standalone_js()
+            .build();
+        assert!(
+            standalone_last.js_standalone
+                && !standalone_last.js_disabled
+                && !standalone_last.js_deferred,
+            "with_standalone_js last should leave only standalone set"
         );
     }
 
