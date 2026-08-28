@@ -10,7 +10,9 @@ use edgezero_core::http::{
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::auction::{
+    AuctionOrchestrator, AuctionProviderBuilder, build_orchestrator_with_providers,
+};
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
@@ -19,7 +21,9 @@ use trusted_server_core::ec::admin::{
 use trusted_server_core::ec::provider::ensure_provider_available;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
-use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
+use trusted_server_core::integrations::{
+    IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput,
+};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -77,6 +81,27 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_with_registrations(settings, &[], &[])
+}
+
+/// Build the application state from explicit settings, composing the built-in
+/// integrations and auction providers with the externally supplied builders in
+/// `integrations` and `auction_providers`.
+///
+/// A deployment that ships a vendor crate calls this to add that crate's
+/// integration and auction provider builders without the adapter naming the
+/// vendor.
+///
+/// # Errors
+///
+/// Returns an error when the auction orchestrator or the integration registry
+/// fail to initialise, which includes two builders claiming the same
+/// integration id or auction provider name.
+pub fn build_state_with_registrations(
+    settings: Settings,
+    integrations: &[IntegrationBuilder],
+    auction_providers: &[AuctionProviderBuilder],
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     // Composition root: reject a provider selection this adapter can never
     // supply, once, before any request is served. The Axum dev server injects
     // no Edge Cookie provider into `RuntimeServices`, so `None` is exactly what
@@ -91,8 +116,8 @@ fn build_state_with_settings(
     // provider that reads no request data. It supplies no host signals either,
     // so the host-signals argument is `None`.
     ensure_provider_available(&settings.ec, None, None)?;
-    let orchestrator = build_orchestrator(&settings)?;
-    let registry = IntegrationRegistry::new(&settings)?;
+    let orchestrator = build_orchestrator_with_providers(&settings, auction_providers)?;
+    let registry = IntegrationRegistry::with_registrations(&settings, integrations)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -632,6 +657,27 @@ impl TrustedServerApp {
         settings: Settings,
     ) -> Result<RouterService, Report<TrustedServerError>> {
         let state = build_state_with_settings(settings)?;
+        Ok(build_router(&state))
+    }
+
+    /// Build the full application router from explicit settings, composing the
+    /// built-in integrations and auction providers with the externally supplied
+    /// builders in `integrations` and `auction_providers`.
+    ///
+    /// The route table is the one [`TrustedServerApp::routes_with_settings`]
+    /// builds, so a composed deployment routes exactly as the plain one does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the auction orchestrator or the integration
+    /// registry fail to initialise, which includes two builders claiming the
+    /// same integration id or auction provider name.
+    pub fn routes_with_registrations(
+        settings: Settings,
+        integrations: &[IntegrationBuilder],
+        auction_providers: &[AuctionProviderBuilder],
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_registrations(settings, integrations, auction_providers)?;
         Ok(build_router(&state))
     }
 }

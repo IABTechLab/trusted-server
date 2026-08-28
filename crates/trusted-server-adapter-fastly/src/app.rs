@@ -102,7 +102,9 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::auction::{
+    AuctionOrchestrator, AuctionProviderBuilder, build_orchestrator_with_providers,
+};
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::EcContext;
@@ -120,8 +122,8 @@ use trusted_server_core::ec::resolve::handle_ec_resolve;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
-    IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
-    RequestFilterRegistryOutcome,
+    IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects,
+    RequestFilterRegistryInput, RequestFilterRegistryOutcome,
 };
 use trusted_server_core::permissions::PermissionState;
 use trusted_server_core::platform::{
@@ -207,6 +209,27 @@ pub(crate) fn load_settings_from_config_store(
 pub(crate) fn build_state_from_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_with_registrations(settings, &[], &[])
+}
+
+/// Build the application state from explicit settings, composing the built-in
+/// integrations and auction providers with the externally supplied builders in
+/// `integrations` and `auction_providers`.
+///
+/// A deployment that ships a vendor crate calls this to add that crate's
+/// integration and auction provider builders without the adapter naming the
+/// vendor.
+///
+/// # Errors
+///
+/// Returns an error when the auction orchestrator or the integration registry
+/// fail to initialise, which includes two builders claiming the same
+/// integration id or auction provider name.
+pub(crate) fn build_state_with_registrations(
+    settings: Settings,
+    integrations: &[IntegrationBuilder],
+    auction_providers: &[AuctionProviderBuilder],
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     warn_if_certificate_check_disabled(&settings);
 
     // Composition root: resolve the provider selection once, before any request
@@ -227,9 +250,8 @@ pub(crate) fn build_state_from_settings(
         Some(Arc::new(FastlyHostSignals::default())),
         None,
     )?;
-
-    let orchestrator = build_orchestrator(&settings)?;
-    let registry = IntegrationRegistry::new(&settings)?;
+    let orchestrator = build_orchestrator_with_providers(&settings, auction_providers)?;
+    let registry = IntegrationRegistry::with_registrations(&settings, integrations)?;
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;

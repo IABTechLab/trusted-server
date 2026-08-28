@@ -13,13 +13,13 @@ use trusted_server_adapter_axum::app::TrustedServerApp;
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
 
-/// Build the full application router from explicit test settings.
+/// Explicit test settings for the route tests.
 ///
 /// The settings baked into the binary contain placeholder secrets that
 /// `get_settings()` rejects by design, which would turn every route into a
 /// startup error page (and its route table into the fallback-only set).
-fn test_router() -> edgezero_core::router::RouterService {
-    let settings = trusted_server_core::settings::Settings::from_toml(
+fn test_settings() -> trusted_server_core::settings::Settings {
+    trusted_server_core::settings::Settings::from_toml(
         r#"
             [[handlers]]
             path = "^/_ts/admin"
@@ -42,9 +42,12 @@ fn test_router() -> edgezero_core::router::RouterService {
             assume_single_jurisdiction = true
         "#,
     )
-    .expect("should parse route test settings");
+    .expect("should parse route test settings")
+}
 
-    TrustedServerApp::routes_with_settings(settings)
+/// Build the full application router from explicit test settings.
+fn test_router() -> edgezero_core::router::RouterService {
+    TrustedServerApp::routes_with_settings(test_settings())
         .expect("should build router from test settings")
 }
 
@@ -890,5 +893,45 @@ fn selecting_a_provider_this_adapter_cannot_supply_fails_at_startup() {
     assert!(
         error.to_string().contains("acme"),
         "the startup error should name the selected provider, got: {error}"
+    );
+}
+
+/// Builds a registration claiming an id a built-in integration already owns.
+fn duplicate_lockr_registration(
+    _settings: &trusted_server_core::settings::Settings,
+) -> Result<
+    Option<trusted_server_core::integrations::IntegrationRegistration>,
+    error_stack::Report<trusted_server_core::error::TrustedServerError>,
+> {
+    Ok(Some(
+        trusted_server_core::integrations::IntegrationRegistration::builder("lockr").build(),
+    ))
+}
+
+fn validate_nothing(
+    _settings: &trusted_server_core::settings::Settings,
+) -> Result<bool, error_stack::Report<trusted_server_core::error::TrustedServerError>> {
+    Ok(true)
+}
+
+#[test]
+fn routes_with_registrations_rejects_a_duplicate_integration_id_naming_both_sources() {
+    let extra = [trusted_server_core::integrations::IntegrationBuilder::new(
+        "lockr",
+        "seam-probe",
+        duplicate_lockr_registration,
+        validate_nothing,
+    )];
+
+    let error = TrustedServerApp::routes_with_registrations(test_settings(), &extra, &[])
+        .err()
+        .expect("should reject a duplicate integration id supplied through the adapter");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("lockr")
+            && message.contains("trusted-server-core")
+            && message.contains("seam-probe"),
+        "error should name the id and both sources: {message}"
     );
 }
