@@ -76,6 +76,7 @@ fail and the service will return its startup-error response.
 | `[publisher]`         | Domain, origin, proxy settings               |
 | `[trusted_client_ip]` | Authenticated client-IP forwarding           |
 | `[ec]`                | Edge Cookie (EC) ID generation               |
+| `[geo]`               | Which module resolves location, if any       |
 | `[tester_cookie]`     | Optional tester-cookie endpoint              |
 | `[device]`            | Device classification provider selection     |
 | `[geo]`               | Geolocation provider selection               |
@@ -650,6 +651,67 @@ A provider advertises the technical permissions its data use requires, and Trust
 ### Country and region rules (`permissions.yaml`)
 
 The country and region permission rules are defined in a human-editable permissions YAML document, compiled into the build (not loaded at runtime). The repository sample is `config/permissions/vanilla.yaml`. Edit or replace the compiled-in file and rebuild to change the policy. There is no `[permissions]` block in `trusted-server.toml`. It defines named **groups** (baselines such as `gdpr-eu`, `gdpr-uk`, `us-opt-out`) and **rules** that map a country or country/state to a group, with an optional `permissions` map that overrides single Data Uses (`granted`, `requires_signal`, or `denied`). A request that matches no rule resolves at the top of the rules tree. See the [Permission Model](/guide/permission-model) for the schema and the repository sample.
+
+## Geo Configuration
+
+Which module resolves a visitor's location, if any. The whole section is
+optional. What resolves location feeds the Edge Cookie context and the device
+information sent with an auction request, so the selector changes what those
+see.
+
+### `[geo]`
+
+| Field      | Type   | Required | Description                                                                                                 |
+| ---------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------- |
+| `provider` | String | No       | `none`, or the id of a registered module that supplies a geo provider. Leave it out to keep the host lookup |
+
+The selector has three states.
+
+**Unset**, which is the whole section left out or written without `provider`.
+The adapter's own host lookup stands, which is what every adapter ships with,
+so a deployment that says nothing about geo behaves as it did before the
+selector existed.
+
+**`none`**, which resolves no location at all. Every lookup returns nothing on
+every platform, whatever the host could have reported. Choose this when the
+deployment must not derive a location from a visitor's address.
+
+```toml
+[geo]
+provider = "none"
+```
+
+**A module id**, which has that module resolve location for every request
+instead of the host. The id is the integration id, which is also the name of
+the module's own configuration block, so the two names match.
+
+```toml
+[geo]
+provider = "example_geo"
+
+[integrations.example_geo]
+enabled = true
+```
+
+#### When the selector names something that cannot supply a provider
+
+The application refuses to build and the message names the module and the reason, in three cases. Every adapter treats this as a startup error, and because the Fastly adapter builds the application per request, it shows there on every request rather than once.
+
+- The module is not registered at all. The message also lists the registered
+  modules that do supply a geo provider, so a typo is easy to spot.
+- The module is registered but not enabled, so its geo provider was never
+  built. Enable the module in its own `[integrations.<id>]` block, or point
+  the selector elsewhere.
+- The module is enabled but supplies no geo provider. Not every module offers
+  one, and a module that does not cannot be selected.
+
+Refusing to build is deliberate, because a deployment that asked for a
+specific location source should not quietly fall back to the host's.
+
+A module that supplies a geo provider the selector does not name is not an
+error. The module registers as usual and startup logs a warning saying the
+module supplies a geo provider that `[geo] provider` does not select, so an
+operator can see a capability that is shipped and unused.
 
 ## Response Headers
 

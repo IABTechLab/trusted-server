@@ -24,6 +24,7 @@ crates/
     fastly/                             # trusted-server-device-fastly (opt-in TLS/H2 device provider)
   edgecookie/                           # vendor Edge Cookie provider crates (built-in HMAC provider is in core)
   geo/                                  # vendor geo provider crates (host geo is injected by the adapter)
+  integrations/                         # Integration modules that ship outside core (seam-probe)
   trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```
@@ -398,6 +399,25 @@ IntegrationRegistration::builder(ID)
 - `creative` is JS-only (no Rust registration); `nextjs`, `aps`, `adserver_mock` are Rust-only.
 - Integrations opt into deferred loading via `.with_deferred_js()` on the registration builder. Deferred modules are served as separate `<script defer>` tags instead of being concatenated into the main bundle.
 - `IntegrationRegistry::js_module_ids_immediate()` returns modules for the main bundle; `js_module_ids_deferred()` returns modules loaded with `defer`.
+
+### Pluggable Capabilities
+
+Each capability below is composed from builders, so a deployment can add one
+from a crate core does not name:
+
+| Capability         | Trait / type                                                              | Selector                                                                                                     | Built-in (core)                                                       | Vendor crates                  |
+| ------------------ | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- | ------------------------------ |
+| Integration module | `IntegrationBuilder` (`integrations/mod.rs`)                              | `[integrations.<id>]` enables it; adapters add outside builders through `routes_with_registrations` / `build_state_with_registrations` | `BUILT_IN_BUILDERS` (prebid, aps, nextjs, datadome, didomi, lockr, ...) | `crates/integrations/<vendor>` |
+| Auction provider   | `AuctionProviderBuilder` (`auction/mod.rs`)                               | `[auction] providers`                                                                                        | prebid, aps, adserver_mock                                            | `crates/integrations/<vendor>` |
+| Geo / location     | `PlatformGeo` (`platform/traits.rs`), declared with `.with_geo_provider()` | `[geo] provider`                                                                                             | host lookup when unset, `none` for `DisabledGeo`                      | `crates/integrations/<vendor>` |
+
+- A vendor crate supplies its id, its source label, a build function, a
+  validate function and optionally a request preparer. Duplicate ids or
+  provider names are refused at startup, naming both sources.
+- `crates/integrations/seam-probe` is the worked example, driven end to end by
+  `crates/trusted-server-adapter-axum/tests/seam_probe.rs`.
+- A vendor's validate function does **not** run through `ts config validate` or
+  `ts config push`, which use the built-in builders only.
 
 ## JS Build Pipeline
 
