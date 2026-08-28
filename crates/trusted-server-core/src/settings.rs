@@ -790,8 +790,11 @@ impl EcProviders {
 
 /// Configuration for the built-in HMAC Edge Cookie provider.
 ///
-/// Mapped from the `[ec.providers.hmac]` TOML block.
+/// Mapped from the `[ec.providers.hmac]` TOML block. Unknown keys are
+/// rejected, so a mistyped setting fails at startup instead of being accepted
+/// silently and leaving the intended setting at its default.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct HmacProviderConfig {
     /// Publisher passphrase used as the HMAC key for EC generation.
     #[validate(custom(function = Ec::validate_passphrase))]
@@ -5230,6 +5233,27 @@ mod tests {
             ),
             "should be a configuration error, got: {:?}",
             err.current_context()
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_in_the_hmac_provider_block_is_rejected() {
+        // A mistyped key in a provider block used to be dropped silently, which
+        // leaves the setting the operator meant to change at its default.
+        let toml_str = crate_test_settings_str().replace(
+            "passphrase = \"test-secret-key-32-bytes-minimum\"",
+            "passphrase = \"test-secret-key-32-bytes-minimum\"\n            typo_key = \"x\"",
+        );
+        assert!(
+            toml_str.contains("typo_key"),
+            "the test configuration should carry the unknown key"
+        );
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("an unknown key in [ec.providers.hmac] should be rejected");
+        assert!(
+            format!("{err:?}").contains("typo_key"),
+            "should name the unknown key: {err:?}"
         );
     }
 
