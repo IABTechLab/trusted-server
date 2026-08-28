@@ -1,4 +1,6 @@
 use std::sync::Arc;
+
+use rand::Rng as _;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
@@ -346,17 +348,12 @@ fn edgezero_main(mut req: FastlyRequest) {
     );
     // The asset/admin/error fallback path: no `EcFinalizeState` (or the ec
     // finalize branch above failed), so there is no pull-sync dispatch here
-    // at all — telemetry is the only post-send step. Reload settings when
-    // `app_state` never built, matching the fallback used earlier in this
-    // function for entry-point finalize headers.
-    match settings_snapshot.as_deref() {
-        Some(settings) => emit_access_telemetry_after_send(settings, &outcome, &timings),
-        None => match load_settings_from_config_store() {
-            Ok(settings) => emit_access_telemetry_after_send(&settings, &outcome, &timings),
-            Err(e) => {
-                log::warn!("access telemetry emission skipped: failed to reload settings: {e:?}");
-            }
-        },
+    // at all — telemetry is the only post-send step. When `app_state` never
+    // built there is nothing to emit either: `access_telemetry_enabled` was
+    // necessarily false without a settings snapshot, so the outcome carries
+    // no access snapshot, and reloading settings here could not change that.
+    if let Some(settings) = settings_snapshot.as_deref() {
+        emit_access_telemetry_after_send(settings, &outcome, &timings);
     }
 }
 
@@ -458,9 +455,9 @@ fn run_edgezero_pull_sync_after_send(
 /// either of those per-route types, so every response class can emit.
 ///
 /// Sampled-out requests return silently — that is the expected, high-volume
-/// case and not worth a log line. A snapshot carrying a degraded
-/// `sample_rate` (see [`should_sample_access_row`]) also returns silently,
-/// since it only occurs on an already-degraded path. Every other drop (row
+/// case and not worth a log line. The sampling roll uses the rate stored on
+/// the snapshot itself, so the emission probability always matches the
+/// row's `sample_rate` column by construction. Every other drop (row
 /// build, token load, send, or non-2xx status — all folded into
 /// `emit_access_event`'s `Result`) logs exactly one warning naming the
 /// reason.
@@ -483,20 +480,12 @@ fn emit_access_telemetry_after_send(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let epoch_ms = u64::try_from(since_epoch.as_millis()).unwrap_or(u64::MAX);
-    // Entropy for the sampling decision: the timestamp's nanosecond
-    // resolution XORed with a per-request value already on hand
-    // (`outcome.bytes`), so two requests handled in the same instance never
-    // collide on sampling decisions purely because they read the same
-    // millisecond. There is no `rand` crate dependency here — see
-    // `tinybird::sampled_in`.
-    let entropy_nanos = u64::try_from(since_epoch.as_nanos()).unwrap_or(u64::MAX);
-    let entropy = entropy_nanos ^ outcome.bytes;
-
-    if !should_sample_access_row(
-        snapshot.sample_rate,
-        settings.tinybird.access_sample_rate,
-        entropy,
-    ) {
+    // Sample with the rate stored on the snapshot itself — the same value
+    // serialized into the row's `sample_rate` column — so the emission
+    // probability and the row's claimed rate cannot diverge, which the
+    // documented `sum(1.0 / sample_rate)` volume estimator depends on.
+    let roll = rand::thread_rng().r#gen::<f64>();
+    if !tinybird::sampled_in(snapshot.sample_rate, roll) {
         return;
     }
 
@@ -510,39 +499,6 @@ fn emit_access_telemetry_after_send(
     if let Err(error) = result {
         log::warn!("access telemetry emission dropped: {error:?}");
     }
-}
-
-/// Whether one response's access-telemetry row should be emitted, combining
-/// the degraded-snapshot guard with the sampling roll.
-///
-/// `snapshot_sample_rate` is the rate recorded on the [`AccessTelemetrySnapshot`]
-/// itself (the value serialized into the row's `sample_rate` column, which
-/// the documented volume estimator divides by as `1.0 / sample_rate`).
-/// `settings_sample_rate` is the rate used for the sampling decision at
-/// call time. The two can diverge: when `app_state` fails to build,
-/// [`edgezero_main`] captures a snapshot with `sample_rate` defaulted to
-/// `0.0` before any settings ever load, but the two settings-reload
-/// emission sites still gate and sample using the *reloaded* settings'
-/// (nonzero) rate. Without this guard, such a row could be sampled in and
-/// emitted while carrying `sample_rate: 0.0`, corrupting the volume
-/// estimator. Dropping these rows is acceptable: they only occur on an
-/// already-degraded path, consistent with this pipeline's fail-quiet
-/// telemetry policy. Split out of [`emit_access_telemetry_after_send`] so
-/// the guard is unit-testable without a network seam.
-///
-/// Callers must already have applied the coarse
-/// `tinybird.enabled`/`access_enabled` gate.
-#[must_use]
-fn should_sample_access_row(
-    snapshot_sample_rate: f64,
-    settings_sample_rate: f64,
-    entropy: u64,
-) -> bool {
-    if snapshot_sample_rate <= 0.0 {
-        return false;
-    }
-
-    tinybird::sampled_in(settings_sample_rate, entropy)
 }
 
 /// Per-response context threaded into [`send_edgezero_response`] so the
@@ -568,11 +524,12 @@ struct SendContext {
 }
 
 /// Outcome of handing a finalized response to the client.
-#[allow(dead_code)]
 pub(crate) struct DeliveryOutcome {
     /// Response body size in bytes.
     pub bytes: u64,
-    /// Whether delivery completed or failed partway.
+    /// Whether delivery completed or failed partway. Collected as
+    /// groundwork; not yet emitted on any surface.
+    #[allow(dead_code)]
     pub result: DeliveryResult,
     /// Access-telemetry dimensions captured for this response at the
     /// freeze point. `None` when access telemetry was disabled at snapshot
@@ -672,6 +629,11 @@ fn drive_streaming_body<W: std::io::Write>(
 /// A drive that failed after writing at least one byte delivered a truncated
 /// response rather than nothing at all, so it is [`DeliveryResult::Partial`],
 /// not [`DeliveryResult::Error`].
+///
+/// The `Ok(())` arm exists for the classifier's totality, not for the
+/// production caller: `send_edgezero_response` consumes this value only in
+/// its `Err` branch and re-derives the success outcome from
+/// `streaming_body.finish()`.
 fn classify_stream_delivery(
     drive_result: &Result<(), Report<TrustedServerError>>,
     bytes: u64,
@@ -1036,7 +998,6 @@ mod tests {
     use edgezero_core::http::HeaderValue;
     use edgezero_core::http::response_builder;
     use fastly::mime;
-    use std::sync::Mutex;
     use std::time::Duration;
     use trusted_server_core::integrations::HeaderMutation;
     use trusted_server_core::request_timing::AuctionWaitPlacement;
@@ -1760,83 +1721,14 @@ mod tests {
         );
     }
 
-    /// Records `"telemetry"` into a shared order log instead of sending a
-    /// real request, standing in for the adapter's platform HTTP client in
-    /// [`post_send_order_is_elapsed_then_pull_sync_then_telemetry`].
-    struct OrderingHttpClient {
-        log: Arc<Mutex<Vec<&'static str>>>,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl trusted_server_core::platform::PlatformHttpClient for OrderingHttpClient {
-        async fn send(
-            &self,
-            _request: trusted_server_core::platform::PlatformHttpRequest,
-        ) -> Result<
-            trusted_server_core::platform::PlatformResponse,
-            Report<trusted_server_core::platform::PlatformError>,
-        > {
-            self.log
-                .lock()
-                .expect("should lock order log")
-                .push("telemetry");
-            let response = response_builder()
-                .status(edgezero_core::http::StatusCode::ACCEPTED)
-                .body(EdgeBody::empty())
-                .expect("should build ordering test response");
-            Ok(trusted_server_core::platform::PlatformResponse::new(
-                response,
-            ))
-        }
-
-        async fn send_async(
-            &self,
-            _request: trusted_server_core::platform::PlatformHttpRequest,
-        ) -> Result<
-            trusted_server_core::platform::PlatformPendingRequest,
-            Report<trusted_server_core::platform::PlatformError>,
-        > {
-            Err(Report::new(
-                trusted_server_core::platform::PlatformError::Unsupported,
-            ))
-        }
-
-        async fn select(
-            &self,
-            _pending_requests: Vec<trusted_server_core::platform::PlatformPendingRequest>,
-        ) -> Result<
-            trusted_server_core::platform::PlatformSelectResult,
-            Report<trusted_server_core::platform::PlatformError>,
-        > {
-            Err(Report::new(
-                trusted_server_core::platform::PlatformError::Unsupported,
-            ))
-        }
-    }
-
     #[test]
-    fn post_send_order_is_elapsed_then_pull_sync_then_telemetry() {
-        // `edgezero_main` cannot be driven directly in a unit test (it
-        // consumes a live `fastly::Request::from_client()`), and
-        // `run_edgezero_pull_sync_after_send` has no injectable seam of its
-        // own — it dispatches through the real identity-graph pull-sync
-        // path, which needs a configured EC KV store, partner registry, and
-        // rate limiter wired together. This test instead exercises the two
-        // REAL functions `edgezero_main` calls that DO have a testable seam
-        // — `send_edgezero_response` (which stamps `request_elapsed` before
-        // returning, per Task 6/7) and `tinybird::emit_access_event` (the
-        // telemetry send added by this task) — around an instrumented
-        // stand-in for the pull-sync dispatch call, in the exact order
-        // `edgezero_main` places them.
-        //
-        // This proves the elapsed-before-telemetry leg from real production
-        // code (the assertion below reads the real `timings` snapshot
-        // between the two calls). The pull-sync-before-telemetry leg is a
-        // source-order invariant in `edgezero_main`'s three call sites
-        // (verified by code review, not by this test) because
-        // `run_edgezero_pull_sync_after_send` itself has no seam to
-        // instrument — see task-8-report.md for this residual.
-        let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    fn request_elapsed_is_stamped_when_send_returns() {
+        // `edgezero_main`'s post-send ordering (pull-sync before telemetry)
+        // is a source-order invariant with no injectable seam, so this test
+        // deliberately proves only the leg that has one: by the time
+        // `send_edgezero_response` returns, `request_elapsed` is already
+        // stamped, so everything `edgezero_main` runs afterwards (pull-sync,
+        // telemetry emission) is excluded from `request_elapsed_ms`.
         let timings = RequestTimings::new();
         let response = response_builder()
             .body(EdgeBody::from("ok"))
@@ -1854,77 +1746,14 @@ mod tests {
                 access_telemetry_enabled: true,
             },
         );
+
         assert!(
             timings.snapshot().request_elapsed_ms.is_some(),
-            "request_elapsed should already be stamped before pull-sync/telemetry run"
-        );
-
-        // Stand-in for `run_edgezero_pull_sync_after_send`, which has no
-        // injectable seam (see the test doc comment above).
-        log.lock().expect("should lock order log").push("pull_sync");
-
-        let http_client = OrderingHttpClient {
-            log: Arc::clone(&log),
-        };
-        let target = tinybird::TinybirdEventsTarget::from_access_config(
-            trusted_server_core::settings::TinybirdSettings {
-                api_host: "api.us-east.aws.tinybird.co".to_owned(),
-                ..trusted_server_core::settings::TinybirdSettings::default()
-            },
-        );
-        let snapshot = outcome
-            .snapshot
-            .as_ref()
-            .expect("should build a snapshot when access telemetry is enabled");
-        let row = access_event_row(snapshot, &timings.snapshot(), 0);
-
-        futures::executor::block_on(tinybird::emit_access_event(&http_client, &target, row))
-            .expect("should send access telemetry");
-
-        assert_eq!(
-            *log.lock().expect("should lock order log"),
-            vec!["pull_sync", "telemetry"],
-            "pull-sync must dispatch before telemetry emits"
-        );
-    }
-
-    #[test]
-    fn should_sample_access_row_rejects_a_degraded_zero_sample_rate() {
-        // A snapshot captured on the app-state-build-failure fallback path
-        // carries `sample_rate: 0.0`. Even when the reloaded settings' rate
-        // would sample every request in (1.0), the row must not emit —
-        // otherwise it would claim `sample_rate: 0.0` and corrupt the
-        // `sum(1.0 / sample_rate)` volume estimator.
-        assert!(
-            !should_sample_access_row(0.0, 1.0, 0),
-            "a snapshot with sample_rate 0.0 must never emit, regardless of entropy or settings' rate"
+            "request_elapsed should be stamped by the time send returns"
         );
         assert!(
-            !should_sample_access_row(0.0, 1.0, u64::MAX),
-            "the degraded-rate guard must not depend on the entropy value"
-        );
-    }
-
-    #[test]
-    fn should_sample_access_row_rejects_a_negative_sample_rate() {
-        assert!(
-            !should_sample_access_row(-1.0, 1.0, 0),
-            "a negative snapshot sample_rate is equally degraded and must not emit"
-        );
-    }
-
-    #[test]
-    fn should_sample_access_row_defers_to_the_settings_sampling_roll_when_not_degraded() {
-        // With a healthy (nonzero) snapshot sample_rate, the outcome should
-        // match `tinybird::sampled_in` exactly, since that is the only
-        // remaining decision.
-        assert!(
-            should_sample_access_row(0.25, 1.0, 0),
-            "a settings rate of 1.0 always samples in, independent of entropy"
-        );
-        assert!(
-            !should_sample_access_row(0.25, 0.0, 0),
-            "a settings rate of 0.0 always samples out, independent of the snapshot's rate"
+            outcome.snapshot.is_some(),
+            "the access snapshot should exist for the enabled context"
         );
     }
 }

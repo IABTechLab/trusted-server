@@ -236,39 +236,26 @@ impl AuctionTelemetrySink for FastlyTinybirdAuctionTelemetrySink {
 // Access telemetry: confirmed-delivery emitter
 // ---------------------------------------------------------------------------
 
-/// Bucket count [`sampled_in`] maps `entropy` into.
-///
-/// Large enough that `rate` values with several significant digits (e.g.
-/// `0.015`) still land in a distinct bucket instead of rounding away, while
-/// staying well inside `u64` range once multiplied by `rate`.
-const ACCESS_SAMPLE_BUCKETS: u64 = 1_000_000;
-
 /// Decides whether one request's access-telemetry row should be emitted.
 ///
-/// `entropy` should vary from request to request — callers derive it from
-/// the wall-clock event timestamp `XORed` with a cheap per-request value (see
-/// the call site in `main.rs`). There is no `rand` crate dependency here:
-/// the wasm32-wasip1 guest has no equivalent to `Math.random()`. Mapping
-/// `entropy % ACCESS_SAMPLE_BUCKETS` into `[0, 1)` and comparing against
-/// `rate` is not cryptographically uniform (the low bits of a timestamp are
-/// not perfectly evenly distributed), but access-telemetry sampling only
-/// needs an approximately even sample, not a provably unbiased one.
+/// `roll` is a uniform draw from `[0, 1)`; callers pass
+/// `rand::thread_rng().r#gen::<f64>()`, which the wasm32-wasip1 guest backs with
+/// real WASI randomness (the EC generation path already relies on this and
+/// the CI wasm release build verifies it). Comparing the draw directly
+/// against `rate` keeps the sampling probability exactly `rate` for every
+/// positive value: there is no bucket quantization, so rates below one in a
+/// million sample proportionally instead of never, and emitted rows'
+/// `sample_rate` matches the probability they were sampled at, which the
+/// `sum(1.0 / sample_rate)` volume estimator depends on.
 ///
-/// `rate <= 0.0` always returns `false` and `rate >= 1.0` always returns
-/// `true`, independent of `entropy`, so both boundary configurations behave
-/// predictably. `0.0` cannot actually occur while `access_enabled` is `true`
-/// (`Settings` validation requires `access_sample_rate > 0.0` in that case),
-/// but this function stays total rather than leaning on that invariant.
+/// `rate <= 0.0` never samples and `rate >= 1.0` always samples, for any
+/// `roll` in `[0, 1)`. `0.0` cannot actually occur while `access_enabled`
+/// is `true` (`Settings` validation requires `access_sample_rate > 0.0` in
+/// that case), but this function stays total rather than leaning on that
+/// invariant.
 #[must_use]
-pub(crate) fn sampled_in(rate: f64, entropy: u64) -> bool {
-    if rate >= 1.0 {
-        return true;
-    }
-    if rate <= 0.0 {
-        return false;
-    }
-    let threshold = (rate * ACCESS_SAMPLE_BUCKETS as f64) as u64;
-    entropy % ACCESS_SAMPLE_BUCKETS < threshold
+pub(crate) fn sampled_in(rate: f64, roll: f64) -> bool {
+    roll < rate
 }
 
 /// Loads and validates the access-log APPEND token from the Fastly secret store.
@@ -963,20 +950,44 @@ mod tests {
     #[test]
     fn sampled_in_boundary_rates_are_unconditional() {
         assert!(
-            sampled_in(1.0, 0),
+            sampled_in(1.0, 0.0),
             "a 1.0 sample rate should always sample in"
         );
         assert!(
-            sampled_in(1.0, u64::MAX),
-            "a 1.0 sample rate should always sample in regardless of entropy"
+            sampled_in(1.0, 0.999_999),
+            "a 1.0 sample rate should sample in for the largest roll"
         );
         assert!(
-            !sampled_in(0.0, 0),
-            "a 0.0 sample rate should never sample in"
+            !sampled_in(0.0, 0.0),
+            "a 0.0 sample rate should never sample in, even on a zero roll"
         );
         assert!(
-            !sampled_in(0.0, u64::MAX),
-            "a 0.0 sample rate should never sample in regardless of entropy"
+            !sampled_in(-1.0, 0.0),
+            "a negative rate should never sample in"
+        );
+    }
+
+    #[test]
+    fn sampled_in_keeps_exact_probability_for_tiny_rates() {
+        // The previous bucket-quantized sampler truncated rates below one
+        // in a million to a zero threshold, silently emitting nothing.
+        // Direct comparison keeps every positive rate proportional.
+        let rate = 0.000_000_1;
+        assert!(
+            sampled_in(rate, rate / 2.0),
+            "a roll below a tiny positive rate should sample in"
+        );
+        assert!(
+            !sampled_in(rate, rate * 2.0),
+            "a roll above a tiny positive rate should sample out"
+        );
+        assert!(
+            !sampled_in(0.000_001_9, 0.000_001_95),
+            "no downward quantization: the boundary sits exactly at the rate"
+        );
+        assert!(
+            sampled_in(0.000_001_9, 0.000_001_85),
+            "rolls just under the rate should sample in"
         );
     }
 
