@@ -164,18 +164,23 @@ For upstream `2xx` responses, Trusted Server streams the upstream body to the br
 
 Preserve these upstream response headers when present:
 
-- `Content-Type`
 - `Content-Encoding`
 - `ETag`
 - `Last-Modified`
 - `Vary`
 - `Cache-Control` when neither integration-level nor per-asset `cache_ttl_seconds` is set
 
-Set this response header:
+Set these response headers:
 
 ```http
+Content-Type: application/javascript; charset=utf-8
+X-Content-Type-Options: nosniff
 X-TS-JS-Asset-Proxy: true
 ```
+
+Do not preserve the upstream `Content-Type`. The configured upstream controls the
+response bytes, but it must not be able to serve an HTML document or other
+sniffable content from the publisher origin. The body remains unchanged.
 
 For `Cache-Control`, resolve the downstream cache policy as follows:
 
@@ -340,7 +345,7 @@ Add unit tests covering:
 - non-HTTPS origins are rejected;
 - exact configured routes are registered;
 - request path selects the correct asset;
-- upstream `2xx` response streams body and sets expected headers;
+- upstream `2xx` response streams the unchanged body, pins the JavaScript content type, and sets `X-Content-Type-Options: nosniff`;
 - upstream `Cache-Control` is preserved when no cache TTL override is configured;
 - configured cache TTL overrides upstream `Cache-Control`;
 - upstream fetch failure returns `502` with `X-TS-Error: js-asset-origin-unreachable`;

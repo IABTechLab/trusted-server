@@ -31,6 +31,8 @@ use crate::settings::{IntegrationConfig, Settings};
 pub(crate) const JS_ASSET_PROXY_INTEGRATION_ID: &str = "js_asset_proxy";
 const HEADER_X_TS_JS_ASSET_PROXY: &str = "X-TS-JS-Asset-Proxy";
 const HEADER_X_TS_ERROR: &str = "X-TS-Error";
+const JS_ASSET_CONTENT_TYPE: &str = "application/javascript; charset=utf-8";
+const X_CONTENT_TYPE_OPTIONS_NOSNIFF: &str = "nosniff";
 const ERROR_ORIGIN_UNREACHABLE: &str = "js-asset-origin-unreachable";
 const ERROR_ORIGIN_STATUS: &str = "js-asset-origin-status";
 
@@ -365,7 +367,6 @@ impl JsAssetProxyIntegration {
     ) -> Response<EdgeBody> {
         let (parts, body) = response.into_parts();
         let status = parts.status;
-        let content_type = parts.headers.get(header::CONTENT_TYPE).cloned();
         let content_encoding = parts.headers.get(header::CONTENT_ENCODING).cloned();
         let etag = parts.headers.get(header::ETAG).cloned();
         let last_modified = parts.headers.get(header::LAST_MODIFIED).cloned();
@@ -379,12 +380,17 @@ impl JsAssetProxyIntegration {
             HEADER_X_TS_JS_ASSET_PROXY,
             http::HeaderValue::from_static("true"),
         );
+        // Upstream bytes are served from the publisher origin, so the upstream
+        // cannot choose a document MIME type or opt into browser MIME sniffing.
+        finalized.headers_mut().insert(
+            header::CONTENT_TYPE,
+            http::HeaderValue::from_static(JS_ASSET_CONTENT_TYPE),
+        );
+        finalized.headers_mut().insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            http::HeaderValue::from_static(X_CONTENT_TYPE_OPTIONS_NOSNIFF),
+        );
 
-        if let Some(content_type) = content_type {
-            finalized
-                .headers_mut()
-                .insert(header::CONTENT_TYPE, content_type);
-        }
         if let Some(content_encoding) = content_encoding {
             finalized
                 .headers_mut()
@@ -558,7 +564,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::constants::{HEADER_REFERER, HEADER_X_FORWARDED_FOR, HEADER_X_TS_EC};
-    use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
+    use crate::html_processor::{BodyCloseInjection, HtmlProcessorConfig, create_html_processor};
     use crate::integrations::{
         AttributeRewriteAction, IntegrationAttributeRewriter, IntegrationRegistry,
     };
@@ -616,6 +622,8 @@ mod tests {
 
     fn process_html_with_registry(html: &str, integrations: IntegrationRegistry) -> String {
         let processor = create_html_processor(HtmlProcessorConfig {
+            csp_nonce_observed: None,
+            body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "publisher.example.com".to_string(),
             request_scheme: "https".to_string(),
@@ -1113,7 +1121,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_response_preserves_body_and_expected_headers() {
+    fn successful_response_preserves_body_and_controls_expected_headers() {
         let mut configured_asset = asset(
             "/assets/vendor.js",
             "https://cdn.example.com/vendor.js",
@@ -1124,7 +1132,7 @@ mod tests {
             JsAssetProxyIntegration::new(config_with_assets(vec![configured_asset.clone()]));
         let upstream = Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/javascript")
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .header(header::CONTENT_ENCODING, "gzip")
             .header(header::ETAG, "\"asset-etag\"")
             .header(header::LAST_MODIFIED, "Tue, 10 Jun 2026 00:00:00 GMT")
@@ -1149,7 +1157,14 @@ mod tests {
                 .headers()
                 .get(header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok()),
-            Some("application/javascript")
+            Some(JS_ASSET_CONTENT_TYPE)
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|value| value.to_str().ok()),
+            Some(X_CONTENT_TYPE_OPTIONS_NOSNIFF)
         );
         assert_eq!(
             response
@@ -1189,6 +1204,13 @@ mod tests {
         assert!(
             response.headers().get(header::SET_COOKIE).is_none(),
             "Set-Cookie should not be forwarded"
+        );
+        let body = futures::executor::block_on(response.into_body().into_bytes_bounded(1024))
+            .expect("should read finalized JS asset body");
+        assert_eq!(
+            body.to_vec(),
+            b"console.log('ok');".to_vec(),
+            "should preserve upstream body bytes"
         );
     }
 
