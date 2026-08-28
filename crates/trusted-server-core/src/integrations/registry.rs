@@ -7,6 +7,7 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
 use http::{Method, Request, Response};
 use matchit::Router;
+use sha2::{Digest as _, Sha256};
 
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::EcContext;
@@ -591,11 +592,30 @@ pub trait IntegrationHeadInjector: Send + Sync {
     }
 }
 
+/// A browser module a registration carries, for a module built outside
+/// `trusted-server-js`. The crate embeds its built IIFE with `include_str!`
+/// and states its SHA-256 as a literal next to it; the registry verifies the
+/// two agree when it is built, and the served `?v=` hash is derived from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CarriedJsModule {
+    /// The built IIFE.
+    pub source: &'static str,
+    /// SHA-256 of `source`, hex encoded, lower case.
+    pub sha256: &'static str,
+}
+
 /// Registration payload returned by integration builders.
 pub struct IntegrationRegistration {
     pub integration_id: &'static str,
     pub js_deferred: bool,
     pub js_disabled: bool,
+    /// Browser module carried by the registration, when the module is not
+    /// compiled into `trusted-server-js`.
+    pub js_module: Option<CarriedJsModule>,
+    /// Serve the module only on its own `/static/tsjs=tsjs-<id>.min.js` path,
+    /// never in the unified bundle and never as a deferred tag; the
+    /// integration injects the tag itself when it decides to.
+    pub js_standalone: bool,
     pub proxies: Vec<Arc<dyn IntegrationProxy>>,
     pub attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
@@ -622,6 +642,8 @@ impl IntegrationRegistrationBuilder {
                 integration_id,
                 js_deferred: false,
                 js_disabled: false,
+                js_module: None,
+                js_standalone: false,
                 proxies: Vec::new(),
                 attribute_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
@@ -690,6 +712,23 @@ impl IntegrationRegistrationBuilder {
         self
     }
 
+    /// Carry a browser module built outside `trusted-server-js`.
+    #[must_use]
+    pub fn with_js_module(mut self, module: CarriedJsModule) -> Self {
+        self.registration.js_module = Some(module);
+        self
+    }
+
+    /// Serve the module standalone only; see
+    /// [`IntegrationRegistration::js_standalone`].
+    #[must_use]
+    pub fn with_standalone_js(mut self) -> Self {
+        self.registration.js_standalone = true;
+        self.registration.js_disabled = false;
+        self.registration.js_deferred = false;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> IntegrationRegistration {
         self.registration
@@ -715,6 +754,11 @@ struct IntegrationRegistryInner {
     enabled_integration_ids: Vec<&'static str>,
     deferred_js_ids: Vec<&'static str>,
     disabled_js_ids: Vec<&'static str>,
+    // Enabled modules served only on their own path, never in the bundle.
+    standalone_js_ids: Vec<&'static str>,
+    // Modules carried by their registrations, verified against their
+    // declared hash at construction.
+    carried_js: Vec<(&'static str, CarriedJsModule)>,
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
@@ -741,6 +785,8 @@ impl Default for IntegrationRegistryInner {
             enabled_integration_ids: Vec::new(),
             deferred_js_ids: Vec::new(),
             disabled_js_ids: Vec::new(),
+            standalone_js_ids: Vec::new(),
+            carried_js: Vec::new(),
             html_rewriters: Vec::new(),
             script_rewriters: Vec::new(),
             html_post_processors: Vec::new(),
@@ -913,6 +959,23 @@ impl IntegrationRegistry {
                     inner.disabled_js_ids.push(registration.integration_id);
                 } else if registration.js_deferred {
                     inner.deferred_js_ids.push(registration.integration_id);
+                }
+                if registration.js_standalone {
+                    inner.standalone_js_ids.push(registration.integration_id);
+                }
+                if let Some(module) = registration.js_module {
+                    // The served `?v=` hash and its memo trust this value, so a
+                    // stale literal is a startup error rather than a stale script.
+                    let actual = hex::encode(Sha256::digest(module.source.as_bytes()));
+                    if actual != module.sha256 {
+                        return Err(Report::new(TrustedServerError::Configuration {
+                            message: format!(
+                                "integration `{}` carries a browser module whose declared SHA-256 does not match its source (declared {}, actual {actual})",
+                                registration.integration_id, module.sha256
+                            ),
+                        }));
+                    }
+                    inner.carried_js.push((registration.integration_id, module));
                 }
             }
         }
@@ -1213,8 +1276,9 @@ impl IntegrationRegistry {
     /// Return JS module IDs that should be included in the tsjs bundle.
     ///
     /// Always includes JS-only modules with no Rust-side registration.
-    /// Includes enabled integrations only when the generated TSJS registry has a
-    /// corresponding browser module.
+    /// Includes enabled integrations only when a browser module serves their
+    /// id, either compiled into `trusted-server-js` or carried by the
+    /// registration, and excludes modules served standalone only.
     #[must_use]
     pub fn js_module_ids(&self) -> Vec<&'static str> {
         // Core JS-only modules that do not have a Rust-side registration.
@@ -1223,8 +1287,9 @@ impl IntegrationRegistry {
         let mut ids: Vec<&'static str> = JS_ALWAYS.to_vec();
 
         for id in &self.inner.enabled_integration_ids {
-            if trusted_server_js::module_bundle(id).is_some()
+            if self.js_part(id).is_some()
                 && !self.inner.disabled_js_ids.contains(id)
+                && !self.inner.standalone_js_ids.contains(id)
                 && !ids.contains(id)
             {
                 ids.push(*id);
@@ -1240,6 +1305,90 @@ impl IntegrationRegistry {
         }
 
         ids
+    }
+
+    /// The module part for one id: the registration that carries it, else
+    /// the compile-time module, for an enabled integration or an always-on
+    /// core module (`core`, `creative`). `None` when nothing serves that id.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::integrations::IntegrationRegistry;
+    ///
+    /// let registry = IntegrationRegistry::default();
+    ///
+    /// assert!(registry.js_part("core").is_some());
+    /// assert!(registry.js_part("lockr").is_none());
+    /// ```
+    #[must_use]
+    pub fn js_part(&self, id: &'static str) -> Option<crate::tsjs_bundle::JsModulePart> {
+        if let Some((carried_id, module)) = self
+            .inner
+            .carried_js
+            .iter()
+            .find(|(carried_id, _)| *carried_id == id)
+        {
+            return Some(crate::tsjs_bundle::JsModulePart {
+                id: carried_id,
+                source: module.source,
+                sha256: module.sha256,
+            });
+        }
+        if id != "core" && id != "creative" && !self.integration_enabled(id) {
+            return None;
+        }
+        crate::tsjs_bundle::JsModulePart::compile_time(id)
+    }
+
+    /// Ids of enabled modules served standalone only.
+    #[must_use]
+    pub fn js_standalone_ids(&self) -> Vec<&'static str> {
+        self.inner
+            .standalone_js_ids
+            .iter()
+            .copied()
+            .filter(|id| self.integration_enabled(id))
+            .collect()
+    }
+
+    /// Parts of the unified bundle: core, then every immediate module.
+    #[must_use]
+    pub fn js_parts_immediate(&self) -> Vec<crate::tsjs_bundle::JsModulePart> {
+        self.parts_for(&self.js_module_ids_immediate())
+    }
+
+    /// Parts served with `<script defer>`, one file each. Core is not
+    /// included.
+    #[must_use]
+    pub fn js_parts_deferred(&self) -> Vec<crate::tsjs_bundle::JsModulePart> {
+        self.js_module_ids_deferred()
+            .into_iter()
+            .filter_map(|id| self.js_part(id))
+            .collect()
+    }
+
+    /// Every part this registry can serve (bundle, deferred and standalone),
+    /// for cache fingerprints. Each id appears once.
+    #[must_use]
+    pub fn js_parts_all(&self) -> Vec<crate::tsjs_bundle::JsModulePart> {
+        let mut ids = self.js_module_ids();
+        for id in self.js_standalone_ids() {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        self.parts_for(&ids)
+    }
+
+    /// Core first, then the part for each id that has one.
+    fn parts_for(&self, ids: &[&'static str]) -> Vec<crate::tsjs_bundle::JsModulePart> {
+        let mut parts = Vec::with_capacity(ids.len() + 1);
+        if let Some(core) = crate::tsjs_bundle::JsModulePart::compile_time("core") {
+            parts.push(core);
+        }
+        parts.extend(ids.iter().filter_map(|id| self.js_part(id)));
+        parts
     }
 
     /// Return JS module IDs for the main (synchronous) bundle, excluding
@@ -1300,6 +1449,8 @@ impl IntegrationRegistry {
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
                 extra_js_module_ids: Vec::new(),
+                standalone_js_ids: Vec::new(),
+                carried_js: Vec::new(),
             }),
         }
     }
@@ -1331,6 +1482,8 @@ impl IntegrationRegistry {
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
                 extra_js_module_ids: Vec::new(),
+                standalone_js_ids: Vec::new(),
+                carried_js: Vec::new(),
             }),
         }
     }
@@ -1358,6 +1511,8 @@ impl IntegrationRegistry {
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
                 extra_js_module_ids: Vec::new(),
+                standalone_js_ids: Vec::new(),
+                carried_js: Vec::new(),
             }),
         }
     }
@@ -1425,6 +1580,8 @@ impl IntegrationRegistry {
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
                 extra_js_module_ids: Vec::new(),
+                standalone_js_ids: Vec::new(),
+                carried_js: Vec::new(),
             }),
         }
     }
@@ -1434,15 +1591,37 @@ impl IntegrationRegistry {
 pub(crate) mod test_support {
     use error_stack::Report;
 
-    use super::IntegrationRegistration;
+    use super::{CarriedJsModule, IntegrationRegistration};
     use crate::error::TrustedServerError;
     use crate::settings::Settings;
+
+    /// A browser module built outside `trusted-server-js`, carried by the
+    /// `probe` registration.
+    pub(crate) const PROBE_JS: &str = "(function(){window.__probe=1;})();";
+    // SHA-256 of PROBE_JS, hex; `probe_js_hash_literal_matches_its_source`
+    // keeps it honest.
+    pub(crate) const PROBE_JS_SHA256: &str =
+        "4a8781b3f95646b33f2d4aa92eeaa93ce4b93e87b3d3f20333682ce33eb2f961";
 
     /// Builds a registration for the `probe` integration on every call.
     pub(crate) fn probe_registration(
         _settings: &Settings,
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
         Ok(Some(IntegrationRegistration::builder("probe").build()))
+    }
+
+    /// Builds a `probe` registration that carries [`PROBE_JS`] on every call.
+    pub(crate) fn carried_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("probe")
+                .with_js_module(CarriedJsModule {
+                    source: PROBE_JS,
+                    sha256: PROBE_JS_SHA256,
+                })
+                .build(),
+        ))
     }
 
     /// Validates nothing and reports the integration as enabled.
@@ -1455,7 +1634,9 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{probe_registration, validate_nothing};
+    use super::test_support::{
+        PROBE_JS, PROBE_JS_SHA256, carried_probe_registration, probe_registration, validate_nothing,
+    };
     use super::*;
     use crate::constants::COOKIE_TS_EC;
     use crate::permissions::{Permission, PermissionSet, PermissionState};
@@ -2583,5 +2764,160 @@ mod tests {
                 && message.contains("seam-probe"),
             "error should name the id and both sources: {message}"
         );
+    }
+
+    fn enable_prebid(settings: &mut Settings) {
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": true,
+                    "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
+                }),
+            )
+            .expect("should insert prebid config");
+    }
+
+    fn enable_gpt_diagnostics(settings: &mut Settings) {
+        settings
+            .integrations
+            .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+            .expect("should insert gpt_diagnostics config");
+    }
+
+    fn carried_probe_builder() -> crate::integrations::IntegrationBuilder {
+        crate::integrations::IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            carried_probe_registration,
+            validate_nothing,
+        )
+    }
+
+    fn lying_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("probe")
+                .with_js_module(CarriedJsModule {
+                    source: PROBE_JS,
+                    sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+                })
+                .build(),
+        ))
+    }
+
+    #[test]
+    fn probe_js_hash_literal_matches_its_source() {
+        assert_eq!(
+            hex::encode(Sha256::digest(PROBE_JS.as_bytes())),
+            PROBE_JS_SHA256,
+            "should keep the PROBE_JS_SHA256 literal equal to the hash of PROBE_JS"
+        );
+    }
+
+    #[test]
+    fn a_carried_js_module_is_served_in_the_immediate_parts() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let extra = [carried_probe_builder()];
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build registry with a carried module");
+
+        let parts = registry.js_parts_immediate();
+        assert_eq!(
+            parts.first().map(|part| part.id),
+            Some("core"),
+            "should put core first in the immediate parts"
+        );
+        let probe = parts
+            .iter()
+            .find(|part| part.id == "probe")
+            .expect("should include the carried probe module in the immediate parts");
+        assert_eq!(
+            probe.source, PROBE_JS,
+            "should serve the carried source verbatim"
+        );
+        assert_eq!(
+            probe.sha256, PROBE_JS_SHA256,
+            "should carry the declared hash on the part"
+        );
+        assert!(
+            registry.js_module_ids_immediate().contains(&"probe"),
+            "should list the carried module among the immediate module ids"
+        );
+    }
+
+    #[test]
+    fn a_carried_js_module_with_a_wrong_hash_is_rejected_at_registry_build() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let extra = [crate::integrations::IntegrationBuilder::new(
+            "probe",
+            "seam-probe",
+            lying_probe_registration,
+            validate_nothing,
+        )];
+
+        let error = IntegrationRegistry::with_registrations(&settings, &extra)
+            .err()
+            .expect("should reject a carried module whose declared hash is wrong");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("probe") && message.contains("does not match"),
+            "error should name the integration and say the hash does not match: {message}"
+        );
+    }
+
+    #[test]
+    fn a_standalone_js_module_is_served_alone_and_not_in_the_bundle() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        enable_gpt_diagnostics(&mut settings);
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+
+        assert!(
+            !registry.js_module_ids().contains(&"gpt_diagnostics"),
+            "should keep a standalone module out of the bundle module ids"
+        );
+        assert!(
+            registry.js_part("gpt_diagnostics").is_some(),
+            "should serve the standalone module as a part"
+        );
+        assert_eq!(
+            registry.js_standalone_ids(),
+            vec!["gpt_diagnostics"],
+            "should list the enabled standalone module"
+        );
+        assert!(
+            registry.js_part("lockr").is_none(),
+            "should not serve a module for an integration that is not enabled"
+        );
+    }
+
+    #[test]
+    fn js_parts_all_covers_bundle_deferred_and_standalone_modules() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        enable_prebid(&mut settings);
+        enable_gpt_diagnostics(&mut settings);
+        let extra = [carried_probe_builder()];
+
+        let registry = IntegrationRegistry::with_registrations(&settings, &extra)
+            .expect("should build registry");
+
+        let ids = registry
+            .js_parts_all()
+            .into_iter()
+            .map(|part| part.id)
+            .collect::<Vec<_>>();
+        for expected in ["core", "creative", "probe", "prebid", "gpt_diagnostics"] {
+            assert_eq!(
+                ids.iter().filter(|id| **id == expected).count(),
+                1,
+                "should list `{expected}` exactly once in {ids:?}"
+            );
+        }
     }
 }

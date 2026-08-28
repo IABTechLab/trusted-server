@@ -29,9 +29,9 @@ pub mod sourcepoint;
 pub mod testlight;
 
 pub use registry::{
-    AttributeRewriteAction, AttributeRewriteOutcome, HeaderMutation, HeaderMutationMode,
-    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationDocumentState,
-    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext,
+    AttributeRewriteAction, AttributeRewriteOutcome, CarriedJsModule, HeaderMutation,
+    HeaderMutationMode, IntegrationAttributeContext, IntegrationAttributeRewriter,
+    IntegrationDocumentState, IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext,
     IntegrationHtmlPostProcessor, IntegrationMetadata, IntegrationProxy, IntegrationRegistration,
     IntegrationRegistrationBuilder, IntegrationRegistry, IntegrationRequestFilter,
     IntegrationScriptContext, IntegrationScriptRewriter, ProxyDispatchInput, RequestFilterDecision,

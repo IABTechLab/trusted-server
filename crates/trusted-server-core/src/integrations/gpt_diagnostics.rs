@@ -239,7 +239,7 @@ pub fn register(
 
     Ok(Some(
         IntegrationRegistration::builder(GPT_DIAGNOSTICS_INTEGRATION_ID)
-            .without_js()
+            .with_standalone_js()
             .build(),
     ))
 }
@@ -492,6 +492,10 @@ mod tests {
             !registry
                 .js_module_ids_deferred()
                 .contains(&GPT_DIAGNOSTICS_INTEGRATION_ID)
+        );
+        assert!(
+            registry.js_part(GPT_DIAGNOSTICS_INTEGRATION_ID).is_some(),
+            "should serve the diagnostics module standalone"
         );
     }
 
