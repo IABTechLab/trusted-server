@@ -441,7 +441,8 @@ impl EcContext {
         if !ec_id_has_only_allowed_chars(&ec_id) {
             return Err(Report::new(TrustedServerError::EdgeCookie {
                 message: format!(
-                    "Provider `{}` produced an identifier that is empty, over {} bytes, or                      outside the cookie-safe alphabet",
+                    "Provider `{}` produced an identifier that is empty, over {} bytes, or \
+                     outside the cookie-safe alphabet",
                     ec_provider.id(),
                     cookies::MAX_EC_ID_LEN,
                 ),
