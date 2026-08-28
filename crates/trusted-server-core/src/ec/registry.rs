@@ -4,7 +4,7 @@
 //! in-memory registry. `HashMap` indexes provide O(1)
 //! lookup by source domain and API key hash.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use error_stack::{Report, ResultExt as _};
 
@@ -74,7 +74,7 @@ impl PartnerRegistry {
     pub fn validate_config_for_deploy(
         partners: &[EcPartner],
     ) -> Result<(), Report<TrustedServerError>> {
-        let mut source_domains = HashMap::with_capacity(partners.len());
+        let mut source_domains = HashSet::with_capacity(partners.len());
         let mut api_token_key_references = HashMap::with_capacity(partners.len());
 
         for partner in partners {
@@ -85,10 +85,7 @@ impl PartnerRegistry {
                     })
                 })?;
 
-            if source_domains
-                .insert(normalized_source.clone(), ())
-                .is_some()
-            {
+            if !source_domains.insert(normalized_source.clone()) {
                 return Err(Report::new(TrustedServerError::Configuration {
                     message: format!("ec.partners: duplicate source_domain '{normalized_source}'"),
                 }));

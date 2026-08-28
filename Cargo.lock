@@ -5398,6 +5398,7 @@ dependencies = [
  "log-fastly",
  "serde",
  "serde_json",
+ "toml",
  "trusted-server-core",
  "url",
  "urlencoding",
