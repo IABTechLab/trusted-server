@@ -402,9 +402,6 @@ impl IntegrationBuilder {
     ///
     /// Returns an error when the configuration cannot be parsed or fails
     /// validation.
-    // Deploy validation does not yet enumerate builders, so nothing in the
-    // crate calls this until that is wired up.
-    #[allow(dead_code)]
     pub(crate) fn validate(&self, settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
         (self.validate)(settings)
     }
