@@ -195,6 +195,11 @@ function installNetworkAndConsoleStubs(pageWindow) {
   };
 }
 
+function expectNoUnexpectedNetworkActivity(stubs) {
+  expect(stubs.unexpectedTransports).toEqual([]);
+  expect(stubs.blockedResourceRequests).toEqual([]);
+}
+
 function installServerState(pageWindow, { analytics = false } = {}) {
   pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
   pageWindow.__tsjs_prebid = { clientSideBidders: [] };
@@ -347,8 +352,7 @@ describe('tsjs-prebid production artifacts', () => {
       expect(pageWindow.__tsjsPrebidShimInstalled).toBe(true);
 
       await runAuction(pageWindow, stubs.fetchSpy);
-      expect(stubs.unexpectedTransports).toEqual([]);
-      expect(stubs.blockedResourceRequests).toEqual([]);
+      expectNoUnexpectedNetworkActivity(stubs);
     } finally {
       dom.window.close();
     }
@@ -367,8 +371,7 @@ describe('tsjs-prebid production artifacts', () => {
       expect(pageWindow.__tsjs_prebid_bundle.modules.analytics).toEqual([]);
       expect(pageWindow.__tsjs_prebid_bundle.runtimeCodes.analytics).toEqual([]);
       await runAuction(pageWindow, stubs.fetchSpy);
-      expect(stubs.unexpectedTransports).toEqual([]);
-      expect(stubs.blockedResourceRequests).toEqual([]);
+      expectNoUnexpectedNetworkActivity(stubs);
     } finally {
       dom.window.close();
     }
@@ -401,8 +404,7 @@ describe('tsjs-prebid production artifacts', () => {
       expect(pageWindow.__watchdogCallbackRan).toBe(true);
       expect(pageWindow.__tsjs_prebid_bundle.modules.analytics).toEqual([]);
       expect(pageWindow.__tsjs_prebid_bundle.runtimeCodes.analytics).toEqual([]);
-      expect(stubs.unexpectedTransports).toEqual([]);
-      expect(stubs.blockedResourceRequests).toEqual([]);
+      expectNoUnexpectedNetworkActivity(stubs);
     } finally {
       vi.useRealTimers();
       dom.window.close();
