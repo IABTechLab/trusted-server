@@ -22,9 +22,9 @@ Signatures use HMAC-SHA256 with the publisher's `proxy_secret`:
 proxy_secret = "publisher_proxy_secret"
 ```
 
-The config value is a key in the Trusted Server secret store. Provision the
-secure random signing value under `publisher_proxy_secret`; the resolved value
-must contain at least 32 characters.
+The config value is a key in the Trusted Server secret store. Provision a
+secure random signing value under `publisher_proxy_secret`; at least 32 random
+bytes are recommended.
 
 ## Signature Validation
 

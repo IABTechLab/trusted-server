@@ -26,7 +26,6 @@ use crate::integrations::{
 use crate::settings::{AssetOriginAuth, IntegrationConfig, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
-const MIN_PROXY_SECRET_LENGTH: usize = 32;
 #[cfg(test)]
 const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
     "prebid",
@@ -251,7 +250,6 @@ pub fn validate_settings_for_runtime(
     settings: &Settings,
 ) -> Result<(), Report<TrustedServerError>> {
     settings.reject_placeholder_secrets()?;
-    validate_proxy_secret_strength(settings)?;
     settings.validate_admin_handler_passwords()?;
     let enabled_auction_providers = validate_enabled_integrations(settings, true)?;
     validate_auction_provider_names(settings, &enabled_auction_providers)?;
@@ -420,17 +418,6 @@ fn missing_secret_key_reference(path: &str) -> Report<TrustedServerError> {
     Report::new(TrustedServerError::Configuration {
         message: format!("secret key reference at `{path}` must not be empty"),
     })
-}
-
-fn validate_proxy_secret_strength(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
-    if settings.publisher.proxy_secret.expose().len() < MIN_PROXY_SECRET_LENGTH {
-        return Err(Report::new(TrustedServerError::Configuration {
-            message: format!(
-                "publisher.proxy_secret must be at least {MIN_PROXY_SECRET_LENGTH} bytes after secret resolution"
-            ),
-        }));
-    }
-    Ok(())
 }
 
 fn validate_auction_provider_names(
@@ -807,24 +794,6 @@ gam_network_id = "99999"
         assert!(
             err.to_string().contains("invalid_publisher_domain"),
             "error should identify the structural validation failure: {err:?}"
-        );
-    }
-
-    #[test]
-    fn runtime_validation_rejects_short_proxy_secret() {
-        let mut settings = valid_settings();
-        settings.publisher.proxy_secret = Redacted::new("short".to_owned());
-
-        let err = validate_settings_for_runtime(&settings)
-            .expect_err("should reject a short resolved proxy secret");
-
-        assert!(
-            err.to_string().contains("at least 32 bytes"),
-            "error should identify the required proxy-secret strength: {err:?}"
-        );
-        assert!(
-            !err.to_string().contains("short"),
-            "error should not expose the resolved secret"
         );
     }
 
