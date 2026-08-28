@@ -101,6 +101,8 @@ pub(crate) struct DiscoveredSlots {
     /// *site*, not of this page: another page that happens to render only one
     /// member of the group must not resurrect the ambiguous prefix.
     pub(crate) ambiguous_stems: BTreeSet<String>,
+    /// Normalized div IDs refused from generation but still observed live.
+    pub(crate) refused_div_ids: BTreeSet<String>,
     /// Diagnostics for placements whose normalized stable stems collided.
     pub(crate) warnings: Vec<String>,
 }
@@ -123,6 +125,7 @@ pub(crate) fn discover_gpt_slots(
     let mut slots = Vec::new();
     let mut warnings = Vec::new();
     let mut ambiguous_stems = BTreeSet::new();
+    let mut refused_div_ids = BTreeSet::new();
     let mut gam_network_id = None;
     let mut had_slot_evidence = false;
     let mut registry_residues: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -141,6 +144,7 @@ pub(crate) fn discover_gpt_slots(
         }
         if let Some(prefix) = volatile_prefix_before_placement(&entry.div_id) {
             refused_stems.insert(slot.div_id.clone());
+            refused_div_ids.insert(slot.div_id);
             push_unique_warning(&mut warnings, volatile_prefix_warning(&prefix));
             continue;
         }
@@ -170,6 +174,7 @@ pub(crate) fn discover_gpt_slots(
             continue;
         }
         if let Some(prefix) = volatile_prefix_before_placement(&raw_div) {
+            refused_div_ids.insert(slot.div_id);
             push_unique_warning(&mut warnings, volatile_prefix_warning(&prefix));
             continue;
         }
@@ -187,6 +192,7 @@ pub(crate) fn discover_gpt_slots(
         had_slot_evidence,
         slots,
         ambiguous_stems,
+        refused_div_ids,
         warnings,
     }
 }
@@ -278,15 +284,36 @@ fn volatile_prefix_before_placement(div_id: &str) -> Option<String> {
 /// suffix.
 ///
 /// Both halves are required. Eight-digit values need at least eight suffix
-/// characters, which avoids treating short calendar labels as generated ids. A
-/// bare digit run is how publishers write stable placement indices, and a token
-/// with a non-alphanumeric character is some other structure than a generated
-/// id.
+/// characters and a mixed-case random-looking suffix; this avoids treating
+/// calendar labels followed by stable words as generated ids. A bare digit run
+/// is how publishers write stable placement indices, and a token with a
+/// non-alphanumeric character is some other structure than a generated id.
 fn is_per_render_token(segment: &str) -> bool {
     let leading_digits = segment.bytes().take_while(u8::is_ascii_digit).count();
     let suffix_length = segment.len().saturating_sub(leading_digits);
-    ((leading_digits >= 10 && suffix_length >= 1) || (leading_digits >= 8 && suffix_length >= 8))
+    let suffix = &segment[leading_digits..];
+    ((leading_digits >= 10 && suffix_length >= 1)
+        || (leading_digits >= 8 && suffix_length >= 8 && has_random_case_alternation(suffix)))
         && segment.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// Whether letter case alternates densely enough to resemble a random token.
+fn has_random_case_alternation(value: &str) -> bool {
+    let mut previous = None;
+    let mut comparisons = 0_usize;
+    let mut transitions = 0_usize;
+    for uppercase in value.bytes().filter_map(|byte| {
+        byte.is_ascii_lowercase()
+            .then_some(false)
+            .or_else(|| byte.is_ascii_uppercase().then_some(true))
+    }) {
+        if let Some(previous) = previous {
+            comparisons += 1;
+            transitions += usize::from(previous != uppercase);
+        }
+        previous = Some(uppercase);
+    }
+    transitions >= 3 && transitions.saturating_mul(3) >= comparisons.saturating_mul(2)
 }
 
 /// Operator-facing text for a div-id family carrying a per-render token.
@@ -1234,6 +1261,12 @@ mod tests {
             "one observation of a per-render family must not be written literally"
         );
         assert_eq!(discovered.gam_network_id.as_deref(), Some("123456789"));
+        assert!(
+            discovered
+                .refused_div_ids
+                .contains("vendor-tag_1724112345678AbCdEfGh_slot_inarticle_1"),
+            "registry refusal should retain its normalized div as observed evidence"
+        );
         assert_volatile_prefix_warning(&discovered, "vendor-tag");
     }
 
@@ -1256,6 +1289,12 @@ mod tests {
             discovered.gam_network_id.as_deref(),
             Some("123456789"),
             "refusing a slot must not discard the network id"
+        );
+        assert!(
+            discovered
+                .refused_div_ids
+                .contains("vendor-tag_1724112345678AbCdEfGh_slot_inarticle_1"),
+            "request refusal should retain its normalized div as observed evidence"
         );
         assert_volatile_prefix_warning(&discovered, "vendor-tag");
     }
@@ -1304,6 +1343,7 @@ mod tests {
         for volatile in [
             "vendor-tag_1724112345678AbCdEfGh_slot_inarticle_1",
             "vendor-tag_12345678AbCdEfGh_slot_inarticle_1",
+            "vendor-tag_20260820AbCdEfGh_slot_inarticle_1",
             "vendor-tag_1724112345678AbCdEfGh_slot_overlay_1-container",
             "vendor-tag_1724112345678AbCdEfGh_slot_sidebar_1",
             "vendor-tag_1724112345678AbCdEfGh_slot_overlay_stable",
@@ -1331,6 +1371,11 @@ mod tests {
             // An eight-digit calendar date plus a stable suffix is not a
             // timestamp-like per-render token.
             "promo-20260820a-sidebar",
+            "promo-20260820Football-sidebar",
+            "promo-20260820football-sidebar",
+            "promo-20260820TopStories-sidebar",
+            "ad-19700101Thumbnail-rail",
+            "ad-00000001AAAAAAAA-rail",
             // The token is trailing, so the prefix before it still identifies
             // this element and normalization/collision handling own the case.
             "vendor-tag_slot_inarticle_1724112345678AbCdEfGh",

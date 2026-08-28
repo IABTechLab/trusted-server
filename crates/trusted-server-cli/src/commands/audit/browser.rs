@@ -734,16 +734,11 @@ async fn resource_count(page: &Page) -> Result<usize, String> {
 }
 
 async fn eval_discard(page: &Page, expression: impl Into<String>, warnings: &mut Vec<Warning>) {
-    match tokio::time::timeout(CDP_OPERATION_TIMEOUT, page.evaluate(expression.into())).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => warnings.push(Warning {
-            code: "page_evaluation_failed".to_string(),
-            message: format!("browser page evaluation failed: {error}"),
-        }),
-        Err(_) => warnings.push(Warning {
-            code: "page_evaluation_timeout".to_string(),
-            message: "browser page evaluation timed out".to_string(),
-        }),
+    if let Err(failure) = browser_scroll::evaluate(page, expression).await {
+        warnings.push(Warning {
+            code: failure.code().to_string(),
+            message: failure.to_string(),
+        });
     }
 }
 

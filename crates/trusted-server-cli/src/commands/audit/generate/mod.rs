@@ -744,8 +744,8 @@ pub(crate) fn run_update_slots(
         &mut notes,
     )?;
     let observed_div_ids = table
-        .slots()
-        .map(|slot| slot.div_id.clone())
+        .observed_div_ids()
+        .map(str::to_string)
         .collect::<Vec<_>>();
     let (merged, merge_diagnostics) = slot_toml::merge_render_slots_with_observed_diagnostics(
         request.existing_creative,
@@ -757,9 +757,9 @@ pub(crate) fn run_update_slots(
     if !merge_diagnostics.unobserved_existing_slot_ids.is_empty() {
         let slot_ids = merge_diagnostics.unobserved_existing_slot_ids.join(", ");
         let follow_up = if request.scroll {
-            "Re-run with broader page/profile coverage; use --replace only to intentionally prune them."
+            "Re-run with broader page/profile coverage; `--replace` prunes them but also discards every hand-written field on the slots the run did rediscover."
         } else {
-            "Re-run with broader coverage or --scroll; use --replace only to intentionally prune them."
+            "Re-run with broader coverage or --scroll; `--replace` prunes them but also discards every hand-written field on the slots the run did rediscover."
         };
         notes.push(format!(
             "preserved {} configured slot(s) not observed during this crawl: {slot_ids}. {follow_up}",
@@ -2251,8 +2251,18 @@ mod tests {
                 ),
                 "should name the preserved slot, got {notes:?}"
             );
-            assert!(notes.contains(expected_follow_up));
-            assert!(!notes.contains(unexpected_follow_up));
+            assert!(
+                notes.contains(expected_follow_up),
+                "should suggest the follow-up matching the scroll setting, got {notes:?}"
+            );
+            assert!(
+                !notes.contains(unexpected_follow_up),
+                "should omit the follow-up that does not apply, got {notes:?}"
+            );
+            assert!(
+                notes.contains("discards every hand-written field"),
+                "should explain the full cost of --replace, got {notes:?}"
+            );
             assert!(out.is_empty(), "unchanged dry-run stdout should stay empty");
             assert_eq!(
                 fs::read_to_string(&config_path).expect("should read config"),
@@ -2335,6 +2345,144 @@ mod tests {
             !notes.contains("not observed during this crawl: ad-refused"),
             "a crawl-observed refused slot must not be labeled unobserved, got {notes:?}"
         );
+    }
+
+    #[test]
+    fn ambiguous_configured_stem_is_not_reported_as_unobserved() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        let mut original =
+            loadable_config().replace("gam_network_id = \"123456789\"", "gam_network_id = \"222\"");
+        original.push_str(
+            "\n[[creative_opportunities.slot]]\n\
+             id = \"in-content\"\n\
+             div_id = \"ad-x\"\n\
+             gam_unit_path = \"/222/homepage/in-content\"\n\
+             page_patterns = [\"/\"]\n\
+             formats = [{ width = 300, height = 250 }]\n",
+        );
+        fs::write(&config_path, &original).expect("should write config");
+        let existing = crate::commands::audit::creative_config(&original, &config_path)
+            .expect("should parse config")
+            .expect("should have creative opportunities");
+        let mut page = collected_page_with_ambiguous_slots("https://publisher.example/");
+        page.gpt_slots.push(collector::CollectedGptSlot {
+            gam_unit_path: "/222/site/header".to_string(),
+            div_id: "ad-stable".to_string(),
+            sizes: vec![(728, 90)],
+        });
+        let collector = FakeCollector::new(page);
+        let mut notes = Vec::new();
+
+        run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: Some(&existing),
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: true,
+                scroll: true,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &collector)],
+            &mut std::io::sink(),
+            &mut notes,
+        )
+        .expect("should preserve the configured ambiguous placement");
+
+        let notes = String::from_utf8(notes).expect("notes should be UTF-8");
+        assert!(
+            notes.contains("skipped ambiguous div-id prefix `ad-x`"),
+            "should retain the ambiguity diagnostic, got {notes:?}"
+        );
+        assert!(
+            !notes.contains("not observed during this crawl: in-content"),
+            "an ambiguity-refused placement must not be labeled unobserved, got {notes:?}"
+        );
+    }
+
+    #[test]
+    fn volatile_refusals_from_registry_and_requests_keep_prefix_observed() {
+        for source in ["registry", "request"] {
+            let temp = TempDir::new().expect("should create temp dir");
+            let config_path = temp.path().join("trusted-server.toml");
+            let mut original = loadable_config();
+            original.push_str(
+                "\n[[creative_opportunities.slot]]\n\
+                 id = \"stable\"\n\
+                 div_id = \"ad-stable\"\n\
+                 gam_unit_path = \"/123456789/site/header\"\n\
+                 page_patterns = [\"/\"]\n\
+                 formats = [{ width = 728, height = 90 }]\n\n\
+                 [[creative_opportunities.slot]]\n\
+                 id = \"volatile-family\"\n\
+                 div_id = \"vendor-tag\"\n\
+                 gam_unit_path = \"/123456789/site/overlay\"\n\
+                 page_patterns = [\"/\"]\n\
+                 formats = [{ width = 300, height = 250 }]\n",
+            );
+            fs::write(&config_path, &original).expect("should write config");
+            let existing = crate::commands::audit::creative_config(&original, &config_path)
+                .expect("should parse config")
+                .expect("should have creative opportunities");
+            let mut page = collected_page();
+            page.requested_url = "https://publisher.example/".to_string();
+            page.final_url = page.requested_url.clone();
+            page.gpt_slots.push(collector::CollectedGptSlot {
+                gam_unit_path: "/123456789/site/header".to_string(),
+                div_id: "ad-stable".to_string(),
+                sizes: vec![(728, 90)],
+            });
+            let volatile_div = "vendor-tag_1724112345678AbCdEfGh_slot_overlay_1";
+            if source == "registry" {
+                page.gpt_slots.push(collector::CollectedGptSlot {
+                    gam_unit_path: "/123456789/site/overlay".to_string(),
+                    div_id: volatile_div.to_string(),
+                    sizes: vec![(300, 250)],
+                });
+            } else {
+                page.network_requests.push(CollectedRequest {
+                    url: format!(
+                        "https://securepubads.g.doubleclick.net/gampad/ads?\
+                         iu_parts=123456789%2Csite%2Coverlay&dids={volatile_div}\
+                         &prev_iu_szs=300x250"
+                    ),
+                    resource_type: Some("fetch".to_string()),
+                });
+            }
+            let collector = FakeCollector::new(page);
+            let mut notes = Vec::new();
+
+            run_update_slots(
+                &UpdateSlotsRequest {
+                    url: "https://publisher.example/",
+                    config_path: &config_path,
+                    existing_creative: Some(&existing),
+                    page_patterns: &[],
+                    replace: false,
+                    cookies: &[],
+                    dry_run: true,
+                    scroll: true,
+                    budget: CrawlBudget::default(),
+                },
+                &[("desktop", &collector)],
+                &mut std::io::sink(),
+                &mut notes,
+            )
+            .expect("the stable slot should let generation complete");
+
+            let notes = String::from_utf8(notes).expect("notes should be UTF-8");
+            assert!(
+                notes.contains("skipped volatile div-id family `vendor-tag`"),
+                "should retain the {source} volatile refusal, got {notes:?}"
+            );
+            assert!(
+                !notes.contains("not observed during this crawl: volatile-family"),
+                "a live configured prefix refused from {source} evidence must stay observed, got {notes:?}"
+            );
+        }
     }
 
     #[test]

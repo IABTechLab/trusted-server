@@ -139,6 +139,8 @@ pub(super) struct EvidenceTable {
     /// carries one and would otherwise contribute it as a usable slot, so the
     /// written config would depend on which pages the crawl happened to sample.
     ambiguous_stems: BTreeSet<String>,
+    /// Normalized div IDs refused from generation but observed live.
+    refused_div_ids: BTreeSet<String>,
 }
 
 impl EvidenceTable {
@@ -162,6 +164,8 @@ impl EvidenceTable {
         self.empty_pages.remove(path);
         self.ambiguous_stems
             .extend(discovered.ambiguous_stems.iter().cloned());
+        self.refused_div_ids
+            .extend(discovered.refused_div_ids.iter().cloned());
 
         for slot in &discovered.slots {
             let entry = self.slots.entry(slot.div_id.clone()).or_insert_with(|| {
@@ -191,6 +195,15 @@ impl EvidenceTable {
             .iter()
             .filter(|div_id| !self.ambiguous_stems.contains(*div_id))
             .filter_map(|div_id| self.slots.get(div_id))
+    }
+
+    /// Every normalized div ID observed, including all refused evidence.
+    pub(super) fn observed_div_ids(&self) -> impl Iterator<Item = &str> {
+        self.order
+            .iter()
+            .map(String::as_str)
+            .chain(self.ambiguous_stems.iter().map(String::as_str))
+            .chain(self.refused_div_ids.iter().map(String::as_str))
     }
 
     /// Number of usable distinct slots observed.

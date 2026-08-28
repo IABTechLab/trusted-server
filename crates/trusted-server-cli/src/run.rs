@@ -517,7 +517,7 @@ mod tests {
         };
         assert_eq!(generate.browser.settle_quiet_ms, 750);
         assert_eq!(generate.browser.settle_max_ms, 12_000);
-        assert!(!generate.scroll);
+        assert!(!generate.scroll, "generation should not scroll by default");
     }
 
     #[test]

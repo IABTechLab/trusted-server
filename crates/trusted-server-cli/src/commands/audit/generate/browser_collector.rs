@@ -539,16 +539,7 @@ async fn collect_page_from_browser(
         .await
         .map_err(|error| format!("failed to create browser page for audit: {error}"))?;
 
-    let result = collect_open_page(
-        &page,
-        target_url,
-        discover_sitemap,
-        settings.assume_consent,
-        settings.scroll,
-        settings.settle_quiet,
-        settings.settle_max,
-    )
-    .await;
+    let result = collect_open_page(&page, target_url, discover_sitemap, settings).await;
     let close_result = timeout(BROWSER_CLOSE_TIMEOUT, page.close()).await;
 
     match (result, close_result) {
@@ -575,16 +566,13 @@ async fn collect_open_page(
     page: &chromiumoxide::Page,
     target_url: &Url,
     discover_sitemap: bool,
-    assume_consent: bool,
-    scroll: bool,
-    settle_quiet: Duration,
-    settle_max: Duration,
+    settings: PageCollectionSettings,
 ) -> CliResult<CollectedPage> {
     let mut warnings = Vec::new();
 
     // Must run before any page script, so the consent platform finds the APIs
     // already answered rather than installing its own gate.
-    if assume_consent {
+    if settings.assume_consent {
         page.evaluate_on_new_document(SHARED_CONSENT_STUB_SCRIPT)
             .await
             .map_err(|error| format!("failed to install the consent stub: {error}"))?;
@@ -629,21 +617,21 @@ async fn collect_open_page(
         )),
     }
 
-    if !wait_for_page_settle(page, settle_quiet, settle_max).await? {
+    if !wait_for_page_settle(page, settings.settle_quiet, settings.settle_max).await? {
         warnings.push(
             "browser audit timed out while waiting for the page to settle; results may be partial"
                 .to_string(),
         );
     }
 
-    if scroll {
+    if settings.scroll {
         warnings.extend(
             browser_scroll::scroll_page(page)
                 .await
                 .into_iter()
                 .map(|failure| failure.to_string()),
         );
-        if !wait_for_page_settle(page, settle_quiet, settle_max).await? {
+        if !wait_for_page_settle(page, settings.settle_quiet, settings.settle_max).await? {
             warnings.push(
                 "browser audit timed out while waiting for the page to settle after scroll; \
                  results may be partial"
@@ -1130,7 +1118,7 @@ mod tests {
               return { getSlots: function () { return [slot] } }
             },
           }
-        }, 1500)
+        }, 900)
       })
     </script>
   </body>

@@ -8,24 +8,17 @@ const SCROLL_STEP_DELAY: Duration = Duration::from_millis(250);
 const SCROLL_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A best-effort browser scroll operation that could not be completed.
-#[derive(Debug)]
+#[derive(Debug, derive_more::Display)]
 pub(crate) enum ScrollFailure {
     /// Chrome rejected the page evaluation.
+    #[display("browser page evaluation failed: {_0}")]
     Evaluation(String),
     /// Chrome did not complete the page evaluation within the operation bound.
+    #[display("browser page evaluation timed out")]
     Timeout,
 }
 
-impl std::fmt::Display for ScrollFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Evaluation(message) => {
-                write!(formatter, "browser page evaluation failed: {message}")
-            }
-            Self::Timeout => formatter.write_str("browser page evaluation timed out"),
-        }
-    }
-}
+impl core::error::Error for ScrollFailure {}
 
 impl ScrollFailure {
     /// Stable warning code used by structured audit output.
@@ -45,19 +38,27 @@ pub(crate) async fn scroll_page(page: &chromiumoxide::Page) -> Vec<ScrollFailure
             "window.scrollTo(0, Math.floor(Math.max(document.body.scrollHeight, \
              document.documentElement.scrollHeight) * {fraction}))"
         );
-        evaluate(page, script, &mut failures).await;
+        if let Err(failure) = evaluate(page, script).await {
+            failures.push(failure);
+        }
         tokio::time::sleep(SCROLL_STEP_DELAY).await;
     }
-    evaluate(page, "window.scrollTo(0, 0)".to_string(), &mut failures).await;
+    if let Err(failure) = evaluate(page, "window.scrollTo(0, 0)").await {
+        failures.push(failure);
+    }
     failures
 }
 
-async fn evaluate(page: &Page, expression: String, failures: &mut Vec<ScrollFailure>) {
-    match tokio::time::timeout(SCROLL_OPERATION_TIMEOUT, page.evaluate(expression)).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => failures.push(ScrollFailure::Evaluation(error.to_string())),
-        Err(_) => failures.push(ScrollFailure::Timeout),
-    }
+/// Evaluates a browser expression with the shared operation bound and errors.
+pub(crate) async fn evaluate(
+    page: &Page,
+    expression: impl Into<String>,
+) -> Result<(), ScrollFailure> {
+    tokio::time::timeout(SCROLL_OPERATION_TIMEOUT, page.evaluate(expression.into()))
+        .await
+        .map_err(|_| ScrollFailure::Timeout)?
+        .map(|_| ())
+        .map_err(|error| ScrollFailure::Evaluation(error.to_string()))
 }
 
 #[cfg(test)]
@@ -74,5 +75,8 @@ mod tests {
             ScrollFailure::Timeout.to_string(),
             "browser page evaluation timed out"
         );
+
+        fn assert_error<T: core::error::Error>() {}
+        assert_error::<ScrollFailure>();
     }
 }
