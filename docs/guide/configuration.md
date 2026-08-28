@@ -1228,12 +1228,11 @@ client_side_bidders = ["rubicon"]
 script_patterns = ["/prebid.js", "/prebid.min.js"]
 
 [[integrations.prebid.managed_user_ids]]
-name = "exampleId"
-params = { pid = "999" }
+name = "sharedId"
 
 [integrations.prebid.managed_user_ids.storage]
 type = "cookie"
-name = "example_env"
+name = "_sharedid"
 expires = 15
 refresh_in_seconds = 1800
 
@@ -1272,8 +1271,9 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__SCRIPT_PATTERNS='["/prebid.js","/prebid.mi
 Each `[[integrations.prebid.managed_user_ids]]` entry names a Prebid
 `userSync.userIds` module that Trusted Server installs on the page and
 reinstates whenever publisher JavaScript replaces the User ID configuration.
-Trusted Server does not interpret the entry, so any Prebid User ID module is
-configurable without a code change:
+Trusted Server does not interpret module-specific fields; every registered
+module uses the same vendor-neutral surface. The managed `name` must match a
+`configNames` entry in the checked-in `user_id_modules.json` registry:
 
 | Field                        | Type    | Default                        | Description                                                                          |
 | ---------------------------- | ------- | ------------------------------ | ------------------------------------------------------------------------------------ |

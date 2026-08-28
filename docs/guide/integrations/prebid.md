@@ -493,8 +493,9 @@ their Prebid JavaScript.
 Each `[[integrations.prebid.managed_user_ids]]` entry is forwarded to Prebid.js
 verbatim. Trusted Server validates only what Prebid needs to address the module
 — a usable entry name and storage key, positive expiry and refresh values — and
-never interprets `params`. Any Prebid User ID module is therefore configurable
-without a code change, and no identity vendor is named in Trusted Server itself.
+never interprets `params`. Supported names come from the checked-in
+`user_id_modules.json` registry, so Trusted Server core needs no
+vendor-specific code and names no identity vendor itself.
 
 ### Prerequisites
 

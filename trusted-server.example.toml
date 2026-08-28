@@ -421,8 +421,8 @@ client_side_bidders = []          # bidders running via native Prebid.js adapter
 # operators can manage identity centrally without publisher JavaScript changes.
 # Each entry is forwarded to Prebid.js verbatim: `name` is a
 # `userSync.userIds` entry name, `params` and `storage` are whatever that module
-# documents. Trusted Server does not interpret them, so any Prebid User ID
-# module works here without a code change. Each `name` must appear only once.
+# documents. Trusted Server does not interpret them; supported names come from
+# the checked-in User ID registry. Each `name` must appear only once.
 #
 # The module must be present in the built bundle: name it under
 # [integrations.prebid.bundle].user_id_modules, or omit that list to take the
@@ -436,12 +436,11 @@ client_side_bidders = []          # bidders running via native Prebid.js adapter
 # written to KV.
 #
 # [[integrations.prebid.managed_user_ids]]
-# name = "exampleId"
-# params = { pid = "999" }
+# name = "sharedId"
 #
 # [integrations.prebid.managed_user_ids.storage]
 # type = "cookie"            # or "html5"
-# name = "example_env"
+# name = "_sharedid"
 # expires = 15               # days; omit to keep Prebid's default
 # refresh_in_seconds = 1800  # omit to keep Prebid's default
 
