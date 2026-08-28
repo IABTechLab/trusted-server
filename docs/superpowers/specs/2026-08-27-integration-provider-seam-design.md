@@ -1,14 +1,18 @@
 # Design Spec: The Integration Provider Seam
 
-**Status:** Proposed, 2026-08-27. Sixth PR in the provider series. It adds
-this document only and targets `main` directly; it reads alongside the
-series' specs, which land with PR #1047.
+**Status:** Proposed, 2026-08-27, revised 2026-08-28. This PR adds this
+document only and targets `main` directly. Following the review of #1043
+(27 August) the seam it defines is a precondition for the provider series
+rather than a follow-up to it, so the order is now this spec, then its
+implementation in a seventh PR against `main` (51Degrees), then PRs #1043
+to #1047 reworked onto it. It reads alongside the series' specs, which land
+with PR #1047.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-07-30-pluggable-providers-design.md`,
 `2026-07-30-provider-migration-rollout-design.md`,
 `provider-code-registry.md`
-**Related PRs:** #1043, #1044, #1045, #1046, #1047, #1054
-**Last updated:** 2026-08-27
+**Related PRs:** #986, #1043, #1044, #1045, #1046, #1047, #1054
+**Last updated:** 2026-08-28
 
 > **Why this spec exists.** PRs #1043 to #1047 open the identity, device and
 > geo seams, so a vendor can ship an Edge Cookie provider in its own crate
@@ -20,14 +24,30 @@ series' specs, which land with PR #1047.
 > single defined piece of work rather than an open question repeated once
 > per vendor.
 
+> **Relationship to #986 and the #1043 review.** The pluggable-providers
+> spec in #986 (31 July) defines identity, device and geo as providers
+> selected by `[ec] provider`, `[device] provider` and `[geo] provider` and
+> wired by each adapter through a composition root. #1043 and #1044
+> implement that. The review of #1043 on 27 August asks instead that a
+> vendor's identity provider be a capability declared on its integration
+> registration, because a vendor ships its browser JavaScript and its
+> identity function together. This revision adopts that end state (§3.6)
+> and applies its rule consistently, so geo and device providers attach the
+> same way. The lifecycle contract, the identifier envelope, the permission
+> gating and the validation rules in #986 are unchanged. What changes is
+> only where a vendor's provider is constructed and selected from. The
+> registration shape needs a registry a vendor crate can register with,
+> which is what §3.1 opens, so this spec precedes #1043 rather than
+> following it.
+
 ## 1. The problem, with the code that causes it
 
-Every claim here was read from the tree at `split/5-response-hook-docs`,
-which is `main` plus the five PRs.
+Every claim here was read from `main` at b7fcb5d4c (28 August), which the
+seventh PR targets; the five series PRs do not touch these files.
 
 1. **The registry is closed.** `IntegrationRegistry::new` takes only
    `&Settings` and iterates a fixed table
-   (`crates/trusted-server-core/src/integrations/registry.rs:797`, table at
+   (`crates/trusted-server-core/src/integrations/registry.rs:792`, table at
    `crates/trusted-server-core/src/integrations/mod.rs:290`). Both
    `IntegrationBuilder` and `builders()` are `pub(crate)` with private
    fields, so no adapter and no external crate can add to the list. The
@@ -40,7 +60,7 @@ which is `main` plus the five PRs.
    entries consumed by `bundle.rs`. `IntegrationRegistry::js_module_ids`
    only serves a module when
    `trusted_server_js::module_bundle(id).is_some()`
-   (`registry.rs:1169`), so an integration outside that compile-time map
+   (`registry.rs:1155`), so an integration outside that compile-time map
    gets no script however it registers.
 3. **Startup validation names every vendor.** `validate_enabled_integrations`
    imports and calls each vendor's config type by name
@@ -50,10 +70,10 @@ which is `main` plus the five PRs.
    the ad server mock.
 5. **Two vendors reach further into core.** DataDome drives cache privacy
    and the origin fetch decision through a marker type
-   (`html_processor.rs:303`, `publisher.rs:4367` to `:4387`,
+   (`html_processor.rs:303`, `publisher.rs:4361` to `:4381`,
    `publisher.rs:2653`), and GPT diagnostics is called by name from all four
    adapters (for example
-   `crates/trusted-server-adapter-fastly/src/app.rs:584`).
+   `crates/trusted-server-adapter-fastly/src/app.rs:564`).
 
 The result is that the project carries nine vendors as core code (ten
 registered integrations, since GPT registers a proxy and a diagnostics
@@ -88,7 +108,10 @@ Make the builder contract public and give the registry a second input.
   calls the companion with an empty slice, so no existing caller changes
   behavior.
 - Duplicate integration ids are a startup error, naming both sources, so a
-  vendor crate cannot silently shadow a built-in.
+  vendor crate cannot silently shadow a built-in. There is no such check
+  today, only a per-route conflict check and a debug-only assertion, and
+  `AuctionOrchestrator::register_provider` silently keeps the last writer,
+  so the builder carries a source label and both tables get the check.
 
 ### 3.2 Carrying browser JavaScript on the registration
 
@@ -97,11 +120,22 @@ and `js_disabled`: the module source and its hash, both `&'static str`, so a
 crate can `include_str!` its own built bundle.
 
 `js_module_ids` keeps serving built-in ids from the compile-time map and
-serves a carried module from the registration. `publisher.rs` composes the
-served script and its hash from both sources rather than calling
-`trusted_server_js::concatenate_modules` alone. The hash rule is unchanged,
-so the served bundle stays cacheable and its integrity attribute stays
-correct.
+serves a carried module from the registration. The composition of the
+served script moves from `trusted-server-js` into core, because every hop
+after `js_module_ids` today re-enters `trusted-server-js` by id and silently
+drops an id it does not know (`bundle.rs`, `concatenated_module_ids` and
+`visit_concatenated_module_parts`), and the hash memo is keyed on the id
+list alone. Core composes body and hash from (id, source, hash) triples
+drawn from both sources, keeping the exact byte rule of today (core first,
+`;\n` separator) so every existing `?v=` hash is unchanged. Three consumers
+follow the registry rather than the compile-time list: the standalone
+module route `parse_single_module_filename` (`publisher.rs`), the
+`GPT_DIAGNOSTICS_INTEGRATION_ID` standalone special case, which becomes a
+registration property, and `template_fingerprint`, which must cover carried
+modules so a vendor crate rebuild invalidates the server-side template
+cache. The served script keeps its cache rule, being the `?v=<hash>` query
+matched at serve time (there is no integrity attribute on the tag today, and
+this change adds none).
 
 ### 3.3 Startup validation on the registration
 
@@ -109,8 +143,14 @@ Replace the named list in `config.rs` with a validation hook on the
 registration, so a vendor validates its own configuration and a missing
 vendor cannot silently stop being validated. The existing test that asserts
 every registered integration is covered by deploy validation
-(`config.rs:408`) is rewritten against the hook, so the guarantee survives
-in a vendor-neutral form.
+(`config.rs:688` on `main`) is rewritten against the hook, so the guarantee
+survives in a vendor-neutral form. Two details the map of `main` adds. The
+enumeration the test needs is independent of which integrations a
+configuration enables, so the registry exposes the full set of registrations
+it was built from, not only the enabled ones. And `adserver_mock` is
+validated today without being a registration (it exists only as an auction
+provider), so auction-side registrations carry the same validation hook and
+the test covers both tables.
 
 ### 3.4 Auction providers
 
@@ -140,6 +180,67 @@ the neutral form.
   four adapters move behind hooks on the registration, so an adapter runs
   whatever its registrations declare.
 
+### 3.6 Identity, geo and device as registration capabilities
+
+The rule. Things the host supplies are platform services, being the KV
+store, the HTTP client, the host geo lookup, and the host TLS and HTTP/2
+signals. Things a vendor supplies are capabilities of that vendor's module.
+An identity provider, a geo provider and a device provider are supplied by
+vendors, with or without any host involved, so all three are module
+capabilities, and the same registration carries them alongside the module's
+JavaScript and hooks.
+
+- The registration builder gains three optional capabilities, at most one
+  of each per registration (names indicative, the shape is normative):
+  `.with_ec_provider(Arc<dyn EdgeCookieProvider>)`,
+  `.with_geo_provider(Arc<dyn PlatformGeo>)` and
+  `.with_device_provider(Arc<dyn DeviceProvider>)`. The traits are the ones
+  #1043 and #1044 define, unchanged.
+- Selection keeps the select-exactly-one semantics of #986. `[ec] provider`,
+  `[geo] provider` and `[device] provider` each name either a built-in (the
+  names #986 and #1043/#1044 already define, for example `hmac` and `none`
+  for identity) or the id of a registered module that declares the matching
+  capability. A selector that names a module which is registered but does
+  not declare the capability, or that names nothing registered, is a
+  startup error. A module that declares a capability the selector does not
+  name is inert for that capability and its other hooks still run, and
+  startup logs a warning naming the module and the unused capability, so an
+  operator can see a module shipping script for a provider that is not
+  selected.
+- No provider is built into core. Everything goes through one method, so
+  the HMAC identity provider from #1043 and the User-Agent-only device
+  provider from #1044 become Tech Lab-owned modules in their own crates
+  under `crates/integrations/`, configured under `[integrations.<id>]` and
+  validated through §3.3 like any other module, and the adapters register
+  them by default. Core keeps only the seam and the `none` state for each
+  capability (no identity, no location, unknown device signals). A
+  deployment that registers no identity module is stateless, as #986's
+  `provider = "none"` already means.
+- Composition. The composition root resolves the selected provider for
+  each capability from the registry once at startup and places it in the
+  per-request services, so the request path is unchanged from #1043 and
+  #1044. Adapters stop injecting vendor providers directly (the
+  `ec_provider` slot on the runtime services builder and the injected
+  closures in `build_device_provider` and `build_geo_provider` go). Host
+  defaults are still supplied by the adapter as platform services and are
+  consumed by a built-in or a module through the request evidence and host
+  signal abstractions, exactly as now. A provider that needs a host signal
+  the running adapter does not expose is rejected at startup, as #986
+  requires.
+- A module that declares all three capabilities may share one backend call
+  per request across them, which is the shared-backend principle in
+  `CLAUDE.md`, and is the case that a split between a registry-attached
+  identity provider and platform-attached geo and device providers would
+  have made impossible.
+- The host-signal device provider that #1044 ships as a separate crate is a
+  provider built on platform signals, so it registers as a module too. The
+  signals it reads stay platform.
+
+Effect on the series. #1043 and #1044 rework their construction and
+selection path onto this section, move the HMAC and User-Agent-only
+providers into module crates, and keep everything else. #1045, #1046
+and #1047 are unaffected beyond the rebase.
+
 ## 4. Migration of the nine existing integrations
 
 One vendor per PR, after this change lands. Each moves its Rust, its
@@ -157,13 +258,31 @@ TypeScript, its config type and its tests into
 `IntegrationSettings` is a flattened map that already accepts unknown vendor
 keys (`crates/trusted-server-core/src/settings.rs:166`).
 
+Two more places every move must touch, found by mapping `main`:
+
+- `crates/trusted-server-core/src/migration_guards.rs` embeds every core
+  source file by relative path with `include_str!`, the thirteen vendor
+  files included, so a vendor move that leaves its entry behind breaks the
+  build rather than a test. The guard cannot derive its list from the
+  registrations, because `include_str!` paths are fixed at compile time, so
+  this change drops the nine vendors' files from the guard instead: a module
+  crate is outside the core neutrality guarantee, and a move then deletes
+  nothing there.
+- The `ts audit` command carries its own vendor table (detection patterns
+  and configuration section names in
+  `crates/trusted-server-cli/src/commands/audit/analyzer.rs` and
+  `commands/audit/mod.rs`). It is outside the registry and outside this
+  change. Each vendor move takes its `ts audit` rows with it, and how the
+  CLI learns a vendor's detection pattern from a crate is a follow-up this
+  spec records but does not solve.
+
 ## 5. What does not change
 
 The request pipeline, the hook traits and their order, the served script
 format and its hash, every `[integrations.*]` table, the permission model,
-and the Edge Cookie, device and geo seams from PRs #1043 to #1046. No
-integration changes behavior. A deployment that lists the same integrations
-gets the same responses.
+and the identity lifecycle, envelope and validation contracts from #986 as
+implemented in PRs #1043 to #1046. No integration changes behavior. A
+deployment that lists the same integrations gets the same responses.
 
 ## 6. Acceptance
 
@@ -173,11 +292,17 @@ gets the same responses.
    right hash, runs its hooks in the right order, and is rejected on a
    duplicate id. A seam is only proven by an implementation that is not the
    built-in one.
-2. **Parity.** The existing integration and parity suites pass unchanged,
+2. **Capabilities round trip.** The same test integration declares an
+   identity, a geo and a device provider. With the three selectors naming
+   it, a request is served by all three (the minted identifier carries its
+   code, the resolved country and the device signals are its). With a
+   selector naming a module that lacks the capability, startup fails with
+   an error that names the module and the capability.
+3. **Parity.** The existing integration and parity suites pass unchanged,
    because the built-in set still registers through the same path.
-3. **No vendor left behind.** The rewritten deploy-validation test shows
+4. **No vendor left behind.** The rewritten deploy-validation test shows
    every registered integration validates its configuration.
-4. All CI gates in `CLAUDE.md`, on all four adapters.
+5. All CI gates in `CLAUDE.md`, on all four adapters.
 
 ## 7. Risk
 
@@ -185,23 +310,32 @@ The change is wide but shallow. It touches the registry, the served script
 path, deploy validation and four adapter entry points, and it changes no
 integration's behavior. The largest risk is the served script, where a
 mistake shows up as a wrong hash or a missing module, so §6's round trip
-covers both. Doing this once is what removes the per-vendor core change
+covers both, and the existing hash round-trip tests in `bundle.rs`,
+`publisher.rs` and `tsjs.rs` pin every current `?v=` value. The second risk
+is the renderer contract, where `BidRenderer::as_aps` is an exhaustive
+single-arm match with eight test sites constructing the variant directly,
+and the wire shape `{"type":"aps", ...}` must survive byte for byte. Doing this once is what removes the per-vendor core change
 that the project pays for today, most recently in PR #1054.
 
 ## 8. Sign-off
 
-| #   | Decision                                                                        | Status               |
-| --- | ------------------------------------------------------------------------------- | -------------------- |
-| 1   | Vendor integrations belong outside core, behind the registration contract       | Proposed             |
-| 2   | Tech Lab engineering reviews vendor crates, and does not maintain them          | Proposed, governance |
-| 3   | A registration may carry its own browser JavaScript                             | Proposed             |
-| 4   | Deploy validation moves onto the registration                                   | Proposed             |
-| 5   | The nine existing integrations migrate one PR each, on the schedule in §4       | Proposed             |
-| 6   | This change is complete in itself: after it, no vendor move needs a core change | Proposed             |
+| #   | Decision                                                                                                                                                                   | Status               |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| 1   | Vendor integrations belong outside core, behind the registration contract                                                                                                  | Proposed             |
+| 2   | Tech Lab engineering reviews vendor crates, and does not maintain them                                                                                                     | Proposed, governance |
+| 3   | A registration may carry its own browser JavaScript                                                                                                                        | Proposed             |
+| 4   | Deploy validation moves onto the registration                                                                                                                              | Proposed             |
+| 5   | The nine existing integrations migrate one PR each, on the schedule in §4                                                                                                  | Proposed             |
+| 6   | This change is complete in itself: after it, no vendor move needs a core change                                                                                            | Proposed             |
+| 7   | Identity, geo and device providers are capabilities of a module registration (§3.6), the #1043 review's rule applied to all three                                          | Proposed             |
+| 8   | No provider is built into core: HMAC and the User-Agent-only device provider are Tech Lab-owned modules configured under `[integrations.<id>]`, and core keeps only `none` | Proposed             |
+| 9   | This spec and its core implementation precede #1043; 51Degrees implements the core seam, the nine vendor moves in §4 stay one PR each                                      | Proposed             |
 
 ## Revision record
 
-| Date       | Change                                                                                                                        |
-| ---------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| 2026-08-27 | First draft, written against `split/5-response-hook-docs`.                                                                    |
-| 2026-08-27 | Brought the bid renderer contract into scope (§3.4), so that after this change no vendor move needs a core change (§8 row 6). |
+| Date       | Change                                                                                                                                                                                                                                                                                                                                     |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 2026-08-27 | First draft, written against `split/5-response-hook-docs`.                                                                                                                                                                                                                                                                                 |
+| 2026-08-27 | Brought the bid renderer contract into scope (§3.4), so that after this change no vendor move needs a core change (§8 row 6).                                                                                                                                                                                                              |
+| 2026-08-28 | Corrected line references to `main` at b7fcb5d4c and added what mapping `main` found: composition of the served script moves into core (§3.2), registration enumeration and the auction-only `adserver_mock` case (§3.3), the duplicate-id gap (§3.1), the source-file guard and the `ts audit` vendor table (§4), the renderer risk (§7). |
+| 2026-08-28 | Adopted the #1043 review's registration shape for identity and applied its rule to geo and device, with no provider built into core (§3.6, §6 item 2, §8 rows 7 to 9). Recorded the relationship to #986 and reordered the series so this spec and its implementation come first.                                                          |
