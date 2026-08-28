@@ -1,15 +1,24 @@
 //! Edge Cookie identity providers.
 //!
-//! An [`EdgeCookieProvider`] derives an Edge Cookie identifier. Providers are
-//! wired by dependency injection: a provider's constructor takes the services it
-//! needs (for example [`RequestInfo`] for the client IP)
-//! (the adapter, through [`build_provider`]) supplies instances per request. A
-//! provider that needs a service the host does not supply cannot be built, so
-//! the request stops rather than silently degrading.
+//! An [`EdgeCookieProvider`] derives an Edge Cookie identifier. The provider is
+//! selected by configuration, with no default, and [`build_provider`] is the
+//! composition root that builds the selected one. A built-in provider is
+//! constructed from its `[ec.providers.<key>]` block, and a vendor provider is
+//! taken from the adapter that injected it. Construction happens once, while
+//! application state is built, and reads no request data, so a selection this
+//! deployment cannot satisfy fails at startup rather than leaving it running
+//! without an identity.
 //!
-//! The provider is selected by configuration, with no default. [`HmacProvider`]
-//! is the built-in server-side implementation that derives the identifier from
-//! the client IP using HMAC, the behavior Trusted Server has always shipped.
+//! Request evidence reaches a provider at call time rather than at
+//! construction. [`EdgeCookieProvider::generate`] borrows a [`RequestInfo`],
+//! which carries the normalized client IP, the User-Agent and the request
+//! headers, for the life of the call, alongside an [`IdentityInput`] holding
+//! the request's gating context. A provider reads what it needs and retains
+//! nothing, so no per-request snapshot is stored or cloned.
+//!
+//! [`HmacProvider`] is the built-in server-side implementation. It derives the
+//! identifier from the client IP using HMAC over the configured passphrase, the
+//! behavior Trusted Server has always shipped.
 
 use std::sync::Arc;
 

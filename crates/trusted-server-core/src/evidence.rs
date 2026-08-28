@@ -1,14 +1,16 @@
-//! Service interfaces injected into providers.
+//! Request evidence passed to providers.
 //!
-//! Trusted Server wires providers by dependency injection. A provider's
-//! constructor takes the services it needs as `Arc<dyn Trait>`, and the adapter
-//! (the composition root) supplies instances per request. A provider that needs
-//! a service the host does not supply cannot be built, so the request stops
-//! rather than silently degrading.
+//! A provider is constructed once, from its own configuration block or by the
+//! adapter that injects it, and is handed the current request's evidence as a
+//! borrowed `&dyn` view on every call, for example the `request_info` argument
+//! of [`generate`](crate::ec::provider::EdgeCookieProvider::generate). Nothing
+//! per-request is stored on the provider, so the same provider serves every
+//! request.
 //!
-//! These traits are the service interfaces. Request-scoped data outlives the
-//! live request only when snapshotted, so an implementation owns its data where
-//! needed ([`OwnedRequestInfo`] is the built-in owned snapshot).
+//! These traits are those views. Request-scoped data outlives the live request
+//! only when snapshotted, so an implementation owns its data where needed.
+//! [`BorrowedRequestInfo`] is the borrowed view core builds on the request
+//! path, and [`OwnedRequestInfo`] is the built-in owned snapshot.
 
 use http::HeaderMap;
 
