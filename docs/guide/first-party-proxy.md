@@ -172,6 +172,8 @@ POST /first-party/sign
 
 A valid host outside a non-empty allowlist returns `403 Forbidden`. The creative runtime treats this response as a policy rejection and does not assign the attempted raw image or iframe URL. Network failures, malformed success responses, and non-403 errors keep the existing direct-load fallback. An empty allowlist permits every valid host.
 
+This blocked-assignment behavior applies when the runtime intercepts a `src` setter or `setAttribute` call before native assignment. Markup inserted through `innerHTML` or `document.write` may begin a native load before the `MutationObserver` requests a signature. A later `403` does not retract that existing attribute.
+
 **Expiration**:
 
 - Default: 30 seconds from signing
