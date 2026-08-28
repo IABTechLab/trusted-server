@@ -20,6 +20,11 @@ pub struct JsModulePart {
     /// The built IIFE.
     pub source: &'static str,
     /// SHA-256 of `source`, hex encoded. Identifies the content in the memo.
+    ///
+    /// The memo in [`compose_hash`] trusts this value rather than hashing
+    /// `source` again, so a part that declares the wrong hash serves a stale
+    /// `?v=` under a valid-looking URL. Debug builds and tests check the
+    /// value against `source`; release builds do not.
     pub sha256: &'static str,
 }
 
@@ -27,21 +32,38 @@ impl JsModulePart {
     /// Looks up a compile-time module of `trusted-server-js` by id.
     ///
     /// Returns `None` when no module with that id was compiled in.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::tsjs_bundle::JsModulePart;
+    ///
+    /// assert!(JsModulePart::compile_time("core").is_some());
+    /// assert!(JsModulePart::compile_time("not-a-module").is_none());
+    /// ```
     #[must_use]
-    pub fn compile_time(id: &str) -> Option<Self> {
+    pub fn compile_time(id: &'static str) -> Option<Self> {
         let source = trusted_server_js::module_bundle(id)?;
         let sha256 = trusted_server_js::single_module_hash(id)?;
-        let id = trusted_server_js::all_module_ids()
-            .into_iter()
-            .find(|candidate| *candidate == id)?;
         Some(Self { id, source, sha256 })
     }
 }
 
 /// Resolves compile-time parts for a list of ids, dropping unknown ids, as
 /// `trusted_server_js` does today.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::tsjs_bundle::compile_time_parts;
+///
+/// let parts = compile_time_parts(&["core", "not-a-module"]);
+///
+/// assert_eq!(parts.len(), 1);
+/// assert_eq!(parts[0].id, "core");
+/// ```
 #[must_use]
-pub fn compile_time_parts(ids: &[&str]) -> Vec<JsModulePart> {
+pub fn compile_time_parts(ids: &[&'static str]) -> Vec<JsModulePart> {
     ids.iter()
         .filter_map(|id| JsModulePart::compile_time(id))
         .collect()
@@ -57,19 +79,17 @@ pub fn compile_time_parts(ids: &[&str]) -> Vec<JsModulePart> {
 /// # Examples
 ///
 /// ```
+/// use sha2::{Digest as _, Sha256};
 /// use trusted_server_core::tsjs_bundle::{JsModulePart, compose};
 ///
+/// fn part(id: &'static str, source: &'static str) -> JsModulePart {
+///     let sha256 = Box::leak(hex::encode(Sha256::digest(source)).into_boxed_str());
+///     JsModulePart { id, source, sha256 }
+/// }
+///
 /// let parts = [
-///     JsModulePart {
-///         id: "example",
-///         source: "(() => { window.example = true; })()",
-///         sha256: "e1",
-///     },
-///     JsModulePart {
-///         id: "core",
-///         source: "(() => { window.tsjs = {}; })()",
-///         sha256: "c1",
-///     },
+///     part("example", "(() => { window.example = true; })()"),
+///     part("core", "(() => { window.tsjs = {}; })()"),
 /// ];
 ///
 /// assert_eq!(
@@ -90,34 +110,29 @@ pub fn compose(parts: &[JsModulePart]) -> String {
 /// The result is memoized per ordered set of `(id, sha256)` pairs, so a
 /// per-request caller hashes a given module set once per process or isolate.
 /// Because the key carries each part's content hash, a carried module that
-/// keeps its id but changes its source gets a new hash.
+/// keeps its id but changes its source gets a new hash. The memo never
+/// evicts, so feed it only sets derived from configuration, never sets
+/// derived from request input.
+///
+/// # Panics
+///
+/// In debug builds, panics when a part's `sha256` is not the SHA-256 of its
+/// `source`. Release builds trust the declared hash.
 ///
 /// # Examples
 ///
 /// ```
+/// use sha2::{Digest as _, Sha256};
 /// use trusted_server_core::tsjs_bundle::{JsModulePart, compose_hash};
 ///
-/// let core = JsModulePart {
-///     id: "core",
-///     source: "(() => { window.tsjs = {}; })()",
-///     sha256: "c1",
-/// };
-/// let before = [
-///     core,
-///     JsModulePart {
-///         id: "example",
-///         source: "(() => { window.example = 1; })()",
-///         sha256: "e1",
-///     },
-/// ];
-/// let after = [
-///     core,
-///     JsModulePart {
-///         id: "example",
-///         source: "(() => { window.example = 2; })()",
-///         sha256: "e2",
-///     },
-/// ];
+/// fn part(id: &'static str, source: &'static str) -> JsModulePart {
+///     let sha256 = Box::leak(hex::encode(Sha256::digest(source)).into_boxed_str());
+///     JsModulePart { id, source, sha256 }
+/// }
+///
+/// let core = JsModulePart::compile_time("core").expect("should have compiled core in");
+/// let before = [core, part("example", "(() => { window.example = 1; })()")];
+/// let after = [core, part("example", "(() => { window.example = 2; })()")];
 ///
 /// assert_eq!(compose_hash(&before).len(), 64);
 /// assert_eq!(compose_hash(&before), compose_hash(&before));
@@ -125,6 +140,15 @@ pub fn compose(parts: &[JsModulePart]) -> String {
 /// ```
 #[must_use]
 pub fn compose_hash(parts: &[JsModulePart]) -> String {
+    for part in parts {
+        debug_assert_eq!(
+            part.sha256,
+            hex::encode(Sha256::digest(part.source)),
+            "should declare the SHA-256 of its source for part `{}`",
+            part.id
+        );
+    }
+
     let ordered = ordered(parts);
     let key = ordered
         .iter()
@@ -196,16 +220,15 @@ fn lock_cache() -> MutexGuard<'static, HashCache> {
 mod tests {
     use super::*;
 
-    fn part(id: &'static str, source: &'static str) -> JsModulePart {
-        JsModulePart {
-            id,
-            source,
-            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
-        }
-    }
-
     fn sha256_hex(bytes: &[u8]) -> String {
         hex::encode(Sha256::digest(bytes))
+    }
+
+    /// Builds a part whose `sha256` really is the hash of `source`, so no two
+    /// parts with different content ever share a memo key.
+    fn part(id: &'static str, source: &'static str) -> JsModulePart {
+        let sha256 = Box::leak(sha256_hex(source.as_bytes()).into_boxed_str());
+        JsModulePart { id, source, sha256 }
     }
 
     #[test]
@@ -283,22 +306,8 @@ mod tests {
 
     #[test]
     fn compose_hash_changes_when_a_carried_module_changes() {
-        let before = [
-            part("core", "C"),
-            JsModulePart {
-                id: "probe",
-                source: "A",
-                sha256: "a",
-            },
-        ];
-        let after = [
-            part("core", "C"),
-            JsModulePart {
-                id: "probe",
-                source: "B",
-                sha256: "b",
-            },
-        ];
+        let before = [part("core", "C"), part("probe", "A")];
+        let after = [part("core", "C"), part("probe", "B")];
 
         assert_ne!(
             compose_hash(&before),
@@ -328,11 +337,7 @@ mod tests {
     fn compose_hash_is_the_hex_sha256_of_compose() {
         let parts = [
             part("core", "(() => {})()"),
-            JsModulePart {
-                id: "carried",
-                source: "(() => { window.carried = true; })()",
-                sha256: "carried-1",
-            },
+            part("carried", "(() => { window.carried = true; })()"),
             part("lockr", "L"),
         ];
 
@@ -341,6 +346,21 @@ mod tests {
             sha256_hex(compose(&parts).as_bytes()),
             "should hash the exact bytes compose produces"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "should declare the SHA-256 of its source for part `lying`")]
+    fn compose_hash_rejects_a_part_whose_declared_hash_is_wrong() {
+        let parts = [
+            part("core", "C"),
+            JsModulePart {
+                id: "lying",
+                source: "A",
+                sha256: "not-the-hash-of-a",
+            },
+        ];
+
+        let _ = compose_hash(&parts);
     }
 
     #[test]
