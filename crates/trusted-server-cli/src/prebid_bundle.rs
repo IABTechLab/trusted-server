@@ -33,6 +33,7 @@ fn cli_error<T>(message: impl Into<String>) -> CliResult<T> {
 pub(crate) struct PrebidBundleConfig {
     pub adapters: Vec<String>,
     pub user_id_modules: Option<Vec<String>>,
+    pub managed_user_id_names: Vec<String>,
     pub external_bundle_url: Option<String>,
 }
 
@@ -235,6 +236,8 @@ pub(crate) fn load_bundle_config(config_path: &Path) -> CliResult<PrebidBundleCo
         ));
     }
 
+    let managed_user_id_names = read_managed_user_id_names(prebid, config_path)?;
+
     let external_bundle_url = prebid
         .get("external_bundle_url")
         .and_then(toml::Value::as_str)
@@ -243,8 +246,54 @@ pub(crate) fn load_bundle_config(config_path: &Path) -> CliResult<PrebidBundleCo
     Ok(PrebidBundleConfig {
         adapters,
         user_id_modules,
+        managed_user_id_names,
         external_bundle_url,
     })
+}
+
+fn read_managed_user_id_names(
+    prebid: &toml::Value,
+    config_path: &Path,
+) -> CliResult<Vec<String>> {
+    let Some(value) = prebid.get("managed_user_ids") else {
+        return Ok(Vec::new());
+    };
+    let entries = value.as_array().ok_or_else(|| {
+        report_error(format!(
+            "{} integrations.prebid.managed_user_ids must be an array of tables",
+            config_path.display()
+        ))
+    })?;
+
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let table = entry.as_table().ok_or_else(|| {
+                report_error(format!(
+                    "{} integrations.prebid.managed_user_ids[{index}] must be a table",
+                    config_path.display()
+                ))
+            })?;
+            let field = format!("integrations.prebid.managed_user_ids[{index}].name");
+            let name = table
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| {
+                    report_error(format!(
+                        "{} {field} must be a non-empty string",
+                        config_path.display()
+                    ))
+                })?;
+            if name.trim().is_empty() {
+                return cli_error(format!(
+                    "{} {field} must be a non-empty string",
+                    config_path.display()
+                ));
+            }
+            Ok(name.to_string())
+        })
+        .collect()
 }
 
 fn read_required_string_array(
@@ -587,6 +636,7 @@ user_id_modules = ["sharedIdSystem", "uid2IdSystem"]
             config.external_bundle_url.as_deref(),
             Some("https://assets.example.com/prebid/trusted-prebid-old.js")
         );
+        assert!(config.managed_user_id_names.is_empty());
     }
 
     #[test]
@@ -606,6 +656,110 @@ adapters = ["rubicon"]
 
         assert_eq!(config.adapters, ["rubicon"]);
         assert_eq!(config.user_id_modules, None);
+        assert!(config.managed_user_id_names.is_empty());
+    }
+
+    #[test]
+    fn bundle_config_loader_reads_managed_user_id_names_in_order() {
+        let (_temp, path) = write_config(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example.com/openrtb2/auction"
+
+[[integrations.prebid.managed_user_ids]]
+name = "identityLink"
+
+[[integrations.prebid.managed_user_ids]]
+name = "pubCommonId"
+
+[integrations.prebid.bundle]
+adapters = ["rubicon"]
+"#,
+        );
+
+        let config = load_bundle_config(&path).expect("should load managed names");
+
+        assert_eq!(
+            config.managed_user_id_names,
+            ["identityLink", "pubCommonId"],
+            "should preserve managed entry order"
+        );
+    }
+
+    #[test]
+    fn bundle_config_loader_rejects_non_array_managed_user_ids() {
+        for managed_user_ids in ["\"identityLink\"", "{ name = \"identityLink\" }"] {
+            let (_temp, path) = write_config(&format!(
+                r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example.com/openrtb2/auction"
+managed_user_ids = {managed_user_ids}
+
+[integrations.prebid.bundle]
+adapters = ["rubicon"]
+"#
+            ));
+
+            let error = load_bundle_config(&path).expect_err("should require an array");
+
+            assert!(
+                error.contains("integrations.prebid.managed_user_ids must be an array of tables"),
+                "should identify the malformed managed list: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_config_loader_rejects_non_table_managed_entry() {
+        let (_temp, path) = write_config(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example.com/openrtb2/auction"
+managed_user_ids = ["identityLink"]
+
+[integrations.prebid.bundle]
+adapters = ["rubicon"]
+"#,
+        );
+
+        let error = load_bundle_config(&path).expect_err("should require managed tables");
+
+        assert!(
+            error.contains("integrations.prebid.managed_user_ids[0] must be a table"),
+            "should identify the malformed managed entry: {error}"
+        );
+    }
+
+    #[test]
+    fn bundle_config_loader_rejects_managed_entry_without_string_name() {
+        for entry in [
+            "{ params = { pid = \"999\" } }",
+            "{ name = 123 }",
+            "{ name = \"\" }",
+            "{ name = \"   \" }",
+        ] {
+            let (_temp, path) = write_config(&format!(
+                r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example.com/openrtb2/auction"
+managed_user_ids = [{entry}]
+
+[integrations.prebid.bundle]
+adapters = ["rubicon"]
+"#
+            ));
+
+            let error = load_bundle_config(&path).expect_err("should reject malformed name");
+
+            assert!(
+                error.contains("integrations.prebid.managed_user_ids[0].name"),
+                "should identify the malformed managed name: {error}"
+            );
+        }
     }
 
     #[test]
