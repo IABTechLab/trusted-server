@@ -32,6 +32,9 @@ use crate::settings::{IntegrationConfig, Settings};
 // Configuration
 // ============================================================================
 
+/// Integration id the ad server mock provider is configured under.
+const ADSERVER_MOCK_INTEGRATION_ID: &str = "adserver_mock";
+
 /// Configuration for mock ad server integration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct AdServerMockConfig {
@@ -556,6 +559,19 @@ impl AuctionProvider for AdServerMockProvider {
 // Auto-Registration
 // ============================================================================
 
+/// Validates the ad server mock configuration for deployment and reports
+/// whether the provider is enabled.
+///
+/// # Errors
+///
+/// Returns an error when the ad server mock configuration cannot be parsed or
+/// fails validation.
+pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    settings
+        .integration_config::<AdServerMockConfig>(ADSERVER_MOCK_INTEGRATION_ID)
+        .map(|config| config.is_some())
+}
+
 /// Auto-register ad server mock provider based on settings configuration.
 ///
 /// # Errors
@@ -567,7 +583,7 @@ pub fn register_providers(
 ) -> Result<Vec<Arc<dyn AuctionProvider>>, Report<TrustedServerError>> {
     let mut providers: Vec<Arc<dyn AuctionProvider>> = Vec::new();
 
-    match settings.integration_config::<AdServerMockConfig>("adserver_mock") {
+    match settings.integration_config::<AdServerMockConfig>(ADSERVER_MOCK_INTEGRATION_ID) {
         Ok(Some(config)) => {
             log::info!(
                 "Registering AdServer Mock mediator (endpoint: {})",

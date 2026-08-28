@@ -205,6 +205,9 @@ fn snapshot_context_request(request: &Request<EdgeBody>) -> Request<EdgeBody> {
 pub struct AuctionOrchestrator {
     config: AuctionConfig,
     providers: HashMap<String, Arc<dyn AuctionProvider>>,
+    /// Provider names in registration order, each paired with the source that
+    /// registered it, so a duplicate can name the source that came first.
+    provider_sources: Vec<(String, &'static str)>,
 }
 
 impl AuctionOrchestrator {
@@ -214,14 +217,36 @@ impl AuctionOrchestrator {
         Self {
             config,
             providers: HashMap::new(),
+            provider_sources: Vec::new(),
         }
     }
 
-    /// Register an auction provider.
-    pub fn register_provider(&mut self, provider: Arc<dyn AuctionProvider>) {
+    /// Register an auction provider attributed to `source`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a provider with the same name is already registered.
+    pub fn register_provider(
+        &mut self,
+        provider: Arc<dyn AuctionProvider>,
+        source: &'static str,
+    ) -> Result<(), Report<TrustedServerError>> {
         let name = provider.provider_name().to_string();
-        log::info!("Registering auction provider: {}", name);
+        if let Some((_, first_source)) = self
+            .provider_sources
+            .iter()
+            .find(|(registered, _)| *registered == name)
+        {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "auction provider `{name}` is registered twice, by `{first_source}` and by `{source}`"
+                ),
+            }));
+        }
+        log::info!("Registering auction provider: {name}");
+        self.provider_sources.push((name.clone(), source));
         self.providers.insert(name, provider);
+        Ok(())
     }
 
     /// Get the number of registered providers.
@@ -1971,11 +1996,21 @@ mod tests {
             ..Default::default()
         };
         let mut orchestrator = AuctionOrchestrator::new(config);
-        orchestrator.register_provider(Arc::new(StubAuctionProvider {
-            name: "bidder",
-            backend: "bidder-backend",
-        }));
-        orchestrator.register_provider(Arc::new(CacheRestoringMediator));
+        orchestrator
+            .register_provider(
+                Arc::new(StubAuctionProvider {
+                    name: "bidder",
+                    backend: "bidder-backend",
+                }),
+                crate::integrations::CORE_SOURCE,
+            )
+            .expect("should register");
+        orchestrator
+            .register_provider(
+                Arc::new(CacheRestoringMediator),
+                crate::integrations::CORE_SOURCE,
+            )
+            .expect("should register");
 
         let request = create_test_auction_request();
         let settings = create_test_settings();
@@ -2027,11 +2062,21 @@ mod tests {
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "bidder",
-                backend: "bidder-backend",
-            }));
-            orchestrator.register_provider(Arc::new(ImmediateMediator));
+            orchestrator
+                .register_provider(
+                    Arc::new(StubAuctionProvider {
+                        name: "bidder",
+                        backend: "bidder-backend",
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
+            orchestrator
+                .register_provider(
+                    Arc::new(ImmediateMediator),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
             let request = create_test_auction_request();
             let settings = create_test_settings();
             let downstream = http::Request::new(edgezero_core::body::Body::empty());
@@ -2215,7 +2260,12 @@ mod tests {
             ..Default::default()
         };
         let mut orchestrator = AuctionOrchestrator::new(config);
-        orchestrator.register_provider(Arc::new(ImmediateNoBidProvider));
+        orchestrator
+            .register_provider(
+                Arc::new(ImmediateNoBidProvider),
+                crate::integrations::CORE_SOURCE,
+            )
+            .expect("should register");
         let settings = create_test_settings();
         let services = noop_services();
         let downstream = http::Request::new(edgezero_core::body::Body::empty());
@@ -2240,7 +2290,12 @@ mod tests {
             ..Default::default()
         };
         let mut orchestrator = AuctionOrchestrator::new(config);
-        orchestrator.register_provider(Arc::new(ImmediateNoBidProvider));
+        orchestrator
+            .register_provider(
+                Arc::new(ImmediateNoBidProvider),
+                crate::integrations::CORE_SOURCE,
+            )
+            .expect("should register");
         let settings = create_test_settings();
         let services = noop_services();
         let downstream = http::Request::new(edgezero_core::body::Body::empty());
@@ -2271,11 +2326,21 @@ mod tests {
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
-            orchestrator.register_provider(Arc::new(ImmediateNoBidProvider));
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "pending",
-                backend: "pending-backend",
-            }));
+            orchestrator
+                .register_provider(
+                    Arc::new(ImmediateNoBidProvider),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
+            orchestrator
+                .register_provider(
+                    Arc::new(StubAuctionProvider {
+                        name: "pending",
+                        backend: "pending-backend",
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, b"{}".to_vec());
             let services = build_services_with_http_client(stub);
@@ -2528,7 +2593,12 @@ mod tests {
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
-            orchestrator.register_provider(Arc::new(LaunchFailingProvider));
+            orchestrator
+                .register_provider(
+                    Arc::new(LaunchFailingProvider),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
 
             let request = create_test_auction_request();
             let settings = create_test_settings();
@@ -2592,14 +2662,24 @@ mod tests {
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-a",
-                backend: "shared-backend",
-            }));
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-b",
-                backend: "shared-backend",
-            }));
+            orchestrator
+                .register_provider(
+                    Arc::new(StubAuctionProvider {
+                        name: "provider-a",
+                        backend: "shared-backend",
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
+            orchestrator
+                .register_provider(
+                    Arc::new(StubAuctionProvider {
+                        name: "provider-b",
+                        backend: "shared-backend",
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, b"{}".to_vec());
             let services = build_services_with_http_client(stub);
@@ -2706,13 +2786,18 @@ mod tests {
                 timeout_ms: 2000,
                 ..Default::default()
             });
-            orchestrator.register_provider(Arc::new(recording_provider(
-                "bidder",
-                "bidder-backend",
-                1000,
-                &predicted,
-                &requested,
-            )));
+            orchestrator
+                .register_provider(
+                    Arc::new(recording_provider(
+                        "bidder",
+                        "bidder-backend",
+                        1000,
+                        &predicted,
+                        &requested,
+                    )),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
             let settings = create_test_settings();
             let downstream = http::Request::new(edgezero_core::body::Body::empty());
             let context = immediate_test_context(&settings, &downstream, &services);
@@ -2750,13 +2835,18 @@ mod tests {
                 timeout_ms: 2000,
                 ..Default::default()
             });
-            orchestrator.register_provider(Arc::new(recording_provider(
-                "bidder",
-                "bidder-backend",
-                1000,
-                &predicted,
-                &requested,
-            )));
+            orchestrator
+                .register_provider(
+                    Arc::new(recording_provider(
+                        "bidder",
+                        "bidder-backend",
+                        1000,
+                        &predicted,
+                        &requested,
+                    )),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
             let settings = create_test_settings();
             let downstream = http::Request::new(edgezero_core::body::Body::empty());
             let context = immediate_test_context(&settings, &downstream, &services);
@@ -2794,17 +2884,27 @@ mod tests {
                 timeout_ms: 2000,
                 ..Default::default()
             });
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "bidder",
-                backend: "bidder-backend",
-            }));
-            orchestrator.register_provider(Arc::new(recording_provider(
-                "mediator",
-                "mediator-backend",
-                2000,
-                &predicted,
-                &requested,
-            )));
+            orchestrator
+                .register_provider(
+                    Arc::new(StubAuctionProvider {
+                        name: "bidder",
+                        backend: "bidder-backend",
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
+            orchestrator
+                .register_provider(
+                    Arc::new(recording_provider(
+                        "mediator",
+                        "mediator-backend",
+                        2000,
+                        &predicted,
+                        &requested,
+                    )),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
             let settings = create_test_settings();
             let downstream = http::Request::new(edgezero_core::body::Body::empty());
             let context = immediate_test_context(&settings, &downstream, &services);
@@ -2844,20 +2944,30 @@ mod tests {
                 timeout_ms: 2000,
                 ..Default::default()
             });
-            orchestrator.register_provider(Arc::new(recording_provider(
-                "bidder",
-                "bidder-backend",
-                2000,
-                &bidder_predicted,
-                &bidder_requested,
-            )));
-            orchestrator.register_provider(Arc::new(recording_provider(
-                "mediator",
-                "mediator-backend",
-                2000,
-                &mediator_predicted,
-                &mediator_requested,
-            )));
+            orchestrator
+                .register_provider(
+                    Arc::new(recording_provider(
+                        "bidder",
+                        "bidder-backend",
+                        2000,
+                        &bidder_predicted,
+                        &bidder_requested,
+                    )),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
+            orchestrator
+                .register_provider(
+                    Arc::new(recording_provider(
+                        "mediator",
+                        "mediator-backend",
+                        2000,
+                        &mediator_predicted,
+                        &mediator_requested,
+                    )),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
             let settings = create_test_settings();
             let downstream = http::Request::new(edgezero_core::body::Body::empty());
             let context = immediate_test_context(&settings, &downstream, &services);
@@ -2905,11 +3015,16 @@ mod tests {
                 timeout_ms: 2000,
                 ..Default::default()
             });
-            orchestrator.register_provider(Arc::new(DivergentBackendProvider {
-                name: "provider-a",
-                predicted: "predicted-backend",
-                resolved: "resolved-backend",
-            }));
+            orchestrator
+                .register_provider(
+                    Arc::new(DivergentBackendProvider {
+                        name: "provider-a",
+                        predicted: "predicted-backend",
+                        resolved: "resolved-backend",
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
             let settings = create_test_settings();
             let downstream = http::Request::new(edgezero_core::body::Body::empty());
             let context = immediate_test_context(&settings, &downstream, &services);
@@ -2943,16 +3058,26 @@ mod tests {
                 timeout_ms: 2000,
                 ..Default::default()
             });
-            orchestrator.register_provider(Arc::new(DivergentBackendProvider {
-                name: "provider-a",
-                predicted: "predicted-a",
-                resolved: "shared-resolved",
-            }));
-            orchestrator.register_provider(Arc::new(DivergentBackendProvider {
-                name: "provider-b",
-                predicted: "predicted-b",
-                resolved: "shared-resolved",
-            }));
+            orchestrator
+                .register_provider(
+                    Arc::new(DivergentBackendProvider {
+                        name: "provider-a",
+                        predicted: "predicted-a",
+                        resolved: "shared-resolved",
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
+            orchestrator
+                .register_provider(
+                    Arc::new(DivergentBackendProvider {
+                        name: "provider-b",
+                        predicted: "predicted-b",
+                        resolved: "shared-resolved",
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
             let settings = create_test_settings();
             let downstream = http::Request::new(edgezero_core::body::Body::empty());
             let context = immediate_test_context(&settings, &downstream, &services);
@@ -3000,14 +3125,24 @@ mod tests {
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-a",
-                backend: "backend-a",
-            }));
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-b",
-                backend: "backend-b",
-            }));
+            orchestrator
+                .register_provider(
+                    Arc::new(StubAuctionProvider {
+                        name: "provider-a",
+                        backend: "backend-a",
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
+            orchestrator
+                .register_provider(
+                    Arc::new(StubAuctionProvider {
+                        name: "provider-b",
+                        backend: "backend-b",
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
 
             let request = create_test_auction_request();
             let settings = create_test_settings();
@@ -3075,10 +3210,15 @@ mod tests {
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-a",
-                backend: "backend-a",
-            }));
+            orchestrator
+                .register_provider(
+                    Arc::new(StubAuctionProvider {
+                        name: "provider-a",
+                        backend: "backend-a",
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
             let request = create_test_auction_request();
             let settings = create_test_settings();
             let downstream = http::Request::builder()
@@ -3153,14 +3293,24 @@ mod tests {
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-a",
-                backend: "backend-a",
-            }));
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-b",
-                backend: "backend-b",
-            }));
+            orchestrator
+                .register_provider(
+                    Arc::new(StubAuctionProvider {
+                        name: "provider-a",
+                        backend: "backend-a",
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
+            orchestrator
+                .register_provider(
+                    Arc::new(StubAuctionProvider {
+                        name: "provider-b",
+                        backend: "backend-b",
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
 
             let request = create_test_auction_request();
             let settings = create_test_settings();
@@ -3218,14 +3368,24 @@ mod tests {
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-a",
-                backend: "backend-a",
-            }));
-            orchestrator.register_provider(Arc::new(StubAuctionProvider {
-                name: "provider-b",
-                backend: "backend-b",
-            }));
+            orchestrator
+                .register_provider(
+                    Arc::new(StubAuctionProvider {
+                        name: "provider-a",
+                        backend: "backend-a",
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
+            orchestrator
+                .register_provider(
+                    Arc::new(StubAuctionProvider {
+                        name: "provider-b",
+                        backend: "backend-b",
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
 
             let request = create_test_auction_request();
             let settings = create_test_settings();

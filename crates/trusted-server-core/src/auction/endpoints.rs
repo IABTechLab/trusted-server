@@ -728,9 +728,14 @@ mod tests {
             .expect("should parse settings with disabled templates");
         let calls = Arc::new(Mutex::new(0));
         let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-        orchestrator.register_provider(Arc::new(TemplateSwitchProbeProvider {
-            calls: Arc::clone(&calls),
-        }));
+        orchestrator
+            .register_provider(
+                Arc::new(TemplateSwitchProbeProvider {
+                    calls: Arc::clone(&calls),
+                }),
+                crate::integrations::CORE_SOURCE,
+            )
+            .expect("should register");
 
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, b"probe response".to_vec());
@@ -797,7 +802,12 @@ mod tests {
             ..Default::default()
         };
         let mut orchestrator = AuctionOrchestrator::new(config);
-        orchestrator.register_provider(Arc::new(PanicOnBidProvider));
+        orchestrator
+            .register_provider(
+                Arc::new(PanicOnBidProvider),
+                crate::integrations::CORE_SOURCE,
+            )
+            .expect("should register");
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
         let services = services_with_telemetry(Arc::clone(&telemetry_sink));
         let ec_id = format!("{}.ABC123", "a".repeat(64));
@@ -928,9 +938,14 @@ mod tests {
         };
         let mut orchestrator = AuctionOrchestrator::new(config);
         let had_eids = Arc::new(std::sync::Mutex::new(None));
-        orchestrator.register_provider(Arc::new(EidCapturingProvider {
-            had_eids: Arc::clone(&had_eids),
-        }));
+        orchestrator
+            .register_provider(
+                Arc::new(EidCapturingProvider {
+                    had_eids: Arc::clone(&had_eids),
+                }),
+                crate::integrations::CORE_SOURCE,
+            )
+            .expect("should register");
         let services = noop_services();
 
         // US-state jurisdiction with an explicit GPC opt-out: auction allowed,

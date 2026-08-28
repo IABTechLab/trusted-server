@@ -9266,7 +9266,12 @@ mod tests {
             request: Request<EdgeBody>,
         ) -> Response<EdgeBody> {
             let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            orchestrator.register_provider(Arc::new(WinningBidProvider));
+            orchestrator
+                .register_provider(
+                    Arc::new(WinningBidProvider),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
             run_with_orchestrator(
                 settings,
                 services,
@@ -14145,7 +14150,12 @@ mod tests {
                 // Arrange
                 let settings = settings_with_dispatching_provider();
                 let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-                orchestrator.register_provider(Arc::new(DispatchingTestProvider));
+                orchestrator
+                    .register_provider(
+                        Arc::new(DispatchingTestProvider),
+                        crate::integrations::CORE_SOURCE,
+                    )
+                    .expect("should register");
                 let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
                 let stub = Arc::new(StubHttpClient::new());
 
@@ -20248,10 +20258,15 @@ mod tests {
             winning_bid: bool,
         ) -> AuctionOrchestrator {
             let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            orchestrator.register_provider(Arc::new(AuctionIdTestProvider {
-                captured_request,
-                winning_bid,
-            }));
+            orchestrator
+                .register_provider(
+                    Arc::new(AuctionIdTestProvider {
+                        captured_request,
+                        winning_bid,
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
             orchestrator
         }
 
@@ -21157,9 +21172,14 @@ mod tests {
             captured: &Arc<Mutex<Option<AuctionRequest>>>,
         ) -> AuctionOrchestrator {
             let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            orchestrator.register_provider(Arc::new(RequestCapturingProvider {
-                captured: Arc::clone(captured),
-            }));
+            orchestrator
+                .register_provider(
+                    Arc::new(RequestCapturingProvider {
+                        captured: Arc::clone(captured),
+                    }),
+                    crate::integrations::CORE_SOURCE,
+                )
+                .expect("should register");
             orchestrator
         }
 
