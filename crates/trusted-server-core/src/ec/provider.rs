@@ -55,15 +55,6 @@ pub struct GeneratedEdgeCookie {
     pub response_headers: Vec<(http::HeaderName, http::HeaderValue)>,
 }
 
-/// A strategy for deriving an Edge Cookie identifier.
-///
-/// Implementations are selected by configuration. A provider derives the
-/// identifier at the edge in [`generate`](Self::generate), and the page
-/// response sets the `ts-ec` cookie.
-///
-/// A provider returns `Ok(None)` from [`generate`](Self::generate) when it
-/// cannot derive an identifier at the edge, so the request proceeds without an
-/// Edge Cookie rather than failing.
 /// The registered short code that namespaces one Edge Cookie provider's
 /// identifiers.
 ///
@@ -174,6 +165,15 @@ pub fn provider_kv_key(provider: &dyn EdgeCookieProvider, full: &str) -> String 
     }
 }
 
+/// A strategy for deriving an Edge Cookie identifier.
+///
+/// Implementations are selected by configuration. A provider derives the
+/// identifier at the edge in [`generate`](Self::generate), and the page
+/// response sets the `ts-ec` cookie.
+///
+/// A provider that cannot derive an identifier at the edge returns a
+/// [`GeneratedEdgeCookie`] whose [`id`](GeneratedEdgeCookie::id) is `None`, so
+/// the request proceeds without an Edge Cookie rather than failing.
 pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
     /// Returns the stable identifier for this provider, used in configuration
     /// and logs.
