@@ -4351,23 +4351,16 @@ pub async fn handle_publisher_request(
         }
     );
 
-    // Recorded before the request is consumed by the origin send: the template cache gate
-    // below needs it, and an authorized response must never become a shared
-    // template.
-    //
-    // A credential this edge already terminated is exempt. Basic auth runs as
-    // middleware ahead of routing, so reaching here on a gated path means the same
-    // handler already validated the request; every reader that can look the template
-    // up has satisfied that same credential. Without the marker the credential is
-    // pass-through to the origin and still disqualifies. See
-    // [`crate::auth::EdgeTerminatedAuthorization`].
+    // Capture cache eligibility before the origin send consumes the request. One
+    // unchanged marked Authorization value passed edge auth; unmarked, replaced,
+    // or repeated values remain pass-through and bypass sharing.
     let authorization_value_count = req.headers().get_all(header::AUTHORIZATION).iter().count();
-    let request_had_authorization = match authorization_value_count {
+    let authorization_disqualifies = match authorization_value_count {
         0 => false,
         1 => req
             .extensions()
             .get::<crate::auth::EdgeTerminatedAuthorization>()
-            .is_none(),
+            .is_none_or(|marker| !marker.matches(req.headers())),
         _ => true,
     };
     let request_had_cookie = req.headers().contains_key(header::COOKIE);
@@ -4415,7 +4408,7 @@ pub async fn handle_publisher_request(
     let request_can_use_shared_template = method_is_cacheable
         && matches!(assembly_mode, AssemblyMode::Esi)
         && !request_host.is_empty()
-        && !request_had_authorization
+        && !authorization_disqualifies
         && !cookie_disqualifies
         && !request_requires_origin
         && reader_supports_assembly;
@@ -4661,7 +4654,7 @@ pub async fn handle_publisher_request(
     let mut template_cache_key = template_cache_reservation.and_then(|reservation| {
         match template_cache_ttl(
             assembly_mode,
-            request_had_authorization,
+            authorization_disqualifies,
             cookie_disqualifies,
             response.status(),
             &gate_content_type,
@@ -5749,7 +5742,7 @@ impl TemplateCachePolicy {
 #[cfg(test)]
 pub(crate) fn template_cache_bypass_reason(
     mode: AssemblyMode,
-    request_had_authorization: bool,
+    authorization_disqualifies: bool,
     cookie_disqualifies: bool,
     status: StatusCode,
     content_type: &str,
@@ -5759,7 +5752,7 @@ pub(crate) fn template_cache_bypass_reason(
     let policy = TemplateCachePolicy::for_test(key_vary, Duration::from_secs(60));
     template_cache_ttl(
         mode,
-        request_had_authorization,
+        authorization_disqualifies,
         cookie_disqualifies,
         status,
         content_type,
@@ -6011,7 +6004,7 @@ fn replayable_policy_headers(
 
 fn template_cache_ttl(
     mode: AssemblyMode,
-    request_had_authorization: bool,
+    authorization_disqualifies: bool,
     cookie_disqualifies: bool,
     status: StatusCode,
     content_type: &str,
@@ -6021,7 +6014,7 @@ fn template_cache_ttl(
     if matches!(mode, AssemblyMode::Inline) {
         return Err(TemplateCacheBypassReason::InlineMode);
     }
-    if request_had_authorization {
+    if authorization_disqualifies {
         return Err(TemplateCacheBypassReason::AuthorizedRequest);
     }
     if cookie_disqualifies {
@@ -9094,7 +9087,9 @@ mod tests {
             );
             request
                 .extensions_mut()
-                .insert(crate::auth::EdgeTerminatedAuthorization::for_test());
+                .insert(crate::auth::EdgeTerminatedAuthorization::for_test(
+                    "Basic dXNlcjpwYXNz",
+                ));
 
             let response = run(&settings, &services, request).await;
             assert_eq!(
@@ -9109,6 +9104,55 @@ mod tests {
                 cache.lookups.lock().expect("should lock lookups").len(),
                 0,
                 "repeated authorization must bypass before the shared template lookup"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_replaced_edge_terminated_authorization_bypasses_the_shared_template() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let mut settings = settings_with_mode("esi");
+            settings.handlers[0] = toml::from_str(
+                r#"
+                    path = "^/article"
+                    username = "user"
+                    password = "pass"
+                "#,
+            )
+            .expect("should parse article auth handler");
+            let settings = Arc::new(settings);
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            let mut request = navigation_request();
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+            );
+            assert!(
+                crate::auth::enforce_basic_auth(&settings, &mut request)
+                    .expect("should evaluate auth")
+                    .is_none(),
+                "the original credential should pass edge auth"
+            );
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer publisher-origin-credential"),
+            );
+
+            let response = run(&settings, &services, request).await;
+            assert_eq!(
+                response
+                    .headers()
+                    .get(HEADER_X_TS_TEMPLATE_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("bypass-request"),
+                "a replacement credential was not validated at the edge and must bypass sharing"
+            );
+            assert_eq!(
+                cache.lookups.lock().expect("should lock lookups").len(),
+                0,
+                "a replaced authorization must bypass before the shared template lookup"
             );
         }
 
@@ -9129,9 +9173,9 @@ mod tests {
                     header::AUTHORIZATION,
                     HeaderValue::from_static("Basic dXNlcjpwYXNz"),
                 );
-                request
-                    .extensions_mut()
-                    .insert(crate::auth::EdgeTerminatedAuthorization::for_test());
+                request.extensions_mut().insert(
+                    crate::auth::EdgeTerminatedAuthorization::for_test("Basic dXNlcjpwYXNz"),
+                );
                 request
             };
 
