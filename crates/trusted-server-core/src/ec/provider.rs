@@ -283,10 +283,11 @@ impl EdgeCookieProvider for HmacProvider {
 ///
 /// # Errors
 ///
-/// None of the built-in constructions fail today. The `Result` is the seam for
-/// a provider whose construction can fail (for example one requiring a host
-/// service the deployment does not supply), so such a misconfiguration fails
-/// loudly rather than minting a degraded identifier.
+/// Returns [`TrustedServerError::EdgeCookie`] when the selected provider cannot
+/// be built: `"hmac"` without an `[ec.providers.hmac]` block, or a vendor key
+/// this deployment's adapter does not inject. Both fail loudly rather than
+/// leaving the deployment running stateless under a selector that says
+/// otherwise.
 pub fn build_provider(
     ec: &Ec,
     injected: Option<Arc<dyn EdgeCookieProvider>>,
@@ -297,11 +298,20 @@ pub fn build_provider(
     let provider: Option<Box<dyn EdgeCookieProvider>> = match key {
         // Explicit statelessness: the same meaning as omitting the selector.
         "none" => None,
-        "hmac" => ec
-            .providers
-            .hmac
-            .as_ref()
-            .map(|config| Box::new(HmacProvider::new(config.passphrase.clone())) as _),
+        // Settings validation rejects `hmac` with no block before this runs, so
+        // reaching here means the two checks have drifted apart. Stopping is
+        // the only safe answer: returning `Ok(None)` would run the deployment
+        // stateless under a selector that says it has an identity provider.
+        "hmac" => {
+            let config = ec.providers.hmac.as_ref().ok_or_else(|| {
+                Report::new(TrustedServerError::EdgeCookie {
+                    message: "Edge Cookie provider `hmac` is selected but has no \
+                              `[ec.providers.hmac]` configuration"
+                        .to_owned(),
+                })
+            })?;
+            Some(Box::new(HmacProvider::new(config.passphrase.clone())) as _)
+        }
         // Any other key names a vendor or host provider the adapter injects
         // through [`RuntimeServices`](crate::platform::RuntimeServices), the same
         // seam the device and geo providers use, so core never names a vendor.
@@ -535,6 +545,25 @@ mod tests {
         assert!(
             err.to_string().contains("acme"),
             "the error should name the selected provider, got: {err}"
+        );
+    }
+
+    #[test]
+    fn selecting_hmac_without_its_block_fails_loudly() {
+        // `Ec::validate_provider_selection` rejects this pair before settings
+        // reach the composition root, so the state is built directly here to
+        // reach the seam. If the two checks ever drift apart, `build_provider`
+        // must still stop rather than hand back a stateless deployment.
+        let ec = Ec {
+            provider: Some("hmac".to_owned()),
+            ..Ec::default()
+        };
+
+        let err = build_provider(&ec, None)
+            .expect_err("selecting hmac with no [ec.providers.hmac] block should error");
+        assert!(
+            err.to_string().contains("[ec.providers.hmac]"),
+            "the error should name the missing block, got: {err}"
         );
     }
 
