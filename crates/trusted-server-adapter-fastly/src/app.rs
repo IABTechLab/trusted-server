@@ -132,7 +132,7 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, handle_page_bids,
+    AppContext, AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, handle_page_bids,
     handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
     publisher_response_into_streaming_response,
 };
@@ -951,7 +951,10 @@ async fn dispatch_fallback(
                             registry: Some(&partner_registry),
                         };
                         match handle_publisher_request(
-                            &state.settings,
+                            AppContext {
+                                settings: &state.settings,
+                                integrations: state.registry.as_ref(),
+                            },
                             &publisher_services,
                             ec.kv_graph.as_ref(),
                             &mut ec.ec_context,
@@ -1428,8 +1431,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AppState, AuctionDispatch, EcContext, EdgeCacheHeader, HandlerFuture, NAMED_ROUTES,
-        NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, TrustedServerApp,
+        AppContext, AppState, AuctionDispatch, EcContext, EdgeCacheHeader, HandlerFuture,
+        NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, TrustedServerApp,
         build_per_request_services, build_state_from_settings, handle_publisher_request,
         publisher_response_into_streaming_response, startup_error_router,
     };
@@ -3022,7 +3025,10 @@ mod tests {
                             Err(report) => return Ok(super::http_error(&report)),
                         };
                     let response = match handle_publisher_request(
-                        &settings,
+                        AppContext {
+                            settings: &settings,
+                            integration_registry: registry.as_ref(),
+                        },
                         &services,
                         None,
                         &mut ec_context,

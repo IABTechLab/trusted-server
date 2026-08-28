@@ -304,7 +304,11 @@ let result = match (method, path.as_str()) {
     },
     
     // Fallback to publisher origin
-    _ => handle_publisher_request(&settings, &integration_registry, &runtime_services, req),
+    _ => handle_publisher_request(
+        AppContext { settings: &settings, integrations: &integration_registry },
+        &runtime_services,
+        req,
+    ),
 }
 ```
 

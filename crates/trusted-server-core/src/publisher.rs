@@ -1987,7 +1987,7 @@ fn assemble_if_shared(
     Ok((out, Some(AssemblyResponseState::ByteSeamFallback)))
 }
 
-/// Fingerprint of every configuration input plus the compiled browser bundle.
+/// Fingerprint of every configuration input plus the browser modules this registry serves.
 ///
 /// This intentionally over-invalidates. Trying to maintain a hand-written list already
 /// omitted publisher origin identity and creative-opportunity shaping fields. A digest of
@@ -1995,17 +1995,23 @@ fn assemble_if_shared(
 /// safe by default: a change misses until someone proves it irrelevant, never cross-serves
 /// an old template under new behavior.
 ///
+/// The module digest covers the parts this registry can actually serve, carried modules
+/// included, so a vendor crate that rebuilds its browser module moves the fingerprint and
+/// leaves behind the templates cached under its old `?v=` hash. It also narrows the module
+/// set from every module compiled into the binary to the enabled set, which is a tightening
+/// rather than a loosening, because a module no deployment serves cannot change what a
+/// template renders.
+///
 /// # Panics
 ///
 /// Does not panic: serializing the already-deserialized typed settings to a JSON value is
 /// infallible for this schema.
-fn template_fingerprint(settings: &Settings) -> String {
+fn template_fingerprint(settings: &Settings, integration_registry: &IntegrationRegistry) -> String {
     use sha2::Digest as _;
 
     let mut hasher = sha2::Sha256::new();
-    hasher.update(
-        trusted_server_js::concatenated_hash(&trusted_server_js::all_module_ids()).as_bytes(),
-    );
+    hasher
+        .update(crate::tsjs_bundle::compose_hash(&integration_registry.js_parts_all()).as_bytes());
     // `serde_json::Value` uses a sorted object map without `preserve_order`, making
     // independently deserialized HashMaps canonical before they are serialized again.
     let canonical = serde_json::to_value(settings)
@@ -4068,6 +4074,18 @@ pub struct AuctionDispatch<'a> {
     pub registry: Option<&'a PartnerRegistry>,
 }
 
+/// The operator configuration and the integrations built from it.
+///
+/// Both are constructed once at startup and always travel together, so they
+/// pass as one argument rather than two. [`AuctionDispatch`] groups the auction
+/// side of the same call for the same reason.
+pub struct AppContext<'a> {
+    /// Operator configuration for this deployment.
+    pub settings: &'a Settings,
+    /// Integrations registered for this deployment.
+    pub integrations: &'a IntegrationRegistry,
+}
+
 /// Proxies requests to the publisher's origin server.
 ///
 /// Returns a [`PublisherResponse`] indicating how the response should be sent:
@@ -4083,7 +4101,7 @@ pub struct AuctionDispatch<'a> {
 /// Returns a [`TrustedServerError`] if the proxy request fails or the
 /// origin backend is unreachable.
 pub async fn handle_publisher_request(
-    settings: &Settings,
+    app: AppContext<'_>,
     services: &RuntimeServices,
     kv: Option<&KvIdentityGraph>,
     ec_context: &mut EcContext,
@@ -4091,6 +4109,11 @@ pub async fn handle_publisher_request(
     mut req: Request<EdgeBody>,
     edge_header: EdgeCacheHeader,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
+    let AppContext {
+        settings,
+        integrations: integration_registry,
+    } = app;
+
     log::debug!("Proxying request to publisher_origin");
 
     // Adapter fallbacks prepare this before EC/cookie handling. Keep this
@@ -4512,7 +4535,7 @@ pub async fn handle_publisher_request(
                 .map(CreativeOpportunitiesConfig::template_cache_vary)
                 .unwrap_or_else(|| VarySpec::new([]))
                 .values_from(req.headers()),
-            template_fingerprint: template_fingerprint(settings),
+            template_fingerprint: template_fingerprint(settings, integration_registry),
             schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
         });
     let mut template_cache_response_state = matches!(assembly_mode, AssemblyMode::Esi)
@@ -6833,6 +6856,20 @@ mod tests {
         .page_json()
     }
 
+    /// Integration registry for a test's `settings`.
+    ///
+    /// Fixtures that parse `crate_test_settings_str()` directly leave
+    /// `proxy.allowed_domains` empty, and the Prebid integration refuses to build
+    /// while the external bundle host is missing from that list, so fill it in the
+    /// same way `create_test_settings` does. Only the allowed-domain list differs
+    /// from the configuration under test, and the registry reaches
+    /// `handle_publisher_request` here solely as a fingerprint input.
+    fn test_registry(settings: &Settings) -> IntegrationRegistry {
+        let mut settings = settings.clone();
+        settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
+        IntegrationRegistry::new(&settings).expect("should create integration registry")
+    }
+
     fn make_test_bid_with_creative(creative: &str) -> Bid {
         Bid {
             slot_id: "slot".to_string(),
@@ -7895,8 +7932,12 @@ mod tests {
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
         let mut ec_context =
             EcContext::read_from_request(settings, &req, services).expect("should read EC context");
+        let registry = test_registry(settings);
         handle_publisher_request(
-            settings,
+            AppContext {
+                settings,
+                integrations: &registry,
+            },
             services,
             None,
             &mut ec_context,
@@ -8163,6 +8204,75 @@ mod tests {
     mod template_fingerprint_tests {
         use super::*;
 
+        use crate::integrations::IntegrationBuilderFn;
+        use sha2::Digest as _;
+
+        /// Fingerprint for a configuration, through a registry built from it.
+        fn fingerprint(settings: &Settings) -> String {
+            let registry =
+                IntegrationRegistry::new(settings).expect("should create integration registry");
+            template_fingerprint(settings, &registry)
+        }
+
+        /// A browser module a vendor crate carries, before its rebuild.
+        const CARRIED_BEFORE: &str = "(function(){window.__carried=1;})();";
+
+        /// The same module after the vendor rebuilt it.
+        const CARRIED_AFTER: &str = "(function(){window.__carried=2;})();";
+
+        /// Hex SHA-256 of `source`, leaked so it can be stated as the
+        /// `&'static str` [`CarriedJsModule`] declares. Two short strings for the
+        /// life of the test binary.
+        fn leaked_hash(source: &str) -> &'static str {
+            Box::leak(hex::encode(sha2::Sha256::digest(source.as_bytes())).into_boxed_str())
+        }
+
+        /// Registration carrying [`CARRIED_BEFORE`]. A `fn` pointer cannot
+        /// capture, so the two sources need a function each.
+        fn carrying_before(
+            _settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            Ok(Some(
+                IntegrationRegistration::builder("probe")
+                    .with_js_module(CarriedJsModule {
+                        source: CARRIED_BEFORE,
+                        sha256: leaked_hash(CARRIED_BEFORE),
+                    })
+                    .build(),
+            ))
+        }
+
+        /// Registration carrying [`CARRIED_AFTER`], the rebuilt module.
+        fn carrying_after(
+            _settings: &Settings,
+        ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+            Ok(Some(
+                IntegrationRegistration::builder("probe")
+                    .with_js_module(CarriedJsModule {
+                        source: CARRIED_AFTER,
+                        sha256: leaked_hash(CARRIED_AFTER),
+                    })
+                    .build(),
+            ))
+        }
+
+        /// Fingerprint for `settings` through a registry whose `probe`
+        /// integration carries the module `registration` supplies.
+        fn fingerprint_with_carried(
+            settings: &Settings,
+            registration: IntegrationBuilderFn,
+        ) -> String {
+            let extra = [IntegrationBuilder::new(
+                "probe",
+                "fingerprint-probe",
+                registration,
+                validate_nothing,
+            )];
+            let registry = IntegrationRegistry::with_registrations(settings, &extra)
+                .expect("should build a registry with a carried module");
+            template_fingerprint(settings, &registry)
+        }
+
         /// Base settings with one integration's config replaced.
         ///
         /// Edits the parsed `[integrations]` map rather than appending TOML, so the two
@@ -8189,8 +8299,8 @@ mod tests {
             // integration off changed the injected `<script>` set and left the cache key
             // untouched, and every reader kept getting the template built while it was on.
             assert_ne!(
-                template_fingerprint(&settings_with_prebid(true, 1000)),
-                template_fingerprint(&settings_with_prebid(false, 1000)),
+                fingerprint(&settings_with_prebid(true, 1000)),
+                fingerprint(&settings_with_prebid(false, 1000)),
                 "the enabled integration set must select a different template"
             );
         }
@@ -8200,8 +8310,8 @@ mod tests {
             // Config reaches the template directly: the prebid head insert carries the
             // account ID, timeout and bidder list into bytes shared between readers.
             assert_ne!(
-                template_fingerprint(&settings_with_prebid(true, 1000)),
-                template_fingerprint(&settings_with_prebid(true, 2500)),
+                fingerprint(&settings_with_prebid(true, 1000)),
+                fingerprint(&settings_with_prebid(true, 2500)),
                 "an integration's configuration must select a different template"
             );
         }
@@ -8212,11 +8322,11 @@ mod tests {
             // An unsorted digest would differ between two requests to the same binary and
             // the cache would never hit — a fix that quietly disables the feature.
             let settings = settings_with_prebid(true, 1000);
-            let first = template_fingerprint(&settings);
+            let first = fingerprint(&settings);
 
             for _ in 0..16 {
                 assert_eq!(
-                    template_fingerprint(&settings),
+                    fingerprint(&settings),
                     first,
                     "the same configuration must always fingerprint identically"
                 );
@@ -8224,7 +8334,7 @@ mod tests {
             // A second, independently parsed `Settings` builds a fresh `HashMap` with a
             // different iteration order, which is what actually exercises the sort.
             assert_eq!(
-                template_fingerprint(&settings_with_prebid(true, 1000)),
+                fingerprint(&settings_with_prebid(true, 1000)),
                 first,
                 "two equal configurations must fingerprint identically"
             );
@@ -8240,11 +8350,25 @@ mod tests {
                 .as_mut()
                 .expect("fixture should configure creative opportunities")
                 .gam_network_id = "different-network".to_string();
-            assert_ne!(template_fingerprint(&base), template_fingerprint(&creative));
+            assert_ne!(fingerprint(&base), fingerprint(&creative));
 
             let mut origin = base.clone();
             origin.publisher.origin_host_header_override = Some("tenant.example.com".to_string());
-            assert_ne!(template_fingerprint(&base), template_fingerprint(&origin));
+            assert_ne!(fingerprint(&base), fingerprint(&origin));
+        }
+
+        #[test]
+        fn a_change_to_a_carried_module_changes_the_fingerprint() {
+            // A module a vendor crate carries is not in the compile-time map, so a
+            // fingerprint built from that map alone would not move when the vendor
+            // rebuilt its bundle and a cached template would keep the stale `?v=`.
+            let settings = create_test_settings();
+
+            assert_ne!(
+                fingerprint_with_carried(&settings, carrying_before),
+                fingerprint_with_carried(&settings, carrying_after),
+                "a rebuilt carried module must select a different template"
+            );
         }
     }
 
@@ -9150,7 +9274,10 @@ mod tests {
             };
             let mut ec_context = EcContext::new_for_test(None, consent);
             let publisher_response = handle_publisher_request(
-                settings,
+                AppContext {
+                    settings,
+                    integrations: &registry,
+                },
                 services,
                 None,
                 &mut ec_context,
@@ -10588,7 +10715,10 @@ mod tests {
             };
             let mut ec_context = EcContext::new_for_test(None, consent);
             let publisher_response = handle_publisher_request(
-                &settings,
+                AppContext {
+                    settings: &settings,
+                    integrations: &registry,
+                },
                 &services,
                 None,
                 &mut ec_context,
@@ -10756,7 +10886,10 @@ mod tests {
             };
             let mut ec_context = EcContext::new_for_test(Some(user.ec_id.to_string()), consent);
             let publisher_response = handle_publisher_request(
-                &settings,
+                AppContext {
+                    settings: &settings,
+                    integrations: &registry,
+                },
                 &services,
                 None,
                 &mut ec_context,
@@ -11820,8 +11953,12 @@ mod tests {
                 .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
                 .body(EdgeBody::empty())
                 .expect("should build authenticated request");
+            let registry = test_registry(&settings);
             let _ = handle_publisher_request(
-                &settings,
+                AppContext {
+                    settings: &settings,
+                    integrations: &registry,
+                },
                 &services,
                 None,
                 &mut ec_context,
@@ -13368,8 +13505,12 @@ mod tests {
         ) -> PublisherResponse {
             let mut ec_context = EcContext::new_for_test(None, consent);
 
+            let registry = test_registry(settings);
             handle_publisher_request(
-                settings,
+                AppContext {
+                    settings,
+                    integrations: &registry,
+                },
                 services,
                 None,
                 &mut ec_context,
@@ -14486,8 +14627,12 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
+        let registry = test_registry(&settings);
         let _ = handle_publisher_request(
-            &settings,
+            AppContext {
+                settings: &settings,
+                integrations: &registry,
+            },
             &services,
             None,
             &mut ec_context,
@@ -20945,8 +21090,12 @@ mod tests {
                 .body(EdgeBody::empty())
                 .expect("should build test request");
 
+            let registry = test_registry(&settings);
             let _ = handle_publisher_request(
-                &settings,
+                AppContext {
+                    settings: &settings,
+                    integrations: &registry,
+                },
                 &services,
                 None,
                 &mut ec_context,
@@ -21029,8 +21178,12 @@ mod tests {
                 .expect("should build test request");
             let slots = slots_with_over_limit_dynamic_sibling();
 
+            let registry = test_registry(&settings);
             let _ = handle_publisher_request(
-                &settings,
+                AppContext {
+                    settings: &settings,
+                    integrations: &registry,
+                },
                 &services,
                 None,
                 &mut ec_context,
