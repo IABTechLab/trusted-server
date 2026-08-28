@@ -1,7 +1,7 @@
 # Documentation Refresh (Full Surface)
 
 **Date:** 2026-08-19
-**Revised:** 2026-08-27 (round 10)
+**Revised:** 2026-08-28 (round 11)
 **Status:** Draft, pending review
 **Scope:** Documentation and doc tooling. No runtime behavior changes.
 **Baseline:** audited_target_tip `985ff2298` ("Restore secret-store key
@@ -157,9 +157,14 @@ Truth-pass acceptance and parity checks operate on defined source sets:
   (including the moved onboarding page), `docs/epics/**` (maintained
   internal records), `docs/business-use-cases.md` while excluded-but-
   tracked, `scripts/README.md`, `tinybird/README.md`, and
-  `tools/docs-parity/README.md` once created, the human-facing comments of
-  `.github/workflows/**`, `.github/actions/**`, and `scripts/*.sh` usage
-  headers, the comment surfaces of the adapter manifests (`fastly.toml`,
+  `tools/docs-parity/README.md` once created, and human-facing comment
+  regions DISCOVERED across all tracked operational files rather than a
+  narrow directory list: `.github/workflows/**`, `.github/actions/**`,
+  issue forms, every tracked `**/*.sh` usage header (crate-local scripts
+  included - `crates/trusted-server-openrtb/generate.sh:23` already
+  carries a false claim that `.cargo/config.toml` defaults to wasm32,
+  which WP2 repairs), `.cargo/config.toml`, and the comment surfaces of
+  the adapter manifests (`fastly.toml`,
   `wrangler.toml`, `wrangler.ci.toml`, `spin.toml`, `axum.toml`, and
   `cloudflare.toml` until retired), `.claude/skills/**`,
   `.claude/agents/**`, and `.github/pull_request_template.md`. A checked
@@ -220,8 +225,19 @@ The owner's standing instruction is one rc PR carrying spec plus work;
 the concrete shape below (which adds the forced `main` containment PR and
 package checkpoints) still awaits explicit confirmation - open question 7
 blocks implementation until it is given, and its answer is recorded with
-owner and date. The shape: a single rc PR (#1049) carrying the spec plus
-all packages,
+owner and date. The delivery graph is exactly four PRs: (a) the single rc PR (#1049)
+carrying the spec plus all packages; (b) the `main` containment PR;
+(c) a `main` automation PR - scheduled workflows and Dependabot read
+their configuration from the DEFAULT branch, so the scheduled
+external-link workflow lives on `main` (explicitly checking out
+`rc/202608` while that branch is live) and `dependabot.yml` lives on
+`main` with `target-branch: rc/202608` where updates should land on rc;
+final acceptance includes a successful `workflow_dispatch` of the
+scheduled job and Dependabot config validation; (d) the CNAME resolution
+PR to `main`, cut when open question 2 resolves (the containment PR
+NEVER carries it - WP1's earlier allowance is superseded). Every
+`main`-target PR records its own fresh audited_main_tip and runs the
+exact-tip assertion before merge. The rc PR carries
 one reviewable commit (or small series) per package, with package-level
 review checkpoints (acceptance evidence recorded before the next package
 lands), generated-output changes in their own commits, and no squash on
@@ -256,9 +272,11 @@ the owner to confirm this shape.
   Pages/DNS/TLS setup, canonical+asset smokes, and a
   project-owned-public-domain allowlist classification). Because only
   `main` deploys, an rc-only edit never reaches the live site: the
-  resolved disposition ships inside the containment PR if question 2 is
-  answered by then, otherwise as a second `main`-target PR. Question 2
-  plus its live smoke is a completion gate for this refresh either way.
+  resolved disposition ships as its own `main`-target PR (delivery graph
+  item (d); the containment PR never carries it). The custom-domain
+  branch also inventories hard-coded Pages URLs (e.g. `README.md:11`)
+  rather than testing only canonical and asset responses. Question 2
+  plus its live smoke is a completion gate for this refresh.
 - `fastly.toml`: empty `authors` list; label the key fixtures
   consistently as local test fixtures; comment the four KV stores; remove
   the `test-prebid-eids.sh` comment. `service_id` stays under its
@@ -325,10 +343,12 @@ type-check` and the `settings_data::get_settings` example (the exported
     remediation of non-document fixtures (e.g. the scraped
     `html_processor.test.html`) is owned here with regression tests re-run;
     rotation/history-rewrite decisions escalate per finding.
-- Human-facing workflow comment repairs: the Spin release-build comment
-  (claims env overrides fix embedded settings; startup now reads the KV
-  store) and the `test-cli` comment (claims a workspace default target
-  that `.cargo/config.toml` does not set).
+- Human-facing workflow/script comment repairs: the Spin release-build
+  comment (claims env overrides fix embedded settings; startup now reads
+  the KV store), the `test-cli` comment, and
+  `crates/trusted-server-openrtb/generate.sh:23` (both claim a workspace
+  default wasm32 target that `.cargo/config.toml` explicitly does not
+  set).
 - Roadmap status pass (shipped/active/deferred; also reconcile the
   malvertising-detection claim with `business-use-cases.md`).
 
@@ -382,11 +402,15 @@ provider profile schemas, and the secret model.
 - Directional field dispositions as independent axes, not a flat
   "one of" (real fields overlap: `S3SigV4AuthConfig.secret_store` is
   simultaneously deprecated, skip-serializing, and normalized away) -
-  lifecycle (canonical / deprecated-alias / rejected), serialization
-  (serialized / skipped), runtime (active / normalized-away /
-  deserialization-only), and secret handling (store-resolved /
-  deliberately-inline / none); the generated reference renders every
-  applicable axis. `tinybird.access_token_secret` is
+  lifecycle (canonical / deprecated / rejected), key identity
+  (canonical / alias, with `alias_of` - `s3_sig_v4` and `pub_id` are
+  aliases, while `S3SigV4AuthConfig.secret_store` is a deprecated
+  accepted field, not an alias), serialization (serialized / skipped),
+  runtime (active / normalized-away / deserialization-only), and secret
+  handling (store-resolved / deliberately-inline / none); the generated
+  reference renders every applicable axis, so
+  `tinybird.access_token_secret` reads as deprecated + skipped +
+  normalized-away simultaneously. `tinybird.access_token_secret` is
   accepted-but-normalized-away (deserialized, then set to `None` and
   never serialized) - not a deliberately inline secret; only
   `trusted_client_ip.shared_secret` currently holds that classification.
@@ -593,13 +617,16 @@ npm):
   rule and covering core's test-utils feature.
 - Native doctests: `cargo test --doc -p trusted-server-core` (host).
 
-The JSDoc contract is explicit: the ESLint jsdoc rule set applies to
-the WP7 file globs (`lib/src/core/render.ts`, `lib/src/core/types.ts`,
-`lib/src/core/registry.ts`, `lib/src/shared/globals.ts`,
-`lib/src/integrations/creative/**`), requiring a file-header block plus
-JSDoc on every exported declaration (functions, classes, interfaces,
-type aliases) via `jsdoc/require-jsdoc` with those contexts, plus
-`jsdoc/check-alignment` and `jsdoc/check-types`.
+The JSDoc contract is explicit and config-relative (ESLint runs from
+`crates/trusted-server-js/lib`, so globs are `src/core/render.ts`,
+`src/core/types.ts`, `src/core/registry.ts`, `src/shared/globals.ts`,
+`src/integrations/creative/**`): `jsdoc/require-file-overview` enforces
+the file-header block (`require-jsdoc` checks declarations, not
+headers), and `jsdoc/require-jsdoc` covers every exported declaration
+form - functions, classes, interfaces, type aliases, exported
+variables/consts, default exports, and re-exports - plus
+`jsdoc/check-alignment` and `jsdoc/check-types`. Each declaration form
+and the file-overview rule get separate synthesized negative fixtures.
 
 Acceptance: worklist complete; matrix builds warning-free with
 `RUSTDOCFLAGS="-D warnings"`; the WP8 jsdoc lint (mandatory, scoped as
@@ -623,16 +650,23 @@ WP8a (lands right after WP1):
   (all languages; graded modes incl. `expected_compile_failure` /
   `expected_validation_failure` / `illustrative_fragment`; expiring
   waivers), the domain/credential scanner + typed allowlist (with a
-  defined input contract: text files detected by content; an
-  expected-text file that is oversized or invalid UTF-8 FAILS the scan
-  rather than being skipped (thresholds must not become evasion
-  mechanisms); generated lockfiles are not blanket-excluded - their
-  structured URL/source/registry fields are scanned while checksum and
-  integrity strings are recognized structurally; known media assets get
-  metadata-string inspection (or are individually manifest-listed with
-  rationale); true binaries are scanned by path/metadata; base64 test
-  fixtures distinguish via the hash-pinned fixture allowlist class -
-  results must be deterministic across platforms), the maintained-source
+  defined input contract: text-vs-binary classification comes from path
+  plus a checked classification manifest, never content sniffing alone -
+  a tracked file the manifest does not classify FAILS the scan (so a new
+  binary cannot appear unreviewed, and text renamed under an unknown
+  extension cannot dodge content inspection); an expected-text file that
+  is oversized or invalid UTF-8 FAILS rather than being skipped
+  (thresholds must not become evasion mechanisms); classified binaries
+  get an ASCII/UTF-8 strings scan, or a reviewed hash-pinned manifest
+  entry where strings scanning is meaningless; generated lockfiles are
+  not blanket-excluded - their structured URL/source/registry fields are
+  scanned while checksum and integrity strings are recognized
+  structurally; known media assets get metadata-string inspection;
+  base64 test fixtures distinguish via the hash-pinned fixture allowlist
+  class - results must be deterministic across platforms. Every detector
+  and encoding class (domain, email, credential shape, service ID,
+  encoded token, binary strings) gets both a synthesized positive
+  fixture and an allowlisted fixture proving the allowlist path), the maintained-source
   manifest checker, and the gate manifest.
 - The example harness, in eight explicit phases (secret resolution
   alone cannot make the template valid: placeholder rejection also
@@ -736,8 +770,11 @@ matrix locally; acceptance greps over the defined sets with output in the
 PR description; the four adapter first-success smokes (Axum env bridge,
 Fastly local push + secrets, Cloudflare envelope transfer, Spin local
 push + variables) executed as documented with commands and cleanup
-recorded; the `main` containment PR merged with its positive smoke (its
-audited_main_tip assertion having passed); and the exact-tip baseline
+recorded; the `main` containment PR merged with its positive smoke and the
+`main` automation PR merged with a successful `workflow_dispatch` of the
+scheduled job and validated Dependabot config (each `main` PR's
+audited_main_tip assertion having passed); every follow-up filed with a
+recorded URL or disposition; and the exact-tip baseline
 assertion for `origin/rc/202608` (equal to the recorded
 audited_target_tip, contained in the branch) passing at the final HEAD -
 not a merge-base comparison.
@@ -753,12 +790,22 @@ not a merge-base comparison.
    evidence-based rewrite in this pass.
 5. CHANGELOG release cut (out of scope; deterministic no-release edit
    defined in Non-goals).
-6. Governance ownership (CODEOWNERS/minutes) - blocks the WP6 governance
-   edit only.
+6. Governance ownership (CODEOWNERS/minutes). Terminal disposition: if
+   no owner is named by the time WP6 lands, the fallback executes - the
+   governance document is corrected to current evidence (no minutes
+   exist; releases are not continuous) without adding CODEOWNERS or
+   minutes commitments - and the refresh completes; naming owners
+   remains a follow-up for maintainers.
 7. Delivery shape confirmation (blocks starting implementation).
 8. CodeQL `push` coverage for `rc/*` (non-blocking).
 
 ## Follow-up issues to file (code, not docs)
+
+Filing is owned work, not an aspiration: WP8b deduplicates this list
+against the existing tracker and files each item (or records an
+existing-issue disposition), with issue URLs, owner, and labels recorded
+in the rc PR description; final verification checks that every entry
+below has a URL or disposition.
 
 - `Hooks::stores()` unimplemented on Cloudflare, Spin, and Axum: request-
   time config/KV registries are empty, the declared `TRUSTED_SERVER_KV`
