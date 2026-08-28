@@ -6,7 +6,10 @@ import { resolve } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 
 import envelope from '../../fixtures/aps-renderer-v1.json';
-import { registerPublisherFirstImpressionAuctions } from '../../../src/core/first_impression';
+import {
+  registerPublisherFirstImpressionAuctions,
+  resolveFirstImpressionElement,
+} from '../../../src/core/first_impression';
 import type { AuctionBidData, TsjsApi } from '../../../src/core/types';
 import {
   APS_PREBID_CREATIVE_RUNNER_URL,
@@ -2791,6 +2794,7 @@ describe('installTsAdInit', () => {
         )
       );
       const selectedElement = selectedIndex === null ? undefined : elements[selectedIndex];
+      expect(resolveFirstImpressionElement(divId)).toBe(selectedElement);
       const mockSlot = {
         addService: vi.fn().mockReturnThis(),
         setTargeting: vi.fn().mockReturnThis(),
@@ -3230,7 +3234,7 @@ describe('installTsRenderBridge', () => {
       Object.assign(new Event('message'), {
         data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
         ports: [{ postMessage }],
-        source: collapsed.source,
+        source: collapsed.iframe.contentWindow!,
         stopImmediatePropagation: vi.fn(),
       }) as unknown as MessageEvent
     );
@@ -3240,6 +3244,36 @@ describe('installTsRenderBridge', () => {
     expect(collapsed.iframe.height).toBe('90');
     expect(collapsed.wrapper.style.width).toBe('728px');
     expect(collapsed.wrapper.style.height).toBe('90px');
+  });
+
+  it('expands every collapsed ancestor through the authenticated slot root', async () => {
+    const tsjs = (window as TestWindow).tsjs!;
+    tsjs.bids.homepage_header.adm = '<div>Fictional creative</div>';
+    tsjs.bids.homepage_header.w = 728;
+    tsjs.bids.homepage_header.h = 90;
+    delete tsjs.bids.homepage_header.nurl;
+    delete tsjs.bids.homepage_header.burl;
+    const bridgeListener = await captureBridgeListener();
+    const collapsed = createCollapsedTrustedSlotIframe();
+    const outerWrapper = document.createElement('div');
+    outerWrapper.style.width = '1px';
+    outerWrapper.style.height = '1px';
+    collapsed.slot.insertBefore(outerWrapper, collapsed.wrapper);
+    outerWrapper.appendChild(collapsed.wrapper);
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [{ postMessage: vi.fn() }],
+        source: collapsed.iframe.contentWindow!,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+
+    expect(collapsed.wrapper.style.width).toBe('728px');
+    expect(collapsed.wrapper.style.height).toBe('90px');
+    expect(outerWrapper.style.width).toBe('728px');
+    expect(outerWrapper.style.height).toBe('90px');
   });
 
   it.each(['fixed', 'anchor', 'expanded', 'oversized'] as const)(
@@ -3737,7 +3771,7 @@ describe('installTsRenderBridge', () => {
     }
   });
 
-  it('does not use the requesting frame to disambiguate a registered APS slot prefix', async () => {
+  it('uses the requesting frame to disambiguate a registered APS slot prefix', async () => {
     const renderer = apsRenderer();
     const prebidAdId = 'native-dynamic-prebid-ad-id';
     const markUsed = vi.fn();
@@ -3765,9 +3799,14 @@ describe('installTsRenderBridge', () => {
         }) as unknown as MessageEvent
       );
 
-      expect(document.querySelector('iframe[title="Ad content"]')).toBeNull();
-      expect(markUsed).not.toHaveBeenCalled();
-      expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeDefined();
+      const native = nativeRunnerIn('div-native-second');
+      native.runner.dispatchEvent(new Event('load'));
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(native.frame.style.display).toBe('');
+      expect(markUsed).toHaveBeenCalledOnce();
+      expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
     } finally {
       marker.remove();
       document.getElementById('div-native-first')?.remove();
@@ -4461,7 +4500,86 @@ describe('installTsRenderBridge', () => {
     expect(fetchStub).not.toHaveBeenCalled();
   });
 
-  it('uses the adInit-resolved div when a responsive prefix becomes ambiguous', async () => {
+  it('uses the requesting frame to resolve inline adm under an ambiguous prefix', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const tsjs = (window as TestWindow).tsjs!;
+    tsjs.bids.homepage_header.adm = '<div>Prefix inline creative</div>';
+    delete tsjs.bids.homepage_header.hb_cache_host;
+    delete tsjs.bids.homepage_header.hb_cache_path;
+    tsjs.adSlots = [
+      {
+        id: 'homepage_header',
+        formats: [[728, 90]],
+        gam_unit_path: '/a/b/c',
+        div_id: 'div-inline-prefix-',
+        targeting: {},
+      },
+    ];
+    tsjs.divToSlotId = {};
+    createTrustedSlotIframe('div-inline-prefix-first');
+    const source = createTrustedSlotIframe('div-inline-prefix-second');
+    const bridgeListener = await captureBridgeListener();
+    const postMessage = vi.fn();
+    const stopImmediatePropagation = vi.fn();
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [{ postMessage }],
+        source,
+        stopImmediatePropagation,
+      }) as unknown as MessageEvent
+    );
+
+    expect(postMessage).toHaveBeenCalledOnce();
+    expect(JSON.parse(postMessage.mock.calls[0]![0])).toEqual(
+      expect.objectContaining({ ad: '<div>Prefix inline creative</div>' })
+    );
+    expect(stopImmediatePropagation).toHaveBeenCalledOnce();
+    expect(fetchStub).not.toHaveBeenCalled();
+    beaconSpy.mockRestore();
+  });
+
+  it('rejects a requesting frame owned by multiple prefix candidates', async () => {
+    const tsjs = (window as TestWindow).tsjs!;
+    tsjs.bids.homepage_header.adm = '<div>Ambiguous inline creative</div>';
+    tsjs.adSlots = [
+      {
+        id: 'homepage_header',
+        formats: [[728, 90]],
+        gam_unit_path: '/a/b/c',
+        div_id: 'div-nested-prefix-',
+        targeting: {},
+      },
+    ];
+    tsjs.divToSlotId = {};
+    const outer = document.createElement('div');
+    outer.id = 'div-nested-prefix-outer';
+    const inner = document.createElement('div');
+    inner.id = 'div-nested-prefix-inner';
+    const iframe = document.createElement('iframe');
+    inner.appendChild(iframe);
+    outer.appendChild(inner);
+    document.body.appendChild(outer);
+    const bridgeListener = await captureBridgeListener();
+    const postMessage = vi.fn();
+    const stopImmediatePropagation = vi.fn();
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [{ postMessage }],
+        source: iframe.contentWindow,
+        stopImmediatePropagation,
+      }) as unknown as MessageEvent
+    );
+
+    expect(postMessage).not.toHaveBeenCalled();
+    expect(stopImmediatePropagation).not.toHaveBeenCalled();
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it('uses the requesting frame when a responsive prefix is ambiguous', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     fetchStub.mockResolvedValue({
       ok: true,
@@ -4486,9 +4604,7 @@ describe('installTsRenderBridge', () => {
         targeting: {},
       },
     ];
-    (window as TestWindow).tsjs!.divToSlotId = {
-      'div-responsive-a': 'homepage_header',
-    };
+    (window as TestWindow).tsjs!.divToSlotId = {};
 
     const bridgeListener = await captureBridgeListener();
     const portMessages: string[] = [];
@@ -4633,6 +4749,13 @@ describe('installTsRenderBridge', () => {
   });
 
   it('does not resize a stale cache response after navigation', async () => {
+    const recordTrustedServerCreativeResponse = vi.fn();
+    (window as TestWindow).tsjs!.gptDiagnosticsRecorder = {
+      recordTrustedServerCreativeRequest: vi.fn().mockReturnValue(91),
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure: vi.fn(),
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     let resolveText: ((body: string) => void) | undefined;
     fetchStub.mockResolvedValue({
       ok: true,
@@ -4659,9 +4782,12 @@ describe('installTsRenderBridge', () => {
     resolveText?.(JSON.stringify({ adm: '<div>cached</div>', w: 300, h: 250 }));
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-    expect(postMessage).toHaveBeenCalledOnce();
+    expect(postMessage).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+    expect(beaconSpy).not.toHaveBeenCalled();
     expect(collapsed.iframe.width).toBe('1');
     expect(collapsed.iframe.height).toBe('1');
+    beaconSpy.mockRestore();
   });
 
   it('expands ${AUCTION_PRICE} from the cached bid price before responding', async () => {
