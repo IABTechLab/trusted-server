@@ -467,10 +467,20 @@ client_side_bidders = []          # bidders running via native Prebid.js adapter
 # external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-<sha256>.js"
 # external_bundle_sha256 = "<manifest sha256>"
 # external_bundle_sri = "<manifest sri>"
-# Bundle build inputs consumed by the `ts prebid bundle` CLI (not the runtime):
-# [integrations.prebid.bundle]
-# adapters = ["rubicon"]
-# user_id_modules = ["sharedIdSystem"]
+# Per-bidder / per-zone param overrides (canonical rule form):
+# [[integrations.prebid.bid_param_override_rules]]
+# when.bidder = "examplebidder"
+# when.zone = "header"
+# set = { placementId = "_abc" }
+#
+# Bundle build inputs consumed by `ts prebid bundle`, not by the edge runtime.
+# Values are exact upstream module stems without `.js`.
+# [integrations.prebid.bundle.modules]
+# bidder = ["rubiconBidAdapter"]
+# Omit user_id for the curated default preset; use [] to select none.
+# user_id = ["sharedIdSystem"]
+# Omitted or empty analytics selects no analytics adapters.
+# analytics = ["atsAnalyticsAdapter"]
 
 # Next.js first-party rewriting for App Router / RSC payloads.
 # [integrations.nextjs]
