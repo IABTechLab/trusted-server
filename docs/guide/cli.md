@@ -316,6 +316,7 @@ exist, so the command prefers a narrow literal path over a plausible guess.
 | More than a quarter of crawled pages return no slots                                    | The run fails. That is the signature of bot protection serving challenge pages, and writing from it would silently narrow the slot set.                                                                                       |
 | Several live elements normalize onto one div-id prefix                                  | The whole group is omitted, on every page of the crawl. A prefix resolves to at most one element and the exact ids change per render; the prefix is named in a note.                                                          |
 | A per-render token sits before the placement part of a div id                           | The slot is omitted from a single observation and the family prefix is named in a note; no stable prefix identifies one element.                                                                                              |
+| A crawled page redirects off the audited origin                                         | The page is skipped on that profile, its path is named in a note, and it stops counting toward profile coverage. There is no override for generation; another site's evidence is never folded into the config.                |
 
 Every run checks that the config it produced still loads before replacing the
 file, and `--dry-run` runs the same check — a clean preview is evidence the
@@ -337,6 +338,9 @@ ts audit ad-templates generate https://publisher.example/ --max-sections 20 --ma
 # Audit exactly one page, as earlier releases did.
 ts audit ad-templates generate https://publisher.example/ --max-pages 1
 
+# Trigger lazy-loaded inventory on every crawled page.
+ts audit ad-templates generate https://publisher.example/ --scroll
+
 # Set the patterns yourself; this disables pattern inference entirely, and the
 # run fails outright if any slot's template had to borrow section_root.
 ts audit ad-templates generate https://publisher.example/ \
@@ -347,9 +351,26 @@ ts audit ad-templates generate https://publisher.example/ --dry-run
 ```
 
 Re-running merges into the existing slots: a slot seen again keeps its
-hand-tuned fields and gains this run's patterns and newly observed formats, and a hand-written
-`gam_unit_path` template is preserved. `--replace` discards existing slots
-instead, which also discards any template you wrote by hand.
+hand-tuned fields and gains this run's patterns and newly observed formats, and
+a hand-written `gam_unit_path` template is preserved. A configured `div_id` is
+matched exactly when the crawl observed that exact id; it is treated as a
+runtime prefix only when it was never observed as a literal element, so a
+configured `ad-sidebar-1` no longer absorbs a discovered `ad-sidebar-10` — the
+sibling is appended as its own slot. A prefix that does claim several
+discovered divs is named in a stderr note, because the runtime resolves a
+prefix to at most one element. `--replace` discards existing slots instead,
+which also discards any template you wrote by hand.
+
+`--scroll` performs the same deterministic stepped scroll on every page and
+device profile after the initial settle, then waits for the page to settle again
+before collecting evidence. It is opt-in because it increases crawl time, ad
+requests, and publisher-page side effects.
+
+During a normal merge, configured slots missing from the current crawl are
+preserved and named in a stderr note. Absence is not proof that a slot is stale:
+the crawl may have missed a page type, device target, or lazy-loaded placement.
+Review coverage and re-run with `--scroll` when appropriate. Only use
+`--replace` when intentionally pruning every slot the run did not rediscover.
 
 A slot that never appeared without a section segment can borrow a
 `section_root` witnessed by another slot only while its patterns are derived
@@ -444,12 +465,14 @@ note: skipped 3 slot(s) that look like one placement under a per-render div id
       that is stable across renders
 ```
 
-The detection is by evidence, not by recognising token shapes: candidates share
-an ad-unit path and formats, and what separates a fragmented placement from two
-legitimate siblings on one unit is co-occurrence — real siblings appear together
-on a page, fragments never do. The suggested prefix is a starting point only, not
-written as a `div_id`, because it reaches only as far as the observed tokens
-happen to agree.
+This particular group is detected by evidence, not by recognising token shapes:
+candidates share an ad-unit path and formats, and what separates a fragmented
+placement from two legitimate siblings on one unit is co-occurrence — real
+siblings appear together on a page, fragments never do. (A single id whose
+per-render token sits _before_ the placement part is refused on shape alone,
+from one observation, as the table above notes.) The suggested prefix is a
+starting point only, not written as a `div_id`, because it reaches only as far
+as the observed tokens happen to agree.
 
 ### Checking for a device split
 
@@ -514,14 +537,15 @@ mode. `--scroll` enables the optional second evidence phase and labels evidence
 first seen after the deterministic scroll.
 
 Browser-backed ad-template generation and verification share `--chrome`,
-`--headful`, `--browser-proxy`, `--no-assume-consent`,
-`--settle-quiet-ms`, `--settle-max-ms`, and
-`--danger-accept-invalid-certs`. Verification also accepts
-`--browser-profile desktop|mobile`; generation uses
-`--profiles desktop,mobile` to compare both profiles. `--cookie NAME=VALUE` is
-repeatable and creates host-only, root-path cookies; HTTPS targets also mark
-them Secure. Verification refuses cookies when URLs span multiple origins. The quiet settle window
-must not exceed the maximum.
+`--headful`, `--browser-proxy`, `--no-assume-consent`, `--scroll`,
+`--settle-quiet-ms`, `--settle-max-ms`, and `--danger-accept-invalid-certs`;
+`--scroll` runs the same deterministic scroll pass in both, and in verification
+it additionally labels the second evidence phase. Verification also accepts
+`--browser-profile desktop|mobile`; generation uses `--profiles desktop,mobile`
+to compare both profiles. `--cookie NAME=VALUE` is repeatable and creates
+host-only, root-path cookies; HTTPS targets also mark them Secure. Verification
+refuses cookies when URLs span multiple origins. The quiet settle window must
+not exceed the maximum.
 
 `ts audit` is not an EdgeZero adapter command. It has no `--adapter` option and
 it does not provision resources, push config, build, deploy, or contact platform

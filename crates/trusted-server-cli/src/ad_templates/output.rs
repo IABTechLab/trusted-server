@@ -186,6 +186,8 @@ pub struct Gates {
     pub matched_slots: GateState,
     /// The `[auction].enabled` kill switch is on.
     pub auction_enabled: GateState,
+    /// The `[creative_opportunities].enabled` template switch is on.
+    pub ad_templates_enabled: GateState,
     /// Consent allows the auction (often `unknown` for live requests).
     pub consent_allows_auction: GateState,
 }
@@ -290,6 +292,7 @@ impl VerificationReport {
                     not_bot: GateState::Pass,
                     matched_slots: GateState::Pass,
                     auction_enabled: GateState::Pass,
+                    ad_templates_enabled: GateState::Pass,
                     consent_allows_auction: GateState::Unknown,
                 }),
                 matched_slot_count: Some(1),

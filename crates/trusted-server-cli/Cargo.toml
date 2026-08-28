@@ -17,6 +17,7 @@ workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 chromiumoxide = { workspace = true }
 clap = { workspace = true }
+derive_more = { workspace = true }
 edgezero-cli = { workspace = true }
 edgezero-core = { workspace = true }
 futures = { workspace = true }
@@ -46,7 +47,6 @@ which = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 base64 = { workspace = true }
 bytes = { workspace = true }
-derive_more = { workspace = true }
 directories = { workspace = true }
 error-stack = { workspace = true }
 http-body-util = { workspace = true }
