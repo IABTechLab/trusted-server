@@ -502,9 +502,16 @@ The module must be present in the built bundle. Name it under
 `bundle.user_id_modules`, or omit that list to take the generator's default
 preset, which covers the commonly used modules.
 
-Nothing validates that pairing. A managed entry whose module is missing from the
-bundle resolves nothing and the auction continues; the only signal is a
-browser-side diagnostic. Confirm the module is in the bundle you deploy.
+`ts prebid bundle` resolves every managed `name` through the checked-in
+`user_id_modules.json` registry. An unknown name, or a name that maps to more
+than one module, fails before bundle generation. After generation, the command
+reads the new manifest and confirms that every resolved module is present. A
+missing module reports both the managed name and required module and leaves the
+existing bundle hash and SRI unchanged.
+
+The browser-side diagnostic remains useful when a bundle is hosted externally,
+is stale, or was modified after generation. Core remains vendor-neutral: it
+forwards each managed entry's `params` to Prebid.js without interpreting them.
 
 ```toml
 [integrations.prebid.bundle]

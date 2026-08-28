@@ -1286,11 +1286,18 @@ configurable without a code change:
 
 The module must be present in the built bundle. Name it under
 `[integrations.prebid.bundle].user_id_modules`, or omit that list to take the
-generator's default preset. This is not validated: a managed entry whose module
-is absent from the bundle resolves nothing, and the only signal is a
-browser-side diagnostic. Persisting a resolved ID into the Edge Cookie identity
-graph additionally requires a matching `[[ec.partners]]` entry whose
-`source_domain` equals the module's OpenRTB EID source.
+generator's default preset. `ts prebid bundle` resolves each managed `name`
+through the checked-in `user_id_modules.json` registry, rejects unknown or
+ambiguous names, and confirms the required modules in the newly generated
+manifest. A failure identifies the managed name or required module and does not
+update the configured bundle hash or SRI. The browser diagnostic remains a
+fallback for externally hosted, stale, or modified bundles. Trusted Server core
+does not interpret module-specific `params`; it forwards them to Prebid.js
+unchanged.
+
+Persisting a resolved ID into the Edge Cookie identity graph additionally
+requires a matching `[[ec.partners]]` entry whose `source_domain` equals the
+module's OpenRTB EID source.
 
 `managed_user_ids` is an array of tables, so it cannot be set through a
 `TRUSTED_SERVER__` environment variable; the scalar overlay only replaces leaves

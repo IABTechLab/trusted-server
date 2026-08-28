@@ -426,8 +426,9 @@ client_side_bidders = []          # bidders running via native Prebid.js adapter
 #
 # The module must be present in the built bundle: name it under
 # [integrations.prebid.bundle].user_id_modules, or omit that list to take the
-# generator's default preset. This pairing is not validated — a managed entry
-# whose module is missing from the bundle resolves nothing.
+# generator's default preset. `ts prebid bundle` resolves every managed name
+# through the checked-in User ID registry and fails if the generated manifest
+# omits its required module without updating the configured hash or SRI.
 #
 # Persisting a resolved ID into the EC identity graph additionally needs a
 # matching partner under [[ec.partners]] whose source_domain equals the module's
