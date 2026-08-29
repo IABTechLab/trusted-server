@@ -148,7 +148,115 @@ pub struct GeneratedEdgeCookie {
     /// Response headers the provider needs set on the outbound response, for
     /// example to request additional client evidence on later requests. Empty
     /// for providers that set no headers, such as [`HmacProvider`].
+    ///
+    /// Core checks every header here against its own reserved response surface
+    /// (see [`reserved_response_effect`]) before it is applied, so a provider
+    /// may set its own cookies and headers but cannot reach into the surface
+    /// core manages.
     pub response_headers: Vec<(http::HeaderName, http::HeaderValue)>,
+}
+
+/// The cookie-name namespace Trusted Server manages.
+///
+/// Every cookie core writes or reads as part of its own behavior is named
+/// `ts-<something>` (`ts-ec` in [`COOKIE_TS_EC`](crate::constants::COOKIE_TS_EC),
+/// `ts-eids` in [`COOKIE_TS_EIDS`](crate::constants::COOKIE_TS_EIDS), and
+/// `ts-tester` in [`COOKIE_TS_TESTER`](crate::constants::COOKIE_TS_TESTER)), so
+/// core defends the whole prefix rather than a list that a new managed cookie
+/// would silently outgrow. `sharedId` is deliberately not reserved: core only
+/// reads it, and it belongs to the page's own identity stack.
+const MANAGED_COOKIE_NAME_PREFIX: &[u8] = b"ts-";
+
+/// The response-header namespace Trusted Server reserves for itself.
+///
+/// Covers the fixed EC output headers and the per-partner
+/// `x-ts-<source_domain>` headers, which is why the prefix is reserved rather
+/// than the four names in
+/// [`INTERNAL_HEADERS`](crate::constants::INTERNAL_HEADERS).
+const RESERVED_RESPONSE_HEADER_PREFIX: &str = "x-ts-";
+
+/// Response headers that frame an HTTP message or are hop-by-hop.
+///
+/// The hop-by-hop set is RFC 7230 §6.1, matching each adapter's
+/// `is_hop_by_hop_response_header`, plus `content-length`, which frames the
+/// body the adapter is about to write. A provider that set any of these would
+/// be rewriting the response envelope rather than adding evidence to it.
+const FRAMING_OR_HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Why one provider response header falls inside core's reserved surface.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, derive_more::Display)]
+pub enum ReservedResponseEffect {
+    /// A `Set-Cookie` naming a cookie in the `ts-` namespace core manages.
+    #[display("sets a cookie in the `ts-` namespace Trusted Server manages")]
+    ManagedCookie,
+
+    /// A header in the `x-ts-` namespace core emits and strips.
+    #[display("sets a header in the reserved `x-ts-` namespace")]
+    ReservedHeader,
+
+    /// A message framing or hop-by-hop header.
+    #[display("sets a message framing or hop-by-hop header")]
+    FramingHeader,
+}
+
+/// The cookie name in a `Set-Cookie` value, as raw bytes.
+///
+/// Reads the bytes rather than a `&str` so a value that is not valid UTF-8
+/// cannot smuggle a managed cookie name past the check.
+fn set_cookie_name(value: &[u8]) -> &[u8] {
+    let pair_end = value.iter().position(|b| *b == b';').unwrap_or(value.len());
+    let pair = &value[..pair_end];
+    let name_end = pair.iter().position(|b| *b == b'=').unwrap_or(pair.len());
+    pair[..name_end].trim_ascii()
+}
+
+/// Classifies one provider response header against core's reserved surface.
+///
+/// Returns `Some` when the header would reach into what core manages, and
+/// `None` for everything else, including a provider's own cookie. Providers
+/// legitimately need to set cookies of their own (an evidence cookie for a
+/// later request, for example), so the rule reserves core's namespace rather
+/// than banning `Set-Cookie` outright.
+///
+/// A rejected effect fails the request rather than being dropped, because a
+/// provider reaching into the reserved surface has broken its contract in the
+/// same way as one minting an identifier outside the cookie-safe alphabet, and
+/// that already fails the request. Serving the response instead would let a
+/// provider set `ts-ec` directly, bypassing core's identifier validation and
+/// its requirement that a minted identifier have an identity-graph row.
+#[must_use]
+pub fn reserved_response_effect(
+    name: &http::HeaderName,
+    value: &http::HeaderValue,
+) -> Option<ReservedResponseEffect> {
+    let lower = name.as_str();
+    if lower == http::header::SET_COOKIE.as_str() {
+        let cookie_name = set_cookie_name(value.as_bytes());
+        if cookie_name.len() >= MANAGED_COOKIE_NAME_PREFIX.len()
+            && cookie_name[..MANAGED_COOKIE_NAME_PREFIX.len()]
+                .eq_ignore_ascii_case(MANAGED_COOKIE_NAME_PREFIX)
+        {
+            return Some(ReservedResponseEffect::ManagedCookie);
+        }
+        return None;
+    }
+    if lower.starts_with(RESERVED_RESPONSE_HEADER_PREFIX) {
+        return Some(ReservedResponseEffect::ReservedHeader);
+    }
+    if FRAMING_OR_HOP_BY_HOP_HEADERS.contains(&lower) {
+        return Some(ReservedResponseEffect::FramingHeader);
+    }
+    None
 }
 
 /// The registered short code that namespaces one Edge Cookie provider's
@@ -525,6 +633,89 @@ mod tests {
             split_provider_code("AB12~x"),
             (None, "AB12~x"),
             "uppercase is outside the code alphabet"
+        );
+    }
+
+    fn header(name: &str, value: &str) -> (http::HeaderName, http::HeaderValue) {
+        (
+            http::HeaderName::from_bytes(name.as_bytes()).expect("should parse header name"),
+            http::HeaderValue::from_str(value).expect("should parse header value"),
+        )
+    }
+
+    #[test]
+    fn reserved_response_effect_rejects_the_namespace_core_manages() {
+        for (name, value, expected) in [
+            (
+                "set-cookie",
+                "ts-ec=hmac~deadbeef.abc123; Path=/",
+                ReservedResponseEffect::ManagedCookie,
+            ),
+            (
+                "Set-Cookie",
+                "  TS-EIDS=x; Path=/",
+                ReservedResponseEffect::ManagedCookie,
+            ),
+            ("x-ts-ec", "spoofed", ReservedResponseEffect::ReservedHeader),
+            (
+                "X-TS-partner.example.com",
+                "uid",
+                ReservedResponseEffect::ReservedHeader,
+            ),
+            ("content-length", "0", ReservedResponseEffect::FramingHeader),
+            (
+                "Transfer-Encoding",
+                "chunked",
+                ReservedResponseEffect::FramingHeader,
+            ),
+            ("connection", "close", ReservedResponseEffect::FramingHeader),
+        ] {
+            let (name, value) = header(name, value);
+            assert_eq!(
+                reserved_response_effect(&name, &value),
+                Some(expected),
+                "`{name}` should be reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_response_effect_allows_provider_owned_effects() {
+        for (name, value) in [
+            ("set-cookie", "acme-evidence=abc; Path=/; Secure"),
+            ("set-cookie", "sharedId=abc"),
+            ("accept-ch", "Sec-CH-UA-Full-Version-List"),
+            ("x-acme-probe", "1"),
+            ("vary", "Sec-CH-UA"),
+        ] {
+            let (name, value) = header(name, value);
+            assert_eq!(
+                reserved_response_effect(&name, &value),
+                None,
+                "`{name}` is the provider's own and should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_response_effect_reads_a_non_utf8_set_cookie_as_bytes() {
+        // A `Set-Cookie` carrying a byte above 127 cannot be read as a string,
+        // so the cookie name is matched on raw bytes. Reading it as UTF-8 and
+        // giving up on failure would let this value through.
+        let name = http::header::SET_COOKIE;
+        let mut bytes = b"ts-ec=value".to_vec();
+        bytes.push(0xff);
+        bytes.extend_from_slice(b"; Path=/");
+        let value =
+            http::HeaderValue::from_bytes(&bytes).expect("should build a non-utf8 header value");
+        assert!(
+            value.to_str().is_err(),
+            "the test value should not be readable as UTF-8"
+        );
+        assert_eq!(
+            reserved_response_effect(&name, &value),
+            Some(ReservedResponseEffect::ManagedCookie),
+            "a non-UTF-8 Set-Cookie should still be matched on its cookie name"
         );
     }
 

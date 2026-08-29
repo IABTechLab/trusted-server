@@ -371,8 +371,10 @@ impl EcContext {
     /// # Errors
     ///
     /// Returns [`TrustedServerError::EdgeCookie`] when the client IP is
-    /// unavailable, the provider fails to derive an identifier, or persisting a
-    /// generated identifier to the KV identity graph fails.
+    /// unavailable, the provider fails to derive an identifier, the provider
+    /// asks for a response header inside core's reserved surface (see
+    /// [`reserved_response_effect`](crate::ec::provider::reserved_response_effect)),
+    /// or persisting a generated identifier to the KV identity graph fails.
     fn generate_with_provider(
         &mut self,
         ec_provider: &dyn EdgeCookieProvider,
@@ -393,6 +395,25 @@ impl EcContext {
         )
         .with_request_target(&self.request_path, &self.request_query);
         let generated: GeneratedEdgeCookie = ec_provider.generate(&request_info, &input)?;
+        // Check every response header the provider asked for against core's
+        // reserved surface before any of them are kept. A provider may set its
+        // own cookies and headers, but not a managed `ts-` cookie, a header in
+        // the `x-ts-` namespace, or a framing or hop-by-hop header. Rejection
+        // fails the request, matching the identifier-bounds rejection below:
+        // without it a provider could write `ts-ec` itself and bypass the
+        // identifier validation and identity-graph row this function enforces.
+        // Checked before the identifier is read, because a provider can return
+        // headers with no identifier at all.
+        for (name, value) in &generated.response_headers {
+            if let Some(effect) = provider::reserved_response_effect(name, value) {
+                return Err(Report::new(TrustedServerError::EdgeCookie {
+                    message: format!(
+                        "Provider `{}` returned a response header `{name}` that {effect}",
+                        ec_provider.id(),
+                    ),
+                }));
+            }
+        }
         // Capture any response headers the provider asked for, even when it
         // produced no identifier (for example while it still needs more client
         // evidence). EC finalization applies them to the response.
@@ -1089,6 +1110,158 @@ mod tests {
             ec.ec_value(),
             None,
             "no identifier should be committed after a mint rejection"
+        );
+    }
+
+    /// A provider that returns a caller-chosen response header and no
+    /// identifier, so a test can drive one provider response effect at a time
+    /// through the organic generate path.
+    #[derive(Debug)]
+    struct HeaderSettingProvider {
+        name: &'static str,
+        value: &'static str,
+        mint: bool,
+    }
+
+    impl EdgeCookieProvider for HeaderSettingProvider {
+        fn id(&self) -> &'static str {
+            "header-setting"
+        }
+
+        fn code(&self) -> ProviderCode {
+            ProviderCode::new("t0hs")
+        }
+
+        fn generate(
+            &self,
+            _request_info: &dyn RequestInfo,
+            _input: &IdentityInput<'_>,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            Ok(GeneratedEdgeCookie {
+                id: self.mint.then(|| "provider-value".to_owned()),
+                response_headers: vec![(
+                    http::HeaderName::from_bytes(self.name.as_bytes())
+                        .expect("should parse header name"),
+                    http::HeaderValue::from_static(self.value),
+                )],
+            })
+        }
+
+        fn accepts_id(&self, value: &str) -> bool {
+            !value.is_empty()
+        }
+
+        fn normalize_id_for_kv(&self, value: &str) -> String {
+            value.to_owned()
+        }
+    }
+
+    fn generate_with_header_setting_provider(
+        provider: HeaderSettingProvider,
+        graph: Option<&KvIdentityGraph>,
+    ) -> (Settings, Result<EcContext, Report<TrustedServerError>>) {
+        use crate::platform::test_support::noop_services_with_ec_provider;
+
+        let mut settings = create_test_settings();
+        settings.ec.provider = Some(EcProviderSelection::from("header-setting"));
+        let services = noop_services_with_ec_provider(Arc::new(provider));
+        let req = create_test_request(&[]);
+        let geo = non_regulated_geo();
+        let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
+            .expect("should read EC context");
+        let outcome = ec.generate_if_needed(&settings, graph).map(|()| ec);
+        (settings, outcome)
+    }
+
+    #[test]
+    fn generate_rejects_a_provider_effect_inside_the_reserved_response_surface() {
+        // A provider that sets the managed `ts-ec` cookie would bypass core's
+        // identifier validation and its identity-graph row entirely, so the
+        // request fails rather than the effect being quietly dropped. The
+        // provider mints no identifier here, which is exactly the case the
+        // cookie write would otherwise slip through.
+        let (_settings, outcome) = generate_with_header_setting_provider(
+            HeaderSettingProvider {
+                name: "set-cookie",
+                value: "ts-ec=forged-value; Path=/",
+                mint: false,
+            },
+            None,
+        );
+
+        let err = outcome.expect_err("a managed cookie effect should fail the request");
+        assert!(
+            err.to_string().contains("header-setting"),
+            "the error should name the provider, got: {err}"
+        );
+
+        // The same for the reserved header namespace and for message framing.
+        for (name, value) in [("x-ts-ec", "forged"), ("transfer-encoding", "chunked")] {
+            let (_settings, outcome) = generate_with_header_setting_provider(
+                HeaderSettingProvider {
+                    name,
+                    value,
+                    mint: false,
+                },
+                None,
+            );
+            assert!(
+                outcome.is_err(),
+                "`{name}` is reserved and should fail the request"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_applies_a_provider_owned_cookie_to_the_response() {
+        // The other half of the rule: a provider's own cookie is not core's, so
+        // it survives generation and reaches the browser response unchanged,
+        // alongside the managed `ts-ec` cookie core writes itself.
+        let graph = KvIdentityGraph::in_memory("test-ec-store");
+        let (settings, outcome) = generate_with_header_setting_provider(
+            HeaderSettingProvider {
+                name: "set-cookie",
+                value: "acme-evidence=abc123; Path=/; Secure",
+                mint: true,
+            },
+            Some(&graph),
+        );
+        let ec = outcome.expect("a provider-owned cookie should not fail the request");
+        assert_eq!(
+            ec.ec_value(),
+            Some("t0hs~provider-value"),
+            "the identifier should still be committed"
+        );
+
+        let mut response = http::Response::builder()
+            .status(200)
+            .body(EdgeBody::empty())
+            .expect("should build test response");
+        finalize::ec_finalize_response(
+            &settings,
+            &ec,
+            Some(&graph),
+            &registry::PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let cookies: Vec<&str> = response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("acme-evidence=abc123")),
+            "the provider's own cookie should reach the response, got: {cookies:?}"
+        );
+        assert!(
+            cookies.iter().any(|cookie| cookie.starts_with("ts-ec=")),
+            "core's own managed cookie should still be written, got: {cookies:?}"
         );
     }
 

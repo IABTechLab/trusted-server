@@ -52,7 +52,11 @@ pub fn ec_finalize_response(
 ) {
     // Apply any response headers the active provider asked for during
     // generation (for example to request more client evidence). This is empty
-    // unless a provider produced headers, so it is safe on every path.
+    // unless a provider produced headers, so it is safe on every path. Each
+    // one was checked against core's reserved response surface at capture
+    // time in `EcContext::generate_with_provider`, so nothing here can set a
+    // managed `ts-` cookie, an `x-ts-` header, or a framing or hop-by-hop
+    // header.
     for (name, value) in ec_context.response_headers() {
         response.headers_mut().insert(name, value.clone());
     }
