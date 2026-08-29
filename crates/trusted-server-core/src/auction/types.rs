@@ -742,14 +742,50 @@ mod tests {
         );
     }
 
+    /// Rewrites every object in `value` with its keys in sorted order, so
+    /// serializing the result gives one fixed key order.
+    ///
+    /// `serde_json::Map` is a `BTreeMap`, which serializes keys in sorted
+    /// order, only while the crate's `preserve_order` feature is off. With the
+    /// feature on it is an `IndexMap` and the order follows insertion instead.
+    /// Nothing in this crate asks for the feature, but Cargo unifies features
+    /// across everything built for one target, and `trusted-server-cli` pulls
+    /// it in through `edgezero-cli` and then `handlebars`. A maintainer
+    /// running `cargo test --workspace --target <host>` therefore builds this
+    /// crate with `preserve_order` on, and a test that pinned insertion order
+    /// would fail there for no reason. Sorting both sides removes the
+    /// dependence on which map `serde_json` was built with.
+    fn with_sorted_keys(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut keys = map.keys().collect::<Vec<_>>();
+                keys.sort_unstable();
+                let mut sorted = serde_json::Map::with_capacity(keys.len());
+                for key in keys {
+                    let child = map.get(key).expect("should find a key the map just listed");
+                    sorted.insert(key.clone(), with_sorted_keys(child));
+                }
+                serde_json::Value::Object(sorted)
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(with_sorted_keys).collect())
+            }
+            scalar => scalar.clone(),
+        }
+    }
+
     #[test]
     fn the_open_renderer_serializes_to_the_same_bytes_as_the_aps_variant_did() {
         // Literal strings captured from the closed-enum form before this
         // change, through the same `serde_json::to_value` path production
         // uses: `BidExt::to_ext` for the OpenRTB response extension, and
-        // `build_bid_map` for `window.tsjs.bids`. Both hand the page an object
-        // whose keys are ordered by `serde_json::Map`, so these are the bytes
-        // a browser actually receives.
+        // `build_bid_map` for `window.tsjs.bids`.
+        //
+        // Both sides go through `with_sorted_keys` first, because the key
+        // order `serde_json` emits is not ours to pin, and that function
+        // explains why. Sorting settles the order without weakening what is
+        // pinned, since two objects serialize to the same sorted bytes only
+        // when they carry exactly the same keys with exactly the same values.
         let full = BidRenderer::from_typed(
             APS_RENDERER_TYPE,
             &ApsRendererV1 {
@@ -781,13 +817,13 @@ mod tests {
         )
         .expect("should build APS renderer descriptor");
 
-        let full_bytes = serde_json::to_string(
+        let full_bytes = serde_json::to_string(&with_sorted_keys(
             &serde_json::to_value(&full).expect("should convert renderer to a JSON value"),
-        )
+        ))
         .expect("should serialize renderer");
-        let absent_bytes = serde_json::to_string(
+        let absent_bytes = serde_json::to_string(&with_sorted_keys(
             &serde_json::to_value(&absent).expect("should convert renderer to a JSON value"),
-        )
+        ))
         .expect("should serialize renderer");
 
         assert_eq!(
