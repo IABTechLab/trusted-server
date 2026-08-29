@@ -69,14 +69,6 @@ function createResolverFixture(metadata) {
   return { temp, packageDir, metadataDir, target };
 }
 
-function fakeBundleMetadata() {
-  return {
-    filename: `trusted-prebid-${'a'.repeat(64)}.js`,
-    sha256: 'a'.repeat(64),
-    sri: 'sha384-example',
-  };
-}
-
 describe('build-prebid-external request parsing', () => {
   it('accepts the typed module request and preserves order', () => {
     const request = parseRequest({
