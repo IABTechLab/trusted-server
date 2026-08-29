@@ -1,7 +1,7 @@
 # Documentation Refresh (Full Surface)
 
 **Date:** 2026-08-19
-**Revised:** 2026-08-28 (round 14)
+**Revised:** 2026-08-29 (round 15)
 **Status:** Draft, pending review
 **Scope:** Documentation and doc tooling. No runtime behavior changes.
 **Baseline:** audited_target_tip `07dfc1c6d` (2026-08-28). The bulk
@@ -259,20 +259,31 @@ The owner's standing instruction is one rc PR carrying spec plus work;
 the concrete shape below (which adds the forced `main` containment PR and
 package checkpoints) still awaits explicit confirmation - open question 7
 blocks implementation until it is given, and its answer is recorded with
-owner and date. The delivery graph is four PRs delivered by this refresh - (a)-(d) -
-plus one mandatory future PR (e) whose tracked issue and draft this
-refresh must produce: (a) the single rc PR (#1049)
+owner and date. The delivery graph is four PRs delivered inside this refresh -
+(a)-(d) - plus two named follow-on `main` PRs it must set up: (c2), the
+post-merge activation PR, and (e), the release handoff. Each is a real
+PR with its own audited_main_tip, because each mutates default-branch
+files: (a) the single rc PR (#1049)
 carrying the spec plus all packages; (b) the `main` containment PR;
 (c) a `main` automation PR, which lands the workflow in
 DISPATCH-ONLY form (no `schedule:` trigger, no rc-targeted Dependabot
 entries) because scheduled runs and Dependabot would otherwise inspect
 pre-refresh rc content and a docs-parity cargo root that does not yet
-exist on any target branch. Activation is a separate, owned post-merge
-checkpoint (see (c2)) that adds the `schedule:` trigger and the
-rc-targeted Dependabot entries once #1049 has merged. Scheduled
+exist on any target branch. Activation is a separate NAMED `main` PR (c2) - it mutates
+default-branch files, so it is a PR under this design's own protection
+model, not a checkpoint - that adds the `schedule:` trigger and the
+rc-targeted Dependabot entries once #1049 has merged, with its own
+audited_main_tip. Scheduled
 workflows and Dependabot read their configuration from the DEFAULT
 branch, so both live on `main`; version updates use
-`target-branch: rc/202608` (security updates always
+`target-branch: rc/202608`. Security updates always target the DEFAULT
+branch, and the dependency graph analyzes manifests from it, so while
+`tools/docs-parity` exists only on rc it receives version-update PRs
+but NO Dependabot alerts or security-update PRs - an explicit,
+time-bounded risk closing at the release merge (temporary dependency
+submission for rc is the mitigation if that window proves long); the
+config validation covers both kinds and says so rather than
+overstating coverage (security updates always
 target the default branch; the config validation covers both kinds and
 the wording distinguishes them). Pre-merge acceptance is not circular
 and not privileged: the workflow is split into two jobs. A dispatch
@@ -291,23 +302,40 @@ fixtures, one per rejected class. A separate
 schedule-only issue-management job holds the job-scoped `issues: write`
 and never executes code from a supplied SHA - it checks out only the
 branch tip it is configured for. Pre-merge, the validation job runs on the rc PR head.
-(c2) is an owned post-merge activation checkpoint, tracked as an issue
-filed in WP8b with a named owner: after #1049 merges into rc, dispatch
-the exact merged rc tip and record it, then land the activation edit
-(schedule trigger + rc-targeted Dependabot roots); after rc lands on
-`main`, validate the retargeted schedule, the Dependabot roots, live
-Pages containment, and the selected CNAME behavior. (e) A fifth, release-triggered handoff PR to `main`, with two distinct
-paths. Normal path - rc/202608 is deleted AFTER a verified merge into
-`main`: the workflow checkout and Dependabot `target-branch` switch to
-`main` (the checkout could fall back dynamically but Dependabot's
+(c2) is the owned post-merge activation PR to `main`, tracked as an
+issue filed in WP8b with a named owner: after #1049 merges into rc,
+record a `merged_rc_tip`, dispatch that exact SHA, then land the
+activation edit (schedule trigger + rc-targeted Dependabot roots).
+Because `main` does not yet contain `tools/docs-parity` or the WP8
+workflows, c2's own checks cannot come from `main`: its validation job
+checks out the trusted merged rc tip for the TOOL and a second checkout
+of the c2 head for the FILES UNDER TEST, statically validating the
+actual changed workflow and Dependabot file, and c2's acceptance
+additionally requires a successful real scheduled run after activation
+(including the schedule-only issue job). Required-check activation on
+`main` is deferred until the release merge puts the tooling there -
+that deferral is recorded in the WP8b branch-protection acceptance item
+rather than leaving c2 blocked on checks that cannot report. (e) The handoff PR to `main`, which GATES branch deletion rather than
+being triggered by it - deleting rc first would leave the schedule and
+Dependabot pointing at a dead branch, the exact state this design
+forbids. Ordering, normal release: verify rc landed on `main` -> merge
+(e) retargeting to `main` -> verify -> only then delete rc. Ordering,
+abandonment: merge (e) disabling/removing the automation -> verify ->
+only then delete rc. Normal path - the workflow checkout and Dependabot
+`target-branch` switch to `main` (the checkout could fall back dynamically but Dependabot's
 target is static, so a `main` edit is unavoidable), an XS retarget-only
-edit. Abandonment path - rc is deleted WITHOUT merging: retargeting is
+edit. Abandonment path - rc is abandoned WITHOUT merging: retargeting is
 invalid because `main` then holds neither the refreshed docs nor
 `tools/docs-parity` and its cargo root, so the handoff instead DISABLES
 and removes the automation (schedule trigger, rc-targeted Dependabot
 entries, link workflow) rather than pointing it at content that does
 not exist; transplanting the tooling to `main` is a separate,
-explicitly sized effort, never a silent XS edit. Both paths have a named owner, a tracked issue filed in WP8b, a
+explicitly sized effort, never a silent XS edit. The two paths are mutually exclusive diffs, so this refresh does not
+open a single speculative draft: it produces a tracked issue plus two
+REVIEWED patch templates/runbooks (retarget, and disable/remove), and
+the concrete PR is opened from the matching runbook once the outcome is
+known, with the same dual-checkout validation c2 uses applied to the
+concrete (e) diff before handoff. Both paths have a named owner, a
 sequencing row, and a verification item (the automation must never keep
 pointing at a dead or content-less branch); (d) the CNAME resolution
 PR to `main`, cut when open question 2 resolves (the containment PR
@@ -407,7 +435,11 @@ type-check` and the `settings_data::get_settings` example (the exported
 - Auction README repairs (route table by symbol name, real provider
   layout: `AuctionPlan`, `PROFILE_REGISTRATIONS`, `GenericOpenRtbProvider`,
   mediator; remove the removed-`mock` sections).
-- Retire `FAQ_POC.md` (fallback if rejected: archive or factual rewrite);
+- `FAQ_POC.md` is a three-way decision (open question 3): retire,
+  archive under the historical tree, or factual rewrite - archive is
+  the deadline fallback; a rewrite carries its own acceptance (every
+  answer verified against code, page kept in the active public set),
+  while retire and archive leave no active-set page;
   replace `gam.md`/`kargo.md` with tombstone content (routes preserved
   unconditionally, `tombstone` orphan-allowlist kind, old-route smokes).
 - `TESTING.md` rewritten as the test-matrix index; the auction runbook
@@ -881,26 +913,30 @@ regions and goldens at final HEAD produces no diff.
 
 ## Sequencing
 
-| Order | Package                                | Size | Depends on                                                                                                    |
-| ----- | -------------------------------------- | ---- | ------------------------------------------------------------------------------------------------------------- |
-| 0     | WP1 containment subset → `main` PR (b) | XS   | -                                                                                                             |
-| 0b    | `main` automation PR (c)               | XS   | WP8a workflow content; dispatch acceptance vs the rc PR head SHA                                              |
-| 9b    | Post-merge activation checkpoint (c2)  | XS   | #1049 merged into rc; adds schedule trigger + rc Dependabot roots                                             |
-| 0c    | CNAME PR (d)                           | XS   | open question 2; completion gate, does not block other rows                                                   |
-| 10    | Release handoff PR (e)                 | XS   | rc merge or deletion; owned, tracked issue; its filing is part of this refresh's completion, its merge is not |
-| 1     | WP1 hygiene (full, rc PR)              | S    | -                                                                                                             |
-| 2     | WP8a scaffolding                       | L    | -                                                                                                             |
-| 3     | WP2 truth pass                         | M    | WP8a (manifest, scanner)                                                                                      |
-| 4     | WP3 config reference                   | L    | WP8a (extractor, harness)                                                                                     |
-| 5     | WP4 API reference                      | M    | WP2, WP8a                                                                                                     |
-| 6     | WP5 pages + nav                        | L    | WP2, WP3, WP8a                                                                                                |
-| 7     | WP6 root + READMEs                     | M    | WP2                                                                                                           |
-| 8     | WP7 in-code docs                       | M    | -                                                                                                             |
-| 9     | WP8b gate activation                   | M    | WP2-WP7                                                                                                       |
+| Order | Package                                | Size | Depends on                                                                                      |
+| ----- | -------------------------------------- | ---- | ----------------------------------------------------------------------------------------------- |
+| 0     | WP1 containment subset → `main` PR (b) | XS   | -                                                                                               |
+| 0b    | `main` automation PR (c)               | XS   | WP8a workflow content; dispatch acceptance vs the rc PR head SHA                                |
+| 9b    | Post-merge activation PR (c2) → `main` | XS   | #1049 merged into rc; own audited_main_tip; dual-checkout validation; real scheduled run        |
+| 0c    | CNAME PR (d)                           | XS   | open question 2; completion gate, does not block other rows                                     |
+| 10    | Release handoff PR (e) → `main`        | XS   | gates rc deletion (merge e, verify, then delete); issue + two runbooks produced by this refresh |
+| 1     | WP1 hygiene (full, rc PR)              | S    | -                                                                                               |
+| 2     | WP8a scaffolding                       | L    | -                                                                                               |
+| 3     | WP2 truth pass                         | M    | WP8a (manifest, scanner)                                                                        |
+| 4     | WP3 config reference                   | L    | WP8a (extractor, harness)                                                                       |
+| 5     | WP4 API reference                      | M    | WP2, WP8a                                                                                       |
+| 6     | WP5 pages + nav                        | L    | WP2, WP3, WP8a                                                                                  |
+| 7     | WP6 root + READMEs                     | M    | WP2                                                                                             |
+| 8     | WP7 in-code docs                       | M    | -                                                                                               |
+| 9     | WP8b gate activation                   | M    | WP2-WP7                                                                                         |
 
 ## Verification
 
-At the final rc-PR HEAD: all GitHub checks green (CodeQL with rc
+Verification runs in three epochs, because a single state cannot hold
+both "target still equals the audited baseline" and "#1049 has merged":
+
+**Epoch 1 - pre-merge, at the final rc-PR HEAD** (`origin/rc/202608`
+still equals audited_target_tip `07dfc1c6d`): all GitHub checks green (CodeQL with rc
 triggers, format including the docs build, the seven test.yml jobs, the
 four integration-test jobs, release builds, JS build/test); the WP8
 parity suite and negative fixtures green; regeneration produces no diff;
@@ -913,25 +949,42 @@ recorded; the `main` containment PR merged with its positive smoke, the
 `main` automation PR merged with a successful read-only validation
 dispatch against the rc PR head and validated Dependabot config, and the
 CNAME PR (d) merged with its branch-specific live smoke (each `main`
-PR's audited_main_tip assertion having passed); the post-merge
-activation checkpoint (c2) recorded with its dispatch against the exact
-merged rc tip; the release-handoff PR (e) existing as a draft PR URL in
-a defined readiness state, with its owner, tracked issue, and both
-path conditions recorded; every follow-up filed with a
-recorded URL or disposition; and the exact-tip baseline
-assertion for `origin/rc/202608` (equal to the recorded
-audited_target_tip, contained in the branch) passing at the final HEAD -
-not a merge-base comparison.
+PR's audited_main_tip assertion having passed); every follow-up filed with a recorded URL or
+disposition; the release-handoff work (e) existing as a tracked issue
+plus two reviewed runbooks (retarget / disable-and-remove), with its
+owner and both path conditions recorded and branch deletion documented
+as gated by (e); and the exact-tip baseline assertion for
+`origin/rc/202608` (equal to the recorded audited_target_tip, contained
+in the branch) passing at this HEAD - not a merge-base comparison.
+
+**Epoch 2 - after #1049 merges into rc**: record a `merged_rc_tip`;
+dispatch that exact SHA through the read-only validation job and record
+the result; open and merge the c2 activation PR to `main` (its own
+audited_main_tip; dual-checkout validation - trusted tool from the
+merged rc tip, files under test from the c2 head - covering the actual
+changed workflow and Dependabot file); then observe one successful real
+scheduled run, including the schedule-only issue job.
+
+**Epoch 3 - at release, before rc deletion**: verify rc landed on
+`main` (or that it is being abandoned); open the concrete (e) PR from
+the matching runbook, validated the same dual-checkout way against its
+real diff; merge it; re-verify the retargeted (or removed) schedule and
+Dependabot roots, live Pages containment, and the selected CNAME
+behavior; only then is rc deleted. If the release merge happened,
+`main` now carries the tooling, so the deferred required-check
+activation on `main` is completed here per the WP8b protection item.
 
 ## Open questions
 
 1. `fastly.toml` `service_id` allowlist owner and review date (blocks
    WP8a scanner activation); the ops migration itself blocks nothing.
 2. CNAME: delete (recommended) or custom domain (fully specified branch).
-3. `FAQ_POC.md` retirement (owner: the maintainer driving this refresh;
-   decide before WP2 starts). Deterministic default if undecided by
-   then: archive it under the historical tree (not a rewrite), leaving
-   no active-set page and no route to preserve. The gam/kargo
+3. `FAQ_POC.md`: three-way - retire, archive, or factual rewrite
+   (owner: the maintainer driving this refresh; decide before WP2
+   starts). Deterministic fallback if undecided by then: archive under
+   the historical tree, leaving no active-set page and no route to
+   preserve. "Do not retire" alone is not an answer - it selects
+   between archive and rewrite, and rewrite has its own acceptance. The gam/kargo
    tombstones are NOT part of this question - WP2 applies them
    unconditionally, with routes preserved, sidebar entries removed, and
    old-route smokes asserting the tombstones serve.
