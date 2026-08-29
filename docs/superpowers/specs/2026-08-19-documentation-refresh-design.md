@@ -1,7 +1,7 @@
 # Documentation Refresh (Full Surface)
 
 **Date:** 2026-08-19
-**Revised:** 2026-08-29 (round 15)
+**Revised:** 2026-08-29 (round 16)
 **Status:** Draft, pending review
 **Scope:** Documentation and doc tooling. No runtime behavior changes.
 **Baseline:** audited_target_tip `07dfc1c6d` (2026-08-28). The bulk
@@ -259,7 +259,15 @@ The owner's standing instruction is one rc PR carrying spec plus work;
 the concrete shape below (which adds the forced `main` containment PR and
 package checkpoints) still awaits explicit confirmation - open question 7
 blocks implementation until it is given, and its answer is recorded with
-owner and date. The delivery graph is four PRs delivered inside this refresh -
+owner and date.
+
+Milestones (so "complete" has one meaning): **implementation-ready**
+after Epoch 1 - PRs (a)-(d) merged and every content/enforcement
+acceptance met; **activated** after Epoch 2 - c2 merged and a real
+scheduled run observed; **lifecycle-closed** after Epoch 3 - (e)
+merged and rc deleted. THIS REFRESH CLOSES AT "activated"; Epoch 3 is
+owned, tracked, and specified here but belongs to release management,
+which is out of scope. The delivery graph is four PRs delivered inside this refresh -
 (a)-(d) - plus two named follow-on `main` PRs it must set up: (c2), the
 post-merge activation PR, and (e), the release handoff. Each is a real
 PR with its own audited_main_tip, because each mutates default-branch
@@ -279,26 +287,57 @@ branch, so both live on `main`; version updates use
 `target-branch: rc/202608`. Security updates always target the DEFAULT
 branch, and the dependency graph analyzes manifests from it, so while
 `tools/docs-parity` exists only on rc it receives version-update PRs
-but NO Dependabot alerts or security-update PRs - an explicit,
-time-bounded risk closing at the release merge (temporary dependency
-submission for rc is the mitigation if that window proves long); the
-config validation covers both kinds and says so rather than
-overstating coverage (security updates always
-target the default branch; the config validation covers both kinds and
-the wording distinguishes them). Pre-merge acceptance is not circular
+but NO Dependabot alerts or security-update PRs - an explicit risk with a
+real bound: owner = the maintainer driving this refresh, review date
+recorded when c2 merges, and a maximum window of 60 days, after which
+the mitigation is mandatory rather than optional. The mitigation is a
+SEPARATE, minimally permissioned dependency-submission job (snapshot
+creation needs `contents: write`, which the read-only validation job
+must never hold). The rc-targeted entry configures version updates
+only; it does not configure security updates, and the validation
+asserts exactly that rather than claiming coverage of both.
+Pre-merge acceptance is not circular
 and not privileged: the workflow is split into two jobs. A dispatch
 validation job runs with `contents: read` only, no secrets, and no
-mutating steps; it checks out and executes the supplied SHA, which must
-be a full 40-character SHA satisfying an exact machine predicate: the API
-reports it as `head.sha` of pull request **#1049** in this same
-repository, with `base.ref == "rc/202608"`, state open, and not a
-draft - or it equals the current `origin/rc/202608` tip. No other
-notion of "approved" is used (so the job needs no
+mutating steps. Its inputs are TWO independent, separately authorized
+SHAs, because one predicate cannot cover both the trusted tool and the
+files being inspected:
+
+- `tool_sha` - the code that EXECUTES. A full 40-character SHA that the
+  API reports as `head.sha` of pull request **#1049** in this same
+  repository with `base.ref == "rc/202608"`, open and non-draft; or the
+  current `origin/rc/202608` tip; or (from Epoch 2 on) the recorded
+  `merged_rc_tip`, which the job independently verifies is still an
+  ancestor of `origin/rc/202608` - if rc has advanced past it in a way
+  that breaks reachability, the job fails and the tip is re-audited.
+- `files_sha` - data that is NEVER executed. A full 40-character SHA
+  that the API reports as the current `head.sha` of a named,
+  same-repository, OPEN pull request targeting `main` (the c2 or e PR).
+  Its checkout uses `persist-credentials: false`, is restricted to an
+  allowed-file set (the workflow file and `.github/dependabot.yml`),
+  canonicalizes paths and rejects symlinks escaping the tree, and is
+  read statically only - "nothing from the files checkout is executed"
+  is an explicit workflow invariant, since executing an untrusted PR
+  checkout in a privileged context is the exact pattern GitHub warns
+  against.
+
+No other notion of "approved" is used (so the job needs no
 `pull-requests: read` beyond the public metadata read it already has;
 if a review-state predicate is ever added, that permission is added
-with it). Arbitrary refs, stale SHAs, other PRs' heads, and
-fork-repository SHAs are rejected, proven by negative workflow
-fixtures, one per rejected class. A separate
+with it). Arbitrary refs, stale heads, other PRs' heads, fork SHAs,
+and a `files_sha` from a closed or non-`main`-targeting PR are
+rejected, proven by negative workflow fixtures, one per rejected class.
+
+Trust and binding: the run is always orchestrated by the dispatcher
+workflow version already merged on `main` (never the version at the
+PR head - a PR must not be able to edit or skip its own validator), so
+the run associates with `main` rather than the PR head. The job
+therefore records `validated_files_sha`, publishes a Check Run/status
+against exactly that SHA, and the PR carries a just-before-merge
+assertion that its head still equals `validated_files_sha`; where a
+Check Run cannot be attached, the fallback is recorded manual evidence
+plus a branch rule requiring approval of the latest push. This binding
+applies identically to c2 and to the abandonment form of e. A separate
 schedule-only issue-management job holds the job-scoped `issues: write`
 and never executes code from a supplied SHA - it checks out only the
 branch tip it is configured for. Pre-merge, the validation job runs on the rc PR head.
@@ -307,10 +346,10 @@ issue filed in WP8b with a named owner: after #1049 merges into rc,
 record a `merged_rc_tip`, dispatch that exact SHA, then land the
 activation edit (schedule trigger + rc-targeted Dependabot roots).
 Because `main` does not yet contain `tools/docs-parity` or the WP8
-workflows, c2's own checks cannot come from `main`: its validation job
-checks out the trusted merged rc tip for the TOOL and a second checkout
-of the c2 head for the FILES UNDER TEST, statically validating the
-actual changed workflow and Dependabot file, and c2's acceptance
+workflows, c2's own checks cannot come from `main`: its validation job runs the
+dual-ref flow above - `tool_sha` = the trusted merged rc tip,
+`files_sha` = the c2 PR head - statically validating the actual changed
+workflow and Dependabot file and binding the result to that SHA, and c2's acceptance
 additionally requires a successful real scheduled run after activation
 (including the schedule-only issue job). Required-check activation on
 `main` is deferred until the release merge puts the tooling there -
@@ -334,8 +373,8 @@ explicitly sized effort, never a silent XS edit. The two paths are mutually excl
 open a single speculative draft: it produces a tracked issue plus two
 REVIEWED patch templates/runbooks (retarget, and disable/remove), and
 the concrete PR is opened from the matching runbook once the outcome is
-known, with the same dual-checkout validation c2 uses applied to the
-concrete (e) diff before handoff. Both paths have a named owner, a
+known, with the same dual-ref validation and SHA binding c2 uses applied to
+the concrete (e) diff before handoff. Both paths have a named owner, a
 sequencing row, and a verification item (the automation must never keep
 pointing at a dead or content-less branch); (d) the CNAME resolution
 PR to `main`, cut when open question 2 resolves (the containment PR
@@ -894,12 +933,18 @@ WP8b (lands last):
 
 Merge-blocking is a repository setting, not a workflow property: a
 failing check blocks merges only when the ruleset/branch protection
-requires it. WP8b therefore carries an externally owned acceptance item
-recording: the required check names and their GitHub App, the
-ruleset/branch-protection evidence for BOTH `rc/202608` and `main`,
-the bypass policy, one demonstrated failing check actually preventing a
-merge, and `merge_group` triggers on the new workflows if the
-repository adopts merge queues.
+requires it. WP8b therefore carries an externally owned acceptance item that is
+PATH-SPECIFIC, because `main` cannot require checks whose tooling it
+does not yet contain: (i) Epoch 1 - the new checks are required on
+`rc/202608`, with one demonstrated failing check actually preventing an
+rc merge, and the `main` deferral explicitly recorded; (ii) normal
+Epoch 3, after the release merge puts the tooling on `main` - the
+checks are activated there, with a separate demonstrated `main` block;
+(iii) abandonment - `main` activation is marked INAPPLICABLE, with
+evidence that no required check referencing a nonexistent workflow
+remains configured on `main`. Every path records the required check
+names and their GitHub App, the bypass policy, and `merge_group`
+triggers on the new workflows if the repository adopts merge queues.
 
 Acceptance: every runtime gate has a synthesized negative fixture (dead
 link, broken intra-doc link, failing doctest, invalid or unknown-keyed
@@ -913,22 +958,22 @@ regions and goldens at final HEAD produces no diff.
 
 ## Sequencing
 
-| Order | Package                                | Size | Depends on                                                                                      |
-| ----- | -------------------------------------- | ---- | ----------------------------------------------------------------------------------------------- |
-| 0     | WP1 containment subset → `main` PR (b) | XS   | -                                                                                               |
-| 0b    | `main` automation PR (c)               | XS   | WP8a workflow content; dispatch acceptance vs the rc PR head SHA                                |
-| 9b    | Post-merge activation PR (c2) → `main` | XS   | #1049 merged into rc; own audited_main_tip; dual-checkout validation; real scheduled run        |
-| 0c    | CNAME PR (d)                           | XS   | open question 2; completion gate, does not block other rows                                     |
-| 10    | Release handoff PR (e) → `main`        | XS   | gates rc deletion (merge e, verify, then delete); issue + two runbooks produced by this refresh |
-| 1     | WP1 hygiene (full, rc PR)              | S    | -                                                                                               |
-| 2     | WP8a scaffolding                       | L    | -                                                                                               |
-| 3     | WP2 truth pass                         | M    | WP8a (manifest, scanner)                                                                        |
-| 4     | WP3 config reference                   | L    | WP8a (extractor, harness)                                                                       |
-| 5     | WP4 API reference                      | M    | WP2, WP8a                                                                                       |
-| 6     | WP5 pages + nav                        | L    | WP2, WP3, WP8a                                                                                  |
-| 7     | WP6 root + READMEs                     | M    | WP2                                                                                             |
-| 8     | WP7 in-code docs                       | M    | -                                                                                               |
-| 9     | WP8b gate activation                   | M    | WP2-WP7                                                                                         |
+| Order | Package                                 | Size | Depends on                                                                                        |
+| ----- | --------------------------------------- | ---- | ------------------------------------------------------------------------------------------------- |
+| 0     | WP1 containment subset → `main` PR (b)  | XS   | -                                                                                                 |
+| 9b    | Post-merge activation PR (c2) → `main`  | S    | #1049 merged into rc; own audited_main_tip; dual-ref validation + SHA binding; real scheduled run |
+| 0c    | CNAME PR (d)                            | XS   | open question 2; completion gate, does not block other rows                                       |
+| 10    | Release handoff PR (e) → `main`         | XS   | gates rc deletion (merge e, verify, then delete); issue + two runbooks produced by this refresh   |
+| 1     | WP1 hygiene (full, rc PR)               | S    | -                                                                                                 |
+| 2     | WP8a scaffolding                        | L    | -                                                                                                 |
+| 2b    | `main` automation PR (c), dispatch-only | XS   | WP8a (workflow content exists); validation dispatch vs the #1049 head                             |
+| 3     | WP2 truth pass                          | M    | WP8a (manifest, scanner)                                                                          |
+| 4     | WP3 config reference                    | L    | WP8a (extractor, harness)                                                                         |
+| 5     | WP4 API reference                       | M    | WP2, WP8a                                                                                         |
+| 6     | WP5 pages + nav                         | L    | WP2, WP3, WP8a                                                                                    |
+| 7     | WP6 root + READMEs                      | M    | WP2                                                                                               |
+| 8     | WP7 in-code docs                        | M    | -                                                                                                 |
+| 9     | WP8b gate activation                    | M    | WP2-WP7                                                                                           |
 
 ## Verification
 
@@ -957,9 +1002,12 @@ as gated by (e); and the exact-tip baseline assertion for
 `origin/rc/202608` (equal to the recorded audited_target_tip, contained
 in the branch) passing at this HEAD - not a merge-base comparison.
 
-**Epoch 2 - after #1049 merges into rc**: record a `merged_rc_tip`;
-dispatch that exact SHA through the read-only validation job and record
-the result; open and merge the c2 activation PR to `main` (its own
+**Epoch 2 - after #1049 merges into rc**: record `merged_rc_tip` as the
+exact merge result of #1049 and verify it is reachable from
+`origin/rc/202608` (if rc has since advanced such that it is not, or
+the predicate no longer accepts it, re-audit and use the new rc tip);
+dispatch that exact SHA as `tool_sha` through the read-only validation
+job and record the result; open and merge the c2 activation PR to `main` (its own
 audited_main_tip; dual-checkout validation - trusted tool from the
 merged rc tip, files under test from the c2 head - covering the actual
 changed workflow and Dependabot file); then observe one successful real
