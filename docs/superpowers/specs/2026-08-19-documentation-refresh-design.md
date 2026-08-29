@@ -361,13 +361,22 @@ rejected, proven by negative workflow fixtures, one per rejected class.
 Trust and binding: the run is always orchestrated by the dispatcher
 workflow version already merged on `main` (never the version at the
 PR head - a PR must not be able to edit or skip its own validator), so
-the run associates with `main` rather than the PR head. The job
-therefore records `validated_files_sha`, publishes a Check Run/status
-against exactly that SHA, and the PR carries a just-before-merge
-assertion that its head still equals `validated_files_sha`; where a
-Check Run cannot be attached, the fallback is recorded manual evidence
-plus a branch rule requiring approval of the latest push. This binding
-applies identically to c2 and to the abandonment form of e. A separate
+the run associates with `main` rather than the PR head. Because the
+validation job holds `contents: read` and no write token it cannot
+itself publish a status, so permissions are split by job: the
+validation job (`contents: read`, no secrets, no mutating steps); an
+ATTESTATION job with `statuses: write` only, no checkout, `needs:` the
+validation job, publishing a COMMIT STATUS (not a Check Run) with a
+fixed context string from a fixed app identity against exactly
+`validated_files_sha`; the schedule-only issue job (`issues: write`
+only); and the dependency-submission job (`contents: write` only).
+That fixed status context is what branch protection requires on the c2
+and e PRs, and each PR carries a just-before-merge assertion that its
+head still equals `validated_files_sha` AND its base still equals the
+authenticated `base_sha`. Manual evidence is NOT an equivalent
+fallback - it cannot block a merge; if the status cannot be published,
+the PR does not merge. This binding
+applies identically to c2 and to the abandonment form of e. The
 schedule-only issue-management job holds the job-scoped `issues: write`
 and never executes code from a supplied SHA - it checks out only the
 branch tip it is configured for. Pre-merge, the validation job runs on the rc PR head.
