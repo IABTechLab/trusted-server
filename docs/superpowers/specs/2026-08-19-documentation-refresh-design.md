@@ -1,7 +1,7 @@
 # Documentation Refresh (Full Surface)
 
 **Date:** 2026-08-19
-**Revised:** 2026-08-28 (round 12)
+**Revised:** 2026-08-28 (round 13)
 **Status:** Draft, pending review
 **Scope:** Documentation and doc tooling. No runtime behavior changes.
 **Baseline:** audited_target_tip `07dfc1c6d` (2026-08-28). The bulk
@@ -179,15 +179,18 @@ Truth-pass acceptance and parity checks operate on defined source sets:
   `wrangler.toml`, `wrangler.ci.toml`, `spin.toml`, `axum.toml`, and
   `cloudflare.toml` until retired), `.claude/skills/**`,
   `.claude/agents/**`, and `.github/pull_request_template.md`. The
-  candidate universe is mechanical, not semantic: a tracked-path rule
-  set (every `**/*.sh`, `**/*.toml` manifest, workflow/action/issue-form
-  YAML, Dockerfile-like files, and markdown outside the other sets)
-  generates the candidate list, and EVERY candidate must carry an
-  explicit include or typed-exclude disposition in the checked
-  maintained-source manifest (`{path, mode, selector}`; whole-file vs
-  comment-region) - an unclassified candidate fails the gate, so a new
-  Dockerfile or unfamiliar operational format cannot silently fall
-  outside the universe. The WP8b inventory gate asserts final set
+  candidate universe is mechanical and complete: it is derived from the
+  all-tracked text/binary classification manifest (WP8a) - EVERY tracked
+  file classified as text is a candidate (a path whitelist cannot
+  recognize an extension it does not know; `.mjs` build scripts and the
+  human-facing `.proto` documentation are real examples outside any
+  whitelist), and every candidate must carry an explicit include or
+  typed-exclude disposition in the checked maintained-source manifest
+  (`{path, mode, selector}`; whole-file vs comment-region). An
+  unclassified candidate fails the gate, so a new Dockerfile or
+  unfamiliar operational format cannot silently fall outside the
+  universe; the path rules below are the default include hints, not the
+  universe. The WP8b inventory gate asserts final set
   equality, with negative fixtures for a new operational extension and
   a comment outside an existing selector.
 - **Historical set:** `docs/superpowers/**` and shipped `CHANGELOG.md`
@@ -224,8 +227,12 @@ Truth-pass acceptance and parity checks operate on defined source sets:
   tool and the SHA-pinned external link-checker action.
 - No rewrite of `business-use-cases.md` marketing copy: it is excluded
   from the build via `srcExclude` and carries a source-level unverified
-  banner (WP1) until an evidence-based rewrite happens (open question 4).
-  `roadmap.md` gets a factual status pass only.
+  banner (WP1). Open question 4 is closed to this disposition - an
+  evidence-based rewrite is not an option inside this refresh, because
+  the delivery graph allocates no PR to remove the exclusion, restore
+  navigation, and smoke the page; republishing it is a separate future
+  effort with its own publishing PR and acceptance. `roadmap.md` gets a
+  factual status pass only.
 - No release management. The 8 breaking `[Unreleased]` entries are a
   maintainer decision; the deterministic no-release CHANGELOG edit is:
   normalize the `**Breaking**` marker formatting, keep `[1.2.0]` with a
@@ -244,7 +251,7 @@ The owner's standing instruction is one rc PR carrying spec plus work;
 the concrete shape below (which adds the forced `main` containment PR and
 package checkpoints) still awaits explicit confirmation - open question 7
 blocks implementation until it is given, and its answer is recorded with
-owner and date. The delivery graph is exactly four PRs: (a) the single rc PR (#1049)
+owner and date. The delivery graph is exactly five PRs: (a) the single rc PR (#1049)
 carrying the spec plus all packages; (b) the `main` containment PR;
 (c) a `main` automation PR - scheduled workflows and Dependabot read
 their configuration from the DEFAULT branch, so the scheduled
@@ -252,15 +259,25 @@ external-link workflow lives on `main` (checking out `rc/202608` while
 that branch is live) and `dependabot.yml` lives on `main` with
 `target-branch: rc/202608` for version updates (security updates always
 target the default branch; the config validation covers both kinds and
-the wording distinguishes them). Pre-merge acceptance is not circular:
-the workflow takes a `workflow_dispatch` input accepting an immutable
-SHA (the rc PR head), so the dispatch validates the WP8 tooling on that
-exact commit BEFORE the rc PR merges; post-merge, a second dispatch
-against the merged tip is recorded. The PR also defines the
-end-of-release handoff: when rc/202608 merges or is deleted, the
-checkout target and Dependabot `target-branch` switch back to `main`
-(an enumerated, owned edit - the automation must not keep pointing at a
-dead branch); (d) the CNAME resolution
+the wording distinguishes them). Pre-merge acceptance is not circular
+and not privileged: the workflow is split into two jobs. A dispatch
+validation job runs with `contents: read` only, no secrets, and no
+mutating steps; it checks out and executes the supplied SHA, which must
+be a full 40-character SHA that the job verifies via the API to be
+either the approved same-repository rc PR's current head or the merged
+rc tip (arbitrary refs, stale SHAs, and non-approved commits are
+rejected, proven by a negative workflow fixture). A separate
+schedule-only issue-management job holds the job-scoped `issues: write`
+and never executes code from a supplied SHA - it checks out only the
+branch tip it is configured for. Pre-merge, the validation job runs on
+the rc PR head; post-merge, a dispatch against the merged tip is
+recorded. (e) A fifth, release-triggered handoff PR to `main`: when
+rc/202608 merges or is deleted, the workflow checkout and Dependabot
+`target-branch` switch back to `main` - the checkout could fall back
+dynamically but Dependabot's target is static, so a `main` edit is
+unavoidable. It has a named owner, a tracked issue filed in WP8b, a
+sequencing row, and a verification item (the automation must not keep
+pointing at a dead branch); (d) the CNAME resolution
 PR to `main`, cut when open question 2 resolves (the containment PR
 NEVER carries it - WP1's earlier allowance is superseded). Every
 `main`-target PR records its own fresh audited_main_tip and runs the
@@ -322,7 +339,11 @@ the owner to confirm this shape.
   that cannot read `CLAUDE.md`, so it carries the list).
 
 Acceptance: `vitepress build` output contains none of the excluded pages;
-the `main` containment PR is merged and its smoke passes; the banner is
+the `main` containment PR is merged and its smoke passes; the CNAME
+disposition (open question 2) is selected and PR (d) is merged with its
+branch-specific live smoke (project-URL re-smoke, or for the custom
+domain: DNS/TLS evidence plus canonical, asset, and hard-coded-URL
+checks) and its own audited_main_tip assertion; the banner is
 present; no internal contacts or access instructions anywhere in the repo;
 every command file links to (not copies) the canonical gates.
 
@@ -597,8 +618,13 @@ contract checklist satisfied; manual-ownership markers present.
 - Every smoke shares one strong oracle - exact expected status, a
   stub-origin sentinel present in the response, and an expected Trusted
   Server rewrite or header proving the app (not a degraded router)
-  served it - plus a negative run per adapter proving that removing the
-  config blob or a required secret makes the smoke FAIL. This matters
+  served it - plus INDEPENDENT negative cases per adapter, each with a
+  diagnostic matcher: (i) missing config blob fails with the expected
+  startup/config diagnostic; (ii) each required secret key, missing or
+  unresolved, fails for its expected reason; and a failure caused by an
+  unrelated launcher, origin, or port error satisfies neither case. One
+  negative run cannot stand in for both halves - both the config
+  handoff and the secret handoff must be proven live. This matters
   concretely: Fastly's `/health` short-circuits before app construction
   and succeeds while startup is broken, and Spin's degraded router
   answers every publisher path with a valid 503, so status-or-response
@@ -849,10 +875,12 @@ matrix locally; acceptance greps over the defined sets with output in the
 PR description; the four adapter first-success smokes (Axum env bridge,
 Fastly local push + secrets, Cloudflare envelope transfer, Spin local
 push + variables) executed as documented with commands and cleanup
-recorded; the `main` containment PR merged with its positive smoke and the
-`main` automation PR merged with a successful `workflow_dispatch` of the
-scheduled job and validated Dependabot config (each `main` PR's
-audited_main_tip assertion having passed); every follow-up filed with a
+recorded; the `main` containment PR merged with its positive smoke, the
+`main` automation PR merged with a successful read-only validation
+dispatch against the rc PR head and validated Dependabot config, and the
+CNAME PR (d) merged with its branch-specific live smoke (each `main`
+PR's audited_main_tip assertion having passed); the release-handoff
+PR (e) has its owner and tracked issue recorded; every follow-up filed with a
 recorded URL or disposition; and the exact-tip baseline
 assertion for `origin/rc/202608` (equal to the recorded
 audited_target_tip, contained in the branch) passing at the final HEAD -
@@ -865,8 +893,8 @@ not a merge-base comparison.
 2. CNAME: delete (recommended) or custom domain (fully specified branch).
 3. `FAQ_POC.md` retirement; gam/kargo tombstones (routes preserved either
    way).
-4. `business-use-cases.md`: excluded-with-banner default vs an
-   evidence-based rewrite in this pass.
+4. `business-use-cases.md`: CLOSED - excluded with a source-level
+   banner; republishing is a separate future effort (see Non-goals).
 5. CHANGELOG release cut (out of scope; deterministic no-release edit
    defined in Non-goals).
 6. Governance ownership (CODEOWNERS/minutes). Terminal disposition: if
