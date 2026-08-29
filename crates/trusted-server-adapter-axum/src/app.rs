@@ -51,6 +51,10 @@ use crate::platform::{AxumPlatformConfigStore, build_runtime_services};
 // ---------------------------------------------------------------------------
 
 /// Application state built once at startup and shared across all requests.
+///
+/// Built once here, unlike on the other three adapters, because `main`
+/// calls [`TrustedServerApp::routes`] before serving, so the router holds
+/// one state for the process's lifetime.
 pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,

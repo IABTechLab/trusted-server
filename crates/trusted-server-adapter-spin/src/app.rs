@@ -52,7 +52,11 @@ use crate::platform::{SpinPlatformConfigStore, build_runtime_services};
 // AppState
 // ---------------------------------------------------------------------------
 
-/// Application state built once at startup and shared across all requests.
+/// Application state shared by everything that serves one request.
+///
+/// Not built once per process, because `edgezero_adapter_spin::run_app`
+/// calls `build_app` inside the per-request entry point, so this is
+/// rebuilt on every request.
 pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,

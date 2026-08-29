@@ -695,7 +695,7 @@ enabled = true
 
 #### When the selector names something that cannot supply a provider
 
-The application refuses to build and the message names the module and the reason, in three cases. Every adapter treats this as a startup error, and because the Fastly adapter builds the application per request, it shows there on every request rather than once.
+The application refuses to build and the message names the module and the reason, in three cases. Every adapter treats this as a startup error. Only the Axum dev server builds the application once, before it starts serving, so only there does the failure show once. Fastly, Cloudflare Workers and Spin all build the application inside the per-request entry point, so on those three the failure shows on every request.
 
 - The module is not registered at all. The message also lists the registered
   modules that do supply a geo provider, so a typo is easy to spot.
