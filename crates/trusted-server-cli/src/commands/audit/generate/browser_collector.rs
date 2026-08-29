@@ -698,27 +698,10 @@ async fn collect_open_page(
         warnings.push(warning.to_string());
     }
 
-    // Best-effort read of the live GPT slot registry. This is the authoritative
-    // source for slot path/div/size, so a failure here downgrades to empty
-    // rather than failing the whole audit.
-    let gpt_slots: Vec<CollectedGptSlot> =
-        match timeout(PAGE_OPERATION_TIMEOUT, page.evaluate(GPT_SLOTS_SCRIPT)).await {
-            Ok(Ok(result)) => match result.into_value() {
-                Ok(slots) => slots,
-                Err(error) => {
-                    warnings.push(format!("failed to decode live GPT slots: {error}"));
-                    Vec::new()
-                }
-            },
-            Ok(Err(error)) => {
-                warnings.push(format!("failed to evaluate live GPT slots: {error}"));
-                Vec::new()
-            }
-            Err(_) => {
-                warnings.push("timed out evaluating live GPT slots".to_string());
-                Vec::new()
-            }
-        };
+    // GPT can finish registering slots after the document and resource stream
+    // are otherwise quiet. Wait for a non-empty registry to stabilize instead
+    // of treating the first empty read as authoritative.
+    let gpt_slots = collect_stable_gpt_slots(page, &mut warnings).await;
 
     // Links come from the hydrated DOM, not the served markup: an app-router
     // page keeps its link graph in the framework payload, so parsing the raw
@@ -976,6 +959,61 @@ const GPT_SLOTS_SCRIPT: &str = r#"() => {
     }
 }"#;
 
+/// Reads GPT until a non-empty registry repeats or the page-operation bound
+/// expires. The latest non-empty snapshot is retained if registration keeps
+/// changing through the bound; an empty result remains best-effort so the
+/// caller can report the more useful GPT state diagnostic.
+async fn collect_stable_gpt_slots(
+    page: &chromiumoxide::Page,
+    warnings: &mut Vec<String>,
+) -> Vec<CollectedGptSlot> {
+    let start = std::time::Instant::now();
+    let mut previous_nonempty = None;
+    let mut latest_nonempty = Vec::new();
+
+    loop {
+        let remaining = PAGE_OPERATION_TIMEOUT.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return latest_nonempty;
+        }
+
+        let slots: Vec<CollectedGptSlot> =
+            match timeout(remaining, page.evaluate(GPT_SLOTS_SCRIPT)).await {
+                Ok(Ok(result)) => match result.into_value() {
+                    Ok(slots) => slots,
+                    Err(error) => {
+                        warnings.push(format!("failed to decode live GPT slots: {error}"));
+                        return latest_nonempty;
+                    }
+                },
+                Ok(Err(error)) => {
+                    warnings.push(format!("failed to evaluate live GPT slots: {error}"));
+                    return latest_nonempty;
+                }
+                Err(_) => {
+                    warnings.push("timed out evaluating live GPT slots".to_string());
+                    return latest_nonempty;
+                }
+            };
+
+        if slots.is_empty() {
+            previous_nonempty = None;
+        } else {
+            if previous_nonempty.as_ref() == Some(&slots) {
+                return slots;
+            }
+            latest_nonempty.clone_from(&slots);
+            previous_nonempty = Some(slots);
+        }
+
+        let remaining = PAGE_OPERATION_TIMEOUT.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return latest_nonempty;
+        }
+        sleep(SETTLE_POLL_INTERVAL.min(remaining)).await;
+    }
+}
+
 async fn wait_for_page_settle(
     page: &chromiumoxide::Page,
     quiet_target: Duration,
@@ -1124,7 +1162,55 @@ mod tests {
   </body>
 </html>"#;
 
-    fn lazy_gpt_fixture_url() -> Url {
+    const DELAYED_GPT_FIXTURE: &str = r#"<!doctype html>
+<html>
+  <body>
+    <div id="ad-z-delayed-0"></div>
+    <div id="ad-a-delayed-0"></div>
+    <script>
+      var zSlot = {
+        getAdUnitPath: function () { return '/123/z-delayed' },
+        getSlotElementId: function () { return 'ad-z-delayed-0' },
+        getSizes: function () {
+          return [{
+            getWidth: function () { return 300 },
+            getHeight: function () { return 250 },
+          }]
+        },
+      }
+      var aSlot = {
+        getAdUnitPath: function () { return '/123/a-delayed' },
+        getSlotElementId: function () { return 'ad-a-delayed-0' },
+        getSizes: function () {
+          return [{
+            getWidth: function () { return 728 },
+            getHeight: function () { return 90 },
+          }]
+        },
+      }
+      var slots = []
+      var registrationStage = 0
+      window.googletag = {
+        pubads: function () {
+          return {
+            getSlots: function () {
+              if (registrationStage === 0) {
+                registrationStage = 1
+                Promise.resolve().then(function () { slots = [zSlot] })
+              } else if (registrationStage === 1 && slots.length === 1) {
+                registrationStage = 2
+                Promise.resolve().then(function () { slots = [zSlot, aSlot] })
+              }
+              return slots
+            },
+          }
+        },
+      }
+    </script>
+  </body>
+</html>"#;
+
+    fn gpt_fixture_url(html: &'static str) -> Url {
         let listener = TcpListener::bind("127.0.0.1:0").expect("should bind fixture server");
         let address = listener.local_addr().expect("should read fixture address");
         std::thread::spawn(move || {
@@ -1146,8 +1232,8 @@ mod tests {
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                LAZY_GPT_FIXTURE.len(),
-                LAZY_GPT_FIXTURE,
+                html.len(),
+                html,
             )
             .expect("should write fixture response");
         });
@@ -1326,11 +1412,11 @@ mod tests {
         }
 
         let without_scroll = BrowserAuditCollector::default()
-            .collect_page(&lazy_gpt_fixture_url(), &[])
+            .collect_page(&gpt_fixture_url(LAZY_GPT_FIXTURE), &[])
             .expect("should collect without scrolling");
         let with_scroll = BrowserAuditCollector::default()
             .with_scroll(true)
-            .collect_page(&lazy_gpt_fixture_url(), &[])
+            .collect_page(&gpt_fixture_url(LAZY_GPT_FIXTURE), &[])
             .expect("should collect with scrolling");
 
         assert!(
@@ -1343,6 +1429,35 @@ mod tests {
                 .iter()
                 .any(|slot| { slot.gam_unit_path == "/123/lazy" && slot.div_id == "ad-lazy-0" }),
             "scrolling should trigger and collect the lazy GPT slot"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Chrome/Chromium; run through scripts/test-cli.sh"]
+    fn waits_for_delayed_gpt_registry_to_stabilize_in_definition_order() {
+        if !browser_fixture_available() {
+            return;
+        }
+
+        let collected = BrowserAuditCollector::default()
+            .collect_page(&gpt_fixture_url(DELAYED_GPT_FIXTURE), &[])
+            .expect("should collect delayed GPT registry");
+
+        assert_eq!(
+            collected.gpt_slots,
+            vec![
+                CollectedGptSlot {
+                    gam_unit_path: "/123/z-delayed".to_string(),
+                    div_id: "ad-z-delayed-0".to_string(),
+                    sizes: vec![(300, 250)],
+                },
+                CollectedGptSlot {
+                    gam_unit_path: "/123/a-delayed".to_string(),
+                    div_id: "ad-a-delayed-0".to_string(),
+                    sizes: vec![(728, 90)],
+                },
+            ],
+            "collector should wait for stable registration without reordering slots"
         );
     }
 
