@@ -37,6 +37,14 @@ const APS_INTEGRATION_ID: &str = "aps";
 /// Renderer type tag carried on the wire by an APS bid, read by the browser to
 /// select the APS renderer.
 pub const APS_RENDERER_TYPE: &str = "aps";
+
+/// Wire key carrying [`ApsRendererV1::bid_id`], for callers that read the bid
+/// identifier out of a renderer payload without deserializing the rest.
+///
+/// `ApsRendererV1` renames its fields to camelCase, so this is `bidId` rather
+/// than the Rust field name. `renderer_bid_id_key_matches_the_serialized_form`
+/// pins the two together.
+pub const APS_RENDERER_BID_ID_KEY: &str = "bidId";
 const APS_RENDERER_ROUTE: &str = "/integrations/aps/renderer";
 const DEFAULT_CURRENCY: &str = "USD";
 const APS_SDK_SOURCE: &str = "prebid";
@@ -2676,5 +2684,40 @@ mod tests {
         assert!(APS_RENDERER_CSP.contains("default-src 'none'"));
         assert!(APS_RENDERER_CSP.contains("sandbox allow-forms"));
         assert!(!APS_RENDERER_CSP.contains("allow-same-origin"));
+    }
+
+    #[test]
+    fn renderer_bid_id_key_matches_the_serialized_form() {
+        let descriptor = ApsRendererV1 {
+            version: 1,
+            account_id: "example-account".to_string(),
+            bid_id: "fictional-bid-id".to_string(),
+            creative_id: None,
+            tag_type: ApsTagType::Iframe,
+            creative_url: "https://creative.example/render".to_string(),
+            aax_response: "fictional-base64".to_string(),
+            width: 300,
+            height: 250,
+        };
+        let renderer = BidRenderer::from_typed(APS_RENDERER_TYPE, &descriptor)
+            .expect("should build APS renderer descriptor");
+
+        assert_eq!(
+            renderer
+                .payload_field(APS_RENDERER_TYPE, APS_RENDERER_BID_ID_KEY)
+                .and_then(serde_json::Value::as_str),
+            Some(descriptor.bid_id.as_str()),
+            "should name the wire key `ApsRendererV1` serializes `bid_id` to"
+        );
+        assert_eq!(
+            renderer
+                .payload_field(APS_RENDERER_TYPE, APS_RENDERER_BID_ID_KEY)
+                .and_then(serde_json::Value::as_str),
+            renderer
+                .payload_as::<ApsRendererV1>(APS_RENDERER_TYPE)
+                .as_ref()
+                .map(|full| full.bid_id.as_str()),
+            "should read the same value as deserializing the whole descriptor"
+        );
     }
 }

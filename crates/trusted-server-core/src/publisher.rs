@@ -65,7 +65,7 @@ use crate::error::TrustedServerError;
 use crate::html_processor::BodyCloseInjection;
 use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
 use crate::integrations::IntegrationRegistry;
-use crate::integrations::aps::{APS_RENDERER_TYPE, ApsRendererV1};
+use crate::integrations::aps::{APS_RENDERER_BID_ID_KEY, APS_RENDERER_TYPE};
 use crate::permissions::PermissionState;
 use crate::platform::{
     GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, VarySpec,
@@ -5268,15 +5268,20 @@ pub(crate) fn build_bid_map_with_auction_id(
                 // OpenRTB bid ID. The latter is the last resort: it is unique per
                 // bid instance rather than a creative, but GAM echoes it verbatim
                 // so the render bridge can find the exact winning bid.
+                //
+                // Borrow the one field wanted rather than deserializing the
+                // whole descriptor, which would clone a payload carrying a
+                // base64 creative envelope of up to 256 KB, once per bid per
+                // page view.
                 let renderer_bid_id = bid
                     .renderer
                     .as_ref()
                     .and_then(|renderer| {
-                        renderer.payload_as::<ApsRendererV1>(APS_RENDERER_TYPE)
+                        renderer.payload_field(APS_RENDERER_TYPE, APS_RENDERER_BID_ID_KEY)
                     })
-                    .map(|renderer| renderer.bid_id);
+                    .and_then(serde_json::Value::as_str);
                 let hb_adid = non_empty(bid.cache_id.as_deref())
-                    .or_else(|| non_empty(renderer_bid_id.as_deref()))
+                    .or_else(|| non_empty(renderer_bid_id))
                     .or_else(|| non_empty(bid.ad_id.as_deref()))
                     .or_else(|| non_empty(bid.bid_id.as_deref()));
                 if let Some(id) = hb_adid {
@@ -19570,6 +19575,71 @@ mod tests {
             let script = build_bids_script(&map);
             assert!(!script.contains("</script></script>"));
             assert!(script.contains("\\u003C/script\\u003E"));
+        }
+
+        #[test]
+        fn bid_map_prefers_the_renderer_bid_id_over_ad_id_and_the_openrtb_bid_id() {
+            // Every hb_adid source carries a different value, so the assertion
+            // below passes only when the renderer field is the one read. The
+            // envelope is oversized on purpose: reading this field must not
+            // copy it.
+            let mut settings = test_settings();
+            settings.auction.sanitize_creatives = true;
+            let mut bid = make_bid("atf_sidebar_ad", 1.50, "aps", "ad-id-value", "", "");
+            bid.bid_id = Some("openrtb-bid-id".to_string());
+            bid.cache_id = None;
+            bid.creative = Some("<script>reject()</script>".to_string());
+            bid.renderer = Some(
+                BidRenderer::from_typed(
+                    APS_RENDERER_TYPE,
+                    &ApsRendererV1 {
+                        version: 1,
+                        account_id: "example-account".to_string(),
+                        bid_id: "renderer-bid-id".to_string(),
+                        creative_id: None,
+                        tag_type: ApsTagType::Iframe,
+                        creative_url: "https://creative.example/render".to_string(),
+                        aax_response: "A".repeat(200 * 1024),
+                        width: 300,
+                        height: 250,
+                    },
+                )
+                .expect("should build APS renderer descriptor"),
+            );
+            let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
+            let obj = map["atf_sidebar_ad"]
+                .as_object()
+                .expect("should include APS bid");
+
+            assert_eq!(
+                obj["hb_adid"], "renderer-bid-id",
+                "should read hb_adid from the renderer payload rather than ad_id or bid_id"
+            );
+        }
+
+        #[test]
+        fn bid_map_ignores_a_renderer_bid_id_carried_under_another_type_tag() {
+            let mut settings = test_settings();
+            settings.auction.sanitize_creatives = true;
+            let mut bid = make_bid("atf_sidebar_ad", 1.50, "example", "ad-id-value", "", "");
+            bid.cache_id = None;
+            bid.renderer = Some(
+                BidRenderer::new("example", serde_json::json!({ "bidId": "renderer-bid-id" }))
+                    .expect("should build renderer descriptor"),
+            );
+            let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
+            let obj = map["atf_sidebar_ad"]
+                .as_object()
+                .expect("should include the bid");
+
+            assert_eq!(
+                obj["hb_adid"], "ad-id-value",
+                "should ignore a bidId carried under a tag that is not the APS renderer"
+            );
         }
 
         #[test]

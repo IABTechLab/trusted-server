@@ -283,12 +283,52 @@ impl BidRenderer {
     ///
     /// Returns `None` when the descriptor carries a different tag, and when the
     /// payload does not match `T`.
+    ///
+    /// Clones the whole payload map and deserializes all of it, so use
+    /// [`payload_field`](Self::payload_field) when the caller wants one field.
+    /// An APS payload carries a base64 creative envelope of up to 256 KB.
     #[must_use]
     pub fn payload_as<T: DeserializeOwned>(&self, renderer_type: &str) -> Option<T> {
         if self.renderer_type != renderer_type {
             return None;
         }
         serde_json::from_value(serde_json::Value::Object(self.payload.clone())).ok()
+    }
+
+    /// Borrow one field of the payload, copying nothing.
+    ///
+    /// Returns `None` when the descriptor carries a different tag, and when
+    /// the payload has no such key. `key` is the wire key, so a payload type
+    /// that renames its fields for serialization must be asked for the
+    /// renamed form.
+    ///
+    /// Unlike [`payload_as`](Self::payload_as) this reads the one field
+    /// asked for and does not check that the rest of the payload matches the
+    /// provider's descriptor type.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use serde_json::json;
+    /// use trusted_server_core::auction::types::BidRenderer;
+    ///
+    /// let renderer = BidRenderer::new("example", json!({ "bidId": "fictional-bid-id" }))
+    ///     .expect("should accept an object payload");
+    ///
+    /// assert_eq!(
+    ///     renderer
+    ///         .payload_field("example", "bidId")
+    ///         .and_then(serde_json::Value::as_str),
+    ///     Some("fictional-bid-id"),
+    /// );
+    /// assert!(renderer.payload_field("other", "bidId").is_none());
+    /// ```
+    #[must_use]
+    pub fn payload_field(&self, renderer_type: &str, key: &str) -> Option<&serde_json::Value> {
+        if self.renderer_type != renderer_type {
+            return None;
+        }
+        self.payload.get(key)
     }
 }
 
@@ -804,6 +844,58 @@ mod tests {
         assert!(
             renderer.payload_as::<ApsRendererV1>("example").is_none(),
             "should refuse a payload requested under a different tag"
+        );
+    }
+
+    #[test]
+    fn renderer_payload_field_borrows_the_same_value_the_whole_descriptor_carries() {
+        let descriptor = ApsRendererV1 {
+            version: 1,
+            account_id: "example-account-id".to_string(),
+            bid_id: "fictional-bid-id".to_string(),
+            creative_id: Some("fictional-creative-id".to_string()),
+            tag_type: ApsTagType::Iframe,
+            creative_url: "https://creative.example/render".to_string(),
+            aax_response: "base64-data".to_string(),
+            width: 300,
+            height: 250,
+        };
+        let renderer = BidRenderer::from_typed(APS_RENDERER_TYPE, &descriptor)
+            .expect("should build APS renderer descriptor");
+
+        assert_eq!(
+            renderer
+                .payload_field(APS_RENDERER_TYPE, "bidId")
+                .and_then(serde_json::Value::as_str),
+            Some(descriptor.bid_id.as_str()),
+            "should read the same bid id the whole descriptor carries"
+        );
+        assert_eq!(
+            renderer
+                .payload_field(APS_RENDERER_TYPE, "bidId")
+                .and_then(serde_json::Value::as_str),
+            renderer
+                .payload_as::<ApsRendererV1>(APS_RENDERER_TYPE)
+                .as_ref()
+                .map(|full| full.bid_id.as_str()),
+            "should agree with the field read through the whole descriptor"
+        );
+        assert!(
+            renderer
+                .payload_field(APS_RENDERER_TYPE, "notAKey")
+                .is_none(),
+            "should return nothing for a key the payload does not carry"
+        );
+    }
+
+    #[test]
+    fn renderer_payload_field_is_hidden_from_a_different_type_tag() {
+        let renderer = BidRenderer::new(APS_RENDERER_TYPE, json!({ "bidId": "fictional-bid-id" }))
+            .expect("should build renderer descriptor");
+
+        assert!(
+            renderer.payload_field("example", "bidId").is_none(),
+            "should refuse a field requested under a different tag"
         );
     }
 
