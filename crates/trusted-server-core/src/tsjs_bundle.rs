@@ -100,7 +100,14 @@ pub fn compile_time_parts(ids: &[&'static str]) -> Vec<JsModulePart> {
 #[must_use]
 pub fn compose(parts: &[JsModulePart]) -> String {
     let ordered = ordered(parts);
-    let mut body = String::new();
+    // Every piece the visit yields has a known length before the walk, so
+    // reserve the exact byte count once rather than letting the pushes grow
+    // the buffer. A bundle of a dozen parts is several hundred kilobytes, and
+    // growing to that size copies roughly twice the bundle on every request
+    // that serves it.
+    let mut size = 0;
+    visit_parts(&ordered, |part| size += part.len());
+    let mut body = String::with_capacity(size);
     visit_parts(&ordered, |part| body.push_str(part));
     body
 }
@@ -330,6 +337,18 @@ mod tests {
             compose(&parts),
             "C;\nL1;\nP",
             "should keep the first occurrence of each id and drop later ones"
+        );
+    }
+
+    #[test]
+    fn compose_reserves_the_exact_bundle_size_before_writing_it() {
+        let parts = compile_time_parts(&trusted_server_js::all_module_ids());
+        let body = compose(&parts);
+
+        assert_eq!(
+            body.capacity(),
+            body.len(),
+            "should allocate the bundle once at its exact size"
         );
     }
 
