@@ -747,10 +747,15 @@ pub(crate) fn run_update_slots(
         .observed_div_ids()
         .map(str::to_string)
         .collect::<Vec<_>>();
+    let observed_literals = table
+        .observed_literals()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     let (merged, merge_diagnostics) = slot_toml::merge_render_slots_with_observed_diagnostics(
         request.existing_creative,
         slots,
         &observed_div_ids,
+        &observed_literals,
         request.replace,
     );
     notes.extend(merge_diagnostics.notes);

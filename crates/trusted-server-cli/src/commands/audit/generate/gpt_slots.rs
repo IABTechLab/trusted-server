@@ -284,17 +284,73 @@ fn volatile_prefix_before_placement(div_id: &str) -> Option<String> {
 /// suffix.
 ///
 /// Both halves are required. Eight-digit values need at least eight suffix
-/// characters and a mixed-case random-looking suffix; this avoids treating
-/// calendar labels followed by stable words as generated ids. A bare digit run
-/// is how publishers write stable placement indices, and a token with a
-/// non-alphanumeric character is some other structure than a generated id.
+/// characters with a random-looking shape; this avoids treating calendar labels
+/// followed by stable words as generated ids while still catching single-case
+/// hashes and mixed alphanumeric tokens. A bare digit run is how publishers
+/// write stable placement indices, and a token with a non-alphanumeric character
+/// is some other structure than a generated id.
 fn is_per_render_token(segment: &str) -> bool {
     let leading_digits = segment.bytes().take_while(u8::is_ascii_digit).count();
     let suffix_length = segment.len().saturating_sub(leading_digits);
     let suffix = &segment[leading_digits..];
     ((leading_digits >= 10 && suffix_length >= 1)
-        || (leading_digits >= 8 && suffix_length >= 8 && has_random_case_alternation(suffix)))
+        || (leading_digits >= 8 && suffix_length >= 8 && looks_random_suffix(suffix)))
         && segment.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// Whether a long suffix has structural signals of generated randomness.
+fn looks_random_suffix(value: &str) -> bool {
+    let digit_count = value.bytes().filter(u8::is_ascii_digit).count();
+    let letter_count = value.bytes().filter(u8::is_ascii_alphabetic).count();
+    if digit_count >= 4 && letter_count >= 4 {
+        return true;
+    }
+
+    let distinct = distinct_ascii_bytes(value);
+    if value.bytes().all(|byte| byte.is_ascii_hexdigit()) && distinct >= 4 {
+        return true;
+    }
+    if value.bytes().all(|byte| byte.is_ascii_uppercase()) && distinct >= 4 {
+        return true;
+    }
+
+    has_random_case_alternation(value) && !has_wordlike_camel_segments(value)
+}
+
+/// Number of distinct ASCII bytes in a candidate token.
+fn distinct_ascii_bytes(value: &str) -> usize {
+    let mut seen = [false; 256];
+    for byte in value.bytes() {
+        seen[usize::from(byte)] = true;
+    }
+    seen.into_iter().filter(|present| *present).count()
+}
+
+/// Whether every CamelCase component contains a vowel-like letter.
+///
+/// This distinguishes short word sequences such as `TopUsNewsAd` and
+/// `MyAdUnitXy` from dense random alternation such as `AbCdEfGh`.
+fn has_wordlike_camel_segments(value: &str) -> bool {
+    let mut segment_has_vowel = false;
+    for (index, byte) in value.bytes().enumerate() {
+        if index > 0 && byte.is_ascii_uppercase() {
+            if !segment_has_vowel {
+                return false;
+            }
+            segment_has_vowel = is_ascii_vowel(byte);
+        } else {
+            segment_has_vowel |= is_ascii_vowel(byte);
+        }
+    }
+    segment_has_vowel
+}
+
+/// Whether an ASCII letter is a vowel, treating `y` as vowel-like for labels.
+const fn is_ascii_vowel(byte: u8) -> bool {
+    matches!(
+        byte.to_ascii_lowercase(),
+        b'a' | b'e' | b'i' | b'o' | b'u' | b'y'
+    )
 }
 
 /// Whether letter case alternates densely enough to resemble a random token.
@@ -1344,6 +1400,10 @@ mod tests {
             "vendor-tag_1724112345678AbCdEfGh_slot_inarticle_1",
             "vendor-tag_12345678AbCdEfGh_slot_inarticle_1",
             "vendor-tag_20260820AbCdEfGh_slot_inarticle_1",
+            "vendor-tag_20260820deadbeef_slot_inarticle_1",
+            "vendor-tag_20260820ABCDEFGH_slot_inarticle_1",
+            "vendor-tag_20260820ABCD1234_slot_inarticle_1",
+            "vendor-tag_20260820A1B2C3D4_slot_inarticle_1",
             "vendor-tag_1724112345678AbCdEfGh_slot_overlay_1-container",
             "vendor-tag_1724112345678AbCdEfGh_slot_sidebar_1",
             "vendor-tag_1724112345678AbCdEfGh_slot_overlay_stable",
@@ -1374,6 +1434,9 @@ mod tests {
             "promo-20260820Football-sidebar",
             "promo-20260820football-sidebar",
             "promo-20260820TopStories-sidebar",
+            "promo-20260820TopUsNewsAd-sidebar",
+            "promo-20260820MyAdUnitXy-sidebar",
+            "promo-20260820Top10Stories-sidebar",
             "ad-19700101Thumbnail-rail",
             "ad-00000001AAAAAAAA-rail",
             // The token is trailing, so the prefix before it still identifies

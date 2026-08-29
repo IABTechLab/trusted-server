@@ -281,7 +281,9 @@ a hand-written `gam_unit_path` template is preserved. A configured `div_id` is
 matched exactly when the crawl observed that exact id; it is treated as a
 runtime prefix only when it was never observed as a literal element, so a
 configured `ad-sidebar-1` no longer absorbs a discovered `ad-sidebar-10` — the
-sibling is appended as its own slot. A prefix that does claim several
+sibling is appended as its own slot, and when the parent carried a floor price,
+targeting, or provider settings, a stderr note names the split because the new
+slot does not inherit them. A prefix that does claim several
 discovered divs is named in a stderr note, because the runtime resolves a
 prefix to at most one element. `--replace` discards existing slots instead,
 which also discards any template you wrote by hand.

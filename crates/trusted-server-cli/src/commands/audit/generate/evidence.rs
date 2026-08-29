@@ -206,6 +206,19 @@ impl EvidenceTable {
             .chain(self.refused_div_ids.iter().map(String::as_str))
     }
 
+    /// Normalized div IDs observed as concrete live elements.
+    ///
+    /// Unlike [`EvidenceTable::observed_div_ids`], this excludes identifiers
+    /// that exist only as refused ambiguity or volatility evidence. Prefix
+    /// routing must not treat those inferred stems as literal DOM elements.
+    pub(super) fn observed_literals(&self) -> impl Iterator<Item = &str> {
+        self.order
+            .iter()
+            .filter(|div_id| !self.ambiguous_stems.contains(*div_id))
+            .filter(|div_id| !self.refused_div_ids.contains(*div_id))
+            .map(String::as_str)
+    }
+
     /// Number of usable distinct slots observed.
     pub(super) fn slot_count(&self) -> usize {
         self.slots().count()
@@ -425,6 +438,50 @@ mod tests {
     }
 
     #[test]
+    fn refused_only_div_ids_are_observed_but_not_literals() {
+        let mut discovered = page(&[("/123/site/home", "ad-x-stable", &[(300, 250)])], false);
+        discovered.refused_div_ids.insert("ad-x".to_string());
+        let mut table = EvidenceTable::default();
+        table.fold_page("/", &discovered);
+
+        assert_eq!(
+            table.observed_div_ids().collect::<Vec<_>>(),
+            ["ad-x-stable", "ad-x"],
+            "the staleness view should retain refused evidence"
+        );
+        assert_eq!(
+            table.observed_literals().collect::<Vec<_>>(),
+            ["ad-x-stable"],
+            "prefix routing should use only concrete live-element evidence"
+        );
+    }
+
+    #[test]
+    fn later_refusal_removes_a_previously_accepted_literal() {
+        let mut table = EvidenceTable::default();
+        table.fold_page(
+            "/",
+            &page(&[("/123/site/home", "ad-x", &[(300, 250)])], false),
+        );
+        let mut refused = DiscoveredSlots {
+            had_slot_evidence: true,
+            ..DiscoveredSlots::default()
+        };
+        refused.refused_div_ids.insert("ad-x".to_string());
+        table.fold_page("/news", &refused);
+
+        assert!(
+            table.observed_literals().next().is_none(),
+            "a site-wide refusal should remove an earlier literal-routing candidate"
+        );
+        assert_eq!(
+            table.observed_div_ids().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["ad-x"]),
+            "the refused stem should remain available to staleness accounting"
+        );
+    }
+
+    #[test]
     fn one_placement_under_per_render_div_ids_is_detected() {
         // Each page yields a new key for the same placement: same unit, same
         // formats, never co-occurring. The tokens here deliberately do *not*
@@ -505,6 +562,10 @@ mod tests {
         assert!(
             !table.is_empty(),
             "the crawl did observe an ad stack, so this is not an empty result"
+        );
+        assert!(
+            table.observed_literals().next().is_none(),
+            "a globally ambiguous stem must not remain a literal-routing candidate"
         );
     }
 

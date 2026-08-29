@@ -17,7 +17,7 @@ use futures::StreamExt as _;
 
 use crate::ad_templates::compare::BrowserAdEvidence;
 use crate::ad_templates::output::Warning;
-use crate::commands::audit::browser_scroll;
+use crate::commands::audit::browser_scroll::{self, CDP_OPERATION_TIMEOUT};
 use crate::commands::audit::collector::{
     AuditCollector, BrowserCollectRequest, BrowserOpts, BrowserProfile, CollectedPage,
     PAGE_SETTLE_MAX_MS, PAGE_SETTLE_QUIET_MS,
@@ -38,8 +38,6 @@ pub(crate) const CHROME_NAMES: &[&str] = &[
 const SETTLE_POLL_MS: u64 = 250;
 /// Hard cap on page navigation so a stalled load cannot hang the audit.
 const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(30);
-/// Bound for each CDP operation after navigation.
-const CDP_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Hard cap per decoded evidence list, so a hostile page cannot inflate CLI
 /// memory.
 ///

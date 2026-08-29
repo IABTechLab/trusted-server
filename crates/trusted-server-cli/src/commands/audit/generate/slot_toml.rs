@@ -209,6 +209,7 @@ pub(super) fn merge_render_slots_with_diagnostics(
         existing,
         discovered_slots,
         &observed_div_ids,
+        &observed_div_ids,
         replace,
     )
 }
@@ -217,12 +218,16 @@ pub(super) fn merge_render_slots_with_diagnostics(
 ///
 /// `observed_div_ids` must be the full normalized evidence set, including divs
 /// refused by template inference, skipped as fragments, or refused as
-/// ambiguous. Passing only the rendered subset can make a configured literal
-/// act as a prefix again or falsely report a live configured slot as unobserved.
+/// ambiguous. `observed_literal_div_ids` contains only concrete live elements;
+/// it controls whether a configured div ID remains eligible as a runtime prefix.
+/// Passing only the rendered subset for observation can falsely report a live
+/// configured slot as unobserved, while treating refused stems as literals can
+/// incorrectly disqualify a configured prefix from merge routing.
 pub(super) fn merge_render_slots_with_observed_diagnostics(
     existing: Option<&CreativeOpportunitiesConfig>,
     discovered_slots: Vec<RenderSlot>,
     observed_div_ids: &[String],
+    observed_literal_div_ids: &[String],
     replace: bool,
 ) -> (Vec<RenderSlot>, MergeDiagnostics) {
     let existing_slots = existing.map(|config| config.slot.as_slice()).unwrap_or(&[]);
@@ -230,7 +235,7 @@ pub(super) fn merge_render_slots_with_observed_diagnostics(
         return (discovered_slots, MergeDiagnostics::default());
     }
 
-    let observed_literals = observed_div_ids
+    let observed_literals = observed_literal_div_ids
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
@@ -286,25 +291,22 @@ pub(super) fn merge_render_slots_with_observed_diagnostics(
                 }
             }
         } else {
-            if let Some(discovered_div) = slot.div_id.as_deref()
-                && let Some(parent) = merged[..existing_count]
-                    .iter()
-                    .filter(|configured| {
-                        configured.div_id.as_deref().is_some_and(|prefix| {
-                            !prefix.is_empty()
-                                && observed_literals.contains(prefix)
-                                && discovered_div != prefix
-                                && discovered_div.starts_with(prefix)
-                        }) && configured.has_tuned_fields()
-                    })
-                    .max_by_key(|configured| configured.div_id.as_deref().map_or(0, str::len))
-            {
-                split_warnings.insert(format!(
-                    "discovered div `{discovered_div}` was split from configured literal prefix \
-                     `{}`; the new slot does not inherit that configured slot's floor price, \
-                     targeting, or provider settings",
-                    parent.div_id.as_deref().unwrap_or_default(),
-                ));
+            if let Some(discovered_div) = slot.div_id.as_deref() {
+                for parent in merged[..existing_count].iter().filter(|configured| {
+                    configured.div_id.as_deref().is_some_and(|prefix| {
+                        !prefix.is_empty()
+                            && observed_literals.contains(prefix)
+                            && discovered_div != prefix
+                            && discovered_div.starts_with(prefix)
+                    }) && configured.has_tuned_fields()
+                }) {
+                    split_warnings.insert(format!(
+                        "discovered div `{discovered_div}` was split from configured div_id prefix \
+                         `{}`; the new slot does not inherit that configured slot's floor price, \
+                         targeting, or provider settings",
+                        parent.div_id.as_deref().unwrap_or_default(),
+                    ));
+                }
             }
             slot.id = unique_slot_id(&slot.id, &merged);
             merged.push(slot);
@@ -415,16 +417,16 @@ fn matching_div_id_index(
 /// [`matching_slot_index`], but observation is deliberately multi-match: an
 /// exact configured slot and every eligible broad prefix are all live when the
 /// element exists.
-fn matching_observed_div_indexes(
-    existing: &[RenderSlot],
-    discovered_div: &str,
-    observed_literals: &BTreeSet<&str>,
-) -> Vec<usize> {
+fn matching_observed_div_indexes<'a>(
+    existing: &'a [RenderSlot],
+    discovered_div: &'a str,
+    observed_literals: &'a BTreeSet<&'a str>,
+) -> impl Iterator<Item = usize> + 'a {
     let discovered_key = discovered_div.trim_end_matches('-');
     existing
         .iter()
         .enumerate()
-        .filter_map(|(index, slot)| {
+        .filter_map(move |(index, slot)| {
             if slot.key() == discovered_key {
                 return Some(index);
             }
@@ -432,7 +434,6 @@ fn matching_observed_div_indexes(
             (!observed_literals.contains(prefix) && discovered_div.starts_with(prefix))
                 .then_some(index)
         })
-        .collect()
 }
 
 /// Header comment emitted above the structurally replaced managed slot array.
@@ -1753,7 +1754,7 @@ slot_id = "sidebar"
             diagnostics.notes
         );
         assert!(
-            diagnostics.notes[0].contains("configured literal prefix `ad-sidebar-1`"),
+            diagnostics.notes[0].contains("configured div_id prefix `ad-sidebar-1`"),
             "should name the disqualified parent prefix, got {:?}",
             diagnostics.notes
         );
@@ -1761,6 +1762,94 @@ slot_id = "sidebar"
             diagnostics.notes[0].contains("does not inherit"),
             "should explain the tuned-field consequence, got {:?}",
             diagnostics.notes
+        );
+    }
+
+    #[test]
+    fn refused_stem_observes_prefix_without_disqualifying_prefix_routing() {
+        let existing = existing_config(
+            "gam_network_id = \"222\"\n\n\
+             [[slot]]\nid = \"ad-x\"\ndiv_id = \"ad-x\"\n\
+             gam_unit_path = \"/222/ad-x\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 300, height = 250 }]\nfloor_price = 1.5\n",
+        );
+        let discovered = vec![RenderSlot::from_evidence(
+            "ad-x-stable",
+            "ad-x-stable",
+            Some("/222/ad-x".to_string()),
+            [(300, 250)],
+            vec!["/news/*".to_string()],
+            false,
+        )];
+
+        let (merged, diagnostics) = merge_render_slots_with_observed_diagnostics(
+            Some(&existing),
+            discovered,
+            &["ad-x".to_string(), "ad-x-stable".to_string()],
+            &["ad-x-stable".to_string()],
+            false,
+        );
+
+        assert_eq!(
+            merged.len(),
+            1,
+            "the configured prefix should absorb its sibling"
+        );
+        assert_eq!(merged[0].page_patterns, ["/", "/news/*"]);
+        assert!(
+            diagnostics.notes.is_empty(),
+            "a refused stem is not a literal split boundary"
+        );
+        assert!(
+            diagnostics.unobserved_existing_slot_ids.is_empty(),
+            "the refused stem should still prove the configured prefix was observed"
+        );
+    }
+
+    #[test]
+    fn split_sibling_warns_for_every_tuned_parent_prefix() {
+        let existing = existing_config(
+            "gam_network_id = \"222\"\n\n\
+             [[slot]]\nid = \"broad\"\ndiv_id = \"ad\"\n\
+             gam_unit_path = \"/222/broad\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 300, height = 250 }]\nfloor_price = 1.0\n\n\
+             [[slot]]\nid = \"side\"\ndiv_id = \"ad-side\"\n\
+             gam_unit_path = \"/222/side\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 300, height = 250 }]\nfloor_price = 2.0\n",
+        );
+        let discovered = ["ad", "ad-side", "ad-sidebar"]
+            .into_iter()
+            .map(|div_id| {
+                RenderSlot::from_evidence(
+                    div_id,
+                    div_id,
+                    Some("/222/new".to_string()),
+                    [(300, 250)],
+                    vec!["/news/*".to_string()],
+                    false,
+                )
+            })
+            .collect();
+
+        let (_, diagnostics) =
+            merge_render_slots_with_diagnostics(Some(&existing), discovered, false);
+
+        assert_eq!(
+            diagnostics.notes.len(),
+            2,
+            "both tuned ancestors should be named"
+        );
+        assert!(
+            diagnostics
+                .notes
+                .iter()
+                .any(|note| note.contains("prefix `ad`"))
+        );
+        assert!(
+            diagnostics
+                .notes
+                .iter()
+                .any(|note| note.contains("prefix `ad-side`"))
         );
     }
 
@@ -2115,6 +2204,7 @@ slot_id = "sidebar"
         let (_, diagnostics) = merge_render_slots_with_observed_diagnostics(
             Some(&existing),
             discovered,
+            &["ad-header".to_string()],
             &["ad-header".to_string()],
             false,
         );

@@ -5,7 +5,8 @@ use std::time::Duration;
 use chromiumoxide::Page;
 
 const SCROLL_STEP_DELAY: Duration = Duration::from_millis(250);
-const SCROLL_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound for each CDP operation after navigation.
+pub(crate) const CDP_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A best-effort browser scroll operation that could not be completed.
 #[derive(Debug, derive_more::Display)]
@@ -54,7 +55,7 @@ pub(crate) async fn evaluate(
     page: &Page,
     expression: impl Into<String>,
 ) -> Result<(), ScrollFailure> {
-    tokio::time::timeout(SCROLL_OPERATION_TIMEOUT, page.evaluate(expression.into()))
+    tokio::time::timeout(CDP_OPERATION_TIMEOUT, page.evaluate(expression.into()))
         .await
         .map_err(|_| ScrollFailure::Timeout)?
         .map(|_| ())
