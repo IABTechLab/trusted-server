@@ -990,4 +990,128 @@ mod tests {
             "the provider's Vary must reach the response, got {vary:?}"
         );
     }
+
+    /// A provider standing in for the one a deployment switched *to*, with a
+    /// different registered code from the provider that minted the live row.
+    #[derive(Debug)]
+    struct SwitchedProvider;
+
+    impl crate::ec::provider::EdgeCookieProvider for SwitchedProvider {
+        fn id(&self) -> &'static str {
+            "switched"
+        }
+
+        fn code(&self) -> crate::ec::provider::ProviderCode {
+            crate::ec::provider::ProviderCode::new("t0sw")
+        }
+
+        fn generate(
+            &self,
+            _request_info: &dyn crate::evidence::RequestInfo,
+            _input: &crate::ec::provider::IdentityInput<'_>,
+        ) -> Result<
+            crate::ec::provider::GeneratedEdgeCookie,
+            error_stack::Report<crate::error::TrustedServerError>,
+        > {
+            Ok(crate::ec::provider::GeneratedEdgeCookie::default())
+        }
+
+        fn accepts_id(&self, value: &str) -> bool {
+            !value.is_empty()
+        }
+
+        fn normalize_id_for_kv(&self, value: &str) -> String {
+            value.to_ascii_lowercase()
+        }
+    }
+
+    #[test]
+    fn switching_provider_leaves_the_previous_providers_row_beyond_withdrawal() {
+        // Pins what a provider switch really does, which the switching
+        // section of the pluggable-providers spec now states plainly. The
+        // retired provider's identifier is owned by nobody this deployment
+        // reads, so a later withdrawal expires the browser cookie but cannot
+        // tombstone the row, and the identifier is never adopted either. If
+        // the deferred `legacy_providers` reader list ever lands, this test
+        // is meant to fail, so that the spec sentence a deployer acts on is
+        // revisited in the same change.
+        let settings = create_test_settings();
+        let graph = graph_with_live_canonical_row();
+        // A TCF record consenting to nothing, under GDPR, so the request
+        // carries an explicit refusal of storage. That is the narrow,
+        // destructive kind of withdrawal, the one that tombstones rather than
+        // merely suppressing, which is the behavior under test.
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            tcf: Some(crate::consent::TcfConsent {
+                version: 2,
+                cmp_id: 0,
+                cmp_version: 0,
+                consent_screen: 0,
+                consent_language: "EN".to_owned(),
+                vendor_list_version: 0,
+                tcf_policy_version: 2,
+                created_ds: 0,
+                last_updated_ds: 0,
+                purpose_consents: vec![false; 24],
+                purpose_legitimate_interests: vec![false; 24],
+                vendor_consents: Vec::new(),
+                vendor_legitimate_interests: Vec::new(),
+                special_feature_opt_ins: vec![false; 12],
+            }),
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        // The browser still carries the identifier the previous provider
+        // minted, but the deployment now runs a provider with a different
+        // code, so read-back treats the cookie as absent and the active
+        // identifier is empty.
+        let ec_context = make_context_with_consent(
+            None,
+            Some(CANONICAL_COOKIE_VALUE),
+            false,
+            false,
+            consent,
+            false,
+        )
+        .with_provider_for_test(std::sync::Arc::new(SwitchedProvider));
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        assert!(
+            ec_context.ec_value().is_none(),
+            "the retired provider's identifier must never be adopted by the new one"
+        );
+
+        let (row, _) = graph
+            .get(CANONICAL_KV_KEY)
+            .expect("should read the previous provider's row")
+            .expect("the previous provider's row should still exist");
+        assert!(
+            row.consent.ok,
+            "withdrawal cannot reach a retired provider's row without the provider that owns the code"
+        );
+
+        let cookies: Vec<&str> = response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("should render set-cookie as utf-8"))
+            .collect();
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("ts-ec=") && cookie.contains("Max-Age=0")),
+            "withdrawal should still expire the browser cookie after a switch, got {cookies:?}"
+        );
+    }
 }

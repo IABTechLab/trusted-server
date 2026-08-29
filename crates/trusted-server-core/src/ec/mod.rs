@@ -505,9 +505,19 @@ impl EcContext {
     /// The identity-graph key for the `ts-ec` cookie the request carried.
     ///
     /// Withdrawal tombstones the cookie's row as well as the active one,
-    /// because a stateless deployment and a cookie the active provider no
-    /// longer mints both leave [`ec_kv_key`](Self::ec_kv_key) empty while a
-    /// live row still exists.
+    /// because a stateless deployment leaves [`ec_kv_key`](Self::ec_kv_key)
+    /// empty while a live row still exists, and the cookie is the only way
+    /// back to it.
+    ///
+    /// This does not reach across a provider switch. An identifier minted
+    /// under a retired provider's `{code}~` prefix is owned by no provider
+    /// this deployment reads, so [`kv_key_for`](Self::kv_key_for) yields
+    /// `None` and its row is never tombstoned. Core cannot derive that key,
+    /// because the canonical form is the owning provider's own normalization.
+    /// The browser cookie is still expired, since that path keys off the raw
+    /// cookie rather than off ownership. See the switching section of
+    /// `docs/superpowers/specs/2026-07-30-pluggable-providers-design.md` for
+    /// what an operator has to do about it.
     #[must_use]
     pub(crate) fn cookie_ec_kv_key(&self) -> Option<String> {
         self.existing_cookie_ec_id()
