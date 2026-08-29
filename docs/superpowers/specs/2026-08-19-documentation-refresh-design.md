@@ -1,7 +1,7 @@
 # Documentation Refresh (Full Surface)
 
 **Date:** 2026-08-19
-**Revised:** 2026-08-29 (round 16)
+**Revised:** 2026-08-29 (round 17)
 **Status:** Draft, pending review
 **Scope:** Documentation and doc tooling. No runtime behavior changes.
 **Baseline:** audited_target_tip `07dfc1c6d` (2026-08-28). The bulk
@@ -262,10 +262,15 @@ blocks implementation until it is given, and its answer is recorded with
 owner and date.
 
 Milestones (so "complete" has one meaning): **implementation-ready**
-after Epoch 1 - PRs (a)-(d) merged and every content/enforcement
-acceptance met; **activated** after Epoch 2 - c2 merged and a real
-scheduled run observed; **lifecycle-closed** after Epoch 3 - (e)
-merged and rc deleted. THIS REFRESH CLOSES AT "activated"; Epoch 3 is
+after Epoch 1 - the `main` PRs (b)-(d) merged, and (a) #1049 complete,
+approved, all checks green, and ready to merge (it is not yet merged;
+Epoch 1 runs at its final pre-merge head while rc still equals the
+audited baseline); **activated** after Epoch 2 - (a) merged, then c2
+merged and a real scheduled run observed; **lifecycle-closed** after
+Epoch 3 - (e) merged and rc deleted. Enforcement acceptance is
+epoch-scoped: WP8b's Epoch 1 items (rc-required checks, demonstrated rc
+block, recorded `main` deferral) gate implementation-ready; its Epoch 3
+items do not. THIS REFRESH CLOSES AT "activated"; Epoch 3 is
 owned, tracked, and specified here but belongs to release management,
 which is out of scope. The delivery graph is four PRs delivered inside this refresh -
 (a)-(d) - plus two named follow-on `main` PRs it must set up: (c2), the
@@ -287,21 +292,34 @@ branch, so both live on `main`; version updates use
 `target-branch: rc/202608`. Security updates always target the DEFAULT
 branch, and the dependency graph analyzes manifests from it, so while
 `tools/docs-parity` exists only on rc it receives version-update PRs
-but NO Dependabot alerts or security-update PRs - an explicit risk with a
-real bound: owner = the maintainer driving this refresh, review date
-recorded when c2 merges, and a maximum window of 60 days, after which
-the mitigation is mandatory rather than optional. The mitigation is a
-SEPARATE, minimally permissioned dependency-submission job (snapshot
-creation needs `contents: write`, which the read-only validation job
-must never hold). The rc-targeted entry configures version updates
+but NO Dependabot alerts or security-update PRs. The mitigation is not deferred to a
+deadline this refresh would close before reaching: c2 installs a
+SEPARATE, minimally permissioned dependency-submission job immediately
+(snapshot creation needs `contents: write`, which the read-only
+validation job must never hold), submitting the `tools/docs-parity`
+manifest for rc so alerts and security updates work from day one; it
+recurs on rc lockfile changes, and (e) removes it on both paths. c2's
+acceptance includes first-successful-snapshot evidence, and the
+Dependabot risk is thereby closed at activation rather than carried as
+a 60-day exposure. The rc-targeted entry configures version updates
 only; it does not configure security updates, and the validation
 asserts exactly that rather than claiming coverage of both.
 Pre-merge acceptance is not circular
 and not privileged: the workflow is split into two jobs. A dispatch
 validation job runs with `contents: read` only, no secrets, and no
-mutating steps. Its inputs are TWO independent, separately authorized
-SHAs, because one predicate cannot cover both the trusted tool and the
-files being inspected:
+mutating steps. It has two mutually exclusive, fail-closed dispatch MODES, because not
+every dispatch inspects a `main` PR:
+
+- `validate_rc` - requires `tool_sha` ONLY (no `files_sha`; supplying
+  one is rejected). Used for the Epoch 1 dispatch against #1049's head
+  and the first Epoch 2 dispatch of `merged_rc_tip`: it exercises the
+  WP8 tooling itself.
+- `validate_main_pr` - requires `tool_sha`, `files_sha`, the PR number,
+  and the authenticated `base_sha` (see below). Used for c2 and e.
+
+Its inputs are TWO independent, separately authorized SHAs, because one
+predicate cannot cover both the trusted tool and the files being
+inspected:
 
 - `tool_sha` - the code that EXECUTES. A full 40-character SHA that the
   API reports as `head.sha` of pull request **#1049** in this same
@@ -313,8 +331,20 @@ files being inspected:
 - `files_sha` - data that is NEVER executed. A full 40-character SHA
   that the API reports as the current `head.sha` of a named,
   same-repository, OPEN pull request targeting `main` (the c2 or e PR).
-  Its checkout uses `persist-credentials: false`, is restricted to an
-  allowed-file set (the workflow file and `.github/dependabot.yml`),
+  Validation is over the DIFF, not just head contents: the job
+  authenticates `base_sha` (the PR's current base, equal to the
+  recorded `audited_main_tip`) and inspects `base_sha...files_sha`,
+  because a restricted checkout cannot prove the PR changes nothing
+  else, and the abandonment form of e deletes the workflow outright so
+  there is no head file to read. It enforces (i) an exact changed-file
+  allowlist, rejecting every extra path; (ii) a path-specific expected
+  patch shape - c2: only the schedule activation plus the named
+  Dependabot additions; normal e: only the rc-to-main retarget;
+  abandonment e: only the reviewed removals; and (iii) workflow AST
+  invariants over the resulting file where one exists - permissions,
+  triggers, `uses` pins, `run` steps, secrets access, local actions,
+  cache/artifact usage, and checkout refs - not merely the presence of
+  an expected schedule. Its checkout uses `persist-credentials: false`,
   canonicalizes paths and rejects symlinks escaping the tree, and is
   read statically only - "nothing from the files checkout is executed"
   is an explicit workflow invariant, since executing an untrusted PR
@@ -346,7 +376,8 @@ issue filed in WP8b with a named owner: after #1049 merges into rc,
 record a `merged_rc_tip`, dispatch that exact SHA, then land the
 activation edit (schedule trigger + rc-targeted Dependabot roots).
 Because `main` does not yet contain `tools/docs-parity` or the WP8
-workflows, c2's own checks cannot come from `main`: its validation job runs the
+workflows, the TOOL cannot come from `main` (the dispatcher/controller
+still does): its validation job runs the
 dual-ref flow above - `tool_sha` = the trusted merged rc tip,
 `files_sha` = the c2 PR head - statically validating the actual changed
 workflow and Dependabot file and binding the result to that SHA, and c2's acceptance
