@@ -3,7 +3,7 @@ Review all staged and unstaged changes in the working tree.
 1. Run `git diff` and `git diff --cached` to see all changes.
 2. Review each changed file for:
    - Correctness and logic errors
-   - Style violations (see CLAUDE.md conventions)
+   - Style violations (see AGENTS.md conventions)
    - Missing error handling
    - Security concerns (hardcoded secrets, injection risks)
    - Missing or incorrect tests
