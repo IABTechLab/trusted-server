@@ -849,20 +849,21 @@ regions and goldens at final HEAD produces no diff.
 
 ## Sequencing
 
-| Order | Package                                | Size | Depends on                                                       |
-| ----- | -------------------------------------- | ---- | ---------------------------------------------------------------- |
-| 0     | WP1 containment subset → `main` PR (b) | XS   | -                                                                |
-| 0b    | `main` automation PR (c)               | XS   | WP8a workflow content; dispatch acceptance vs the rc PR head SHA |
-| 0c    | CNAME PR (d)                           | XS   | open question 2; completion gate, does not block other rows      |
-| 1     | WP1 hygiene (full, rc PR)              | S    | -                                                                |
-| 2     | WP8a scaffolding                       | L    | -                                                                |
-| 3     | WP2 truth pass                         | M    | WP8a (manifest, scanner)                                         |
-| 4     | WP3 config reference                   | L    | WP8a (extractor, harness)                                        |
-| 5     | WP4 API reference                      | M    | WP2, WP8a                                                        |
-| 6     | WP5 pages + nav                        | L    | WP2, WP3, WP8a                                                   |
-| 7     | WP6 root + READMEs                     | M    | WP2                                                              |
-| 8     | WP7 in-code docs                       | M    | -                                                                |
-| 9     | WP8b gate activation                   | M    | WP2-WP7                                                          |
+| Order | Package                                | Size | Depends on                                                                                                    |
+| ----- | -------------------------------------- | ---- | ------------------------------------------------------------------------------------------------------------- |
+| 0     | WP1 containment subset → `main` PR (b) | XS   | -                                                                                                             |
+| 0b    | `main` automation PR (c)               | XS   | WP8a workflow content; dispatch acceptance vs the rc PR head SHA                                              |
+| 0c    | CNAME PR (d)                           | XS   | open question 2; completion gate, does not block other rows                                                   |
+| 10    | Release handoff PR (e)                 | XS   | rc merge or deletion; owned, tracked issue; its filing is part of this refresh's completion, its merge is not |
+| 1     | WP1 hygiene (full, rc PR)              | S    | -                                                                                                             |
+| 2     | WP8a scaffolding                       | L    | -                                                                                                             |
+| 3     | WP2 truth pass                         | M    | WP8a (manifest, scanner)                                                                                      |
+| 4     | WP3 config reference                   | L    | WP8a (extractor, harness)                                                                                     |
+| 5     | WP4 API reference                      | M    | WP2, WP8a                                                                                                     |
+| 6     | WP5 pages + nav                        | L    | WP2, WP3, WP8a                                                                                                |
+| 7     | WP6 root + READMEs                     | M    | WP2                                                                                                           |
+| 8     | WP7 in-code docs                       | M    | -                                                                                                             |
+| 9     | WP8b gate activation                   | M    | WP2-WP7                                                                                                       |
 
 ## Verification
 
