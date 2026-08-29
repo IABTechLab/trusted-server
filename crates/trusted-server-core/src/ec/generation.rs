@@ -190,12 +190,17 @@ pub fn is_valid_ec_hash(value: &str) -> bool {
 /// the random suffix allows mixed-case alphanumeric characters by
 /// construction.
 ///
-/// A minted identifier carries the provider-code envelope, `hmac~` before
-/// the bare value, and that is the form the partner-facing paths (pull sync,
-/// batch sync, the admin lookup) receive, so both the enveloped and the
-/// legacy bare form are accepted. An identifier under any other provider's
-/// code is not an HMAC identifier and is rejected here: those paths accept
-/// only the built-in provider's identifiers today.
+/// A minted identifier carries the provider-code envelope, `hmac~` before the
+/// bare value, so both the enveloped and the legacy bare form are accepted
+/// here. An identifier under any other provider's code is not an HMAC
+/// identifier and is rejected.
+///
+/// This is the built-in provider's grammar, not the deployment's. The
+/// partner-facing paths (pull sync, batch sync, the admin lookup) dispatch by
+/// provider code through
+/// [`AcceptedProviders`](super::provider::AcceptedProviders), which reaches
+/// this only for an identifier the built-in provider owns, or as the fallback
+/// for a stateless deployment that has selected no provider at all.
 #[must_use]
 pub fn is_valid_ec_id(value: &str) -> bool {
     let bare = match split_provider_code(value) {

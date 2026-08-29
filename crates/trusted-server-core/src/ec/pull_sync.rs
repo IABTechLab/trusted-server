@@ -19,7 +19,7 @@ use crate::platform::{
 };
 use crate::settings::Settings;
 
-use super::generation::{ec_hash, is_valid_ec_id};
+use super::generation::ec_hash;
 use super::kv::KvIdentityGraph;
 use super::kv_types::KvEntry;
 use super::rate_limiter::RateLimiter;
@@ -62,9 +62,15 @@ pub fn build_pull_sync_context(ec_context: &EcContext) -> Option<PullSyncContext
         return None;
     }
 
+    // Accept an identifier from whichever provider this deployment reads,
+    // dispatched by the identifier's provider code, rather than only the
+    // built-in HMAC shape. A host-signal or vendor provider's identifiers are
+    // valid here for the same reason they are valid in the organic path.
     let ec_id_ref = ec_context.ec_value()?;
-    if !is_valid_ec_id(ec_id_ref) {
-        log::debug!("Pull sync: skipping dispatch because active EC ID is invalid format");
+    if !ec_context.accepts_id(ec_id_ref) {
+        log::debug!(
+            "Pull sync: skipping dispatch because the active EC ID is not one this              deployment's providers accept"
+        );
         return None;
     }
 
@@ -496,6 +502,86 @@ mod tests {
             context.ec_id(),
             ec_context.ec_value().expect("ec should be present"),
             "should capture the EC ID from context"
+        );
+    }
+
+    /// A non-HMAC provider whose identifiers are opaque, modeling the
+    /// host-signal provider PR #1044 adds: valid identifiers that the built-in
+    /// HMAC grammar rejects outright.
+    #[derive(Debug)]
+    struct OpaqueProvider;
+
+    impl crate::ec::provider::EdgeCookieProvider for OpaqueProvider {
+        fn id(&self) -> &'static str {
+            "opaque"
+        }
+
+        fn code(&self) -> crate::ec::provider::ProviderCode {
+            crate::ec::provider::ProviderCode::new("t0op")
+        }
+
+        fn generate(
+            &self,
+            _request_info: &dyn crate::evidence::RequestInfo,
+            _input: &crate::ec::provider::IdentityInput<'_>,
+        ) -> Result<
+            crate::ec::provider::GeneratedEdgeCookie,
+            error_stack::Report<crate::error::TrustedServerError>,
+        > {
+            Ok(crate::ec::provider::GeneratedEdgeCookie::default())
+        }
+
+        fn accepts_id(&self, value: &str) -> bool {
+            !value.is_empty()
+        }
+    }
+
+    #[test]
+    fn build_pull_sync_context_accepts_the_active_non_hmac_provider() {
+        // A deployment whose active provider is not the built-in HMAC one must
+        // still dispatch pull sync for the identifiers that provider minted.
+        // The built-in grammar rejected every non-`hmac` code, so these
+        // identifiers worked in the organic path and were silently skipped
+        // here.
+        const OPAQUE_ID: &str = "t0op~Opaque_Value_MixedCase";
+
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.ec.provider = Some(crate::ec::provider::EcProviderSelection::from("opaque"));
+        let services = crate::platform::test_support::noop_services_with_ec_provider(
+            std::sync::Arc::new(OpaqueProvider),
+        );
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://example.com")
+            .header("cookie", format!("ts-ec={OPAQUE_ID}"))
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+        let geo = crate::geo::GeoInfo {
+            city: String::new(),
+            country: "US".to_owned(),
+            continent: "NorthAmerica".to_owned(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: None,
+            asn: None,
+        };
+
+        let ec_context =
+            EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
+                .expect("should read EC context");
+        assert_eq!(
+            ec_context.ec_value(),
+            Some(OPAQUE_ID),
+            "the opaque identifier should read back before pull sync sees it"
+        );
+
+        let context = build_pull_sync_context(&ec_context)
+            .expect("should dispatch pull sync for the active provider's identifier");
+        assert_eq!(
+            context.ec_id(),
+            OPAQUE_ID,
+            "should carry the identifier through unchanged"
         );
     }
 

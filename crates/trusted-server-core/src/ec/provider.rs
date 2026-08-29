@@ -31,6 +31,7 @@ use crate::evidence::RequestInfo;
 use crate::redacted::Redacted;
 use crate::settings::Ec;
 
+use super::cookies::ec_id_has_only_allowed_chars;
 use super::generation;
 
 /// The Edge Cookie identity provider a deployment has selected.
@@ -368,6 +369,93 @@ pub fn provider_kv_key(provider: &dyn EdgeCookieProvider, full: &str) -> String 
             provider.normalize_id_for_kv(value)
         ),
         (None, value) => provider.normalize_id_for_kv(value),
+    }
+}
+
+/// The providers whose identifiers a partner or diagnostic path accepts.
+///
+/// Pull sync, batch sync, and the admin lookup each take an identifier from
+/// outside the organic request path and have to decide whether Trusted Server
+/// issued it. The answer is in two parts. The **global cookie bounds** (the
+/// length cap and the cookie-safe alphabet, see `ec_id_has_only_allowed_chars`)
+/// apply to every identifier whichever provider minted it. The rest is
+/// **dispatched by the `{code}~` prefix** to the provider that owns that code,
+/// which canonicalizes its own value part and decides whether the canonical
+/// form is one of its own. A code no provider in the set owns is rejected, so a
+/// second provider's identifiers can never be adopted or written under this
+/// deployment's keys.
+///
+/// The set holds the deployment's active provider. The design's
+/// `legacy_providers` reader list, the providers that never mint but must still
+/// recognize identifiers a previous provider issued, is not implemented on this
+/// branch, so [`active`](Self::active) fills `readers` with the one active
+/// provider. That is the seam: when the configured legacy readers land they are
+/// built alongside the active provider and pushed into the same list, and
+/// neither [`accepts`](Self::accepts) nor
+/// [`canonical_kv_key`](Self::canonical_kv_key) changes.
+pub struct AcceptedProviders<'a> {
+    readers: Vec<&'a dyn EdgeCookieProvider>,
+}
+
+impl<'a> AcceptedProviders<'a> {
+    /// The set holding only the deployment's active provider.
+    ///
+    /// `None` means no provider is selected, so the deployment is stateless.
+    #[must_use]
+    pub fn active(provider: Option<&'a dyn EdgeCookieProvider>) -> Self {
+        Self {
+            readers: provider.into_iter().collect(),
+        }
+    }
+
+    /// The provider in the set that owns `full`'s code.
+    ///
+    /// Dispatch is on the code alone, before any provider looks at a value, so
+    /// an identifier a partner echoed back in a different case still reaches
+    /// its own provider to be canonicalized rather than being rejected first.
+    /// A legacy bare identifier predates the envelope and belongs to the
+    /// built-in HMAC provider alone.
+    fn owner(&self, full: &str) -> Option<&'a dyn EdgeCookieProvider> {
+        let (code, _) = split_provider_code(full);
+        self.readers.iter().copied().find(|provider| match code {
+            Some(code) => provider.code().as_str() == code,
+            None => provider.id() == EcProviderSelection::HMAC_KEY,
+        })
+    }
+
+    /// Whether `full` is an identifier this deployment accepts.
+    #[must_use]
+    pub fn accepts(&self, full: &str) -> bool {
+        self.canonical_kv_key(full).is_some()
+    }
+
+    /// The identity-graph key for `full`, or `None` when nothing in the set
+    /// accepts it.
+    ///
+    /// The owning provider supplies the canonical form of its own value part
+    /// and the code prefix is preserved verbatim, so two providers' rows can
+    /// never share a key.
+    #[must_use]
+    pub fn canonical_kv_key(&self, full: &str) -> Option<String> {
+        if !ec_id_has_only_allowed_chars(full) {
+            return None;
+        }
+        match self.owner(full) {
+            Some(owner) => {
+                let key = provider_kv_key(owner, full);
+                provider_owns_id(owner, &key).then_some(key)
+            }
+            // No provider is selected, so there is no code to dispatch on and
+            // the built-in HMAC grammar is the fallback, the same fallback
+            // `EcContext::accepts_id` has always used for a stateless
+            // deployment.
+            None if self.readers.is_empty() => {
+                let key = generation::normalize_ec_id_for_kv(full);
+                generation::is_valid_ec_id(&key).then_some(key)
+            }
+            // A code that belongs to some other deployment's provider.
+            None => None,
+        }
     }
 }
 
@@ -739,6 +827,63 @@ mod tests {
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie::default())
         }
+    }
+
+    #[test]
+    fn accepted_providers_splits_global_bounds_from_provider_dispatch() {
+        let hmac = HmacProvider::new(Redacted::new("test-secret-key-32-bytes-minimum".to_owned()));
+        let hmac_value = format!("{}.ABC123", "a".repeat(64));
+        let active = AcceptedProviders::active(Some(&hmac));
+
+        // The global bounds come first and apply whoever minted the value: a
+        // character outside the cookie-safe alphabet, or a value over the
+        // length cap, never reaches a provider.
+        assert!(
+            !active.accepts(&format!("hmac~{hmac_value} with spaces")),
+            "the cookie-safe alphabet is a global bound"
+        );
+        assert!(
+            !active.accepts(&format!("hmac~{}", "a".repeat(300))),
+            "the length cap is a global bound"
+        );
+
+        // Then dispatch by code to the provider that owns it.
+        assert!(
+            active.accepts(&format!("hmac~{hmac_value}")),
+            "the active provider's own code is accepted"
+        );
+        assert!(
+            active.accepts(&hmac_value),
+            "the legacy bare form belongs to the built-in provider"
+        );
+        assert!(
+            !active.accepts(&format!("t0ac~{hmac_value}")),
+            "a code no configured provider reads is rejected even in the HMAC shape"
+        );
+
+        // A vendor provider's own identifiers are accepted when it is the
+        // active one, and the built-in bare form then belongs to nobody.
+        let vendor = AcceptedProviders::active(Some(&VendorProvider));
+        assert!(
+            vendor.accepts(&format!("t0ac~{hmac_value}")),
+            "the vendor provider's code is accepted when it is active"
+        );
+        assert!(
+            !vendor.accepts(&hmac_value),
+            "the legacy bare form is the built-in provider's alone"
+        );
+
+        // With no provider selected the deployment is stateless, so the
+        // built-in grammar is the fallback, as it has always been.
+        let stateless = AcceptedProviders::active(None);
+        assert!(
+            stateless.accepts(&hmac_value),
+            "a stateless deployment falls back to the built-in grammar"
+        );
+        assert!(
+            !stateless.accepts("not-an-identifier"),
+            "the fallback is still the built-in grammar, not anything goes"
+        );
     }
 
     #[test]

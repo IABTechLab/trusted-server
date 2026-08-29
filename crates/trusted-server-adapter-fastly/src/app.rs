@@ -113,6 +113,7 @@ use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::provider::build_provider;
 use trusted_server_core::ec::provider::ensure_provider_available;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
@@ -570,7 +571,12 @@ async fn execute_named(
                     // copy is bot-gated, while operators use curl for this
                     // authenticated diagnostic.
                     let kv = crate::maybe_identity_graph(&state.settings);
-                    handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
+                    // The selected provider decides which identifiers this
+                    // deployment recognizes, so build it here rather than
+                    // assuming the built-in HMAC shape. The read-only
+                    // diagnostic builds no EC request state to borrow it from.
+                    let provider = build_provider(&state.settings.ec, services.ec_provider())?;
+                    handle_admin_ec_lookup(kv.as_ref(), &registry, provider.as_deref(), &req)
                 }
                 NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
                 _ => unreachable!("admin diagnostics should use early dispatch"),
@@ -734,7 +740,11 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
     let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
         let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
         let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-        handle_batch_sync(&kv, &partner_registry, &limiter, req)
+        // A partner echoes back an identifier the deployment's own provider
+        // minted, so validation and KV normalization are dispatched through
+        // that provider rather than the built-in HMAC grammar.
+        let provider = build_provider(&state.settings.ec, services.ec_provider())?;
+        handle_batch_sync(&kv, &partner_registry, &limiter, provider.as_deref(), req)
     });
 
     let mut response = result.unwrap_or_else(|e| http_error(&e));

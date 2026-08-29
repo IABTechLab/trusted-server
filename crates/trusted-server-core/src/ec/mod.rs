@@ -492,19 +492,27 @@ impl EcContext {
         self.ec_value.as_deref()
     }
 
+    /// The providers whose identifiers this request's paths accept.
+    ///
+    /// Today that is the selected provider alone (see
+    /// [`AcceptedProviders`](provider::AcceptedProviders) for the
+    /// `legacy_providers` seam).
+    #[must_use]
+    pub(crate) fn accepted_providers(&self) -> provider::AcceptedProviders<'_> {
+        provider::AcceptedProviders::active(self.selected_provider.as_deref())
+    }
+
     /// Returns whether `value` is a well-formed identifier for the selected
     /// provider.
     ///
     /// Lets core validate a cookie or active identifier (for example before
     /// withdrawing it) through the provider that issued it, rather than assuming
-    /// the built-in shape. Falls back to the built-in shape when no provider is
-    /// configured.
+    /// the built-in shape. The global cookie bounds are checked first, then the
+    /// provider-specific part is dispatched by the identifier's code. Falls back
+    /// to the built-in shape when no provider is configured.
     #[must_use]
     pub(crate) fn accepts_id(&self, value: &str) -> bool {
-        self.selected_provider.as_ref().map_or_else(
-            || is_valid_ec_id(value),
-            |provider| provider::provider_owns_id(provider.as_ref(), value),
-        )
+        self.accepted_providers().accepts(value)
     }
 
     /// Returns whether the `ts-ec` cookie was present on the incoming request.
