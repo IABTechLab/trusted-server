@@ -1,7 +1,7 @@
 # Documentation Refresh (Full Surface)
 
 **Date:** 2026-08-19
-**Revised:** 2026-08-28 (round 13)
+**Revised:** 2026-08-28 (round 14)
 **Status:** Draft, pending review
 **Scope:** Documentation and doc tooling. No runtime behavior changes.
 **Baseline:** audited_target_tip `07dfc1c6d` (2026-08-28). The bulk
@@ -186,8 +186,14 @@ Truth-pass acceptance and parity checks operate on defined source sets:
   human-facing `.proto` documentation are real examples outside any
   whitelist), and every candidate must carry an explicit include or
   typed-exclude disposition in the checked maintained-source manifest
-  (`{path, mode, selector}`; whole-file vs comment-region). An
-  unclassified candidate fails the gate, so a new Dockerfile or
+  (`{path, mode, selector}`; whole-file vs comment-region). Comment
+  regions are closed the same way files are: every comment-region file
+  class needs a supported comment extractor (fail closed when none
+  exists for a class), and EVERY extracted comment span must be
+  included or typed-excluded - so a new human-facing comment added
+  outside an existing selector fails the gate rather than passing
+  because its file is already classified. An unclassified candidate or
+  span fails the gate, so a new Dockerfile or
   unfamiliar operational format cannot silently fall outside the
   universe; the path rules below are the default include hints, not the
   universe. The WP8b inventory gate asserts final set
@@ -213,8 +219,10 @@ Truth-pass acceptance and parity checks operate on defined source sets:
   live site (Pages deploys only from `main`), and internal details are
   scrubbed from the public repository regardless of build exclusion.
 - Sensitive real-world values are removed or covered by the typed,
-  expiring allowlist (the `fastly.toml` `service_id` is its one
-  owner-approved, time-bounded entry pending the ops-owned migration).
+  expiring allowlist (the `fastly.toml` `service_id` is its one PROPOSED
+  exception, pending the ops-owned migration; it becomes an approved,
+  time-bounded entry only once open question 1 records an owner and
+  review date, which gates scanner activation).
 - CI catches regressions: docs build (already live on rc), rustdoc with
   broken-intra-doc-link denial, doctests, and semantic parity bound to the
   reader-facing markdown.
@@ -251,33 +259,57 @@ The owner's standing instruction is one rc PR carrying spec plus work;
 the concrete shape below (which adds the forced `main` containment PR and
 package checkpoints) still awaits explicit confirmation - open question 7
 blocks implementation until it is given, and its answer is recorded with
-owner and date. The delivery graph is exactly five PRs: (a) the single rc PR (#1049)
+owner and date. The delivery graph is four PRs delivered by this refresh - (a)-(d) -
+plus one mandatory future PR (e) whose tracked issue and draft this
+refresh must produce: (a) the single rc PR (#1049)
 carrying the spec plus all packages; (b) the `main` containment PR;
-(c) a `main` automation PR - scheduled workflows and Dependabot read
-their configuration from the DEFAULT branch, so the scheduled
-external-link workflow lives on `main` (checking out `rc/202608` while
-that branch is live) and `dependabot.yml` lives on `main` with
-`target-branch: rc/202608` for version updates (security updates always
+(c) a `main` automation PR, which lands the workflow in
+DISPATCH-ONLY form (no `schedule:` trigger, no rc-targeted Dependabot
+entries) because scheduled runs and Dependabot would otherwise inspect
+pre-refresh rc content and a docs-parity cargo root that does not yet
+exist on any target branch. Activation is a separate, owned post-merge
+checkpoint (see (c2)) that adds the `schedule:` trigger and the
+rc-targeted Dependabot entries once #1049 has merged. Scheduled
+workflows and Dependabot read their configuration from the DEFAULT
+branch, so both live on `main`; version updates use
+`target-branch: rc/202608` (security updates always
 target the default branch; the config validation covers both kinds and
 the wording distinguishes them). Pre-merge acceptance is not circular
 and not privileged: the workflow is split into two jobs. A dispatch
 validation job runs with `contents: read` only, no secrets, and no
 mutating steps; it checks out and executes the supplied SHA, which must
-be a full 40-character SHA that the job verifies via the API to be
-either the approved same-repository rc PR's current head or the merged
-rc tip (arbitrary refs, stale SHAs, and non-approved commits are
-rejected, proven by a negative workflow fixture). A separate
+be a full 40-character SHA satisfying an exact machine predicate: the API
+reports it as `head.sha` of pull request **#1049** in this same
+repository, with `base.ref == "rc/202608"`, state open, and not a
+draft - or it equals the current `origin/rc/202608` tip. No other
+notion of "approved" is used (so the job needs no
+`pull-requests: read` beyond the public metadata read it already has;
+if a review-state predicate is ever added, that permission is added
+with it). Arbitrary refs, stale SHAs, other PRs' heads, and
+fork-repository SHAs are rejected, proven by negative workflow
+fixtures, one per rejected class. A separate
 schedule-only issue-management job holds the job-scoped `issues: write`
 and never executes code from a supplied SHA - it checks out only the
-branch tip it is configured for. Pre-merge, the validation job runs on
-the rc PR head; post-merge, a dispatch against the merged tip is
-recorded. (e) A fifth, release-triggered handoff PR to `main`: when
-rc/202608 merges or is deleted, the workflow checkout and Dependabot
-`target-branch` switch back to `main` - the checkout could fall back
-dynamically but Dependabot's target is static, so a `main` edit is
-unavoidable. It has a named owner, a tracked issue filed in WP8b, a
-sequencing row, and a verification item (the automation must not keep
-pointing at a dead branch); (d) the CNAME resolution
+branch tip it is configured for. Pre-merge, the validation job runs on the rc PR head.
+(c2) is an owned post-merge activation checkpoint, tracked as an issue
+filed in WP8b with a named owner: after #1049 merges into rc, dispatch
+the exact merged rc tip and record it, then land the activation edit
+(schedule trigger + rc-targeted Dependabot roots); after rc lands on
+`main`, validate the retargeted schedule, the Dependabot roots, live
+Pages containment, and the selected CNAME behavior. (e) A fifth, release-triggered handoff PR to `main`, with two distinct
+paths. Normal path - rc/202608 is deleted AFTER a verified merge into
+`main`: the workflow checkout and Dependabot `target-branch` switch to
+`main` (the checkout could fall back dynamically but Dependabot's
+target is static, so a `main` edit is unavoidable), an XS retarget-only
+edit. Abandonment path - rc is deleted WITHOUT merging: retargeting is
+invalid because `main` then holds neither the refreshed docs nor
+`tools/docs-parity` and its cargo root, so the handoff instead DISABLES
+and removes the automation (schedule trigger, rc-targeted Dependabot
+entries, link workflow) rather than pointing it at content that does
+not exist; transplanting the tooling to `main` is a separate,
+explicitly sized effort, never a silent XS edit. Both paths have a named owner, a tracked issue filed in WP8b, a
+sequencing row, and a verification item (the automation must never keep
+pointing at a dead or content-less branch); (d) the CNAME resolution
 PR to `main`, cut when open question 2 resolves (the containment PR
 NEVER carries it - WP1's earlier allowance is superseded). Every
 `main`-target PR records its own fresh audited_main_tip and runs the
@@ -853,6 +885,7 @@ regions and goldens at final HEAD produces no diff.
 | ----- | -------------------------------------- | ---- | ------------------------------------------------------------------------------------------------------------- |
 | 0     | WP1 containment subset → `main` PR (b) | XS   | -                                                                                                             |
 | 0b    | `main` automation PR (c)               | XS   | WP8a workflow content; dispatch acceptance vs the rc PR head SHA                                              |
+| 9b    | Post-merge activation checkpoint (c2)  | XS   | #1049 merged into rc; adds schedule trigger + rc Dependabot roots                                             |
 | 0c    | CNAME PR (d)                           | XS   | open question 2; completion gate, does not block other rows                                                   |
 | 10    | Release handoff PR (e)                 | XS   | rc merge or deletion; owned, tracked issue; its filing is part of this refresh's completion, its merge is not |
 | 1     | WP1 hygiene (full, rc PR)              | S    | -                                                                                                             |
@@ -880,8 +913,11 @@ recorded; the `main` containment PR merged with its positive smoke, the
 `main` automation PR merged with a successful read-only validation
 dispatch against the rc PR head and validated Dependabot config, and the
 CNAME PR (d) merged with its branch-specific live smoke (each `main`
-PR's audited_main_tip assertion having passed); the release-handoff
-PR (e) has its owner and tracked issue recorded; every follow-up filed with a
+PR's audited_main_tip assertion having passed); the post-merge
+activation checkpoint (c2) recorded with its dispatch against the exact
+merged rc tip; the release-handoff PR (e) existing as a draft PR URL in
+a defined readiness state, with its owner, tracked issue, and both
+path conditions recorded; every follow-up filed with a
 recorded URL or disposition; and the exact-tip baseline
 assertion for `origin/rc/202608` (equal to the recorded
 audited_target_tip, contained in the branch) passing at the final HEAD -
@@ -892,8 +928,13 @@ not a merge-base comparison.
 1. `fastly.toml` `service_id` allowlist owner and review date (blocks
    WP8a scanner activation); the ops migration itself blocks nothing.
 2. CNAME: delete (recommended) or custom domain (fully specified branch).
-3. `FAQ_POC.md` retirement; gam/kargo tombstones (routes preserved either
-   way).
+3. `FAQ_POC.md` retirement (owner: the maintainer driving this refresh;
+   decide before WP2 starts). Deterministic default if undecided by
+   then: archive it under the historical tree (not a rewrite), leaving
+   no active-set page and no route to preserve. The gam/kargo
+   tombstones are NOT part of this question - WP2 applies them
+   unconditionally, with routes preserved, sidebar entries removed, and
+   old-route smokes asserting the tombstones serve.
 4. `business-use-cases.md`: CLOSED - excluded with a source-level
    banner; republishing is a separate future effort (see Non-goals).
 5. CHANGELOG release cut (out of scope; deterministic no-release edit
