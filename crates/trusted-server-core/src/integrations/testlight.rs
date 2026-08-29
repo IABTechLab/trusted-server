@@ -511,7 +511,7 @@ mod tests {
             );
             let settings = create_test_settings();
 
-            testlight_integration()
+            let refused = testlight_integration()
                 .handle(
                     &settings,
                     &services,
@@ -519,6 +519,7 @@ mod tests {
                 )
                 .await
                 .expect_err("a foreign provider code should not be proxied upstream");
+            drop(refused);
 
             assert!(
                 stub.recorded_backend_names().is_empty(),
@@ -541,7 +542,7 @@ mod tests {
             settings.ec.provider = None;
             settings.ec.providers.hmac = None;
 
-            testlight_integration()
+            let refused = testlight_integration()
                 .handle(
                     &settings,
                     &services,
@@ -549,6 +550,7 @@ mod tests {
                 )
                 .await
                 .expect_err("a deployment that mints no identifier should proxy none");
+            drop(refused);
 
             assert!(
                 stub.recorded_backend_names().is_empty(),
