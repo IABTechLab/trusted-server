@@ -688,6 +688,24 @@ pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
 }
 
+/// Build a [`RuntimeServices`] with an injected geo provider, so a test can
+/// drive a geo outcome through the [`PlatformGeo`] seam rather than
+/// constructing the resolved status by hand.
+///
+/// This is the only way to reach the lookup-failure path, because the seam is
+/// what turns an `Err` into the requires-signal floor.
+pub(crate) fn build_services_with_geo(geo: Arc<dyn PlatformGeo>) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(geo)
+        .client_info(ClientInfo::default())
+        .build()
+}
+
 /// Build a [`RuntimeServices`] carrying an Edge Cookie provider, so a test can
 /// exercise the seam an opaque-identifier vendor provider reaches core through.
 pub(crate) fn noop_services_with_ec_provider(

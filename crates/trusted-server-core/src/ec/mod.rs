@@ -1735,6 +1735,54 @@ mod tests {
         );
     }
 
+    /// A geo provider whose lookup fails, the state the permission model's
+    /// fail-closed rule exists for.
+    ///
+    /// No geo provider shipped in this workspace can fail: the Fastly SDK's
+    /// `geo_lookup` returns an `Option`, the Cloudflare provider reads request
+    /// headers, and the Axum and Spin providers resolve nothing at all. The
+    /// `Result` on [`PlatformGeo::lookup`] is there for a provider that does
+    /// its own fallible lookup, so this stands in for one and proves the floor
+    /// is reached through the seam rather than only from a hand-built status.
+    #[derive(Debug)]
+    struct FailingGeo;
+
+    impl crate::platform::PlatformGeo for FailingGeo {
+        fn lookup(
+            &self,
+            _client_ip: Option<std::net::IpAddr>,
+        ) -> Result<Option<GeoInfo>, Report<crate::platform::PlatformError>> {
+            Err(Report::new(crate::platform::PlatformError::Geo))
+        }
+    }
+
+    #[test]
+    fn a_geo_provider_failure_resolves_permissions_at_the_requires_signal_floor() {
+        use crate::permissions::Permission;
+        use crate::platform::test_support::build_services_with_geo;
+
+        // A default country that grants storage, so the assertion can only
+        // pass by the failure reaching the floor rather than the default.
+        let mut settings = create_test_settings();
+        settings.geo.default_country = Some("US/CA".to_owned());
+        let req = create_test_request(&[]);
+
+        let granted = EcContext::read_from_request_resolving_geo(&settings, &req, &noop_services())
+            .expect("should read EC context with a geo provider that resolves nothing");
+        assert!(
+            granted.permissions().is_set(Permission::StoreOnDevice),
+            "the default country must grant storage, or this test proves nothing"
+        );
+
+        let services = build_services_with_geo(std::sync::Arc::new(FailingGeo));
+        let failed = EcContext::read_from_request_resolving_geo(&settings, &req, &services)
+            .expect("a failed lookup should resolve permissions, not fail the request");
+        assert!(
+            !failed.permissions().is_set(Permission::StoreOnDevice),
+            "a geo provider failure must resolve at the requires-signal floor, not the default"
+        );
+    }
+
     #[test]
     fn no_location_resolves_the_consent_jurisdiction_from_the_default_country() {
         use crate::consent::jurisdiction::Jurisdiction;

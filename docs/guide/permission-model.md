@@ -249,6 +249,10 @@ flowchart TD
     Check -- "No" --> Skip([Skip provider])
 ```
 
+The "Failed" branch is the rule for a geo provider that can report a failed
+lookup. None of the providers shipped today can, so a geo outage takes the
+"No or none resolved" branch instead. See the default-country note below.
+
 ## Configuration
 
 The geo provider, which resolves the country, and the default country for
@@ -270,9 +274,17 @@ default_country = "US"
 
 The default country covers requests the geo provider leaves unmatched. A
 failed geo lookup is different: it resolves every permission to the
-requires-signal floor instead of the default, so an outage is handled
-protectively rather than as the deployer's default jurisdiction, and it is
-logged at error level.
+requires-signal floor instead of the default, and is logged at error level.
+
+Read that alongside which lookups can actually fail, because it decides how
+much the default country is doing for you. None of the geo providers shipped
+today can fail. Fastly's lookup returns "no data" rather than an error, the
+Cloudflare provider reads request headers, and the Axum and Spin providers
+resolve nothing at all. **A geo outage therefore reaches the default country,
+not the floor**, because "no data" and "the deployer left this unmatched" are
+the same state. Choose the default country on that basis: whatever it grants
+is what an outage grants. The floor applies to a geo provider that does its
+own lookup and can report a failure.
 
 ```yaml
 # permissions.yaml (excerpt). Each group lists every permission and its flag.
