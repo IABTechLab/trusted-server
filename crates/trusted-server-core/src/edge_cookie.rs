@@ -13,13 +13,12 @@ use crate::ec::cookies::ec_id_has_only_allowed_chars;
 #[cfg(test)]
 use crate::ec::generation::normalize_ip;
 #[cfg(test)]
-use crate::ec::provider::{IdentityInput, build_provider};
+use crate::ec::provider::IdentityInput;
+use crate::ec::provider::{build_provider, provider_owns_id};
 use crate::error::TrustedServerError;
 #[cfg(test)]
 use crate::evidence::BorrowedRequestInfo;
-#[cfg(test)]
 use crate::platform::RuntimeServices;
-#[cfg(test)]
 use crate::settings::Settings;
 
 /// Generates a fresh EC ID using the configured Edge Cookie provider.
@@ -116,6 +115,56 @@ pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<Trust
         }
     }
 
+    Ok(None)
+}
+
+/// Gets an existing EC ID from the request, but only one the deployment's
+/// selected provider recognizes.
+///
+/// [`get_ec_id`] applies the global cookie bounds alone, the length cap and the
+/// cookie-safe alphabet, which any value a browser can be persuaded to carry
+/// will pass. This adds provider ownership on top: the identifier's `{code}~`
+/// prefix is dispatched to the provider that owns it, which decides whether the
+/// value is one of its own. That is the same test the EC lifecycle applies when
+/// it reads the cookie back, so both agree on what this deployment issued.
+///
+/// Returns `None` for a value carrying another deployment's provider code, for a
+/// value the selected provider does not recognize, and for every value at all
+/// when no provider is selected, because a stateless deployment issues no
+/// identifier and so has none to hand on.
+///
+/// Use this wherever the identifier leaves the edge (an outbound origin URL, a
+/// click target, a proxied request body), so nothing is egressed that this
+/// deployment did not issue.
+///
+/// # Errors
+///
+/// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
+/// - [`TrustedServerError::EdgeCookie`] if the selected provider cannot be built
+pub fn recognized_ec_id(
+    settings: &Settings,
+    services: &RuntimeServices,
+    req: &Request<EdgeBody>,
+) -> Result<Option<String>, Report<TrustedServerError>> {
+    let Some(ec_id) = get_ec_id(req)? else {
+        return Ok(None);
+    };
+
+    let Some(provider) = build_provider(&settings.ec, services.ec_provider())? else {
+        log::debug!(
+            "No Edge Cookie provider configured; withholding the request's EC ID from egress"
+        );
+        return Ok(None);
+    };
+
+    if provider_owns_id(provider.as_ref(), &ec_id) {
+        return Ok(Some(ec_id));
+    }
+
+    log::debug!(
+        "Withholding an EC ID provider `{}` does not recognize from egress",
+        provider.id(),
+    );
     Ok(None)
 }
 
