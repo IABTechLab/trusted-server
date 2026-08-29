@@ -78,16 +78,16 @@ pub fn ec_finalize_response(
             expire_ec_cookie(settings, response);
 
             // Compute once for the authoritative identity-graph tombstones.
-            let ids_to_withdraw = withdrawal_ec_ids(ec_context);
+            let keys_to_withdraw = withdrawal_kv_keys(ec_context);
 
             // The identity-graph tombstone is the authoritative withdrawal marker
             // for subsequent EC behavior.
             if let Some(graph) = kv {
-                apply_withdrawal_tombstones(&ids_to_withdraw, |ec_id| {
-                    if let Err(err) = graph.write_withdrawal_tombstone(ec_id) {
+                apply_withdrawal_tombstones(&keys_to_withdraw, |kv_key| {
+                    if let Err(err) = graph.write_withdrawal_tombstone(kv_key) {
                         log::error!(
                             "Failed to write withdrawal tombstone for EC ID '{}': {err:?}",
-                            log_id(ec_id),
+                            log_id(kv_key),
                         );
                     }
                 });
@@ -99,8 +99,12 @@ pub fn ec_finalize_response(
 
     // Returning user: EC is permitted and came from the request.
     if ec_context.ec_was_present() && !ec_context.ec_generated() && ec_permitted {
-        if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value()) {
-            ingest_eid_cookies(eids_cookie, sharedid_cookie, ec_id, graph, registry);
+        // Key EID ingestion by the provider's canonical form of the identifier,
+        // the key the identity-graph row is stored under, so an ingested EID
+        // lands on the live row rather than creating a second one keyed by the
+        // value the browser carries.
+        if let (Some(graph), Some(kv_key)) = (kv, ec_context.ec_kv_key()) {
+            ingest_eid_cookies(eids_cookie, sharedid_cookie, &kv_key, graph, registry);
         }
 
         // Ordinary returning-user page views no longer refresh the browser
@@ -112,12 +116,14 @@ pub fn ec_finalize_response(
     // there is no KV graph: that would mint a browser cookie with no backing
     // identity-graph row, producing a phantom ID on later requests.
     if ec_context.ec_generated() {
-        let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value()) else {
-            log::info!("Skipping generated EC response write because KV graph is unavailable");
+        let (Some(graph), Some(kv_key)) = (kv, ec_context.ec_kv_key()) else {
+            log::info!(
+                "Skipping generated EC response write because the KV graph or the                  identity-graph key is unavailable"
+            );
             return;
         };
 
-        ingest_eid_cookies(eids_cookie, sharedid_cookie, ec_id, graph, registry);
+        ingest_eid_cookies(eids_cookie, sharedid_cookie, &kv_key, graph, registry);
         set_ec_cookie_on_response(settings, ec_context, response);
     }
 }
@@ -167,30 +173,35 @@ pub fn clear_ec_on_response(settings: &Settings, response: &mut Response<EdgeBod
     clear_ec_headers_on_response(response, None);
 }
 
-fn withdrawal_ec_ids(ec_context: &EcContext) -> HashSet<String> {
-    let mut hashes = HashSet::new();
+/// The identity-graph keys a withdrawal must tombstone.
+///
+/// Both the `ts-ec` cookie the request carried and the active identifier are
+/// turned into keys by the provider that owns them, so the tombstone lands on
+/// the row the live identifier is stored under rather than on the raw cookie
+/// value. An identifier no provider this deployment reads owns produces no key
+/// and is dropped, which is the same filtering the previous shape check did.
+/// The two collapse to one key when they are the same identity written two
+/// ways.
+fn withdrawal_kv_keys(ec_context: &EcContext) -> HashSet<String> {
+    let mut keys = HashSet::new();
 
-    if let Some(cookie_ec_id) = ec_context.existing_cookie_ec_id()
-        && ec_context.accepts_id(cookie_ec_id)
-    {
-        hashes.insert(cookie_ec_id.to_owned());
+    if let Some(cookie_kv_key) = ec_context.cookie_ec_kv_key() {
+        keys.insert(cookie_kv_key);
     }
 
-    if let Some(active_ec_id) = ec_context.ec_value()
-        && ec_context.accepts_id(active_ec_id)
-    {
-        hashes.insert(active_ec_id.to_owned());
+    if let Some(active_kv_key) = ec_context.ec_kv_key() {
+        keys.insert(active_kv_key);
     }
 
-    hashes
+    keys
 }
 
-fn apply_withdrawal_tombstones<F>(ec_ids: &HashSet<String>, mut write_tombstone: F)
+fn apply_withdrawal_tombstones<F>(kv_keys: &HashSet<String>, mut write_tombstone: F)
 where
     F: FnMut(&str),
 {
-    for ec_id in ec_ids {
-        write_tombstone(ec_id);
+    for kv_key in kv_keys {
+        write_tombstone(kv_key);
     }
 }
 
@@ -270,6 +281,50 @@ mod tests {
         )
     }
 
+    /// The identifier [`CanonicalizingProvider`] mints, as the browser carries
+    /// it in the `ts-ec` cookie.
+    const CANONICAL_COOKIE_VALUE: &str = "t0ca~MiXeD.CaseId";
+
+    /// The identity-graph key generation writes that identifier's row under.
+    /// Pinned to the mint path by
+    /// `generate_keys_the_identity_graph_by_the_normalized_identifier` in the
+    /// `ec` module tests.
+    const CANONICAL_KV_KEY: &str = "t0ca~mixed.caseid";
+
+    fn canonicalizing_context(
+        ec_was_present: bool,
+        ec_generated: bool,
+        consent: ConsentContext,
+        ec_allowed: bool,
+    ) -> EcContext {
+        make_context_with_consent(
+            Some(CANONICAL_COOKIE_VALUE),
+            Some(CANONICAL_COOKIE_VALUE),
+            ec_was_present,
+            ec_generated,
+            consent,
+            ec_allowed,
+        )
+        .with_provider_for_test(std::sync::Arc::new(
+            crate::ec::tests::CanonicalizingProvider,
+        ))
+    }
+
+    fn graph_with_live_canonical_row() -> KvIdentityGraph {
+        let graph = KvIdentityGraph::in_memory("finalize-canonical-store");
+        graph
+            .create(
+                CANONICAL_KV_KEY,
+                &crate::ec::kv_types::KvEntry::minimal(
+                    "ssp.example.com",
+                    "partner-uid-123",
+                    1_741_824_000,
+                ),
+            )
+            .expect("should write the row generation keys by the canonical form");
+        graph
+    }
+
     fn sample_ec_id(suffix: &str) -> String {
         format!("{}.{suffix}", "a".repeat(64))
     }
@@ -292,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_ec_ids_returns_cookie_ec_only_when_active_missing() {
+    fn withdrawal_kv_keys_returns_cookie_ec_only_when_active_missing() {
         let cookie_ec = sample_ec_id("cook1e");
         let ec_context = make_context(
             None,
@@ -303,7 +358,7 @@ mod tests {
             false,
         );
 
-        let ids = withdrawal_ec_ids(&ec_context);
+        let ids = withdrawal_kv_keys(&ec_context);
 
         assert_eq!(ids.len(), 1, "should include exactly one EC ID");
         assert!(
@@ -313,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_ec_ids_deduplicates_matching_cookie_and_active_ec() {
+    fn withdrawal_kv_keys_deduplicates_matching_cookie_and_active_ec() {
         let ec_id = sample_ec_id("same01");
         let ec_context = make_context(
             Some(&ec_id),
@@ -324,14 +379,14 @@ mod tests {
             false,
         );
 
-        let ids = withdrawal_ec_ids(&ec_context);
+        let ids = withdrawal_kv_keys(&ec_context);
 
         assert_eq!(ids.len(), 1, "should deduplicate identical EC IDs");
         assert!(ids.contains(&ec_id), "should retain the shared EC ID");
     }
 
     #[test]
-    fn withdrawal_ec_ids_includes_both_cookie_and_active_when_different() {
+    fn withdrawal_kv_keys_includes_both_cookie_and_active_when_different() {
         let active_ec = sample_ec_id("activ1");
         let cookie_ec = sample_ec_id("cook1e");
         let ec_context = make_context(
@@ -343,7 +398,7 @@ mod tests {
             false,
         );
 
-        let ids = withdrawal_ec_ids(&ec_context);
+        let ids = withdrawal_kv_keys(&ec_context);
 
         assert_eq!(ids.len(), 2, "should include both distinct EC IDs");
         assert!(ids.contains(&active_ec), "should include active EC ID");
@@ -351,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_ec_ids_filters_invalid_values() {
+    fn withdrawal_kv_keys_filters_invalid_values() {
         let valid_ec = sample_ec_id("valid1");
         let ec_context = make_context(
             Some(&valid_ec),
@@ -362,7 +417,7 @@ mod tests {
             false,
         );
 
-        let ids = withdrawal_ec_ids(&ec_context);
+        let ids = withdrawal_kv_keys(&ec_context);
 
         assert_eq!(ids.len(), 1, "should ignore malformed EC values");
         assert!(ids.contains(&valid_ec), "should keep the valid EC ID");
@@ -716,6 +771,95 @@ mod tests {
         assert!(
             get_header(&response, "set-cookie").is_none(),
             "a closed consent gate must not write a ts-ec cookie"
+        );
+    }
+
+    #[test]
+    fn withdrawal_tombstones_the_canonical_row_not_the_cookie_value() {
+        // The tombstone is the authoritative revocation marker, so it has to
+        // land on the key the live row uses. Written under the raw cookie
+        // value it creates a second row nothing reads, and the revocation
+        // never takes effect for a provider whose canonical form differs.
+        let settings = create_test_settings();
+        let graph = graph_with_live_canonical_row();
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let ec_context = canonicalizing_context(true, false, consent, false);
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let (live_row, _) = graph
+            .get(CANONICAL_KV_KEY)
+            .expect("should read the canonical row")
+            .expect("the canonical row should still exist");
+        assert!(
+            !live_row.consent.ok,
+            "withdrawal should tombstone the row the live identifier is keyed by"
+        );
+        assert!(
+            graph
+                .get(CANONICAL_COOKIE_VALUE)
+                .expect("should read the graph")
+                .is_none(),
+            "withdrawal should not write a tombstone under the raw cookie value"
+        );
+    }
+
+    #[test]
+    fn eid_ingestion_keys_by_the_providers_canonical_form() {
+        // An ingested EID must join the row the identifier already has. Keyed
+        // by the raw cookie value the upsert finds no row and the partner ID
+        // is dropped.
+        let settings = create_test_settings();
+        let graph = graph_with_live_canonical_row();
+        let partners = vec![make_partner("sharedid.org")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let ec_context = canonicalizing_context(true, false, consent, true);
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            Some("shared-cookie-id"),
+            &mut response,
+        );
+
+        let (row, _) = graph
+            .get(CANONICAL_KV_KEY)
+            .expect("should read the canonical row")
+            .expect("the canonical row should still exist");
+        assert_eq!(
+            row.ids.get("sharedid.org").map(|id| id.uid.as_str()),
+            Some("shared-cookie-id"),
+            "the ingested EID should land on the row keyed by the canonical form"
+        );
+        assert!(
+            graph
+                .get(CANONICAL_COOKIE_VALUE)
+                .expect("should read the graph")
+                .is_none(),
+            "EID ingestion should not create a row under the raw cookie value"
         );
     }
 }

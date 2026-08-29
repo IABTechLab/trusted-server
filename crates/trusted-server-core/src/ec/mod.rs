@@ -515,6 +515,41 @@ impl EcContext {
         self.accepted_providers().accepts(value)
     }
 
+    /// The identity-graph key for `value` under the providers this deployment
+    /// reads.
+    ///
+    /// The one place core turns an identifier into a row key. Every read and
+    /// write of an identity-graph row goes through this, so a provider whose
+    /// canonical form differs from the cookie value still finds the row it
+    /// minted. The owning provider is picked by the identifier's `{code}~`
+    /// prefix and supplies the canonical form of its own value part, matching
+    /// what [`generate_if_needed`](Self::generate_if_needed) wrote at mint.
+    ///
+    /// `None` when no provider this deployment reads owns `value`, in which
+    /// case there is no row to read or write.
+    #[must_use]
+    pub(crate) fn kv_key_for(&self, value: &str) -> Option<String> {
+        self.accepted_providers().canonical_kv_key(value)
+    }
+
+    /// The identity-graph key for this request's active identifier.
+    #[must_use]
+    pub(crate) fn ec_kv_key(&self) -> Option<String> {
+        self.ec_value().and_then(|value| self.kv_key_for(value))
+    }
+
+    /// The identity-graph key for the `ts-ec` cookie the request carried.
+    ///
+    /// Withdrawal tombstones the cookie's row as well as the active one,
+    /// because a stateless deployment and a cookie the active provider no
+    /// longer mints both leave [`ec_kv_key`](Self::ec_kv_key) empty while a
+    /// live row still exists.
+    #[must_use]
+    pub(crate) fn cookie_ec_kv_key(&self) -> Option<String> {
+        self.existing_cookie_ec_id()
+            .and_then(|value| self.kv_key_for(value))
+    }
+
     /// Returns whether the `ts-ec` cookie was present on the incoming request.
     #[must_use]
     pub fn cookie_was_present(&self) -> bool {
@@ -611,6 +646,22 @@ impl EcContext {
     #[must_use]
     pub fn ec_hash(&self) -> Option<&str> {
         self.ec_value.as_deref().map(generation::ec_hash)
+    }
+
+    /// Attaches a selected provider to a test-only [`EcContext`].
+    ///
+    /// The production constructor builds the provider from settings and
+    /// injected services. A test that only needs the provider's identifier
+    /// semantics (which identifiers it owns, and their canonical key form)
+    /// takes this shortcut instead.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_provider_for_test(
+        mut self,
+        provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+    ) -> Self {
+        self.selected_provider = Some(provider);
+        self
     }
 
     /// Creates a test-only `EcContext` whose creation gate is derived from the
@@ -1344,8 +1395,11 @@ mod tests {
 
     /// A provider whose identifier normalizes to a distinct canonical form, to
     /// prove the identity graph is keyed by the canonical form.
+    ///
+    /// Shared with the identify and finalization tests, which need a provider
+    /// whose canonical key is not the value the browser carries.
     #[derive(Debug)]
-    struct CanonicalizingProvider;
+    pub(crate) struct CanonicalizingProvider;
 
     impl EdgeCookieProvider for CanonicalizingProvider {
         fn id(&self) -> &'static str {
@@ -1402,6 +1456,14 @@ mod tests {
                 .expect("should read the graph")
                 .is_some(),
             "the graph row should be keyed by the code plus the canonical form"
+        );
+        // Pin the read-side derivation to the key generation actually wrote.
+        // Identify, the withdrawal tombstones, and EID ingestion all read the
+        // row through `ec_kv_key`, so the two must never drift apart.
+        assert_eq!(
+            ec.ec_kv_key().as_deref(),
+            Some("t0ca~mixed.caseid"),
+            "the read-side key should be the key generation wrote"
         );
     }
 
