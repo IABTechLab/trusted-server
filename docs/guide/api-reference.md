@@ -321,14 +321,14 @@ curl -I "https://edge.example.com/first-party/click?tsurl=https://advertiser.com
 
 ### GET/POST /first-party/sign
 
-URL signing endpoint. Returns signed first-party proxy URL for a given target URL.
+URL signing endpoint. Returns a signed first-party proxy URL for a valid HTTP or HTTPS target. When `proxy.allowed_domains` is non-empty, the endpoint checks the parsed target host before signing. An empty list permits every valid host.
 
 **Request Methods:** GET or POST
 
 **GET Request:**
 
 ```bash
-curl "https://edge.example.com/first-party/sign?url=https://external.com/pixel.gif"
+curl "https://edge.example.com/first-party/sign?url=https://cdn.example.com/pixel.gif"
 ```
 
 **POST Request:**
@@ -336,16 +336,23 @@ curl "https://edge.example.com/first-party/sign?url=https://external.com/pixel.g
 ```bash
 curl -X POST https://edge.example.com/first-party/sign \
   -H "Content-Type: application/json" \
-  -d '{"url":"https://external.com/pixel.gif"}'
+  -d '{"url":"https://cdn.example.com/pixel.gif"}'
 ```
 
 **Response:**
 
 ```json
 {
-  "signed_url": "https://edge.example.com/first-party/proxy?tsurl=https://external.com/pixel.gif&tstoken=abc123..."
+  "href": "/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example.com%2Fpixel.gif&tstoken=abc123...&tsexp=1234567890",
+  "base": "https://cdn.example.com/pixel.gif"
 }
 ```
+
+`href` is the signed proxy path. `base` is the normalized target without its query or fragment.
+
+**Error Responses:**
+
+- `403 Forbidden`: The target has a valid host that does not match a non-empty `proxy.allowed_domains` list
 
 **Use Cases:**
 
