@@ -266,6 +266,43 @@ pub fn reserved_response_effect(
     None
 }
 
+/// Applies a provider's response headers to a response that already carries
+/// the publisher origin's own.
+///
+/// Every header here accumulates with what the origin returned rather than
+/// replacing it, because a provider on this seam only ever adds evidence about
+/// the request. It is never correcting the origin's output, so core has no
+/// grounds to discard a value it did not write. Working through the headers a
+/// provider can actually set:
+///
+/// - `Set-Cookie` can never be folded into one field line, so replacing it
+///   drops every cookie the origin set, a publisher's session and sign-in
+///   cookies included. This is the case the whole rule turns on, because
+///   `response_headers` is a list of pairs precisely so a provider can set more
+///   than one cookie of its own, and replacing collapses those too.
+/// - The list-valued headers a provider realistically sets, `Vary` first among
+///   them, mean the union of their field lines. Replacing the origin's
+///   `Vary: Accept-Encoding` with the provider's own would break the cache
+///   correctness the origin asked for.
+/// - The single-valued headers where replacing would be the right answer are
+///   exactly the ones a provider must not author at all, and
+///   [`reserved_response_effect`] already fails the request for them: core's
+///   `x-ts-` namespace, the `ts-` managed cookies, and the framing and
+///   hop-by-hop set.
+///
+/// So nothing a provider is permitted to set here needs to replace, and
+/// accumulating is the direction that cannot silently destroy someone else's
+/// header. Appending where one value was wanted leaves a duplicate a reviewer
+/// can see; replacing where two were wanted leaves nothing at all.
+pub(crate) fn apply_provider_response_headers<I>(headers: &mut http::HeaderMap, provider_headers: I)
+where
+    I: IntoIterator<Item = (http::HeaderName, http::HeaderValue)>,
+{
+    for (name, value) in provider_headers {
+        headers.append(name, value);
+    }
+}
+
 /// The registered short code that namespaces one Edge Cookie provider's
 /// identifiers.
 ///

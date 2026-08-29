@@ -16,6 +16,7 @@ use super::cookies::{expire_ec_cookie, set_ec_cookie};
 use super::kv::KvIdentityGraph;
 use super::log_id;
 use super::prebid_eids::ingest_eid_cookies;
+use super::provider::apply_provider_response_headers;
 use super::registry::PartnerRegistry;
 
 /// TS-managed response headers tied to EC identity output.
@@ -56,10 +57,13 @@ pub fn ec_finalize_response(
     // one was checked against core's reserved response surface at capture
     // time in `EcContext::generate_with_provider`, so nothing here can set a
     // managed `ts-` cookie, an `x-ts-` header, or a framing or hop-by-hop
-    // header.
-    for (name, value) in ec_context.response_headers() {
-        response.headers_mut().insert(name, value.clone());
-    }
+    // header. They accumulate with whatever the origin returned rather than
+    // replacing it, for the reasons on
+    // `provider::apply_provider_response_headers`.
+    apply_provider_response_headers(
+        response.headers_mut(),
+        ec_context.response_headers().iter().cloned(),
+    );
 
     let ec_permitted = ec_context.ec_allowed();
 
@@ -860,6 +864,130 @@ mod tests {
                 .expect("should read the graph")
                 .is_none(),
             "EID ingestion should not create a row under the raw cookie value"
+        );
+    }
+
+    /// A provider that sets one cookie of its own and one `Vary` entry, the
+    /// two response effects a provider realistically asks for, so a test can
+    /// watch both land on a response the origin already wrote headers to.
+    #[derive(Debug)]
+    struct EvidenceHeaderProvider;
+
+    impl crate::ec::provider::EdgeCookieProvider for EvidenceHeaderProvider {
+        fn id(&self) -> &'static str {
+            "evidence-header"
+        }
+
+        fn code(&self) -> crate::ec::provider::ProviderCode {
+            crate::ec::provider::ProviderCode::new("t0eh")
+        }
+
+        fn generate(
+            &self,
+            _request_info: &dyn crate::evidence::RequestInfo,
+            _input: &crate::ec::provider::IdentityInput<'_>,
+        ) -> Result<
+            crate::ec::provider::GeneratedEdgeCookie,
+            error_stack::Report<crate::error::TrustedServerError>,
+        > {
+            Ok(crate::ec::provider::GeneratedEdgeCookie {
+                id: Some("evidence-id".to_owned()),
+                response_headers: vec![
+                    (
+                        http::header::SET_COOKIE,
+                        HeaderValue::from_static("vendor-ev=abc; Path=/"),
+                    ),
+                    (http::header::VARY, HeaderValue::from_static("sec-ch-ua")),
+                ],
+            })
+        }
+
+        fn accepts_id(&self, value: &str) -> bool {
+            !value.is_empty()
+        }
+
+        fn normalize_id_for_kv(&self, value: &str) -> String {
+            value.to_owned()
+        }
+    }
+
+    #[test]
+    fn provider_response_headers_reach_the_response_without_dropping_the_origins() {
+        // The response finalization runs on is the finished one, so it already
+        // carries the publisher origin's own headers. A provider effect must
+        // add to those, never replace them: replacing `Set-Cookie` would drop
+        // the publisher's session and sign-in cookies, and replacing `Vary`
+        // would break the caching the origin asked for.
+        let settings = create_test_settings();
+        let graph = KvIdentityGraph::in_memory("finalize-provider-headers-store");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context = make_context_with_consent(None, None, false, false, consent, true)
+            .with_provider_for_test(std::sync::Arc::new(EvidenceHeaderProvider));
+        ec_context
+            .generate_if_needed(&settings, Some(&graph))
+            .expect("should mint through the provider");
+
+        // What the publisher's origin returned, before EC finalization runs.
+        let mut response = empty_response();
+        response.headers_mut().append(
+            http::header::SET_COOKIE,
+            HeaderValue::from_static("publisher_session=origin-value; Path=/; HttpOnly"),
+        );
+        response.headers_mut().append(
+            http::header::VARY,
+            HeaderValue::from_static("accept-encoding"),
+        );
+
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let cookies: Vec<&str> = response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("should render set-cookie as utf-8"))
+            .collect();
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("publisher_session=origin-value")),
+            "the origin's own cookie must survive a provider effect, got {cookies:?}"
+        );
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("vendor-ev=abc")),
+            "the provider's cookie must reach the response, got {cookies:?}"
+        );
+        assert!(
+            cookies.iter().any(|cookie| cookie.starts_with("ts-ec=")),
+            "core's own managed cookie must still be written, got {cookies:?}"
+        );
+
+        let vary: Vec<&str> = response
+            .headers()
+            .get_all(http::header::VARY)
+            .iter()
+            .map(|value| value.to_str().expect("should render vary as utf-8"))
+            .collect();
+        assert!(
+            vary.contains(&"accept-encoding"),
+            "the origin's Vary must survive a provider effect, got {vary:?}"
+        );
+        assert!(
+            vary.contains(&"sec-ch-ua"),
+            "the provider's Vary must reach the response, got {vary:?}"
         );
     }
 }
