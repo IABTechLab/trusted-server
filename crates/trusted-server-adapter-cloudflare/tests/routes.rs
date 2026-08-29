@@ -714,6 +714,13 @@ const UNINJECTED_PROVIDER_TOML: &str = r#"
 
     [ec.providers.acme]
     endpoint = "https://ec.acme.example.com"
+
+    # An Edge Cookie provider is configured, so the permission model needs a
+    # default country, and single-jurisdiction operation acknowledged because
+    # no geo provider is selected.
+    [geo]
+    default_country = "FR"
+    assume_single_jurisdiction = true
 "#;
 
 /// A provider selection this adapter can never supply must fail while the

@@ -2912,6 +2912,14 @@ mod tests {
                     [ec]
                     passphrase = "test-secret-key-32-bytes-minimum"
 
+                    # The deprecated passphrase migrates to the hmac provider, so
+                    # the permission model needs a default country, and
+                    # single-jurisdiction operation acknowledged because no geo
+                    # provider is selected.
+                    [geo]
+                    default_country = "FR"
+                    assume_single_jurisdiction = true
+
                     [auction]
                     enabled = true
                     providers = []

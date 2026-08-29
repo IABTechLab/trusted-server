@@ -975,6 +975,13 @@ mod tests {
 
         [ec.providers.acme]
         endpoint = "https://ec.acme.example.com"
+
+        # An Edge Cookie provider is configured, so the permission model needs a
+        # default country, and single-jurisdiction operation acknowledged because
+        # no geo provider is selected.
+        [geo]
+        default_country = "FR"
+        assume_single_jurisdiction = true
     "#;
 
     /// The per-request Edge Cookie read must return its error rather than a
