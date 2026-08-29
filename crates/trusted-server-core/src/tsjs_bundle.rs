@@ -114,12 +114,21 @@ pub fn compose(parts: &[JsModulePart]) -> String {
 
 /// SHA-256 of [`compose`]'s output, hex encoded, without materializing it.
 ///
-/// The result is memoized per ordered set of `(id, sha256)` pairs, so a
-/// per-request caller hashes a given module set once per process or isolate.
-/// Because the key carries each part's content hash, a carried module that
-/// keeps its id but changes its source gets a new hash. The memo never
-/// evicts, so feed it only sets derived from configuration, never sets
-/// derived from request input.
+/// The result is memoized per ordered set of `(id, sha256)` pairs. Because the
+/// key carries each part's content hash, a carried module that keeps its id
+/// but changes its source gets a new hash. The memo never evicts, so feed it
+/// only sets derived from configuration, never sets derived from request
+/// input.
+///
+/// The memo can only hit where the process outlives the request, which of the
+/// four adapters means the Axum dev server alone, because its `main` builds
+/// the router once before serving. Fastly starts a fresh Wasm instance per
+/// request, and `edgezero_adapter_cloudflare::run_app` and
+/// `edgezero_adapter_spin::run_app` both call `build_app` inside the
+/// per-request entry point, so on those three every call is a miss. A miss
+/// costs a key vector, two mutex locks and a stored copy of the hash, all
+/// beside a SHA-256 over the whole bundle, so the memo is close to free where
+/// it cannot hit and removes the hash entirely where it can.
 ///
 /// # Panics
 ///
