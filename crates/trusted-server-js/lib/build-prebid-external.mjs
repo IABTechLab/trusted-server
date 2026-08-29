@@ -392,7 +392,6 @@ function resolveOneModule(stem, definition, context) {
   }
 
   return {
-    kind: definition.requestKey,
     stem,
     specifier,
     runtimeCodes: [...new Set(runtimeCodes)].sort(),
