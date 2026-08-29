@@ -961,9 +961,7 @@ regions and goldens at final HEAD produces no diff.
 | Order | Package                                 | Size | Depends on                                                                                        |
 | ----- | --------------------------------------- | ---- | ------------------------------------------------------------------------------------------------- |
 | 0     | WP1 containment subset → `main` PR (b)  | XS   | -                                                                                                 |
-| 9b    | Post-merge activation PR (c2) → `main`  | S    | #1049 merged into rc; own audited_main_tip; dual-ref validation + SHA binding; real scheduled run |
 | 0c    | CNAME PR (d)                            | XS   | open question 2; completion gate, does not block other rows                                       |
-| 10    | Release handoff PR (e) → `main`         | XS   | gates rc deletion (merge e, verify, then delete); issue + two runbooks produced by this refresh   |
 | 1     | WP1 hygiene (full, rc PR)               | S    | -                                                                                                 |
 | 2     | WP8a scaffolding                        | L    | -                                                                                                 |
 | 2b    | `main` automation PR (c), dispatch-only | XS   | WP8a (workflow content exists); validation dispatch vs the #1049 head                             |
@@ -974,6 +972,12 @@ regions and goldens at final HEAD produces no diff.
 | 7     | WP6 root + READMEs                      | M    | WP2                                                                                               |
 | 8     | WP7 in-code docs                        | M    | -                                                                                                 |
 | 9     | WP8b gate activation                    | M    | WP2-WP7                                                                                           |
+| 9b    | Post-merge activation PR (c2) → `main`  | S    | #1049 merged into rc; own audited_main_tip; dual-ref validation + SHA binding; real scheduled run |
+| 10    | Release handoff PR (e) → `main`         | XS   | gates rc deletion (merge e, verify, then delete); issue + two runbooks produced by this refresh   |
+
+Orders 0-9 are Epoch 1 (this refresh; closes at implementation-ready
+once they land, then activated after 9b). 9b is Epoch 2. 10 is Epoch 3,
+owned and specified here but executed at release.
 
 ## Verification
 
