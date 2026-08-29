@@ -61,7 +61,7 @@ echo "==> Building TSJS browser fixtures..."
 cd "$REPO_ROOT/$TSJS_LIB_DIR"
 npm ci
 npm run build
-npm run build:prebid-external
+npm run build:prebid-external -- --modules-json '{"bidder":["rubiconBidAdapter"]}'
 cd "$REPO_ROOT/$BROWSER_DIR"
 
 # --- Export env vars for global-setup.ts ---
