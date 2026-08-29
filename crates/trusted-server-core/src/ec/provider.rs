@@ -338,8 +338,30 @@ pub fn split_provider_code(full: &str) -> (Option<&str>, &str) {
 /// carries, with the value part accepted by that provider's
 /// [`accepts_id`](EdgeCookieProvider::accepts_id). A legacy bare identifier
 /// (no code prefix) belongs only to the built-in HMAC provider, which
-/// dual-reads its pre-envelope form for one release cycle so deployed cookies
-/// keep working across the migration.
+/// dual-reads its pre-envelope form so deployed cookies keep working across
+/// the migration.
+///
+/// # Retiring the legacy bare reader
+///
+/// The reader stays until a bare identifier can no longer arrive. A returning
+/// visitor's bare cookie is never rewritten into the coded form, and neither
+/// the cookie nor its identity-graph row is refreshed on an ordinary page view
+/// (see `ec_finalize_response` in [`finalize`](super::finalize)), so each has
+/// one fixed lifetime running from the moment it was written: `COOKIE_MAX_AGE`
+/// in [`cookies`](super::cookies) and `ENTRY_TTL` in [`kv`](super::kv), both
+/// one year, neither operator-configurable. The earliest safe retirement is
+/// therefore one year (the longer of the two, and today they are equal) after
+/// the last release that could still mint a bare identifier has stopped
+/// running anywhere, plus however long a deployment's own rollout takes to
+/// reach every point of presence.
+///
+/// The other half of that condition, evidence that bare identifiers really
+/// have stopped arriving, cannot be checked today. Nothing counts or logs a
+/// bare-form read-back, so there is no observed legacy-reader traffic to look
+/// at, and the elapsed time alone cannot tell anyone whether a deployment
+/// somewhere is still serving them. Scheduling the removal needs that signal
+/// to exist first. Until it does the reader stays, and keeping it costs one
+/// string comparison per read-back.
 #[must_use]
 pub fn provider_owns_id(provider: &dyn EdgeCookieProvider, full: &str) -> bool {
     match split_provider_code(full) {

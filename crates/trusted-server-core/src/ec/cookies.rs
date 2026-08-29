@@ -131,6 +131,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_ec_cookie_lifetime_is_one_year() {
+        // The legacy bare-identifier reader's retirement condition (see
+        // `provider_owns_id`) is written in terms of this lifetime and the
+        // identity-graph `ENTRY_TTL`, which `kv::tests::constants_have_expected_values`
+        // pins to the same figure. Changing either moves the earliest safe
+        // retirement, so neither may drift unnoticed.
+        assert_eq!(
+            COOKIE_MAX_AGE, 31_536_000,
+            "the EC cookie should live one year"
+        );
+    }
+
+    #[test]
     fn identifier_bounds_reject_oversize_and_accept_tilde() {
         assert!(
             ec_id_has_only_allowed_chars("a.~-_Z9"),
