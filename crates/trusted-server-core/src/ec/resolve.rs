@@ -27,7 +27,7 @@ use super::cookies::{
 };
 use super::kv::KvIdentityGraph;
 use super::kv_types::KvEntry;
-use super::provider::{ClientResolveInput, build_provider};
+use super::provider::{ClientResolveInput, apply_provider_response_headers, build_provider};
 
 /// Maximum size of a resolve request body.
 ///
@@ -163,9 +163,7 @@ pub fn handle_ec_resolve(
         .map(|value| super::provider::apply_provider_code(provider.as_ref(), &value));
     let Some(ec_id) = generated_id else {
         let mut response = status_only(StatusCode::NO_CONTENT);
-        for (name, value) in generated.response_headers {
-            response.headers_mut().insert(name, value);
-        }
+        apply_provider_response_headers(response.headers_mut(), generated.response_headers);
         return Ok(response);
     };
 
@@ -224,9 +222,11 @@ pub fn handle_ec_resolve(
 
     // Apply any response headers the provider asked for (for example to request
     // more client evidence on a later request). Empty for the demo provider.
-    for (name, value) in generated.response_headers {
-        response.headers_mut().insert(name, value);
-    }
+    // They accumulate with what this handler already set rather than replacing
+    // it, for the reasons on `provider::apply_provider_response_headers`; here
+    // that keeps the `Cache-Control: no-store` every identity response must
+    // carry, which a replacing write would drop.
+    apply_provider_response_headers(response.headers_mut(), generated.response_headers);
 
     set_provider_ec_cookie(settings, &mut response, &ec_id);
     // The Edge Cookie is HttpOnly, so the page script cannot see it; the
@@ -529,6 +529,59 @@ mod tests {
         assert!(
             format!("{err:?}").contains("x-ts-` namespace"),
             "the failure should name the reserved effect, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_accumulates_provider_response_headers_with_its_own() {
+        // The provider's own effects must add to what the handler already set,
+        // never replace it. Replacing collapsed a provider's own cookie list
+        // to whichever came last, and would drop the `Cache-Control: no-store`
+        // that every identity response has to carry.
+        let graph = in_memory_graph();
+        let response = resolve_with_header_provider(
+            &[
+                ("set-cookie", "vendor-ev=abc; Path=/"),
+                ("set-cookie", "vendor-state=xyz; Path=/"),
+                ("cache-control", "max-age=600"),
+            ],
+            true,
+            Some(&graph),
+        )
+        .expect("should handle resolve");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a minted identifier should return 200"
+        );
+
+        let cookies: Vec<&str> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("should render set-cookie as utf-8"))
+            .collect();
+        for expected in ["vendor-ev=abc", "vendor-state=xyz", "ts-ec=", "ts-ecr=1"] {
+            assert!(
+                cookies.iter().any(|cookie| cookie.starts_with(expected)),
+                "`{expected}` should survive on the response, got {cookies:?}"
+            );
+        }
+
+        let cache_control: Vec<&str> = response
+            .headers()
+            .get_all(header::CACHE_CONTROL)
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .expect("should render cache-control as utf-8")
+            })
+            .collect();
+        assert!(
+            cache_control.contains(&"no-store"),
+            "a provider header must not drop the no-store an identity response carries, got              {cache_control:?}"
         );
     }
 
