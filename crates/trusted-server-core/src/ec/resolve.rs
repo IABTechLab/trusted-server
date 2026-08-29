@@ -57,13 +57,18 @@ const MAX_BODY_SIZE: usize = 64 * 1024;
 /// closed, no provider is configured, no graph is available, or the provider
 /// mints nothing, the response is `204` with no cookie. Every response this
 /// handler builds carries `Cache-Control: no-store`; a provider or
-/// configuration error propagates to the adapter's error response instead.
+/// configuration error propagates to the adapter's error response instead,
+/// and so does a provider asking for a response header inside core's reserved
+/// surface, which is a broken provider contract rather than a bad request.
 ///
 /// # Errors
 ///
 /// Returns [`TrustedServerError`] when the provider fails to process the
-/// payload. A payload that is merely unverified or absent yields a `204`
-/// rather than an error.
+/// payload, or asks for a response header inside core's reserved surface
+/// (see
+/// [`reserved_response_effect`](crate::ec::provider::reserved_response_effect)).
+/// A payload that is merely unverified or absent yields a `204` rather than an
+/// error.
 pub fn handle_ec_resolve(
     settings: &Settings,
     req: Request<EdgeBody>,
@@ -131,6 +136,27 @@ pub fn handle_ec_resolve(
             "not minted"
         },
     );
+
+    // Check every response header the provider asked for against core's
+    // reserved surface, exactly as the organic mint path does in
+    // `EcContext::generate_with_provider`. A provider may set its own cookies
+    // and headers, but not a managed `ts-` cookie, a header in the `x-ts-`
+    // namespace, or a framing or hop-by-hop header. Without this a
+    // browser-side provider could set `ts-ec` itself and walk straight past
+    // the identifier bounds, the conflict check and the row-before-cookie
+    // rule below. The check sits before the identifier is read because a
+    // provider can return headers with no identifier at all, which is the
+    // 204 path, and that path applies headers too.
+    for (name, value) in &generated.response_headers {
+        if let Some(effect) = super::provider::reserved_response_effect(name, value) {
+            return Err(Report::new(TrustedServerError::EdgeCookie {
+                message: format!(
+                    "Provider `{}` returned a response header `{name}` that {effect}",
+                    provider.id(),
+                ),
+            }));
+        }
+    }
 
     let generated_id = generated
         .id
@@ -391,6 +417,119 @@ mod tests {
         fn normalize_id_for_kv(&self, value: &str) -> String {
             value.to_owned()
         }
+    }
+
+    /// The identifier [`ResolveHeaderProvider`] mints when asked to.
+    const HEADER_PROVIDER_ID: &str = "5c3a1b70-2f4d-4a19-9c6e-7b0d18e4a221";
+
+    /// A **test-only** provider that returns caller-chosen response headers
+    /// from the client-resolve path, so a test can drive one provider response
+    /// effect at a time through this endpoint, with and without an identifier.
+    #[derive(Debug)]
+    struct ResolveHeaderProvider {
+        headers: &'static [(&'static str, &'static str)],
+        mint: bool,
+    }
+
+    impl EdgeCookieProvider for ResolveHeaderProvider {
+        fn id(&self) -> &'static str {
+            "resolve-header"
+        }
+
+        fn code(&self) -> crate::ec::provider::ProviderCode {
+            crate::ec::provider::ProviderCode::new("t0rh")
+        }
+
+        fn generate(
+            &self,
+            _request_info: &dyn RequestInfo,
+            _input: &IdentityInput<'_>,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            Ok(GeneratedEdgeCookie::default())
+        }
+
+        fn resolve_from_client(
+            &self,
+            _input: &ClientResolveInput<'_>,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            Ok(GeneratedEdgeCookie {
+                id: self.mint.then(|| HEADER_PROVIDER_ID.to_owned()),
+                response_headers: self
+                    .headers
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            http::HeaderName::from_bytes(name.as_bytes())
+                                .expect("should parse header name"),
+                            HeaderValue::from_static(value),
+                        )
+                    })
+                    .collect(),
+            })
+        }
+
+        fn accepts_id(&self, value: &str) -> bool {
+            !value.is_empty()
+        }
+
+        fn normalize_id_for_kv(&self, value: &str) -> String {
+            value.to_owned()
+        }
+    }
+
+    /// Drives one resolve request through [`ResolveHeaderProvider`], returning
+    /// whatever the handler produced.
+    fn resolve_with_header_provider(
+        headers: &'static [(&'static str, &'static str)],
+        mint: bool,
+        graph: Option<&crate::ec::kv::KvIdentityGraph>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        let mut settings = create_test_settings();
+        settings.ec.provider = Some(EcProviderSelection::from("resolve-header"));
+        let services =
+            noop_services_with_ec_provider(Arc::new(ResolveHeaderProvider { headers, mint }));
+        let organic = Request::builder()
+            .method(Method::GET)
+            .uri("https://edge.example.com/")
+            .body(EdgeBody::empty())
+            .expect("should build organic request");
+        let ec = EcContext::read_from_request(&settings, &organic, &services)
+            .expect("should read EC context");
+        handle_ec_resolve(&settings, post(HEADER_PROVIDER_ID), &ec, graph)
+    }
+
+    #[test]
+    fn resolve_rejects_a_reserved_response_effect_when_nothing_is_minted() {
+        // The 204 path applied provider headers with no check at all, so a
+        // browser-side provider could set the managed identity cookie while
+        // returning no identifier, walking past the identifier bounds, the
+        // conflict check and the row-before-cookie rule below it.
+        let outcome = resolve_with_header_provider(
+            &[("set-cookie", "ts-ec=forged-value; Path=/")],
+            false,
+            None,
+        );
+
+        let err = outcome.expect_err("a managed cookie effect should fail the request");
+        assert!(
+            format!("{err:?}").contains("ts-` namespace"),
+            "the failure should name the reserved effect, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_a_reserved_response_effect_on_the_minted_path() {
+        // The same check has to cover the 200 path, where the provider does
+        // mint and core is about to write its own cookie and headers.
+        let graph = in_memory_graph();
+        let outcome =
+            resolve_with_header_provider(&[("x-ts-ec", "forged-value")], true, Some(&graph));
+
+        let err = outcome.expect_err("a reserved header effect should fail the request");
+        assert!(
+            format!("{err:?}").contains("x-ts-` namespace"),
+            "the failure should name the reserved effect, got {err:?}"
+        );
     }
 
     #[test]
