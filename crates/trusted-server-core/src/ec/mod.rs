@@ -316,8 +316,9 @@ impl EcContext {
     ///
     /// # Errors
     ///
-    /// Returns an error if the client IP is unavailable and generation is
-    /// needed, or if HMAC generation fails.
+    /// Returns an error if the selected provider fails to derive an identifier,
+    /// which includes a provider that needs the client IP being run on a host
+    /// that cannot supply one.
     pub fn generate_if_needed(
         &mut self,
         settings: &Settings,
@@ -343,16 +344,14 @@ impl EcContext {
             return Ok(());
         }
 
-        // EC generation needs the client IP; checked after the cheap skip
-        // guards so a stateless deployment on a host with no client IP does not
-        // log spurious errors. The provider reads it borrowed at generate time
-        // (see [`generate_with_provider`]), so nothing is cloned here.
-        if self.client_ip.is_none() {
-            return Err(Report::new(TrustedServerError::EdgeCookie {
-                message: "Client IP required for EC generation but unavailable".to_owned(),
-            }));
-        }
-
+        // Whether the client IP is needed is the selected provider's decision,
+        // not core's. A provider that derives identity from headers, cookies,
+        // query parameters, or the client reads no IP and must still run on a
+        // host that cannot supply one. The IP is passed as the documented
+        // unavailable value, the empty string (see
+        // [`RequestInfo::client_ip`](crate::evidence::RequestInfo::client_ip)),
+        // and a provider that needs it refuses there, which fails the request
+        // rather than serving without identity.
         self.generate_with_provider(ec_provider.as_ref(), settings, kv)
     }
 
@@ -370,8 +369,9 @@ impl EcContext {
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::EdgeCookie`] when the client IP is
-    /// unavailable, the provider fails to derive an identifier, the provider
+    /// Returns [`TrustedServerError::EdgeCookie`] when the provider fails to
+    /// derive an identifier (which for [`HmacProvider`] includes an
+    /// unavailable client IP), the provider
     /// asks for a response header inside core's reserved surface (see
     /// [`reserved_response_effect`](crate::ec::provider::reserved_response_effect)),
     /// or persisting a generated identifier to the KV identity graph fails.
@@ -1062,6 +1062,75 @@ mod tests {
                 .expect("kv get should succeed")
                 .is_none(),
             "the KV key must be case-sensitive and verbatim, not lowercased"
+        );
+    }
+
+    #[test]
+    fn a_provider_that_reads_no_client_ip_mints_when_the_host_has_none() {
+        use crate::platform::test_support::noop_services_with_ec_provider_without_client_ip;
+
+        // The requirement for a client IP belongs to the provider that uses
+        // one, not to core. A provider deriving identity from the request
+        // query and cookies runs on a host that cannot determine a client IP,
+        // and receives the documented unavailable value, the empty string.
+        let provider = Arc::new(EvidenceCapturingProvider::default());
+        let mut settings = create_test_settings();
+        settings.ec.provider = Some(EcProviderSelection::from("evidence"));
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/page?id=abc123")
+            .header("cookie", "client-id=xyz789")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let services = noop_services_with_ec_provider_without_client_ip(provider.clone());
+        let geo = non_regulated_geo();
+        let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
+            .expect("should read EC context");
+        assert_eq!(
+            ec.client_ip(),
+            None,
+            "the host should supply no client IP in this test"
+        );
+
+        ec.generate_if_needed(&settings, None)
+            .expect("a provider that reads no client IP should still mint");
+        assert_eq!(
+            ec.ec_value(),
+            Some("t0ev~evidence-ec"),
+            "the identifier should be committed with no client IP available"
+        );
+    }
+
+    #[test]
+    fn the_hmac_provider_refuses_when_the_host_has_no_client_ip() {
+        // The other half: the built-in provider's only input is the client IP,
+        // so with none it fails rather than hashing the empty string into an
+        // identifier every visitor on that host would share. Identity cannot be
+        // established, so the request fails rather than being served without.
+        let settings = create_test_settings();
+        let req = create_test_request(&[]);
+        let geo = non_regulated_geo();
+        let mut ec =
+            EcContext::read_from_request_with_geo(&settings, &req, &noop_services(), Some(&geo))
+                .expect("should read EC context");
+        assert_eq!(
+            ec.client_ip(),
+            None,
+            "the host should supply no client IP in this test"
+        );
+
+        let err = ec
+            .generate_if_needed(&settings, None)
+            .expect_err("the HMAC provider should refuse without a client IP");
+        assert!(
+            err.to_string().contains("client IP"),
+            "the error should name the missing client IP, got: {err}"
+        );
+        assert_eq!(
+            ec.ec_value(),
+            None,
+            "no identifier should be committed when the provider refuses"
         );
     }
 

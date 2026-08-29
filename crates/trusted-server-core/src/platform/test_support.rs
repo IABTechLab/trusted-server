@@ -694,6 +694,30 @@ pub(crate) fn noop_services() -> RuntimeServices {
 pub(crate) fn noop_services_with_ec_provider(
     ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
 ) -> RuntimeServices {
+    // A fixed client IP, so a provider that reads one (the built-in HMAC
+    // provider does) can run.
+    noop_services_with_ec_provider_and_ip(
+        ec_provider,
+        Some("203.0.113.10".parse().expect("should parse test client IP")),
+    )
+}
+
+/// Build a [`RuntimeServices`] with an injected Edge Cookie provider and no
+/// client IP, modeling a host that cannot determine one.
+///
+/// Whether that matters is the provider's decision, so this exists to test both
+/// answers: a provider reading other evidence still mints, and one that needs
+/// the IP refuses.
+pub(crate) fn noop_services_with_ec_provider_without_client_ip(
+    ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+) -> RuntimeServices {
+    noop_services_with_ec_provider_and_ip(ec_provider, None)
+}
+
+fn noop_services_with_ec_provider_and_ip(
+    ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+    client_ip: Option<IpAddr>,
+) -> RuntimeServices {
     RuntimeServices::builder()
         .config_store(Arc::new(NoopConfigStore))
         .secret_store(Arc::new(NoopSecretStore))
@@ -701,9 +725,8 @@ pub(crate) fn noop_services_with_ec_provider(
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
         .geo(Arc::new(NoopGeo))
-        // A fixed client IP so the generate path (which requires one) can run.
         .client_info(ClientInfo {
-            client_ip: Some("203.0.113.10".parse().expect("should parse test client IP")),
+            client_ip,
             ..ClientInfo::default()
         })
         .ec_provider(ec_provider)

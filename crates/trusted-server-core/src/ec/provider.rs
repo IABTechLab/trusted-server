@@ -531,6 +531,14 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
 /// Derives the identifier from the client IP (read from the [`RequestInfo`]
 /// passed at call time) and the configured passphrase via
 /// [`generation::generate_ec_id`].
+///
+/// The client IP is this provider's only input, so it is this provider that
+/// requires one. On a host that cannot supply one, [`RequestInfo::client_ip`]
+/// is the empty string and [`generate`](Self::generate) fails rather than
+/// hashing the empty string into an identifier every visitor on that host
+/// would share. The failure reaches the caller, so the request fails rather
+/// than being served without identity. A provider that reads other evidence
+/// makes its own decision and is unaffected.
 #[derive(Debug, Clone)]
 pub struct HmacProvider {
     passphrase: Redacted<String>,
@@ -558,7 +566,14 @@ impl EdgeCookieProvider for HmacProvider {
         request_info: &dyn RequestInfo,
         _input: &IdentityInput<'_>,
     ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
-        let id = generation::generate_ec_id(self.passphrase.expose(), request_info.client_ip())?;
+        let client_ip = request_info.client_ip();
+        if client_ip.is_empty() {
+            return Err(Report::new(TrustedServerError::EdgeCookie {
+                message: "Edge Cookie provider `hmac` requires the client IP, and this host                           could not supply one"
+                    .to_owned(),
+            }));
+        }
+        let id = generation::generate_ec_id(self.passphrase.expose(), client_ip)?;
         Ok(GeneratedEdgeCookie {
             id: Some(id),
             response_headers: Vec::new(),
