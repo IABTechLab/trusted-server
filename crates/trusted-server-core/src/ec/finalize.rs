@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use edgezero_core::body::Body as EdgeBody;
 use http::Response;
 
+use crate::constants::EC_RESPONSE_HEADERS;
 use crate::settings::Settings;
 
 use super::EcContext;
@@ -18,14 +19,6 @@ use super::log_id;
 use super::prebid_eids::ingest_eid_cookies;
 use super::provider::apply_provider_response_headers;
 use super::registry::PartnerRegistry;
-
-/// TS-managed response headers tied to EC identity output.
-const EC_RESPONSE_HEADERS: &[&str] = &[
-    "x-ts-ec",
-    "x-ts-eids",
-    "x-ts-ec-consent",
-    "x-ts-eids-truncated",
-];
 
 /// Finalizes EC response behavior for all routes.
 ///
