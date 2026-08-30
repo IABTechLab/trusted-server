@@ -554,7 +554,7 @@ pub(crate) fn derive_device_signals(settings: &Settings, req: &FastlyRequest) ->
         .get_client_ip_addr()
         .map(|ip| ip.to_string())
         .unwrap_or_default();
-    let request_info = BorrowedRequestInfo::new(&client_ip).with_headers(&headers);
+    let request_info = BorrowedRequestInfo::new(&client_ip, None).with_headers(&headers);
     build_device_provider(settings, || {
         let host_signals: Arc<dyn HostSignals> = Arc::new(FastlyHostSignals::from_request(req));
         Box::new(FastlyDeviceProvider::new(host_signals)) as Box<dyn DeviceProvider>

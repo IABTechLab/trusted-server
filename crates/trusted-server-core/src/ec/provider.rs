@@ -1131,6 +1131,7 @@ mod tests {
     use super::*;
     use crate::evidence::OwnedRequestInfo;
     use crate::settings::{EcProviders, HmacProviderConfig, HostSignalsProviderConfig};
+    use http::HeaderMap;
 
     #[test]
     fn a_malformed_provider_code_is_refused_rather_than_panicking() {
@@ -1506,7 +1507,7 @@ mod tests {
     }
 
     fn test_request_info() -> OwnedRequestInfo {
-        OwnedRequestInfo::new("203.0.113.1".to_owned())
+        OwnedRequestInfo::new("203.0.113.1".to_owned(), HeaderMap::new())
     }
 
     /// Test host signals with fixed JA4/H2 values.

@@ -370,6 +370,7 @@ fn evaluate_known_browser(ja4_class: Option<&str>, h2_fp_hash: Option<&str>) -> 
 mod tests {
     use super::*;
     use crate::evidence::OwnedRequestInfo;
+    use http::HeaderMap;
 
     // Chrome Mac UA
     const CHROME_MAC_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
@@ -792,7 +793,7 @@ mod tests {
             http::HeaderValue::from_str(user_agent)
                 .expect("should build a valid User-Agent header"),
         );
-        OwnedRequestInfo::new(String::new()).with_headers(headers)
+        OwnedRequestInfo::new(String::new(), headers)
     }
 
     /// A stand-in for the host-specific provider the adapter injects, so the

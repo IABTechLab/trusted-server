@@ -105,6 +105,14 @@ impl OwnedRequestInfo {
     /// so a provider can read request parameters through
     /// [`query_param`](RequestInfo::query_param).
     #[must_use]
+    /// Replaces the header snapshot, for a caller that builds the info first
+    /// and has the headers second.
+    #[must_use]
+    pub fn with_headers(mut self, headers: HeaderMap) -> Self {
+        self.headers = headers;
+        self
+    }
+
     pub fn with_request_target(mut self, path: String, query: String) -> Self {
         self.path = path;
         self.query = query;
@@ -180,6 +188,14 @@ impl<'a> BorrowedRequestInfo<'a> {
     /// provider can read request parameters through
     /// [`query_param`](RequestInfo::query_param).
     #[must_use]
+    /// Borrows a different header map, for a caller that builds the info first
+    /// and has the headers second.
+    #[must_use]
+    pub fn with_headers(mut self, headers: &'a HeaderMap) -> Self {
+        self.headers = Some(headers);
+        self
+    }
+
     pub fn with_request_target(mut self, path: &'a str, query: &'a str) -> Self {
         self.path = path;
         self.query = query;
@@ -218,6 +234,20 @@ impl RequestInfo for BorrowedRequestInfo<'_> {
     fn query(&self) -> &str {
         self.query
     }
+}
+
+/// Host-computed client fingerprints that are not carried in request headers.
+///
+/// A host that can compute them supplies an implementation (Fastly exposes the
+/// TLS JA4 and HTTP/2 fingerprints). A provider that needs them takes
+/// `Arc<dyn HostSignals>` in its constructor, and on a host that supplies none the
+/// provider cannot be built and the request stops.
+pub trait HostSignals: Send + Sync + core::fmt::Debug {
+    /// The full JA4 TLS fingerprint, or `None` when unavailable.
+    fn ja4(&self) -> Option<&str>;
+
+    /// The raw HTTP/2 SETTINGS fingerprint, or `None` when unavailable.
+    fn h2(&self) -> Option<&str>;
 }
 
 #[cfg(test)]
@@ -310,8 +340,8 @@ mod tests {
     fn request_info_reads_the_user_agent_from_attached_headers() {
         let headers = headers_with_user_agent("ExampleAgent/1.0");
 
-        let owned = OwnedRequestInfo::new(String::new()).with_headers(headers.clone());
-        let borrowed = BorrowedRequestInfo::new("").with_headers(&headers);
+        let owned = OwnedRequestInfo::new(String::new(), headers.clone());
+        let borrowed = BorrowedRequestInfo::new("", Some(&headers));
 
         assert_eq!(
             owned.user_agent(),
@@ -328,12 +358,12 @@ mod tests {
     #[test]
     fn request_info_reports_no_user_agent_without_headers() {
         assert_eq!(
-            OwnedRequestInfo::new(String::new()).user_agent(),
+            OwnedRequestInfo::new(String::new(), HeaderMap::new()).user_agent(),
             "",
             "a snapshot built without headers should report no User-Agent"
         );
         assert_eq!(
-            BorrowedRequestInfo::new("").user_agent(),
+            BorrowedRequestInfo::new("", None).user_agent(),
             "",
             "a borrowed view built without headers should report no User-Agent"
         );

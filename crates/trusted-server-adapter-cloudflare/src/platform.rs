@@ -663,15 +663,22 @@ pub fn build_runtime_services(
 /// Reads Cloudflare geo headers injected by the Workers runtime.
 ///
 /// `cf-ipcountry` is available on all plans. `cf-ipcity`, `cf-ipcontinent`,
-/// `cf-iplatitude`, and `cf-iplongitude` require an Enterprise plan. Absent or
-/// unparseable values default to empty strings or `0.0`. Country code `XX`
-/// (Cloudflare's "unknown" sentinel) is treated as absent.
+/// `cf-iplatitude`, `cf-iplongitude` and `cf-region-code` require an Enterprise
+/// plan and the visitor-location managed transform. Absent or unparseable
+/// values default to empty strings or `0.0`. Country code `XX` (Cloudflare's
+/// "unknown" sentinel) is treated as absent.
+///
+/// The region is the ISO 3166-2 subdivision code from `cf-region-code`, for
+/// example `CA`, and not the subdivision name from `cf-region`, because the US
+/// state privacy rules in `[consent.us_states] privacy_states` are written as
+/// two-letter codes and a name would never match one.
 struct CloudflareGeo {
     country: String,
     city: String,
     continent: String,
     latitude: f64,
     longitude: f64,
+    region: Option<String>,
 }
 
 impl PlatformGeo for CloudflareGeo {
@@ -686,7 +693,7 @@ impl PlatformGeo for CloudflareGeo {
             latitude: self.latitude,
             longitude: self.longitude,
             metro_code: 0,
-            region: None,
+            region: self.region.clone(),
             asn: None,
         }))
     }
@@ -720,12 +727,19 @@ fn build_geo(ctx: &edgezero_core::context::RequestContext) -> CloudflareGeo {
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
+    let region = headers
+        .get("cf-region-code")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     CloudflareGeo {
         country,
         city,
         continent,
         latitude,
         longitude,
+        region,
     }
 }
 
@@ -781,6 +795,80 @@ mod tests {
             .body(edgezero_core::body::Body::empty())
             .expect("should build test request");
         RequestContext::new(req, PathParams::default())
+    }
+
+    /// Builds a request context carrying several headers at once.
+    fn make_ctx_with_headers(headers: &[(&str, &str)]) -> RequestContext {
+        let mut builder = request_builder().method("GET").uri("https://example.com/");
+        for (name, value) in headers {
+            builder = builder.header(
+                *name,
+                HeaderValue::from_str(value).expect("should parse test header value"),
+            );
+        }
+        let req = builder
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build test request");
+        RequestContext::new(req, PathParams::default())
+    }
+
+    #[test]
+    fn a_us_state_visitor_reaches_the_us_state_jurisdiction_and_its_opt_out() {
+        // This adapter used to hardcode `region: None` and read no region
+        // header, and the consequence ran all the way to the privacy outcome.
+        // `detect_jurisdiction` reaches its US branch only when the country is
+        // `US` and a region is present, so every US visitor fell through to
+        // `NonRegulated`, where `allows_ec_creation` returns true without ever
+        // reading `ctx.gpc`. A Sec-GPC opt-out was therefore ignored for every
+        // US visitor on Cloudflare.
+        let config = trusted_server_core::consent_config::ConsentConfig::default();
+
+        let ctx = make_ctx_with_headers(&[("cf-ipcountry", "US"), ("cf-region-code", "CA")]);
+        let geo = build_geo(&ctx)
+            .lookup(None)
+            .expect("should look up without failing")
+            .expect("a country header should resolve a location");
+        assert_eq!(
+            geo.region.as_deref(),
+            Some("CA"),
+            "the ISO 3166-2 subdivision code should reach the geo info"
+        );
+
+        let jurisdiction =
+            trusted_server_core::consent::jurisdiction::detect_jurisdiction(Some(&geo), &config);
+        assert_eq!(
+            jurisdiction,
+            trusted_server_core::consent::jurisdiction::Jurisdiction::UsState("CA".to_owned()),
+            "a Californian visitor should reach the US state jurisdiction"
+        );
+
+        // Reaching that jurisdiction is what this adapter is responsible for,
+        // and it is the switch every downstream opt-out hangs off. A Sec-GPC
+        // signal, a GPP US sale opt-out and a US Privacy opt-out are all
+        // consulted on the US state branch and none of them are consulted on
+        // the unregulated one, so a visitor who never reaches the US state
+        // jurisdiction has every one of those signals ignored. Which gate reads
+        // the jurisdiction is core's business and changes across this stack, so
+        // it is core that tests the reading.
+
+        // Without the region header nothing can place the visitor in a state,
+        // so the jurisdiction is the unregulated one and the same opt-out is
+        // ignored. That is the behavior this fix removes for any deployment
+        // whose plan supplies the header.
+        let ctx = make_ctx_with_headers(&[("cf-ipcountry", "US")]);
+        let geo = build_geo(&ctx)
+            .lookup(None)
+            .expect("should look up without failing")
+            .expect("a country header should resolve a location");
+        assert_eq!(
+            geo.region, None,
+            "no region header should mean no region, not an invented one"
+        );
+        assert_eq!(
+            trusted_server_core::consent::jurisdiction::detect_jurisdiction(Some(&geo), &config),
+            trusted_server_core::consent::jurisdiction::Jurisdiction::NonRegulated,
+            "with no region a US visitor cannot be placed in a privacy state"
+        );
     }
 
     fn make_ctx_without_header() -> RequestContext {
