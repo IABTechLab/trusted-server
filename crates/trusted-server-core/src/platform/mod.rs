@@ -89,9 +89,15 @@ use crate::settings::Settings;
 /// the top of the `permissions.yaml` rules tree. `provider = "none"` spells the
 /// same choice explicitly. The host platform's own geo lookup is opt-in:
 /// `provider = "platform"` returns `host_default`, which the adapter passes
-/// as its platform geo implementation. A selected-but-unknown provider is
-/// rejected at startup by
-/// [`GeoConfig::validate_provider_selection`](crate::settings::GeoConfig::validate_provider_selection).
+/// as its platform geo implementation.
+///
+/// Any other value names an integration module that declares a geo provider.
+/// This function returns [`DisabledGeo`] for one, because it cannot see the
+/// registry, and the adapter then replaces it with the module's provider from
+/// `IntegrationRegistry::geo_provider`. So the value returned here is the base
+/// the adapter starts from, not necessarily what serves the request. A selector
+/// naming a module that supplies no geo provider is rejected when the registry
+/// is built, which is the only layer that can tell.
 #[must_use]
 pub fn build_geo_provider(
     settings: &Settings,

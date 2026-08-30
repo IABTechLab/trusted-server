@@ -31,6 +31,20 @@ const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// The settings baked into the binary carry placeholder secrets that
 /// `get_settings()` rejects by design, so every test states its own.
 fn settings_with(extra: &str) -> Settings {
+    // The permission model requires a `[geo] default_country`, because there
+    // must always be a permission baseline for a request the geo provider
+    // leaves unmatched. Tests that select a geo provider write their own
+    // `[geo]` table, so only supply one when the caller has not.
+    let geo = if extra.contains("[geo]") {
+        String::new()
+    } else {
+        "
+[geo]
+default_country = \"US\"
+assume_single_jurisdiction = true
+"
+        .to_owned()
+    };
     Settings::from_toml(&format!(
         r#"
             [[handlers]]
@@ -48,6 +62,7 @@ fn settings_with(extra: &str) -> Settings {
             passphrase = "test-secret-key-32-bytes-minimum"
 
             {extra}
+            {geo}
         "#
     ))
     .expect("should parse seam probe test settings")
@@ -197,6 +212,7 @@ async fn proxy_route_reports_the_modules_geo_and_that_the_preparer_ran() {
         r#"
             [geo]
             provider = "seam_probe"
+            default_country = "US"
             {PROBE_BLOCK}
         "#
     ));
@@ -320,6 +336,7 @@ fn geo_selector_naming_a_module_without_a_provider_fails_at_startup() {
         r#"
             [geo]
             provider = "seam_probe"
+            default_country = "US"
 
             [integrations.seam_probe]
             country = "ZZ"

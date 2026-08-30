@@ -1005,7 +1005,11 @@ impl GeoConfig {
         &self,
         ec: &Ec,
     ) -> Result<(), Report<TrustedServerError>> {
-        let geo_disabled = !matches!(self.provider.as_deref(), Some("platform"));
+        // Location is resolved by the host lookup (`platform`) or by any
+        // integration module that declares a geo provider. Only an unset
+        // selector and the explicit `none` resolve nothing, so only those
+        // two leave every request on the default country.
+        let geo_disabled = matches!(self.provider.as_deref(), None | Some("none"));
         // The selector is a typed enum on this branch, so statelessness is the
         // absent selector or the explicit `none`, matched rather than compared
         // as a string.
