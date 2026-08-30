@@ -118,6 +118,16 @@ impl From<EcProviderSelection> for String {
 /// built-in provider becomes a module of its own.
 pub const HMAC_PROVIDER_KEY: &str = "hmac";
 
+/// The provider names core supplies itself.
+///
+/// A name in this list is already taken, so an adapter that injects a provider
+/// under one of them has two suppliers claiming a single name and
+/// [`build_provider`] refuses the pair rather than picking one. The list grows
+/// and shrinks with the resolution arms in [`resolve_named_provider`], and it
+/// empties when the built-in HMAC provider becomes a module like every other
+/// provider, at which point no name is reserved and every provider is injected.
+const BUILTIN_PROVIDER_KEYS: &[&str] = &[HMAC_PROVIDER_KEY];
+
 /// The registry code of the built-in HMAC provider.
 ///
 /// The same text as [`HMAC_PROVIDER_KEY`], but a different role: this is the
@@ -685,6 +695,47 @@ impl EdgeCookieProvider for HmacProvider {
     }
 }
 
+/// Refuses an injected provider that claims a name core supplies itself.
+///
+/// Two suppliers cannot own one name. Core ships the `hmac` provider, and once
+/// this work merges IAB Tech Lab is itself a vendor shipping an HMAC provider,
+/// so the two really can arrive under the same name in one deployment. The
+/// resolution order alone would answer that by quietly preferring the built-in
+/// one and dropping the injected provider, which an operator has no way to see,
+/// so the pair is refused here and the error names both claimants.
+///
+/// The check runs whatever the selector says, so an operator is told at startup
+/// rather than on the first request that happens to select the contested name,
+/// and it runs before the selection is read so a deployment cannot hide the
+/// clash by selecting something else.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::EdgeCookie`] when the injected provider's id
+/// is one of [`BUILTIN_PROVIDER_KEYS`].
+fn ensure_no_name_collision(
+    injected: Option<&dyn EdgeCookieProvider>,
+) -> Result<(), Report<TrustedServerError>> {
+    let Some(injected) = injected else {
+        return Ok(());
+    };
+    let Some(claimed) = BUILTIN_PROVIDER_KEYS
+        .iter()
+        .find(|key| **key == injected.id())
+    else {
+        return Ok(());
+    };
+    Err(Report::new(TrustedServerError::EdgeCookie {
+        message: format!(
+            "Edge Cookie provider name `{claimed}` is claimed twice, by the provider \
+             built into Trusted Server core and by the provider this deployment's \
+             adapter injects. Give the injected provider a name of its own and select \
+             it under that name, because `[ec] provider = \"{claimed}\"` cannot mean \
+             both of them."
+        ),
+    }))
+}
+
 /// Builds the Edge Cookie provider named by the `[ec] provider` selector,
 /// injecting the services it needs.
 ///
@@ -704,6 +755,7 @@ pub fn build_provider(
     ec: &Ec,
     injected: Option<Arc<dyn EdgeCookieProvider>>,
 ) -> Result<Option<Box<dyn EdgeCookieProvider>>, Report<TrustedServerError>> {
+    ensure_no_name_collision(injected.as_deref())?;
     let Some(selection) = ec.provider.as_ref() else {
         return Ok(None);
     };
@@ -726,6 +778,10 @@ pub fn build_provider(
 /// device and geo providers use, so core never names a vendor. The injected
 /// provider is used when its own id matches the name, and its
 /// `[ec.providers.<name>]` block is read by the adapter that built it.
+///
+/// Looking at core first is safe only because
+/// [`ensure_no_name_collision`] has already refused an injected provider that
+/// claims a built-in name, so this order can never shadow one silently.
 ///
 /// # Errors
 ///
@@ -1276,6 +1332,82 @@ mod tests {
             "kv:x",
             "should delegate normalize_id_for_kv to the inner provider"
         );
+    }
+
+    /// A vendor provider that claims the name core already uses for its
+    /// built-in HMAC provider.
+    #[derive(Debug)]
+    struct VendorNamedHmacProvider;
+
+    impl EdgeCookieProvider for VendorNamedHmacProvider {
+        fn id(&self) -> &'static str {
+            HMAC_PROVIDER_KEY
+        }
+
+        fn code(&self) -> ProviderCode {
+            crate::provider_code!("t0vh")
+        }
+
+        fn generate(
+            &self,
+            _request_info: &dyn RequestInfo,
+            _input: &IdentityInput<'_>,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            Ok(GeneratedEdgeCookie::default())
+        }
+    }
+
+    #[test]
+    fn two_providers_claiming_one_name_are_refused_and_both_are_named() {
+        // Once this work merges, IAB Tech Lab supplies an HMAC provider as a
+        // vendor module while core still supplies one of its own, so a
+        // deployment really can wire two providers called `hmac`. Resolution
+        // order alone would prefer the built-in one and drop the injected one
+        // with nothing said, which is the fault this guards.
+        let mut providers = EcProviders::default();
+        providers.hmac = Some(HmacProviderConfig {
+            passphrase: test_passphrase(),
+        });
+        let selected_hmac = Ec {
+            provider: Some(EcProviderSelection::from(HMAC_PROVIDER_KEY)),
+            providers,
+            ..Ec::default()
+        };
+
+        let err = build_provider(&selected_hmac, Some(Arc::new(VendorNamedHmacProvider)))
+            .expect_err("two providers claiming `hmac` should be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains(HMAC_PROVIDER_KEY),
+            "the error should name the contested name, got: {message}"
+        );
+        assert!(
+            message.contains("core") && message.contains("adapter"),
+            "the error should name both claimants, got: {message}"
+        );
+
+        // The clash is a wiring fault, not a property of the selection, so
+        // selecting something else does not hide it and the operator still
+        // learns at startup.
+        let selected_elsewhere = Ec {
+            provider: Some(EcProviderSelection::None),
+            ..Ec::default()
+        };
+        let err =
+            ensure_provider_available(&selected_elsewhere, Some(Arc::new(VendorNamedHmacProvider)))
+                .expect_err("the clash should be refused whatever the selector says");
+        assert!(
+            err.to_string().contains(HMAC_PROVIDER_KEY),
+            "the startup check should name the contested name too, got: {err}"
+        );
+
+        // A vendor name of its own is unaffected.
+        let vendor = Ec {
+            provider: Some(EcProviderSelection::Named("acme".to_owned())),
+            ..Ec::default()
+        };
+        build_provider(&vendor, Some(Arc::new(VendorProvider)))
+            .expect("a vendor provider under its own name should still build");
     }
 
     #[test]
