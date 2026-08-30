@@ -11,12 +11,10 @@
 //!
 //! Request evidence reaches a provider at call time rather than at
 //! construction. [`EdgeCookieProvider::generate`] borrows a [`RequestInfo`],
-//! which carries the normalized client IP, for the life of the call, alongside
-//! an [`IdentityInput`] holding the request's gating context. A provider reads
-//! what it needs and retains nothing, so no per-request snapshot is stored or
-//! cloned. `RequestInfo` is the seam rather than a fixed parameter list, so a
-//! provider needing further evidence gains a defaulted accessor for it in the
-//! change that first reads it.
+//! which carries the normalized client IP, the User-Agent and the request
+//! headers, for the life of the call, alongside an [`IdentityInput`] holding
+//! the request's gating context. A provider reads what it needs and retains
+//! nothing, so no per-request snapshot is stored or cloned.
 //!
 //! [`HmacProvider`] is the built-in server-side implementation. It derives the
 //! identifier from the client IP using HMAC over the configured passphrase, the
