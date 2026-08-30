@@ -83,12 +83,17 @@ impl FastlyDeviceProvider {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl DeviceProvider for FastlyDeviceProvider {
     fn id(&self) -> &'static str {
         "fastly"
     }
 
-    fn detect(&self, request_info: &dyn RequestInfo) -> DeviceSignals {
+    async fn detect(
+        &self,
+        request_info: &dyn RequestInfo,
+        _services: &trusted_server_core::platform::RuntimeServices,
+    ) -> DeviceSignals {
         DeviceSignals::derive(
             request_info.user_agent(),
             self.host_signals.ja4(),

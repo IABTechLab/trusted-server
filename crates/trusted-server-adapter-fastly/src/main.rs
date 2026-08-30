@@ -27,8 +27,10 @@ use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::{BorrowedRequestInfo, HostSignals};
 use trusted_server_core::integrations::RequestFilterEffects;
-use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::platform::build_geo_provider;
+use trusted_server_core::platform::{
+    ClientInfo, PlatformKvStore, RuntimeServices, UnavailableKvStore,
+};
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
@@ -48,9 +50,12 @@ mod rate_limiter;
 mod template_cache;
 mod tinybird;
 
-use crate::app::{EcFinalizeState, TrustedServerApp, load_settings_from_config_store};
+use crate::app::{
+    AppState, EcFinalizeState, TrustedServerApp, build_finalize_services,
+    load_settings_from_config_store,
+};
 use crate::ec_kv::FastlyEcKvStore;
-use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, resolve_geo_for_response};
+use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, geo_allowed_for_response};
 use crate::platform::{FastlyPlatformGeo, client_info_from_request};
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 
@@ -198,7 +203,12 @@ fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
     // Reuse the settings snapshot already loaded for the app state rather than
     // fetching and validating the config-store blob a second time per request.
     let device_signals = match settings_snapshot.as_deref() {
-        Some(settings) => derive_device_signals(settings, &req),
+        Some(settings) => {
+            // The entry point is synchronous host code, so it drives the async
+            // provider seam at the same boundary it already drives the router.
+            let services = build_finalize_services(settings, entry_point_kv_store(&app_state));
+            futures::executor::block_on(derive_device_signals(settings, &req, &services))
+        }
         None => {
             log::warn!(
                 "EdgeZero device signals: settings unavailable, using UA-only classification"
@@ -236,11 +246,21 @@ fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
 
     if !take_finalize_sentinel(&mut response) {
         if let Some(settings) = settings_snapshot.as_deref() {
-            apply_entry_point_finalize_headers(settings, &mut response, client_ip);
+            futures::executor::block_on(apply_entry_point_finalize_headers(
+                settings,
+                &mut response,
+                client_ip,
+                entry_point_kv_store(&app_state),
+            ));
         } else {
             match load_settings_from_config_store(env) {
                 Ok(settings) => {
-                    apply_entry_point_finalize_headers(&settings, &mut response, client_ip);
+                    futures::executor::block_on(apply_entry_point_finalize_headers(
+                        &settings,
+                        &mut response,
+                        client_ip,
+                        entry_point_kv_store(&app_state),
+                    ));
                 }
                 Err(e) => {
                     log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
@@ -318,21 +338,41 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
         .is_some()
 }
 
-fn apply_entry_point_finalize_headers(
+/// The key-value store a provider called from the entry point is given.
+///
+/// The entry-point paths run whether or not application state was built, so a
+/// deployment whose state failed to build offers the unavailable store rather
+/// than no services at all. A provider that needs the store then fails its own
+/// call instead of the entry point silently skipping the provider.
+fn entry_point_kv_store(app_state: &Option<Arc<AppState>>) -> Arc<dyn PlatformKvStore> {
+    app_state.as_ref().map_or_else(
+        || Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>,
+        |state| Arc::clone(&state.default_kv_store),
+    )
+}
+
+async fn apply_entry_point_finalize_headers(
     settings: &Settings,
     response: &mut HttpResponse,
     client_ip: Option<std::net::IpAddr>,
+    kv_store: Arc<dyn PlatformKvStore>,
 ) {
     // Route through the [geo] provider selector, so a deployment that opts
     // out of geolocation makes no host geo call on the entry-point finalize
     // path either.
     let geo = build_geo_provider(settings, Arc::new(FastlyPlatformGeo));
-    let geo_info = resolve_geo_for_response(response, client_ip, |client_ip| {
-        geo.lookup(client_ip).unwrap_or_else(|e| {
+    let geo_info = if geo_allowed_for_response(response) {
+        let services = build_finalize_services(settings, kv_store).with_client_info(ClientInfo {
+            client_ip,
+            ..ClientInfo::default()
+        });
+        geo.lookup(client_ip, &services).await.unwrap_or_else(|e| {
             log::warn!("entry-point geo lookup failed: {e}");
             None
         })
-    });
+    } else {
+        None
+    };
     apply_finalize_headers(settings, geo_info.as_ref(), response);
 }
 
@@ -536,14 +576,17 @@ pub(crate) fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<Stri
 
 /// Derives device signals via the configured device-detection provider.
 ///
-/// The providers read request data from injected services. Device
-/// classification reads only the User-Agent, borrowed here through a
-/// `BorrowedRequestInfo`, unless `fastly` is selected, in which case the Fastly
-/// provider also reads the TLS and HTTP/2 signals captured into a
-/// [`FastlyHostSignals`]. The Fastly entry point still reads those TLS and
-/// HTTP/2 signals on every request to build the host-signal service and client
-/// info, so the capture is not conditional on the provider selection.
-pub(crate) fn derive_device_signals(settings: &Settings, req: &FastlyRequest) -> DeviceSignals {
+/// The providers read request data from injected services: device classification
+/// reads only the User-Agent, borrowed here through a `BorrowedRequestInfo`, while the
+/// Fastly provider also reads the TLS/H2 fingerprints captured into a
+/// [`FastlyHostSignals`]. The Fastly provider, and so the fingerprint capture, is
+/// built only when selected, so the default request path makes no Fastly-specific
+/// fingerprint call.
+pub(crate) async fn derive_device_signals(
+    settings: &Settings,
+    req: &FastlyRequest,
+    services: &RuntimeServices,
+) -> DeviceSignals {
     let mut headers = HeaderMap::new();
     if let Some(value) = req
         .get_header_str(header::USER_AGENT.as_str())
@@ -560,7 +603,8 @@ pub(crate) fn derive_device_signals(settings: &Settings, req: &FastlyRequest) ->
         let host_signals: Arc<dyn HostSignals> = Arc::new(FastlyHostSignals::from_request(req));
         Box::new(FastlyDeviceProvider::new(host_signals)) as Box<dyn DeviceProvider>
     })
-    .detect(&request_info)
+    .detect(&request_info, services)
+    .await
 }
 
 #[cfg(test)]
@@ -834,7 +878,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::panic)]
     fn entry_point_finalize_skips_geo_lookup_for_401() {
         let settings = test_settings();
         let mut response = response_builder()
@@ -842,10 +885,14 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build response");
 
-        let geo_info = resolve_geo_for_response(&response, None, |_| {
-            panic!("should skip entry-point geo lookup for 401 responses");
-        });
-        apply_finalize_headers(&settings, geo_info.as_ref(), &mut response);
+        // The predicate is what stops the lookup, so assert on it directly:
+        // a `true` here would send the client IP to the geo provider on a
+        // response that never authenticated.
+        assert!(
+            !geo_allowed_for_response(&response),
+            "should skip entry-point geo lookup for 401 responses"
+        );
+        apply_finalize_headers(&settings, None, &mut response);
 
         assert_eq!(
             response

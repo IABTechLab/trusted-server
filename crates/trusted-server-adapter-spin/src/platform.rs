@@ -819,8 +819,13 @@ pub fn build_runtime_services(
 
 struct NullGeo;
 
+#[async_trait::async_trait(?Send)]
 impl PlatformGeo for NullGeo {
-    fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+    async fn lookup(
+        &self,
+        _client_ip: Option<IpAddr>,
+        _services: &trusted_server_core::platform::RuntimeServices,
+    ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
         Ok(None)
     }
 }
@@ -854,6 +859,15 @@ mod tests {
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::io::Write as _;
+
+    /// The services graph a provider is handed, built the same way the request
+    /// path builds it so the tests exercise the production shape.
+    fn test_services() -> RuntimeServices {
+        build_runtime_services(
+            &make_ctx_without_spin_context(),
+            &trusted_server_core::settings::Settings::default(),
+        )
+    }
 
     fn make_ctx_without_spin_context() -> RequestContext {
         let req = request_builder()
@@ -932,18 +946,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn null_geo_always_returns_none() {
+    #[tokio::test]
+    async fn null_geo_always_returns_none() {
         let geo = NullGeo;
 
         assert!(
-            geo.lookup(None).expect("should not fail").is_none(),
+            geo.lookup(None, &test_services())
+                .await
+                .expect("should not fail")
+                .is_none(),
             "should return None without a client IP"
         );
         assert!(
-            geo.lookup(Some("127.0.0.1".parse().expect("should parse IP")))
-                .expect("should not fail")
-                .is_none(),
+            geo.lookup(
+                Some("127.0.0.1".parse().expect("should parse IP")),
+                &test_services()
+            )
+            .await
+            .expect("should not fail")
+            .is_none(),
             "should return None for any client IP"
         );
     }
@@ -1058,7 +1079,8 @@ mod tests {
         assert!(
             services
                 .geo()
-                .lookup(None)
+                .lookup(None, &test_services())
+                .await
                 .expect("should not fail")
                 .is_none(),
             "should use null geo"

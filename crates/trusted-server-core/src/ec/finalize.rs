@@ -947,6 +947,7 @@ mod tests {
     #[derive(Debug)]
     struct EvidenceHeaderProvider;
 
+    #[async_trait::async_trait(?Send)]
     impl crate::ec::provider::EdgeCookieProvider for EvidenceHeaderProvider {
         fn id(&self) -> &'static str {
             "evidence-header"
@@ -956,10 +957,11 @@ mod tests {
             crate::provider_code!("t0eh")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn crate::evidence::RequestInfo,
             _input: &crate::ec::provider::IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<
             crate::ec::provider::GeneratedEdgeCookie,
             error_stack::Report<crate::error::TrustedServerError>,
@@ -985,8 +987,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn provider_response_headers_reach_the_response_without_dropping_the_origins() {
+    #[tokio::test]
+    async fn provider_response_headers_reach_the_response_without_dropping_the_origins() {
         // The response finalization runs on is the finished one, so it already
         // carries the publisher origin's own headers. A provider effect must
         // add to those, never replace them: replacing `Set-Cookie` would drop
@@ -1002,8 +1004,13 @@ mod tests {
         let mut ec_context = make_context_with_consent(None, None, false, false, consent, true)
             .with_provider_for_test(std::sync::Arc::new(EvidenceHeaderProvider));
         ec_context
-            .generate_if_needed(&settings, Some(&graph))
-            .expect("should create the identifier through the provider");
+            .generate_if_needed(
+                &settings,
+                Some(&graph),
+                &crate::platform::test_support::noop_services(),
+            )
+            .await
+            .expect("should mint through the provider");
 
         // What the publisher's origin returned, before EC finalization runs.
         let mut response = empty_response();
@@ -1070,6 +1077,7 @@ mod tests {
     #[derive(Debug)]
     struct SwitchedProvider;
 
+    #[async_trait::async_trait(?Send)]
     impl crate::ec::provider::EdgeCookieProvider for SwitchedProvider {
         fn id(&self) -> &'static str {
             "switched"
@@ -1079,10 +1087,11 @@ mod tests {
             crate::provider_code!("t0sw")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn crate::evidence::RequestInfo,
             _input: &crate::ec::provider::IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<
             crate::ec::provider::GeneratedEdgeCookie,
             error_stack::Report<crate::error::TrustedServerError>,

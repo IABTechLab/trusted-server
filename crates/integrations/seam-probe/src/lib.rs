@@ -213,6 +213,7 @@ pub struct SeamProbeEc;
 /// The four-character code core stamps on identifiers this provider owns.
 const SEAM_PROBE_EC_CODE: ProviderCode = trusted_server_core::provider_code!("sprb");
 
+#[async_trait::async_trait(?Send)]
 impl EdgeCookieProvider for SeamProbeEc {
     fn id(&self) -> &'static str {
         SEAM_PROBE_ID
@@ -222,10 +223,11 @@ impl EdgeCookieProvider for SeamProbeEc {
         SEAM_PROBE_EC_CODE
     }
 
-    fn generate(
+    async fn generate(
         &self,
         request_info: &dyn RequestInfo,
         _input: &IdentityInput<'_>,
+        _services: &trusted_server_core::platform::RuntimeServices,
     ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
         // Derived from evidence so the test can prove this ran rather than the
         // built-in provider, and prove the evidence actually arrived.
@@ -246,12 +248,17 @@ impl EdgeCookieProvider for SeamProbeEc {
 #[derive(Debug)]
 pub struct SeamProbeDevice;
 
+#[async_trait::async_trait(?Send)]
 impl DeviceProvider for SeamProbeDevice {
     fn id(&self) -> &'static str {
         SEAM_PROBE_ID
     }
 
-    fn detect(&self, _request_info: &dyn RequestInfo) -> DeviceSignals {
+    async fn detect(
+        &self,
+        _request_info: &dyn RequestInfo,
+        _services: &trusted_server_core::platform::RuntimeServices,
+    ) -> DeviceSignals {
         DeviceSignals {
             is_mobile: 1,
             platform_class: Some("seam-probe".to_owned()),
@@ -263,8 +270,13 @@ impl DeviceProvider for SeamProbeDevice {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl PlatformGeo for SeamProbeGeo {
-    fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+    async fn lookup(
+        &self,
+        _client_ip: Option<IpAddr>,
+        _services: &trusted_server_core::platform::RuntimeServices,
+    ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
         Ok(Some(GeoInfo {
             city: "Example City".to_string(),
             country: self.country.clone(),
@@ -297,7 +309,11 @@ impl IntegrationProxy for SeamProbeProxy {
         services: &RuntimeServices,
         req: Request<EdgeBody>,
     ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-        let country = match services.geo().lookup(services.client_info().client_ip) {
+        let country = match services
+            .geo()
+            .lookup(services.client_info().client_ip, services)
+            .await
+        {
             Ok(geo) => geo.map(|info| info.country),
             Err(error) => {
                 log::warn!("seam probe geo lookup failed: {error}");

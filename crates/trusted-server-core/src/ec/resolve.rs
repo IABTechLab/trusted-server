@@ -71,11 +71,12 @@ const MAX_BODY_SIZE: usize = 64 * 1024;
 /// [`reserved_response_effect`](crate::ec::provider::reserved_response_effect)).
 /// A payload that is merely unverified or absent yields a `204` rather than an
 /// error.
-pub fn handle_ec_resolve(
+pub async fn handle_ec_resolve(
     settings: &Settings,
     req: Request<EdgeBody>,
     ec_context: &EcContext,
     kv: Option<&KvIdentityGraph>,
+    services: &crate::platform::RuntimeServices,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // This endpoint sets identity state from a page script, so the posted
     // request must originate from the publisher's own site. Browsers always
@@ -128,7 +129,7 @@ pub fn handle_ec_resolve(
         consent: Some(ec_context.consent()),
     };
 
-    let generated = provider.resolve_from_client(&input)?;
+    let generated = provider.resolve_from_client(&input, services).await?;
     log::debug!(
         "EC resolve handled (provider={}): id {}",
         provider.id(),
@@ -346,7 +347,7 @@ mod tests {
         IdentityInput,
     };
     use crate::evidence::RequestInfo;
-    use crate::platform::test_support::noop_services_with_ec_provider;
+    use crate::platform::test_support::{noop_services, noop_services_with_ec_provider};
     use crate::test_support::tests::create_test_settings;
     use http::Method;
     use std::sync::Arc;
@@ -418,6 +419,7 @@ mod tests {
     #[derive(Debug)]
     struct TestIdProvider;
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieProvider for TestIdProvider {
         fn id(&self) -> &'static str {
             "testid"
@@ -427,18 +429,20 @@ mod tests {
             crate::provider_code!("t0id")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             // The identifier is created in the browser, so the edge derives nothing.
             Ok(GeneratedEdgeCookie::default())
         }
 
-        fn resolve_from_client(
+        async fn resolve_from_client(
             &self,
             input: &ClientResolveInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             // The page posts the identifier it generated. Accept a well-formed UUID.
             let value = core::str::from_utf8(input.payload)
@@ -475,6 +479,7 @@ mod tests {
         mint: bool,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieProvider for ResolveHeaderProvider {
         fn id(&self) -> &'static str {
             "resolve-header"
@@ -484,17 +489,19 @@ mod tests {
             crate::provider_code!("t0rh")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie::default())
         }
 
-        fn resolve_from_client(
+        async fn resolve_from_client(
             &self,
             _input: &ClientResolveInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie {
                 id: self.mint.then(|| HEADER_PROVIDER_ID.to_owned()),
@@ -523,7 +530,7 @@ mod tests {
 
     /// Drives one resolve request through [`ResolveHeaderProvider`], returning
     /// whatever the handler produced.
-    fn resolve_with_header_provider(
+    async fn resolve_with_header_provider(
         headers: &'static [(&'static str, &'static str)],
         mint: bool,
         graph: Option<&crate::ec::kv::KvIdentityGraph>,
@@ -539,11 +546,11 @@ mod tests {
             .expect("should build organic request");
         let ec = EcContext::read_from_request(&settings, &organic, &services)
             .expect("should read EC context");
-        handle_ec_resolve(&settings, post(HEADER_PROVIDER_ID), &ec, graph)
+        handle_ec_resolve(&settings, post(HEADER_PROVIDER_ID), &ec, graph, &services).await
     }
 
-    #[test]
-    fn resolve_rejects_a_reserved_response_effect_when_nothing_is_minted() {
+    #[tokio::test]
+    async fn resolve_rejects_a_reserved_response_effect_when_nothing_is_minted() {
         // The 204 path applied provider headers with no check at all, so a
         // browser-side provider could set the managed identity cookie while
         // returning no identifier, walking past the identifier bounds, the
@@ -554,35 +561,38 @@ mod tests {
             None,
         );
 
-        let err = outcome.expect_err("a managed cookie effect should fail the request");
+        let err = outcome
+            .await
+            .expect_err("a managed cookie effect should fail the request");
         assert!(
             format!("{err:?}").contains("ts-` namespace"),
             "the failure should name the reserved effect, got {err:?}"
         );
     }
 
-    #[test]
-    fn resolve_rejects_a_reserved_response_effect_on_the_minted_path() {
+    #[tokio::test]
+    async fn resolve_rejects_a_reserved_response_effect_on_the_minted_path() {
         // The same check has to cover the 200 path, where the provider does
         // create and core is about to write its own cookie and headers.
         let graph = in_memory_graph();
         let outcome =
             resolve_with_header_provider(&[("x-ts-ec", "forged-value")], true, Some(&graph));
 
-        let err = outcome.expect_err("a reserved header effect should fail the request");
+        let err = outcome
+            .await
+            .expect_err("a reserved header effect should fail the request");
         assert!(
             format!("{err:?}").contains("x-ts-` namespace"),
             "the failure should name the reserved effect, got {err:?}"
         );
     }
 
-    #[test]
-    fn resolve_accumulates_provider_response_headers_with_its_own() {
-        // The provider's own cookies must add to what the handler already set,
-        // never replace it. Replacing collapsed a provider's own cookie list to
-        // whichever came last, and would drop the `Cache-Control: no-store` core
-        // writes onto every identity response (a provider cannot set
-        // `cache-control` itself, so core's directive is what has to survive).
+    #[tokio::test]
+    async fn resolve_accumulates_provider_response_headers_with_its_own() {
+        // The provider's own effects must add to what the handler already set,
+        // never replace it. Replacing collapsed a provider's own cookie list
+        // to whichever came last, and would drop the `Cache-Control: no-store`
+        // that every identity response has to carry.
         let graph = in_memory_graph();
         let response = resolve_with_header_provider(
             &[
@@ -592,6 +602,7 @@ mod tests {
             true,
             Some(&graph),
         )
+        .await
         .expect("should handle resolve");
 
         assert_eq!(
@@ -629,8 +640,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn client_set_value_round_trips_through_the_ec_scenario() {
+    #[tokio::test]
+    async fn client_set_value_round_trips_through_the_ec_scenario() {
         // A client-generated first-party UUID, the value the browser posts back.
         const TEST_ID: &str = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
 
@@ -652,7 +663,8 @@ mod tests {
             ec.ec_value().is_none(),
             "no EC should exist on the first visit"
         );
-        ec.generate_if_needed(&settings, None)
+        ec.generate_if_needed(&settings, None, &services)
+            .await
             .expect("should run generation");
         assert!(
             ec.ec_value().is_none(),
@@ -664,7 +676,8 @@ mod tests {
         //    value as the EC cookie.
         const CODED_TEST_ID: &str = "t0id~3f2504e0-4f89-41d3-9a0c-0305e82c3301";
         let graph = in_memory_graph();
-        let response = handle_ec_resolve(&settings, post(TEST_ID), &ec, Some(&graph))
+        let response = handle_ec_resolve(&settings, post(TEST_ID), &ec, Some(&graph), &services)
+            .await
             .expect("should handle resolve");
         assert_eq!(
             response.status(),
@@ -707,12 +720,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_sets_cookie_marker_and_no_store_when_word_matches_and_allowed() {
+    #[tokio::test]
+    async fn resolve_sets_cookie_marker_and_no_store_when_word_matches_and_allowed() {
         let settings = settings_with_client_fixed();
         let graph = in_memory_graph();
-        let response = handle_ec_resolve(&settings, post(FIXED_WORD), &gated(true), Some(&graph))
-            .expect("should handle resolve");
+        let response = handle_ec_resolve(
+            &settings,
+            post(FIXED_WORD),
+            &gated(true),
+            Some(&graph),
+            &noop_services(),
+        )
+        .await
+        .expect("should handle resolve");
 
         assert_eq!(
             response.status(),
@@ -766,12 +786,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_returns_204_when_not_allowed() {
+    #[tokio::test]
+    async fn resolve_returns_204_when_not_allowed() {
         let settings = settings_with_client_fixed();
         let graph = in_memory_graph();
-        let response = handle_ec_resolve(&settings, post(FIXED_WORD), &gated(false), Some(&graph))
-            .expect("should handle resolve");
+        let response = handle_ec_resolve(
+            &settings,
+            post(FIXED_WORD),
+            &gated(false),
+            Some(&graph),
+            &noop_services(),
+        )
+        .await
+        .expect("should handle resolve");
 
         assert_eq!(
             response.status(),
@@ -784,13 +811,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_returns_204_when_no_provider_configured() {
+    #[tokio::test]
+    async fn resolve_returns_204_when_no_provider_configured() {
         let mut settings = create_test_settings();
         settings.ec.provider = None;
         let graph = in_memory_graph();
-        let response = handle_ec_resolve(&settings, post("123"), &gated(true), Some(&graph))
-            .expect("should handle resolve");
+        let response = handle_ec_resolve(
+            &settings,
+            post("123"),
+            &gated(true),
+            Some(&graph),
+            &noop_services(),
+        )
+        .await
+        .expect("should handle resolve");
 
         assert_eq!(
             response.status(),
@@ -803,13 +837,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_rejects_oversized_body() {
+    #[tokio::test]
+    async fn resolve_rejects_oversized_body() {
         let settings = settings_with_client_fixed();
         let big = "x".repeat(MAX_BODY_SIZE + 1);
         let graph = in_memory_graph();
-        let response = handle_ec_resolve(&settings, post(&big), &gated(true), Some(&graph))
-            .expect("should handle resolve");
+        let response = handle_ec_resolve(
+            &settings,
+            post(&big),
+            &gated(true),
+            Some(&graph),
+            &noop_services(),
+        )
+        .await
+        .expect("should handle resolve");
 
         assert_eq!(
             response.status(),
@@ -818,14 +859,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_rejects_a_missing_or_foreign_origin() {
+    #[tokio::test]
+    async fn resolve_rejects_a_missing_or_foreign_origin() {
         let settings = settings_with_client_fixed();
         let graph = in_memory_graph();
         for origin in [None, Some("https://attacker.example")] {
             let request = post_with(origin, Some("text/plain"), FIXED_WORD);
-            let response = handle_ec_resolve(&settings, request, &gated(true), Some(&graph))
-                .expect("should handle resolve");
+            let response = handle_ec_resolve(
+                &settings,
+                request,
+                &gated(true),
+                Some(&graph),
+                &noop_services(),
+            )
+            .await
+            .expect("should handle resolve");
             assert_eq!(
                 response.status(),
                 StatusCode::FORBIDDEN,
@@ -838,8 +886,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolve_rejects_a_publisher_subdomain_origin() {
+    #[tokio::test]
+    async fn resolve_rejects_a_publisher_subdomain_origin() {
         let settings = settings_with_client_fixed();
         let graph = in_memory_graph();
         let request = post_with(
@@ -847,8 +895,15 @@ mod tests {
             Some("text/plain"),
             FIXED_WORD,
         );
-        let response = handle_ec_resolve(&settings, request, &gated(true), Some(&graph))
-            .expect("should handle resolve");
+        let response = handle_ec_resolve(
+            &settings,
+            request,
+            &gated(true),
+            Some(&graph),
+            &noop_services(),
+        )
+        .await
+        .expect("should handle resolve");
         assert_eq!(
             response.status(),
             StatusCode::FORBIDDEN,
@@ -856,8 +911,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_rejects_a_plain_http_origin() {
+    #[tokio::test]
+    async fn resolve_rejects_a_plain_http_origin() {
         let settings = settings_with_client_fixed();
         let graph = in_memory_graph();
         let request = post_with(
@@ -865,8 +920,15 @@ mod tests {
             Some("text/plain"),
             FIXED_WORD,
         );
-        let response = handle_ec_resolve(&settings, request, &gated(true), Some(&graph))
-            .expect("should handle resolve");
+        let response = handle_ec_resolve(
+            &settings,
+            request,
+            &gated(true),
+            Some(&graph),
+            &noop_services(),
+        )
+        .await
+        .expect("should handle resolve");
         assert_eq!(
             response.status(),
             StatusCode::FORBIDDEN,
@@ -874,8 +936,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_rejects_a_non_default_port_origin() {
+    #[tokio::test]
+    async fn resolve_rejects_a_non_default_port_origin() {
         let settings = settings_with_client_fixed();
         let graph = in_memory_graph();
         let request = post_with(
@@ -883,8 +945,15 @@ mod tests {
             Some("text/plain"),
             FIXED_WORD,
         );
-        let response = handle_ec_resolve(&settings, request, &gated(true), Some(&graph))
-            .expect("should handle resolve");
+        let response = handle_ec_resolve(
+            &settings,
+            request,
+            &gated(true),
+            Some(&graph),
+            &noop_services(),
+        )
+        .await
+        .expect("should handle resolve");
         assert_eq!(
             response.status(),
             StatusCode::FORBIDDEN,
@@ -892,8 +961,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_accepts_a_configured_extra_origin() {
+    #[tokio::test]
+    async fn resolve_accepts_a_configured_extra_origin() {
         let mut settings = settings_with_client_fixed();
         settings
             .ec
@@ -905,8 +974,15 @@ mod tests {
             Some("text/plain"),
             FIXED_WORD,
         );
-        let response = handle_ec_resolve(&settings, request, &gated(true), Some(&graph))
-            .expect("should handle resolve");
+        let response = handle_ec_resolve(
+            &settings,
+            request,
+            &gated(true),
+            Some(&graph),
+            &noop_services(),
+        )
+        .await
+        .expect("should handle resolve");
         assert_eq!(
             response.status(),
             StatusCode::OK,
@@ -951,8 +1027,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolve_rejects_an_unexpected_content_type() {
+    #[tokio::test]
+    async fn resolve_rejects_an_unexpected_content_type() {
         let settings = settings_with_client_fixed();
         let graph = in_memory_graph();
         let request = post_with(
@@ -960,8 +1036,15 @@ mod tests {
             Some("application/x-www-form-urlencoded"),
             FIXED_WORD,
         );
-        let response = handle_ec_resolve(&settings, request, &gated(true), Some(&graph))
-            .expect("should handle resolve");
+        let response = handle_ec_resolve(
+            &settings,
+            request,
+            &gated(true),
+            Some(&graph),
+            &noop_services(),
+        )
+        .await
+        .expect("should handle resolve");
         assert_eq!(
             response.status(),
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -969,15 +1052,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_conflicts_when_a_different_identity_already_exists() {
+    #[tokio::test]
+    async fn resolve_conflicts_when_a_different_identity_already_exists() {
         let settings = settings_with_client_fixed();
         let graph = in_memory_graph();
         let existing = format!("{}.ABC123", "e".repeat(64));
         let ec_context =
             EcContext::new_for_test_gated(Some(existing), ConsentContext::default(), true);
-        let response = handle_ec_resolve(&settings, post(FIXED_WORD), &ec_context, Some(&graph))
-            .expect("should handle resolve");
+        let response = handle_ec_resolve(
+            &settings,
+            post(FIXED_WORD),
+            &ec_context,
+            Some(&graph),
+            &noop_services(),
+        )
+        .await
+        .expect("should handle resolve");
         assert_eq!(
             response.status(),
             StatusCode::CONFLICT,
@@ -989,11 +1079,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_mints_nothing_without_an_identity_graph() {
+    #[tokio::test]
+    async fn resolve_mints_nothing_without_an_identity_graph() {
         let settings = settings_with_client_fixed();
-        let response = handle_ec_resolve(&settings, post(FIXED_WORD), &gated(true), None)
-            .expect("should handle resolve");
+        let response = handle_ec_resolve(
+            &settings,
+            post(FIXED_WORD),
+            &gated(true),
+            None,
+            &noop_services(),
+        )
+        .await
+        .expect("should handle resolve");
         assert_eq!(
             response.status(),
             StatusCode::NO_CONTENT,
@@ -1005,13 +1102,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_sets_no_cookie_for_unmatched_word() {
+    #[tokio::test]
+    async fn resolve_sets_no_cookie_for_unmatched_word() {
         let settings = settings_with_client_fixed();
         let graph = in_memory_graph();
-        let response =
-            handle_ec_resolve(&settings, post("not-the-word"), &gated(true), Some(&graph))
-                .expect("should handle resolve");
+        let response = handle_ec_resolve(
+            &settings,
+            post("not-the-word"),
+            &gated(true),
+            Some(&graph),
+            &noop_services(),
+        )
+        .await
+        .expect("should handle resolve");
 
         assert_eq!(
             response.status(),

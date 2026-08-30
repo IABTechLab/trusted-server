@@ -257,12 +257,15 @@ impl EcContext {
     /// Returns [`TrustedServerError`] when the selected Edge Cookie provider
     /// cannot be built, the same as
     /// [`read_from_request_with_geo`](Self::read_from_request_with_geo).
-    pub fn read_from_request_resolving_geo(
+    pub async fn read_from_request_resolving_geo(
         settings: &Settings,
         req: &Request<EdgeBody>,
         services: &RuntimeServices,
     ) -> Result<Self, Report<TrustedServerError>> {
-        let lookup = services.geo().lookup(services.client_info().client_ip);
+        let lookup = services
+            .geo()
+            .lookup(services.client_info().client_ip, services)
+            .await;
         let geo_info = match &lookup {
             Ok(info) => info.clone(),
             Err(error) => {
@@ -421,17 +424,14 @@ impl EcContext {
     ///
     /// # Errors
     ///
-    /// Forwards every error from `generate_with_provider`: the selected provider
-    /// failing to derive an identifier (which includes a provider that needs the
-    /// client IP being run on a host that cannot supply one), the provider
-    /// producing an identifier outside the cookie-safe alphabet or over the
-    /// length cap, the provider asking for a response header inside core's
-    /// reserved surface, or persisting the identifier to the KV identity graph
-    /// failing.
-    pub fn generate_if_needed(
+    /// Returns an error if the selected provider fails to derive an identifier,
+    /// which includes a provider that needs the client IP being run on a host
+    /// that cannot supply one.
+    pub async fn generate_if_needed(
         &mut self,
         settings: &Settings,
         kv: Option<&KvIdentityGraph>,
+        services: &RuntimeServices,
     ) -> Result<(), Report<TrustedServerError>> {
         if self.ec_value.is_some() {
             return Ok(());
@@ -468,10 +468,10 @@ impl EcContext {
         // host that cannot supply one. The IP is passed as the documented
         // unavailable value, the empty string (see
         // [`RequestInfo::client_ip`](crate::evidence::RequestInfo::client_ip)),
-        // and a provider that needs it refuses there, returning the error to
-        // the caller. The publisher proxy and integration proxy log it and
-        // serve the response without an Edge Cookie.
-        self.generate_with_provider(ec_provider.as_ref(), settings, kv)
+        // and a provider that needs it refuses there, which fails the request
+        // rather than serving without identity.
+        self.generate_with_provider(ec_provider.as_ref(), settings, kv, services)
+            .await
     }
 
     /// Derives and commits an EC identifier using a specific provider.
@@ -493,11 +493,12 @@ impl EcContext {
     /// asks for a response header inside core's reserved surface (see
     /// [`reserved_response_effect`](crate::ec::provider::reserved_response_effect)),
     /// or persisting a generated identifier to the KV identity graph fails.
-    fn generate_with_provider(
+    async fn generate_with_provider(
         &mut self,
         ec_provider: &dyn EdgeCookieProvider,
         settings: &Settings,
         kv: Option<&KvIdentityGraph>,
+        services: &RuntimeServices,
     ) -> Result<(), Report<TrustedServerError>> {
         let input = IdentityInput {
             permissions: Some(&self.permissions),
@@ -506,14 +507,16 @@ impl EcContext {
         // Pass the request evidence captured at read time, borrowed: the client
         // IP, the request headers (so a provider reads cookies and client hints),
         // and the URL path and query (so it reads request parameters). A built-in
-        // provider reads only the client IP; a vendor provider reads what it
+        // provider reads only the client IP, and a vendor provider reads what it
         // needs through [`RequestInfo`].
         let request_info = BorrowedRequestInfo::new(
             self.client_ip.as_deref().unwrap_or_default(),
             Some(&self.request_headers),
         )
         .with_request_target(&self.request_path, &self.request_query);
-        let generated: GeneratedEdgeCookie = ec_provider.generate(&request_info, &input)?;
+        let generated: GeneratedEdgeCookie = ec_provider
+            .generate(&request_info, &input, services)
+            .await?;
         // Check every response header the provider asked for against core's
         // reserved surface before any of them are kept. A provider may set its
         // own cookies and headers, but not a managed `ts-` cookie, a header in
@@ -1025,6 +1028,7 @@ mod tests {
         seen_cookie: std::sync::Mutex<Option<String>>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieProvider for CookieCapturingProvider {
         fn id(&self) -> &'static str {
             "cookie-capturing"
@@ -1034,10 +1038,11 @@ mod tests {
             crate::provider_code!("t0cc")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             let cookie = request_info.header("cookie").map(ToOwned::to_owned);
             *self.seen_cookie.lock().expect("should lock seen cookie") = cookie;
@@ -1045,8 +1050,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_provider_reads_request_cookies_from_the_request_info() {
+    #[tokio::test]
+    async fn a_provider_reads_request_cookies_from_the_request_info() {
         // RequestInfo contract: a provider given request info that carries
         // headers can read request cookies through it (a client that stores
         // values in cookies relies on this). The organic generate path passes a
@@ -1066,7 +1071,12 @@ mod tests {
         };
 
         provider
-            .generate(&request_info, &IdentityInput::default())
+            .generate(
+                &request_info,
+                &IdentityInput::default(),
+                &crate::platform::test_support::noop_services(),
+            )
+            .await
             .expect("generation should succeed");
 
         assert_eq!(
@@ -1087,6 +1097,7 @@ mod tests {
     #[derive(Debug)]
     struct OpaqueIdProvider;
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieProvider for OpaqueIdProvider {
         fn id(&self) -> &'static str {
             "opaque"
@@ -1096,10 +1107,11 @@ mod tests {
             crate::provider_code!("t0op")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie::default())
         }
@@ -1230,6 +1242,7 @@ mod tests {
         seen_client_ip: std::sync::Mutex<Option<String>>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieProvider for EvidenceCapturingProvider {
         fn id(&self) -> &'static str {
             "evidence"
@@ -1239,10 +1252,11 @@ mod tests {
             crate::provider_code!("t0ev")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             let query_id = request_info.query_param("id").unwrap_or_default();
             let cookie = request_info.header("cookie").unwrap_or_default().to_owned();
@@ -1263,8 +1277,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generate_passes_request_parameters_and_cookies_to_the_provider() {
+    #[tokio::test]
+    async fn generate_passes_request_parameters_and_cookies_to_the_provider() {
         use crate::platform::test_support::noop_services_with_ec_provider;
 
         let provider = Arc::new(EvidenceCapturingProvider::default());
@@ -1284,7 +1298,8 @@ mod tests {
         let geo = non_regulated_geo();
         let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
             .expect("should read EC context");
-        ec.generate_if_needed(&settings, None)
+        ec.generate_if_needed(&settings, None, &services)
+            .await
             .expect("should run generation");
 
         let seen = provider
@@ -1310,6 +1325,7 @@ mod tests {
     #[derive(Debug)]
     struct ServerOpaqueProvider;
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieProvider for ServerOpaqueProvider {
         fn id(&self) -> &'static str {
             "server-opaque"
@@ -1319,10 +1335,11 @@ mod tests {
             crate::provider_code!("t0so")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie {
                 id: Some("Opaque_EC_Value_MixedCase_123".to_owned()),
@@ -1339,8 +1356,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generate_persists_an_opaque_identifier_to_kv_under_its_own_key() {
+    #[tokio::test]
+    async fn generate_persists_an_opaque_identifier_to_kv_under_its_own_key() {
         use crate::platform::test_support::noop_services_with_ec_provider;
 
         const OPAQUE: &str = "t0so~Opaque_EC_Value_MixedCase_123";
@@ -1354,7 +1371,8 @@ mod tests {
         let req = create_test_request(&[]);
         let mut ec = EcContext::read_from_request(&settings, &req, &services)
             .expect("should read EC context");
-        ec.generate_if_needed(&settings, Some(&graph))
+        ec.generate_if_needed(&settings, Some(&graph), &services)
+            .await
             .expect("should generate and persist");
 
         assert_eq!(
@@ -1380,8 +1398,152 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_provider_that_reads_no_client_ip_mints_when_the_host_has_none() {
+    /// A geo provider that resolves the country from the config store it is
+    /// handed, the geo counterpart of [`ConfigReadingProvider`].
+    #[derive(Debug)]
+    struct ConfigReadingGeo;
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::platform::PlatformGeo for ConfigReadingGeo {
+        async fn lookup(
+            &self,
+            _client_ip: Option<std::net::IpAddr>,
+            services: &crate::platform::RuntimeServices,
+        ) -> Result<Option<GeoInfo>, Report<crate::platform::PlatformError>> {
+            let country = services
+                .config_store()
+                .get(&crate::platform::StoreName::from("vendor_store"), "country")?;
+            Ok(Some(GeoInfo {
+                country,
+                ..non_regulated_geo()
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_geo_provider_reads_a_platform_service_through_the_services_it_is_given() {
+        use crate::platform::test_support::FixedConfigStore;
+
+        // The geo half of the seam acceptance test. Geo runs ahead of the
+        // permission model and feeds it the country, so a vendor geo provider
+        // that resolves location from a backend or a store needs the platform
+        // services exactly as an Edge Cookie provider does. `DE` can only
+        // appear here if the provider read it through the services this call
+        // supplied.
+        let settings = create_test_settings();
+        let req = create_test_request(&[]);
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(FixedConfigStore {
+                store: "vendor_store",
+                key: "country",
+                value: "DE",
+            }))
+            .secret_store(Arc::new(crate::platform::test_support::NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(Arc::new(crate::platform::test_support::NoopBackend))
+            .http_client(Arc::new(crate::platform::test_support::NoopHttpClient))
+            .geo(Arc::new(ConfigReadingGeo))
+            .client_info(crate::platform::ClientInfo::default())
+            .build();
+
+        let ec = EcContext::read_from_request_resolving_geo(&settings, &req, &services)
+            .await
+            .expect("should read EC context");
+
+        assert_eq!(
+            ec.geo_info().map(|info| info.country.as_str()),
+            Some("DE"),
+            "the resolved country must come from the value the geo provider read              through the services it was handed"
+        );
+    }
+
+    /// A provider that derives its identifier from a value it reads out of the
+    /// config store at mint time, which is the whole point of handing providers
+    /// the platform services. Nothing about the value is known when the
+    /// provider is constructed, so an identifier carrying it can only come from
+    /// a real read through the services passed to `generate`.
+    #[derive(Debug)]
+    struct ConfigReadingProvider;
+
+    #[async_trait::async_trait(?Send)]
+    impl EdgeCookieProvider for ConfigReadingProvider {
+        fn id(&self) -> &'static str {
+            "config-reading"
+        }
+
+        fn code(&self) -> ProviderCode {
+            crate::provider_code!("t0cr")
+        }
+
+        async fn generate(
+            &self,
+            _request_info: &dyn RequestInfo,
+            _input: &IdentityInput<'_>,
+            services: &crate::platform::RuntimeServices,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            let tenant = services
+                .config_store()
+                .get(&crate::platform::StoreName::from("vendor_store"), "tenant")
+                .map_err(|error| {
+                    error.change_context(TrustedServerError::EdgeCookie {
+                        message: "config-reading provider could not read its tenant".to_owned(),
+                    })
+                })?;
+            Ok(GeneratedEdgeCookie {
+                id: Some(format!("tenant-{tenant}")),
+                response_headers: Vec::new(),
+            })
+        }
+
+        fn accepts_id(&self, value: &str) -> bool {
+            !value.is_empty()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_provider_reads_a_platform_service_through_the_services_it_is_given() {
+        use crate::platform::test_support::{
+            FixedConfigStore, services_with_ec_provider_and_config_store,
+        };
+
+        // The acceptance test for the asynchronous provider seam. Before
+        // providers were handed the platform services, a provider could not
+        // reach a config store, a key-value store, a secret or a backend at
+        // all, which made every real vendor provider impossible to write. This
+        // proves the services that arrive at `generate` are the caller's real
+        // ones: the identifier can only carry `acme` if the provider actually
+        // read it out of the store on this request, because nothing gives the
+        // provider that value at construction time.
+        let provider = Arc::new(ConfigReadingProvider);
+        let mut settings = create_test_settings();
+        settings.ec.provider = Some(EcProviderSelection::from("config-reading"));
+        let req = create_test_request(&[]);
+        let geo = non_regulated_geo();
+
+        let services = services_with_ec_provider_and_config_store(
+            provider.clone(),
+            Arc::new(FixedConfigStore {
+                store: "vendor_store",
+                key: "tenant",
+                value: "acme",
+            }),
+        );
+        let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
+            .expect("should read EC context");
+
+        ec.generate_if_needed(&settings, None, &services)
+            .await
+            .expect("the provider should mint from the config value it read");
+
+        assert_eq!(
+            ec.ec_value(),
+            Some("t0cr~tenant-acme"),
+            "the identifier must carry the value the provider read through the              services it was handed, which proves the seam delivers them"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_reads_no_client_ip_mints_when_the_host_has_none() {
         use crate::platform::test_support::noop_services_with_ec_provider_without_client_ip;
 
         // The requirement for a client IP belongs to the provider that uses
@@ -1410,8 +1572,9 @@ mod tests {
             "the host should supply no client IP in this test"
         );
 
-        ec.generate_if_needed(&settings, None)
-            .expect("a provider that reads no client IP should still create an identifier");
+        ec.generate_if_needed(&settings, None, &services)
+            .await
+            .expect("a provider that reads no client IP should still mint");
         assert_eq!(
             ec.ec_value(),
             Some("t0ev~evidence-ec"),
@@ -1428,8 +1591,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_hmac_provider_refuses_when_the_host_has_no_client_ip() {
+    #[tokio::test]
+    async fn the_hmac_provider_refuses_when_the_host_has_no_client_ip() {
         // The other half: the built-in provider's only input is the client IP,
         // so with none it fails rather than hashing the empty string into an
         // identifier every visitor on that host would share. Identity cannot be
@@ -1449,7 +1612,8 @@ mod tests {
         );
 
         let err = ec
-            .generate_if_needed(&settings, None)
+            .generate_if_needed(&settings, None, &noop_services())
+            .await
             .expect_err("the HMAC provider should refuse without a client IP");
         assert!(
             err.to_string().contains("client IP"),
@@ -1467,6 +1631,7 @@ mod tests {
     #[derive(Debug)]
     struct IllegalIdProvider;
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieProvider for IllegalIdProvider {
         fn id(&self) -> &'static str {
             "illegal"
@@ -1476,10 +1641,11 @@ mod tests {
             crate::provider_code!("t0il")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie {
                 id: Some("bad;value with spaces".to_owned()),
@@ -1492,8 +1658,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generate_rejects_an_identifier_outside_the_cookie_safe_alphabet() {
+    #[tokio::test]
+    async fn generate_rejects_an_identifier_outside_the_cookie_safe_alphabet() {
         use crate::platform::test_support::noop_services_with_ec_provider;
 
         let mut settings = create_test_settings();
@@ -1504,8 +1670,9 @@ mod tests {
             .expect("should read EC context");
 
         let err = ec
-            .generate_if_needed(&settings, None)
-            .expect_err("an identifier outside the alphabet should be rejected at creation");
+            .generate_if_needed(&settings, None, &services)
+            .await
+            .expect_err("an identifier outside the alphabet should be rejected at mint");
         assert!(
             err.to_string().contains("illegal"),
             "the error should name the provider, got: {err}"
@@ -1527,6 +1694,7 @@ mod tests {
         mint: bool,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieProvider for HeaderSettingProvider {
         fn id(&self) -> &'static str {
             "header-setting"
@@ -1536,10 +1704,11 @@ mod tests {
             crate::provider_code!("t0hs")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie {
                 id: self.mint.then(|| "provider-value".to_owned()),
@@ -1560,7 +1729,7 @@ mod tests {
         }
     }
 
-    fn generate_with_header_setting_provider(
+    async fn generate_with_header_setting_provider(
         provider: HeaderSettingProvider,
         graph: Option<&KvIdentityGraph>,
     ) -> (Settings, Result<EcContext, Report<TrustedServerError>>) {
@@ -1572,12 +1741,15 @@ mod tests {
         let req = create_test_request(&[]);
         let mut ec = EcContext::read_from_request(&settings, &req, &services)
             .expect("should read EC context");
-        let outcome = ec.generate_if_needed(&settings, graph).map(|()| ec);
+        let outcome = ec
+            .generate_if_needed(&settings, graph, &services)
+            .await
+            .map(|()| ec);
         (settings, outcome)
     }
 
-    #[test]
-    fn generate_rejects_a_provider_effect_inside_the_reserved_response_surface() {
+    #[tokio::test]
+    async fn generate_rejects_a_provider_effect_inside_the_reserved_response_surface() {
         // A provider that sets the managed `ts-ec` cookie would bypass core's
         // identifier validation and its identity-graph row entirely, so the
         // request fails rather than the effect being quietly dropped. The
@@ -1590,7 +1762,8 @@ mod tests {
                 mint: false,
             },
             None,
-        );
+        )
+        .await;
 
         let err = outcome.expect_err("a managed cookie effect should fail the request");
         assert!(
@@ -1607,7 +1780,8 @@ mod tests {
                     mint: false,
                 },
                 None,
-            );
+            )
+            .await;
             assert!(
                 outcome.is_err(),
                 "`{name}` is reserved and should fail the request"
@@ -1615,8 +1789,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generate_applies_a_provider_owned_cookie_to_the_response() {
+    #[tokio::test]
+    async fn generate_applies_a_provider_owned_cookie_to_the_response() {
         // The other half of the rule: a provider's own cookie is not core's, so
         // it survives generation and reaches the browser response unchanged,
         // alongside the managed `ts-ec` cookie core writes itself.
@@ -1628,7 +1802,8 @@ mod tests {
                 mint: true,
             },
             Some(&graph),
-        );
+        )
+        .await;
         let ec = outcome.expect("a provider-owned cookie should not fail the request");
         assert_eq!(
             ec.ec_value(),
@@ -1676,6 +1851,7 @@ mod tests {
     #[derive(Debug)]
     pub(crate) struct CanonicalizingProvider;
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieProvider for CanonicalizingProvider {
         fn id(&self) -> &'static str {
             "canonical"
@@ -1685,10 +1861,11 @@ mod tests {
             crate::provider_code!("t0ca")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie {
                 id: Some("MiXeD.CaseId".to_owned()),
@@ -1705,8 +1882,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generate_keys_the_identity_graph_by_the_normalized_identifier() {
+    #[tokio::test]
+    async fn generate_keys_the_identity_graph_by_the_normalized_identifier() {
         use crate::platform::test_support::noop_services_with_ec_provider;
 
         let mut settings = create_test_settings();
@@ -1716,7 +1893,8 @@ mod tests {
         let req = create_test_request(&[]);
         let mut ec = EcContext::read_from_request(&settings, &req, &services)
             .expect("should read EC context");
-        ec.generate_if_needed(&settings, Some(&graph))
+        ec.generate_if_needed(&settings, Some(&graph), &services)
+            .await
             .expect("should generate and persist");
 
         assert_eq!(
@@ -1741,8 +1919,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn hmac_mints_a_coded_identifier_and_dual_reads_the_legacy_bare_form() {
+    #[tokio::test]
+    async fn hmac_mints_a_coded_identifier_and_dual_reads_the_legacy_bare_form() {
         let settings = create_test_settings();
         // Place the request in a US opt-out state, whose baseline grants the
         // storage permission with no signal, so the creation runs.
@@ -1753,7 +1931,8 @@ mod tests {
         );
         let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
             .expect("should read EC context");
-        ec.generate_if_needed(&settings, None)
+        ec.generate_if_needed(&settings, None, &services)
+            .await
             .expect("should generate");
         let created = ec.ec_value().expect("should create an identifier");
         assert!(
@@ -1806,10 +1985,12 @@ mod tests {
     #[derive(Debug)]
     struct FailingGeo;
 
+    #[async_trait::async_trait(?Send)]
     impl crate::platform::PlatformGeo for FailingGeo {
-        fn lookup(
+        async fn lookup(
             &self,
             _client_ip: Option<std::net::IpAddr>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<Option<GeoInfo>, Report<crate::platform::PlatformError>> {
             Err(Report::new(crate::platform::PlatformError::Geo))
         }
@@ -1830,8 +2011,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_geo_provider_failure_resolves_permissions_at_the_requires_signal_floor() {
+    #[tokio::test]
+    async fn a_geo_provider_failure_resolves_permissions_at_the_requires_signal_floor() {
         use crate::permissions::Permission;
         use crate::platform::test_support::build_services_with_geo;
 
@@ -1851,6 +2032,7 @@ mod tests {
 
         let services = build_services_with_geo(std::sync::Arc::new(FailingGeo));
         let failed = EcContext::read_from_request_resolving_geo(&settings, &req, &services)
+            .await
             .expect("a failed lookup should resolve permissions, not fail the request");
         assert!(
             !failed.permissions().is_set(Permission::StoreOnDevice),
@@ -2006,8 +2188,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn generate_if_needed_skips_when_ec_exists() {
+    #[tokio::test]
+    async fn generate_if_needed_skips_when_ec_exists() {
         let settings = create_test_settings();
         let ec_id = valid_ec_id("d", "Exist1");
         let cookie = format!("ts-ec={ec_id}");
@@ -2015,7 +2197,8 @@ mod tests {
 
         let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
             .expect("should read EC context");
-        ec.generate_if_needed(&settings, None)
+        ec.generate_if_needed(&settings, None, &noop_services())
+            .await
             .expect("should not error when EC already exists");
 
         assert_eq!(

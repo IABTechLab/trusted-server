@@ -606,8 +606,13 @@ impl PlatformHttpClient for StubHttpClient {
 
 pub(crate) struct NoopGeo;
 
+#[async_trait::async_trait(?Send)]
 impl PlatformGeo for NoopGeo {
-    fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+    async fn lookup(
+        &self,
+        _client_ip: Option<IpAddr>,
+        _services: &crate::platform::RuntimeServices,
+    ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
         Ok(None)
     }
 }
@@ -723,8 +728,62 @@ pub(crate) fn noop_services_with_ec_provider(
 /// client IP, modeling a host that cannot determine one.
 ///
 /// Whether that matters is the provider's decision, so this exists to test both
-/// answers: a provider reading other evidence still creates an identifier, and
-/// one that needs the IP refuses.
+/// answers: a provider reading other evidence still mints, and one that needs
+/// the IP refuses.
+/// A config store that answers one known key, so a test can prove a provider
+/// reached the config store it was handed rather than a value it already held.
+#[derive(Debug)]
+pub(crate) struct FixedConfigStore {
+    pub(crate) store: &'static str,
+    pub(crate) key: &'static str,
+    pub(crate) value: &'static str,
+}
+
+impl PlatformConfigStore for FixedConfigStore {
+    fn get(&self, store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+        if store_name.as_ref() == self.store && key == self.key {
+            Ok(self.value.to_owned())
+        } else {
+            Err(Report::new(PlatformError::ConfigStore))
+        }
+    }
+
+    fn put(
+        &self,
+        _store_id: &StoreId,
+        _key: &str,
+        _value: &str,
+    ) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
+    fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+}
+
+/// Build a [`RuntimeServices`] carrying both an Edge Cookie provider and a
+/// config store the provider is expected to read through, so a test can prove
+/// the services reaching the provider are the ones the caller supplied.
+pub(crate) fn services_with_ec_provider_and_config_store(
+    ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+    config_store: Arc<dyn PlatformConfigStore>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(config_store)
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip: Some("203.0.113.10".parse().expect("should parse test client IP")),
+            ..ClientInfo::default()
+        })
+        .ec_provider(ec_provider)
+        .build()
+}
+
 pub(crate) fn noop_services_with_ec_provider_without_client_ip(
     ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
 ) -> RuntimeServices {

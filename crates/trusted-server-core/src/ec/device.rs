@@ -127,6 +127,12 @@ impl DeviceSignals {
 /// classification the Edge Cookie gate needs, not a full device-detection
 /// result such as make, model, OS version, or screen size. A richer device
 /// model for the ad request is a separate concern.
+/// Uses `#[async_trait(?Send)]` for the same reason as
+/// [`PlatformHttpClient`](crate::platform::PlatformHttpClient): the trait
+/// object stays `Send + Sync` so it can be shared and run multi-threaded,
+/// while the future it returns is pinned to one thread because the host SDKs
+/// produce `!Send` futures on wasm32.
+#[async_trait::async_trait(?Send)]
 pub trait DeviceProvider: Send + Sync {
     /// Returns the stable identifier for this provider, used in configuration
     /// and logs.
@@ -139,7 +145,15 @@ pub trait DeviceProvider: Send + Sync {
     /// Device signals gate identity operations and must always yield a value,
     /// so this is infallible: a provider that cannot determine a signal returns
     /// the unknown variant rather than failing the request.
-    fn detect(&self, request_info: &dyn RequestInfo) -> DeviceSignals;
+    /// Asynchronous because a device provider may reach a backend, a
+    /// key-value store or a secret to classify a request, and a provider that
+    /// cannot make those calls cannot be written at all. The built-in
+    /// User-Agent provider does no I/O and returns immediately.
+    async fn detect(
+        &self,
+        request_info: &dyn RequestInfo,
+        services: &crate::platform::RuntimeServices,
+    ) -> DeviceSignals;
 
     /// The permissions this provider's data use requires.
     ///
@@ -167,12 +181,17 @@ impl BuiltinDeviceProvider {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl DeviceProvider for BuiltinDeviceProvider {
     fn id(&self) -> &'static str {
         "builtin"
     }
 
-    fn detect(&self, request_info: &dyn RequestInfo) -> DeviceSignals {
+    async fn detect(
+        &self,
+        request_info: &dyn RequestInfo,
+        _services: &crate::platform::RuntimeServices,
+    ) -> DeviceSignals {
         DeviceSignals::derive_ua_only(request_info.user_agent())
     }
 }
@@ -774,15 +793,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn builtin_device_provider_is_ua_only() {
+    #[tokio::test]
+    async fn builtin_device_provider_is_ua_only() {
         let provider = BuiltinDeviceProvider::new();
         assert_eq!(provider.id(), "builtin");
 
         // The built-in provider classifies from the User-Agent in the request
         // info passed to `detect` alone, recording no host signal.
         let request_info = request_info_with_ua(CHROME_MAC_UA);
-        let signals = provider.detect(&request_info);
+        let signals = provider
+            .detect(
+                &request_info,
+                &crate::platform::test_support::noop_services(),
+            )
+            .await;
         assert_eq!(
             signals,
             DeviceSignals::derive_ua_only(CHROME_MAC_UA),
@@ -809,12 +833,17 @@ mod tests {
     /// selection logic can be tested in core without the Fastly provider crate.
     struct StubFastlyProvider;
 
+    #[async_trait::async_trait(?Send)]
     impl DeviceProvider for StubFastlyProvider {
         fn id(&self) -> &'static str {
             "fastly"
         }
 
-        fn detect(&self, _request_info: &dyn RequestInfo) -> DeviceSignals {
+        async fn detect(
+            &self,
+            _request_info: &dyn RequestInfo,
+            _services: &crate::platform::RuntimeServices,
+        ) -> DeviceSignals {
             DeviceSignals::derive_ua_only("")
         }
     }

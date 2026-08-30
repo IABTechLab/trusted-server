@@ -2,7 +2,7 @@ use std::net::IpAddr;
 
 use error_stack::Report;
 
-use super::{GeoInfo, PlatformBackendSpec, PlatformError, StoreId, StoreName};
+use super::{GeoInfo, PlatformBackendSpec, PlatformError, RuntimeServices, StoreId, StoreName};
 
 /// Synchronous, object-safe access to a key-value config store.
 ///
@@ -134,7 +134,19 @@ pub trait PlatformBackend: Send + Sync {
     }
 }
 
-/// Synchronous, object-safe geo lookup.
+/// Object-safe geo lookup.
+///
+/// Asynchronous because a geo provider may reach a backend, a key-value store
+/// or a secret to resolve a location, and a provider that cannot make those
+/// calls cannot be written at all. A provider that resolves from data already
+/// in hand still declares an async method and returns immediately.
+///
+/// Uses `#[async_trait(?Send)]` for the same reason as
+/// [`PlatformHttpClient`](super::PlatformHttpClient): the trait object stays
+/// `Send + Sync` so it can be shared and run multi-threaded, while the future
+/// it returns is pinned to one thread because the host SDKs produce `!Send`
+/// futures on wasm32.
+#[async_trait::async_trait(?Send)]
 pub trait PlatformGeo: Send + Sync {
     /// Look up geographic information for the given client IP address.
     ///
@@ -149,7 +161,11 @@ pub trait PlatformGeo: Send + Sync {
     ///
     /// Returns [`PlatformError::Geo`] when the platform geo lookup fails
     /// unexpectedly. Returns `Ok(None)` when no data is available for the IP.
-    fn lookup(&self, client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>>;
+    async fn lookup(
+        &self,
+        client_ip: Option<IpAddr>,
+        services: &RuntimeServices,
+    ) -> Result<Option<GeoInfo>, Report<PlatformError>>;
 
     /// The permissions this provider's data use requires.
     ///

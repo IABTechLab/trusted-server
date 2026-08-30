@@ -263,7 +263,8 @@ pub async fn handle_auction(
     // Look up geo for device info.
     let geo = services
         .geo()
-        .lookup(services.client_info().client_ip)
+        .lookup(services.client_info().client_ip, services)
+        .await
         .unwrap_or_else(|e| {
             log::warn!("geo lookup failed: {e}");
             None

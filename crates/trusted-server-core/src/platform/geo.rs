@@ -2,7 +2,7 @@ use std::net::IpAddr;
 
 use error_stack::Report;
 
-use super::{GeoInfo, PlatformError, PlatformGeo};
+use super::{GeoInfo, PlatformError, PlatformGeo, RuntimeServices};
 
 /// A geo provider that resolves nothing.
 ///
@@ -18,8 +18,13 @@ use super::{GeoInfo, PlatformError, PlatformGeo};
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DisabledGeo;
 
+#[async_trait::async_trait(?Send)]
 impl PlatformGeo for DisabledGeo {
-    fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+    async fn lookup(
+        &self,
+        _client_ip: Option<IpAddr>,
+        _services: &RuntimeServices,
+    ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
         Ok(None)
     }
 }

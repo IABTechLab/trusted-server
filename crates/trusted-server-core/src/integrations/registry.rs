@@ -1485,7 +1485,7 @@ impl IntegrationRegistry {
             // Only generate for document navigations — subresource requests
             // may lack consent signals such as the Sec-GPC header.
             if is_navigation_request(&req) {
-                if let Err(err) = ec_context.generate_if_needed(settings, kv) {
+                if let Err(err) = ec_context.generate_if_needed(settings, kv, services).await {
                     log::error!("EC generation failed for integration proxy: {err:?}");
                 }
             } else {
@@ -3651,10 +3651,12 @@ mod tests {
     #[derive(Debug)]
     struct FixedCountryGeo;
 
+    #[async_trait::async_trait(?Send)]
     impl crate::platform::PlatformGeo for FixedCountryGeo {
-        fn lookup(
+        async fn lookup(
             &self,
             _client_ip: Option<std::net::IpAddr>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<Option<GeoInfo>, Report<crate::platform::PlatformError>> {
             Ok(Some(GeoInfo {
                 city: "Example City".to_owned(),
@@ -3695,8 +3697,8 @@ mod tests {
         settings
     }
 
-    #[test]
-    fn geo_provider_resolves_the_provider_declared_by_the_selected_module() {
+    #[tokio::test]
+    async fn geo_provider_resolves_the_provider_declared_by_the_selected_module() {
         let settings = settings_selecting_geo_provider("geo-probe");
 
         let registry = IntegrationRegistry::with_registrations(&settings, &geo_probe_builders())
@@ -3706,7 +3708,8 @@ mod tests {
             .geo_provider()
             .expect("should resolve the module's geo provider");
         let resolved = provider
-            .lookup(None)
+            .lookup(None, &noop_services())
+            .await
             .expect("should look up without failing")
             .expect("should resolve a location");
         assert_eq!(
@@ -3715,8 +3718,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn geo_provider_none_resolves_no_location() {
+    #[tokio::test]
+    async fn geo_provider_none_resolves_no_location() {
         let settings = settings_selecting_geo_provider("none");
 
         let registry = IntegrationRegistry::with_registrations(&settings, &geo_probe_builders())
@@ -3727,15 +3730,16 @@ mod tests {
             .expect("should resolve the disabled geo provider");
         assert!(
             provider
-                .lookup(None)
+                .lookup(None, &noop_services())
+                .await
                 .expect("should look up without failing")
                 .is_none(),
             "should resolve no location when the selector is `none`"
         );
     }
 
-    #[test]
-    fn an_unset_geo_selector_resolves_the_disabled_provider_and_platform_opts_in() {
+    #[tokio::test]
+    async fn an_unset_geo_selector_resolves_the_disabled_provider_and_platform_opts_in() {
         // Unset is the permission model's privacy default: it resolves the
         // disabled provider, so no client IP ever reaches a host geo service.
         // It is deliberately not the same as leaving the adapter's own lookup
@@ -3754,7 +3758,8 @@ mod tests {
             .expect("an unset selector should resolve the disabled provider, not nothing");
         assert!(
             provider
-                .lookup(None)
+                .lookup(None, &noop_services())
+                .await
                 .expect("should look up without failing")
                 .is_none(),
             "the disabled provider should resolve no location and make no host call"

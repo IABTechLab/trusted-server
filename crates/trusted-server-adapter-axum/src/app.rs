@@ -243,12 +243,12 @@ where
 ///
 /// Returns an error when the selected Edge Cookie provider cannot be built for
 /// this request, or when the request's `Cookie` header is not valid UTF-8.
-fn build_ec_context(
+async fn build_ec_context(
     state: &AppState,
     services: &RuntimeServices,
     req: &Request,
 ) -> Result<EcContext, Report<TrustedServerError>> {
-    EcContext::read_from_request_resolving_geo(&state.settings, req, services)
+    EcContext::read_from_request_resolving_geo(&state.settings, req, services).await
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +302,7 @@ async fn dispatch_fallback(
 
     // Run the server-side auction with the configured creative-opportunity
     // slots; `handle_publisher_request` matches them against the request path.
-    let mut ec_context = build_ec_context(state, services, &req)?;
+    let mut ec_context = build_ec_context(state, services, &req).await?;
     let auction = AuctionDispatch {
         orchestrator: &state.orchestrator,
         slots: state.settings.creative_opportunity_slots(),
@@ -541,7 +541,7 @@ fn named_route_handler(
                         // Build the geo-aware EC context so the auction consent
                         // gate sees the caller's jurisdiction — `EcContext::default()`
                         // fails it closed for consented users.
-                        let ec_context = build_ec_context(&state, &services, &req)?;
+                        let ec_context = build_ec_context(&state, &services, &req).await?;
                         handle_auction(
                             &state.settings,
                             &state.orchestrator,
@@ -560,7 +560,7 @@ fn named_route_handler(
                         if req.method() == Method::OPTIONS {
                             Ok(page_bids_preflight_denied())
                         } else {
-                            let ec_context = build_ec_context(&state, &services, &req)?;
+                            let ec_context = build_ec_context(&state, &services, &req).await?;
                             let auction = AuctionDispatch {
                                 orchestrator: &state.orchestrator,
                                 slots: state.settings.creative_opportunity_slots(),
@@ -806,8 +806,8 @@ mod tests {
     /// `EcContext::default()`, so a deployment whose selected provider could not
     /// be built served every request with no identity. The call sites propagate
     /// the error to `http_error`, matching the Fastly adapter.
-    #[test]
-    fn build_ec_context_fails_when_the_selected_provider_is_unavailable() {
+    #[tokio::test]
+    async fn build_ec_context_fails_when_the_selected_provider_is_unavailable() {
         let state = state_with_uninjected_provider();
         let req = request_builder()
             .method("POST")
@@ -819,6 +819,7 @@ mod tests {
         let req = ctx.into_request();
 
         let error = build_ec_context(&state, &services, &req)
+            .await
             .expect_err("an unavailable Edge Cookie provider must fail the request");
 
         assert!(

@@ -199,18 +199,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn runtime_services_geo_lookup_returns_none_for_no_ip() {
+    #[tokio::test]
+    async fn runtime_services_geo_lookup_returns_none_for_no_ip() {
         let services = noop_services();
         let result = services
             .geo()
-            .lookup(services.client_info().client_ip)
+            .lookup(services.client_info().client_ip, &noop_services())
+            .await
             .expect("should not fail for noop geo with no ip");
         assert!(result.is_none(), "should return None when no IP is present");
     }
 
-    #[test]
-    fn build_geo_provider_defaults_to_no_geo() {
+    #[tokio::test]
+    async fn build_geo_provider_defaults_to_no_geo() {
         let settings = Settings::default();
         let host: Arc<dyn PlatformGeo> = Arc::new(test_support::NoopGeo);
         let selected = build_geo_provider(&settings, Arc::clone(&host));
@@ -220,7 +221,11 @@ mod tests {
         );
         assert!(
             selected
-                .lookup(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))))
+                .lookup(
+                    Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
+                    &noop_services()
+                )
+                .await
                 .expect("disabled geo lookup should not fail")
                 .is_none(),
             "the default geo provider should resolve nothing"

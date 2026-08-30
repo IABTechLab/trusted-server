@@ -326,6 +326,29 @@ pub(crate) fn runtime_services_for_consent_route(
 /// Applies the module-supplied geo provider selected by `[geo] provider`. When
 /// the selector is unset the registry resolves no provider and the Fastly
 /// lookup stands, so the request path is unchanged.
+/// Builds the services graph handed to a provider on a response-side finalize
+/// path.
+///
+/// The finalize paths run after the handler, where the per-request services
+/// built by [`build_per_request_services`] are already out of scope, but a geo
+/// provider still needs real platform services to resolve a location. Nothing
+/// here varies per request except the client metadata, so this is built once
+/// and cloned with [`RuntimeServices::with_client_info`] at each call.
+pub(crate) fn build_finalize_services(
+    settings: &Settings,
+    kv_store: Arc<dyn PlatformKvStore>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(FastlyPlatformConfigStore))
+        .secret_store(Arc::new(FastlyPlatformSecretStore))
+        .kv_store(kv_store)
+        .backend(Arc::new(FastlyPlatformBackend))
+        .http_client(Arc::new(FastlyPlatformHttpClient))
+        .geo(build_geo_provider(settings, Arc::new(FastlyPlatformGeo)))
+        .client_info(ClientInfo::default())
+        .build()
+}
+
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
     let client_info = ctx
         .request()
@@ -512,7 +535,7 @@ fn device_signals_for(req: &Request) -> DeviceSignals {
 
 /// Builds the per-request EC state, mirroring the pre-routing prelude of the
 /// legacy `route_request` step by step.
-fn build_ec_request_state(
+async fn build_ec_request_state(
     settings: &Settings,
     services: &RuntimeServices,
     req: &Request,
@@ -532,7 +555,7 @@ fn build_ec_request_state(
     let sharedid_cookie = crate::extract_cookie_value(req, COOKIE_SHAREDID);
 
     let (ec_context, setup_error) =
-        match EcContext::read_from_request_resolving_geo(settings, req, services) {
+        match EcContext::read_from_request_resolving_geo(settings, req, services).await {
             Ok(mut context) => {
                 context.set_device_signals(device_signals);
                 (context, None)
@@ -691,7 +714,7 @@ async fn execute_named(
         return Ok(http_error(&report));
     }
 
-    let mut ec = build_ec_request_state(&state.settings, &services, &req);
+    let mut ec = build_ec_request_state(&state.settings, &services, &req).await;
     // EcContext creation errors short-circuit before filters, mirroring legacy:
     // the legacy path returns its error response before running filter_request.
     if let Some(report) = ec.setup_error.take() {
@@ -767,9 +790,16 @@ async fn run_named_route(
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
         NamedRouteHandler::EcResolve => {
             // The resolve endpoint persists the identity-graph row before
-            // creating, so it takes the same bot-gated graph as generation: an
-            // unrecognized client gets no graph, and therefore no new Edge Cookie.
-            handle_ec_resolve(&state.settings, req, &ec.ec_context, ec.kv_graph.as_ref())
+            // minting, so it takes the same bot-gated graph as generation: an
+            // unrecognized client gets no graph, and therefore no mint.
+            handle_ec_resolve(
+                &state.settings,
+                req,
+                &ec.ec_context,
+                ec.kv_graph.as_ref(),
+                services,
+            )
+            .await
         }
         NamedRouteHandler::Auction => {
             // The auction reads consent data, so the consent KV store must be
@@ -898,7 +928,7 @@ async fn dispatch_fallback(
         return http_error(&report);
     }
 
-    let mut ec = build_ec_request_state(&state.settings, services, &req);
+    let mut ec = build_ec_request_state(&state.settings, services, &req).await;
     if let Some(report) = ec.setup_error.take() {
         let response = http_error(&report);
         return attach_dispatch_extensions(response, ec, RequestFilterEffects::default());
@@ -964,7 +994,8 @@ async fn dispatch_fallback(
             && is_navigation_request(&req)
             && let Err(err) = ec
                 .ec_context
-                .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
+                .generate_if_needed(&state.settings, ec.kv_graph.as_ref(), services)
+                .await
         {
             log::error!("EC generation failed for publisher proxy: {err:?}");
         }
@@ -1405,6 +1436,7 @@ impl TrustedServerApp {
             .middleware(FinalizeResponseMiddleware::new(
                 Arc::clone(&state.settings),
                 build_geo_provider(&state.settings, Arc::new(FastlyPlatformGeo)),
+                build_finalize_services(&state.settings, Arc::clone(&state.default_kv_store)),
             ))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
 

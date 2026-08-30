@@ -1537,6 +1537,7 @@ mod tests {
     #[derive(Debug)]
     struct OpaqueProvider;
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieProvider for OpaqueProvider {
         fn id(&self) -> &'static str {
             "opaque"
@@ -1546,10 +1547,11 @@ mod tests {
             crate::provider_code!("t0op")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn crate::evidence::RequestInfo,
             _input: &super::super::provider::IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<super::super::provider::GeneratedEdgeCookie, Report<TrustedServerError>>
         {
             Ok(super::super::provider::GeneratedEdgeCookie::default())

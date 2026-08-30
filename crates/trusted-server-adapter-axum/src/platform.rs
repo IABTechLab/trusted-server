@@ -186,8 +186,13 @@ impl PlatformBackend for AxumPlatformBackend {
 /// No-op geo implementation — geographic lookup is unavailable in local development.
 pub struct AxumPlatformGeo;
 
+#[async_trait::async_trait(?Send)]
 impl PlatformGeo for AxumPlatformGeo {
-    fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+    async fn lookup(
+        &self,
+        _client_ip: Option<IpAddr>,
+        _services: &trusted_server_core::platform::RuntimeServices,
+    ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
         Ok(None)
     }
 }
@@ -604,6 +609,21 @@ pub fn build_runtime_services(
 mod tests {
     use super::*;
     use edgezero_core::body::Body as EdgeBody;
+
+    /// The services graph a provider is handed, built the same way the request
+    /// path builds it so the tests exercise the production shape.
+    fn test_services() -> RuntimeServices {
+        let req = edgezero_core::http::request_builder()
+            .method("GET")
+            .uri("https://example.com/")
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+        let ctx = edgezero_core::context::RequestContext::new(
+            req,
+            edgezero_core::params::PathParams::default(),
+        );
+        build_runtime_services(&ctx, &trusted_server_core::settings::Settings::default())
+    }
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -688,13 +708,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn geo_always_returns_none() {
+    #[tokio::test]
+    async fn geo_always_returns_none() {
         let geo = AxumPlatformGeo;
-        let no_ip = geo.lookup(None).expect("should not error");
+        let no_ip = geo
+            .lookup(None, &test_services())
+            .await
+            .expect("should not error");
         assert!(no_ip.is_none(), "should return None for no IP");
         let with_ip = geo
-            .lookup(Some("127.0.0.1".parse().expect("should parse IP")))
+            .lookup(
+                Some("127.0.0.1".parse().expect("should parse IP")),
+                &test_services(),
+            )
+            .await
             .expect("should not error");
         assert!(with_ip.is_none(), "should return None for any IP");
     }

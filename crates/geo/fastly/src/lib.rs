@@ -38,8 +38,13 @@ fn geo_from_fastly(geo: &Geo) -> GeoInfo {
 /// resolves the location, and `provider = "none"` disables geo instead.
 pub struct FastlyPlatformGeo;
 
+#[async_trait::async_trait(?Send)]
 impl PlatformGeo for FastlyPlatformGeo {
-    fn lookup(&self, client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+    async fn lookup(
+        &self,
+        client_ip: Option<IpAddr>,
+        _services: &trusted_server_core::platform::RuntimeServices,
+    ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
         Ok(client_ip
             .and_then(geo_lookup)
             .map(|geo| geo_from_fastly(&geo)))

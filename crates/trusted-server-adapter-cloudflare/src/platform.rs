@@ -682,8 +682,13 @@ struct CloudflareGeo {
     region: Option<String>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl PlatformGeo for CloudflareGeo {
-    fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+    async fn lookup(
+        &self,
+        _client_ip: Option<IpAddr>,
+        _services: &trusted_server_core::platform::RuntimeServices,
+    ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
         if self.country.is_empty() {
             return Ok(None);
         }
@@ -785,6 +790,18 @@ mod tests {
     use edgezero_core::http::{HeaderValue, request_builder};
     use edgezero_core::params::PathParams;
 
+    /// The services graph a provider is handed, built the same way the request
+    /// path builds it so the tests exercise the production shape.
+    fn test_services() -> RuntimeServices {
+        let req = edgezero_core::http::request_builder()
+            .method("GET")
+            .uri("https://example.com/")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build test request");
+        let ctx = RequestContext::new(req, PathParams::default());
+        build_runtime_services(&ctx, &trusted_server_core::settings::Settings::default())
+    }
+
     fn make_ctx_with_header(name: &str, value: &str) -> RequestContext {
         let req = request_builder()
             .method("GET")
@@ -813,8 +830,8 @@ mod tests {
         RequestContext::new(req, PathParams::default())
     }
 
-    #[test]
-    fn a_us_state_visitor_reaches_the_us_state_jurisdiction_and_its_opt_out() {
+    #[tokio::test]
+    async fn a_us_state_visitor_reaches_the_us_state_jurisdiction_and_its_opt_out() {
         // This adapter used to hardcode `region: None` and read no region
         // header, and the consequence ran all the way to the privacy outcome.
         // `detect_jurisdiction` reaches a US state node of the policy tree
@@ -825,7 +842,8 @@ mod tests {
         // Cloudflare.
         let ctx = make_ctx_with_headers(&[("cf-ipcountry", "US"), ("cf-region-code", "CA")]);
         let geo = build_geo(&ctx)
-            .lookup(None)
+            .lookup(None, &test_services())
+            .await
             .expect("should look up without failing")
             .expect("a country header should resolve a location");
         assert_eq!(
@@ -857,7 +875,8 @@ mod tests {
         // whose plan supplies the header.
         let ctx = make_ctx_with_headers(&[("cf-ipcountry", "US")]);
         let geo = build_geo(&ctx)
-            .lookup(None)
+            .lookup(None, &test_services())
+            .await
             .expect("should look up without failing")
             .expect("a country header should resolve a location");
         assert_eq!(
@@ -923,20 +942,21 @@ mod tests {
         assert!(geo.country.is_empty(), "XX should be treated as absent");
     }
 
-    #[test]
-    fn build_geo_lookup_returns_none_when_country_absent() {
+    #[tokio::test]
+    async fn build_geo_lookup_returns_none_when_country_absent() {
         let ctx = make_ctx_without_header();
         let geo = build_geo(&ctx);
         assert!(
-            geo.lookup(None)
+            geo.lookup(None, &test_services())
+                .await
                 .expect("should perform geo lookup")
                 .is_none(),
             "should return None when no country header"
         );
     }
 
-    #[test]
-    fn build_geo_lookup_returns_some_with_populated_country() {
+    #[tokio::test]
+    async fn build_geo_lookup_returns_some_with_populated_country() {
         let req = request_builder()
             .method("GET")
             .uri("https://example.com/")
@@ -950,7 +970,8 @@ mod tests {
         let ctx = RequestContext::new(req, PathParams::default());
         let geo = build_geo(&ctx);
         let info = geo
-            .lookup(None)
+            .lookup(None, &test_services())
+            .await
             .expect("should perform geo lookup")
             .expect("should return GeoInfo when country is set");
         assert_eq!(info.country, "US", "should populate country");

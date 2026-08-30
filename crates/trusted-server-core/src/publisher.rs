@@ -10861,10 +10861,12 @@ mod tests {
         /// as a substring rather than requiring inference.
         struct StubGeo(&'static str);
 
+        #[async_trait::async_trait(?Send)]
         impl crate::platform::PlatformGeo for StubGeo {
-            fn lookup(
+            async fn lookup(
                 &self,
                 _client_ip: Option<std::net::IpAddr>,
+                _services: &crate::platform::RuntimeServices,
             ) -> Result<Option<GeoInfo>, Report<crate::platform::PlatformError>> {
                 Ok(Some(GeoInfo {
                     city: self.0.to_string(),
