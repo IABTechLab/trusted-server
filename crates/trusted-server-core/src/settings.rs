@@ -858,7 +858,7 @@ pub struct DeviceConfig {
     /// compiled WebAssembly can switch providers at deployment. An unknown key is
     /// rejected at startup by
     /// [`validate_provider_selection`](Self::validate_provider_selection).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
 }
 
@@ -908,7 +908,7 @@ pub struct GeoConfig {
     /// WebAssembly can switch providers at deployment. An unknown key is rejected
     /// at startup by
     /// [`validate_provider_selection`](Self::validate_provider_selection).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
 }
 
@@ -8391,6 +8391,29 @@ formats = [{{ width = 300, height = 250 }}]
         assert_creative_opportunity_slot_config_rejected(
             &slot_body,
             "must render to at most 100 UTF-8 bytes",
+        );
+    }
+
+    /// An unset selector must not serialize as `"provider": null`.
+    ///
+    /// The section as a whole is skipped while every field is default, so this
+    /// serializes the struct directly. Once a later change makes another field
+    /// required, the section is always emitted and a null selector would then
+    /// reach a config blob, where a binary that predates the field rejects it.
+    #[test]
+    fn an_unset_provider_selector_is_omitted_from_the_serialized_section() {
+        let geo = GeoConfig::default();
+        let json = serde_json::to_string(&geo).expect("should serialize the geo section");
+        assert!(
+            !json.contains("provider"),
+            "an unset geo selector should be omitted rather than serialized as null, got {json}"
+        );
+
+        let device = DeviceConfig::default();
+        let json = serde_json::to_string(&device).expect("should serialize the device section");
+        assert!(
+            !json.contains("provider"),
+            "an unset device selector should be omitted rather than serialized as null, got {json}"
         );
     }
 
