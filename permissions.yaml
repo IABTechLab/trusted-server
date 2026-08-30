@@ -1,5 +1,12 @@
 # Country and region permission rules for Trusted Server's permission model.
 #
+# The vocabulary is not ours. The permissions are the IAB Tech Lab Privacy
+# Taxonomy Data Uses, with the IAB TCF Europe purposes mapped onto them where
+# no Data Use exists yet. That is deliberate, because a permission a provider
+# declares should be stated in the industry's own terms rather than in a
+# vocabulary this project invented, so a reader can check it against the
+# taxonomy rather than against us.
+#
 # This file is compiled into the build, not loaded at runtime. Editing it and
 # rebuilding is how a deployer changes the default policy, so the rules stay
 # visible and reviewable in version control.
@@ -43,7 +50,8 @@
 # meaning is explicit. (A `default: <flag>` shorthand is also accepted for any
 # Data Use a group omits.)
 groups:
-  # European Union: opt-in; the modeled ad-tech purposes require a signal.
+  # European Union, where the model is opt-in, so the modeled ad-tech purposes
+  # require a signal.
   gdpr-eu:
     necessary.operations.storage: requires_signal
     advertising_marketing.first_party.contextual: requires_signal

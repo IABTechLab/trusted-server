@@ -23,6 +23,19 @@ the examples use the most protective baseline (GDPR-EU). With no Edge Cookie
 provider selected there is nothing to gate, so no identifier is created and the
 request proceeds.
 
+## Where the vocabulary comes from
+
+The permissions are not a vocabulary this project invented. They are the IAB
+Tech Lab Privacy Taxonomy Data Uses, with the IAB TCF Europe purposes mapped
+onto them where no Data Use exists yet.
+
+That matters for reading the rest of this guide. When a provider declares the
+permissions its data use requires, it is naming a Data Use from that taxonomy,
+so an operator or an auditor can check the declaration against the taxonomy
+rather than against our interpretation of it. The mapping from TCF purposes is
+recorded in `permissions.yaml` alongside the rules, so no signal-to-permission
+policy is hidden in code.
+
 ## Separating legal policy from the core
 
 The core does not encode any jurisdiction's law or any single policy. A provider
@@ -104,7 +117,7 @@ into the consumer.
 
 The permission names are IAB Privacy Taxonomy Data Uses, mapped from the IAB TCF
 Europe purposes and used **only** as technical identifiers. No CMP or TCF policy
-is implemented in the core. Two purposes have no Data Use yet: purpose 1 (device
+is implemented in the core. Two purposes have no Data Use yet, being purpose 1 (device
 storage) uses a proposed `necessary.operations.storage` key, and purpose 11
 keeps its TCF identifier `select-basic-content`. Both are flagged for an upstream
 taxonomy addition. All eleven purposes are now resolved against the incoming
@@ -301,7 +314,7 @@ default_country = "US"
 ```
 
 The default country covers requests the geo provider leaves unmatched. A
-failed geo lookup is different: it resolves every permission to the
+failed geo lookup is different, because it resolves every permission to the
 requires-signal floor instead of the default, and is logged at error level.
 
 Read that alongside which lookups can actually fail, because it decides how
@@ -310,7 +323,7 @@ today can fail. Fastly's lookup returns "no data" rather than an error, the
 Cloudflare provider reads request headers, and the Axum and Spin providers
 resolve nothing at all. **A geo outage therefore reaches the default country,
 not the floor**, because "no data" and "the deployer left this unmatched" are
-the same state. Choose the default country on that basis: whatever it grants
+the same state. Choose the default country on that basis, meaning whatever it grants
 is what an outage grants. The floor applies to a geo provider that does its
 own lookup and can report a failure.
 
@@ -338,7 +351,7 @@ rules:
 
 ## Relationship to Edge Cookies
 
-Edge Cookie creation is gated through this model: the built-in HMAC provider
+Edge Cookie creation is gated through this model, because the built-in HMAC provider
 requires `necessary.operations.storage`, so an Edge Cookie is created only when that
 permission is set. See [Edge Cookies](/guide/edge-cookies) for the full
 request lifecycle.
