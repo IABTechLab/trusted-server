@@ -40,6 +40,21 @@ path, in `ec/mod.rs`. Treat a device or geo declaration as a statement of
 intent until that gap is closed, and do not rely on it to keep a provider from
 running.
 
+## Evidence is not rationed, use is
+
+Every provider sees all the evidence available for a request. Trusted Server
+does not decide which vendor is allowed to see which signal, because
+withholding a signal from one vendor and not another would discriminate between
+them, and the core stays neutral between vendors.
+
+What a vendor may do with what it sees is the part that is governed. A provider
+declares the permissions its data use requires, and the permission model decides
+whether each one is set. So access is universal and use is gated, rather than
+the other way round.
+
+If you are looking for a way to stop a vendor using a signal, the answer is a
+permission, not a hidden signal.
+
 ## Permission sources
 
 Permissions are the single currency every service and provider reads. A provider

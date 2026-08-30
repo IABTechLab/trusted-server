@@ -312,6 +312,19 @@ configuration can set a permission with no consent at all.
   "runs without any consent".
 - A gated provider **runs once its required permissions are set**, by whatever
   method.
+**Evidence is not rationed, use is.** Every provider and every integration sees
+all the evidence available for a request, including host signals such as the TLS
+JA4 and HTTP/2 fingerprints. The core never decides which vendor may see what,
+because withholding a signal from one vendor and not another discriminates
+between them, and the core stays neutral. What a vendor may *do* with the
+evidence is governed by the permissions it declares and the system sets. Access
+is universal, use is gated.
+
+The practical consequence: never "fix" a vendor's access to a signal by hiding
+the signal. If a use needs controlling, express it as a permission. A change
+that removes evidence from a provider's reach is working against the
+architecture, not protecting it.
+
 - Reserve "consent" for the consent subsystem (`consent/`, `ConsentContext`,
   GDPR and TCF strings) where it genuinely means a consent signal. In the
   permission layer prefer "permission", "set" / "unset", and "signal" (consent
