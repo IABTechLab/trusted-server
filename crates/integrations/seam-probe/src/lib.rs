@@ -211,7 +211,7 @@ impl SeamProbeGeo {
 pub struct SeamProbeEc;
 
 /// The four-character code core stamps on identifiers this provider owns.
-const SEAM_PROBE_EC_CODE: ProviderCode = ProviderCode::new("sprb");
+const SEAM_PROBE_EC_CODE: ProviderCode = trusted_server_core::provider_code!("sprb");
 
 impl EdgeCookieProvider for SeamProbeEc {
     fn id(&self) -> &'static str {

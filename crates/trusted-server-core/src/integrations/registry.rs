@@ -1797,7 +1797,11 @@ impl IntegrationRegistry {
                 standalone_js_ids: Vec::new(),
                 carried_js: Vec::new(),
                 geo_providers: Vec::new(),
+                ec_providers: Vec::new(),
+                device_providers: Vec::new(),
                 geo_provider: None,
+                ec_provider: None,
+                device_provider: None,
             }),
         }
     }
@@ -1833,7 +1837,11 @@ impl IntegrationRegistry {
                 standalone_js_ids: Vec::new(),
                 carried_js: Vec::new(),
                 geo_providers: Vec::new(),
+                ec_providers: Vec::new(),
+                device_providers: Vec::new(),
                 geo_provider: None,
+                ec_provider: None,
+                device_provider: None,
             }),
         }
     }
@@ -1865,7 +1873,11 @@ impl IntegrationRegistry {
                 standalone_js_ids: Vec::new(),
                 carried_js: Vec::new(),
                 geo_providers: Vec::new(),
+                ec_providers: Vec::new(),
+                device_providers: Vec::new(),
                 geo_provider: None,
+                ec_provider: None,
+                device_provider: None,
             }),
         }
     }
@@ -1937,7 +1949,11 @@ impl IntegrationRegistry {
                 standalone_js_ids: Vec::new(),
                 carried_js: Vec::new(),
                 geo_providers: Vec::new(),
+                ec_providers: Vec::new(),
+                device_providers: Vec::new(),
                 geo_provider: None,
+                ec_provider: None,
+                device_provider: None,
             }),
         }
     }
