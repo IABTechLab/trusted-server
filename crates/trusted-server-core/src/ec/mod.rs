@@ -515,9 +515,9 @@ impl EcContext {
     /// `None` and its row is never tombstoned. Core cannot derive that key,
     /// because the canonical form is the owning provider's own normalization.
     /// The browser cookie is still expired, since that path keys off the raw
-    /// cookie rather than off ownership. See the switching section of
-    /// `docs/superpowers/specs/2026-07-30-pluggable-providers-design.md` for
-    /// what an operator has to do about it.
+    /// cookie rather than off ownership. See the provider-switching section
+    /// of the pluggable providers design spec for what an operator has to do
+    /// about it.
     #[must_use]
     pub(crate) fn cookie_ec_kv_key(&self) -> Option<String> {
         self.existing_cookie_ec_id()

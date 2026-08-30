@@ -306,12 +306,12 @@ where
 /// The registered short code that namespaces one Edge Cookie provider's
 /// identifiers.
 ///
-/// Exactly four characters from `[a-z0-9]`, allocated append-only in
-/// `docs/superpowers/specs/provider-code-registry.md` and never reused. The
-/// code appears as the `{code}~` prefix of every identifier the provider
-/// mints, so identifiers from different providers can never collide in the
-/// cookie, the identity graph, or a withdrawal, and each identifier records
-/// which provider created it.
+/// Exactly four characters from `[a-z0-9]`, allocated append-only in the
+/// provider-code registry and never reused. The code appears as the
+/// `{code}~` prefix of every identifier the provider mints, so identifiers
+/// from different providers can never collide in the cookie, the identity
+/// graph, or a withdrawal, and each identifier records which provider
+/// created it.
 #[derive(Debug, Copy, Clone, Eq, Hash, PartialEq, derive_more::Display)]
 pub struct ProviderCode(&'static str);
 
@@ -540,10 +540,10 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
     /// identifier it mints.
     ///
     /// Mandatory, with no default: a provider must allocate a unique code in
-    /// `docs/superpowers/specs/provider-code-registry.md` before it can exist,
-    /// so no two providers can ever mint colliding identifiers. Core applies
-    /// the code at mint and checks it at read-back, and the provider itself
-    /// only ever sees its own value part.
+    /// the provider-code registry before it can exist, so no two providers
+    /// can ever mint colliding identifiers. Core applies the code at mint and
+    /// checks it at read-back, and the provider itself only ever sees its own
+    /// value part.
     fn code(&self) -> ProviderCode;
 
     /// Derives an Edge Cookie identifier from the provider's injected services
