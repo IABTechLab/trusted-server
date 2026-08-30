@@ -35,11 +35,14 @@ use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
+use trusted_server_core::settings_data::{
+    default_config_key, default_config_store_name, get_settings_from_config_store,
+};
 
 use crate::middleware::{
     AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware, SanitizeRequestMiddleware,
 };
-use crate::platform::build_runtime_services;
+use crate::platform::{SpinPlatformConfigStore, build_runtime_services};
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -64,12 +67,23 @@ pub struct AppState {
 
 /// Build the application state, loading settings and constructing all per-application components.
 ///
+/// Settings are read from the platform config store at run time, the same way
+/// the Fastly, Axum and Cloudflare adapters read them, so an operator publishes
+/// one with `ts config push` and the deployed component picks it up. This
+/// adapter previously compiled `trusted-server.example.toml` into the binary
+/// and parsed it here, which could never succeed, because that template ships
+/// placeholder secrets and the placeholder admin password fails validation.
+///
 /// # Errors
 ///
-/// Returns an error when settings, the auction orchestrator, or the integration
-/// registry fail to initialise.
+/// Returns an error when the config store holds no readable app config, or when
+/// settings, the auction orchestrator, or the integration registry fail to
+/// initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let settings = Settings::from_toml(include_str!("../../../trusted-server.example.toml"))?;
+    let store_name = default_config_store_name();
+    let config_key = default_config_key();
+    let settings =
+        get_settings_from_config_store(&SpinPlatformConfigStore, &store_name, &config_key)?;
     build_state_with_settings(settings)
 }
 
@@ -911,6 +925,36 @@ mod tests {
     use edgezero_core::params::PathParams;
 
     use super::*;
+
+    #[test]
+    fn build_state_takes_its_settings_from_the_platform_config_store() {
+        // This adapter used to compile the shipped example template into the
+        // binary and parse it here. That template carries placeholder secrets
+        // by design, and the placeholder admin password fails
+        // `validate_admin_handler_passwords`, so `build_state` could never
+        // return `Ok` and the router fell back to the start-up error handler
+        // that answers every request with 503. Nothing caught it because every
+        // other test enters through the `routes_with_settings` parity seam and
+        // never calls this function.
+        //
+        // There is no Spin runtime under `cargo test`, so there are no
+        // component variables to read and this cannot return `Ok` here. What it
+        // must never do again is fail because of a configuration baked into the
+        // binary, so the failure has to be the absence of a config store and
+        // nothing else.
+        let Err(error) = build_state() else {
+            return;
+        };
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("config store"),
+            "build_state should fail only for want of a config store, got: {message}"
+        );
+        assert!(
+            !message.to_lowercase().contains("password"),
+            "build_state must not fail on a configuration compiled into the binary, got: {message}"
+        );
+    }
 
     /// Settings selecting a vendor Edge Cookie provider this adapter does not
     /// inject, with the `[ec.providers.<key>]` block configuration validation
