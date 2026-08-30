@@ -16,7 +16,7 @@ defers, and why the feature is normative rather than deferred.
 > browser POST to a new public endpoint (`POST /_ts/api/v1/ec/resolve`),
 > plus a demo provider (`client-fixed`) and a JS bundle. Review found the
 > endpoint accepted cross-origin identity-setting posts with no origin
-> check, minted cookies with no identity-graph row (violating an invariant
+> check, created cookies with no identity-graph row (violating an invariant
 > the organic path enforces explicitly), was registered on only one of four
 > adapters, and could never round-trip because the core did not recognize
 > non-HMAC identifiers. None of that is an argument the feature is a bad
@@ -54,7 +54,7 @@ verify against.
 | Threat                           | Vector                                                                                                                                                             | Consequence if unmitigated                                                                                                                                                                                                                                       |
 | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Cross-site identity fixation** | `text/plain` POST is a CORS-simple request: any page on the web can `fetch(resolveUrl, {method: "POST", credentials: "include", body: payload})` with no preflight | An attacker pins a chosen identity onto a victim's first-party cookie jar, a login-CSRF for the ad-identity layer, and the victim's activity accretes to an attacker-controlled ID                                                                               |
-| **Replay**                       | A captured valid payload (from the attacker's own session or a leak) replayed against another browser                                                              | Same as fixation, without needing to mint payloads                                                                                                                                                                                                               |
+| **Replay**                       | A captured valid payload (from the attacker's own session or a leak) replayed against another browser                                                              | Same as fixation, without needing to create payloads                                                                                                                                                                                                             |
 | **Phantom identity**             | Endpoint sets the cookie without an identity-graph row                                                                                                             | Later requests carry an EC that the KV graph has never seen; downstream sync and withdrawal logic operate on an identity that half-exists (the organic generation path explicitly refuses to write a cookie when the graph write fails, for exactly this reason) |
 | **Un-tombstoneable identity**    | Core does not recognize the provider's identifier shape                                                                                                            | Withdrawal cannot expire or tombstone the identity, which is a compliance failure and not only a bug                                                                                                                                                             |
 | **Amplification**                | The page script cannot observe an HttpOnly cookie, so it cannot know the cookie is already set                                                                     | A POST on every page view of every session (PR #838's JS gated on reading a cookie its own server marked HttpOnly, making the guard permanently false)                                                                                                           |
@@ -79,7 +79,7 @@ same-site` (which v1 does not consult at all), not to a suffix match on
    open (§7.5) for publishers whose pages run on domains other than the
    configured apex.
 2. **Verify the payload per provider.** The endpoint hands the posted
-   payload to the selected provider's `resolve_from_client` and mints only
+   payload to the selected provider's `resolve_from_client` and creates only
    what the provider returns; whether the payload is trustworthy is the
    provider's responsibility, stated on the trait. A real vendor provider
    verifies a signed, audience-bound, expiring envelope; the draft's
@@ -90,8 +90,8 @@ same-site` (which v1 does not consult at all), not to a suffix match on
    server-side providers are untouched.
 3. **Preserve the identity-graph invariant.** Implemented: the graph row is
    written before the cookie is set, keyed by the provider's
-   `normalize_id_for_kv` canonical form, exactly like the organic mint
-   path. No graph available → no mint (`204`), same as organic generation;
+   `normalize_id_for_kv` canonical form, exactly like the organic create
+   path. No graph available → no create (`204`), same as organic generation;
    a graph write failure → `503`, no cookie.
 4. **Round-trip through the lifecycle contract.** Implemented: read-back
    goes through the selected provider's `accepts_id`, the KV key through
@@ -101,7 +101,7 @@ same-site` (which v1 does not consult at all), not to a suffix match on
 5. **Exist on every adapter, where parity means identical behavior,
    including identical refusal.** Partially implemented, documented: the
    Fastly adapter routes the endpoint (passing the same bot-gated identity
-   graph as organic generation, so unrecognized clients cannot mint
+   graph as organic generation, so unrecognized clients cannot create
    through resolve either). The Axum, Cloudflare, and Spin adapters
    deliberately do not route it, matching `identify` and `batch-sync`,
    which need the same platform KV wiring those adapters do not have; the
@@ -113,20 +113,20 @@ same-site` (which v1 does not consult at all), not to a suffix match on
    declaration.** Implemented: every response carries `Cache-Control:
 no-store`, and the gate is the selected provider's complete
    `required_permissions()` through the same resolved permission state as
-   organic minting, not a hard-coded storage check.
+   organic creating, not a hard-coded storage check.
 7. **Bound every input.** Implemented: request body at most 65,536 bytes, where
    an advertised `Content-Length` over the limit answers `413` before the
    read, and the read body is re-checked so a missing or false length does
    not bypass the bound. `Content-Type` allowlist: `text/plain` and
    `application/json`, matched on the media type alone, case-insensitively,
    ignoring parameters (the browser's default `text/plain;charset=UTF-8`
-   passes); anything else → `415`. The minted identifier must fit the
+   passes); anything else → `415`. The created identifier must fit the
    global identifier bounds (at most 256 bytes, cookie-safe alphabet,
-   shared with every other mint path); violation → `400`, never a rewrite.
+   shared with every other create path); violation → `400`, never a rewrite.
    Core then applies the provider's registered code envelope
    (`provider-code-registry.md`): the cookie and the identity-graph key
    carry `{code}~value`, so a client-set identity is namespaced to its
-   provider exactly like an edge-minted one (the demo's cookie value is
+   provider exactly like an edge-created one (the demo's cookie value is
    `cfix~an-ec`). Status codes are part of the contract: `400` out-of-bounds identifier,
    `403` origin rejection, `409` different-identity conflict, `413` body,
    `415` content type, `503` graph-write failure, `204` closed gate / no
@@ -147,7 +147,7 @@ no-store`, and the gate is the selected provider's complete
    primitive no production adapter exposes today. Designing the
    reservation against a hypothetical envelope would repeat the mistake
    this series exists to fix. v1's stance: the endpoint is safe without it
-   for the providers v1 ships (the demo mints a constant, feature-gated
+   for the providers v1 ships (the demo creates a constant, feature-gated
    out of production), and the reservation lands with the first vendor
    scheme, designed against its real envelope, with the draft's §3.9 as
    the starting bar. Until then the draft's text is preserved below as the
@@ -208,7 +208,7 @@ identifier, constant-equality verification) is compiled only behind the
 `client-fixed-demo` cargo feature. In a production build the settings
 validator rejects the selection at startup with a direct message, and the
 provider builder rejects it again as defense in depth. A fixed shared word
-is not an identity; the demo exists to exercise verify-before-mint end to
+is not an identity; the demo exists to exercise verify-before-create end to
 end in tests and demonstrations.
 
 ## 6. Testing

@@ -300,7 +300,7 @@ deployment that lists the same integrations gets the same responses.
    built-in one.
 2. **Capabilities round trip.** The same test integration declares an
    identity, a geo and a device provider. With the three selectors naming
-   it, a request is served by all three (the minted identifier carries its
+   it, a request is served by all three (the created identifier carries its
    code, the resolved country and the device signals are its). With a
    selector naming a module that lacks the capability, startup fails with
    an error that names the module and the capability.

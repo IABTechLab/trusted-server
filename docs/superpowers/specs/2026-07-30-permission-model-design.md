@@ -638,7 +638,7 @@ requires a live user signal (§4.2), never a policy change.
 | Undecodable record present (TCF, GPP, or USP)     | Revokes every Data Use (fail-closed acquisition); never withdraws; opt-outs still honored                                                                                                  |
 | Expired TCF record                                | Distinct state, not malformed; treated as absent, so the baseline applies                                                                                                                  |
 | Signals contradict (opt-out plus consent)         | Opt-out wins (§4)                                                                                                                                                                          |
-| No EC provider selected                           | Identity fails closed: nothing minted, an incoming cookie value never used or egressed (§7)                                                                                                |
+| No EC provider selected                           | Identity fails closed: nothing created, an incoming cookie value never used or egressed (§7)                                                                                               |
 
 The posture is fail-closed. Every ambiguous state resolves to the
 configured baseline or more restrictive.

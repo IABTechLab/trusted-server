@@ -12,7 +12,7 @@
 > **Context.** PR #838 proposed a first implementation of this epic in a single
 > change. Review of that PR surfaced design gaps this spec exists to close
 > before a second implementation pass: an identity abstraction that owned
-> minting but not recognition, per-adapter divergence in provider selection,
+> creating but not recognition, per-adapter divergence in provider selection,
 > silent misconfiguration modes, and speculative trait surface with no
 > production caller. This spec is the authoritative statement of what the
 > provider architecture must do; where it contradicts PR #838, this spec wins.
@@ -40,7 +40,7 @@ Goals, as implemented:
   default deployment makes no third-party or host-specific call.
 - An **EC provider declares** the permissions its data use requires
   (`required_permissions` on the trait), and **core enforces** that
-  declaration before minting or using an identity. A provider cannot
+  declaration before creating or using an identity. A provider cannot
   authorize itself. The enforcement machinery is the permission model's
   subject and lands with it in PR #1045 (see the permission model spec).
   Geo and device carry the same declaration method with an empty default,
@@ -111,22 +111,22 @@ the provider as settled either way.
 
 ## 3. The identity lifecycle contract
 
-This is the section PR #838 lacked. Its trait abstracted **minting** an
+This is the section PR #838 lacked. Its trait abstracted **creating** an
 identifier but left **recognition** and **KV key normalization** hard-coded
 to the built-in HMAC shape, so a provider whose identifiers did not match
-`{64hex}.{6alnum}` minted cookies that the very next request discarded.
+`{64hex}.{6alnum}` created cookies that the very next request discarded.
 
 The implemented contract routes every lifecycle operation core performs on
 an EC value through the selected provider:
 
 | Lifecycle operation | Where core uses it                                                                                                                                                                                                                                                | Contract                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Mint**            | EC generation on first eligible request, and the client-cycle resolve endpoint                                                                                                                                                                                    | The provider returns the identifier (`generate` server-side, `resolve_from_client` for the client cycle) and only core writes the cookie, after enforcing the global bounds below.                                                                                                                                                                                                                                                    |
+| **Create**          | EC generation on first eligible request, and the client-cycle resolve endpoint                                                                                                                                                                                    | The provider returns the identifier (`generate` server-side, `resolve_from_client` for the client cycle) and only core writes the cookie, after enforcing the global bounds below.                                                                                                                                                                                                                                                    |
 | **Recognize**       | Reading `ts-ec` back from the request, deciding `ec_was_present`, withdrawal checks, and every path that hands the value onward: the origin URL in `append_ec_id`, the click-target URL in `handle_first_party_click`, and the proxied body an integration builds | `accepts_id` answers whether a value is a well-formed identifier the provider issues. A value the selected provider does not recognize is treated as absent, so it is never used or egressed, while the raw cookie value stays visible to withdrawal handling. The egress paths reach the same answer through `edge_cookie::recognized_ec_id`, and a deployment with no provider selected recognizes nothing and so egresses nothing. |
 | **KV key**          | Identity-graph row reads and writes                                                                                                                                                                                                                               | `normalize_id_for_kv` returns the key form. The default lowercases the built-in HMAC hash segment and preserves the suffix, keeping today's keys. An opaque or case-sensitive provider overrides to the identity function so distinct identifiers never collapse into one row.                                                                                                                                                        |
 | **Withdraw**        | Expiring the cookie and writing revocation markers                                                                                                                                                                                                                | The identifiers eligible for a **graph tombstone** are exactly those the selected provider owns, dispatched on the `{code}~` prefix first and then `accepts_id`, never a shape check the provider cannot influence. Expiring the **cookie** is broader: it keys off the raw cookie being present, so it still fires for an identifier the selected provider does not own (see the switching case, §6.1).                              |
 
-**Invariant:** for every provider `P` and every identifier `id` minted by
+**Invariant:** for every provider `P` and every identifier `id` created by
 `P`, `id` round-trips read-back byte for byte. A test in `ec/mod.rs` proves
 the round-trip with a non-default provider whose identifiers are opaque, and
 a second test in `ec/resolve.rs` proves the client-cycle value survives the
@@ -144,7 +144,7 @@ grammar lands, the KV key is the provider's normalized identifier verbatim,
 which keeps every pre-epic HMAC row reachable.
 
 The pre-epic IP-cluster prefix listing runs unchanged, but the key space it
-lists over does not. A fresh mint is keyed `hmac~<hash>.<suffix>`, so the
+lists over does not. A fresh create is keyed `hmac~<hash>.<suffix>`, so the
 prefix `evaluate_cluster` derives is `hmac~<hash>` for a coded row while a
 legacy bare row still lists under `<hash>` on its own. Prefix matching is
 anchored at the start of the key, so two rows for the same client IP that
@@ -165,12 +165,12 @@ is the change that has to build the bridge.
 
 One global rule sits above every provider, and it is implemented:
 
-- **Identifier bounds.** A minted identifier obeys a global cookie-safe
+- **Identifier bounds.** A created identifier obeys a global cookie-safe
   alphabet (normatively `[A-Za-z0-9._~-]`, valid cookie octets with no
   separators, whitespace, or control characters) and a global maximum of
   **256 bytes**, stated here so dependent documents reference one number.
   The bound applies to the identifier itself, not only its key form. Core
-  enforces the bound wherever an identifier enters the system, at mint
+  enforces the bound wherever an identifier enters the system, at create
   (both `generate` and the resolve endpoint), at cookie read-back, and at
   cookie write. The constant is `MAX_EC_ID_LEN` in `ec/cookies.rs`. A
   violating value is rejected outright and logged. No sanitizing rewrite
@@ -207,7 +207,7 @@ resolved in the implementation:
   The draft banned the field when nothing consumed it. The consumer landed
   in the same series, satisfying the rule the ban enforced.
 - `IdentityInput.permissions` / `IdentityInput.consent`: **shipped and
-  populated.** The organic mint path passes the request's resolved
+  populated.** The organic create path passes the request's resolved
   permission state and consent context so a provider can read them for
   behavior beyond gating. The gate itself has already run before `generate`
   is called, so a provider cannot use the fields to authorize itself.
@@ -227,13 +227,13 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
     /// Stable configuration key ("hmac").
     fn id(&self) -> &'static str;
     /// Registered four-character code (provider-code-registry.md), the
-    /// `{code}~` namespace of every identifier the provider mints.
+    /// `{code}~` namespace of every identifier the provider creates.
     /// Mandatory, no default: a provider cannot exist without a unique
     /// code, so identifiers from different providers can never collide.
     fn code(&self) -> ProviderCode;
     /// Derives an identifier from the provider's injected services and the
     /// request evidence passed at call time. A client-side provider defers
-    /// here (returns no id) and mints later in resolve_from_client.
+    /// here (returns no id) and creates later in resolve_from_client.
     fn generate(
         &self,
         request_info: &dyn RequestInfo,
@@ -249,7 +249,7 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
     /// Permissions this provider's data use requires. Default: none, so a
     /// vendor-neutral provider requires no permission.
     fn required_permissions(&self) -> PermissionSet { /* none */ }
-    /// Client-cycle counterpart to generate: mints from a value the page
+    /// Client-cycle counterpart to generate: creates from a value the page
     /// posted to the resolve endpoint, after verifying it. Default: no-op,
     /// so a server-side provider does not participate. See the
     /// client-cycle spec.
@@ -260,14 +260,14 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
 }
 ```
 
-Core owns the code envelope. At mint it prefixes the provider's value with
+Core owns the code envelope. At create it prefixes the provider's value with
 `{code}~`, at read-back it strips and checks the code before the provider's
 `accepts_id` sees the value part, and the identity graph key preserves the
 code verbatim around the provider's canonical form. A cookie carrying
 another provider's code is treated as absent, never adopted, so switching
 providers cannot silently mix identity populations, and a withdrawal always
 acts on a key that can only belong to one provider. The built-in HMAC
-provider mints `hmac~<64 hex>.<6 alphanumeric>` and dual-reads its
+provider creates `hmac~<64 hex>.<6 alphanumeric>` and dual-reads its
 pre-envelope bare form for one release cycle so deployed cookies keep
 working; the bare form belongs to hmac alone. Codes are allocated
 append-only in `provider-code-registry.md`, and a leading digit is valid
@@ -287,13 +287,13 @@ ahead of the caller that consumes it.
 
 ## 5. Permission enforcement is core's job, for EC providers
 
-Before minting through an EC provider, core resolves the request's
+Before creating through an EC provider, core resolves the request's
 permission state and refuses when the provider's `required_permissions()`
 are not all set. The gate is implemented in `EcContext`. The selected
 provider is built once at request read time, its declaration is checked
 against the resolved state, and generation is skipped (with a log line
 naming the jurisdiction) when the requirement is not met. With no provider
-selected, nothing may mint or use an identifier, so the gate is closed
+selected, nothing may create or use an identifier, so the gate is closed
 rather than open by default. The enforcement point lands with the
 permission model in PR #1045, and the permission model spec governs the
 resolution machinery (country and region baselines, signals, and the
@@ -364,10 +364,10 @@ when the provider is built, stopping the request rather than degrading.
 | `[geo] default_country` unset, or matching no `permissions.yaml` rule          | **Startup error.** The value is the permission baseline for a request the geo provider leaves unmatched, so there must always be one and the value must resolve to a real rule.                                                                       |
 | An EC provider configured, no geo provider, `assume_single_jurisdiction` unset | **Startup error.** With geolocation off, every request resolves as `default_country`, so a visitor from any other jurisdiction silently receives the default jurisdiction's rules. That is acceptable only as an explicit operator decision.          |
 
-One draft row was not adopted, the startup error for a minting provider
+One draft row was not adopted, the startup error for a creating provider
 with no identity-graph store. `[ec] ec_store` remains optional, because the
 portability adapters run without platform KV. The client-cycle resolve
-endpoint refuses to mint when no graph is available (a cookie without a row
+endpoint refuses to create when no graph is available (a cookie without a row
 could never be withdrawn through the graph), and the organic path persists
 the row whenever the graph is configured. Whether configuration should
 force the pairing is follow-up work with the migration spec.
@@ -382,7 +382,7 @@ applies its own `deny_unknown_fields` when it deserializes.
 ### 6.1 Provider switching: what a switch actually does
 
 Switching `[ec] provider` **retires every identity the previous provider
-minted**. This section says exactly what that means, because a deployer has
+created**. This section says exactly what that means, because a deployer has
 to plan around it rather than discover it.
 
 The draft specified an ordered `legacy_providers` reader list, provider
@@ -397,7 +397,7 @@ cookies stay recognized when the newly selected provider accepts their
 shape. That is not what the code does and never was once core took
 ownership of the `{code}~` envelope (§5). Ownership is decided on the code
 prefix **before** any provider is asked about the shape, so a newly selected
-provider rejects every identifier the previous one minted, whatever its
+provider rejects every identifier the previous one created, whatever its
 shape, because the code differs.
 
 What a switch does, precisely:
@@ -441,9 +441,9 @@ logged, none silent:
 | Failure                                                        | Behavior                                                                                                                                                                   |
 | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `generate` returns an error                                    | No identity this request. The organic caller logs at error level and the request proceeds stateless. No cookie is written.                                                 |
-| A provider mints an identifier outside the global bounds       | Rejected at mint, never rewritten. The organic path yields no identity. The resolve endpoint returns 400.                                                                  |
-| Identity-graph write fails at mint                             | The mint is undone (no identifier, no cookie), with the error logged. The resolve endpoint returns 503. The next eligible request retries.                                 |
-| The host-signals provider finds no TLS/HTTP-2 fingerprints     | Defers with a warning. No identity this request, and no degraded IP-only identifier is minted under the host-signals name.                                                 |
+| A provider creates an identifier outside the global bounds     | Rejected at create, never rewritten. The organic path yields no identity. The resolve endpoint returns 400.                                                                |
+| Identity-graph write fails at create                           | The create is undone (no identifier, no cookie), with the error logged. The resolve endpoint returns 503. The next eligible request retries.                               |
+| The host-signals provider finds no TLS/HTTP-2 fingerprints     | Defers with a warning. No identity this request, and no degraded IP-only identifier is created under the host-signals name.                                                |
 | Geo lookup **fails** (the provider errors)                     | Every permission resolves to the requires-signal floor, and the failure is logged at error level. The failure is **not** papered over with the `default_country` baseline. |
 | Geo resolves **no location**, or a country/region with no rule | The `[geo] default_country` baseline applies. This is the configured-default case, deliberately distinct from the failure row above (`GeoStatus` in `ec/consent.rs`).      |
 | An incoming cookie value fails the bounds at read-back         | Treated as absent, with a warning naming the source.                                                                                                                       |
@@ -464,7 +464,7 @@ authority state, negative-intent outbox, rowless withdrawal, and deployment
 metadata, wire schemas with known-answer vectors, and a per-field graph-row
 contract. The provider-code registry is now implemented: codes are
 allocated in `provider-code-registry.md`, carried as the `{code}~` prefix
-of every minted identifier, and therefore present in every graph key. The
+of every created identifier, and therefore present in every graph key. The
 key grammar differs from the draft in one deliberate way, a tilde separator
 instead of delimiter-free fixed width, because pre-envelope bare
 identifiers remain deployed and a code such as `51dd` is valid hex, so
@@ -492,7 +492,7 @@ request path:
   injecting the host's `HostSignals` when supplied and matching an
   adapter-injected vendor provider by its `id()`. The provider is built
   once per request during `EcContext` construction and reused for
-  read-back, the permission gate, and minting, so the per-request
+  read-back, the permission gate, and creating, so the per-request
   triple-build observed in PR #838 (cloning the secret into a fresh box up
   to three times per request) is gone.
 - `build_device_provider` (`ec/device.rs`) returns the builtin classifier
@@ -588,7 +588,7 @@ Implemented, in the crates named:
   acknowledgment.
 - Geo builder tests showing the default selects no geo, `none` selects no
   geo explicitly, and `platform` selects the host implementation.
-- Host-signals provider tests covering minting from fingerprints,
+- Host-signals provider tests covering creating from fingerprints,
   deferring without them, and the loud failure of a selected but
   uninjected vendor provider.
 
@@ -638,12 +638,12 @@ this revision describes.
 | Draft position                                                                                                                      | Implemented position                                                                                                                                                                                                                                                                                                         | Why                                                                                                                                                                       |
 | ----------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Trait surface is a canonicalizing `parse` returning a typed id, plus `graph_key_suffix`, `cluster_prefix`, and `verify`             | `accepts_id` (recognition) plus `normalize_id_for_kv` (KV key form), defaults matching the built-in shape. No typed id, key suffix, cluster capability, or `verify`. `keys_equal` stays out, as the draft required.                                                                                                          | Recognition and KV keying are the two operations core performs today. A byte-for-byte round-trip test with a non-default provider pins the contract.                      |
-| `GeneratedEdgeCookie::response_headers` and `IdentityInput.permissions` / `.consent` banned as speculative surface                  | Shipped with production consumers. Finalization applies provider headers, the resolve path returns them, and the organic mint path populates the input fields.                                                                                                                                                               | The client-cycle resolve path landed in the same series and is their caller, satisfying the minimalism rule the ban enforced.                                             |
-| Identifier bounds enforced at mint and parse                                                                                        | Enforced at mint (`generate` and the resolve endpoint), cookie read-back, and cookie write. Violations rejected outright, never rewritten. `MAX_EC_ID_LEN` in `ec/cookies.rs`.                                                                                                                                               | Every identifier entry point is covered, and the pre-epic sanitizing rewrite was removed as a silent-divergence hazard.                                                   |
+| `GeneratedEdgeCookie::response_headers` and `IdentityInput.permissions` / `.consent` banned as speculative surface                  | Shipped with production consumers. Finalization applies provider headers, the resolve path returns them, and the organic create path populates the input fields.                                                                                                                                                             | The client-cycle resolve path landed in the same series and is their caller, satisfying the minimalism rule the ban enforced.                                             |
+| Identifier bounds enforced at create and parse                                                                                      | Enforced at create (`generate` and the resolve endpoint), cookie read-back, and cookie write. Violations rejected outright, never rewritten. `MAX_EC_ID_LEN` in `ec/cookies.rs`.                                                                                                                                             | Every identifier entry point is covered, and the pre-epic sanitizing rewrite was removed as a silent-divergence hazard.                                                   |
 | `provider = "none"` is valid alongside `legacy_providers` blocks                                                                    | `none` (or an omitted selector) with any configured provider block is a startup error.                                                                                                                                                                                                                                       | No `legacy_providers` exists in these PRs, so a block alongside statelessness can only be a mistake.                                                                      |
 | Every selection key is closed and unknown keys are startup errors                                                                   | Device and geo keys are closed. EC vendor keys are open. Unknown blocks are captured as raw values in core, the adapter deserializes its own block, and a selected key with no injected provider fails loudly.                                                                                                               | Core never names a vendor, so a vendor provider adds no core change.                                                                                                      |
 | Capability mismatch is a startup error at adapter wiring time                                                                       | Configuration coherence fails at startup. A host-capability mismatch (missing `HostSignals`, uninjected vendor) fails loudly when the provider is built, stopping the request.                                                                                                                                               | The adapter capability declaration that would move the check to startup is deferred with the capability matrix.                                                           |
-| A minting provider with no identity-graph store is a startup error                                                                  | Not implemented. `ec_store` stays optional. The resolve endpoint refuses to mint without a graph. The organic path persists rows whenever the graph is configured.                                                                                                                                                           | Portability adapters run without platform KV. Whether configuration should force the pairing is follow-up work.                                                           |
+| A creating provider with no identity-graph store is a startup error                                                                 | Not implemented. `ec_store` stays optional. The resolve endpoint refuses to create without a graph. The organic path persists rows whenever the graph is configured.                                                                                                                                                         | Portability adapters run without platform KV. Whether configuration should force the pairing is follow-up work.                                                           |
 | `[device] provider = "fastly"` is startup-rejected pending a separate security design                                               | Shipped as a selectable opt-in. The Fastly adapter injects `HostSignals`, the provider strengthens the browser/bot gate, and rows persist derived classes, not raw fingerprints.                                                                                                                                             | Selection is an explicit operator opt-in and the neutral default makes no host fingerprint call.                                                                          |
 | The `host-signals` EC provider is deliberately dropped and its selection rejected                                                   | Shipped in PR #1044 as an opt-in built-in that defers with a warning when the host supplies no signals. **Open, flagged for the series review**, not settled either way.                                                                                                                                                     | Its identifier shape shares the HMAC grammar, and a sign-off row defers host fingerprint processing, so the review decides whether the provider ships in the series.      |
 | Geo default flip sequenced into the later permission-model step, with an acknowledgment guard                                       | Landed as specified in the same series, with the default of none, `default_country` required and validated against `permissions.yaml`, the `assume_single_jurisdiction` acknowledgment, and a failed lookup resolving to the requires-signal floor with error logging (`GeoStatus`, resolved in core so all adapters agree). | The permission model shipped in PR #1045, so the constraints exist where the draft required them.                                                                         |
