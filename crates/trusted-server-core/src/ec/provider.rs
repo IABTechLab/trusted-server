@@ -124,7 +124,7 @@ pub const HMAC_PROVIDER_KEY: &str = "hmac";
 /// `{code}~` namespace stamped on every identifier the built-in provider
 /// mints, and it is what [`generation`] matches when it decides whether an
 /// enveloped identifier is one of its own.
-pub const HMAC_PROVIDER_CODE: ProviderCode = ProviderCode::new(HMAC_PROVIDER_KEY);
+pub const HMAC_PROVIDER_CODE: ProviderCode = crate::provider_code!(HMAC_PROVIDER_KEY);
 
 /// The request-scoped gating context passed to [`EdgeCookieProvider::generate`].
 ///
@@ -317,30 +317,41 @@ where
 pub struct ProviderCode(&'static str);
 
 impl ProviderCode {
-    /// Creates a provider code, validating the registry format.
+    /// Creates a provider code when `code` matches the registry format.
     ///
-    /// # Panics
+    /// Returns `None` when `code` is not exactly four characters of `[a-z0-9]`,
+    /// so a caller that assembles a code from anything other than a literal is
+    /// handed an answer it has to deal with rather than a panic. Nothing in
+    /// this function can panic, whatever it is called with and wherever it is
+    /// called from.
     ///
-    /// Panics when `code` is not exactly four characters of `[a-z0-9]`. Codes
-    /// are compile-time literals, so the panic fires in tests and never on a
-    /// request path.
+    /// Use [`provider_code!`](crate::provider_code) for a literal. That macro
+    /// runs this check while the crate is compiled, so a malformed code is a
+    /// build failure and the resulting value needs no unwrapping.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::ec::provider::ProviderCode;
+    ///
+    /// assert_eq!(ProviderCode::new("t0ac").map(ProviderCode::as_str), Some("t0ac"));
+    /// assert_eq!(ProviderCode::new("nope!"), None);
+    /// ```
     #[must_use]
-    pub const fn new(code: &'static str) -> Self {
+    pub const fn new(code: &'static str) -> Option<Self> {
         let bytes = code.as_bytes();
-        assert!(
-            bytes.len() == 4,
-            "provider code must be exactly four characters"
-        );
+        if bytes.len() != 4 {
+            return None;
+        }
         let mut i = 0;
         while i < bytes.len() {
             let b = bytes[i];
-            assert!(
-                b.is_ascii_lowercase() || b.is_ascii_digit(),
-                "provider code characters must be [a-z0-9]"
-            );
+            if !b.is_ascii_lowercase() && !b.is_ascii_digit() {
+                return None;
+            }
             i += 1;
         }
-        Self(code)
+        Some(Self(code))
     }
 
     /// The code as a string slice.
@@ -348,6 +359,34 @@ impl ProviderCode {
     pub const fn as_str(self) -> &'static str {
         self.0
     }
+}
+
+/// Builds a [`ProviderCode`] from a constant, checked while the crate is
+/// compiled.
+///
+/// The check runs inside a `const` block, so a code that is not exactly four
+/// characters of `[a-z0-9]` fails the build instead of panicking at run time,
+/// and the value the macro produces needs no unwrapping. Every provider code in
+/// this workspace is written through this macro, which is what makes
+/// [`ProviderCode::new`]'s fallible form safe to hand to anyone else.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::provider_code;
+///
+/// assert_eq!(provider_code!("t0ac").as_str(), "t0ac");
+/// ```
+#[macro_export]
+macro_rules! provider_code {
+    ($code:expr) => {
+        const {
+            match $crate::ec::provider::ProviderCode::new($code) {
+                Some(code) => code,
+                None => panic!("provider code must be exactly four characters of [a-z0-9]"),
+            }
+        }
+    };
 }
 
 /// The separator between a provider code and the provider's identifier value.
@@ -798,6 +837,45 @@ mod tests {
     use crate::settings::{EcProviders, HmacProviderConfig};
 
     #[test]
+    fn a_malformed_provider_code_is_refused_rather_than_panicking() {
+        // `ProviderCode::new` is public, so a vendor crate can reach it with a
+        // value it assembled rather than a literal. Every rejected shape has to
+        // come back as `None`, because a panic here would take down whatever
+        // request the caller was serving.
+        for malformed in ["", "abc", "abcde", "AB12", "t0a_", "t0a-", "t0a ", "t.ac"] {
+            assert_eq!(
+                ProviderCode::new(malformed),
+                None,
+                "`{malformed}` is outside the registry format and should be refused"
+            );
+        }
+
+        assert_eq!(
+            ProviderCode::new("t0ac").map(ProviderCode::as_str),
+            Some("t0ac"),
+            "a well-formed code should still be accepted"
+        );
+    }
+
+    #[test]
+    fn the_provider_code_macro_keeps_the_compile_time_guarantee() {
+        // The macro checks a literal while the crate is compiled and yields the
+        // code itself, so the codes written across this workspace stay as
+        // strong as the old panicking constructor made them, with none of the
+        // run-time risk.
+        assert_eq!(
+            crate::provider_code!("t0ac").as_str(),
+            "t0ac",
+            "the macro should yield the code it was given"
+        );
+        assert_eq!(
+            HMAC_PROVIDER_CODE.as_str(),
+            HMAC_PROVIDER_KEY,
+            "the built-in code should still be the built-in key"
+        );
+    }
+
+    #[test]
     fn split_provider_code_separates_coded_and_legacy_forms() {
         assert_eq!(
             split_provider_code("hmac~abc.DEF123"),
@@ -919,7 +997,7 @@ mod tests {
         }
 
         fn code(&self) -> ProviderCode {
-            ProviderCode::new("t0ac")
+            crate::provider_code!("t0ac")
         }
 
         fn generate(
@@ -1162,7 +1240,7 @@ mod tests {
             }
 
             fn code(&self) -> ProviderCode {
-                ProviderCode::new("t0in")
+                crate::provider_code!("t0in")
             }
 
             fn generate(

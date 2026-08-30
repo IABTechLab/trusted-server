@@ -518,7 +518,7 @@ mod tests {
         }
 
         fn code(&self) -> crate::ec::provider::ProviderCode {
-            crate::ec::provider::ProviderCode::new("t0op")
+            crate::provider_code!("t0op")
         }
 
         fn generate(

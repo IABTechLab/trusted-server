@@ -1543,7 +1543,7 @@ mod tests {
         }
 
         fn code(&self) -> super::super::provider::ProviderCode {
-            super::super::provider::ProviderCode::new("t0op")
+            crate::provider_code!("t0op")
         }
 
         fn generate(

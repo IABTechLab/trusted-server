@@ -781,7 +781,7 @@ mod tests {
         }
 
         fn code(&self) -> ProviderCode {
-            ProviderCode::new("t0op")
+            crate::provider_code!("t0op")
         }
 
         fn generate(
@@ -878,7 +878,7 @@ mod tests {
         }
 
         fn code(&self) -> ProviderCode {
-            ProviderCode::new("t0so")
+            crate::provider_code!("t0so")
         }
 
         fn generate(
@@ -957,7 +957,7 @@ mod tests {
         }
 
         fn code(&self) -> ProviderCode {
-            ProviderCode::new("t0ni")
+            crate::provider_code!("t0ni")
         }
 
         fn generate(
@@ -1065,7 +1065,7 @@ mod tests {
         }
 
         fn code(&self) -> ProviderCode {
-            ProviderCode::new("t0il")
+            crate::provider_code!("t0il")
         }
 
         fn generate(
@@ -1126,7 +1126,7 @@ mod tests {
         }
 
         fn code(&self) -> ProviderCode {
-            ProviderCode::new("t0hs")
+            crate::provider_code!("t0hs")
         }
 
         fn generate(
@@ -1276,7 +1276,7 @@ mod tests {
         }
 
         fn code(&self) -> ProviderCode {
-            ProviderCode::new("t0ca")
+            crate::provider_code!("t0ca")
         }
 
         fn generate(

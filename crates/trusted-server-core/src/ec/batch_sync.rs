@@ -301,7 +301,7 @@ mod tests {
         }
 
         fn code(&self) -> ProviderCode {
-            ProviderCode::new("t0op")
+            crate::provider_code!("t0op")
         }
 
         fn generate(
