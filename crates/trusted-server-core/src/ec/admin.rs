@@ -370,7 +370,9 @@ fn requested_ec_id(
     if !accepted_providers.accepts(&ec_id) {
         return Err(Box::new(json_error(
             StatusCode::BAD_REQUEST,
-            "invalid EC ID: not an identifier any provider this deployment reads              issued (the built-in HMAC provider issues {64hex}.{6alnum}, with or              without the hmac~ prefix)",
+            "invalid EC ID: not an identifier any provider this deployment reads \
+             issued (the built-in HMAC provider issues {64hex}.{6alnum}, with or \
+             without the hmac~ prefix)",
         )));
     }
 

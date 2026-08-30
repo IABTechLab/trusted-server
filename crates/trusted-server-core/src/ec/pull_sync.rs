@@ -69,7 +69,8 @@ pub fn build_pull_sync_context(ec_context: &EcContext) -> Option<PullSyncContext
     let ec_id_ref = ec_context.ec_value()?;
     if !ec_context.accepts_id(ec_id_ref) {
         log::debug!(
-            "Pull sync: skipping dispatch because the active EC ID is not one this              deployment's providers accept"
+            "Pull sync: skipping dispatch because the active EC ID is not one this \
+             deployment's providers accept"
         );
         return None;
     }

@@ -632,7 +632,8 @@ impl EdgeCookieProvider for HmacProvider {
         let client_ip = request_info.client_ip();
         if client_ip.is_empty() {
             return Err(Report::new(TrustedServerError::EdgeCookie {
-                message: "Edge Cookie provider `hmac` requires the client IP, and this host                           could not supply one"
+                message: "Edge Cookie provider `hmac` requires the client IP, and this host \
+                          could not supply one"
                     .to_owned(),
             }));
         }

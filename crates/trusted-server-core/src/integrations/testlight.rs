@@ -193,7 +193,8 @@ impl IntegrationProxy for TestlightIntegration {
             .change_context(Self::error("Failed to read EC ID"))?
             .ok_or_else(|| {
                 Report::new(Self::error(
-                    "No EC ID this deployment's Edge Cookie provider recognizes was found \n                     in the ts-ec cookie",
+                    "No EC ID this deployment's Edge Cookie provider recognizes was found \
+                     in the ts-ec cookie",
                 ))
             })?;
 

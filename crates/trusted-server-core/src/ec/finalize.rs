@@ -122,7 +122,8 @@ pub fn ec_finalize_response(
     if ec_context.ec_generated() {
         let (Some(graph), Some(kv_key)) = (kv, ec_context.ec_kv_key()) else {
             log::info!(
-                "Skipping generated EC response write because the KV graph or the                  identity-graph key is unavailable"
+                "Skipping generated EC response write because the KV graph or the \
+                 identity-graph key is unavailable"
             );
             return;
         };
