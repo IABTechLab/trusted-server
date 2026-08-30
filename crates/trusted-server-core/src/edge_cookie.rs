@@ -73,18 +73,31 @@ pub fn generate_ec_id(
     Ok(generated.id)
 }
 
-/// Gets an existing EC ID from the request.
+/// Reads whatever the request offers as an Edge Cookie identifier, before any
+/// check that this deployment could have issued it.
 ///
-/// Attempts to retrieve an existing EC ID from:
-/// 1. The `x-ts-ec` header
-/// 2. The `ts-ec` cookie
+/// Reads the `x-ts-ec` header first and then the `ts-ec` cookie. Both are
+/// client-controlled. `x-ts-ec` is stripped from responses but is not stripped
+/// from inbound requests, so a caller must treat the result as an attacker's
+/// choice of string.
 ///
-/// Returns `None` if neither source contains an EC ID.
+/// The only checks applied here are the global cookie bounds, the length cap
+/// and the cookie-safe alphabet in
+/// [`ec_id_has_only_allowed_chars`](crate::ec::cookies::ec_id_has_only_allowed_chars),
+/// which every identifier must satisfy whichever provider minted it. Those
+/// bounds are a backstop on what may travel in a cookie, not a test of
+/// authenticity, and on their own they accept any run of `[A-Za-z0-9._~-]`.
+///
+/// Deciding whether this deployment issued the value needs the selected
+/// provider, which this function does not have, so it is deliberately not
+/// public. Use [`recognized_ec_id`], which applies provider ownership on top.
 ///
 /// # Errors
 ///
 /// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
-pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<TrustedServerError>> {
+pub(crate) fn unvalidated_ec_id_from_request(
+    req: &Request<EdgeBody>,
+) -> Result<Option<String>, Report<TrustedServerError>> {
     if let Some(ec_id) = req
         .headers()
         .get(HEADER_X_TS_EC)
@@ -119,12 +132,20 @@ pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<Trust
 /// Gets an existing EC ID from the request, but only one the deployment's
 /// selected provider recognizes.
 ///
-/// [`get_ec_id`] applies the global cookie bounds alone, the length cap and the
-/// cookie-safe alphabet, which any value a browser can be persuaded to carry
-/// will pass. This adds provider ownership on top: the identifier's `{code}~`
-/// prefix is dispatched to the provider that owns it, which decides whether the
-/// value is one of its own. That is the same test the EC lifecycle applies when
-/// it reads the cookie back, so both agree on what this deployment issued.
+/// [`unvalidated_ec_id_from_request`] applies the global cookie bounds alone,
+/// the length cap and the cookie-safe alphabet, which any value a browser can
+/// be persuaded to carry will pass. This adds provider ownership on top, so the
+/// identifier's `{code}~` prefix is dispatched to the provider that owns it,
+/// which decides whether the value is one of its own. That is the same test the
+/// EC lifecycle applies when it reads the cookie back, so both agree on what
+/// this deployment issued.
+///
+/// This is the only way to read an inbound identifier from outside this module,
+/// because the bounds alone cannot tell an identifier this deployment minted
+/// from one an attacker typed. A vendor identifier is not required to match the
+/// built-in HMAC shape, so the right test is the selected provider's own
+/// [`accepts_id`](crate::ec::provider::EdgeCookieProvider::accepts_id) rather
+/// than the built-in strict format check.
 ///
 /// Returns `None` for a value carrying another deployment's provider code, for a
 /// value the selected provider does not recognize, and for every value at all
@@ -144,7 +165,7 @@ pub fn recognized_ec_id(
     services: &RuntimeServices,
     req: &Request<EdgeBody>,
 ) -> Result<Option<String>, Report<TrustedServerError>> {
-    let Some(ec_id) = get_ec_id(req)? else {
+    let Some(ec_id) = unvalidated_ec_id_from_request(req)? else {
         return Ok(None);
     };
 
@@ -186,7 +207,7 @@ pub(crate) fn get_or_generate_ec_id_from_http_request(
     services: &RuntimeServices,
     req: &Request<EdgeBody>,
 ) -> Result<Option<String>, Report<TrustedServerError>> {
-    if let Some(id) = get_ec_id(req)? {
+    if let Some(id) = unvalidated_ec_id_from_request(req)? {
         return Ok(Some(id));
     }
 
@@ -388,11 +409,63 @@ mod tests {
     }
 
     #[test]
+    fn an_identifier_this_deployment_never_issued_is_not_recognized() {
+        // `x-ts-ec` is stripped from responses but not from inbound requests,
+        // so a client can put whatever it likes in it, and the raw reader
+        // prefers the header over the cookie. The global cookie bounds accept
+        // any run of `[A-Za-z0-9._~-]`, so they cannot tell an identifier this
+        // deployment minted from one an attacker typed. Provider ownership is
+        // what draws that line.
+        let settings = create_test_settings();
+        let services = noop_services();
+
+        for forged in [
+            // Passes the alphabet and the length cap, owned by nobody.
+            "not-an-identifier",
+            // The built-in shape under another deployment's provider code.
+            "zz00~aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.Ab1234",
+            // This deployment's code carrying a value its provider never mints.
+            "hmac~not-the-hmac-shape",
+        ] {
+            let req = create_test_request(&[(HEADER_X_TS_EC, forged)]);
+
+            // The raw reader hands it straight back, which is exactly why it is
+            // not the check anything may rely on.
+            assert_eq!(
+                unvalidated_ec_id_from_request(&req)
+                    .expect("should read the header")
+                    .as_deref(),
+                Some(forged),
+                "the global bounds alone should accept `{forged}`"
+            );
+
+            assert_eq!(
+                recognized_ec_id(&settings, &services, &req)
+                    .expect("should decide without erroring"),
+                None,
+                "`{forged}` was never issued here and must not be recognized"
+            );
+        }
+
+        // A value the selected provider does own is still recognized, so the
+        // check rejects forgeries rather than everything.
+        let issued = format!("hmac~{}.Ab1234", "a".repeat(64));
+        let req = create_test_request(&[(HEADER_X_TS_EC, issued.as_str())]);
+        assert_eq!(
+            recognized_ec_id(&settings, &services, &req)
+                .expect("should decide without erroring")
+                .as_deref(),
+            Some(issued.as_str()),
+            "an identifier the selected provider owns should still be recognized"
+        );
+    }
+
+    #[test]
     fn test_get_ec_id_with_header() {
         let settings = create_test_settings();
         let req = create_test_request(&[(HEADER_X_TS_EC, "existing_ec_id")]);
 
-        let ec_id = get_ec_id(&req).expect("should get EC ID");
+        let ec_id = unvalidated_ec_id_from_request(&req).expect("should get EC ID");
         assert_eq!(ec_id, Some("existing_ec_id".to_string()));
 
         let ec_id = get_or_generate_ec_id(&settings, &noop_services(), &req)
@@ -409,7 +482,7 @@ mod tests {
             &format!("{}=existing_cookie_id", COOKIE_TS_EC),
         )]);
 
-        let ec_id = get_ec_id(&req).expect("should get EC ID");
+        let ec_id = unvalidated_ec_id_from_request(&req).expect("should get EC ID");
         assert_eq!(ec_id, Some("existing_cookie_id".to_string()));
 
         let ec_id = get_or_generate_ec_id(&settings, &noop_services(), &req)
@@ -427,7 +500,8 @@ mod tests {
             .body(edgezero_core::body::Body::empty())
             .expect("should build test request");
 
-        let ec_id = get_ec_id(&req).expect("should get EC ID from http request");
+        let ec_id =
+            unvalidated_ec_id_from_request(&req).expect("should get EC ID from http request");
 
         assert_eq!(ec_id, Some("existing_http_ec_id".to_string()));
     }
@@ -455,7 +529,7 @@ mod tests {
     #[test]
     fn test_get_ec_id_none() {
         let req = create_test_request(&[]);
-        let ec_id = get_ec_id(&req).expect("should handle missing ID");
+        let ec_id = unvalidated_ec_id_from_request(&req).expect("should handle missing ID");
         assert!(ec_id.is_none());
     }
 
@@ -477,7 +551,8 @@ mod tests {
             (header::COOKIE, &format!("{}=valid_cookie_id", COOKIE_TS_EC)),
         ]);
 
-        let ec_id = get_ec_id(&req).expect("should handle invalid header gracefully");
+        let ec_id =
+            unvalidated_ec_id_from_request(&req).expect("should handle invalid header gracefully");
         assert_eq!(
             ec_id,
             Some("valid_cookie_id".to_string()),
@@ -510,7 +585,8 @@ mod tests {
             &format!("{}=bad<script>value", COOKIE_TS_EC),
         )]);
 
-        let ec_id = get_ec_id(&req).expect("should handle invalid cookie gracefully");
+        let ec_id =
+            unvalidated_ec_id_from_request(&req).expect("should handle invalid cookie gracefully");
         assert!(
             ec_id.is_none(),
             "should reject cookie with disallowed characters"
