@@ -380,8 +380,9 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         None => builder.build(),
     };
 
-    // A module-supplied geo provider selected by `[geo] provider` replaces the
-    // Fastly lookup, and an unset selector leaves the host lookup in place.
+    // Unset and `"none"` both resolve nothing, so no client IP reaches a host
+    // geo service. `"platform"` opts in to the Fastly lookup below, and any
+    // other key names an integration module that declares a geo provider.
     match state.registry.geo_provider() {
         Some(provider) => services.with_geo(provider),
         None => services,

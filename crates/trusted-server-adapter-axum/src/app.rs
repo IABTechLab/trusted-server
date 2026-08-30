@@ -137,8 +137,9 @@ pub fn build_state_with_registrations(
 /// Build per-request [`RuntimeServices`], applying the module-supplied geo
 /// provider selected by `[geo] provider`.
 ///
-/// When the selector is unset the registry resolves no provider and this
-/// adapter's own host lookup stands, so the request path is unchanged.
+/// Unset and `"none"` both resolve nothing, so no client IP reaches a host geo
+/// service. `"platform"` opts in to this adapter's own lookup, and any other
+/// key names an integration module that declares a geo provider.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
     let services = build_runtime_services(ctx, &state.settings);
     match state.registry.geo_provider() {
@@ -782,7 +783,8 @@ mod tests {
     fn state_with_uninjected_provider() -> AppState {
         let settings = Settings::from_toml(UNINJECTED_PROVIDER_TOML)
             .expect("should parse settings selecting an uninjected provider");
-        let orchestrator = build_orchestrator(&settings).expect("should build orchestrator");
+        let orchestrator =
+            build_orchestrator_with_providers(&settings, &[]).expect("should build orchestrator");
         let registry = IntegrationRegistry::new(&settings).expect("should build registry");
         AppState {
             settings: Arc::new(settings),
