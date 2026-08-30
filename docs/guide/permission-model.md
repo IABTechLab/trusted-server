@@ -27,9 +27,18 @@ request proceeds.
 
 The core does not encode any jurisdiction's law or any single policy. A provider
 advertises the technical permissions its data use requires, and the core runs
-the provider only when every required permission is set. A provider that
-requires nothing always runs, so a vendor-neutral default shows no consent
-dialogue and needs no per-request policy interaction.
+the Edge Cookie provider only when every permission that provider requires is
+set. An Edge Cookie provider that requires nothing always runs, so a
+vendor-neutral default shows no consent dialogue and needs no per-request
+policy interaction.
+
+Device and geo providers declare their required permissions through the same
+method, and the core does not yet gate either of them on what they declare, so
+for those two the declaration is recorded rather than enforced. The only place
+a declaration currently decides whether a provider runs is the Edge Cookie
+path, in `ec/mod.rs`. Treat a device or geo declaration as a statement of
+intent until that gap is closed, and do not rely on it to keep a provider from
+running.
 
 ## Permission sources
 
@@ -119,8 +128,11 @@ The eleven named Data Uses, with the TCF purpose each maps from:
 ## How providers use permissions
 
 A provider advertises a required permission set. The core resolves the
-permissions it has set for the request, then runs the provider only when every
-required permission is set.
+permissions it has set for the request, then runs the Edge Cookie provider only
+when every permission that provider requires is set. Device and geo providers
+advertise a set in the same way, and nothing gates them on it yet, so the table
+below lists only the provider whose declaration currently decides whether it
+runs.
 
 | Provider                  | Requires                       | Effect when not set       |
 | ------------------------- | ------------------------------ | ------------------------- |
@@ -209,8 +221,9 @@ rather than silently ignored.
 ## How a request resolves
 
 A permission is _set_ when Trusted Server may rely on it for this request, and
-unset otherwise. A provider runs only when every permission it requires is
-set.
+unset otherwise. The Edge Cookie provider runs only when every permission it
+requires is set, which is the one place a declaration currently decides whether
+a provider runs.
 
 Signal precedence is fixed in code, most restrictive first. A US-style opt-out
 (GPC, a GPP sale opt-out, or a US Privacy opt-out) suppresses the Data Uses
