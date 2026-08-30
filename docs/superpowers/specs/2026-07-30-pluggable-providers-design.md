@@ -178,10 +178,22 @@ One global rule sits above every provider, and it is implemented:
   not at all, and the cookie value and the identity-graph key can never
   silently diverge.
 
-## 4. Trait surface: minimalism rule
+## 4. Trait surface: minimalism rule, and where it does not apply
 
 Every trait method must have at least one production (non-test) caller in
-the same change that introduces it. How the surface observed in PR #838
+the same change that introduces it. **This rule does not apply to an evidence
+interface, and applying it there was a mistake we made and are correcting.**
+
+An evidence interface describes what a request carries, not what today's code
+happens to read. Holding it to the caller rule produces an interface that grows
+a method each time a vendor arrives, which is not something a vendor can write
+against and cannot be stable across a release. It also puts the boundary in the
+wrong place, because what a provider may see is not the control. What a provider
+may do with what it sees is the control, and that is the permission model.
+
+So `RequestInfo` carries everything the request carries, whether or not code in
+this repository reads it yet. The rule stands for behavioural traits, where a
+method with no caller really is dead weight. How the surface observed in PR #838
 resolved in the implementation:
 
 - `keys_equal`: **not shipped.** Its legitimate purpose (equivalent-envelope
