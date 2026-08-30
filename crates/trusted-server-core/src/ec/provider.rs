@@ -128,10 +128,11 @@ pub const HMAC_PROVIDER_CODE: ProviderCode = ProviderCode::new(HMAC_PROVIDER_KEY
 
 /// The request-scoped gating context passed to [`EdgeCookieProvider::generate`].
 ///
-/// Request data (client IP, User-Agent, headers, host signals) reaches a
-/// provider through the services injected into its constructor, not through this
-/// struct. This carries only the per-request gating context a provider may read
-/// for behavior beyond gating. The gate has already confirmed Edge Cookie
+/// Request data reaches a provider through the `request_info` parameter of
+/// [`EdgeCookieProvider::generate`], not through this struct and not through
+/// anything injected into the provider's constructor. This struct carries only
+/// the per-request gating context a provider may read for behavior beyond
+/// gating. The gate has already confirmed Edge Cookie
 /// storage is allowed before `generate` is called.
 #[derive(Default)]
 pub struct IdentityInput<'a> {
@@ -546,8 +547,8 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
     /// value part.
     fn code(&self) -> ProviderCode;
 
-    /// Derives an Edge Cookie identifier from the provider's injected services
-    /// and the request's gating context.
+    /// Derives an Edge Cookie identifier from the request evidence in
+    /// `request_info` and the gating context in `input`.
     ///
     /// # Errors
     ///
