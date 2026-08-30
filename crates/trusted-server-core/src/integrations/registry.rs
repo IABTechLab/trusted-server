@@ -888,6 +888,17 @@ const GEO_PROVIDER_NONE: &str = "none";
 /// `[geo] provider` value opting in to the adapter's own host geo lookup.
 const GEO_PROVIDER_PLATFORM: &str = "platform";
 
+/// `[device] provider` value naming the User-Agent-only provider core supplies.
+///
+/// The same choice as leaving the selector unset, spelled explicitly.
+const DEVICE_PROVIDER_BUILTIN: &str = "builtin";
+
+/// `[device] provider` value opting in to the host provider the adapter builds.
+///
+/// Resolved by `build_device_provider` in [`device`](crate::ec::device) rather
+/// than by a module, so the registry supplies nothing for it.
+const DEVICE_PROVIDER_FASTLY: &str = "fastly";
+
 /// Resolves `[geo] provider` against the modules that declared a geo provider.
 ///
 /// Returns `None` when the selector is unset, which leaves the adapter's own
@@ -943,15 +954,15 @@ fn resolve_ec_provider(
 fn resolve_device_provider(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
-) -> Option<Arc<dyn DeviceProvider>> {
+) -> Result<Option<Arc<dyn DeviceProvider>>, Report<TrustedServerError>> {
     let selector = settings.device.provider.as_deref();
-    let resolved = selector.and_then(|key| {
-        inner
-            .device_providers
-            .iter()
-            .find(|(id, _)| *id == key)
-            .map(|(_, provider)| Arc::clone(provider))
-    });
+    let resolved = match selector {
+        // Unset and `builtin` both name the provider core supplies itself, and
+        // `fastly` names the host provider the adapter builds, so the registry
+        // supplies nothing for any of the three.
+        None | Some(DEVICE_PROVIDER_BUILTIN) | Some(DEVICE_PROVIDER_FASTLY) => None,
+        Some(module_id) => Some(module_device_provider(module_id, inner)?),
+    };
 
     for (id, _) in &inner.device_providers {
         if selector != Some(*id) {
@@ -961,7 +972,56 @@ fn resolve_device_provider(
         }
     }
 
-    resolved
+    Ok(resolved)
+}
+
+/// Looks up the device provider declared by the module `module_id`.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] naming the module and the
+/// capability when the module declares no device provider, is registered but
+/// not enabled, or is not registered at all. Without this a mistyped selector
+/// would fall back to core's built-in provider with nothing said, which is the
+/// silent wrong answer the geo selector already refuses to give.
+fn module_device_provider(
+    module_id: &str,
+    inner: &IntegrationRegistryInner,
+) -> Result<Arc<dyn DeviceProvider>, Report<TrustedServerError>> {
+    if let Some((_, provider)) = inner
+        .device_providers
+        .iter()
+        .find(|(id, _)| *id == module_id)
+    {
+        return Ok(Arc::clone(provider));
+    }
+
+    let message = if inner
+        .enabled_integration_ids
+        .iter()
+        .copied()
+        .any(|id| id == module_id)
+    {
+        format!(
+            "`[device] provider` selects integration module `{module_id}`, which declares no device provider"
+        )
+    } else if inner.builder_ids.iter().any(|(id, _)| *id == module_id) {
+        format!(
+            "`[device] provider` selects integration module `{module_id}`, which is registered but not enabled, so its device provider is unavailable"
+        )
+    } else {
+        format!(
+            "`[device] provider` selects integration module `{module_id}`, which is not registered; the registered modules that declare a device provider are [{}]",
+            inner
+                .device_providers
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    Err(Report::new(TrustedServerError::Configuration { message }))
 }
 
 fn resolve_geo_provider(
@@ -1264,7 +1324,7 @@ impl IntegrationRegistry {
         }
         let geo_provider = resolve_geo_provider(settings, &inner)?;
         inner.ec_provider = resolve_ec_provider(settings, &inner);
-        inner.device_provider = resolve_device_provider(settings, &inner);
+        inner.device_provider = resolve_device_provider(settings, &inner)?;
         inner.geo_provider = geo_provider;
 
         Ok(Self {
@@ -3675,15 +3735,40 @@ mod tests {
     }
 
     #[test]
-    fn geo_provider_is_unset_when_no_module_is_selected() {
+    fn an_unset_geo_selector_resolves_the_disabled_provider_and_platform_opts_in() {
+        // Unset is the permission model's privacy default: it resolves the
+        // disabled provider, so no client IP ever reaches a host geo service.
+        // It is deliberately not the same as leaving the adapter's own lookup
+        // in place, which is what `platform` now spells.
         let settings = crate::test_support::tests::create_test_settings();
+        assert!(
+            settings.geo.provider.is_none(),
+            "the shared test settings should leave the geo selector unset"
+        );
 
         let registry = IntegrationRegistry::with_registrations(&settings, &geo_probe_builders())
             .expect("should build registry with an unset geo selector");
 
+        let provider = registry
+            .geo_provider()
+            .expect("an unset selector should resolve the disabled provider, not nothing");
+        assert!(
+            provider
+                .lookup(None)
+                .expect("should look up without failing")
+                .is_none(),
+            "the disabled provider should resolve no location and make no host call"
+        );
+
+        // `platform` is the explicit opt-in to the adapter's own lookup, and it
+        // is the one case that resolves nothing here so the adapter's provider
+        // stands.
+        let platform = settings_selecting_geo_provider(GEO_PROVIDER_PLATFORM);
+        let registry = IntegrationRegistry::with_registrations(&platform, &geo_probe_builders())
+            .expect("should build registry with the platform geo selector");
         assert!(
             registry.geo_provider().is_none(),
-            "should leave the adapter's own host lookup in place"
+            "`platform` should leave the adapter's own host lookup in place"
         );
     }
 

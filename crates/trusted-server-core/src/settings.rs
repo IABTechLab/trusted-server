@@ -4189,28 +4189,43 @@ mod tests {
 
     #[test]
     fn geo_selector_is_omitted_from_serialized_config_when_unset() {
-        // `ts config push` serializes `Settings` verbatim. An empty `geo` table in
-        // the blob makes a `deny_unknown_fields` binary that predates the selector
-        // reject it during rollout or rollback.
+        // `ts config push` serializes `Settings` verbatim, so a selector nobody
+        // set must not appear in the blob. A `deny_unknown_fields` binary that
+        // predates the selector rejects the key during rollout or rollback.
+        //
+        // The `[geo]` table itself is always written now that `default_country`
+        // is required, so the assertion is about the selector key rather than
+        // the table, which is what the blob's compatibility actually turns on.
         let settings = Settings::from_toml(&crate_test_settings_str())
             .expect("should parse settings without a geo selector");
 
         let value = serde_json::to_value(&settings).expect("should serialize settings");
 
+        let geo = value
+            .get("geo")
+            .expect("the geo table is written because default_country is required");
         assert!(
-            value.get("geo").is_none(),
-            "an unset geo selector should not be serialized, got {value}"
+            geo.get("provider").is_none(),
+            "an unset geo selector should not be serialized, got {geo}"
+        );
+        assert!(
+            value
+                .get("device")
+                .is_none_or(|device| device.get("provider").is_none()),
+            "an unset device selector should not be serialized, got {value}"
         );
     }
 
     #[test]
     fn a_selected_geo_provider_stays_in_the_serialized_config() {
-        let settings = Settings::from_toml(&format!(
-            "{}
-[geo]
-provider = \"none\"
-",
-            crate_test_settings_str()
+        // The shared test settings already carry a `[geo]` table, because
+        // `default_country` is required, so the selector is set inside that
+        // table rather than in a second one, which TOML rejects as a duplicate
+        // key.
+        let settings = Settings::from_toml(&crate_test_settings_str().replace(
+            "[geo]",
+            "[geo]
+provider = \"none\"",
         ))
         .expect("should parse settings with a geo selector");
 
@@ -5625,12 +5640,30 @@ provider = \"none\"
             .validate_provider_selection()
             .expect("should validate the fastly opt-in");
 
-        let unknown = DeviceConfig {
+        // As with geo, a key core does not know is no longer a settings error,
+        // because a module id is a legitimate value here too.
+        let module_key = DeviceConfig {
             provider: Some("acme".to_owned()),
         };
+        module_key
+            .validate_provider_selection()
+            .expect("a module id should be accepted by settings validation");
+
+        // And as with geo, the rejection happens at registry build, so a
+        // mistyped selector cannot fall back to the built-in provider in
+        // silence.
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.device.provider = Some("acme".to_owned());
+        let error = match crate::integrations::IntegrationRegistry::new(&settings) {
+            Ok(_) => {
+                panic!("a device provider no module supplies should be rejected at registry build")
+            }
+            Err(error) => error,
+        };
+        let message = error.to_string();
         assert!(
-            unknown.validate_provider_selection().is_err(),
-            "an unknown device provider should be rejected at startup"
+            message.contains("acme") && message.contains("[device] provider"),
+            "the error should name the selector and the module, got: {message}"
         );
     }
 
@@ -5680,13 +5713,34 @@ provider = \"none\"
         none.validate_provider_selection()
             .expect("should validate the explicit opt-out of geolocation");
 
-        let unknown = GeoConfig {
+        // A key core does not know is no longer a settings error, because a
+        // module id is a legitimate value and a closed list here would shut
+        // every module out of geo. Settings accepts it and the registry decides.
+        let module_key = GeoConfig {
             provider: Some("acme".to_owned()),
             assume_single_jurisdiction: false,
         };
+        module_key
+            .validate_provider_selection()
+            .expect("a module id should be accepted by settings validation");
+
+        // The rejection moved to registry build, where it is known whether any
+        // module supplies the name. With no module supplying `acme`, building
+        // the registry fails and the error names the selector and the module.
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.geo.provider = Some("acme".to_owned());
+        // `IntegrationRegistry` is not `Debug`, so the error is taken by match
+        // rather than `expect_err`.
+        let error = match crate::integrations::IntegrationRegistry::new(&settings) {
+            Ok(_) => {
+                panic!("a geo provider no module supplies should be rejected at registry build")
+            }
+            Err(error) => error,
+        };
+        let message = error.to_string();
         assert!(
-            unknown.validate_provider_selection().is_err(),
-            "an unknown geo provider should be rejected at startup"
+            message.contains("acme") && message.contains("[geo] provider"),
+            "the error should name the selector and the module, got: {message}"
         );
     }
 
