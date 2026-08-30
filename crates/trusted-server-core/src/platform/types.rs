@@ -9,6 +9,7 @@ use super::{
     PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformHttpClient, PlatformKvStore,
     PlatformSecretStore,
 };
+use crate::ec::device::DeviceProvider;
 use crate::ec::provider::EdgeCookieProvider;
 use crate::evidence::HostSignals;
 
@@ -202,6 +203,7 @@ pub struct RuntimeServices {
     /// path resolves the selection itself, which is what a deployment that
     /// selects no provider, the Axum adapter, and the core tests all do.
     pub(crate) resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    pub(crate) device_provider: Option<Arc<dyn DeviceProvider>>,
 }
 
 impl RuntimeServices {
@@ -316,6 +318,13 @@ impl RuntimeServices {
         self.resolved_ec_provider.clone()
     }
 
+    /// The device provider a module supplied, when `[device] provider` selected
+    /// one. `None` leaves core's own device classification in place.
+    #[must_use]
+    pub fn device_provider(&self) -> Option<Arc<dyn DeviceProvider>> {
+        self.device_provider.clone()
+    }
+
     /// Wrap the KV store in a [`super::KvHandle`] for ergonomic access to
     /// JSON helpers, pagination, and validation.
     #[must_use]
@@ -367,6 +376,32 @@ impl RuntimeServices {
         Self { geo, ..self }
     }
 
+    /// Returns a clone of this instance with the Edge Cookie provider replaced.
+    ///
+    /// Adapters use this to apply the module-supplied provider selected by
+    /// `[ec] provider`, the same way they apply a module's geo provider, so a
+    /// vendor declares identity on its registration rather than through a
+    /// second extension mechanism.
+    #[must_use]
+    pub fn with_ec_provider(self, ec_provider: Arc<dyn EdgeCookieProvider>) -> Self {
+        Self {
+            ec_provider: Some(ec_provider),
+            ..self
+        }
+    }
+
+    /// Returns a clone of this instance with the device provider replaced.
+    ///
+    /// Adapters use this to apply the module-supplied provider selected by
+    /// `[device] provider`.
+    #[must_use]
+    pub fn with_device_provider(self, device_provider: Arc<dyn DeviceProvider>) -> Self {
+        Self {
+            device_provider: Some(device_provider),
+            ..self
+        }
+    }
+
     /// Returns a clone of this instance with the template cache replaced.
     ///
     /// Spike-only (#1009).
@@ -416,6 +451,7 @@ pub struct RuntimeServicesBuilder {
     client_info: Option<ClientInfo>,
     host_signals: Option<Arc<dyn HostSignals>>,
     resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    device_provider: Option<Arc<dyn DeviceProvider>>,
 }
 
 impl RuntimeServicesBuilder {
@@ -433,6 +469,7 @@ impl RuntimeServicesBuilder {
             client_info: None,
             host_signals: None,
             resolved_ec_provider: None,
+            device_provider: None,
         }
     }
 
@@ -577,6 +614,7 @@ impl RuntimeServicesBuilder {
                 .expect("should set client_info before building RuntimeServices"),
             host_signals: self.host_signals,
             resolved_ec_provider: self.resolved_ec_provider,
+            device_provider: self.device_provider,
         }
     }
 }

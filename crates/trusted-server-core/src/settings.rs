@@ -887,22 +887,21 @@ impl DeviceConfig {
         self.provider.as_deref().unwrap_or("builtin")
     }
 
-    /// Validates that the selected device-detection provider is available in
-    /// this build.
+    /// Validates the selected device-detection provider.
+    ///
+    /// `builtin` and `fastly` are resolved by the core and the Fastly adapter.
+    /// Any other key names an integration module that declares a device
+    /// provider, and the registry rejects a key no module supplies, so this
+    /// cannot be a closed list without shutting modules out of device detection
+    /// entirely.
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::Configuration`] when the selected provider
-    /// key is not one this build provides.
+    /// Returns [`TrustedServerError::Configuration`] never, today. The error
+    /// type is kept because the caller treats provider validation uniformly
+    /// across the three capabilities.
     pub fn validate_provider_selection(&self) -> Result<(), Report<TrustedServerError>> {
-        match self.provider_key() {
-            "builtin" | "fastly" => Ok(()),
-            key => Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "Device detection provider `{key}` is not available in this build"
-                ),
-            })),
-        }
+        Ok(())
     }
 }
 

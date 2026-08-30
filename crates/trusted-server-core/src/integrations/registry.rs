@@ -11,7 +11,9 @@ use sha2::{Digest as _, Sha256};
 
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::EcContext;
+use crate::ec::device::DeviceProvider;
 use crate::ec::kv::KvIdentityGraph;
+use crate::ec::provider::{EcProviderSelection, EdgeCookieProvider};
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
@@ -624,9 +626,21 @@ pub struct IntegrationRegistration {
     pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
     /// Geo provider this module supplies, selectable by `[geo] provider`.
     ///
-    /// Declaring one does not make it active: the module is only asked to
-    /// resolve location when `[geo] provider` names this module's id.
+    /// Declaring one does not make it active, because the module is only asked
+    /// to resolve location when `[geo] provider` names this module's id.
     pub geo_provider: Option<Arc<dyn PlatformGeo>>,
+    /// Edge Cookie provider this module supplies, selectable by `[ec] provider`.
+    ///
+    /// Declaring one does not make it active, because the module is only asked
+    /// to mint an identifier when `[ec] provider` names this module's id. This
+    /// is the same route geo takes, so identity is not a second extension
+    /// mechanism sitting beside the integration system.
+    pub ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    /// Device provider this module supplies, selectable by `[device] provider`.
+    ///
+    /// Declaring one does not make it active, because the module is only asked
+    /// to classify a request when `[device] provider` names this module's id.
+    pub device_provider: Option<Arc<dyn DeviceProvider>>,
 }
 
 impl IntegrationRegistration {
@@ -656,6 +670,8 @@ impl IntegrationRegistrationBuilder {
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 geo_provider: None,
+                ec_provider: None,
+                device_provider: None,
             },
         }
     }
@@ -710,6 +726,28 @@ impl IntegrationRegistrationBuilder {
     #[must_use]
     pub fn with_geo_provider(mut self, provider: Arc<dyn PlatformGeo>) -> Self {
         self.registration.geo_provider = Some(provider);
+        self
+    }
+
+    /// Declare the Edge Cookie provider this module supplies.
+    ///
+    /// The provider only mints identifiers when `[ec] provider` names this
+    /// module's id, and a declared provider the selector does not choose is
+    /// reported as a startup warning, the same as geo.
+    #[must_use]
+    pub fn with_ec_provider(mut self, provider: Arc<dyn EdgeCookieProvider>) -> Self {
+        self.registration.ec_provider = Some(provider);
+        self
+    }
+
+    /// Declare the device provider this module supplies.
+    ///
+    /// The provider only classifies requests when `[device] provider` names
+    /// this module's id, and a declared provider the selector does not choose
+    /// is reported as a startup warning, the same as geo.
+    #[must_use]
+    pub fn with_device_provider(mut self, provider: Arc<dyn DeviceProvider>) -> Self {
+        self.registration.device_provider = Some(provider);
         self
     }
 
@@ -797,9 +835,17 @@ struct IntegrationRegistryInner {
     // Geo providers declared by the enabled registrations, in registration
     // order. Declaring one does not activate it.
     geo_providers: Vec<(&'static str, Arc<dyn PlatformGeo>)>,
+    // Edge Cookie providers each declaring module supplies, in registration
+    // order. `[ec] provider` picks at most one of them.
+    ec_providers: Vec<(&'static str, Arc<dyn EdgeCookieProvider>)>,
+    // Device providers each declaring module supplies, in registration order.
+    // `[device] provider` picks at most one of them.
+    device_providers: Vec<(&'static str, Arc<dyn DeviceProvider>)>,
     // The provider `[geo] provider` resolved to, or `None` when the selector
     // is unset and the adapter's own host lookup stands.
     geo_provider: Option<Arc<dyn PlatformGeo>>,
+    ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    device_provider: Option<Arc<dyn DeviceProvider>>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -827,7 +873,11 @@ impl Default for IntegrationRegistryInner {
             extra_js_module_ids: Vec::new(),
             request_preparers: Vec::new(),
             geo_providers: Vec::new(),
+            ec_providers: Vec::new(),
+            device_providers: Vec::new(),
             geo_provider: None,
+            ec_provider: None,
+            device_provider: None,
         }
     }
 }
@@ -850,6 +900,70 @@ const GEO_PROVIDER_PLATFORM: &str = "platform";
 /// Returns [`TrustedServerError::Configuration`] when the selector names a
 /// module that is not registered, is registered but not enabled, or is enabled
 /// and declares no geo provider.
+/// Resolves the Edge Cookie provider `[ec] provider` names, when a module
+/// supplies it.
+///
+/// Unlike geo, identity has providers built into core, so a selector naming one
+/// of those is not an error here. This returns `Some` only when a registered
+/// module declared a provider under that name, and core resolves the rest.
+fn resolve_ec_provider(
+    settings: &Settings,
+    inner: &IntegrationRegistryInner,
+) -> Option<Arc<dyn EdgeCookieProvider>> {
+    // `None` spells statelessness and never names a module, so only a named
+    // selection can match one.
+    let selector = match settings.ec.provider.as_ref() {
+        Some(EcProviderSelection::Named(key)) => Some(key.as_str()),
+        Some(EcProviderSelection::None) | None => None,
+    };
+    let resolved = selector.and_then(|key| {
+        inner
+            .ec_providers
+            .iter()
+            .find(|(id, _)| *id == key)
+            .map(|(_, provider)| Arc::clone(provider))
+    });
+
+    for (id, _) in &inner.ec_providers {
+        if selector != Some(*id) {
+            log::warn!(
+                "integration module `{id}` declares an Edge Cookie provider that `[ec] provider` does not select"
+            );
+        }
+    }
+
+    resolved
+}
+
+/// Resolves the device provider `[device] provider` names, when a module
+/// supplies it.
+///
+/// As with identity, core has a built-in device provider, so a selector naming
+/// it is not an error here.
+fn resolve_device_provider(
+    settings: &Settings,
+    inner: &IntegrationRegistryInner,
+) -> Option<Arc<dyn DeviceProvider>> {
+    let selector = settings.device.provider.as_deref();
+    let resolved = selector.and_then(|key| {
+        inner
+            .device_providers
+            .iter()
+            .find(|(id, _)| *id == key)
+            .map(|(_, provider)| Arc::clone(provider))
+    });
+
+    for (id, _) in &inner.device_providers {
+        if selector != Some(*id) {
+            log::warn!(
+                "integration module `{id}` declares a device provider that `[device] provider` does not select"
+            );
+        }
+    }
+
+    resolved
+}
+
 fn resolve_geo_provider(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
@@ -1095,6 +1209,16 @@ impl IntegrationRegistry {
                         .geo_providers
                         .push((registration.integration_id, provider));
                 }
+                if let Some(provider) = registration.ec_provider {
+                    inner
+                        .ec_providers
+                        .push((registration.integration_id, provider));
+                }
+                if let Some(provider) = registration.device_provider {
+                    inner
+                        .device_providers
+                        .push((registration.integration_id, provider));
+                }
                 if registration.js_disabled {
                     inner.disabled_js_ids.push(registration.integration_id);
                 } else if registration.js_deferred {
@@ -1139,6 +1263,8 @@ impl IntegrationRegistry {
             inner.extra_js_module_ids.push("ec_client_fixed");
         }
         let geo_provider = resolve_geo_provider(settings, &inner)?;
+        inner.ec_provider = resolve_ec_provider(settings, &inner);
+        inner.device_provider = resolve_device_provider(settings, &inner);
         inner.geo_provider = geo_provider;
 
         Ok(Self {
@@ -1151,6 +1277,20 @@ impl IntegrationRegistry {
     #[must_use]
     pub fn geo_provider(&self) -> Option<Arc<dyn PlatformGeo>> {
         self.inner.geo_provider.clone()
+    }
+
+    /// The Edge Cookie provider `[ec] provider` selected from a module, or
+    /// `None` when the selector names a provider built into core or nothing.
+    #[must_use]
+    pub fn ec_provider(&self) -> Option<Arc<dyn EdgeCookieProvider>> {
+        self.inner.ec_provider.clone()
+    }
+
+    /// The device provider `[device] provider` selected from a module, or
+    /// `None` when the selector names a provider built into core or nothing.
+    #[must_use]
+    pub fn device_provider(&self) -> Option<Arc<dyn DeviceProvider>> {
+        self.inner.device_provider.clone()
     }
 
     /// Every integration id the registry was built from, enabled or not, in

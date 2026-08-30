@@ -437,3 +437,102 @@ fn auction_provider_name_from_an_outside_builder_satisfies_the_configured_list()
         "should name the provider nothing provides: {error}"
     );
 }
+
+/// Settings selecting a module-supplied provider.
+///
+/// These cannot use [`settings_with`], because that fixture carries the
+/// deprecated `[ec] passphrase`, and configuration validation rejects the old
+/// key and a provider selection together.
+fn settings_selecting_module(extra: &str) -> Settings {
+    Settings::from_toml(&format!(
+        r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.example.com"
+            cookie_domain = ".test-publisher.example.com"
+            origin_url = "https://origin.test-publisher.example.com"
+            proxy_secret = "seam-probe-test-proxy-secret"
+
+            [geo]
+            default_country = "US"
+            assume_single_jurisdiction = true
+
+            {extra}
+
+            {PROBE_BLOCK}
+        "#
+    ))
+    .expect("should parse settings selecting a module-supplied provider")
+}
+
+// ---------------------------------------------------------------------------
+// Identity and device declared on the registration
+// ---------------------------------------------------------------------------
+
+/// `[ec] provider` naming a module resolves to that module's Edge Cookie
+/// provider, so identity reaches core through the integration registration
+/// rather than through a second extension mechanism.
+///
+/// This is the check that matters for the architectural finding on #1043. The
+/// probe's provider mints an identifier that starts `seam-probe-`, which the
+/// built-in HMAC provider can never produce, so a passing assertion means the
+/// module's provider ran and not core's.
+#[test]
+fn ec_selector_naming_a_module_resolves_that_modules_provider() {
+    let settings = settings_selecting_module(
+        r#"
+            [ec]
+            provider = "seam_probe"
+
+            [ec.providers.seam_probe]
+        "#,
+    );
+
+    let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
+        &settings,
+        &[seam_probe::builder()],
+    )
+    .expect("should build a registry with the probe registered");
+
+    let provider = registry
+        .ec_provider()
+        .expect("`[ec] provider = \"seam_probe\"` should resolve the module's provider");
+
+    assert_eq!(
+        provider.id(),
+        "seam_probe",
+        "the resolved provider should be the one the module declared"
+    );
+}
+
+/// `[device] provider` naming a module resolves that module's device provider
+/// the same way, so all three capabilities travel one route.
+#[test]
+fn device_selector_naming_a_module_resolves_that_modules_provider() {
+    let settings = settings_selecting_module(
+        r#"
+            [device]
+            provider = "seam_probe"
+        "#,
+    );
+
+    let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
+        &settings,
+        &[seam_probe::builder()],
+    )
+    .expect("should build a registry with the probe registered");
+
+    let provider = registry
+        .device_provider()
+        .expect("`[device] provider = \"seam_probe\"` should resolve the module's provider");
+
+    assert_eq!(
+        provider.id(),
+        "seam_probe",
+        "the resolved provider should be the one the module declared"
+    );
+}

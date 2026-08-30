@@ -177,8 +177,9 @@ pub(crate) struct AppState {
     /// Resolving reads no request data, so the result is kept and handed to
     /// every request through
     /// [`RuntimeServices::resolved_ec_provider`](trusted_server_core::platform::RuntimeServices::resolved_ec_provider).
-    /// `None` for a deployment that selects no provider.
-    pub(crate) ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    /// `None` for a deployment that selects no provider, and for one whose
+    /// provider must be resolved per request.
+    pub(crate) resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -232,26 +233,28 @@ pub(crate) fn build_state_with_registrations(
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     warn_if_certificate_check_disabled(&settings);
 
+    let orchestrator = build_orchestrator_with_providers(&settings, auction_providers)?;
+    let registry = IntegrationRegistry::with_registrations(&settings, integrations)?;
+
     // Composition root: resolve the provider selection once, before any request
     // is served, so a selection this adapter can never supply fails here rather
     // than on the first request, and keep what the resolution produced so the
-    // request path does not resolve the same settings again. This adapter
-    // injects no vendor Edge Cookie provider, so `None` is the injected
-    // argument, and one is passed here once this adapter supplies it.
+    // request path does not resolve the same settings again. The registry is
+    // built first because a module can supply the vendor Edge Cookie provider
+    // the selector names, and resolving without it would reject a selection
+    // this deployment can in fact satisfy.
     //
     // This adapter injects host signals on every request, so a startup instance
     // with no captured signals answers the only question the check asks,
     // which is whether the service exists at all. That same emptiness is why
     // `build_reusable_provider` hands back nothing for a provider built from
-    // those signals, leaving it to be resolved per request against the
-    // signals that request actually carried.
-    let ec_provider = build_reusable_provider(
+    // those fingerprints, leaving it to be resolved per request against the
+    // fingerprints that request actually carried.
+    let resolved_ec_provider = build_reusable_provider(
         &settings.ec,
         Some(Arc::new(FastlyHostSignals::default())),
-        None,
+        registry.ec_provider(),
     )?;
-    let orchestrator = build_orchestrator_with_providers(&settings, auction_providers)?;
-    let registry = IntegrationRegistry::with_registrations(&settings, integrations)?;
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
@@ -262,7 +265,7 @@ pub(crate) fn build_state_with_registrations(
         registry: Arc::new(registry),
         default_kv_store,
         auction_telemetry_sink,
-        ec_provider,
+        resolved_ec_provider,
     }))
 }
 
@@ -375,7 +378,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
     // again. Nothing is set for a deployment that selects no provider, or one
     // whose provider is built from this request's own host signals, and both
     // are resolved on the request path instead.
-    let services = match state.ec_provider.clone() {
+    let services = match state.resolved_ec_provider.clone() {
         Some(provider) => builder.resolved_ec_provider(provider).build(),
         None => builder.build(),
     };
@@ -383,10 +386,17 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
     // Unset and `"none"` both resolve nothing, so no client IP reaches a host
     // geo service. `"platform"` opts in to the Fastly lookup below, and any
     // other key names an integration module that declares a geo provider.
-    match state.registry.geo_provider() {
-        Some(provider) => services.with_geo(provider),
-        None => services,
+    let mut services = services;
+    if let Some(provider) = state.registry.geo_provider() {
+        services = services.with_geo(provider);
     }
+    if let Some(provider) = state.registry.ec_provider() {
+        services = services.with_ec_provider(provider);
+    }
+    if let Some(provider) = state.registry.device_provider() {
+        services = services.with_device_provider(provider);
+    }
+    services
 }
 
 fn publisher_fallback_methods() -> [Method; 7] {

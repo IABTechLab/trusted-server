@@ -141,11 +141,17 @@ pub fn build_state_with_registrations(
 /// service. `"platform"` opts in to this adapter's own lookup, and any other
 /// key names an integration module that declares a geo provider.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
-    let services = build_runtime_services(ctx, &state.settings);
-    match state.registry.geo_provider() {
-        Some(provider) => services.with_geo(provider),
-        None => services,
+    let mut services = build_runtime_services(ctx, &state.settings);
+    if let Some(provider) = state.registry.geo_provider() {
+        services = services.with_geo(provider);
     }
+    if let Some(provider) = state.registry.ec_provider() {
+        services = services.with_ec_provider(provider);
+    }
+    if let Some(provider) = state.registry.device_provider() {
+        services = services.with_device_provider(provider);
+    }
+    services
 }
 
 // ---------------------------------------------------------------------------

@@ -28,7 +28,12 @@ use serde_json::json;
 use trusted_server_core::auction::AuctionProviderBuilder;
 use trusted_server_core::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use trusted_server_core::auction::types::{AuctionContext, AuctionRequest, AuctionResponse};
+use trusted_server_core::ec::device::{DeviceProvider, DeviceSignals};
+use trusted_server_core::ec::provider::{
+    EdgeCookieProvider, GeneratedEdgeCookie, IdentityInput, ProviderCode,
+};
 use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::evidence::RequestInfo;
 use trusted_server_core::integrations::{
     CarriedJsModule, IntegrationBuilder, IntegrationEndpoint, IntegrationProxy,
     IntegrationRegistration,
@@ -196,6 +201,68 @@ impl SeamProbeGeo {
     }
 }
 
+/// The probe's Edge Cookie provider, declared on its registration so identity
+/// reaches core the same way location does.
+///
+/// It mints a value derived from the request evidence rather than a constant,
+/// so a test can tell the difference between the module's provider running and
+/// core's built-in one running.
+#[derive(Debug)]
+pub struct SeamProbeEc;
+
+/// The four-character code core stamps on identifiers this provider owns.
+const SEAM_PROBE_EC_CODE: ProviderCode = ProviderCode::new("sprb");
+
+impl EdgeCookieProvider for SeamProbeEc {
+    fn id(&self) -> &'static str {
+        SEAM_PROBE_ID
+    }
+
+    fn code(&self) -> ProviderCode {
+        SEAM_PROBE_EC_CODE
+    }
+
+    fn generate(
+        &self,
+        request_info: &dyn RequestInfo,
+        _input: &IdentityInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        // Derived from evidence so the test can prove this ran rather than the
+        // built-in provider, and prove the evidence actually arrived.
+        let ip = request_info.client_ip();
+        let id = format!("seam-probe-{}", if ip.is_empty() { "no-ip" } else { ip });
+        Ok(GeneratedEdgeCookie {
+            id: Some(id),
+            response_headers: Vec::new(),
+        })
+    }
+
+    fn accepts_id(&self, value: &str) -> bool {
+        value.starts_with("seam-probe-")
+    }
+}
+
+/// The probe's device provider, declared on the same registration.
+#[derive(Debug)]
+pub struct SeamProbeDevice;
+
+impl DeviceProvider for SeamProbeDevice {
+    fn id(&self) -> &'static str {
+        SEAM_PROBE_ID
+    }
+
+    fn detect(&self, _request_info: &dyn RequestInfo) -> DeviceSignals {
+        DeviceSignals {
+            is_mobile: 1,
+            platform_class: Some("seam-probe".to_owned()),
+            known_browser: Some(true),
+            looks_like_browser: true,
+            ja4_class: None,
+            h2_fp_hash: None,
+        }
+    }
+}
+
 impl PlatformGeo for SeamProbeGeo {
     fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
         Ok(Some(GeoInfo {
@@ -344,6 +411,13 @@ pub fn register(
         });
     if config.declares_geo {
         registration = registration.with_geo_provider(Arc::new(SeamProbeGeo::new(config.country)));
+    }
+    {
+        // Identity and device are declared the same way location is, so one
+        // module supplies all three and there is no second mechanism.
+        registration = registration
+            .with_ec_provider(Arc::new(SeamProbeEc))
+            .with_device_provider(Arc::new(SeamProbeDevice));
     }
 
     Ok(Some(registration.build()))

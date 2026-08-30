@@ -69,8 +69,9 @@ pub struct AppState {
     /// Resolving reads no request data, so the result is kept and handed to
     /// every request through
     /// [`RuntimeServices::resolved_ec_provider`](trusted_server_core::platform::RuntimeServices::resolved_ec_provider).
-    /// `None` for a deployment that selects no provider.
-    ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    /// `None` for a deployment that selects no provider, and for one whose
+    /// provider must be resolved per request.
+    resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -127,22 +128,24 @@ pub fn build_state_with_registrations(
     integrations: &[IntegrationBuilder],
     auction_providers: &[AuctionProviderBuilder],
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    let orchestrator = build_orchestrator_with_providers(&settings, auction_providers)?;
+    let registry = IntegrationRegistry::with_registrations(&settings, integrations)?;
+
     // Composition root: resolve the provider selection once, before any request
     // is served, so a selection this adapter can never supply fails here rather
     // than on the first request. Keeping what the resolution produced is what
-    // stops the request path resolving the same settings again. This adapter
-    // supplies no host signals and injects no vendor Edge Cookie provider, so
-    // both arguments are `None`, and each is passed here once this adapter
-    // supplies it.
-    let ec_provider = build_reusable_provider(&settings.ec, None, None)?;
-    let orchestrator = build_orchestrator_with_providers(&settings, auction_providers)?;
-    let registry = IntegrationRegistry::with_registrations(&settings, integrations)?;
+    // stops the request path resolving the same settings again. The registry is
+    // built first because a module can supply the vendor Edge Cookie provider
+    // the selector names, and resolving without it would reject a selection
+    // this deployment can in fact satisfy. This adapter supplies no host
+    // signals, so that argument stays `None` until it does.
+    let resolved_ec_provider = build_reusable_provider(&settings.ec, None, registry.ec_provider())?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
-        ec_provider,
+        resolved_ec_provider,
     }))
 }
 
@@ -161,12 +164,18 @@ pub fn build_state_with_registrations(
 /// host geo service. `"platform"` opts in to this adapter's own lookup, and any
 /// other key names an integration module that declares a geo provider.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
-    let services = build_runtime_services(ctx, &state.settings)
-        .with_resolved_ec_provider(state.ec_provider.clone());
-    match state.registry.geo_provider() {
-        Some(provider) => services.with_geo(provider),
-        None => services,
+    let mut services = build_runtime_services(ctx, &state.settings)
+        .with_resolved_ec_provider(state.resolved_ec_provider.clone());
+    if let Some(provider) = state.registry.geo_provider() {
+        services = services.with_geo(provider);
     }
+    if let Some(provider) = state.registry.ec_provider() {
+        services = services.with_ec_provider(provider);
+    }
+    if let Some(provider) = state.registry.device_provider() {
+        services = services.with_device_provider(provider);
+    }
+    services
 }
 
 // ---------------------------------------------------------------------------
