@@ -1,12 +1,13 @@
 # Design Spec: The Integration Provider Seam
 
-**Status:** Proposed, 2026-08-27, revised 2026-08-28. This PR adds this
-document only and targets `main` directly. Following the review of #1043
+**Status:** Proposed, 2026-08-27, revised 2026-08-28. This PR adds design
+documents only and targets `main` directly. Following the review of #1043
 (27 August) the seam it defines is a precondition for the provider series
 rather than a follow-up to it, so the order is now this spec, then its
 implementation in a seventh PR against `main` (51Degrees), then PRs #1043
-to #1047 reworked onto it. It reads alongside the series' specs, which land
-with PR #1047.
+to #1047 reworked onto it. It reads alongside the series' specs, which this
+PR now carries too, so the whole normative set is reviewable before any of
+the code lands.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-07-30-pluggable-providers-design.md`,
 `2026-07-30-provider-migration-rollout-design.md`,
@@ -418,3 +419,4 @@ defines, and both should land before the first vendor is asked to use it.
 | 2026-08-28 | Corrected line references to `main` at b7fcb5d4c and added what mapping `main` found: composition of the served script moves into core (§3.2), registration enumeration and the auction-only `adserver_mock` case (§3.3), the duplicate-id gap (§3.1), the source-file guard and the `ts audit` vendor table (§4), the renderer risk (§7). |
 | 2026-08-28 | Recorded what implementing the seam found (§8): the operator CLI skips a vendor's deploy rules, a carried module's hash literal is fragile, providers resolve more than once per request, and one core reader still reads an APS payload. Recorded the construction-time hash check in §3.2.                                               |
 | 2026-08-28 | Adopted the #1043 review's registration shape for identity and applied its rule to geo and device, with no provider built into core (§3.6, §6 item 2, §8 rows 7 to 9). Recorded the relationship to #986 and reordered the series so this spec and its implementation come first.                                                          |
+| 2026-08-30 | Moved the five series design specs and the provider-code registry into this PR from PRs #1043 to #1047, so every normative document is reviewed before the code that implements it. Document content is unchanged; only this status line and this row are new.                                                                             |
