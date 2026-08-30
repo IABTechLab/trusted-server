@@ -78,7 +78,7 @@ use crate::geo::GeoInfo;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use device::DeviceSignals;
-use provider::{EdgeCookieProvider, GeneratedEdgeCookie, IdentityInput, build_provider};
+use provider::{EdgeCookieProvider, GeneratedEdgeCookie, IdentityInput};
 
 use self::kv::KvIdentityGraph;
 use self::kv_types::KvEntry;
@@ -202,12 +202,14 @@ impl EcContext {
     ) -> Result<Self, Report<TrustedServerError>> {
         let parsed = parse_ec_from_request(req)?;
 
-        // Build the selected provider once. It is used here to decide whether
-        // the incoming cookie value is a usable identifier. Building it needs
-        // no request data, so nothing is cloned from the request.
-        let ec_provider = services.ec_provider();
+        // Take the selected provider once. It is used here to decide whether
+        // the incoming cookie value is a usable identifier, and again by
+        // generation, which reuses this one rather than asking for another.
+        // Resolving needs no request data, so an adapter that resolved the
+        // selection while it built application state hands the same instance
+        // back here and nothing is built a second time on this request.
         let selected_provider: Option<Arc<dyn crate::ec::provider::EdgeCookieProvider>> =
-            build_provider(&settings.ec, ec_provider.clone())?.map(Arc::from);
+            provider::request_provider(&settings.ec, services)?;
 
         // Read back an existing identifier only when the selected provider
         // accepts its shape, so an opaque vendor identifier (for example a signed
@@ -810,6 +812,42 @@ mod tests {
             region: None,
             asn: None,
         }
+    }
+
+    #[test]
+    fn read_from_request_reuses_the_provider_the_composition_root_resolved() {
+        // Reading EC state runs on every request, and it used to resolve
+        // `[ec] provider` itself even though the composition root had just
+        // resolved the same settings, so the provider was built twice per
+        // request. An adapter now threads the resolved provider through
+        // `RuntimeServices`, and the context has to take that instance.
+        let mut settings = create_test_settings();
+        settings.ec.provider = Some(EcProviderSelection::from("opaque"));
+
+        let ec_config = settings.ec.clone();
+        let resolved = crate::ec::provider::build_shared_provider(
+            &ec_config,
+            Some(Arc::new(OpaqueIdProvider)),
+        )
+        .expect("the composition root should resolve the selection")
+        .expect("the selection should yield a provider");
+
+        let services = crate::platform::test_support::noop_services_with_resolved_ec_provider(
+            Arc::clone(&resolved),
+        );
+        let req = create_test_request(&[]);
+        let ec = EcContext::read_from_request(&settings, &req, &services)
+            .expect("should read EC context");
+
+        let used = ec
+            .selected_provider
+            .as_ref()
+            .expect("the context should hold the selected provider");
+        assert!(
+            Arc::ptr_eq(used, &resolved),
+            "reading EC state should reuse the provider resolved at startup rather \
+             than building a second one for this request"
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::ec::generation::normalize_ip;
 #[cfg(test)]
 use crate::ec::provider::IdentityInput;
-use crate::ec::provider::{build_provider, provider_owns_id};
+use crate::ec::provider::{provider_owns_id, request_provider};
 use crate::error::TrustedServerError;
 #[cfg(test)]
 use crate::evidence::BorrowedRequestInfo;
@@ -51,7 +51,7 @@ pub fn generate_ec_id(
 
     log::trace!("Generating fresh EC ID from normalized client context");
 
-    let Some(provider) = build_provider(&settings.ec, services.ec_provider())? else {
+    let Some(provider) = request_provider(&settings.ec, services)? else {
         log::info!("No Edge Cookie provider configured; running statelessly");
         return Ok(None);
     };
@@ -148,7 +148,7 @@ pub fn recognized_ec_id(
         return Ok(None);
     };
 
-    let Some(provider) = build_provider(&settings.ec, services.ec_provider())? else {
+    let Some(provider) = request_provider(&settings.ec, services)? else {
         log::debug!(
             "No Edge Cookie provider configured; withholding the request's EC ID from egress"
         );

@@ -18,7 +18,7 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
-use trusted_server_core::ec::provider::ensure_provider_available;
+use trusted_server_core::ec::provider::{EdgeCookieProvider, build_shared_provider};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -57,6 +57,16 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    /// The Edge Cookie provider `[ec] provider` selects, resolved once here.
+    ///
+    /// This adapter runs a fresh instance per request, so application state and
+    /// the request path used to resolve the same selection twice for every
+    /// request, once to check it could be satisfied and once to use it.
+    /// Resolving reads no request data, so the result is kept and handed to
+    /// every request through
+    /// [`RuntimeServices::resolved_ec_provider`](trusted_server_core::platform::RuntimeServices::resolved_ec_provider).
+    /// `None` for a deployment that selects no provider.
+    ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -115,12 +125,13 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    // Composition root: reject a provider selection this adapter can never
-    // supply, once, before any request is served. This adapter injects no Edge
-    // Cookie provider into `RuntimeServices`, so `None` is exactly what
-    // `EcContext` sees per request; pass the injected provider here as well
-    // once this adapter supplies one.
-    ensure_provider_available(&settings.ec, None)?;
+    // Composition root: resolve the provider selection once, before any request
+    // is served, so a selection this adapter can never supply fails here rather
+    // than on the first request. Keeping what the resolution produced is what
+    // stops the request path resolving the same settings again. This adapter
+    // injects no vendor Edge Cookie provider, so `None` is the injected
+    // argument, and one is passed here once this adapter supplies it.
+    let ec_provider = build_shared_provider(&settings.ec, None)?;
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
 
@@ -128,6 +139,7 @@ fn build_state_with_settings(
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        ec_provider,
     }))
 }
 
@@ -135,8 +147,11 @@ fn build_state_with_settings(
 // Per-request RuntimeServices
 // ---------------------------------------------------------------------------
 
-fn build_per_request_services(ctx: &RequestContext) -> RuntimeServices {
-    build_runtime_services(ctx)
+/// Builds the per-request services, carrying the Edge Cookie provider the
+/// composition root already resolved so the request path does not resolve
+/// `[ec] provider` a second time.
+fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
+    build_runtime_services(ctx).with_resolved_ec_provider(state.ec_provider.clone())
 }
 
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
@@ -195,7 +210,7 @@ where
         let s = Arc::clone(&state);
         let f = f.clone();
         Box::pin(async move {
-            let services = build_per_request_services(&ctx);
+            let services = build_per_request_services(&s, &ctx);
             let mut req = ctx.into_request();
             if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
                 &s.settings,
@@ -393,7 +408,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             state: Arc<AppState>,
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
-            let services = build_per_request_services(&ctx);
+            let services = build_per_request_services(&state, &ctx);
             let mut req = ctx.into_request();
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
@@ -698,7 +713,10 @@ mod tests {
             .body(edgezero_core::body::Body::empty())
             .expect("should build test request");
         let ctx = RequestContext::new(req, PathParams::default());
-        let services = build_per_request_services(&ctx);
+        // No resolved provider is threaded here, so the request path resolves
+        // the selection itself, which is what an embedder driving core
+        // directly does and where the loud failure has to stay.
+        let services = build_runtime_services(&ctx);
         let req = ctx.into_request();
 
         let error = build_ec_context(&settings, &services, &req)

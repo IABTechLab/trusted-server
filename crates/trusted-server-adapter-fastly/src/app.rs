@@ -113,8 +113,8 @@ use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
-use trusted_server_core::ec::provider::build_provider;
-use trusted_server_core::ec::provider::ensure_provider_available;
+use trusted_server_core::ec::provider::request_provider;
+use trusted_server_core::ec::provider::{EdgeCookieProvider, build_shared_provider};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
@@ -162,6 +162,16 @@ pub(crate) struct AppState {
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
+    /// The Edge Cookie provider `[ec] provider` selects, resolved once here.
+    ///
+    /// This adapter runs a fresh instance per request, so application state and
+    /// the request path used to resolve the same selection twice for every
+    /// request, once to check it could be satisfied and once to use it.
+    /// Resolving reads no request data, so the result is kept and handed to
+    /// every request through
+    /// [`RuntimeServices::resolved_ec_provider`](trusted_server_core::platform::RuntimeServices::resolved_ec_provider).
+    /// `None` for a deployment that selects no provider.
+    pub(crate) ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -194,12 +204,13 @@ pub(crate) fn build_state_from_settings(
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     warn_if_certificate_check_disabled(&settings);
 
-    // Composition root: reject a provider selection this adapter can never
-    // supply, once, before any request is served. This adapter injects no Edge
-    // Cookie provider into `RuntimeServices`, so `None` is exactly what
-    // `EcContext` sees per request; pass the injected provider here as well
-    // once this adapter supplies one.
-    ensure_provider_available(&settings.ec, None)?;
+    // Composition root: resolve the provider selection once, before any request
+    // is served, so a selection this adapter can never supply fails here rather
+    // than on the first request. Keeping what the resolution produced is what
+    // stops the request path resolving the same settings again. This adapter
+    // injects no vendor Edge Cookie provider, so `None` is the injected
+    // argument, and one is passed here once this adapter supplies it.
+    let ec_provider = build_shared_provider(&settings.ec, None)?;
 
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
@@ -213,6 +224,7 @@ pub(crate) fn build_state_from_settings(
         registry: Arc::new(registry),
         default_kv_store,
         auction_telemetry_sink,
+        ec_provider,
     }))
 }
 
@@ -280,7 +292,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
             ..ClientInfo::default()
         });
 
-    RuntimeServices::builder()
+    let builder = RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(Arc::clone(&state.default_kv_store))
@@ -293,8 +305,16 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(Arc::new(FastlyPlatformGeo))
         .auction_telemetry_sink(Arc::clone(&state.auction_telemetry_sink))
-        .client_info(client_info)
-        .build()
+        .client_info(client_info);
+
+    // Hand every request the provider resolved at the composition root, so the
+    // request path reuses that instance instead of resolving `[ec] provider`
+    // again. Nothing is set for a deployment that selects no provider, which
+    // resolves to nothing either way.
+    match state.ec_provider.clone() {
+        Some(provider) => builder.resolved_ec_provider(provider).build(),
+        None => builder.build(),
+    }
 }
 
 fn publisher_fallback_methods() -> [Method; 7] {
@@ -575,7 +595,7 @@ async fn execute_named(
                     // deployment recognizes, so build it here rather than
                     // assuming the built-in HMAC shape. The read-only
                     // diagnostic builds no EC request state to borrow it from.
-                    let provider = build_provider(&state.settings.ec, services.ec_provider())?;
+                    let provider = request_provider(&state.settings.ec, &services)?;
                     handle_admin_ec_lookup(kv.as_ref(), &registry, provider.as_deref(), &req)
                 }
                 NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
@@ -743,7 +763,7 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
         // A partner echoes back an identifier the deployment's own provider
         // minted, so validation and KV normalization are dispatched through
         // that provider rather than the built-in HMAC grammar.
-        let provider = build_provider(&state.settings.ec, services.ec_provider())?;
+        let provider = request_provider(&state.settings.ec, services)?;
         handle_batch_sync(&kv, &partner_registry, &limiter, provider.as_deref(), req)
     });
 
@@ -1555,6 +1575,11 @@ mod tests {
         let registry = IntegrationRegistry::from_request_filters(filters);
         let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
+        // Resolved the same way the composition root resolves it, so this
+        // router behaves like a served one.
+        let ec_provider =
+            trusted_server_core::ec::provider::build_shared_provider(&settings.ec, None)
+                .expect("should resolve the Edge Cookie provider selection");
         let state = Arc::new(super::AppState {
             auction_telemetry_sink: Arc::new(
                 trusted_server_core::auction::NoopAuctionTelemetrySink,
@@ -1563,6 +1588,7 @@ mod tests {
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
             default_kv_store,
+            ec_provider,
         });
         TrustedServerApp::routes_for_state(&state)
     }

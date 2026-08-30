@@ -847,8 +847,53 @@ pub fn ensure_provider_available(
     ec: &Ec,
     injected: Option<Arc<dyn EdgeCookieProvider>>,
 ) -> Result<(), Report<TrustedServerError>> {
-    build_provider(ec, injected)?;
+    build_shared_provider(ec, injected)?;
     Ok(())
+}
+
+/// Resolves the selected provider into a shared handle the composition root can
+/// keep and the request path can reuse.
+///
+/// The same resolution as [`build_provider`], returned as an `Arc` rather than
+/// a `Box` so one instance can be threaded into
+/// [`RuntimeServices`](crate::platform::RuntimeServices) and read by every
+/// request without being built again. An adapter that calls this while it
+/// builds application state gets the startup check
+/// [`ensure_provider_available`] performs and the provider itself for one piece
+/// of work rather than two.
+///
+/// # Errors
+///
+/// The same errors as [`build_provider`].
+pub fn build_shared_provider(
+    ec: &Ec,
+    injected: Option<Arc<dyn EdgeCookieProvider>>,
+) -> Result<Option<Arc<dyn EdgeCookieProvider>>, Report<TrustedServerError>> {
+    Ok(build_provider(ec, injected)?.map(Arc::from))
+}
+
+/// The Edge Cookie provider to use for this request.
+///
+/// Resolving `[ec] provider` reads no request data, so an adapter that resolved
+/// it once while it built application state and threaded the result into
+/// [`RuntimeServices::resolved_ec_provider`](crate::platform::RuntimeServices::resolved_ec_provider)
+/// gets that same instance back here, and nothing is resolved or constructed
+/// again on the request path. An adapter that threaded nothing resolves here
+/// instead, from the same settings and the same injected provider, which is
+/// what the core tests and any embedder driving core directly do.
+///
+/// # Errors
+///
+/// The same errors as [`build_provider`], and only when the adapter threaded
+/// nothing, because a threaded provider has already been resolved successfully.
+pub fn request_provider(
+    ec: &Ec,
+    services: &crate::platform::RuntimeServices,
+) -> Result<Option<Arc<dyn EdgeCookieProvider>>, Report<TrustedServerError>> {
+    if let Some(resolved) = services.resolved_ec_provider() {
+        return Ok(Some(resolved));
+    }
+    build_shared_provider(ec, services.ec_provider())
 }
 
 /// Adapts an injected, shared [`EdgeCookieProvider`] to the owned `Box` that
@@ -1441,6 +1486,48 @@ mod tests {
         assert!(
             err.to_string().contains("[ec.providers.hmac]"),
             "the error should name the missing block, got: {err}"
+        );
+    }
+
+    #[test]
+    fn the_request_path_reuses_the_provider_the_composition_root_resolved() {
+        // A composition root resolves the selection once while it builds
+        // application state, which is the same work `build_provider` does on a
+        // request, so doing both means doing it twice for every request. The
+        // resolved provider is threaded into `RuntimeServices`, and this is the
+        // assertion that the request path takes it rather than resolving again:
+        // the same allocation, not merely an equal one.
+        let ec = Ec {
+            provider: Some(EcProviderSelection::Named("acme".to_owned())),
+            ..Ec::default()
+        };
+        let resolved = build_shared_provider(&ec, Some(Arc::new(VendorProvider)))
+            .expect("the composition root should resolve the selection")
+            .expect("the selection should yield a provider");
+
+        let services = crate::platform::test_support::noop_services_with_resolved_ec_provider(
+            Arc::clone(&resolved),
+        );
+        let for_request = request_provider(&ec, &services)
+            .expect("the request path should take the resolved provider")
+            .expect("the resolved provider should be there");
+
+        assert!(
+            Arc::ptr_eq(&resolved, &for_request),
+            "the request path should reuse the resolved provider, not build a second one"
+        );
+
+        // An adapter that threads nothing still resolves for itself, so core
+        // driven directly behaves exactly as it did before.
+        let unthreaded =
+            crate::platform::test_support::noop_services_with_ec_provider(Arc::new(VendorProvider));
+        let built = request_provider(&ec, &unthreaded)
+            .expect("an unthreaded adapter should resolve on the request path")
+            .expect("the selection should yield a provider");
+        assert_eq!(
+            built.id(),
+            "acme",
+            "resolving on the request path should still select the injected provider"
         );
     }
 

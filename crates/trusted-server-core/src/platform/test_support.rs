@@ -714,6 +714,31 @@ pub(crate) fn noop_services_with_ec_provider_without_client_ip(
     noop_services_with_ec_provider_and_ip(ec_provider, None)
 }
 
+/// Build a [`RuntimeServices`] carrying an Edge Cookie provider that a
+/// composition root already resolved, the way a production adapter threads it.
+///
+/// Use this to check that the request path reuses that instance rather than
+/// resolving `[ec] provider` for itself. [`noop_services_with_ec_provider`]
+/// is the other half of the pair, offering a vendor provider as an input to
+/// the selector instead of the selector's answer.
+pub(crate) fn noop_services_with_resolved_ec_provider(
+    resolved: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip: Some("203.0.113.10".parse().expect("should parse test client IP")),
+            ..ClientInfo::default()
+        })
+        .resolved_ec_provider(resolved)
+        .build()
+}
+
 fn noop_services_with_ec_provider_and_ip(
     ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
     client_ip: Option<IpAddr>,

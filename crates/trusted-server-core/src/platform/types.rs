@@ -196,6 +196,13 @@ pub struct RuntimeServices {
     /// own crate and be injected, so core never names a vendor (the same
     /// pattern as [`geo`](Self::geo)).
     pub(crate) ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    /// The Edge Cookie provider this deployment already resolved from
+    /// `[ec] provider` while it built application state.
+    ///
+    /// `None` when the adapter resolved nothing here, in which case the request
+    /// path resolves the selection itself, which is what a deployment that
+    /// selects no provider and the core tests both do.
+    pub(crate) resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
 }
 
 impl RuntimeServices {
@@ -294,6 +301,21 @@ impl RuntimeServices {
         self.ec_provider.clone()
     }
 
+    /// Returns the Edge Cookie provider the composition root already resolved,
+    /// when the adapter threaded one through.
+    ///
+    /// Resolving `[ec] provider` reads no request data, so the answer is the
+    /// same for every request and an adapter that resolves it once while it
+    /// builds application state can hand the result here instead of the
+    /// request path resolving the same settings again. `None` means nothing was
+    /// threaded, so the request path resolves for itself. Read this through
+    /// [`request_provider`](crate::ec::provider::request_provider) rather than
+    /// directly, so both answers are handled in one place.
+    #[must_use]
+    pub fn resolved_ec_provider(&self) -> Option<Arc<dyn EdgeCookieProvider>> {
+        self.resolved_ec_provider.clone()
+    }
+
     /// Wrap the KV store in a [`super::KvHandle`] for ergonomic access to
     /// JSON helpers, pagination, and validation.
     #[must_use]
@@ -310,6 +332,25 @@ impl RuntimeServices {
     pub fn with_kv_store(self, store: Arc<dyn PlatformKvStore>) -> Self {
         Self {
             kv_store: store,
+            ..self
+        }
+    }
+
+    /// Returns a clone of this instance with the resolved Edge Cookie provider
+    /// replaced.
+    ///
+    /// Adapters that build their per-request services through a shared helper
+    /// with no application state in hand use this to thread the provider the
+    /// composition root resolved. `None` leaves the request path to resolve
+    /// `[ec] provider` for itself, which is what a deployment selecting no
+    /// provider does.
+    #[must_use]
+    pub fn with_resolved_ec_provider(
+        self,
+        resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    ) -> Self {
+        Self {
+            resolved_ec_provider,
             ..self
         }
     }
@@ -362,6 +403,7 @@ pub struct RuntimeServicesBuilder {
     auction_telemetry_sink: Option<Arc<dyn AuctionTelemetrySink>>,
     client_info: Option<ClientInfo>,
     ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
+    resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
 }
 
 impl RuntimeServicesBuilder {
@@ -378,6 +420,7 @@ impl RuntimeServicesBuilder {
             auction_telemetry_sink: None,
             client_info: None,
             ec_provider: None,
+            resolved_ec_provider: None,
         }
     }
 
@@ -469,6 +512,18 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Set the Edge Cookie provider the composition root already resolved.
+    ///
+    /// Optional, and different from [`ec_provider`](Self::ec_provider), which
+    /// is the vendor provider offered to the selector as an input. This one is
+    /// the output, the provider the selector actually chose, so setting it
+    /// keeps the request path from resolving the same settings a second time.
+    #[must_use]
+    pub fn resolved_ec_provider(mut self, provider: Arc<dyn EdgeCookieProvider>) -> Self {
+        self.resolved_ec_provider = Some(provider);
+        self
+    }
+
     /// Construct [`RuntimeServices`] from the accumulated configuration.
     ///
     /// # Panics
@@ -510,6 +565,7 @@ impl RuntimeServicesBuilder {
                 .client_info
                 .expect("should set client_info before building RuntimeServices"),
             ec_provider: self.ec_provider,
+            resolved_ec_provider: self.resolved_ec_provider,
         }
     }
 }

@@ -81,6 +81,11 @@ fn build_state_with_settings(
     // no Edge Cookie provider into `RuntimeServices`, so `None` is exactly what
     // `EcContext` sees per request; pass the injected provider here as well
     // once this adapter supplies one.
+    //
+    // This adapter checks rather than keeps what the check resolved, unlike the
+    // Fastly, Cloudflare and Spin adapters, because it is a long-lived process
+    // whose application state is built once at start-up while theirs is rebuilt
+    // for every request. There is no second resolution per request here to save.
     ensure_provider_available(&settings.ec, None)?;
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
