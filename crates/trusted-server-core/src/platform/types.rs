@@ -191,7 +191,7 @@ pub struct RuntimeServices {
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
     /// Per-request client metadata extracted at the entry point.
     pub(crate) client_info: ClientInfo,
-    /// Host-computed client fingerprints (TLS JA4, HTTP/2), when the host
+    /// Host-computed client signals (TLS JA4, HTTP/2), when the host
     /// supplies them. `None` on a host that exposes none, so a provider that
     /// requires them cannot be built and the request stops.
     pub(crate) host_signals: Option<Arc<dyn HostSignals>>,
@@ -289,13 +289,13 @@ impl RuntimeServices {
         &self.client_info
     }
 
-    /// Returns the host-computed client fingerprints, when the host supplies
+    /// Returns the host-computed client signals, when the host supplies
     /// them.
     ///
-    /// A provider that derives identity from the TLS JA4 or HTTP/2 fingerprints
+    /// A provider that derives identity from the TLS JA4 or HTTP/2 signals
     /// takes these as an injected service. The result is `None` on a host that
     /// exposes none, so such a provider cannot be built there and the request
-    /// stops rather than minting a degraded identifier.
+    /// stops rather than creating a degraded identifier.
     #[must_use]
     pub fn host_signals(&self) -> Option<Arc<dyn HostSignals>> {
         self.host_signals.clone()
@@ -500,9 +500,9 @@ impl RuntimeServicesBuilder {
         self
     }
 
-    /// Set the host-computed client fingerprints service.
+    /// Set the host-computed client signals service.
     ///
-    /// Optional: a host that exposes no TLS/HTTP-2 fingerprints leaves this
+    /// Optional: a host that exposes no TLS or HTTP/2 signals leaves this
     /// unset, so a provider that requires them cannot be built and the request
     /// stops.
     #[must_use]

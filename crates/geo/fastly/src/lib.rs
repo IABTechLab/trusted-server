@@ -2,13 +2,14 @@
 //!
 //! [`FastlyPlatformGeo`] implements [`PlatformGeo`] using Fastly's `geo_lookup`,
 //! for deployments on Fastly Compute. It is the host platform's geo provider,
-//! injected by the Fastly adapter via `build_geo_provider`; selecting a vendor
-//! geo provider replaces it.
+//! injected by the Fastly adapter via `build_geo_provider`. With no selector,
+//! or `provider = "platform"`, this host lookup resolves the location, and
+//! `provider = "none"` disables geo instead.
 //!
-//! Unlike the pure-logic device provider, this crate calls the Fastly geo SDK
-//! directly, so it depends on the `fastly` crate and builds only for the
-//! `wasm32-wasip1` target. The platform-neutral `PlatformGeo` trait and the
-//! `DisabledGeo` default both live in `trusted-server-core`.
+//! Like the Fastly device provider, this crate calls the Fastly SDK directly,
+//! so it depends on the `fastly` crate and builds only for the `wasm32-wasip1`
+//! target. The platform-neutral `PlatformGeo` trait and the `DisabledGeo`
+//! default both live in `trusted-server-core`.
 
 use std::net::IpAddr;
 
@@ -33,7 +34,8 @@ fn geo_from_fastly(geo: &Geo) -> GeoInfo {
 /// Fastly geo-lookup implementation of [`PlatformGeo`].
 ///
 /// The host platform geo provider for Fastly Compute. The adapter injects it via
-/// `build_geo_provider`; selecting a vendor geo provider replaces it.
+/// `build_geo_provider`. With no selector, or `provider = "platform"`, it
+/// resolves the location, and `provider = "none"` disables geo instead.
 pub struct FastlyPlatformGeo;
 
 impl PlatformGeo for FastlyPlatformGeo {

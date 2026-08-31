@@ -754,9 +754,9 @@ pub struct EcProviders {
     #[validate(nested)]
     pub hmac: Option<HmacProviderConfig>,
 
-    /// The built-in host-signal provider, keyed `host-signals`. Mints the Edge
-    /// Cookie from the host's TLS/HTTP-2 fingerprints plus the client IP, so it
-    /// requires a host that supplies those fingerprints.
+    /// The built-in host-signal provider, keyed `host-signals`. Creates the Edge
+    /// Cookie from the host's TLS and HTTP/2 signals plus the client IP, so it
+    /// requires a host that supplies those signals.
     #[serde(default, rename = "host-signals")]
     #[validate(nested)]
     pub host_signals: Option<HostSignalsProviderConfig>,
@@ -835,7 +835,7 @@ pub struct HmacProviderConfig {
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct HostSignalsProviderConfig {
-    /// Passphrase used as the HMAC key over the host fingerprints and client IP.
+    /// Passphrase used as the HMAC key over the host signals and client IP.
     #[validate(custom(function = Ec::validate_passphrase))]
     pub passphrase: Redacted<String>,
 }
@@ -851,9 +851,11 @@ pub struct DeviceConfig {
     /// The key of the device-detection provider to activate.
     ///
     /// Defaults to the built-in `builtin` provider when absent, which classifies
-    /// from the User-Agent alone and makes no host-specific call, so the default
-    /// path stays host-neutral. The opt-in `fastly` provider strengthens the
-    /// browser/bot gate with the host's TLS/H2 fingerprints. Override it with the
+    /// from the User-Agent alone, so device classification itself makes no
+    /// host-specific call. The opt-in `fastly` provider strengthens the
+    /// browser/bot gate with the host's TLS and HTTP/2 signals, which the Fastly
+    /// entry point reads on every request regardless of this selector. Override
+    /// it with the
     /// `TRUSTED_SERVER__device__provider` environment variable so the same
     /// compiled WebAssembly can switch providers at deployment. An unknown key is
     /// rejected at startup by

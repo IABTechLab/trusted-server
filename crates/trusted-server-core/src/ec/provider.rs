@@ -6,10 +6,12 @@
 //! constructed from its `[ec.providers.<key>]` block, and a vendor provider is
 //! taken from the adapter that injected it. A built-in provider that also needs
 //! a host service, as the host-signal provider needs the [`HostSignals`]
-//! fingerprints, is built only on a host that supplies that service.
-//! Construction happens once, while application state is built, and reads no
-//! request data, so a selection this deployment cannot satisfy fails at startup
-//! rather than leaving it running without an identity.
+//! service, is built only on a host that supplies that service.
+//! Construction reads configuration and long-lived services, so a selection
+//! this deployment cannot satisfy fails at startup rather than leaving it
+//! running without an identity. The host-signal provider is the exception: it
+//! is built per request from that request's TLS and HTTP/2 signals (see
+//! [`is_request_scoped`](EdgeCookieProvider::is_request_scoped)).
 //!
 //! Request evidence reaches a provider at call time rather than at
 //! construction. [`EdgeCookieProvider::generate`] borrows a [`RequestInfo`],
@@ -628,7 +630,7 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
     /// Almost every provider is built from configuration and services that are
     /// the same for every request, so one instance can be resolved once and
     /// handed to all of them. [`HostSignalProvider`] is the exception, because
-    /// it is built from the TLS and HTTP/2 fingerprints of a single request and
+    /// it is built from the TLS and HTTP/2 signals of a single request and
     /// answers `true` here. A composition root reads this through
     /// [`build_reusable_provider`] to decide whether keeping the instance is
     /// safe, and keeping a request-scoped one would serve every later request
@@ -741,7 +743,7 @@ impl EdgeCookieProvider for HmacProvider {
 
 /// The built-in host-signal Edge Cookie provider.
 ///
-/// Derives the identifier from the host fingerprints (TLS JA4 and HTTP/2, read
+/// Derives the identifier from the host signals (TLS JA4 and HTTP/2, read
 /// from the injected [`HostSignals`]) plus the client IP (from [`RequestInfo`]),
 /// keyed by the configured passphrase. It is host-agnostic: it depends on the
 /// `HostSignals` capability, so any host that supplies one can use it. A host
@@ -768,7 +770,7 @@ impl EdgeCookieProvider for HostSignalProvider {
         HOST_SIGNALS_PROVIDER_KEY
     }
 
-    // Built from the fingerprints of one request, so it is only ever valid for
+    // Built from the signals of one request, so it is only ever valid for
     // that request and must never be kept and reused.
     fn is_request_scoped(&self) -> bool {
         true
@@ -785,11 +787,11 @@ impl EdgeCookieProvider for HostSignalProvider {
     ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
         let ja4 = self.host_signals.ja4().unwrap_or_default();
         let h2 = self.host_signals.h2().unwrap_or_default();
-        // With no fingerprint at all, minting would silently degrade to an
-        // IP-only identifier under the host-signals name. Defer instead: no
-        // identity this request, and the request proceeds.
+        // With no signal at all, creating an identifier would silently degrade
+        // to an IP-only identifier under the host-signals name. Defer instead,
+        // meaning no identity this request, and the request proceeds.
         if ja4.is_empty() && h2.is_empty() {
-            log::warn!("Host-signal EC provider found no TLS/HTTP-2 fingerprints; deferring");
+            log::warn!("Host-signal EC provider found no TLS/HTTP-2 signals; deferring");
             return Ok(GeneratedEdgeCookie::default());
         }
         let id = generation::generate_hmac_ec_id(
@@ -929,9 +931,9 @@ fn resolve_named_provider(
         return Ok(Box::new(HmacProvider::new(config.passphrase.clone())));
     }
 
-    // The host-signal provider needs fingerprints only some hosts supply, and
+    // The host-signal provider needs signals only some hosts supply, and
     // that check cannot be made in settings validation at all, so it is made
-    // here rather than minting a degraded identifier under this name.
+    // here rather than creating a degraded identifier under this name.
     if key == HOST_SIGNALS_PROVIDER_KEY {
         let config = ec.providers.host_signals.as_ref().ok_or_else(|| {
             Report::new(TrustedServerError::EdgeCookie {
@@ -943,7 +945,7 @@ fn resolve_named_provider(
         let signals = host_signals.ok_or_else(|| {
             Report::new(TrustedServerError::EdgeCookie {
                 message: "The host-signals Edge Cookie provider requires a host that supplies \
-                          TLS/HTTP-2 fingerprints, which this host does not"
+                          TLS/HTTP-2 signals, which this host does not"
                     .to_owned(),
             })
         })?;
@@ -979,7 +981,7 @@ fn resolve_named_provider(
 ///
 /// `host_signals` answers whether this adapter supplies a [`HostSignals`]
 /// service at all, which is fixed per deployment, rather than what any one
-/// request fingerprints to. An adapter that injects host signals on every
+/// request's signals are. An adapter that injects host signals on every
 /// request passes an instance here even though its values are empty at
 /// startup, and an adapter that never injects them passes `None`.
 ///
@@ -1026,14 +1028,14 @@ pub fn build_shared_provider(
 /// alone, and keeping one saves resolving the same settings again on every
 /// request.
 ///
-/// [`HostSignalProvider`] is not, because it is built from the fingerprints of
+/// [`HostSignalProvider`] is not, because it is built from the signals of
 /// one request and reports
 /// [`is_request_scoped`](EdgeCookieProvider::is_request_scoped). Keeping that
-/// one would freeze the fingerprints captured while application state was built,
+/// one would freeze the signals captured while application state was built,
 /// which on every adapter here are empty, so every later request would find no
-/// fingerprints and defer. `Ok(None)` comes back for it, the adapter threads
+/// signals and defer. `Ok(None)` comes back for it, the adapter threads
 /// nothing, and the request path resolves it per request against that request's
-/// own fingerprints.
+/// own signals.
 ///
 /// `Ok(None)` therefore means "nothing to keep", which covers both a stateless
 /// deployment and a provider that must be resolved per request. Both leave the
@@ -1689,7 +1691,7 @@ mod tests {
     }
 
     #[test]
-    fn host_signal_provider_mints_from_fingerprints() {
+    fn host_signal_provider_creates_from_signals() {
         let signals = Arc::new(TestHostSignals {
             ja4: Some("t13d1516h2_8daaf6152771_e5627efa2ab1".to_owned()),
             h2: Some("1:65536;4:6291456".to_owned()),
@@ -1701,12 +1703,12 @@ mod tests {
             .expect("should generate");
         assert!(
             generated.id.is_some(),
-            "the host-signal provider mints an identifier from the fingerprints"
+            "the host-signal provider should create an identifier from the signals"
         );
     }
 
     #[test]
-    fn host_signal_provider_defers_without_fingerprints() {
+    fn host_signal_provider_defers_without_signals() {
         let signals = Arc::new(TestHostSignals {
             ja4: None,
             h2: None,
@@ -1718,7 +1720,7 @@ mod tests {
             .expect("should generate");
         assert!(
             generated.id.is_none(),
-            "with no host fingerprints the provider should defer rather than              mint an IP-only identifier"
+            "with no host signals the provider should defer rather than create an IP-only identifier"
         );
     }
 
@@ -1758,13 +1760,13 @@ mod tests {
 
     #[test]
     fn a_provider_built_from_request_evidence_is_never_kept_and_reused() {
-        // The host-signal provider captures the fingerprints of the request it
+        // The host-signal provider captures the signals of the request it
         // was built for. A composition root builds application state with an
         // empty host-signal service, because there is no request yet, so
         // keeping that instance would serve every later request from empty
-        // fingerprints and the provider would defer forever. It must come back
+        // signals and the provider would defer forever. It must come back
         // as nothing to keep, leaving the request path to resolve it against
-        // the fingerprints each request actually carried.
+        // the signals each request actually carried.
         let mut providers = EcProviders::default();
         providers.host_signals = Some(HostSignalsProviderConfig {
             passphrase: test_passphrase(),
@@ -1914,8 +1916,8 @@ mod tests {
             "the host-signal provider should fail the startup check with no host signals",
         );
         assert!(
-            err.to_string().contains("TLS/HTTP-2 fingerprints"),
-            "the error should say the host supplies no fingerprints, got: {err}"
+            err.to_string().contains("TLS/HTTP-2 signals"),
+            "the error should say the host supplies no signals, got: {err}"
         );
 
         let signals: Arc<dyn HostSignals> = Arc::new(TestHostSignals {
@@ -1923,7 +1925,7 @@ mod tests {
             h2: None,
         });
         ensure_provider_available(&selected, Some(signals), None).expect(
-            "should pass on a host that injects host signals, whatever this request fingerprints to",
+            "should pass on a host that injects host signals, whatever this request's signals are",
         );
     }
 }

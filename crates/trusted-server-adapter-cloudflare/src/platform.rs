@@ -797,7 +797,7 @@ mod tests {
         RequestContext::new(req, PathParams::default())
     }
 
-    /// Builds a request context carrying several headers at once.
+    /// Builds a request context carrying multiple headers at once.
     fn make_ctx_with_headers(headers: &[(&str, &str)]) -> RequestContext {
         let mut builder = request_builder().method("GET").uri("https://example.com/");
         for (name, value) in headers {

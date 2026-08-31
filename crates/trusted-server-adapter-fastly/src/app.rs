@@ -216,11 +216,11 @@ pub(crate) fn build_state_from_settings(
     // argument, and one is passed here once this adapter supplies it.
     //
     // This adapter injects host signals on every request, so a startup instance
-    // with no captured fingerprints answers the only question the check asks,
+    // with no captured signals answers the only question the check asks,
     // which is whether the service exists at all. That same emptiness is why
     // `build_reusable_provider` hands back nothing for a provider built from
-    // those fingerprints, leaving it to be resolved per request against the
-    // fingerprints that request actually carried.
+    // those signals, leaving it to be resolved per request against the
+    // signals that request actually carried.
     let ec_provider = build_reusable_provider(
         &settings.ec,
         Some(Arc::new(FastlyHostSignals::default())),
@@ -307,10 +307,10 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
             ..ClientInfo::default()
         });
 
-    // The TLS JA4 and HTTP/2 fingerprints arrive as trusted internal headers
+    // The TLS JA4 and HTTP/2 signals arrive as trusted internal headers
     // injected by the entry point. They build the host-signal service a
     // host-signal provider reads. Fastly always supplies the capability, so the
-    // service is always set even when a request carried no fingerprint.
+    // service is always set even when a request carried no signal.
     let tls_ja4 = ctx
         .request()
         .headers()

@@ -1,11 +1,11 @@
 //! Device signal derivation for bot detection and browser classification.
 //!
 //! The [`DeviceSignals`] derivation here is pure computation, with no KV I/O or
-//! Fastly SDK calls. A [`DeviceProvider`] is wired by dependency injection: its
-//! constructor takes the services it reads (the [`RequestInfo`] for the
-//! User-Agent, and on a fingerprinting host the
-//! [`HostSignals`](crate::evidence::HostSignals) for the TLS/H2 fingerprints),
-//! and classifies the request from them.
+//! Fastly SDK calls. A [`DeviceProvider`] is wired by dependency injection. It
+//! reads the [`RequestInfo`] for the User-Agent from the borrowed argument
+//! passed to `detect` at call time, and on a host that supplies them the
+//! [`HostSignals`](crate::evidence::HostSignals) for the TLS and HTTP/2 signals
+//! injected into its constructor, then classifies the request from both.
 //!
 //! # Signals
 //!
@@ -37,14 +37,14 @@ pub struct DeviceSignals {
     /// Coarse OS family: `"mac"`, `"windows"`, `"ios"`, `"android"`,
     /// `"linux"`.
     pub platform_class: Option<String>,
-    /// SHA256 prefix (12 hex chars) of raw H2 SETTINGS fingerprint.
+    /// SHA256 prefix (12 hex chars) of the raw H2 SETTINGS signal.
     pub h2_fp_hash: Option<String>,
     /// `true` = known browser, `false` = known bot, `None` = unknown.
     pub known_browser: Option<bool>,
     /// Whether the request looks like a real browser, used to gate Edge Cookie
     /// writes. Computed by the producing provider: the built-in provider uses a
     /// User-Agent-only heuristic, while the Fastly provider strengthens it with
-    /// the TLS/H2 fingerprints.
+    /// the TLS and HTTP/2 signals.
     pub looks_like_browser: bool,
 }
 
@@ -52,10 +52,10 @@ impl DeviceSignals {
     /// Derives device signals from the User-Agent alone, with no
     /// host-specific TLS or HTTP/2 evidence.
     ///
-    /// This is the default path: it touches no Fastly-specific API, so a
-    /// default deployment stays host-neutral. `ja4_class` and `h2_fp_hash` are
-    /// left absent, and the browser/bot decision uses a User-Agent-only
-    /// heuristic (`looks_like_browser_from_ua`).
+    /// This is the default path. It touches no Fastly-specific API, so device
+    /// classification stays host-neutral by default. `ja4_class` and
+    /// `h2_fp_hash` are left absent, and the browser/bot decision uses a
+    /// User-Agent-only heuristic (`looks_like_browser_from_ua`).
     #[must_use]
     pub fn derive_ua_only(ua: &str) -> Self {
         let platform_class = parse_platform_class(ua);
@@ -72,13 +72,13 @@ impl DeviceSignals {
     }
 
     /// Derives device signals from the User-Agent strengthened with the
-    /// host's TLS/H2 fingerprints.
+    /// host's TLS and HTTP/2 signals.
     ///
     /// `ua` is the `User-Agent` header value. `ja4` is the full JA4 hash
     /// from `req.get_tls_ja4()`. `h2_fp` is the raw H2 SETTINGS string
-    /// from `req.get_client_h2_fingerprint()`. These fingerprints are
+    /// from `req.get_client_h2_fingerprint()`. These signals are
     /// host-specific (Fastly), so only the opt-in Fastly device provider
-    /// uses this path; the browser/bot gate then requires a TLS fingerprint.
+    /// uses this path, and the browser/bot gate then requires a TLS signal.
     #[must_use]
     pub fn derive(ua: &str, ja4: Option<&str>, h2_fp: Option<&str>) -> Self {
         let is_mobile = parse_is_mobile(ua);
@@ -86,8 +86,8 @@ impl DeviceSignals {
         let platform_class = parse_platform_class(ua);
         let h2_fp_hash = h2_fp.map(compute_h2_fp_hash);
         let known_browser = evaluate_known_browser(ja4_class.as_deref(), h2_fp_hash.as_deref());
-        // The fingerprint-strengthened gate: a real browser produces a valid
-        // TLS fingerprint and a recognizable UA platform. Raw HTTP clients
+        // The gate strengthened by host signals. A real browser produces a valid
+        // TLS signal and a recognizable UA platform. Raw HTTP clients
         // (curl, Python requests, Go net/http, headless scrapers) lack one or
         // both. This is intentionally aimed at filtering obvious missing-signal
         // traffic, not at resisting deliberate JA4 + UA spoofing.
@@ -146,8 +146,8 @@ pub trait DeviceProvider: Send + Sync {
 ///
 /// Derives [`DeviceSignals`] from the User-Agent alone via
 /// [`DeviceSignals::derive_ua_only`], touching no host-specific API. It reads
-/// only [`RequestInfo::user_agent`] and never a host fingerprint, so the default
-/// request path stays host-neutral.
+/// only [`RequestInfo::user_agent`] and never a host signal, so device
+/// classification stays host-neutral by default.
 #[derive(Debug, Default)]
 pub struct BuiltinDeviceProvider;
 
@@ -174,8 +174,10 @@ impl DeviceProvider for BuiltinDeviceProvider {
 /// Returns the built-in User-Agent-only provider unless the `fastly` selector is
 /// set, in which case it builds the host-specific provider through the
 /// `build_fastly` factory the adapter supplies. The factory runs only when that
-/// provider is selected, so the default path captures no host fingerprints (see
-/// [`BuiltinDeviceProvider`] for the host-neutral default). A
+/// provider is selected, so device classification itself reads no host signals
+/// by default (see [`BuiltinDeviceProvider`] for the host-neutral default). The
+/// Fastly entry point still reads the TLS and HTTP/2 signals on every request to
+/// build the host-signal service and client info. A
 /// selected-but-unknown provider is rejected at startup by
 /// [`DeviceConfig::validate_provider_selection`](crate::settings::DeviceConfig::validate_provider_selection),
 /// so this falls back to the built-in provider for that case.
@@ -252,7 +254,7 @@ fn parse_platform_class(ua: &str) -> Option<String> {
 /// This is the default, host-neutral gate. It filters obvious non-browser
 /// traffic but does not resist a bot that forges a complete browser
 /// User-Agent. The opt-in Fastly device provider strengthens the gate with the
-/// TLS/H2 fingerprints for deployments that need it.
+/// TLS and HTTP/2 signals for deployments that need it.
 #[must_use]
 fn looks_like_browser_from_ua(ua: &str, platform_class: Option<&str>) -> bool {
     platform_class.is_some() && ua.contains("Mozilla/") && !looks_like_bot_ua(ua)
@@ -285,11 +287,11 @@ fn looks_like_bot_ua(ua: &str) -> bool {
     BOT_MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
-/// Extracts Section 1 from a full JA4 fingerprint.
+/// Extracts Section 1 from a full JA4 string.
 ///
 /// JA4 format: `section1_section2_section3` separated by underscores.
 /// Section 1 identifies browser family (cipher count, extension count,
-/// ALPN) without uniquely fingerprinting a device.
+/// ALPN) without uniquely identifying a device.
 ///
 /// Returns `None` if the input is empty or has no underscore-delimited
 /// section.
@@ -303,7 +305,7 @@ fn extract_ja4_section1(full_ja4: &str) -> Option<String> {
 }
 
 /// Computes a 12-hex-char prefix of the SHA256 hash of the raw H2
-/// SETTINGS fingerprint string.
+/// SETTINGS signal string.
 ///
 /// The raw string looks like `"1:65536;2:0;4:6291456;6:262144"`.
 #[must_use]
@@ -314,7 +316,7 @@ fn compute_h2_fp_hash(raw_h2_fp: &str) -> String {
     hex::encode(&digest[..6])
 }
 
-/// Known browser fingerprint allowlist.
+/// Known browser signal allowlist.
 ///
 /// Each entry is `(ja4_class, h2_fp_prefix, known_browser)`.
 /// `h2_fp_prefix` is the raw H2 SETTINGS string (not the hash) — we
@@ -330,7 +332,7 @@ const KNOWN_BROWSERS: &[(&str, &str, bool)] = &[
     ("t13d1717h2", "1:65536;2:0;4:131072;5:16384", true),
 ];
 
-/// Returns H2 fingerprint hashes for the known browser allowlist.
+/// Returns H2 signal hashes for the known browser allowlist.
 ///
 /// Computed once on first call and cached via `OnceLock`.
 fn known_browser_h2_hashes() -> &'static Vec<(&'static str, String, bool)> {
@@ -507,7 +509,7 @@ mod tests {
         assert_eq!(
             evaluate_known_browser(Some(ja4), Some(&h2_hash)),
             Some(true),
-            "Chrome fingerprint should be recognized"
+            "Chrome signal should be recognized"
         );
     }
 
@@ -518,7 +520,7 @@ mod tests {
         assert_eq!(
             evaluate_known_browser(Some(ja4), Some(&h2_hash)),
             Some(true),
-            "Safari fingerprint should be recognized"
+            "Safari signal should be recognized"
         );
     }
 
@@ -529,7 +531,7 @@ mod tests {
         assert_eq!(
             evaluate_known_browser(Some(ja4), Some(&h2_hash)),
             Some(true),
-            "Firefox fingerprint should be recognized"
+            "Firefox signal should be recognized"
         );
     }
 
@@ -679,7 +681,7 @@ mod tests {
         );
         assert!(
             signals.looks_like_browser,
-            "unknown fingerprint with valid JA4 + platform should pass"
+            "unknown signal with valid JA4 + platform should pass"
         );
         assert_eq!(signals.known_browser, None, "should not match allowlist");
     }
@@ -695,7 +697,7 @@ mod tests {
 
     #[test]
     fn looks_like_browser_rejects_missing_ja4() {
-        // Real UA but no TLS fingerprint (e.g. HTTP/1.1 or missing SDK support)
+        // Real UA but no TLS signal (e.g. HTTP/1.1 or missing SDK support)
         let signals = DeviceSignals::derive(CHROME_MAC_UA, None, Some("1:65536"));
         assert!(
             !signals.looks_like_browser,
@@ -771,7 +773,7 @@ mod tests {
         assert_eq!(provider.id(), "builtin");
 
         // The built-in provider classifies from the User-Agent in the request
-        // info passed to `detect` alone, recording no host fingerprint.
+        // info passed to `detect` alone, recording no host signal.
         let request_info = request_info_with_ua(CHROME_MAC_UA);
         let signals = provider.detect(&request_info);
         assert_eq!(

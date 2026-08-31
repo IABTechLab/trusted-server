@@ -1,11 +1,11 @@
 //! The Fastly device provider and host-signal capture.
 //!
 //! [`FastlyDeviceProvider`] strengthens the built-in User-Agent classification
-//! with the host's TLS (JA4) and HTTP/2 fingerprints, for deployments on Fastly
+//! with the host's TLS (JA4) and HTTP/2 signals, for deployments on Fastly
 //! Compute. It is selected by `[device] provider = "fastly"` and wired in by the
 //! Fastly adapter, which injects the request info and the captured host signals.
 //!
-//! [`FastlyHostSignals`] captures those fingerprints from a live Fastly request
+//! [`FastlyHostSignals`] captures those signals from a live Fastly request
 //! (`get_tls_ja4()`, `get_client_h2_fingerprint()`) into owned values, so it can
 //! be shared as an injected [`HostSignals`] service that outlives the borrow of
 //! the request. Capturing through the SDK is why this crate depends on the
@@ -21,9 +21,9 @@ use fastly::Request as FastlyRequest;
 use trusted_server_core::ec::device::{DeviceProvider, DeviceSignals};
 use trusted_server_core::evidence::{HostSignals, RequestInfo};
 
-/// Host-computed client fingerprints captured from a live Fastly request.
+/// Host-computed client signals captured from a live Fastly request.
 ///
-/// Reads the TLS JA4 and HTTP/2 fingerprints once through the Fastly SDK and
+/// Reads the TLS JA4 and HTTP/2 signals once through the Fastly SDK and
 /// owns them, so the value can be injected as a [`HostSignals`] service that
 /// outlives the borrow of the request it was captured from. Off-host the SDK
 /// accessors return `None`, so the signals are simply absent.
@@ -34,9 +34,9 @@ pub struct FastlyHostSignals {
 }
 
 impl FastlyHostSignals {
-    /// Builds host signals from already-captured fingerprint values.
+    /// Builds host signals from already-captured signal values.
     ///
-    /// Use this when the adapter has read the fingerprints once (for example
+    /// Use this when the adapter has read the signals once (for example
     /// into the client metadata, or from the trusted internal headers the entry
     /// point injects) and wants to share them without another SDK call.
     #[must_use]
@@ -44,7 +44,7 @@ impl FastlyHostSignals {
         Self { ja4, h2 }
     }
 
-    /// Captures the TLS JA4 and HTTP/2 fingerprints from a live Fastly request.
+    /// Captures the TLS JA4 and HTTP/2 signals from a live Fastly request.
     #[must_use]
     pub fn from_request(req: &FastlyRequest) -> Self {
         Self {
@@ -66,10 +66,11 @@ impl HostSignals for FastlyHostSignals {
 
 /// The Fastly device provider, opt-in via `[device] provider = "fastly"`.
 ///
-/// Classifies a request with the fingerprint-strengthened
-/// [`DeviceSignals::derive`], reading the User-Agent from its injected
-/// [`RequestInfo`] and the TLS/HTTP-2 fingerprints from its injected
-/// [`HostSignals`], so the browser/bot gate is backed by the live request.
+/// Classifies a request with [`DeviceSignals::derive`], which strengthens the
+/// User-Agent classification with the host signals. It reads the User-Agent
+/// from its injected [`RequestInfo`] and the TLS and HTTP/2 signals from its
+/// injected [`HostSignals`], so the browser/bot gate is backed by the live
+/// request.
 pub struct FastlyDeviceProvider {
     host_signals: Arc<dyn HostSignals>,
 }

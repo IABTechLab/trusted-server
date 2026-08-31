@@ -171,7 +171,7 @@ fn edgezero_main(mut req: FastlyRequest, env: &EnvConfig) {
     let client_info = client_info_from_request(&req, resolved_client_ip);
     let client_ip = client_info.client_ip;
 
-    // Strip and re-inject the TLS JA4 and HTTP/2 fingerprints from the
+    // Strip and re-inject the TLS JA4 and HTTP/2 signals from the
     // authoritative Fastly SDK values, under the same trust model, so the
     // EdgeZero app path can build the host-signal service from these internal
     // headers (the SDK accessors return real values only on the live client
@@ -536,12 +536,13 @@ pub(crate) fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<Stri
 
 /// Derives device signals via the configured device-detection provider.
 ///
-/// The providers read request data from injected services: device classification
-/// reads only the User-Agent, borrowed here through a `BorrowedRequestInfo`, while the
-/// Fastly provider also reads the TLS/H2 fingerprints captured into a
-/// [`FastlyHostSignals`]. The Fastly provider, and so the fingerprint capture, is
-/// built only when selected, so the default request path makes no Fastly-specific
-/// fingerprint call.
+/// The providers read request data from injected services. Device
+/// classification reads only the User-Agent, borrowed here through a
+/// `BorrowedRequestInfo`, unless `fastly` is selected, in which case the Fastly
+/// provider also reads the TLS and HTTP/2 signals captured into a
+/// [`FastlyHostSignals`]. The Fastly entry point still reads those TLS and
+/// HTTP/2 signals on every request to build the host-signal service and client
+/// info, so the capture is not conditional on the provider selection.
 pub(crate) fn derive_device_signals(settings: &Settings, req: &FastlyRequest) -> DeviceSignals {
     let mut headers = HeaderMap::new();
     if let Some(value) = req

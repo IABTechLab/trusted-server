@@ -60,8 +60,8 @@ pub fn generate_ec_id(
 
     // The provider reads request data (the client IP and the request headers)
     // borrowed at call time, so nothing is cloned. A provider that also reads
-    // host fingerprints takes them from the injected host signals rather than
-    // from this request info.
+    // host signals takes them from the injected `HostSignals` service rather
+    // than from this request info.
     let request_info = BorrowedRequestInfo::new(&client_ip, request_headers);
     // The publisher path gates creation on the request's consent context at
     // the call site, and the built-in provider reads neither that result nor
