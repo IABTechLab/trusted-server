@@ -98,8 +98,9 @@ fn build_state_with_settings(
 ///
 /// # Errors
 ///
-/// Returns an error when the auction orchestrator or the integration registry
-/// fail to initialise, which includes two builders claiming the same
+/// Returns an error when the selected Edge Cookie provider cannot be built for
+/// this adapter, or when the auction orchestrator or the integration registry
+/// fail to initialize, which includes two builders claiming the same
 /// integration id or auction provider name.
 pub fn build_state_with_registrations(
     settings: Settings,
@@ -134,12 +135,14 @@ pub fn build_state_with_registrations(
 // Per-request RuntimeServices
 // ---------------------------------------------------------------------------
 
-/// Build per-request [`RuntimeServices`], applying the module-supplied geo
-/// provider selected by `[geo] provider`.
+/// Build per-request [`RuntimeServices`], applying the module-supplied geo,
+/// Edge Cookie and device providers selected by `[geo]`, `[ec]` and
+/// `[device] provider`.
 ///
-/// Unset and `"none"` both resolve nothing, so no client IP reaches a host geo
-/// service. `"platform"` opts in to this adapter's own lookup, and any other
-/// key names an integration module that declares a geo provider.
+/// Unset and `"none"` both resolve nothing for geo, so no client IP reaches a
+/// host geo service. `"platform"` opts in to this adapter's own lookup, and any
+/// other key names an integration module that declares a geo provider. Identity
+/// and device are applied the same way when a module supplies them.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
     let mut services = build_runtime_services(ctx, &state.settings);
     if let Some(provider) = state.registry.geo_provider() {
@@ -691,8 +694,9 @@ impl TrustedServerApp {
     ///
     /// # Errors
     ///
-    /// Returns an error when the auction orchestrator or the integration
-    /// registry fail to initialise, which includes two builders claiming the
+    /// Returns an error when the selected Edge Cookie provider cannot be built
+    /// for this adapter, or when the auction orchestrator or the integration
+    /// registry fail to initialize, which includes two builders claiming the
     /// same integration id or auction provider name.
     pub fn routes_with_registrations(
         settings: Settings,

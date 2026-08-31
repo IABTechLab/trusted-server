@@ -632,7 +632,7 @@ pub struct IntegrationRegistration {
     /// Edge Cookie provider this module supplies, selectable by `[ec] provider`.
     ///
     /// Declaring one does not make it active, because the module is only asked
-    /// to mint an identifier when `[ec] provider` names this module's id. This
+    /// to create an identifier when `[ec] provider` names this module's id. This
     /// is the same route geo takes, so identity is not a second extension
     /// mechanism sitting beside the integration system.
     pub ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
@@ -722,7 +722,7 @@ impl IntegrationRegistrationBuilder {
     ///
     /// The provider only resolves location when `[geo] provider` names this
     /// module's id, and a declared provider the selector does not choose is
-    /// reported as a startup warning.
+    /// logged as a warning when the registry is built.
     #[must_use]
     pub fn with_geo_provider(mut self, provider: Arc<dyn PlatformGeo>) -> Self {
         self.registration.geo_provider = Some(provider);
@@ -731,9 +731,9 @@ impl IntegrationRegistrationBuilder {
 
     /// Declare the Edge Cookie provider this module supplies.
     ///
-    /// The provider only mints identifiers when `[ec] provider` names this
+    /// The provider only creates identifiers when `[ec] provider` names this
     /// module's id, and a declared provider the selector does not choose is
-    /// reported as a startup warning, the same as geo.
+    /// logged as a warning when the registry is built, the same as geo.
     #[must_use]
     pub fn with_ec_provider(mut self, provider: Arc<dyn EdgeCookieProvider>) -> Self {
         self.registration.ec_provider = Some(provider);
@@ -744,7 +744,7 @@ impl IntegrationRegistrationBuilder {
     ///
     /// The provider only classifies requests when `[device] provider` names
     /// this module's id, and a declared provider the selector does not choose
-    /// is reported as a startup warning, the same as geo.
+    /// is logged as a warning when the registry is built, the same as geo.
     #[must_use]
     pub fn with_device_provider(mut self, provider: Arc<dyn DeviceProvider>) -> Self {
         self.registration.device_provider = Some(provider);
@@ -842,7 +842,8 @@ struct IntegrationRegistryInner {
     // `[device] provider` picks at most one of them.
     device_providers: Vec<(&'static str, Arc<dyn DeviceProvider>)>,
     // The provider `[geo] provider` resolved to, or `None` when the selector
-    // is unset and the adapter's own host lookup stands.
+    // is `platform` and the adapter's own host lookup stands. Unset and `none`
+    // both resolve the disabled provider.
     geo_provider: Option<Arc<dyn PlatformGeo>>,
     ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
     device_provider: Option<Arc<dyn DeviceProvider>>,
@@ -899,18 +900,6 @@ const DEVICE_PROVIDER_BUILTIN: &str = "builtin";
 /// than by a module, so the registry supplies nothing for it.
 const DEVICE_PROVIDER_FASTLY: &str = "fastly";
 
-/// Resolves `[geo] provider` against the modules that declared a geo provider.
-///
-/// Returns `None` when the selector is unset, which leaves the adapter's own
-/// host lookup in place. A module that declares a geo provider the selector
-/// does not choose is reported as a warning, so an operator can see a module
-/// shipping a capability the deployment never uses.
-///
-/// # Errors
-///
-/// Returns [`TrustedServerError::Configuration`] when the selector names a
-/// module that is not registered, is registered but not enabled, or is enabled
-/// and declares no geo provider.
 /// Resolves the Edge Cookie provider `[ec] provider` names, when a module
 /// supplies it.
 ///
@@ -1024,6 +1013,20 @@ fn module_device_provider(
     Err(Report::new(TrustedServerError::Configuration { message }))
 }
 
+/// Resolves `[geo] provider` against the modules that declared a geo provider.
+///
+/// Returns the disabled provider when the selector is unset or `none`, `None`
+/// when it is `platform` so the adapter's own host lookup stands, and the
+/// module's provider otherwise. A module that declares a geo provider the
+/// selector does not choose is logged as a warning when the registry is built,
+/// so an operator can see a module shipping a capability the deployment never
+/// uses.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the selector names a
+/// module that is not registered, is registered but not enabled, or is enabled
+/// and declares no geo provider.
 fn resolve_geo_provider(
     settings: &Settings,
     inner: &IntegrationRegistryInner,
@@ -1333,7 +1336,8 @@ impl IntegrationRegistry {
     }
 
     /// The geo provider `[geo] provider` selected, or `None` when the selector
-    /// is unset and the adapter's own host lookup stands.
+    /// is `platform` and the adapter's own host lookup stands. Unset and `none`
+    /// both resolve the disabled provider.
     #[must_use]
     pub fn geo_provider(&self) -> Option<Arc<dyn PlatformGeo>> {
         self.inner.geo_provider.clone()
@@ -1354,8 +1358,9 @@ impl IntegrationRegistry {
     }
 
     /// Every integration id the registry was built from, enabled or not, in
-    /// registration order. The deploy validation and registry tests enumerate
-    /// this to check every builder was considered.
+    /// registration order. A registry test enumerates this to check every
+    /// builder was considered, while the deploy validation test iterates the
+    /// builder lists themselves rather than this method.
     #[must_use]
     pub fn registered_builder_ids(&self) -> Vec<&'static str> {
         self.inner.builder_ids.iter().map(|(id, _)| *id).collect()
@@ -1773,7 +1778,7 @@ impl IntegrationRegistry {
     }
 
     /// Every part this registry can serve (bundle, deferred and standalone),
-    /// for cache fingerprints. Each id appears once.
+    /// for cache hashes. Each id appears once.
     #[must_use]
     pub fn js_parts_all(&self) -> Vec<crate::tsjs_bundle::JsModulePart> {
         let mut ids = self.js_module_ids();

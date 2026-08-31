@@ -102,7 +102,7 @@ pub fn compose(parts: &[JsModulePart]) -> String {
     let ordered = ordered(parts);
     // Every piece the visit yields has a known length before the walk, so
     // reserve the exact byte count once rather than letting the pushes grow
-    // the buffer. A bundle of a dozen parts is several hundred kilobytes, and
+    // the buffer. A bundle of a dozen parts is hundreds of kilobytes, and
     // growing to that size copies roughly twice the bundle on every request
     // that serves it.
     let mut size = 0;

@@ -286,7 +286,8 @@ impl BidRenderer {
     ///
     /// Clones the whole payload map and deserializes all of it, so use
     /// [`payload_field`](Self::payload_field) when the caller wants one field.
-    /// An APS payload carries a base64 creative envelope of up to 256 KB.
+    /// An APS payload carries a base64 encoding of a creative envelope of up
+    /// to 256 KB.
     #[must_use]
     pub fn payload_as<T: DeserializeOwned>(&self, renderer_type: &str) -> Option<T> {
         if self.renderer_type != renderer_type {

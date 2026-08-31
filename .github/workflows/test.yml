@@ -116,6 +116,14 @@ jobs:
         run: |
           cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/host: //p')"
 
+      # The seam-probe fixture crate's own unit tests only run when invoked on
+      # the host target, because no adapter alias compiles its test target. Run
+      # them here so a fault in the seam fixture cannot sit unseen behind a
+      # green gate set.
+      - name: Run host-target seam-probe integration tests
+        run: |
+          cargo test --package trusted-server-integration-seam-probe --target "$(rustc -vV | sed -n 's/host: //p')"
+
       - name: Verify Fastly WASM release build
         run: cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 

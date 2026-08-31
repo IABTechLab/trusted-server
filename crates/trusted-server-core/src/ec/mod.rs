@@ -1458,7 +1458,7 @@ mod tests {
     }
 
     /// A provider that derives its identifier from a value it reads out of the
-    /// config store at mint time, which is the whole point of handing providers
+    /// config store at generate time, which is the whole point of handing providers
     /// the platform services. Nothing about the value is known when the
     /// provider is constructed, so an identifier carrying it can only come from
     /// a real read through the services passed to `generate`.
@@ -1533,7 +1533,7 @@ mod tests {
 
         ec.generate_if_needed(&settings, None, &services)
             .await
-            .expect("the provider should mint from the config value it read");
+            .expect("the provider should create an identifier from the config value it read");
 
         assert_eq!(
             ec.ec_value(),

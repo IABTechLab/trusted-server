@@ -724,7 +724,7 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
     ///
     /// Returns [`TrustedServerError::EdgeCookie`] when derivation fails.
     /// Asynchronous, and handed the platform services, because a provider may
-    /// reach a backend, a key-value store or a secret to mint an identifier,
+    /// reach a backend, a key-value store or a secret to derive an identifier,
     /// and a provider that cannot make those calls cannot be written at all.
     /// A provider that derives from data already in hand still declares an
     /// async method and returns immediately.

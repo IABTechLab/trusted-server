@@ -223,8 +223,9 @@ pub(crate) fn build_state_from_settings(
 ///
 /// # Errors
 ///
-/// Returns an error when the auction orchestrator or the integration registry
-/// fail to initialise, which includes two builders claiming the same
+/// Returns an error when the selected Edge Cookie provider cannot be built for
+/// this adapter, or when the auction orchestrator or the integration registry
+/// fail to initialize, which includes two builders claiming the same
 /// integration id or auction provider name.
 pub(crate) fn build_state_with_registrations(
     settings: Settings,
@@ -323,32 +324,11 @@ pub(crate) fn runtime_services_for_consent_route(
 /// continues to rely on the trusted `fastly-ssl` header injected by
 /// `edgezero_main` after sanitization.
 ///
-/// Applies the module-supplied geo provider selected by `[geo] provider`. When
-/// the selector is unset the registry resolves no provider and the Fastly
-/// lookup stands, so the request path is unchanged.
-/// Builds the services graph handed to a provider on a response-side finalize
-/// path.
-///
-/// The finalize paths run after the handler, where the per-request services
-/// built by [`build_per_request_services`] are already out of scope, but a geo
-/// provider still needs real platform services to resolve a location. Nothing
-/// here varies per request except the client metadata, so this is built once
-/// and cloned with [`RuntimeServices::with_client_info`] at each call.
-pub(crate) fn build_finalize_services(
-    settings: &Settings,
-    kv_store: Arc<dyn PlatformKvStore>,
-) -> RuntimeServices {
-    RuntimeServices::builder()
-        .config_store(Arc::new(FastlyPlatformConfigStore))
-        .secret_store(Arc::new(FastlyPlatformSecretStore))
-        .kv_store(kv_store)
-        .backend(Arc::new(FastlyPlatformBackend))
-        .http_client(Arc::new(FastlyPlatformHttpClient))
-        .geo(build_geo_provider(settings, Arc::new(FastlyPlatformGeo)))
-        .client_info(ClientInfo::default())
-        .build()
-}
-
+/// Applies the module-supplied providers selected by `[geo]`, `[ec]` and
+/// `[device] provider` on top of the base services. Unset and `none` resolve
+/// the disabled geo provider, `platform` leaves the Fastly lookup standing,
+/// and any other key names a module's provider. Identity and device are
+/// applied the same way when a module supplies them.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
     let client_info = ctx
         .request()
@@ -420,6 +400,30 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         services = services.with_device_provider(provider);
     }
     services
+}
+
+/// Builds the services graph handed to a provider on a response-side finalize
+/// path.
+///
+/// The finalize paths run after the handler, where the per-request services
+/// built by [`build_per_request_services`] are already out of scope, but a geo
+/// provider still needs real platform services to resolve a location. The
+/// middleware builds this once and clones it per request with
+/// [`RuntimeServices::with_client_info`], and the entry point rebuilds it per
+/// call.
+pub(crate) fn build_finalize_services(
+    settings: &Settings,
+    kv_store: Arc<dyn PlatformKvStore>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(FastlyPlatformConfigStore))
+        .secret_store(Arc::new(FastlyPlatformSecretStore))
+        .kv_store(kv_store)
+        .backend(Arc::new(FastlyPlatformBackend))
+        .http_client(Arc::new(FastlyPlatformHttpClient))
+        .geo(build_geo_provider(settings, Arc::new(FastlyPlatformGeo)))
+        .client_info(ClientInfo::default())
+        .build()
 }
 
 fn publisher_fallback_methods() -> [Method; 7] {

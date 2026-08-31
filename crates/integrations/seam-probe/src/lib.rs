@@ -1,8 +1,9 @@
 //! An integration that lives outside `trusted-server-core` and exercises every
 //! part of the integration seam from a vendor crate's position.
 //!
-//! One registration carries a browser module, a proxy route, a request
-//! preparer, a geo provider and its own configuration block, and the crate
+//! One registration carries a browser module, a proxy route, a geo provider,
+//! an Edge Cookie identity provider and a device provider, alongside its own
+//! configuration block. The builder adds a request preparer, and the crate
 //! also supplies an auction provider builder. The round-trip tests in
 //! `crates/trusted-server-adapter-axum/tests/seam_probe.rs` drive each of
 //! those through a real adapter, so the seam is proven by a caller that core
@@ -204,8 +205,8 @@ impl SeamProbeGeo {
 /// The probe's Edge Cookie provider, declared on its registration so identity
 /// reaches core the same way location does.
 ///
-/// It mints a value derived from the request evidence rather than a constant,
-/// so a test can tell the difference between the module's provider running and
+/// It derives a value from the request evidence rather than a constant, so a
+/// test can tell the difference between the module's provider running and
 /// core's built-in one running.
 #[derive(Debug)]
 pub struct SeamProbeEc;
@@ -400,7 +401,8 @@ fn check_country(country: &str) -> Result<(), Report<TrustedServerError>> {
 ///
 /// # Errors
 ///
-/// Returns an error when the block is present but cannot be parsed.
+/// Returns an error when the block is present but cannot be parsed or fails
+/// validation.
 fn read_config(settings: &Settings) -> Result<Option<SeamProbeConfig>, Report<TrustedServerError>> {
     settings.integration_config::<SeamProbeConfig>(SEAM_PROBE_ID)
 }
@@ -409,7 +411,8 @@ fn read_config(settings: &Settings) -> Result<Option<SeamProbeConfig>, Report<Tr
 ///
 /// # Errors
 ///
-/// Returns an error when the probe is enabled with a country that is not two
+/// Returns an error when the configuration block cannot be parsed or fails
+/// validation, or when the probe is enabled with a country that is not two
 /// letters.
 pub fn register(
     settings: &Settings,
@@ -444,7 +447,8 @@ pub fn register(
 ///
 /// # Errors
 ///
-/// Returns an error when the probe is enabled with a country that is not two
+/// Returns an error when the configuration block cannot be parsed or fails
+/// validation, or when the probe is enabled with a country that is not two
 /// letters.
 pub fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
     let Some(config) = read_config(settings)? else {
@@ -536,6 +540,97 @@ mod tests {
     use super::*;
 
     use sha2::{Digest as _, Sha256};
+    use trusted_server_core::platform::{
+        ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
+        PlatformSecretStore, StoreId, StoreName, UnavailableHttpClient, UnavailableKvStore,
+    };
+
+    /// Config store that answers nothing, so a test can build
+    /// [`RuntimeServices`] without a real platform.
+    ///
+    /// [`SeamProbeGeo::lookup`] resolves from the country it holds and reads
+    /// none of the services, so the store is never queried.
+    struct StubConfigStore;
+
+    impl PlatformConfigStore for StubConfigStore {
+        fn get(
+            &self,
+            _store_name: &StoreName,
+            _key: &str,
+        ) -> Result<String, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        fn put(
+            &self,
+            _store_id: &StoreId,
+            _key: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    /// Secret store that answers nothing, paired with [`StubConfigStore`].
+    struct StubSecretStore;
+
+    impl PlatformSecretStore for StubSecretStore {
+        fn get_bytes(
+            &self,
+            _store_name: &StoreName,
+            _key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        fn create(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    /// Backend manager that registers nothing, paired with the stub stores.
+    struct StubBackend;
+
+    impl PlatformBackend for StubBackend {
+        fn predict_name(
+            &self,
+            _spec: &PlatformBackendSpec,
+        ) -> Result<String, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    /// Builds a minimal [`RuntimeServices`] the geo lookup can be handed. Every
+    /// service is a stub or a core-provided unavailable implementation because
+    /// [`SeamProbeGeo::lookup`] reads none of them.
+    fn build_probe_services() -> RuntimeServices {
+        RuntimeServices::builder()
+            .config_store(Arc::new(StubConfigStore))
+            .secret_store(Arc::new(StubSecretStore))
+            .kv_store(Arc::new(UnavailableKvStore))
+            .backend(Arc::new(StubBackend))
+            .http_client(Arc::new(UnavailableHttpClient))
+            .geo(Arc::new(DisabledGeo))
+            .client_info(ClientInfo::default())
+            .build()
+    }
 
     /// Settings carrying a `[integrations.seam_probe]` block with `body`
     /// appended to it.
@@ -555,6 +650,10 @@ mod tests {
 
                 [ec]
                 passphrase = "test-secret-key-32-bytes-minimum"
+
+                [geo]
+                default_country = "US"
+                assume_single_jurisdiction = true
 
                 [integrations.seam_probe]
                 {body}
@@ -625,6 +724,10 @@ mod tests {
 
                 [ec]
                 passphrase = "test-secret-key-32-bytes-minimum"
+
+                [geo]
+                default_country = "US"
+                assume_single_jurisdiction = true
             "#,
         )
         .expect("should parse settings without a probe block");
@@ -655,12 +758,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn geo_provider_resolves_the_configured_country() {
+    #[tokio::test]
+    async fn geo_provider_resolves_the_configured_country() {
         let provider = SeamProbeGeo::new("ZZ".to_string());
+        let services = build_probe_services();
 
         let geo = provider
-            .lookup(None)
+            .lookup(None, &services)
+            .await
             .expect("should resolve location")
             .expect("should return geo information");
 

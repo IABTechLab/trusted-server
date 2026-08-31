@@ -709,9 +709,9 @@ Refusing to build is deliberate, because a deployment that asked for a
 specific location source should not quietly fall back to the host's.
 
 A module that supplies a geo provider the selector does not name is not an
-error. The module registers as usual and startup logs a warning saying the
-module supplies a geo provider that `[geo] provider` does not select, so an
-operator can see a capability that is shipped and unused.
+error. The module registers as usual and the registry logs a warning when it is
+built, saying the module supplies a geo provider that `[geo] provider` does not
+select, so an operator can see a capability that is shipped and unused.
 
 ## Response Headers
 

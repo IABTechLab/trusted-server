@@ -294,7 +294,8 @@ pub type IntegrationBuilderFn =
 /// still caught.
 pub type IntegrationValidateFn = fn(&Settings) -> Result<bool, Report<TrustedServerError>>;
 
-/// Prepares a request before routing, for every request the adapter sees.
+/// Prepares a request before routing, for every routed request except the
+/// health check.
 ///
 /// Runs whether or not the integration is enabled, so an integration can
 /// strip its reserved query or cookie even when it is switched off.

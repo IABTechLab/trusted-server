@@ -1988,7 +1988,7 @@ fn assemble_if_shared(
     Ok((out, Some(AssemblyResponseState::ByteSeamFallback)))
 }
 
-/// Fingerprint of every configuration input plus the browser modules this registry serves.
+/// Hash of every configuration input plus the browser modules this registry serves.
 ///
 /// This intentionally over-invalidates. Trying to maintain a hand-written list already
 /// omitted publisher origin identity and creative-opportunity shaping fields. A digest of
@@ -1997,8 +1997,8 @@ fn assemble_if_shared(
 /// an old template under new behavior.
 ///
 /// The module digest covers the parts this registry can actually serve, carried modules
-/// included, so a vendor crate that rebuilds its browser module moves the fingerprint, and
-/// templates keyed under the previous fingerprint are no longer read. It also narrows the
+/// included, so a vendor crate that rebuilds its browser module moves the hash, and
+/// templates keyed under the previous hash are no longer read. It also narrows the
 /// module set from every module compiled into the binary to the ones this deployment can
 /// serve. That is safe because a module this deployment never serves appears in no bundle
 /// hash and no injected URL, so it cannot change what a template renders.
@@ -4084,9 +4084,9 @@ pub struct AuctionDispatch<'a> {
 
 /// The operator configuration and the integrations built from it.
 ///
-/// Both are constructed once at startup and always travel together, so they
-/// pass as one argument rather than two. [`AuctionDispatch`] groups the auction
-/// side of the same call for the same reason.
+/// Both are built together with the application state and always travel
+/// together, so they pass as one argument rather than two. [`AuctionDispatch`]
+/// groups the auction side of the same call for the same reason.
 pub struct AppContext<'a> {
     /// Operator configuration for this deployment.
     pub settings: &'a Settings,
@@ -4467,7 +4467,7 @@ pub async fn handle_publisher_request(
     let request_requires_origin = request_bypasses_template_cache(req.headers())
         || gpt_diagnostics.requires_private_no_store()
         || personalization_requires_origin;
-    // The only vendor-named signal core still reads. It decides nothing about caching
+    // The only DataDome-specific signal core still reads. It decides nothing about caching
     // or the origin path, because it travels to `HtmlProcessorConfig` so DataDome's own
     // head injection can leave its client-side tag out, and it moves out of core with
     // the DataDome integration. Read from the request rather than derived from the
@@ -5271,8 +5271,8 @@ pub(crate) fn build_bid_map_with_auction_id(
                 //
                 // Borrow the one field wanted rather than deserializing the
                 // whole descriptor, which would clone a payload carrying a
-                // base64 creative envelope of up to 256 KB, once per bid per
-                // page view.
+                // base64 encoding of a creative envelope of up to 256 KB, once
+                // per bid per page view.
                 let renderer_bid_id = bid
                     .renderer
                     .as_ref()
@@ -8234,7 +8234,7 @@ mod tests {
         use crate::integrations::IntegrationBuilderFn;
         use sha2::Digest as _;
 
-        /// Fingerprint for a configuration, through a registry built from it.
+        /// Hash for a configuration, through a registry built from it.
         fn fingerprint(settings: &Settings) -> String {
             let registry =
                 IntegrationRegistry::new(settings).expect("should create integration registry");
@@ -8283,7 +8283,7 @@ mod tests {
             ))
         }
 
-        /// Fingerprint for `settings` through a registry whose `probe`
+        /// Hash for `settings` through a registry whose `probe`
         /// integration carries the module `registration` supplies.
         fn fingerprint_with_carried(
             settings: &Settings,
@@ -8387,7 +8387,7 @@ mod tests {
         #[test]
         fn a_change_to_a_carried_module_changes_the_fingerprint() {
             // A module a vendor crate carries is not in the compile-time map, so a
-            // fingerprint built from that map alone would not move when the vendor
+            // hash built from that map alone would not move when the vendor
             // rebuilt its bundle and a cached template would keep the stale `?v=`.
             let settings = create_test_settings();
 

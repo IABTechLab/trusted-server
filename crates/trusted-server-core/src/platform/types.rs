@@ -379,10 +379,10 @@ impl RuntimeServices {
     /// Returns a clone of this instance with the per-request client metadata
     /// replaced.
     ///
-    /// Response-side paths build the rest of the services graph once, when the
-    /// application starts, and vary only the client metadata per request. A
-    /// provider called from one of those paths still needs the real client
-    /// data, so this applies it without rebuilding the graph.
+    /// A response-side path that builds the rest of the services graph once and
+    /// varies only the client metadata per request uses this to apply the real
+    /// client data without rebuilding the graph. A provider called from such a
+    /// path still needs that data.
     #[must_use]
     pub fn with_client_info(self, client_info: ClientInfo) -> Self {
         Self {

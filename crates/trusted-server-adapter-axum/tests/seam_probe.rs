@@ -8,16 +8,25 @@
 //! returns, the error a startup or deploy check produces) rather than on a
 //! function having been called.
 
+use std::sync::Arc;
+
 use axum::body::Body as AxumBody;
-use axum::http::Request;
+use axum::http::{HeaderMap, Request};
 use edgezero_adapter_axum::service::EdgeZeroAxumService;
 use error_stack::Report;
 use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp;
 use trusted_server_core::auction::AuctionProviderBuilder;
 use trusted_server_core::config::validate_settings_for_deploy_with;
+use trusted_server_core::ec::provider::{EdgeCookieProvider as _, IdentityInput};
 use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::evidence::OwnedRequestInfo;
 use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistration};
+use trusted_server_core::platform::{
+    ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
+    PlatformError, PlatformSecretStore, RuntimeServices, StoreId, StoreName, UnavailableHttpClient,
+    UnavailableKvStore,
+};
 use trusted_server_core::settings::Settings;
 use trusted_server_core::tsjs::tsjs_script_src;
 use trusted_server_core::tsjs_bundle::{JsModulePart, compile_time_parts};
@@ -477,10 +486,11 @@ fn settings_selecting_module(extra: &str) -> Settings {
 /// provider, so identity reaches core through the integration registration
 /// rather than through a second extension mechanism.
 ///
-/// This is the check that matters for the architectural finding on #1043. The
-/// probe's provider mints an identifier that starts `seam-probe-`, which the
-/// built-in HMAC provider can never produce, so a passing assertion means the
-/// module's provider ran and not core's.
+/// This test proves the selection resolves the module's provider by its id.
+/// `ec_provider_generates_an_identifier_with_the_modules_prefix` then drives
+/// that resolved provider through `generate` and asserts the `seam-probe-`
+/// prefix the built-in HMAC provider can never produce, so the round trip is
+/// proven there.
 #[test]
 fn ec_selector_naming_a_module_resolves_that_modules_provider() {
     let settings = settings_selecting_module(
@@ -535,4 +545,134 @@ fn device_selector_naming_a_module_resolves_that_modules_provider() {
         "seam_probe",
         "the resolved provider should be the one the module declared"
     );
+}
+
+/// `[ec] provider` naming a module resolves a provider that, when driven
+/// through `generate`, produces an identifier the built-in HMAC provider can
+/// never make.
+///
+/// The selection tests above prove the resolved provider is the module's by
+/// its id. This one drives that provider end to end: it hands the resolved
+/// provider a request and asserts the identifier it returns starts
+/// `seam-probe-`, a prefix only the module's provider produces, so the
+/// module's provider genuinely ran and read the evidence rather than core's
+/// built-in one answering.
+#[tokio::test]
+async fn ec_provider_generates_an_identifier_with_the_modules_prefix() {
+    let settings = settings_selecting_module(
+        r#"
+            [ec]
+            provider = "seam_probe"
+
+            [ec.providers.seam_probe]
+        "#,
+    );
+
+    let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
+        &settings,
+        &[seam_probe::builder()],
+    )
+    .expect("should build a registry with the probe registered");
+
+    let provider = registry
+        .ec_provider()
+        .expect("`[ec] provider = \"seam_probe\"` should resolve the module's provider");
+
+    let request_info = OwnedRequestInfo::new("192.0.2.1".to_owned(), HeaderMap::new());
+    let generated = provider
+        .generate(&request_info, &IdentityInput::default(), &stub_services())
+        .await
+        .expect("the module's provider should generate an identifier");
+
+    let id = generated
+        .id
+        .expect("the module's provider should return an identifier");
+    assert!(
+        id.starts_with("seam-probe-"),
+        "the identifier should carry the module provider's prefix, got `{id}`"
+    );
+    assert_eq!(
+        id, "seam-probe-192.0.2.1",
+        "the module's provider should derive the identifier from the request evidence"
+    );
+}
+
+/// Config store that answers nothing, so a test can build [`RuntimeServices`]
+/// without a real platform.
+///
+/// The probe's Edge Cookie provider derives its identifier from the request
+/// evidence and reads none of the services, so the store is never queried.
+struct StubConfigStore;
+
+impl PlatformConfigStore for StubConfigStore {
+    fn get(&self, _store_name: &StoreName, _key: &str) -> Result<String, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
+    fn put(
+        &self,
+        _store_id: &StoreId,
+        _key: &str,
+        _value: &str,
+    ) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
+    fn delete(&self, _store_id: &StoreId, _key: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+}
+
+/// Secret store that answers nothing, paired with [`StubConfigStore`].
+struct StubSecretStore;
+
+impl PlatformSecretStore for StubSecretStore {
+    fn get_bytes(
+        &self,
+        _store_name: &StoreName,
+        _key: &str,
+    ) -> Result<Vec<u8>, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
+    fn create(
+        &self,
+        _store_id: &StoreId,
+        _name: &str,
+        _value: &str,
+    ) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
+    fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+}
+
+/// Backend manager that registers nothing, paired with the stub stores.
+struct StubBackend;
+
+impl PlatformBackend for StubBackend {
+    fn predict_name(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
+    fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+}
+
+/// Builds a minimal [`RuntimeServices`] to hand a provider under test. Every
+/// service is a stub or a core-provided unavailable implementation because the
+/// probe's Edge Cookie provider reads only the request evidence.
+fn stub_services() -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(StubConfigStore))
+        .secret_store(Arc::new(StubSecretStore))
+        .kv_store(Arc::new(UnavailableKvStore))
+        .backend(Arc::new(StubBackend))
+        .http_client(Arc::new(UnavailableHttpClient))
+        .geo(Arc::new(DisabledGeo))
+        .client_info(ClientInfo::default())
+        .build()
 }
