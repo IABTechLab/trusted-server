@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn build_pull_sync_context_accepts_the_active_non_hmac_provider() {
         // A deployment whose active provider is not the built-in HMAC one must
-        // still dispatch pull sync for the identifiers that provider minted.
+        // still dispatch pull sync for the identifiers that provider created.
         // The built-in grammar rejected every non-`hmac` code, so these
         // identifiers worked in the organic path and were silently skipped
         // here.
@@ -805,7 +805,7 @@ mod tests {
             jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
             ..ConsentContext::default()
         };
-        // The form the mint path produces since the provider-code envelope.
+        // The form the creation path produces since the provider-code envelope.
         let ec_id = format!("hmac~{}.ABC123", "a".repeat(64));
         let ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
 
@@ -814,7 +814,7 @@ mod tests {
         assert_eq!(
             context.ec_id(),
             ec_id,
-            "should dispatch the coded identifier as minted"
+            "should dispatch the coded identifier as created"
         );
     }
 }

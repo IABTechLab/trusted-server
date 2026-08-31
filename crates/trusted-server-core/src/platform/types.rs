@@ -191,7 +191,7 @@ pub struct RuntimeServices {
     /// Per-request client metadata extracted at the entry point.
     pub(crate) client_info: ClientInfo,
     /// A vendor or host Edge Cookie provider the adapter injects, selected when
-    /// `[ec] provider` names it. `None` when only the built-in providers are in
+    /// `[ec] provider` names it. `None` when only the built-in provider is in
     /// use. This is the seam that lets a vendor Edge Cookie provider live in its
     /// own crate and be injected, so core never names a vendor (the same
     /// pattern as [`geo`](Self::geo)).
@@ -201,7 +201,7 @@ pub struct RuntimeServices {
     ///
     /// `None` when the adapter resolved nothing here, in which case the request
     /// path resolves the selection itself, which is what a deployment that
-    /// selects no provider and the core tests both do.
+    /// selects no provider, the Axum adapter, and the core tests all do.
     pub(crate) resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
 }
 
@@ -292,7 +292,7 @@ impl RuntimeServices {
 
     /// Returns the adapter-injected Edge Cookie provider, when one is wired.
     ///
-    /// `None` when the deployment uses only the built-in providers (which core
+    /// `None` when the deployment uses only the built-in provider (which core
     /// builds itself). A vendor or host provider is injected here by the
     /// adapter, so [`build_provider`](crate::ec::provider::build_provider) can
     /// return it without core naming the vendor.
@@ -342,8 +342,8 @@ impl RuntimeServices {
     /// Adapters that build their per-request services through a shared helper
     /// with no application state in hand use this to thread the provider the
     /// composition root resolved. `None` leaves the request path to resolve
-    /// `[ec] provider` for itself, which is what a deployment selecting no
-    /// provider does.
+    /// `[ec] provider` for itself, which is what the Axum adapter and a
+    /// deployment selecting no provider both do.
     #[must_use]
     pub fn with_resolved_ec_provider(
         self,

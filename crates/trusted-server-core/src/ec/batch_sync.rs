@@ -199,7 +199,7 @@ fn process_mappings(
         // The global cookie bounds, then the provider that owns the
         // identifier's code, which canonicalizes its own value part and decides
         // whether the canonical form is one of its own. A partner echoing back
-        // an identifier a non-HMAC provider minted is accepted here; an
+        // an identifier a non-HMAC provider created is accepted here; an
         // identifier under a code this deployment does not read is not.
         let Some(ec_id) = accepted_providers.canonical_kv_key(&mapping.ec_id) else {
             errors.push(MappingError {
@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn process_mappings_accepts_an_identifier_from_the_active_non_hmac_provider() {
         // A deployment whose active provider is not the built-in HMAC one still
-        // has to accept the identifiers that provider minted. Before the
+        // has to accept the identifiers that provider created. Before the
         // dispatch these were rejected outright by the HMAC grammar, so a
         // partner could never sync a mapping against them.
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
@@ -707,7 +707,7 @@ mod tests {
     fn process_mappings_canonicalizes_through_the_owning_provider() {
         // KV normalization is dispatched the same way as validation. The
         // built-in provider lowercases its hash segment, so a partner echoing
-        // uppercase hex still writes the row minted at generation time, while
+        // uppercase hex still writes the row created at generation time, while
         // the opaque provider's own normalization leaves its value untouched.
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
         let uppercase = format!("hmac~{}.ABC123", "A".repeat(64));
@@ -785,7 +785,7 @@ mod tests {
     fn process_mappings_accepts_a_minted_coded_ec_id() {
         let writer = MockWriter::new(vec![Ok(UpsertResult::Written)]);
         // Partners echo the identifier identify gave them, which carries the
-        // provider-code envelope since the mint path applies it.
+        // provider-code envelope since the creation path applies it.
         let ec_id = format!("hmac~{}.ABC123", "a".repeat(64));
         let mappings = vec![mapping(&ec_id, "uid-1", 1)];
 

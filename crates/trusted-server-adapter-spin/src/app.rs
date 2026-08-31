@@ -68,8 +68,8 @@ pub struct AppState {
 /// Build the application state, loading settings and constructing all per-application components.
 ///
 /// Settings are read from the platform config store at run time, the same way
-/// the Fastly, Axum and Cloudflare adapters read them, so an operator publishes
-/// one with `ts config push` and the deployed component picks it up. This
+/// the Fastly and Axum adapters read them, so an operator publishes one with
+/// `ts config push` and the deployed component picks it up. This
 /// adapter previously compiled `trusted-server.example.toml` into the binary
 /// and parsed it here, which could never succeed, because that template ships
 /// placeholder secrets and the placeholder admin password fails validation.
@@ -78,7 +78,7 @@ pub struct AppState {
 ///
 /// Returns an error when the config store holds no readable app config, or when
 /// settings, the auction orchestrator, or the integration registry fail to
-/// initialise.
+/// initialize.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let store_name = default_config_store_name();
     let config_key = default_config_key();
@@ -93,7 +93,7 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 ///
 /// Returns an error when the selected Edge Cookie provider cannot be built for
 /// this adapter, or when the auction orchestrator or the integration registry
-/// fail to initialise.
+/// fail to initialize.
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {

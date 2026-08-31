@@ -706,8 +706,8 @@ pub(crate) fn noop_services_with_ec_provider(
 /// client IP, modeling a host that cannot determine one.
 ///
 /// Whether that matters is the provider's decision, so this exists to test both
-/// answers: a provider reading other evidence still mints, and one that needs
-/// the IP refuses.
+/// answers: a provider reading other evidence still creates an identifier, and
+/// one that needs the IP refuses.
 pub(crate) fn noop_services_with_ec_provider_without_client_ip(
     ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
 ) -> RuntimeServices {

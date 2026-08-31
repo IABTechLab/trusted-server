@@ -363,12 +363,12 @@ mod tests {
         );
     }
 
-    /// The identifier [`CanonicalizingProvider`] mints, as the browser carries
-    /// it in the `ts-ec` cookie.
+    /// The identifier [`CanonicalizingProvider`] creates, as the browser
+    /// carries it in the `ts-ec` cookie.
     const CANONICAL_COOKIE_VALUE: &str = "t0ca~MiXeD.CaseId";
 
     /// The identity-graph key generation writes that identifier's row under.
-    /// Pinned to the mint path by
+    /// Pinned to the creation path by
     /// `generate_keys_the_identity_graph_by_the_normalized_identifier` in the
     /// `ec` module tests, which asserts both the key it writes and the key
     /// [`EcContext::ec_kv_key`] derives.

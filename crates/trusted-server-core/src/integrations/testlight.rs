@@ -550,7 +550,7 @@ mod tests {
                     testlight_auction_request(VALID_SYNTHETIC_ID),
                 )
                 .await
-                .expect_err("a deployment that mints no identifier should proxy none");
+                .expect_err("a deployment that creates no identifier should proxy none");
             drop(refused);
 
             assert!(

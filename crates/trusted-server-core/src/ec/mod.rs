@@ -140,8 +140,8 @@ pub struct EcContext {
     /// The consent context for this request.
     consent: ConsentContext,
     /// Whether Edge Cookie creation is allowed for this request. Resolved once
-    /// at construction from the consent context and read via
-    /// [`ec_allowed`](Self::ec_allowed).
+    /// at construction: closed when no provider is selected, otherwise from the
+    /// request's consent context. Read via [`ec_allowed`](Self::ec_allowed).
     ec_allowed: bool,
     /// The normalized client IP, captured early before the request body
     /// is consumed. `None` when the platform cannot determine client IP.
@@ -162,10 +162,10 @@ pub struct EcContext {
     /// A snapshot of the request evidence a provider reads at generation time:
     /// the request headers (so a provider can read cookies and client hints), and
     /// the URL path and query string (so it can read request parameters).
-    /// Captured once at construction, and only when a provider is configured, so
-    /// a deployment with no Edge Cookie provider clones nothing. A provider reads
-    /// these through [`RequestInfo`](crate::evidence::RequestInfo) at generate
-    /// time.
+    /// Captured once at construction, and only when a provider is configured and
+    /// the request carries no usable identifier, so a no-provider deployment and
+    /// a returning visitor both clone nothing. A provider reads these through
+    /// [`RequestInfo`](crate::evidence::RequestInfo) at generate time.
     request_headers: http::HeaderMap,
     request_path: String,
     request_query: String,
@@ -274,8 +274,8 @@ impl EcContext {
 
         // Gate Edge Cookie creation and use on the request's consent context
         // (jurisdiction and consent signals). With no provider selected nothing
-        // may mint or use an identifier, so the gate is closed rather than open
-        // by default. Downstream consumers read the stored result via
+        // may create or use an identifier, so the gate is closed rather than
+        // open by default. Downstream consumers read the stored result via
         // [`EcContext::ec_allowed`] rather than re-deriving it.
         let ec_allowed = selected_provider
             .as_ref()
@@ -318,9 +318,13 @@ impl EcContext {
     ///
     /// # Errors
     ///
-    /// Returns an error if the selected provider fails to derive an identifier,
-    /// which includes a provider that needs the client IP being run on a host
-    /// that cannot supply one.
+    /// Forwards every error from `generate_with_provider`: the selected provider
+    /// failing to derive an identifier (which includes a provider that needs the
+    /// client IP being run on a host that cannot supply one), the provider
+    /// producing an identifier outside the cookie-safe alphabet or over the
+    /// length cap, the provider asking for a response header inside core's
+    /// reserved surface, or persisting the identifier to the KV identity graph
+    /// failing.
     pub fn generate_if_needed(
         &mut self,
         settings: &Settings,
@@ -352,22 +356,22 @@ impl EcContext {
         // host that cannot supply one. The IP is passed as the documented
         // unavailable value, the empty string (see
         // [`RequestInfo::client_ip`](crate::evidence::RequestInfo::client_ip)),
-        // and a provider that needs it refuses there, which fails the request
-        // rather than serving without identity.
+        // and a provider that needs it refuses there, returning the error to
+        // the caller. The publisher proxy and integration proxy log it and
+        // serve the response without an Edge Cookie.
         self.generate_with_provider(ec_provider.as_ref(), settings, kv)
     }
 
     /// Derives and commits an EC identifier using a specific provider.
     ///
     /// Split out of [`generate_if_needed`](Self::generate_if_needed) so the
-    /// provider is supplied explicitly: the configured path builds it from
-    /// settings, and tests pass one in to observe the [`IdentityInput`] a
-    /// provider receives. The request evidence captured at read time (client
-    /// IP, headers, and the URL path and query) is passed borrowed through
-    /// [`RequestInfo`](crate::evidence::RequestInfo), so a provider can read
-    /// cookies and request parameters at generate time; the built-ins read
-    /// only the client IP. The skip guards (existing EC, consent gate)
-    /// stay in [`generate_if_needed`](Self::generate_if_needed).
+    /// provider is supplied explicitly, resolved once at read time and threaded
+    /// here rather than rebuilt. The request evidence captured at read time
+    /// (client IP, headers, and the URL path and query) is passed borrowed
+    /// through [`RequestInfo`](crate::evidence::RequestInfo), so a provider can
+    /// read cookies and request parameters at generate time; the built-in HMAC
+    /// provider reads only the client IP. The skip guards (existing EC, consent
+    /// gate) stay in [`generate_if_needed`](Self::generate_if_needed).
     ///
     /// # Errors
     ///
@@ -430,7 +434,7 @@ impl EcContext {
             );
             return Ok(());
         };
-        // Enforce the global identifier bounds at mint: the cookie-safe
+        // Enforce the global identifier bounds at creation. The cookie-safe
         // alphabet and the length cap apply to every provider, so no
         // implementation can emit a value the cookie layer or the identity
         // graph cannot carry. Rejection is loud and total; the identifier is
@@ -520,12 +524,22 @@ impl EcContext {
     /// The identity-graph key for `value` under the providers this deployment
     /// reads.
     ///
-    /// The one place core turns an identifier into a row key. Every read and
-    /// write of an identity-graph row goes through this, so a provider whose
-    /// canonical form differs from the cookie value still finds the row it
-    /// minted. The owning provider is picked by the identifier's `{code}~`
-    /// prefix and supplies the canonical form of its own value part, matching
-    /// what [`generate_if_needed`](Self::generate_if_needed) wrote at mint.
+    /// The canonical route from an identifier to a row key. The organic
+    /// generate, identify and finalize paths turn an identifier into a row key
+    /// through this (or through [`ec_kv_key`](Self::ec_kv_key), which wraps it),
+    /// so a provider whose canonical form differs from the cookie value still
+    /// finds the row it created. The owning provider is picked by the
+    /// identifier's `{code}~` prefix and supplies the canonical form of its own
+    /// value part, matching what
+    /// [`generate_if_needed`](Self::generate_if_needed) wrote at creation.
+    ///
+    /// Known gap: pull sync (`ec::pull_sync`) and the admin lookup
+    /// (`ec::admin`) still key rows by the raw active identifier rather than
+    /// this canonical form, so for a provider whose canonical form differs from
+    /// the cookie value they can read or write under the wrong key. The three
+    /// organic paths were routed through the canonical form (commit
+    /// `343ac3e`); these two were left keying raw and are tracked as a known
+    /// issue for a later change.
     ///
     /// `None` when no provider this deployment reads owns `value`, in which
     /// case there is no row to read or write.
@@ -547,7 +561,7 @@ impl EcContext {
     /// empty while a live row still exists, and the cookie is the only way
     /// back to it.
     ///
-    /// This does not reach across a provider switch. An identifier minted
+    /// This does not reach across a provider switch. An identifier created
     /// under a retired provider's `{code}~` prefix is owned by no provider
     /// this deployment reads, so [`kv_key_for`](Self::kv_key_for) yields
     /// `None` and its row is never tombstoned. Core cannot derive that key,
@@ -637,7 +651,8 @@ impl EcContext {
 
     /// Returns whether Edge Cookie creation is allowed for this request.
     ///
-    /// Resolved once at construction from the consent context (see
+    /// Resolved once at construction: closed when no provider is selected,
+    /// otherwise from the request's consent context (see
     /// [`consent::ec_consent_granted`]).
     #[must_use]
     pub fn ec_allowed(&self) -> bool {
@@ -847,8 +862,10 @@ mod tests {
     fn a_provider_reads_request_cookies_from_the_request_info() {
         // RequestInfo contract: a provider given request info that carries
         // headers can read request cookies through it (a client that stores
-        // values in cookies relies on this). The organic generate path passes
-        // no header snapshot; a caller that has headers supplies them.
+        // values in cookies relies on this). The organic generate path passes a
+        // snapshot of the request headers through generate_with_provider, so a
+        // provider reads request cookies through it there too; this test
+        // supplies its own headers directly.
         let mut headers = http::HeaderMap::new();
         headers.insert(
             "cookie",
@@ -1083,12 +1100,12 @@ mod tests {
         assert_eq!(
             ec.ec_value(),
             Some("t0ev~evidence-ec"),
-            "the identifier the provider minted should be committed under its code"
+            "the identifier the provider created should be committed under its code"
         );
     }
 
-    /// A provider that mints an opaque, mixed-case, non-HMAC identifier at the
-    /// edge, so a test can prove such an identifier persists to the KV identity
+    /// A provider that creates an opaque, mixed-case, non-HMAC identifier at
+    /// the edge, so a test can prove such an identifier persists to the KV identity
     /// graph under its own value as the key.
     #[derive(Debug)]
     struct ServerOpaqueProvider;
@@ -1133,7 +1150,7 @@ mod tests {
         let services = noop_services_with_ec_provider(Arc::new(ServerOpaqueProvider));
         let graph = KvIdentityGraph::in_memory("test-ec-store");
 
-        // No existing cookie, so the edge mints and persists.
+        // No existing cookie, so the edge creates one and persists it.
         let req = create_test_request(&[]);
         let geo = non_regulated_geo();
         let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
@@ -1144,7 +1161,7 @@ mod tests {
         assert_eq!(
             ec.ec_value(),
             Some(OPAQUE),
-            "the opaque identifier should be minted"
+            "the opaque identifier should be created"
         );
 
         // The entry is stored under the full identifier verbatim.
@@ -1231,7 +1248,7 @@ mod tests {
         );
 
         ec.generate_if_needed(&settings, None)
-            .expect("a provider that reads no client IP should still mint");
+            .expect("a provider that reads no client IP should still create an identifier");
         assert_eq!(
             ec.ec_value(),
             Some("t0ev~evidence-ec"),
@@ -1244,7 +1261,9 @@ mod tests {
         // The other half: the built-in provider's only input is the client IP,
         // so with none it fails rather than hashing the empty string into an
         // identifier every visitor on that host would share. Identity cannot be
-        // established, so the request fails rather than being served without.
+        // established, so generate_if_needed returns the error, which the
+        // publisher and integration proxies log before serving the response
+        // without an Edge Cookie.
         let settings = create_test_settings();
         let req = create_test_request(&[]);
         let geo = non_regulated_geo();
@@ -1271,8 +1290,8 @@ mod tests {
         );
     }
 
-    /// A provider that mints an identifier outside the cookie-safe alphabet,
-    /// to prove core rejects it at mint rather than rewriting it.
+    /// A provider that creates an identifier outside the cookie-safe alphabet,
+    /// to prove core rejects it at creation rather than rewriting it.
     #[derive(Debug)]
     struct IllegalIdProvider;
 
@@ -1315,7 +1334,7 @@ mod tests {
 
         let err = ec
             .generate_if_needed(&settings, None)
-            .expect_err("an identifier outside the alphabet should be rejected at mint");
+            .expect_err("an identifier outside the alphabet should be rejected at creation");
         assert!(
             err.to_string().contains("illegal"),
             "the error should name the provider, got: {err}"
@@ -1323,7 +1342,7 @@ mod tests {
         assert_eq!(
             ec.ec_value(),
             None,
-            "no identifier should be committed after a mint rejection"
+            "no identifier should be committed after a creation rejection"
         );
     }
 
@@ -1392,7 +1411,7 @@ mod tests {
         // A provider that sets the managed `ts-ec` cookie would bypass core's
         // identifier validation and its identity-graph row entirely, so the
         // request fails rather than the effect being quietly dropped. The
-        // provider mints no identifier here, which is exactly the case the
+        // provider creates no identifier here, which is exactly the case the
         // cookie write would otherwise slip through.
         let (_settings, outcome) = generate_with_header_setting_provider(
             HeaderSettingProvider {
@@ -1565,10 +1584,10 @@ mod tests {
             .expect("should read EC context");
         ec.generate_if_needed(&settings, None)
             .expect("should generate");
-        let minted = ec.ec_value().expect("should mint an identifier");
+        let created = ec.ec_value().expect("should create an identifier");
         assert!(
-            minted.starts_with("hmac~"),
-            "a fresh HMAC identifier should carry the hmac code, got {minted}"
+            created.starts_with("hmac~"),
+            "a fresh HMAC identifier should carry the hmac code, got {created}"
         );
 
         // A deployed pre-envelope cookie (bare form) still reads back, so the

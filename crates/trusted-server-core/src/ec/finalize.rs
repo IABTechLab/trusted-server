@@ -22,8 +22,8 @@ use super::registry::PartnerRegistry;
 
 /// Finalizes EC response behavior for all routes.
 ///
-/// Applies the resolved consent gate, last-seen updates, cookie
-/// reconciliation, Prebid EID ingestion, and cookie writes for new EC generation.
+/// Applies the resolved consent gate, cookie reconciliation, Prebid EID
+/// ingestion, and cookie writes for new EC generation.
 ///
 /// When the request carries an explicit withdrawal signal (a storage opt-out or
 /// a TCF record refusing storage) and the client presented a cookie, the browser
@@ -279,12 +279,12 @@ mod tests {
         )
     }
 
-    /// The identifier [`CanonicalizingProvider`] mints, as the browser carries
+    /// The identifier [`CanonicalizingProvider`] creates, as the browser carries
     /// it in the `ts-ec` cookie.
     const CANONICAL_COOKIE_VALUE: &str = "t0ca~MiXeD.CaseId";
 
     /// The identity-graph key generation writes that identifier's row under.
-    /// Pinned to the mint path by
+    /// Pinned to the creation path by
     /// `generate_keys_the_identity_graph_by_the_normalized_identifier` in the
     /// `ec` module tests.
     const CANONICAL_KV_KEY: &str = "t0ca~mixed.caseid";
@@ -923,7 +923,7 @@ mod tests {
             .with_provider_for_test(std::sync::Arc::new(EvidenceHeaderProvider));
         ec_context
             .generate_if_needed(&settings, Some(&graph))
-            .expect("should mint through the provider");
+            .expect("should create the identifier through the provider");
 
         // What the publisher's origin returned, before EC finalization runs.
         let mut response = empty_response();
@@ -986,7 +986,7 @@ mod tests {
     }
 
     /// A provider standing in for the one a deployment switched *to*, with a
-    /// different registered code from the provider that minted the live row.
+    /// different registered code from the provider that created the live row.
     #[derive(Debug)]
     struct SwitchedProvider;
 
@@ -1057,7 +1057,7 @@ mod tests {
             ..Default::default()
         };
         // The browser still carries the identifier the previous provider
-        // minted, but the deployment now runs a provider with a different
+        // created, but the deployment now runs a provider with a different
         // code, so read-back treats the cookie as absent and the active
         // identifier is empty.
         let ec_context = make_context_with_consent(

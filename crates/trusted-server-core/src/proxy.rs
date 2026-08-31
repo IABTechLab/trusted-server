@@ -3089,7 +3089,7 @@ mod tests {
 
         assert_eq!(
             param, None,
-            "a deployment that mints no identifier should hand none to the click target"
+            "a deployment that creates no identifier should hand none to the click target"
         );
     }
 

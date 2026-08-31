@@ -87,14 +87,14 @@ pub fn generate_ec_id(
     generate_hmac_ec_id(passphrase, &[client_ip])
 }
 
-/// Mints an Edge Cookie identifier as HMAC-SHA256 over the given parts plus a
+/// Creates an Edge Cookie identifier as HMAC-SHA256 over the given parts plus a
 /// random suffix, in the `{64hex}.{6alnum}` format.
 ///
 /// The parts are joined with a unit separator (`\u{1f}`), which cannot appear in
-/// a client IP, User-Agent, JA4, or HTTP/2 fingerprint, so distinct part lists
-/// cannot collide. A provider that derives identity from several request signals
-/// (for example a Fastly provider over JA4, H2, IP, and UA) passes them as
-/// separate parts. Each part must be pre-normalized by the caller.
+/// a client IP, User-Agent, or TLS and HTTP/2 signal, so distinct part lists
+/// cannot collide. A provider that derives identity from multiple request
+/// signals (for example a Fastly provider over JA4, H2, IP, and UA) passes them
+/// as separate parts. Each part must be pre-normalized by the caller.
 ///
 /// # Errors
 ///
@@ -141,12 +141,12 @@ pub fn ec_hash(ec_id: &str) -> &str {
 /// defense-in-depth measure for EC IDs submitted by external partners
 /// (via batch sync) that may use uppercase hex.
 ///
-/// A minted identifier carries the built-in provider's code envelope
-/// (`hmac~` before the value, see
+/// An identifier this function creates carries the built-in provider's code
+/// envelope (`hmac~` before the value, see
 /// [`PROVIDER_CODE_SEPARATOR`](super::provider::PROVIDER_CODE_SEPARATOR)),
 /// and partners echo that form back, so the envelope is kept and only the
 /// value inside it is lowercased. That keeps the key identical to the one
-/// written at mint. An identifier under any other provider's code is not
+/// written at creation. An identifier under any other provider's code is not
 /// HMAC-shaped and is returned unchanged, because only that provider knows
 /// how to normalize it.
 #[must_use]
@@ -190,10 +190,10 @@ pub fn is_valid_ec_hash(value: &str) -> bool {
 /// the random suffix allows mixed-case alphanumeric characters by
 /// construction.
 ///
-/// A minted identifier carries the provider-code envelope, `hmac~` before the
-/// bare value, so both the enveloped and the legacy bare form are accepted
-/// here. An identifier under any other provider's code is not an HMAC
-/// identifier and is rejected.
+/// An identifier this provider creates carries the provider-code envelope,
+/// `hmac~` before the bare value, so both the enveloped and the legacy bare
+/// form are accepted here. An identifier under any other provider's code is
+/// not an HMAC identifier and is rejected.
 ///
 /// This is the built-in provider's grammar, not the deployment's. The
 /// partner-facing paths (pull sync, batch sync, the admin lookup) dispatch by
@@ -417,7 +417,7 @@ mod tests {
         let coded = format!("hmac~{}.ABC123", "a".repeat(64));
         assert!(
             is_valid_ec_id(&coded),
-            "should accept a minted identifier carrying the hmac code"
+            "should accept a created identifier carrying the hmac code"
         );
     }
 

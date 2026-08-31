@@ -24,7 +24,7 @@ const COOKIE_MAX_AGE: i32 = 365 * 24 * 60 * 60;
 
 /// Maximum length in bytes of an Edge Cookie identifier.
 ///
-/// A global bound enforced wherever an identifier enters the system (mint,
+/// A global bound enforced wherever an identifier enters the system (creation,
 /// cookie read-back, cookie write), so no provider can emit a value the cookie
 /// layer, logs, or the KV key space cannot carry.
 pub(crate) const MAX_EC_ID_LEN: usize = 256;
@@ -34,11 +34,12 @@ fn is_allowed_ec_id_char(c: char) -> bool {
 }
 
 // Identifier allowlist: [A-Za-z0-9._~-], the cookie-safe alphabet every
-// Edge Cookie identifier must fit regardless of which provider minted it.
+// Edge Cookie identifier must fit regardless of which provider created it.
 // This is intentionally broader than the built-in format validator
-// (`generation::is_valid_ec_id`), which enforces the exact
-// `<64-hex>.<6-alphanumeric>` structure of the HMAC provider; an opaque
-// vendor identifier only has to fit the alphabet and the length bound.
+// (`generation::is_valid_ec_id`), which enforces the HMAC provider's
+// `<64-hex>.<6-alphanumeric>` structure, either bare or under the `hmac~`
+// envelope; an opaque vendor identifier only has to fit the alphabet and the
+// length bound.
 #[must_use]
 pub(crate) fn ec_id_has_only_allowed_chars(ec_id: &str) -> bool {
     !ec_id.is_empty() && ec_id.len() <= MAX_EC_ID_LEN && ec_id.chars().all(is_allowed_ec_id_char)

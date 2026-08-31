@@ -345,7 +345,7 @@ fn cookie_ec_id(req: &Request<EdgeBody>) -> Result<String, Box<Response<EdgeBody
 ///
 /// The identifier is validated in two parts: the global cookie bounds, then
 /// the provider that owns its `{code}~` prefix, so an operator can look up an
-/// identifier minted by whichever provider this deployment reads rather than
+/// identifier created by whichever provider this deployment reads rather than
 /// only a built-in HMAC one.
 ///
 /// Returns the (boxed) error response to send directly when no valid ID is
@@ -371,8 +371,8 @@ fn requested_ec_id(
         return Err(Box::new(json_error(
             StatusCode::BAD_REQUEST,
             "invalid EC ID: not an identifier any provider this deployment reads \
-             issued (the built-in HMAC provider issues {64hex}.{6alnum}, with or \
-             without the hmac~ prefix)",
+             issued (the built-in HMAC provider issues hmac~{64hex}.{6alnum} and \
+             still reads the bare legacy form)",
         )));
     }
 

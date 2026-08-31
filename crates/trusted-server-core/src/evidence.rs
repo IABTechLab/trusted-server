@@ -18,7 +18,7 @@ use http::HeaderMap;
 ///
 /// The request data any host can supply: the normalized client IP, the
 /// User-Agent, and request headers. A provider receives it by reference at call
-/// time (`generate`/`detect`), reads what it needs, and does not retain it.
+/// time (`generate`), reads what it needs, and does not retain it.
 pub trait RequestInfo: Send + Sync + core::fmt::Debug {
     /// The normalized client IP, or `""` when the host cannot determine it.
     fn client_ip(&self) -> &str;
@@ -143,11 +143,13 @@ impl RequestInfo for OwnedRequestInfo {
 
 /// A borrowed [`RequestInfo`] over the live request, with no allocation.
 ///
-/// The composition root builds one per request from the normalized client IP and
-/// an optional borrow of the request headers, then passes it to a provider by
-/// shared reference at call time (`generate`/`detect`). It borrows rather than
-/// owns, so it must not outlive the request. A provider reads it during the call
-/// and does not retain it, so no per-request `HeaderMap` clone is needed.
+/// Built at generate time from the normalized client IP and an optional borrow
+/// of the request-header snapshot core captured at read time, then passed to a
+/// provider by shared reference at call time (`generate`). It borrows rather
+/// than owns, so it must not outlive the request. A provider reads it during the
+/// call and does not retain it. `BorrowedRequestInfo` itself allocates nothing;
+/// the one header clone is the snapshot core takes at read time, and only when a
+/// provider is configured and the request carries no usable identifier.
 #[derive(Debug)]
 pub struct BorrowedRequestInfo<'a> {
     client_ip: &'a str,

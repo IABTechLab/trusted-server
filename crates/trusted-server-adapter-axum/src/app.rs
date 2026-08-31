@@ -72,7 +72,7 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 ///
 /// Returns an error when the selected Edge Cookie provider cannot be built for
 /// this adapter, or when the auction orchestrator or the integration registry
-/// fail to initialise.
+/// fail to initialize.
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
@@ -85,7 +85,10 @@ fn build_state_with_settings(
     // This adapter checks rather than keeps what the check resolved, unlike the
     // Fastly, Cloudflare and Spin adapters, because it is a long-lived process
     // whose application state is built once at start-up while theirs is rebuilt
-    // for every request. There is no second resolution per request here to save.
+    // for every request. It injects and threads no provider, so `EcContext`
+    // resolves the selection itself on every request, building a fresh built-in
+    // provider that reads no request data; this dev server accepts that
+    // per-request construction rather than caching a resolved provider.
     ensure_provider_available(&settings.ec, None)?;
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;

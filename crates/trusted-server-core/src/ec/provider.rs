@@ -4,17 +4,19 @@
 //! selected by configuration, with no default, and [`build_provider`] is the
 //! composition root that builds the selected one. A built-in provider is
 //! constructed from its `[ec.providers.<key>]` block, and a vendor provider is
-//! taken from the adapter that injected it. Construction happens once, while
-//! application state is built, and reads no request data, so a selection this
-//! deployment cannot satisfy fails at startup rather than leaving it running
-//! without an identity.
+//! taken from the adapter that injected it. Construction reads no request data,
+//! so a selection this deployment cannot satisfy fails at startup rather than
+//! leaving it running without an identity. Fastly, Cloudflare and Spin resolve
+//! the provider once per application state and thread the result. Axum and
+//! embedders resolve per request.
 //!
 //! Request evidence reaches a provider at call time rather than at
 //! construction. [`EdgeCookieProvider::generate`] borrows a [`RequestInfo`],
 //! which carries the normalized client IP, the User-Agent and the request
 //! headers, for the life of the call, alongside an [`IdentityInput`] holding
 //! the request's gating context. A provider reads what it needs and retains
-//! nothing, so no per-request snapshot is stored or cloned.
+//! nothing. Core snapshots the headers, path and query it lends to the provider
+//! at generate time, and the provider itself keeps none of it.
 //!
 //! [`HmacProvider`] is the built-in server-side implementation. It derives the
 //! identifier from the client IP using HMAC over the configured passphrase, the
@@ -55,7 +57,7 @@ use super::generation;
 #[serde(from = "String", into = "String")]
 pub enum EcProviderSelection {
     /// Explicit statelessness, spelled `"none"`. The same meaning as omitting
-    /// the selector: no Edge Cookie is minted and no provider block may be
+    /// the selector: no Edge Cookie is created and no provider block may be
     /// configured.
     None,
 
@@ -130,7 +132,7 @@ const BUILTIN_PROVIDER_KEYS: &[&str] = &[HMAC_PROVIDER_KEY];
 ///
 /// The same text as [`HMAC_PROVIDER_KEY`], but a different role: this is the
 /// `{code}~` namespace stamped on every identifier the built-in provider
-/// mints, and it is what [`generation`] matches when it decides whether an
+/// creates, and it is what [`generation`] matches when it decides whether an
 /// enveloped identifier is one of its own.
 pub const HMAC_PROVIDER_CODE: ProviderCode = crate::provider_code!(HMAC_PROVIDER_KEY);
 
@@ -140,8 +142,10 @@ pub const HMAC_PROVIDER_CODE: ProviderCode = crate::provider_code!(HMAC_PROVIDER
 /// [`EdgeCookieProvider::generate`], not through this struct and not through
 /// anything injected into the provider's constructor. This struct carries only
 /// the per-request gating context a provider may read for behavior beyond
-/// gating. The gate has already confirmed Edge Cookie
-/// storage is allowed before `generate` is called.
+/// gating. On the organic request path the gate has confirmed Edge Cookie
+/// storage is allowed before `generate` is called. A direct
+/// `edge_cookie::generate_ec_id` call, test-only today, reaches `generate`
+/// without that gate.
 #[derive(Default)]
 pub struct IdentityInput<'a> {
     /// The request's consent context, when available, for provider-specific
@@ -191,13 +195,17 @@ const MANAGED_COOKIE_NAME_PREFIX: &[u8] = b"ts-";
 /// [`INTERNAL_HEADERS`](crate::constants::INTERNAL_HEADERS).
 const RESERVED_RESPONSE_HEADER_PREFIX: &str = "x-ts-";
 
-/// Response headers that frame an HTTP message or are hop-by-hop.
+/// Response headers that frame an HTTP message, are hop-by-hop, or govern
+/// caching.
 ///
-/// The hop-by-hop set is RFC 7230 §6.1, matching each adapter's
-/// `is_hop_by_hop_response_header`, plus `content-length`, which frames the
-/// body the adapter is about to write. A provider that set any of these would
-/// be rewriting the response envelope rather than adding evidence to it.
+/// The hop-by-hop set is RFC 7230 §6.1, plus `content-length`, which frames the
+/// body the adapter is about to write, and `cache-control`, which governs
+/// whether the response may be cached. A provider that set any of these would
+/// be rewriting the response envelope rather than adding evidence to it, and a
+/// provider setting `cache-control` could make an identity-bearing response
+/// publicly cacheable, so it is reserved with the rest.
 const FRAMING_OR_HOP_BY_HOP_HEADERS: &[&str] = &[
+    "cache-control",
     "connection",
     "content-length",
     "keep-alive",
@@ -246,10 +254,10 @@ fn set_cookie_name(value: &[u8]) -> &[u8] {
 ///
 /// A rejected effect fails the request rather than being dropped, because a
 /// provider reaching into the reserved surface has broken its contract in the
-/// same way as one minting an identifier outside the cookie-safe alphabet, and
+/// same way as one creating an identifier outside the cookie-safe alphabet, and
 /// that already fails the request. Serving the response instead would let a
 /// provider set `ts-ec` directly, bypassing core's identifier validation and
-/// its requirement that a minted identifier have an identity-graph row.
+/// its requirement that a created identifier have an identity-graph row.
 #[must_use]
 pub fn reserved_response_effect(
     name: &http::HeaderName,
@@ -317,7 +325,7 @@ where
 ///
 /// Exactly four characters from `[a-z0-9]`, allocated append-only in the
 /// provider-code registry and never reused. The code appears as the
-/// `{code}~` prefix of every identifier the provider mints, so identifiers
+/// `{code}~` prefix of every identifier the provider creates, so identifiers
 /// from different providers can never collide in the cookie, the identity
 /// graph, or a withdrawal, and each identifier records which provider
 /// created it.
@@ -435,16 +443,19 @@ pub fn split_provider_code(full: &str) -> (Option<&str>, &str) {
 /// # Retiring the legacy bare reader
 ///
 /// The reader stays until a bare identifier can no longer arrive. A returning
-/// visitor's bare cookie is never rewritten into the coded form, and neither
-/// the cookie nor its identity-graph row is refreshed on an ordinary page view
-/// (see `ec_finalize_response` in [`finalize`](super::finalize)), so each has
-/// one fixed lifetime running from the moment it was written: `COOKIE_MAX_AGE`
-/// in [`cookies`](super::cookies) and `ENTRY_TTL` in [`kv`](super::kv), both
-/// one year, neither operator-configurable. The earliest safe retirement is
-/// therefore one year (the longer of the two, and today they are equal) after
-/// the last release that could still mint a bare identifier has stopped
-/// running anywhere, plus however long a deployment's own rollout takes to
-/// reach every point of presence.
+/// visitor's bare cookie is never rewritten into the coded form, and its
+/// `COOKIE_MAX_AGE` lifetime in [`cookies`](super::cookies) (one year, not
+/// operator-configurable) runs from the moment it was written. The
+/// identity-graph row is not fixed the same way: an ordinary page view that
+/// ingests `ts-eids` or `sharedId` cookies runs `ingest_eid_cookies` in
+/// `ec_finalize_response` (see [`finalize`](super::finalize)), which rewrites
+/// the bare-keyed row with a fresh `ENTRY_TTL` in [`kv`](super::kv) (also one
+/// year), so the row's clock restarts on each such view. The earliest safe
+/// retirement is therefore one year after the last write that could still
+/// leave a bare-keyed row, which is the later of the last release that could
+/// still create a bare identifier stopping everywhere and the last page view
+/// that refreshed such a row, plus however long a deployment's own rollout
+/// takes to reach every point of presence.
 ///
 /// The other half of that condition, evidence that bare identifiers really
 /// have stopped arriving, cannot be checked today. Nothing counts or logs a
@@ -461,7 +472,7 @@ pub fn provider_owns_id(provider: &dyn EdgeCookieProvider, full: &str) -> bool {
     }
 }
 
-/// The full minted identifier for `value` under `provider`'s code.
+/// The full created identifier for `value` under `provider`'s code.
 #[must_use]
 pub fn apply_provider_code(provider: &dyn EdgeCookieProvider, value: &str) -> String {
     format!("{}{PROVIDER_CODE_SEPARATOR}{value}", provider.code())
@@ -489,15 +500,22 @@ pub fn provider_kv_key(provider: &dyn EdgeCookieProvider, full: &str) -> String 
 /// outside the organic request path and have to decide whether Trusted Server
 /// issued it. The answer is in two parts. The **global cookie bounds** (the
 /// length cap and the cookie-safe alphabet, see `ec_id_has_only_allowed_chars`)
-/// apply to every identifier whichever provider minted it. The rest is
+/// apply to every identifier whichever provider created it. The rest is
 /// **dispatched by the `{code}~` prefix** to the provider that owns that code,
 /// which canonicalizes its own value part and decides whether the canonical
 /// form is one of its own. A code no provider in the set owns is rejected, so a
 /// second provider's identifiers can never be adopted or written under this
 /// deployment's keys.
 ///
+/// Batch sync keys its rows through [`canonical_kv_key`](Self::canonical_kv_key)
+/// here. Pull sync and the admin lookup still read and write rows by the raw
+/// active identifier rather than the canonical form, so for a provider whose
+/// canonical form differs from the cookie value they can key the wrong row.
+/// That gap is recorded on `EcContext::kv_key_for` and tracked as a known
+/// issue for a later change.
+///
 /// The set holds the deployment's active provider. The design's
-/// `legacy_providers` reader list, the providers that never mint but must still
+/// `legacy_providers` reader list, the providers that never create but must still
 /// recognize identifiers a previous provider issued, is not implemented on this
 /// branch, so [`active`](Self::active) fills `readers` with the one active
 /// provider. That is the seam: when the configured legacy readers land they are
@@ -585,13 +603,13 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
     fn id(&self) -> &'static str;
 
     /// The provider's registered code, the `{code}~` namespace of every
-    /// identifier it mints.
+    /// identifier it creates.
     ///
     /// Mandatory, with no default: a provider must allocate a unique code in
     /// the provider-code registry before it can exist, so no two providers
-    /// can ever mint colliding identifiers. Core applies the code at mint and
-    /// checks it at read-back, and the provider itself only ever sees its own
-    /// value part.
+    /// can ever create colliding identifiers. Core applies the code at
+    /// creation and checks it at read-back, and the provider itself only ever
+    /// sees its own value part.
     fn code(&self) -> ProviderCode;
 
     /// Derives an Edge Cookie identifier from the request evidence in
@@ -618,8 +636,8 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
     /// identifier round-trips instead of being silently dropped on read-back.
     ///
     /// The default accepts the built-in HMAC identifier shape
-    /// (`<64 hex>.<6 alphanumeric>`), which is correct for [`HmacProvider`] and
-    /// the other core providers.
+    /// (`<64 hex>.<6 alphanumeric>`), which is correct for [`HmacProvider`], the
+    /// one provider core builds in.
     fn accepts_id(&self, value: &str) -> bool {
         generation::is_valid_ec_id(value)
     }
@@ -647,9 +665,9 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
 /// requires one. On a host that cannot supply one, [`RequestInfo::client_ip`]
 /// is the empty string and [`generate`](Self::generate) fails rather than
 /// hashing the empty string into an identifier every visitor on that host
-/// would share. The failure reaches the caller, so the request fails rather
-/// than being served without identity. A provider that reads other evidence
-/// makes its own decision and is unaffected.
+/// would share. The failure is returned to the caller. The publisher proxy and
+/// integration proxy log it and serve the response without an Edge Cookie. A
+/// provider that reads other evidence makes its own decision and is unaffected.
 #[derive(Debug, Clone)]
 pub struct HmacProvider {
     passphrase: Redacted<String>,
@@ -734,14 +752,15 @@ fn ensure_no_name_collision(
     }))
 }
 
-/// Builds the Edge Cookie provider named by the `[ec] provider` selector,
-/// injecting the services it needs.
+/// Builds the Edge Cookie provider named by the `[ec] provider` selector.
 ///
-/// This is the composition root for the built-in providers. The per-request
-/// [`RequestInfo`] is passed borrowed to
-/// [`generate`](EdgeCookieProvider::generate) at call time rather than stored, so
-/// no request snapshot is cloned here. Returns `Ok(None)` when no provider is
-/// selected, so the caller stays stateless.
+/// This is the composition root for the Edge Cookie provider. It reads the
+/// `[ec]` configuration and takes the adapter's optional injected provider,
+/// resolving the selector to the built-in provider or the injected one. The
+/// per-request [`RequestInfo`] is passed borrowed to
+/// [`generate`](EdgeCookieProvider::generate) at call time rather than stored,
+/// so no request snapshot is cloned here. Returns `Ok(None)` when no provider
+/// is selected, so the caller stays stateless.
 ///
 /// # Errors
 ///
@@ -1036,6 +1055,16 @@ mod tests {
                 ReservedResponseEffect::FramingHeader,
             ),
             ("connection", "close", ReservedResponseEffect::FramingHeader),
+            (
+                "cache-control",
+                "public, max-age=31536000",
+                ReservedResponseEffect::FramingHeader,
+            ),
+            (
+                "Cache-Control",
+                "public",
+                ReservedResponseEffect::FramingHeader,
+            ),
         ] {
             let (name, value) = header(name, value);
             assert_eq!(
@@ -1114,7 +1143,7 @@ mod tests {
         let hmac_value = format!("{}.ABC123", "a".repeat(64));
         let active = AcceptedProviders::active(Some(&hmac));
 
-        // The global bounds come first and apply whoever minted the value: a
+        // The global bounds come first and apply whoever created the value. A
         // character outside the cookie-safe alphabet, or a value over the
         // length cap, never reaches a provider.
         assert!(

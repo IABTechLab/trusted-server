@@ -198,7 +198,7 @@ pub(crate) fn load_settings_from_config_store(
 ///
 /// Returns an error when the selected Edge Cookie provider cannot be built for
 /// this adapter, or when the auction orchestrator or the integration registry
-/// fail to initialise.
+/// fail to initialize.
 pub(crate) fn build_state_from_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
@@ -761,7 +761,7 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
         let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
         let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
         // A partner echoes back an identifier the deployment's own provider
-        // minted, so validation and KV normalization are dispatched through
+        // created, so validation and KV normalization are dispatched through
         // that provider rather than the built-in HMAC grammar.
         let provider = request_provider(&state.settings.ec, services)?;
         handle_batch_sync(&kv, &partner_registry, &limiter, provider.as_deref(), req)

@@ -25,7 +25,7 @@ use crate::settings::Settings;
 ///
 /// Routes through the pluggable provider model: the active `[ec] provider`
 /// selection decides the outcome. Returns `Ok(None)` when no provider is
-/// configured, so Trusted Server runs statelessly and mints no Edge Cookie.
+/// configured, so Trusted Server runs statelessly and creates no Edge Cookie.
 /// `request_headers` lets a provider that derives identity from request
 /// evidence read it; the built-in HMAC provider ignores it and uses only the
 /// normalized client IP.
@@ -86,7 +86,7 @@ pub fn generate_ec_id(
 /// The only checks applied here are the global cookie bounds, the length cap
 /// and the cookie-safe alphabet in
 /// [`ec_id_has_only_allowed_chars`](crate::ec::cookies::ec_id_has_only_allowed_chars),
-/// which every identifier must satisfy whichever provider minted it. Those
+/// which every identifier must satisfy whichever provider created it. Those
 /// bounds are a backstop on what may travel in a cookie, not a test of
 /// authenticity, and on their own they accept any run of `[A-Za-z0-9._~-]`.
 ///
@@ -142,9 +142,12 @@ pub(crate) fn unvalidated_ec_id_from_request(
 /// EC lifecycle applies when it reads the cookie back, so both agree on what
 /// this deployment issued.
 ///
-/// This is the only way to read an inbound identifier from outside this module,
-/// because the bounds alone cannot tell an identifier this deployment minted
-/// from one an attacker typed. A vendor identifier is not required to match the
+/// This is the validated way to read an inbound identifier from outside this
+/// module, because the bounds alone cannot tell an identifier this deployment
+/// issued from one an attacker typed. The module also exposes
+/// [`get_or_generate_ec_id`], which is `pub` and returns the raw cookie value
+/// without this ownership check, so prefer this function wherever the identifier
+/// will be trusted or egressed. A vendor identifier is not required to match the
 /// built-in HMAC shape, so the right test is the selected provider's own
 /// [`accepts_id`](crate::ec::provider::EdgeCookieProvider::accepts_id) rather
 /// than the built-in strict format check.
@@ -343,7 +346,7 @@ mod tests {
             .expect("generation should not error when no provider is configured");
         assert!(
             id.is_none(),
-            "no Edge Cookie provider should mean no Edge Cookie is minted"
+            "no Edge Cookie provider should mean no Edge Cookie is created"
         );
     }
 
@@ -382,7 +385,7 @@ mod tests {
         let bare_legacy_shape = format!("{}.{}", "a".repeat(64), "Ab12z9");
         assert!(
             !is_ec_id_format(&bare_legacy_shape),
-            "a fresh mint always carries the provider code"
+            "a freshly created identifier always carries the provider code"
         );
 
         let missing_suffix = format!("hmac~{}", "a".repeat(64));
@@ -416,7 +419,7 @@ mod tests {
         // so a client can put whatever it likes in it, and the raw reader
         // prefers the header over the cookie. The global cookie bounds accept
         // any run of `[A-Za-z0-9._~-]`, so they cannot tell an identifier this
-        // deployment minted from one an attacker typed. Provider ownership is
+        // deployment created from one an attacker typed. Provider ownership is
         // what draws that line.
         let settings = create_test_settings();
         let services = noop_services();
@@ -426,7 +429,7 @@ mod tests {
             "not-an-identifier",
             // The built-in shape under another deployment's provider code.
             "zz00~aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.Ab1234",
-            // This deployment's code carrying a value its provider never mints.
+            // This deployment's code carrying a value its provider never creates.
             "hmac~not-the-hmac-shape",
         ] {
             let req = create_test_request(&[(HEADER_X_TS_EC, forged)]);

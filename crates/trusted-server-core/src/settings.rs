@@ -480,12 +480,14 @@ pub struct Ec {
     /// The key of the Edge Cookie identity provider to activate.
     ///
     /// Names one of the blocks under [`providers`](Self::providers), for
-    /// example `"hmac"`. Set it in the `[ec]` TOML section or override it with
-    /// the `TRUSTED_SERVER__ec__provider` environment variable so the same
-    /// compiled WebAssembly can switch providers at deployment. When absent, no
-    /// Edge Cookie is generated and Trusted Server runs statelessly; the
-    /// explicit `"none"` spells the same choice. Selecting a provider whose
-    /// block is missing is rejected at startup by
+    /// example `"hmac"`. Set it in the `[ec]` TOML section. Deployment tooling
+    /// can merge a `TRUSTED_SERVER__EC__PROVIDER` environment value into the
+    /// published configuration before it is loaded, so the same compiled
+    /// WebAssembly can switch providers at deployment. The running server reads
+    /// its settings from the platform config store, not the environment. When
+    /// absent, no Edge Cookie is generated and Trusted Server runs statelessly,
+    /// and the explicit `"none"` spells the same choice. Selecting a provider
+    /// whose block is missing is rejected at startup by
     /// [`validate_provider_selection`](Self::validate_provider_selection).
     ///
     /// Typed as [`EcProviderSelection`], which reads and writes the same
@@ -508,8 +510,10 @@ pub struct Ec {
     /// Configuration blocks for the available Edge Cookie identity providers.
     ///
     /// Each provider has its own optional `[ec.providers.<key>]` block. The
-    /// [`provider`](Self::provider) selector names which one is active, so a
-    /// block can be configured (or kept) without being the one in use.
+    /// [`provider`](Self::provider) selector names which one is active. Exactly
+    /// one block may be present, and it must be the one the selector names, so
+    /// [`validate_provider_selection`](Self::validate_provider_selection)
+    /// rejects an unselected block.
     #[serde(default)]
     #[validate(nested)]
     pub providers: EcProviders,
@@ -612,8 +616,11 @@ impl Ec {
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::Configuration`] when the selected provider
-    /// key is unknown or its `[ec.providers.<key>]` block is absent.
+    /// Returns [`TrustedServerError::Configuration`] when the selected
+    /// provider's `[ec.providers.<key>]` block is absent, when a provider block
+    /// is configured with no selector or alongside `"none"`, or when a
+    /// configured block is not the selected one. Any selector name is accepted
+    /// so long as its block is present, so there is no unknown-key check.
     pub fn validate_provider_selection(&self) -> Result<(), Report<TrustedServerError>> {
         let Some(selection) = self.provider.as_ref() else {
             if !self.providers.is_empty() {
@@ -737,8 +744,9 @@ impl Ec {
 /// passphrase = "replace-with-32-plus-byte-random-secret"
 /// ```
 ///
-/// The active provider is chosen by the [`Ec::provider`] selector, so a block
-/// can be present without being in use.
+/// The active provider is chosen by the [`Ec::provider`] selector, and the one
+/// block present must be the one it names (see
+/// [`Ec::validate_provider_selection`]).
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct EcProviders {
     /// The built-in HMAC-over-client-IP provider, keyed `hmac`.

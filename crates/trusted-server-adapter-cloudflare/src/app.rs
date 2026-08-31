@@ -121,7 +121,7 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
 ///
 /// Returns an error when the selected Edge Cookie provider cannot be built for
 /// this adapter, or when the auction orchestrator or the integration registry
-/// fail to initialise.
+/// fail to initialize.
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
