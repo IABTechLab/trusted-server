@@ -101,10 +101,6 @@ impl OwnedRequestInfo {
         }
     }
 
-    /// Attaches the request target (URL path and query string) to this snapshot,
-    /// so a provider can read request parameters through
-    /// [`query_param`](RequestInfo::query_param).
-    #[must_use]
     /// Replaces the header snapshot, for a caller that builds the info first
     /// and has the headers second.
     #[must_use]
@@ -113,6 +109,10 @@ impl OwnedRequestInfo {
         self
     }
 
+    /// Attaches the request target (URL path and query string) to this snapshot,
+    /// so a provider can read request parameters through
+    /// [`query_param`](RequestInfo::query_param).
+    #[must_use]
     pub fn with_request_target(mut self, path: String, query: String) -> Self {
         self.path = path;
         self.query = query;
@@ -184,10 +184,6 @@ impl<'a> BorrowedRequestInfo<'a> {
         }
     }
 
-    /// Attaches the borrowed request target (URL path and query string), so a
-    /// provider can read request parameters through
-    /// [`query_param`](RequestInfo::query_param).
-    #[must_use]
     /// Borrows a different header map, for a caller that builds the info first
     /// and has the headers second.
     #[must_use]
@@ -196,6 +192,10 @@ impl<'a> BorrowedRequestInfo<'a> {
         self
     }
 
+    /// Attaches the borrowed request target (URL path and query string), so a
+    /// provider can read request parameters through
+    /// [`query_param`](RequestInfo::query_param).
+    #[must_use]
     pub fn with_request_target(mut self, path: &'a str, query: &'a str) -> Self {
         self.path = path;
         self.query = query;
