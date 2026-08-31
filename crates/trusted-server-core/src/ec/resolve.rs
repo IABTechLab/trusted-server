@@ -537,16 +537,16 @@ mod tests {
 
     #[test]
     fn resolve_accumulates_provider_response_headers_with_its_own() {
-        // The provider's own effects must add to what the handler already set,
-        // never replace it. Replacing collapsed a provider's own cookie list
-        // to whichever came last, and would drop the `Cache-Control: no-store`
-        // that every identity response has to carry.
+        // The provider's own cookies must add to what the handler already set,
+        // never replace it. Replacing collapsed a provider's own cookie list to
+        // whichever came last, and would drop the `Cache-Control: no-store` core
+        // writes onto every identity response (a provider cannot set
+        // `cache-control` itself, so core's directive is what has to survive).
         let graph = in_memory_graph();
         let response = resolve_with_header_provider(
             &[
                 ("set-cookie", "vendor-ev=abc; Path=/"),
                 ("set-cookie", "vendor-state=xyz; Path=/"),
-                ("cache-control", "max-age=600"),
             ],
             true,
             Some(&graph),
