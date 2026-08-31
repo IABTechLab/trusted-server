@@ -1381,7 +1381,7 @@ mod tests {
         // The requirement for a client IP belongs to the provider that uses
         // one, not to core. A provider deriving identity from the request
         // query and cookies runs on a host that cannot determine a client IP,
-        // and receives the documented unavailable value, the empty string.
+        // and still mints.
         let provider = Arc::new(EvidenceCapturingProvider::default());
         let mut settings = create_test_settings();
         settings.ec.provider = Some(EcProviderSelection::from("evidence"));
