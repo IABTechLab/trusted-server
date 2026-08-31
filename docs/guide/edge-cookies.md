@@ -112,21 +112,21 @@ The `ec_identity_store` KV store is the only EC lifecycle store. It holds identi
 
 The Edge Cookie identifier comes from a configurable provider, selected by `[ec] provider`. A provider is one of two types, and the permission gate above applies to both. The two reach the **same outcome** (a `ts-ec` cookie set and carried on every later request) by **different routes**.
 
-- **Server-side** (for example the built-in HMAC provider, or the built-in `host-signals` provider that mints from the host's TLS JA4 and HTTP/2 fingerprints on a host that supplies them). The provider derives the identifier at the edge from request data in `generate()`, and the **page response** sets the cookie. Nothing client-side is involved.
-- **Client-side** (for example the `client-fixed` demo). The provider cannot derive the identifier at the edge, so `generate()` defers and returns no identifier. The page then runs the provider's own JavaScript in the browser, which does its work and posts the result to the resolve endpoint. The provider mints from that value in `resolve_from_client()`, and the **resolve response** sets the cookie.
+- **Server-side** (for example the built-in HMAC provider, or the built-in `host-signals` provider that creates the identifier from the host's TLS JA4 and HTTP/2 signals on a host that supplies them). The provider derives the identifier at the edge from request data in `generate()`, and the **page response** sets the cookie. Nothing client-side is involved.
+- **Client-side** (for example the `client-fixed` demo). The provider cannot derive the identifier at the edge, so `generate()` defers and returns no identifier. The page then runs the provider's own JavaScript in the browser, which does its work and posts the result to the resolve endpoint. The provider creates the identifier from that value in `resolve_from_client()`, and the **resolve response** sets the cookie.
 
 ```mermaid
 flowchart TD
     Start(["Page request, no Edge Cookie"]) --> Type{"Provider type"}
 
-    Type -->|"Server-side (e.g. HMAC)"| SGen["generate() mints at the edge from request data"]
+    Type -->|"Server-side (e.g. HMAC)"| SGen["generate() creates the identifier at the edge from request data"]
     SGen --> SSet["Page response sets ts-ec"]
 
     Type -->|"Client-side (e.g. client-fixed)"| CDefer["generate() defers, returns no identifier"]
     CDefer --> CPage["Page response, no cookie, delivers the provider JS"]
     CPage --> CBox[["Provider JS (black box): runs in the browser and does its work"]]
     CBox --> CPost["JS posts the result to POST /_ts/api/v1/ec/resolve"]
-    CPost --> CResolve["resolve_from_client() verifies and mints"]
+    CPost --> CResolve["resolve_from_client() verifies and creates"]
     CResolve --> CSet["Resolve response sets ts-ec"]
 
     SSet --> Same(["Same outcome: ts-ec set, carried on every later request"])
@@ -138,15 +138,15 @@ The two types differ only in route and in the methods they use:
 | Feature              | Server-side               | Client-side                                    |
 | -------------------- | ------------------------- | ---------------------------------------------- |
 | Example              | HMAC (`hmac`)             | `client-fixed` (demo)                          |
-| Mints in             | `generate()`, at the edge | `resolve_from_client()`, from the posted value |
+| Created in           | `generate()`, at the edge | `resolve_from_client()`, from the posted value |
 | `generate()` returns | the identifier            | no identifier (defers)                         |
 | Client JavaScript    | none                      | the provider JS (black box), which posts back  |
 | Endpoint             | none                      | `POST /_ts/api/v1/ec/resolve`                  |
 | Cookie set on        | the page response         | the resolve response                           |
 
-The resolve endpoint requires an `Origin` on the publisher's domain and a `text/plain` or `application/json` body, and it answers `409` rather than silently replacing an identity the request already carries. A minted identifier is persisted to the identity graph before the cookie is set, so withdrawal reaches a client-set identity the same way it reaches an edge-minted one. On success the cookie is set on the endpoint's own first-party `200` response, so the value is live for every subsequent request without a second navigation. The cookie is `HttpOnly`, so the page script never reads it back; a non-`HttpOnly` marker cookie (`ts-ecr=1`, carrying no identity) tells the script a resolve succeeded so it does not post again on every page view. Every resolve response carries `Cache-Control: no-store`. The `client-fixed` demonstration provider is compiled only behind the `client-fixed-demo` cargo feature, so a production build rejects selecting it at startup.
+The resolve endpoint requires an `Origin` on the publisher's domain and a `text/plain` or `application/json` body, and it answers `409` rather than silently replacing an identity the request already carries. A created identifier is persisted to the identity graph before the cookie is set, so withdrawal reaches a client-set identity the same way it reaches an edge-created one. On success the cookie is set on the endpoint's own first-party `200` response, so the value is live for every subsequent request without a second navigation. The cookie is `HttpOnly`, so the page script never reads it back; a non-`HttpOnly` marker cookie (`ts-ecr=1`, carrying no identity) tells the script a resolve succeeded so it does not post again on every page view. Every resolve response carries `Cache-Control: no-store`. The `client-fixed` demonstration provider is compiled only behind the `client-fixed-demo` cargo feature, so a production build rejects selecting it at startup.
 
-Because the posted value comes from the browser, **verification is the provider's responsibility**. A client-side provider must verify the payload (for example a signature) before minting, or a client could forge an Edge Cookie. The endpoint itself is provider-agnostic. It bounds the body, applies the same permission gate as organic generation, calls the provider, and writes the cookie.
+Because the posted value comes from the browser, **verification is the provider's responsibility**. A client-side provider must verify the payload (for example a signature) before creating the identifier, or a client could forge an Edge Cookie. The endpoint itself is provider-agnostic. It bounds the body, applies the same permission gate as organic generation, calls the provider, and writes the cookie.
 
 A built-in `client-fixed` provider demonstrates the client-side type end to end with no vendor coupling. Client and server share one fixed, known word. When no Edge Cookie is present, the page script (shipped in the tsjs bundle when that provider is selected) posts that word, the server verifies it matches, and on a match sets it as the Edge Cookie. The value is verifiable because it is a known constant, which is the point of the demo. It is useless in production, because a fixed value is not an identity, so it is for demonstration and testing only.
 

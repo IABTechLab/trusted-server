@@ -110,8 +110,8 @@ pull_sync_concurrency = 3
 # [ec.providers.hmac]
 # passphrase = "replace-with-32-plus-byte-random-secret"
 
-# Built-in host-signal provider block. Mints the identifier from the host's TLS
-# JA4 and HTTP/2 fingerprints instead of the client IP, so it needs a host that
+# Built-in host-signal provider block. Creates the identifier from the host's TLS
+# JA4 and HTTP/2 signals instead of the client IP, so it needs a host that
 # supplies those signals (Fastly does). Uncomment it together with
 # `provider = "host-signals"` above, and give it its own secret on the same
 # terms as the hmac block.
@@ -141,10 +141,10 @@ pull_sync_concurrency = 3
 # Device-detection provider. Selects how a request is classified into device
 # signals (browser/bot gating). Default "builtin" classifies from the User-Agent
 # alone and makes no host call, so a default deployment stays host-neutral. The
-# opt-in "fastly" provider adds the host's TLS/H2 fingerprints to the gate.
+# opt-in "fastly" provider adds the host's TLS/H2 signals to the gate.
 # Override at deployment with TRUSTED_SERVER__device__provider.
 # [device]
-# provider = "builtin"   # or "fastly" to add TLS/H2 fingerprint evidence
+# provider = "builtin"   # or "fastly" to add TLS/H2 signal evidence
 
 [geo]
 # Geo / IP intelligence provider. No provider is the default: Trusted Server

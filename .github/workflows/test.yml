@@ -107,11 +107,11 @@ jobs:
         run: |
           cargo test --package trusted-server-openrtb-codegen --target "$(rustc -vV | sed -n 's/host: //p')"
 
-      # The core library is otherwise only exercised through the WebAssembly
+      # The core library's unit tests otherwise run only on the WebAssembly
       # targets, which build with panic=abort, so their harness stops at the
       # first failing test and reports every later one as never run. A run that
-      # looks like a single failure can be several. This native run reports them
-      # all at once, which is what makes a red build readable.
+      # looks like a single failure can hide many more. This native run reports
+      # them all at once, which is what makes a red build readable.
       - name: Run host-target core library tests
         run: |
           cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/host: //p')"
