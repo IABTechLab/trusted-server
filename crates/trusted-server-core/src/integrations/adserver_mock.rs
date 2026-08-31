@@ -312,10 +312,7 @@ impl AdServerMockProvider {
                     width,
                     height,
                     bidder: restored_bidder,
-                    returned_seat: original.map_or_else(
-                        || (seat_name != "unknown").then(|| seat_name.to_string()),
-                        |bid| bid.returned_seat.clone(),
-                    ),
+                    returned_seat: original.and_then(|bid| bid.returned_seat.clone()),
                     adomain: bid["adomain"].as_array().map(|arr| {
                         arr.iter()
                             .filter_map(|v| v.as_str().map(String::from))
@@ -807,6 +804,49 @@ mod tests {
     }
 
     #[test]
+    fn unmatched_mediator_seats_do_not_become_upstream_returned_seats() {
+        let provider = AdServerMockProvider::new(AdServerMockConfig::default());
+        let mediation_response = json!({
+            "seatbid": [
+                {
+                    "seat": "provider-instance",
+                    "bid": [{
+                        "id": "bid-provider",
+                        "impid": "slot-provider",
+                        "price": 1.0,
+                        "adm": "<div>Provider</div>",
+                        "w": 300,
+                        "h": 250,
+                        "crid": "uncorrelated-provider-creative"
+                    }]
+                },
+                {
+                    "seat": "unknown",
+                    "bid": [{
+                        "id": "bid-unknown",
+                        "impid": "slot-unknown",
+                        "price": 2.0,
+                        "adm": "<div>Unknown</div>",
+                        "w": 728,
+                        "h": 90,
+                        "crid": "uncorrelated-unknown-creative"
+                    }]
+                }
+            ]
+        });
+
+        let response = provider.parse_mediation_response(&mediation_response, 10, &BidIndex::new());
+
+        assert_eq!(response.bids.len(), 2);
+        assert_eq!(response.bids[0].bidder, "provider-instance");
+        assert_eq!(response.bids[1].bidder, "unknown");
+        assert!(
+            response.bids.iter().all(|bid| bid.returned_seat.is_none()),
+            "an unmatched mediator seat is provider correlation identity, not an upstream seat"
+        );
+    }
+
+    #[test]
     fn parse_mediation_response_restores_original_bid_render_fields() {
         let provider = AdServerMockProvider::new(AdServerMockConfig::default());
         let mediation_response = json!({
@@ -844,7 +884,7 @@ mod tests {
                 creative: Some("<div>Original Ad</div>".to_string()),
                 adomain: Some(vec!["example.com".to_string()]),
                 bidder: "mocktioneer".to_string(),
-                returned_seat: None,
+                returned_seat: Some("upstream-seat".to_string()),
                 width: 728,
                 height: 90,
                 nurl: Some("https://ssp.example/win".to_string()),
@@ -917,9 +957,10 @@ mod tests {
             Some("/cache"),
             "should restore PBS cache path"
         );
-        assert!(
-            bid.returned_seat.is_none(),
-            "a matched original with no returned seat must not inherit mediator seat"
+        assert_eq!(
+            bid.returned_seat.as_deref(),
+            Some("upstream-seat"),
+            "should restore returned seat only from the matched original bid"
         );
     }
 

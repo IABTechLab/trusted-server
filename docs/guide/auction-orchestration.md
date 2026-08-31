@@ -846,11 +846,11 @@ Floor prices can be set per-slot in the auction request. The orchestrator enforc
 
 The orchestrator is designed to be resilient:
 
-- **Provider launch failure** — If a provider fails to launch its request (e.g., missing backend), it is skipped with a warning. Other providers continue.
+- **Provider launch failure** — The provider records a `launch_failed` outcome and other providers continue. If every eligible provider fails before producing a pending or immediate outcome, direct `/auction` execution returns `502 Bad Gateway`. Split publisher execution records `dispatch_failed` telemetry and continues the origin response without bids.
 - **Provider parse failure** — If a response can't be parsed, an `AuctionResponse::error()` is recorded. Other results are unaffected.
-- **No providers configured** — Returns an error: `"No providers configured"`
-- **All providers fail** — Returns an empty `OrchestrationResult` with zero winning bids
-- **Mediator returns bids without decoded prices** — Those bids are filtered out with a warning
+- **No providers configured** — Completes as a no-bid without provider I/O.
+- **No provider produces a valid bid** — Returns an empty `OrchestrationResult` with zero winning bids after recording provider outcomes.
+- **Mediator returns bids without decoded prices** — Those bids are filtered out with a warning.
 
 ## Observability
 

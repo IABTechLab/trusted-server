@@ -614,6 +614,7 @@ mod tests {
     use crate::auction::types::{AuctionRequest, AuctionResponse};
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
+    use crate::error::IntoHttpResponse as _;
     use crate::openrtb::Uid;
     use crate::platform::test_support::{
         NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, StubHttpClient,
@@ -883,6 +884,64 @@ mod tests {
             Some("auction_disabled"),
             "should identify the disabled auction policy"
         );
+    }
+
+    #[tokio::test]
+    async fn all_planned_launch_failures_return_bad_gateway_and_execution_failed_telemetry() {
+        let settings_toml = format!(
+            "{}\n[auction]\nenabled = true\n\n[auction.providers.launch-fail]\nprotocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = \"https://bidder.example/auction\"\nrouting = \"all_eligible\"\n",
+            crate_test_settings_str()
+        );
+        let settings =
+            Settings::from_toml(&settings_toml).expect("should parse launch-failure settings");
+        let plan = Arc::new(
+            crate::auction::compile_auction_plan(&settings)
+                .expect("should compile launch-failure plan"),
+        );
+        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+        let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+        let services = services_with_telemetry(Arc::clone(&telemetry_sink));
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let body = json!({
+            "adUnits": [{
+                "code": "div-gpt-ad-1",
+                "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+            }]
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.example/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should serialize launch-failure body"),
+            ))
+            .expect("should build launch-failure request");
+
+        let error = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &ec_context,
+            &services,
+            request,
+        )
+        .await
+        .expect_err("all planned launch failures should fail the auction endpoint");
+
+        assert_eq!(
+            error.current_context().status_code(),
+            StatusCode::BAD_GATEWAY
+        );
+        let batches = telemetry_sink
+            .batches
+            .lock()
+            .expect("should lock telemetry batches");
+        assert_eq!(batches.len(), 1, "should emit one telemetry batch");
+        let rows = batches[0].rows();
+        assert_eq!(rows.len(), 1, "should emit one execution-failure summary");
+        assert_eq!(rows[0].event_kind, "summary");
+        assert_eq!(rows[0].terminal_status.as_deref(), Some("execution_failed"));
+        assert_eq!(rows[0].terminal_reason.as_deref(), Some("execution_failed"));
     }
 
     #[tokio::test]
