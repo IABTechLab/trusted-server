@@ -976,7 +976,9 @@ describe('prebid/installPrebidNpm', () => {
 
     expect(mockSetConfig).toHaveBeenCalledWith({ consentManagement: queuedConsent });
     expect(mockMergeConfig).toHaveBeenCalledWith({ consentManagement: lateConsent });
-    expect(mockSetConfig.mock.calls.filter(([value]) => value?.consentManagement)).toHaveLength(2);
+    expect(
+      mockSetConfig.mock.calls.filter(([value]) => value?.consentManagement?.gdpr?.cmpApi === 'iab')
+    ).toHaveLength(1);
   });
 
   it('preserves effective User ID entries and replaces identityLink exactly once', () => {

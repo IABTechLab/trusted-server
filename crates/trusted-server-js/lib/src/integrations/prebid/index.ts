@@ -441,6 +441,47 @@ export function auctionBidsToPrebidBids(
 // ---------------------------------------------------------------------------
 
 type PbjsConfig = Parameters<typeof pbjs.setConfig>[0];
+type PrebidGetConfig = (key?: string) => unknown;
+
+function activateManagedUserIdTcfConsent(
+  managedUserIds: InjectedManagedUserId[] | undefined,
+  setConfig: typeof pbjs.setConfig,
+  getConfig: PrebidGetConfig | undefined
+): void {
+  if (
+    !managedUserIds?.length ||
+    typeof window === 'undefined' ||
+    typeof (window as { __tcfapi?: unknown }).__tcfapi !== 'function' ||
+    typeof getConfig !== 'function'
+  ) {
+    return;
+  }
+
+  let effectiveConsentManagement: unknown;
+  try {
+    effectiveConsentManagement = getConfig.call(pbjs, 'consentManagement');
+  } catch (error) {
+    log.error('[tsjs-prebid] effective consentManagement configuration could not be read', error);
+    return;
+  }
+
+  if (effectiveConsentManagement !== undefined && !isRecord(effectiveConsentManagement)) {
+    log.error('[tsjs-prebid] effective consentManagement configuration is not mergeable');
+    return;
+  }
+
+  const effectiveConsent = effectiveConsentManagement ?? {};
+  if (Object.prototype.hasOwnProperty.call(effectiveConsent, 'gdpr')) {
+    return;
+  }
+
+  setConfig({
+    consentManagement: {
+      ...effectiveConsent,
+      gdpr: { cmpApi: 'iab' },
+    },
+  } as PbjsConfig);
+}
 
 type TrustedServerBid = { bidder?: string; params?: Record<string, unknown> };
 type BannerSize = [number, number];
@@ -1203,6 +1244,9 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       mergeConfig?: typeof pbjs.setConfig;
     };
     const originalMergeConfig = prebidConfigApi.mergeConfig?.bind(pbjs);
+    const getConfig = (pbjs as unknown as { getConfig?: PrebidGetConfig }).getConfig;
+
+    activateManagedUserIdTcfConsent(managedUserIds, originalSetConfig, getConfig);
 
     const normalizePublisherConfig = (publisherConfig: PbjsConfig): PbjsConfig => {
       try {
@@ -1225,7 +1269,6 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     }
     managedPbjs[MANAGED_USER_IDS_SET_CONFIG_SENTINEL] = true;
 
-    const getConfig = (pbjs as unknown as { getConfig?: (key?: string) => unknown }).getConfig;
     if (typeof getConfig === 'function') {
       const effectiveUserIds = configuredUserIdEntries(getConfig.call(pbjs, 'userSync.userIds'));
       pbjs.setConfig({ userSync: { userIds: effectiveUserIds } } as PbjsConfig);
