@@ -1,6 +1,7 @@
 # Design Spec: Client-Cycle Edge Cookie Providers and the Resolve Endpoint
 
-**Status:** Implemented (hardened v1) in PR #1046, on the threat model below.
+**Status:** Proposed. PR #1046 carries the implementation (hardened v1, on
+the threat model below) and is not yet merged to main.
 The full anti-replay reservation machinery (§3.9) and the vendor envelope
 verification it serves are deliberately not in v1: they land with the first
 real vendor scheme, which brings the concrete envelope format the

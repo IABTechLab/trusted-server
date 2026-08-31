@@ -1,6 +1,7 @@
 # Design Spec: Jurisdiction Permission Model
 
-**Status:** Implemented in PR #1045; revised against the implementation, 2026-08-25.
+**Status:** Proposed. PR #1045 carries the implementation and is not yet
+merged to main. Revised against that implementation, 2026-08-25.
 **Author:** Engineering
 **Issue references:** #779
 **Related specs:** `2026-07-30-pluggable-providers-design.md`,

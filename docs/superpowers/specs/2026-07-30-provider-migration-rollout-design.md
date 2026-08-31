@@ -1,9 +1,10 @@
 # Design Spec: Provider and Permission Model, Migration and Rollout
 
-**Status:** Revised against the implemented series (PRs #1043-#1047),
-2026-08-25. The §8 sign-off rows remain the series' decision ledger, and rows the
-implementation now satisfies are marked with their PR so the task force can
-ratify rather than re-litigate.
+**Status:** Proposed. The implementation is carried by the series PRs #1043 to
+#1047, none of which is yet merged to main, and this document was revised
+against that series on 2026-08-25. The §8 sign-off rows remain the series'
+decision ledger, and rows the implementation now satisfies are marked with
+their PR so the task force can ratify rather than re-litigate.
 **Author:** Engineering
 **Issue references:** #777-#781 (epic)
 **Related specs:** `2026-07-30-pluggable-providers-design.md`,

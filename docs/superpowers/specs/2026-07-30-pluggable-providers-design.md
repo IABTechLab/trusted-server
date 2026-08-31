@@ -1,7 +1,8 @@
 # Design Spec: Pluggable Edge Cookie, Device, and Geo Providers
 
-**Status:** Implemented in PR #1043 (Edge Cookie provider seam) and PR #1044
-(device and geo selection); revised against the implementation, 2026-08-25.
+**Status:** Proposed. The implementation is carried by PR #1043 (Edge Cookie
+provider seam) and PR #1044 (device and geo selection), neither of which is
+yet merged to main. Revised against that implementation, 2026-08-25.
 **Author:** Engineering
 **Issue references:** #777, #778, #780, #781
 **Related specs:** `2026-07-30-permission-model-design.md`,

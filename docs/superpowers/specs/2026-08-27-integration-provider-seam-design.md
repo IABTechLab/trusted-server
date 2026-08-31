@@ -67,11 +67,12 @@ seventh PR targets, and the five series PRs do not touch these files.
    imports and calls each vendor's config type by name
    (`crates/trusted-server-core/src/config.rs:136` to `:166`).
 4. **Auction providers are a second closed table.**
-   `crates/trusted-server-core/src/auction/mod.rs:49` lists Prebid, APS and
-   the ad server mock.
+   The list of Prebid, APS and the ad server mock is at
+   `crates/trusted-server-core/src/auction/mod.rs:51` to `:53`, inside
+   `provider_builders()` at `:49`.
 5. **Two vendors reach further into core.** DataDome drives cache privacy
    and the origin fetch decision through a marker type
-   (`html_processor.rs:303`, `publisher.rs:4361` to `:4381`,
+   (`html_processor.rs:303`, `publisher.rs:4369` to `:4381`,
    `publisher.rs:2653`), and GPT diagnostics is called by name from all four
    adapters (for example
    `crates/trusted-server-adapter-fastly/src/app.rs:564`).
@@ -182,9 +183,16 @@ the neutral form.
   extension meaning "this response is personalized to the request, do not
   share it", set by any integration. Core keeps the behavior, being the full
   body buffer and private cache, and stops naming a vendor.
-- **Request prepare and finalize.** The direct GPT diagnostics calls in the
-  four adapters move behind hooks on the registration, so an adapter runs
-  whatever its registrations declare.
+- **Request prepare and finalize.** The direct GPT diagnostics calls move
+  behind hooks on the registration, so an adapter runs whatever its
+  registrations declare. Those calls reach beyond the adapter edge. On
+  `main` nine production `prepare_request` call sites sit in the four
+  adapters (two in Fastly, two in Axum, two in Cloudflare and three in
+  Spin) and a tenth sits in core's `handle_publisher_request`
+  (`publisher.rs:4050`). `finalize_response` has one production call site
+  and it is in core rather than in any adapter (`publisher.rs:4783`), so
+  the finalize hook has to run on the core response path and not only at
+  the adapter edge.
 
 ### 3.6 Identity, geo and device as registration capabilities
 
@@ -262,18 +270,27 @@ TypeScript, its config type and its tests into
 
 `[integrations.<vendor>]` configuration tables need no change, because
 `IntegrationSettings` is a flattened map that already accepts unknown vendor
-keys (`crates/trusted-server-core/src/settings.rs:166`).
+keys (`crates/trusted-server-core/src/settings.rs:215`).
 
 Two more places every move must touch, found by mapping `main`:
 
-- `crates/trusted-server-core/src/migration_guards.rs` embeds every core
-  source file by relative path with `include_str!`, the thirteen vendor
-  files included, so a vendor move that leaves its entry behind breaks the
-  build rather than a test. The guard cannot derive its list from the
-  registrations, because `include_str!` paths are fixed at compile time, so
-  this change drops the nine vendors' files from the guard instead, because a module
-  crate is outside the core neutrality guarantee, and a move then deletes
-  nothing there.
+- `crates/trusted-server-core/src/migration_guards.rs` embeds core source
+  files by relative path with `include_str!`, so a vendor move that leaves
+  an embedded entry behind breaks the build rather than a test. On `main`
+  the directory `crates/trusted-server-core/src/integrations/` holds 23
+  `.rs` files, being 2 infrastructure files (`mod.rs` and `registry.rs`),
+  6 files in the `nextjs/` subdirectory, 2 in the `datadome/` submodule and
+  13 top-level integration modules. The guard embeds 20 of those 23, and 9
+  of the 20 are files of the nine vendors in the table above. The three it
+  does not embed are `osano.rs` and the two `datadome/` files, so the guard
+  is already incomplete and the Osano move has no guard entry to delete.
+  Separately, `builders()` registers 13 integrations, which is not the same
+  13 as the file count, because `adserver_mock` is a file with no
+  registration while `nextjs` is a registration held in a subdirectory. The
+  guard cannot derive its list from the registrations, because
+  `include_str!` paths are fixed at compile time, so this change drops the
+  vendors' files from the guard instead, because a module crate is outside
+  the core neutrality guarantee, and a move then deletes nothing there.
 - The `ts audit` command carries its own vendor table (detection patterns
   and configuration section names in
   `crates/trusted-server-cli/src/commands/audit/analyzer.rs` and
@@ -292,18 +309,24 @@ deployment that lists the same integrations gets the same responses.
 
 ## 6. Acceptance
 
-1. **A round trip with a non-default implementation.** A test integration
-   defined outside `trusted-server-core`, carrying its own JavaScript,
-   registers through an adapter, appears in the served bundle with the
-   right hash, runs its hooks in the right order, and is rejected on a
-   duplicate id. A seam is only proven by an implementation that is not the
-   built-in one.
-2. **Capabilities round trip.** The same test integration declares an
-   identity, a geo and a device provider. With the three selectors naming
-   it, a request is served by all three (the created identifier carries its
-   code, the resolved country and the device signals are its). With a
-   selector naming a module that lacks the capability, startup fails with
-   an error that names the module and the capability.
+1. **A round trip with a non-default implementation, on Fastly.** A test
+   integration defined outside `trusted-server-core`, carrying its own
+   JavaScript, registers through an adapter, appears in the served bundle
+   with the right hash, runs its hooks in the right order, and is rejected
+   on a duplicate id. A seam is only proven by an implementation that is
+   not the built-in one. The round trip has to run on the Fastly adapter,
+   which is the primary deployment target, and not only on the Axum dev
+   server, because a seam proven on the dev server alone is not a seam any
+   production deployment can use. The Fastly adapter carries only
+   `src/main.rs` and so has no library target for an external crate to
+   register through (§8 item 7), so meeting this criterion means giving
+   that adapter a composition entry point a vendor crate can reach.
+2. **Capabilities round trip, on the same adapter.** The same test
+   integration declares an identity, a geo and a device provider. With the
+   three selectors naming it, a request is served by all three (the created
+   identifier carries its code, the resolved country and the device signals
+   are its). With a selector naming a module that lacks the capability,
+   startup fails with an error that names the module and the capability.
 3. **Parity.** The existing integration and parity suites pass unchanged,
    because the built-in set still registers through the same path.
 4. **No vendor left behind.** The rewritten deploy-validation test shows
@@ -346,12 +369,22 @@ for each vendor to rediscover.
    or a documented build-script recipe removes the trap, and the probe pins the
    file's line endings and tests the literal, which every vendor would
    otherwise have to reinvent.
-3. **A provider is resolved more than once per request.** A proxy that
-   wants the resolved location calls the geo provider itself while the
-   request path has already called it. `CLAUDE.md`'s principle that a
-   vendor sharing one backend makes a single call per request needs a
-   per-request provider context to hang that on, which this change does not
-   introduce.
+3. **A provider is resolved more than once per request.** On `main` this is
+   core against core rather than a proxy against the request path. Every
+   adapter resolves geo once to build the EC context (`build_ec_context` at
+   `crates/trusted-server-adapter-axum/src/app.rs:162`,
+   `crates/trusted-server-adapter-cloudflare/src/app.rs:142` and
+   `crates/trusted-server-adapter-spin/src/app.rs:346`, and
+   `build_ec_request_state` at
+   `crates/trusted-server-adapter-fastly/src/app.rs:394`). On
+   `POST /auction` the same request then reaches `handle_auction`, which
+   looks the same client IP up a second time to fill in the auction's
+   device info (`crates/trusted-server-core/src/auction/endpoints.rs:262`).
+   Those two are the only production geo call sites in the tree, so the
+   auction route is where the duplication shows. `CLAUDE.md`'s principle
+   that a vendor sharing one backend makes a single call per request needs
+   a per-request provider context to hang that on, which this change does
+   not introduce.
 4. **One core reader still reaches into a vendor's payload.** The
    `hb_adid` fallback in the publisher reads the APS renderer's fields, so
    the APS migration needs a neutral answer for it rather than only the
@@ -359,13 +392,22 @@ for each vendor to rediscover.
 
 5. **Request preparation covers different routes on each host.** Every
    adapter runs preparers before routing, but not on the same set of
-   routes: one runs them on every route but the health check, one skips a
-   batch endpoint and its admin diagnostics deliberately, one covers three
-   of its paths, and one skips its inline admin stubs. A module that strips
-   its own reserved query or cookie is therefore protected on a different
-   set of routes depending on the host it is deployed to. Making that
-   uniform means routing each adapter's hand-written handlers through one
-   wrapper, which is worth doing before a vendor depends on it.
+   routes. Cloudflare covers everything it registers, because every route
+   binding goes through one wrapper (`make_handler`) and the adapter has no
+   health route at all. Axum covers every route but `GET /health`, which is
+   bound to an inline closure. Fastly covers every route but `GET /health`,
+   which short-circuits before the app is built, plus the S2S batch sync
+   and the two admin lookup routes, which return deliberately before the
+   preparer runs. Spin is the widest gap, covering only `POST /auction`,
+   the two page-bids GET routes and the publisher fallback, so its
+   `/health`, its discovery and signature-verification routes, its inline
+   admin stubs and all six of its first-party bindings (`proxy`, `click`,
+   `sign` on GET and POST, and `proxy-rebuild` on GET and POST) run with no
+   preparer at all. A module that strips its own reserved query or cookie
+   is therefore protected on a different set of routes depending on the
+   host it is deployed to. Making that uniform means routing each adapter's
+   hand-written handlers through one wrapper, which is worth doing before a
+   vendor depends on it.
 
 6. **A module's validate function runs nowhere in a real deployment.**
    Building the registry calls only a builder's build function, and the
@@ -420,3 +462,4 @@ defines, and both should land before the first vendor is asked to use it.
 | 2026-08-28 | Recorded what implementing the seam found (§8): the operator CLI skips a vendor's deploy rules, a carried module's hash literal is fragile, providers resolve more than once per request, and one core reader still reads an APS payload. Recorded the construction-time hash check in §3.2.                                               |
 | 2026-08-28 | Adopted the #1043 review's registration shape for identity and applied its rule to geo and device, with no provider built into core (§3.6, §6 item 2, §8 rows 7 to 9). Recorded the relationship to #986 and reordered the series so this spec and its implementation come first.                                                          |
 | 2026-08-30 | Moved the five series design specs and the provider-code registry into this PR from PRs #1043 to #1047, so every normative document is reviewed before the code that implements it. Document content is unchanged, and only this status line and this row are new.                                                                             |
+| 2026-08-31 | Corrected the counts and line references the review found, against `main` at d516a9e94: the source-file guard counts (§4), the prepare and finalize call-site counts (§3.5), the real double geo resolution on `POST /auction` (§8 item 3), the per-adapter preparer coverage (§8 item 5), and the `settings.rs`, `auction/mod.rs` and `publisher.rs` line references. §6 now requires the round trip on Fastly rather than on any adapter. |
