@@ -1010,7 +1010,7 @@ mod tests {
                 &crate::platform::test_support::noop_services(),
             )
             .await
-            .expect("should mint through the provider");
+            .expect("should create through the provider");
 
         // What the publisher's origin returned, before EC finalization runs.
         let mut response = empty_response();

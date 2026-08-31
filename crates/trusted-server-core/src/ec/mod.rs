@@ -1574,7 +1574,7 @@ mod tests {
 
         ec.generate_if_needed(&settings, None, &services)
             .await
-            .expect("a provider that reads no client IP should still mint");
+            .expect("a provider that reads no client IP should still create an identifier");
         assert_eq!(
             ec.ec_value(),
             Some("t0ev~evidence-ec"),
@@ -1672,7 +1672,7 @@ mod tests {
         let err = ec
             .generate_if_needed(&settings, None, &services)
             .await
-            .expect_err("an identifier outside the alphabet should be rejected at mint");
+            .expect_err("an identifier outside the alphabet should be rejected at creation");
         assert!(
             err.to_string().contains("illegal"),
             "the error should name the provider, got: {err}"

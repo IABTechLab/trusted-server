@@ -727,9 +727,9 @@ pub(crate) fn noop_services_with_ec_provider(
 /// Build a [`RuntimeServices`] with an injected Edge Cookie provider and no
 /// client IP, modeling a host that cannot determine one.
 ///
-/// Whether that matters is the provider's decision, so this exists to test both
-/// answers: a provider reading other evidence still mints, and one that needs
-/// the IP refuses.
+/// Whether that matters is the provider's decision, so this exists to test
+/// both answers: a provider reading other evidence still creates an
+/// identifier, and one that needs the IP refuses.
 /// A config store that answers one known key, so a test can prove a provider
 /// reached the config store it was handed rather than a value it already held.
 #[derive(Debug)]

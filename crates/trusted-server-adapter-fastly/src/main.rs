@@ -578,10 +578,10 @@ pub(crate) fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<Stri
 ///
 /// The providers read request data from injected services: device classification
 /// reads only the User-Agent, borrowed here through a `BorrowedRequestInfo`, while the
-/// Fastly provider also reads the TLS/H2 fingerprints captured into a
-/// [`FastlyHostSignals`]. The Fastly provider, and so the fingerprint capture, is
+/// Fastly provider also reads the TLS/H2 signals captured into a
+/// [`FastlyHostSignals`]. The Fastly provider, and so the signal capture, is
 /// built only when selected, so the default request path makes no Fastly-specific
-/// fingerprint call.
+/// signal call.
 pub(crate) async fn derive_device_signals(
     settings: &Settings,
     req: &FastlyRequest,

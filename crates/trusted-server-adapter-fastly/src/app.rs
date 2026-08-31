@@ -249,8 +249,8 @@ pub(crate) fn build_state_with_registrations(
     // with no captured signals answers the only question the check asks,
     // which is whether the service exists at all. That same emptiness is why
     // `build_reusable_provider` hands back nothing for a provider built from
-    // those fingerprints, leaving it to be resolved per request against the
-    // fingerprints that request actually carried.
+    // those signals, leaving it to be resolved per request against the
+    // signals that request actually carried.
     let resolved_ec_provider = build_reusable_provider(
         &settings.ec,
         Some(Arc::new(FastlyHostSignals::default())),
@@ -794,8 +794,8 @@ async fn run_named_route(
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
         NamedRouteHandler::EcResolve => {
             // The resolve endpoint persists the identity-graph row before
-            // minting, so it takes the same bot-gated graph as generation: an
-            // unrecognized client gets no graph, and therefore no mint.
+            // creating, so it takes the same bot-gated graph as generation: an
+            // unrecognized client gets no graph, and therefore no new Edge Cookie.
             handle_ec_resolve(
                 &state.settings,
                 req,
