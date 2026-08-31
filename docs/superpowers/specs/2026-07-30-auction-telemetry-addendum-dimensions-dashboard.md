@@ -97,10 +97,10 @@ divergence. They do not provide billing or business reconciliation.
    `browser_family`, and `os_family` for breakdown panels. Do not add these
    dimensions to the per-minute rollups; the cardinality product would slow
    every panel to serve a use case that does not need minute grain.
-3. Emit two new coarse fields from the edge: `browser_family` and `os_family`.
-   Both derive from signals `DeviceSignals` already computes or can compute
-   from the UA without storing it. No raw UA, IP, or fingerprint value is
-   emitted; the privacy posture of the parent design is unchanged.
+3. Emit the complete `user_agent` from the edge and derive `browser_family`
+   and `os_family` in the Tinybird dimensional materialized views. Data syncs,
+   rather than edge application code, own aggregation policy. The raw
+   datasource retains the User-Agent under its existing 30-day TTL.
 4. Add `currency` to the bid rollups and endpoints. CPM quantiles are always
    computed and displayed per currency.
 5. Replace the quarantine stub with the workspace quarantine source and add an
@@ -113,32 +113,24 @@ divergence. They do not provide billing or business reconciliation.
 
 ## A. Edge changes (Rust)
 
-### New fields
+### New field
 
 Add to `AuctionObservationContext` and every emitted row:
 
-| field            | type                   | values                                                                    |
-| ---------------- | ---------------------- | ------------------------------------------------------------------------- |
-| `browser_family` | LowCardinality(String) | `chrome` / `edge` / `safari` / `firefox` / `samsung` / `opera` / `other` / `unknown` |
-| `os_family`      | LowCardinality(String) | `windows` / `mac` / `ios` / `android` / `linux` / `other` / `unknown`     |
+| field        | type             | values                                         |
+| ------------ | ---------------- | ---------------------------------------------- |
+| `user_agent` | Nullable(String) | complete request User-Agent, or null if absent |
 
-- `os_family` is `DeviceSignals.platform_class` mapped to the bounded set,
-  with `unknown` for `None`.
-- `browser_family` is a new pure function in `ec/device.rs` beside
-  `parse_platform_class`, an ordered allowlist match on the UA string. Order
-  matters: `Edg` before `Chrome`, `SamsungBrowser` before `Chrome`, `OPR`
-  before `Chrome`, `Chrome`/`CriOS` before `Safari`, `Firefox`/`FxiOS` before
-  `Safari`. Anything matching none of the tokens is `other`; empty UA is
-  `unknown`. The function returns an enum-backed `&'static str`, never a UA
-  substring, so cardinality is bounded by construction.
-- Both fields snapshot into the observation context at creation, same as
-  `is_mobile`, so there is no re-parsing and no divergence between row kinds
-  of one auction.
+- `/auction` reads the value from `AuctionRequest.device.user_agent`.
+- Initial-navigation and SPA paths snapshot the original request header before
+  dispatch so skipped and abandoned observations retain the same value.
+- Edge code does not trim, truncate, or classify the value. Every row kind in
+  one observation receives the same snapshot.
 
-Privacy note: the parent design's guarantees hold. The new fields are coarse
-classifications from an allowlist, not UA substrings, and are shared by very
-large user populations. Existing tests asserting no raw UA serialization gain
-cases for the new fields.
+Data contract note: complete User-Agent retention is intentional, including on
+consent-denied observations, and is bounded by the raw datasource's existing
+30-day TTL. EC IDs, internal auction request IDs, IP addresses, full URLs,
+query strings, fragments, and fingerprint values remain excluded.
 
 ### Unchanged
 
@@ -147,16 +139,15 @@ untouched by this addendum.
 
 ## B. Tinybird: raw datasource migration
 
-Add to `auction_events_raw` (additive, defaulted, so historical rows and
-lagging edge versions remain valid):
+Add to `auction_events_raw`:
 
 ```text
-`browser_family` LowCardinality(String) DEFAULT 'unknown',
-`os_family` LowCardinality(String) DEFAULT 'unknown'
+`user_agent` Nullable(String)
 ```
 
-Rows from edge versions that predate the field arrive without the key and take
-the default. No sorting-key change.
+The migration is additive. Historical rows, edge versions that predate the
+field, and requests without a valid User-Agent remain null. No sorting-key
+change. Do not use `LowCardinality` for the raw value.
 
 ## C. Tinybird: fixed per-minute materialized views
 
@@ -235,19 +226,32 @@ Three new materialized views and target datasources, mirroring the per-minute
 family at hour grain with breakdown dimensions. `device_class` is derived once
 in the MV: `is_mobile` 0 maps to `desktop`, 1 to `mobile`, 2 to `unknown`.
 
-- `auction_overview_dims_rollup`: key `(event_date, hour, publisher_domain,
-  auction_source, terminal_status, country, device_class, browser_family,
-  os_family)`; measures `auctions`, `requested_slots`, `winning_bids`.
-  `terminal_reason` is deliberately excluded here; reason analysis stays on
-  the per-minute rollup to keep this table's cardinality down.
-- `auction_provider_dims_rollup`: key `(event_date, hour, publisher_domain,
-  auction_source, provider, country, device_class, browser_family)`; measures
-  `requests`, `successes`, `nobids`, `errors`, `timeouts`, `abandonments`,
-  `latency_samples`, `latency_quantiles`.
-- `auction_bid_dims_rollup`: key `(event_date, hour, publisher_domain,
-  auction_source, provider, seat, currency, country, device_class,
-  browser_family)`; measures `bids`, `priced_bids`, `wins`,
-  `winning_cpm_quantiles`.
+The materialized views also derive bounded `browser_family` and `os_family`
+values from `user_agent`. Browser checks use this order: Edge, Samsung
+Internet, Opera, Chrome or iOS Chrome, Firefox or iOS Firefox, then Safari.
+OS checks use this order: iOS, Android, macOS, Windows, then Linux. Empty or
+null values map to `unknown`; unmatched non-empty values map to `other`. The
+closed sets are:
+
+- `browser_family`: `chrome`, `edge`, `safari`, `firefox`, `samsung`, `opera`,
+  `other`, `unknown`;
+- `os_family`: `windows`, `mac`, `ios`, `android`, `linux`, `other`, `unknown`.
+
+- `auction_overview_dims_rollup` measures `auctions`, `requested_slots`, and
+  `winning_bids`. The key contains `event_date`, `hour`, `publisher_domain`,
+  `auction_source`, `terminal_status`, `country`, `device_class`,
+  `browser_family`, and `os_family`. `terminal_reason` is deliberately excluded
+  here; reason analysis stays on the per-minute rollup to keep this table's
+  cardinality down.
+- `auction_provider_dims_rollup` measures `requests`, `successes`, `nobids`,
+  `errors`, `timeouts`, `abandonments`, `latency_samples`, and
+  `latency_quantiles`. The key contains `event_date`, `hour`,
+  `publisher_domain`, `auction_source`, `provider`, `country`, `device_class`,
+  and `browser_family`.
+- `auction_bid_dims_rollup` measures `bids`, `priced_bids`, `wins`, and
+  `winning_cpm_quantiles`. The key contains `event_date`, `hour`,
+  `publisher_domain`, `auction_source`, `provider`, `seat`, `currency`,
+  `country`, `device_class`, and `browser_family`.
 
 Retention 13 months, same as the per-minute family. Real-world cardinality is
 sparse (only observed combinations materialize), and hour grain keeps the
@@ -329,9 +333,12 @@ to collection (includes origin race)"; no panel title uses the bare phrase
 
 ## Testing
 
-- Unit tests for `parse_browser_family` covering the ordered-token pitfalls
-  (Edge, Samsung Internet, Opera, iOS Chrome/Firefox reporting as Safari
-  lookalikes) and asserting the return set is closed.
+- Rust tests assert that `/auction`, initial-navigation, and SPA observation
+  construction preserves the complete User-Agent and that every NDJSON row
+  carries the same value.
+- Tinybird tests cover the ordered-token pitfalls for Edge, Samsung Internet,
+  Opera, iOS Chrome, and iOS Firefox, and assert that browser and OS outputs
+  stay inside their closed sets.
 - Fixture NDJSON gains rows with null `provider_response_time_ms` (launch
   error, abandoned), null `price_cpm` bids including a null-price win, and a
   non-USD currency. `tb test` cases assert these rows are counted, excluded
@@ -339,8 +346,9 @@ to collection (includes origin race)"; no panel title uses the bare phrase
 - Reconciliation fixtures cover a skipped summary with no provider call
   (healthy), an orphan provider auction (unhealthy), and a raw-to-rollup count
   mismatch (unhealthy).
-- Privacy tests extend to the two new fields: values must be members of the
-  closed sets, never UA substrings.
+- Data-contract tests continue to exclude EC IDs, internal request IDs, IP
+  addresses, and full URLs while asserting that the complete User-Agent reaches
+  the Tinybird request body.
 - Deployment smoke test asserts quarantine endpoint is configured and rollup
   repopulation ran (row counts in rebuilt rollups match a raw control query).
 
@@ -348,11 +356,12 @@ to collection (includes origin race)"; no panel title uses the bare phrase
 
 1. Run the investigation query; root-cause and fix the auction_api summary
    gap. Do not build on the pipeline before trusting it.
-2. Deploy raw datasource additive columns, then edge emission of the new
-   fields (order matters; unknown keys would otherwise quarantine).
+2. Deploy the raw datasource `user_agent` column, then edge emission of the
+   field (order matters; unknown keys would otherwise quarantine).
 3. Deploy fixed per-minute MVs and rollup schemas with repopulate.
-4. Deploy dimensional rollups and new endpoints; backfill from the 30-day raw
-   window so breakdown panels are not empty on day one.
+4. Deploy dimensional rollups that derive browser and OS families, plus the new
+   endpoints; backfill from the 30-day raw window so breakdown panels are not
+   empty on day one.
 5. Deploy the provisioned dashboard JSON; retire the hand-built dashboard.
 
 ## Out of scope
