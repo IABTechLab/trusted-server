@@ -129,7 +129,7 @@ function tcData({ purpose1 = true, purpose3 = true, purpose4 = true, vendor97 = 
  *
  * @returns the URLs the page requested and the cookies it managed to set.
  */
-async function runGdprPage(grants = {}) {
+async function runGdprPage(grants = {}, { publisherConsentManagement } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
     url: 'https://pub.example.com/article',
     runScripts: 'outside-only',
@@ -189,11 +189,15 @@ async function runGdprPage(grants = {}) {
   };
 
   pageWindow.eval(bundleCode);
-  pageWindow.pbjs.setConfig({
+  const publisherConfig = {
     // Resolve User IDs before the auction so one auction is enough to observe
     // whether IdentityLink ran.
     userSync: { auctionDelay: 300, syncEnabled: false },
-  });
+  };
+  if (publisherConsentManagement !== undefined) {
+    publisherConfig.consentManagement = publisherConsentManagement;
+  }
+  pageWindow.pbjs.setConfig(publisherConfig);
   pageWindow.eval(shimCode);
 
   pageWindow.pbjs.requestBids({ adUnits: [], bidsBackHandler: () => {} });
@@ -201,7 +205,11 @@ async function runGdprPage(grants = {}) {
   await new Promise((resolve) => pageWindow.setTimeout(resolve, 400));
   await new Promise((resolve) => setTimeout(resolve, 50));
 
-  return { requestedUrls, cookies: pageWindow.document.cookie };
+  return {
+    requestedUrls,
+    cookies: pageWindow.document.cookie,
+    consentManagement: pageWindow.pbjs.getConfig('consentManagement'),
+  };
 }
 
 describe('external bundle TCF enforcement', () => {
@@ -247,5 +255,18 @@ describe('external bundle TCF enforcement', () => {
 
     expect(envelopeRequests(requestedUrls)).toHaveLength(1);
     expect(cookies).toContain(LIVE_RAMP_STORAGE_NAME);
+  });
+
+  it('preserves publisher-owned GDPR configuration in the generated bundle', async () => {
+    const publisherConsentManagement = {
+      gdpr: { cmpApi: 'iab', timeout: 123, defaultGdprScope: true },
+    };
+
+    const { consentManagement } = await runGdprPage(
+      {},
+      { publisherConsentManagement }
+    );
+
+    expect(consentManagement.gdpr).toEqual(publisherConsentManagement.gdpr);
   });
 });
