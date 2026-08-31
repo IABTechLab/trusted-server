@@ -21,6 +21,10 @@ use serde_json::Value as Json;
 use url::{Url, Url as ParsedUrl};
 use validator::{Validate, ValidationError};
 
+use crate::auction::openrtb::{
+    BidRejectionReason, ResponseAdmissionDiagnostics, parse_optional_bid_dimension,
+    resolve_bid_dimensions,
+};
 use crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
 use crate::auction::plan::AuctionPlan;
 use crate::auction::profile::PrebidProfilePlan;
@@ -2056,6 +2060,7 @@ fn parse_planned_prebid_openrtb(
         }
     }
 
+    let mut diagnostics = ResponseAdmissionDiagnostics::default();
     let mut bids = Vec::new();
     if let Some(seatbids) = response_json.get("seatbid").and_then(Json::as_array) {
         for seatbid in seatbids {
@@ -2066,28 +2071,32 @@ fn parse_planned_prebid_openrtb(
             let delivery_bidder = returned_seat.unwrap_or("unknown");
             if let Some(entries) = seatbid.get("bid").and_then(Json::as_array) {
                 for entry in entries {
-                    match parse_planned_prebid_bid(entry, delivery_bidder, returned_seat) {
-                        Ok(bid) if planned_prebid_bid_is_allowed(&bid, input) => bids.push(bid),
-                        Ok(_) => {}
-                        Err(()) => {
-                            let impression = entry
-                                .get("impid")
-                                .and_then(Json::as_str)
-                                .unwrap_or("<missing>");
-                            log::warn!(
-                                "Prebid: failed to parse bid from seat '{delivery_bidder}' for imp '{impression}'"
-                            );
+                    match parse_planned_prebid_bid(entry, delivery_bidder, returned_seat, input) {
+                        Ok(bid) => bids.push(bid),
+                        Err(reason) => {
+                            diagnostics.record(reason);
+                            if reason == BidRejectionReason::InvalidBid {
+                                let impression = entry
+                                    .get("impid")
+                                    .and_then(Json::as_str)
+                                    .unwrap_or("<missing>");
+                                log::warn!(
+                                    "Prebid: failed to parse bid from seat '{delivery_bidder}' for imp '{impression}'"
+                                );
+                            }
                         }
                     }
                 }
             }
         }
     }
-    if bids.is_empty() {
+    let mut parsed = if bids.is_empty() {
         AuctionResponse::no_bid(provider_id, response_time_ms)
     } else {
         AuctionResponse::success(provider_id, bids, response_time_ms)
-    }
+    };
+    diagnostics.attach_to(&mut parsed);
+    parsed
 }
 
 fn enrich_planned_prebid_metadata(
@@ -2116,43 +2125,27 @@ fn enrich_planned_prebid_metadata(
     }
 }
 
-fn planned_prebid_bid_is_allowed(bid: &AuctionBid, input: &ProviderAuctionInput) -> bool {
-    input.slots().iter().any(|slot| {
-        slot.slot().id == bid.slot_id
-            && slot
-                .slot()
-                .formats
-                .iter()
-                .any(|format| (format.width, format.height) == (bid.width, bid.height))
-    })
-}
-
 fn parse_planned_prebid_bid(
     bid: &Json,
     delivery_bidder: &str,
     returned_seat: Option<&str>,
-) -> Result<AuctionBid, ()> {
+    input: &ProviderAuctionInput,
+) -> Result<AuctionBid, BidRejectionReason> {
     let slot_id = bid
         .get("impid")
         .and_then(Json::as_str)
-        .ok_or(())?
+        .filter(|slot_id| !slot_id.is_empty())
+        .ok_or(BidRejectionReason::InvalidBid)?
         .to_string();
+    let width = parse_optional_bid_dimension(bid, "w")?;
+    let height = parse_optional_bid_dimension(bid, "h")?;
+    let (width, height) = resolve_bid_dimensions(input, &slot_id, width, height)?;
     let price = bid
         .get("price")
         .and_then(Json::as_f64)
         .filter(|price| price.is_finite() && *price >= 0.0)
-        .ok_or(())?;
+        .ok_or(BidRejectionReason::InvalidBid)?;
     let creative = bid.get("adm").and_then(Json::as_str).map(String::from);
-    let width = bid
-        .get("w")
-        .and_then(Json::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(0);
-    let height = bid
-        .get("h")
-        .and_then(Json::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(0);
     let cache_entry = bid
         .get("ext")
         .and_then(|ext| ext.get("prebid"))
@@ -8222,23 +8215,32 @@ set = { networkId = 42 }
         }
     }
 
-    fn planned_prebid_input(slot_ids: &[&str]) -> ProviderAuctionInput {
+    fn planned_prebid_input_with_formats(
+        slot_ids: &[&str],
+        formats: Vec<AdFormat>,
+    ) -> ProviderAuctionInput {
         let provider_id = ProviderId::from_str("pbs-instance").expect("should parse provider ID");
+        let bidder_id = BidderId::from_str("exampleBidder").expect("should parse bidder ID");
         let plan = crate::auction::plan::AuctionPlan::compile(AuctionPlanConfig {
             timeout_ms: 1_000,
             providers: BTreeMap::from([(
-                provider_id,
+                provider_id.clone(),
                 ProviderConfig {
                     protocol: "openrtb-2.6".to_string(),
                     profile: "prebid-server".to_string(),
                     endpoint: "https://pbs.example/openrtb2/auction".to_string(),
                     timeout_ms: None,
-                    routing: RoutingMode::AllEligible,
+                    routing: RoutingMode::Explicit,
                     notifications: NotificationConfig::default(),
                     profile_config: json!({}),
                 },
             )]),
-            bidders: BTreeMap::new(),
+            bidders: BTreeMap::from([(
+                bidder_id,
+                BidderRouteConfig {
+                    provider: provider_id,
+                },
+            )]),
             mediator: None,
             request_signing: None,
         })
@@ -8247,7 +8249,17 @@ set = { networkId = 42 }
         let request = make_auction_request(
             slot_ids
                 .iter()
-                .map(|slot_id| make_slot(slot_id, HashMap::new()))
+                .map(|slot_id| {
+                    let mut slot = make_slot(
+                        slot_id,
+                        HashMap::from([(
+                            "exampleBidder".to_string(),
+                            json!({"placement": "example-placement"}),
+                        )]),
+                    );
+                    slot.formats.clone_from(&formats);
+                    slot
+                })
                 .collect(),
         );
         crate::auction::routing::route_auction(request, &inbound, &plan, None)
@@ -8255,6 +8267,17 @@ set = { networkId = 42 }
             .first()
             .expect("should route planned PBS test slots")
             .clone()
+    }
+
+    fn planned_prebid_input(slot_ids: &[&str]) -> ProviderAuctionInput {
+        planned_prebid_input_with_formats(
+            slot_ids,
+            vec![AdFormat {
+                media_type: MediaType::Banner,
+                width: 300,
+                height: 250,
+            }],
+        )
     }
 
     #[test]
@@ -8476,6 +8499,80 @@ set = { networkId = 42 }
         assert_eq!(parsed.bids.len(), 1, "should retain only the admitted bid");
         assert_eq!(parsed.bids[0].slot_id, "requested");
         assert_eq!(parsed.bids[0].price, Some(1.0));
+        assert_eq!(
+            parsed.metadata["response_admission"]["rejected_bid_count"],
+            3
+        );
+        assert_eq!(
+            parsed.metadata["response_admission"]["rejection_reasons"]["unrequested_impression"],
+            1
+        );
+        assert_eq!(
+            parsed.metadata["response_admission"]["rejection_reasons"]["dimension_mismatch"],
+            1
+        );
+        assert_eq!(
+            parsed.metadata["response_admission"]["rejection_reasons"]["invalid_bid"],
+            1
+        );
+    }
+
+    #[test]
+    fn planned_parser_infers_only_unambiguous_missing_dimensions() {
+        let profile = planned_prebid_profile(false);
+        let input = planned_prebid_input(&["requested"]);
+        let inferred = futures::executor::block_on(parse_planned_prebid_response(
+            "pbs-instance",
+            &profile,
+            &input,
+            prebid_platform_response(
+                StatusCode::OK,
+                Some("application/json"),
+                br#"{"seatbid":[{"bid":[{"impid":"requested","price":1.0}]}]}"#.to_vec(),
+            ),
+            42,
+            "auction-inferred",
+        ))
+        .expect("should parse planned PBS response");
+        assert_eq!(inferred.status, crate::auction::types::BidStatus::Success);
+        assert_eq!(inferred.bids[0].width, 300);
+        assert_eq!(inferred.bids[0].height, 250);
+
+        let formats = vec![
+            AdFormat {
+                media_type: MediaType::Banner,
+                width: 300,
+                height: 250,
+            },
+            AdFormat {
+                media_type: MediaType::Banner,
+                width: 320,
+                height: 50,
+            },
+        ];
+        let input = planned_prebid_input_with_formats(&["requested"], formats);
+        let ambiguous = futures::executor::block_on(parse_planned_prebid_response(
+            "pbs-instance",
+            &profile,
+            &input,
+            prebid_platform_response(
+                StatusCode::OK,
+                Some("application/json"),
+                br#"{"seatbid":[{"bid":[{"impid":"requested","price":1.0}]}]}"#.to_vec(),
+            ),
+            42,
+            "auction-ambiguous",
+        ))
+        .expect("should parse planned PBS response");
+        assert_eq!(ambiguous.status, crate::auction::types::BidStatus::NoBid);
+        assert_eq!(
+            ambiguous.metadata["response_admission"]["rejected_bid_count"],
+            1
+        );
+        assert_eq!(
+            ambiguous.metadata["response_admission"]["rejection_reasons"]["ambiguous_dimensions"],
+            1
+        );
     }
 
     #[test]

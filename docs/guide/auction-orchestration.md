@@ -349,11 +349,19 @@ Transforms auction requests into OpenRTB 2.x format and sends them to a Prebid S
 
 **Response parsing:**
 
-- Bids include decoded `price` (clear decimal CPM)
-- Creative HTML provided in `adm` field
-- Winning creative URLs rewritten to first-party proxy format by default when the `/auction` response is assembled
-- Per-bidder timing (`responsetimemillis`), errors, and warnings always attached as response metadata
-- When `debug` is enabled, PBS debug payload and per-bid status (`bidstatus`) also included
+- Bids include decoded `price` as a decimal CPM.
+- Missing bid dimensions inherit the routed impression size only when that
+  impression has one banner format. Ambiguous or mismatched dimensions are
+  rejected.
+- Creative HTML comes from the `adm` field.
+- Winning creative URLs are rewritten to first-party proxy format by default
+  when the `/auction` response is assembled.
+- Per-bidder timing (`responsetimemillis`), errors, and warnings are attached as
+  response metadata.
+- `response_admission` reports bounded rejected-bid and reason counts without
+  retaining raw bid payloads.
+- When `debug` is enabled, PBS debug payload and per-bid status (`bidstatus`) are
+  also included.
 
 ```toml
 [auction.providers.pbs-main]

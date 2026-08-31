@@ -3,7 +3,7 @@
 //! Profiles receive only routed, privacy-approved facts and never the raw
 //! downstream request or unrestricted runtime services.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use error_stack::Report;
 use serde_json::{Map, Value, json};
@@ -29,6 +29,117 @@ const DEFAULT_CURRENCY: &str = "USD";
 const APS_SDK_SOURCE: &str = "prebid";
 const APS_SDK_VERSION: &str = "2.2.0";
 const MAX_CONSERVATIVE_LANGUAGE_BYTES: usize = 8;
+
+/// Fixed reasons why an upstream bid failed response admission.
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum BidRejectionReason {
+    InvalidBid,
+    UnrequestedImpression,
+    DimensionMismatch,
+    AmbiguousDimensions,
+}
+
+impl BidRejectionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidBid => "invalid_bid",
+            Self::UnrequestedImpression => "unrequested_impression",
+            Self::DimensionMismatch => "dimension_mismatch",
+            Self::AmbiguousDimensions => "ambiguous_dimensions",
+        }
+    }
+}
+
+/// Bounded aggregate diagnostics for rejected upstream bids.
+#[derive(Debug, Default)]
+pub(crate) struct ResponseAdmissionDiagnostics {
+    rejected_bid_count: u32,
+    reason_counts: BTreeMap<BidRejectionReason, u32>,
+}
+
+impl ResponseAdmissionDiagnostics {
+    /// Record one rejected bid without retaining upstream payload data.
+    pub(crate) fn record(&mut self, reason: BidRejectionReason) {
+        self.rejected_bid_count = self.rejected_bid_count.saturating_add(1);
+        let count = self.reason_counts.entry(reason).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    /// Attach fixed-cardinality rejection counts to a provider response.
+    pub(crate) fn attach_to(self, response: &mut AuctionResponse) {
+        if self.rejected_bid_count == 0 {
+            return;
+        }
+        let reasons = self
+            .reason_counts
+            .into_iter()
+            .map(|(reason, count)| (reason.as_str().to_string(), json!(count)))
+            .collect::<Map<_, _>>();
+        response.metadata.insert(
+            "response_admission".to_string(),
+            json!({
+                "rejected_bid_count": self.rejected_bid_count,
+                "rejection_reasons": reasons,
+            }),
+        );
+    }
+}
+
+/// Parse an optional positive `OpenRTB` bid dimension.
+pub(crate) fn parse_optional_bid_dimension(
+    value: &Value,
+    key: &str,
+) -> Result<Option<u32>, BidRejectionReason> {
+    let Some(raw) = value.get(key) else {
+        return Ok(None);
+    };
+    raw.as_u64()
+        .and_then(|dimension| u32::try_from(dimension).ok())
+        .filter(|dimension| *dimension > 0)
+        .map(Some)
+        .ok_or(BidRejectionReason::InvalidBid)
+}
+
+/// Validate explicit dimensions or infer them from one routed banner format.
+pub(crate) fn resolve_bid_dimensions(
+    input: &ProviderAuctionInput,
+    slot_id: &str,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<(u32, u32), BidRejectionReason> {
+    let slot = input
+        .slots()
+        .iter()
+        .find(|slot| slot.slot().id == slot_id)
+        .ok_or(BidRejectionReason::UnrequestedImpression)?;
+    let dimensions = slot
+        .slot()
+        .formats
+        .iter()
+        .map(|format| (format.width, format.height))
+        .collect::<BTreeSet<_>>();
+
+    if let (Some(width), Some(height)) = (width, height) {
+        return dimensions
+            .contains(&(width, height))
+            .then_some((width, height))
+            .ok_or(BidRejectionReason::DimensionMismatch);
+    }
+
+    if dimensions.len() != 1 {
+        return Err(BidRejectionReason::AmbiguousDimensions);
+    }
+    let inferred = dimensions
+        .first()
+        .copied()
+        .expect("should have one routed banner format");
+    if width.is_some_and(|width| width != inferred.0)
+        || height.is_some_and(|height| height != inferred.1)
+    {
+        return Err(BidRejectionReason::DimensionMismatch);
+    }
+    Ok(inferred)
+}
 
 /// Result of request construction before transport.
 #[derive(Debug)]
@@ -566,19 +677,7 @@ pub(crate) fn extract_standard_response(
                 .with_metadata("error_type", json!("parse_response"));
         }
     }
-    let allowed_impressions = input
-        .slots()
-        .iter()
-        .map(|slot| {
-            let dimensions = slot
-                .slot()
-                .formats
-                .iter()
-                .map(|format| (format.width, format.height))
-                .collect::<HashSet<_>>();
-            (slot.slot().id.as_str(), dimensions)
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut diagnostics = ResponseAdmissionDiagnostics::default();
     let mut bids = Vec::new();
     for seatbid in response
         .get("seatbid")
@@ -594,40 +693,47 @@ pub(crate) fn extract_standard_response(
             continue;
         };
         for value in entries {
-            if let Some(bid) = extract_standard_bid(value, returned_seat)
-                && allowed_impressions
-                    .get(bid.slot_id.as_str())
-                    .is_some_and(|dimensions| dimensions.contains(&(bid.width, bid.height)))
-            {
-                bids.push(bid);
+            match extract_standard_bid(value, returned_seat, input) {
+                Ok(bid) => bids.push(bid),
+                Err(reason) => diagnostics.record(reason),
             }
         }
     }
-    if bids.is_empty() {
+    let mut parsed = if bids.is_empty() {
         AuctionResponse::no_bid(provider_id, response_time_ms)
     } else {
         AuctionResponse::success(provider_id, bids, response_time_ms)
-    }
+    };
+    diagnostics.attach_to(&mut parsed);
+    parsed
 }
 
-fn extract_standard_bid(value: &Value, returned_seat: Option<&str>) -> Option<Bid> {
-    let slot_id = value.get("impid")?.as_str()?.to_string();
+fn extract_standard_bid(
+    value: &Value,
+    returned_seat: Option<&str>,
+    input: &ProviderAuctionInput,
+) -> Result<Bid, BidRejectionReason> {
+    let slot_id = value
+        .get("impid")
+        .and_then(Value::as_str)
+        .filter(|slot_id| !slot_id.is_empty())
+        .ok_or(BidRejectionReason::InvalidBid)?
+        .to_string();
+    let width = parse_optional_bid_dimension(value, "w")?;
+    let height = parse_optional_bid_dimension(value, "h")?;
+    let (width, height) = resolve_bid_dimensions(input, &slot_id, width, height)?;
     let price = value
-        .get("price")?
-        .as_f64()
-        .filter(|price| price.is_finite() && *price >= 0.0)?;
-    let width = u32::try_from(value.get("w")?.as_u64()?)
-        .ok()
-        .filter(|value| *value > 0)?;
-    let height = u32::try_from(value.get("h")?.as_u64()?)
-        .ok()
-        .filter(|value| *value > 0)?;
+        .get("price")
+        .and_then(Value::as_f64)
+        .filter(|price| price.is_finite() && *price >= 0.0)
+        .ok_or(BidRejectionReason::InvalidBid)?;
     let creative = value
         .get("adm")
         .and_then(Value::as_str)
         .filter(|creative| !creative.is_empty())
-        .map(str::to_string)?;
-    Some(Bid {
+        .map(str::to_string)
+        .ok_or(BidRejectionReason::InvalidBid)?;
+    Ok(Bid {
         slot_id,
         price: Some(price),
         currency: DEFAULT_CURRENCY.to_string(),

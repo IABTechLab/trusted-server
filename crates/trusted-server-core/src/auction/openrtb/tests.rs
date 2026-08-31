@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use super::test_executor::execute_standard_fixture;
 use super::*;
 use crate::auction::plan::{
-    AuctionPlan, AuctionPlanConfig, BidderRouteConfig, NotificationConfig, ProviderConfig,
-    ProviderId, RoutingMode,
+    AuctionPlan, AuctionPlanConfig, BidderId, BidderRouteConfig, NotificationConfig,
+    ProviderConfig, ProviderId, RoutingMode,
 };
 use crate::auction::provider::{GenericOpenRtbProvider, ProviderRequestOutcome};
 use crate::auction::routing::route_auction;
@@ -35,21 +35,36 @@ fn config(profile: &str, profile_config: Value) -> AuctionPlanConfig {
 }
 
 fn config_with_endpoint(profile: &str, profile_config: Value, endpoint: &str) -> AuctionPlanConfig {
+    let provider_id = ProviderId::from_str("fictional-provider").expect("should parse provider ID");
+    let prebid_server = profile == "prebid-server";
     AuctionPlanConfig {
         timeout_ms: 321,
         providers: BTreeMap::from([(
-            ProviderId::from_str("fictional-provider").expect("should parse provider"),
+            provider_id.clone(),
             ProviderConfig {
                 protocol: "openrtb-2.6".to_string(),
                 profile: profile.to_string(),
                 endpoint: endpoint.to_string(),
                 timeout_ms: Some(321),
-                routing: RoutingMode::AllEligible,
+                routing: if prebid_server {
+                    RoutingMode::Explicit
+                } else {
+                    RoutingMode::AllEligible
+                },
                 notifications: NotificationConfig::default(),
                 profile_config,
             },
         )]),
-        bidders: BTreeMap::new(),
+        bidders: prebid_server
+            .then(|| {
+                BTreeMap::from([(
+                    BidderId::from_str("exampleBidder").expect("should parse bidder ID"),
+                    BidderRouteConfig {
+                        provider: provider_id,
+                    },
+                )])
+            })
+            .unwrap_or_default(),
         mediator: None,
         request_signing: None,
     }
@@ -737,7 +752,7 @@ fn signed_profiles_and_unsigned_standard_have_exact_full_goldens() {
         (
             "prebid-server",
             json!({}),
-            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
         ),
         (
             "aps",
@@ -811,7 +826,9 @@ fn defensive_no_impression_outcome_does_not_build_transportable_request() {
     );
 }
 
-fn standard_fixture() -> (AuctionPlan, RoutedAuction, OpenRtbRequest) {
+fn standard_fixture_with_formats(
+    formats: Vec<AdFormat>,
+) -> (AuctionPlan, RoutedAuction, OpenRtbRequest) {
     let mut raw = config(
         "standard",
         json!({"request_ext": {"fixture": true}, "imp_ext": {"slot_fixture": true}}),
@@ -831,7 +848,9 @@ fn standard_fixture() -> (AuctionPlan, RoutedAuction, OpenRtbRequest) {
         .uri("https://publisher.example/auction")
         .body(EdgeBody::empty())
         .expect("should build inbound request");
-    let routed = route_auction(canonical_parity_auction_request(), &inbound, &plan, None);
+    let mut auction_request = canonical_parity_auction_request();
+    auction_request.slots[0].formats = formats;
+    let routed = route_auction(auction_request, &inbound, &plan, None);
     let request = match build_request(
         &routed.inputs()[0],
         &routed,
@@ -845,6 +864,14 @@ fn standard_fixture() -> (AuctionPlan, RoutedAuction, OpenRtbRequest) {
         OpenRtbBuildOutcome::NoImpressions => panic!("should retain impression"),
     };
     (plan, routed, request)
+}
+
+fn standard_fixture() -> (AuctionPlan, RoutedAuction, OpenRtbRequest) {
+    standard_fixture_with_formats(vec![AdFormat {
+        media_type: MediaType::Banner,
+        width: 300,
+        height: 250,
+    }])
 }
 
 #[test]
@@ -922,6 +949,65 @@ fn standard_response_rejects_unknown_impressions_and_dimensions_but_keeps_siblin
     assert_eq!(response.status, BidStatus::Success);
     assert_eq!(response.bids.len(), 1);
     assert_eq!(response.bids[0].bid_id.as_deref(), Some("good"));
+    assert_eq!(
+        response.metadata["response_admission"]["rejected_bid_count"],
+        2
+    );
+    assert_eq!(
+        response.metadata["response_admission"]["rejection_reasons"]["unrequested_impression"],
+        1
+    );
+    assert_eq!(
+        response.metadata["response_admission"]["rejection_reasons"]["dimension_mismatch"],
+        1
+    );
+}
+
+#[test]
+fn standard_response_infers_only_unambiguous_missing_dimensions() {
+    let (_plan, routed, _request) = standard_fixture();
+    let inferred = extract_standard_response(
+        "fictional-provider",
+        &routed.inputs()[0],
+        &json!({"seatbid": [{"bid": [
+            {"id":"inferred","impid":"fictional-slot","price":1.0,"adm":"ok"}
+        ]}]}),
+        0,
+    );
+    assert_eq!(inferred.status, BidStatus::Success);
+    assert_eq!(inferred.bids[0].width, 300);
+    assert_eq!(inferred.bids[0].height, 250);
+
+    let formats = vec![
+        AdFormat {
+            media_type: MediaType::Banner,
+            width: 300,
+            height: 250,
+        },
+        AdFormat {
+            media_type: MediaType::Banner,
+            width: 320,
+            height: 50,
+        },
+    ];
+    let (_plan, routed, _request) = standard_fixture_with_formats(formats);
+    let ambiguous = extract_standard_response(
+        "fictional-provider",
+        &routed.inputs()[0],
+        &json!({"seatbid": [{"bid": [
+            {"id":"ambiguous","impid":"fictional-slot","price":1.0,"adm":"ok"}
+        ]}]}),
+        0,
+    );
+    assert_eq!(ambiguous.status, BidStatus::NoBid);
+    assert_eq!(
+        ambiguous.metadata["response_admission"]["rejected_bid_count"],
+        1
+    );
+    assert_eq!(
+        ambiguous.metadata["response_admission"]["rejection_reasons"]["ambiguous_dimensions"],
+        1
+    );
 }
 
 #[test]

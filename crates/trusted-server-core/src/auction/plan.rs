@@ -98,7 +98,7 @@ impl FromStr for BidderId {
             || value.trim() != value
         {
             return Err(configuration_error(format!(
-                "bidder ID must be nonempty, at most {MAX_ID_BYTES} UTF-8 bytes, contain no control characters, and have no surrounding whitespace"
+                "bidder ID {value:?} must be nonempty, at most {MAX_ID_BYTES} UTF-8 bytes, contain no control characters, and have no surrounding whitespace"
             )));
         }
         Ok(Self(value.to_string()))
@@ -304,6 +304,11 @@ impl AuctionPlan {
                     raw.profile
                 ))
             })?;
+            if registration.id == "prebid-server" && raw.routing == RoutingMode::AllEligible {
+                return Err(configuration_error(format!(
+                    "provider `{id}` cannot use routing `all_eligible` with profile `prebid-server`; configure explicit bidder routes"
+                )));
+            }
             if !raw.profile_config.is_object() {
                 return Err(configuration_error(format!(
                     "provider `{id}` profile_config must be an object"
@@ -903,8 +908,32 @@ mod tests {
     fn bidder_id_enforces_admission_bounds() {
         assert!(BidderId::from_str("exampleBidder").is_ok());
         for invalid in ["", " bidder", "bidder\n", &"a".repeat(129)] {
-            assert!(BidderId::from_str(invalid).is_err());
+            let error = BidderId::from_str(invalid).expect_err("should reject invalid bidder ID");
+            assert!(
+                error.to_string().contains(&format!("{invalid:?}")),
+                "should identify invalid bidder ID {invalid:?}: {error:?}"
+            );
         }
+    }
+
+    #[test]
+    fn compiler_rejects_all_eligible_for_prebid_server_only() {
+        let mut prebid = provider("prebid-server");
+        prebid.routing = RoutingMode::AllEligible;
+        let error = AuctionPlan::compile(config(BTreeMap::from([(id("pbs-main"), prebid)])))
+            .expect_err("should reject all_eligible Prebid Server routing");
+        let message = error.to_string();
+        for expected in ["pbs-main", "all_eligible", "prebid-server"] {
+            assert!(
+                message.contains(expected),
+                "should identify provider, routing, and profile: {error:?}"
+            );
+        }
+
+        let mut standard = provider("standard");
+        standard.routing = RoutingMode::AllEligible;
+        AuctionPlan::compile(config(BTreeMap::from([(id("standard-main"), standard)])))
+            .expect("should retain all_eligible for non-Prebid profiles");
     }
 
     #[test]

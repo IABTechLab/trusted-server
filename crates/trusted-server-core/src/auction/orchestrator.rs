@@ -2611,7 +2611,7 @@ mod tests {
                             profile: "prebid-server".to_string(),
                             endpoint: format!("https://{id}.example.test/openrtb"),
                             timeout_ms: Some(1_000),
-                            routing: RoutingMode::AllEligible,
+                            routing: RoutingMode::Explicit,
                             notifications: notifications.clone(),
                             profile_config: profile_config.clone(),
                         },
@@ -2687,6 +2687,14 @@ mod tests {
             site: None,
             context: HashMap::new(),
         }
+    }
+
+    fn planned_prebid_request() -> AuctionRequest {
+        let mut request = planned_request();
+        request.slots[0]
+            .bidders
+            .insert("trustedServer".to_string(), serde_json::json!({}));
+        request
     }
 
     #[tokio::test]
@@ -5639,7 +5647,7 @@ mod tests {
         ]))
         .expect("should compile planned PBS auction");
         let orchestrator = AuctionOrchestratorHarness::new(plan, None);
-        let request = planned_request();
+        let request = planned_prebid_request();
         let settings = create_test_settings();
         let inbound = http::Request::builder()
             .uri("https://publisher.example/auction")
@@ -6224,7 +6232,7 @@ mod tests {
 
         for (plan, status, body, expected) in cases {
             let routed = route_auction(
-                planned_request(),
+                planned_prebid_request(),
                 &http::Request::new(edgezero_core::body::Body::empty()),
                 plan,
                 None,
@@ -6695,7 +6703,7 @@ mod tests {
         ]))
         .expect("should compile planned PBS auction");
         let routed = route_auction(
-            planned_request(),
+            planned_prebid_request(),
             &http::Request::new(edgezero_core::body::Body::empty()),
             &plan,
             None,
