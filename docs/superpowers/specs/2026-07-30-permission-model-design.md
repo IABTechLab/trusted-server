@@ -45,12 +45,12 @@ These are the initial sources. Issues #777 and #779 also envision publisher
 interaction and external services as permission sources. That source interface
 remains **explicitly deferred**, not silently dropped. §10 records the
 divergence, and the documentation (`docs/guide/permission-model.md`) already
-frames consent as one source among several so a later source plugs into the
+frames consent as one source among many so a later source plugs into the
 same mechanism. Core code resolves permissions through a per-permission
 `ConsentSignal` closure (`Grant`, `Revoke`, `Neutral`), so a new source is a
 new producer of that signal, not a new resolution algorithm.
 
-Scope: the model governs decisions Trusted Server makes. A downstream protocol
+Scope. The model governs decisions Trusted Server makes. A downstream protocol
 receives the full regulatory context only where that protocol defines fields
 for it (OpenRTB consent fields, and proxy-mode forwarding of raw strings).
 The draft's stronger rule, that identity rows carry normalized per-permission
@@ -129,7 +129,7 @@ or replaces the file and rebuilds to change policy. The file is not read at
 runtime.
 
 This keeps the mechanism the draft rejected, for a reason the draft's own
-premise no longer supports: the draft required policy to flow through the
+premise no longer supports. The draft required policy to flow through the
 runtime config pipeline (`ts config push`, staged activation, §5.5), and that
 activation apparatus does not exist. Publishing a `[permissions]` TOML section
 with no activation protocol would reintroduce exactly the mixed-revision and
@@ -148,7 +148,7 @@ Within the embedded model, the draft's specific complaints are answered:
   a misspelled override key fails loudly instead of being swallowed.
 - Two rule keys naming the same location in different case are rejected at
   parse, so one spelling cannot silently overwrite another.
-- Auditability lives where the draft placed it, in version control: the file
+- Auditability lives where the draft placed it, in version control. The file
   ships in the repository, and its history is the change log.
 
 The `include_str!` path still reaches above the crate root, so the crate
@@ -229,7 +229,7 @@ Format rules, as implemented:
 - A rule key is a bare country or a `country/region` pair. Keys are matched
   case-insensitively, and a region entry takes precedence over its country
   entry.
-- The **signals** section is new relative to the draft: the TCF purpose to
+- The **signals** section is new relative to the draft. The TCF purpose to
   Data Use mapping, the opt-out source list, and the opt-out revoke set are
   data in the file, so no signal-to-permission policy lives in the code. The
   `signals.tcf.authoritative` flag governs only whether a present TCF
@@ -275,7 +275,7 @@ Not implemented. `detect_jurisdiction`, driven by the runtime lists
 jurisdiction source for the auction consent gate and for
 `ConsentContext.jurisdiction`, while the permission model resolves against
 `permissions.yaml` independently. The drift risk the draft named is real and
-stands recorded: adding a country to one source has no effect on the other,
+stands recorded. Adding a country to one source has no effect on the other,
 and no CI test asserts consistency between the legacy lists and the policy
 table. Unifying the two, with the auction gate reading a policy regime class,
 travels with the dispatch migration (§7.4) as deferred follow-up.
@@ -318,7 +318,7 @@ sources count and what they revoke or grant. The code decides only the order.
    closed rather than degrading to the no-signal baseline, which under a
    `granted` baseline would turn garbage into a grant. It never withdraws
    (§4.2). An **expired** TCF record is deliberately a distinct state, not
-   malformed: the decoded record is cleared, the raw string is kept for
+   malformed. The decoded record is cleared, the raw string is kept for
    proxy forwarding, and acquisition proceeds as if the record were absent,
    so the baseline applies.
 4. **Only then does a present TCF record decide the mapped Data Uses**, when
@@ -363,8 +363,8 @@ outcome is also a **withdrawal** is a separate, narrower question (§4.2).
 
 ### 4.2 Withdrawal vs. absence
 
-Withdrawal (destructive: expire the `ts-ec` cookie, write the identity-graph
-tombstone) and non-grant (the permission is simply unset, EC response
+Withdrawal (destructive, expiring the `ts-ec` cookie and writing the
+identity-graph tombstone) and non-grant (the permission is simply unset, EC response
 headers stripped, nothing egressed) are distinct outcomes, never conflated.
 "Baseline" below means the resolved acquisition rule for
 `necessary.operations.storage` in the request's jurisdiction, resolved once
@@ -385,7 +385,7 @@ The implemented trigger, exhaustively (nothing else withdraws):
    signals only, satisfying the draft's live-request constraint by
    construction.
 2. **US-style opt-outs never withdraw.** GPC and sale opt-outs are use
-   restrictions: they suppress the permissions the policy revokes (EC
+   restrictions, which suppress the permissions the policy revokes (EC
    headers stripped, nothing egressed) but never trigger destruction, so
    lifting the opt-out restores the identity.
 3. **A malformed record never withdraws.** It suppresses only (§4, step 3).
@@ -394,12 +394,12 @@ The implemented trigger, exhaustively (nothing else withdraws):
    made a choice is never stripped of an existing identity.
 5. **A policy change is not a user signal.** There are no runtime policy
    edits (§3.1), and a rebuild that tightens a baseline does not itself
-   tombstone: withdrawal still requires the affirmative refusal above on a
+   tombstone, because withdrawal still requires the affirmative refusal above on a
    live request.
 
 The draft's additional trigger, an explicit storage-withdrawal or
 authenticated deletion request honored in every jurisdiction, has no
-implemented carrier: no such endpoint exists. It is recorded as deferred
+implemented carrier, as no such endpoint exists. It is recorded as deferred
 (§11), and when it arrives it joins this list as a global trigger.
 
 `ec_storage_withdrawn` (in `ec/consent.rs`, surfaced as
@@ -428,7 +428,7 @@ associated consistency and retention contracts. That machinery depends on
 storage primitives (linearizable per-key CAS, independent durability
 domains) the current adapters do not qualify. The 2026-07-31 draft remains
 the reference design for that work. Until it lands, the known gaps the
-draft called out stand: cookie expiry is not fenced on the tombstone
+draft called out stand. Cookie expiry is not fenced on the tombstone
 commit, and revocation durability is bounded by the KV store's behavior.
 
 ### 4.4 Signal normalization
@@ -444,7 +444,7 @@ per-permission `ConsentSignal` closure. The implemented pipeline:
 2. Resolve standalone-TCF vs GPP-embedded-TCF conflicts per the configured
    mode (`restrictive`, `permissive`, `newest`), preserving the pre-epic
    selection algorithm.
-3. Apply the expiry check: a TCF record older than the configured maximum
+3. Apply the expiry check, where a TCF record older than the configured maximum
    age has its decoded form cleared, the `expired` flag set, and its raw
    string preserved. Expiry is its own state, excluded from
    malformed-present, and resolves as absent for acquisition.
@@ -459,18 +459,18 @@ so the pre-epic order stands. Recorded in §11.
 store (not on the `EcContext` construction path), a request carrying no
 consent signals falls back to the consent persisted for that EC ID, with
 the jurisdiction re-derived from the current request's geo. Staleness is
-enforced by the store: entries are written with a TTL equal to
+enforced by the store, where entries are written with a TTL equal to
 `max_consent_age_days`, so an entry older than a live record's allowed age
 has expired out of the store. A live signal always wins because the
 fallback is consulted only when the request carries none. The draft's
 declared change, running the loaded record through the full normalization
-pipeline, is not implemented: the loaded record substitutes directly. The
+pipeline, is not implemented. The loaded record substitutes directly. The
 narrow read is permission-exempt by construction, since determining
 storage cannot itself require storage.
 
 **Proxy mode.** Proxy mode still skips semantic decoding entirely. The
 draft's minimal opt-out extraction was not implemented, but the fail-open
-consequence the draft feared does not arise under the permission model: a
+consequence the draft feared does not arise under the permission model. A
 present record in proxy mode is present-but-undecoded, which blocks every
 baseline grant (§4, step 3), and the GPC header needs no decoding, so the
 GPC opt-out is honored directly. No grants are ever derived in proxy mode.
@@ -545,9 +545,9 @@ than constructing the status by hand.
 provider that performs its own fallible lookup, and none of the providers
 shipped in this workspace is one. Fastly's `geo_lookup` returns an
 `Option` and the SDK collapses every hostcall, buffer and parse failure
-into `None` before it reaches the caller; the Cloudflare provider reads
-request headers, which cannot error; the Axum and Spin providers resolve
-nothing at all; and `DisabledGeo`, the default whenever
+into `None` before it reaches the caller. The Cloudflare provider reads
+request headers, which cannot error. The Axum and Spin providers resolve
+nothing at all. `DisabledGeo`, the default whenever
 `[geo] provider` is not `"platform"`, returns nothing by construction. So
 **a host geo outage today does not reach this floor.** It surfaces as
 `Ok(None)`, which is `NoLocation`, and falls back to the deployer's
@@ -557,7 +557,7 @@ outage does, and should read §5.3 and the default-country guidance with
 that in mind. The floor becomes reachable when a vendor geo crate under
 `crates/geo/` does a real lookup that can fail.
 
-At the floor, an explicit valid grant still counts: a TCF record consenting
+At the floor, an explicit valid grant still counts. A TCF record consenting
 to a mapped purpose sets that permission under `requires_signal`, exactly
 the divergence-from-deny-all the draft declared for this row. Absent,
 malformed, or refusing evidence sets nothing.
@@ -583,7 +583,7 @@ makes the dangerous migration config (a permissive `default_country` with
 geo unset) an explicit operator decision rather than an accident, closing
 the highest-severity finding of the PR #838 review.
 
-The guard's consumer list is narrower than the draft's: the draft enumerated
+The guard's consumer list is narrower than the draft's. The draft enumerated
 every jurisdiction consumer (EC provider, regime-gated auction dispatch,
 raw-EC and EID egress). In the implementation the EC provider is the only
 consumer whose behavior the policy gates, because auction dispatch was not
@@ -593,7 +593,7 @@ dispatch joins the model, the guard's trigger list grows with it.
 ### 5.4 Defaults: one deployer fallback plus a protective floor
 
 `[geo] default_country` is **required in every mode** and is validated at
-startup: it must be set, and it must resolve to a rule in
+startup, meaning it must be set, and it must resolve to a rule in
 `permissions.yaml`. It accepts a country (`FR`) or a country/region key
 (`US/CA`), matched case-insensitively, so a no-geo single-state deployment
 can select its state rule. It covers two states the draft kept separate:
@@ -604,7 +604,7 @@ can select its state rule. It covers two states the draft kept separate:
 The draft's `rules.default` policy entry does not exist, so
 "resolved-but-unmatched" falls to the same deployer default as
 "unresolved". The separation the draft treated as safety-critical is the
-one the implementation does keep: a **failed** lookup never reaches the
+one the implementation does keep, where a **failed** lookup never reaches the
 deployer default and resolves at the requires-signal floor instead (§5.2).
 With no default configured startup fails, and in the unreachable
 belt-and-braces case where resolution still finds no rule, the floor
@@ -612,7 +612,7 @@ applies.
 
 ### 5.5 Policy revision activation (deferred)
 
-Not implemented, and currently moot: policy is compiled into the binary
+Not implemented, and currently moot. Policy is compiled into the binary
 (§3.1), so the deployed artifact is the policy identity and there is no
 runtime activation to coordinate. The draft's activation design, covering
 the JCS-canonical policy digest and ordinal pair, the activation register
@@ -628,17 +628,17 @@ requires a live user signal (§4.2), never a policy change.
 
 | Condition                                         | Resolution behavior                                                                                                                                                                        |
 | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Geo lookup reports a failure                      | Requires-signal floor for every permission, never the deployer default; error logged. No provider shipped today can report one, so a host geo outage lands on the row above instead (§5.2) |
+| Geo lookup reports a failure                      | Requires-signal floor for every permission, never the deployer default, with the error logged. No provider shipped today can report one, so a host geo outage lands on the row above instead (§5.2) |
 | No geo provider configured                        | `default_country` baseline, guarded by `assume_single_jurisdiction` (§5.3)                                                                                                                 |
 | Country resolved, no matching rule                | `default_country` baseline (§5.4)                                                                                                                                                          |
 | Region resolved, no region rule                   | Country rule                                                                                                                                                                               |
 | `default_country` unset or names no rule          | Startup failure (§3.3)                                                                                                                                                                     |
 | EC provider configured, no geo, no acknowledgment | Startup failure (§5.3)                                                                                                                                                                     |
-| Malformed `permissions.yaml`                      | Parse error at settings load, once per instance; the embedded file is a build-time constant, never per-request                                                                             |
-| Undecodable record present (TCF, GPP, or USP)     | Revokes every Data Use (fail-closed acquisition); never withdraws; opt-outs still honored                                                                                                  |
-| Expired TCF record                                | Distinct state, not malformed; treated as absent, so the baseline applies                                                                                                                  |
+| Malformed `permissions.yaml`                      | Parse error at settings load, once per instance, because the embedded file is a build-time constant, never per-request                                                                             |
+| Undecodable record present (TCF, GPP, or USP)     | Revokes every Data Use (fail-closed acquisition), never withdraws, and still honors opt-outs                                                                                                  |
+| Expired TCF record                                | Distinct state, not malformed, and treated as absent, so the baseline applies                                                                                                                  |
 | Signals contradict (opt-out plus consent)         | Opt-out wins (§4)                                                                                                                                                                          |
-| No EC provider selected                           | Identity fails closed: nothing created, an incoming cookie value never used or egressed (§7)                                                                                               |
+| No EC provider selected                           | Identity fails closed, with nothing created and an incoming cookie value never used or egressed (§7)                                                                                               |
 
 The posture is fail-closed. Every ambiguous state resolves to the
 configured baseline or more restrictive.
@@ -653,7 +653,7 @@ Consumers of the resolved set in the implementation:
    every declared permission is set (`ec_allowed`). A provider that
    requires nothing always runs. **Geo** is ungated because gating it is
    circular, jurisdiction being an input to permission resolution.
-   **Device** is ungated by a separate, deliberate decision: its
+   **Device** is ungated by a separate, deliberate decision, because its
    security-classification role must run for traffic that has granted
    nothing, and operator selection is the recorded authorization (providers
    spec §5). The built-in Edge Cookie providers declare
@@ -661,7 +661,7 @@ Consumers of the resolved set in the implementation:
 
 2. **EC lifecycle.** Creation requires the provider's declared permissions
    through the gate above. Withdrawal follows §4.2. Recognition and
-   revocation of an existing identifier are never permission-gated: the
+   revocation of an existing identifier are never permission-gated, and the
    withdrawal path runs precisely when `ec_allowed` is false, reading the
    raw cookie value kept for that purpose.
 
@@ -678,11 +678,11 @@ Consumers of the resolved set in the implementation:
    | OpenRTB `user.id` on the `/auction` endpoint | `ec_sharing_allowed`                                          |
    | Identify endpoint (partner-facing)           | `ec_sharing_allowed`                                          |
    | Pull sync (browser-request-scoped)           | `ec_sharing_allowed`, from the live request resolution        |
-   | Batch sync (context-free S2S)                | Authenticated; withdrawn or missing rows are ineligible       |
+   | Batch sync (context-free S2S)                | Authenticated, and withdrawn or missing rows are ineligible   |
    | KV EID resolution for auctions               | `ec_allowed`, then the EID pair gate on the result            |
    | Publisher navigation and page-bids `user.id` | `ec_sharing_allowed` (the storage plus personalised-ads pair) |
 
-   With **no EC provider configured**, identity fails closed: the gate is
+   With **no EC provider configured**, identity fails closed, meaning the gate is
    closed rather than open by default (`ec_allowed` is false), so a cookie
    value present on the request is treated as absent and never used or
    egressed. This replaces PR #838's vacuously-true `is_none_or` check.
@@ -702,7 +702,7 @@ Consumers of the resolved set in the implementation:
 
 4. **Server-side auction dispatch (not migrated).** Dispatch is still gated
    by the consent subsystem (`consent_allows_server_side_auction`), not by
-   the permission model: when the jurisdiction is GDPR or unknown, or an EU
+   the permission model. When the jurisdiction is GDPR or unknown, or an EU
    TCF signal is present, dispatch requires an effective TCF record
    consenting to Purpose 1, and otherwise no bid request leaves (a no-bid
    response, with no PBS/APS call and no UA/IP/geo forwarding). Known
@@ -715,7 +715,7 @@ Consumers of the resolved set in the implementation:
    (§11) together with §3.4.
 
 The client-cycle resolve endpoint (`/_ts/api/v1/ec/resolve`) is a further
-consumer: a provider-derived identifier posted by the page is accepted only
+consumer, where a provider-derived identifier posted by the page is accepted only
 through the same provider and permission gates.
 
 ### 7.1 Contextual OpenRTB v1 allowlist (deferred)
@@ -741,8 +741,8 @@ Implemented, in `permissions.rs`, `ec/consent.rs`, `ec/mod.rs`,
   destroying, consent is not a withdrawal, GPC alone never withdraws, sale
   opt-outs never withdraw, no signal never withdraws, malformed never
   withdraws.
-- **Fail-closed acquisition.** Malformed records block baseline grants;
-  each undecodable record family is detected; an expired TCF record is not
+- **Fail-closed acquisition.** Malformed records block baseline grants,
+  each undecodable record family is detected, and an expired TCF record is not
   treated as malformed and resolves at the baseline.
 - **Geo status.** A failed lookup resolves at the requires-signal floor
   (permissions and the storage baseline both), driven through a
@@ -790,10 +790,10 @@ acceptance contract, not two:
 
 | #779 says                                                                                    | This spec says                                                                                                                         | Why                                                                                                                     |
 | -------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| Unmatched countries fall to `default_country`                                                | Adopted: unmatched and unresolved requests both fall to the required `[geo] default_country`; a **failed** lookup floors instead (§5)  | The failure state is the one that must never reach a permissive default; the draft's `rules.default` split was not kept |
-| The full TCF purpose vocabulary is modeled                                                   | Adopted and extended: all eleven purposes are signal-resolved, and the full Privacy Taxonomy is carried as declared baseline (§2)      | The joint taxonomy work made whole-taxonomy declaration the goal; `denied` defaults keep undeclared uses inert          |
-| Policy is an embedded file                                                                   | Adopted: `permissions.yaml` is compiled into the build (§3.1); runtime configuration is deferred follow-up                             | The runtime push and activation pipeline does not exist; version control is the audit trail meanwhile                   |
-| Permission sources are open-ended (#777: publisher interaction, external services may grant) | Sources are jurisdiction, policy, and the §4 signals; further sources are deferred, and the `ConsentSignal` closure is their seam (§1) | Shipping an interface with no second source repeats the inert-surface mistake; the extension seam is defined            |
+| Unmatched countries fall to `default_country`                                                | Adopted. Unmatched and unresolved requests both fall to the required `[geo] default_country`, and a **failed** lookup floors instead (§5)  | The failure state is the one that must never reach a permissive default, and the draft's `rules.default` split was not kept |
+| The full TCF purpose vocabulary is modeled                                                   | Adopted and extended. All eleven purposes are signal-resolved, and the full Privacy Taxonomy is carried as declared baseline (§2)      | The joint taxonomy work made whole-taxonomy declaration the goal, and `denied` defaults keep undeclared uses inert          |
+| Policy is an embedded file                                                                   | Adopted. `permissions.yaml` is compiled into the build (§3.1), and runtime configuration is deferred follow-up                             | The runtime push and activation pipeline does not exist, and version control is the audit trail meanwhile                   |
+| Permission sources are open-ended (#777: publisher interaction, external services may grant) | Sources are jurisdiction, policy, and the §4 signals. Further sources are deferred, and the `ConsentSignal` closure is their seam (§1) | Shipping an interface with no second source repeats the inert-surface mistake, and the extension seam is defined            |
 
 ## 11. Revision record vs the 2026-07-31 draft
 
@@ -803,11 +803,11 @@ PR #1045).
 
 | Draft position                                                                                                                                      | Implemented position                                                                                                                                                                                                                  | Why                                                                                                                                                                                        |
 | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Vocabulary is two TCF-purpose identifiers, enforced permissions only (§2)                                                                           | IAB Privacy Taxonomy Data Uses: eleven named purposes all signal-resolved, plus 53 taxonomy Data Uses carried as declared but unenforced baseline flags                                                                               | The joint taxonomy adoption postdates the draft; whole-taxonomy declaration serves completeness and demonstration, with `denied` defaults keeping unenforced flags inert                   |
-| Policy lives in `[permissions]` in `trusted-server.toml`, published via `ts config push` (§3.1)                                                     | Policy is `permissions.yaml`, compiled into the build with `include_str!`, parsed once and covered by tests                                                                                                                           | The runtime config push and activation apparatus does not exist; publishing runtime policy without it would recreate the hazards the draft cataloged; runtime policy is deferred follow-up |
-| Every group carries a required `regime` class read by auction dispatch (§3.2)                                                                       | No regime field exists                                                                                                                                                                                                                | Its only consumer, regime-gated dispatch, was not migrated; the field returns with that work                                                                                               |
-| Overrides name explicit acquisition rules, replacing the `+`/`-` sigils (§3.2)                                                                      | Adopted: a detailed rule's `permissions` map assigns `granted`, `requires_signal`, or `denied` per Data Use                                                                                                                           | The draft's requirement, expressed in the YAML schema; `requires_signal` is now expressible per rule                                                                                       |
-| Two fallbacks: policy `rules.default` for unmatched countries, `default_country` only for the static no-geo mode (§5.4)                             | One required `[geo] default_country` covers unmatched and unresolved requests in every mode, startup-validated; a failed lookup floors separately                                                                                     | One deployer knob is simpler; the safety-critical separation kept is failure vs absence, carried by `GeoStatus`                                                                            |
+| Vocabulary is two TCF-purpose identifiers, enforced permissions only (§2)                                                                           | IAB Privacy Taxonomy Data Uses, with eleven named purposes all signal-resolved, plus 53 taxonomy Data Uses carried as declared but unenforced baseline flags                                                                               | The joint taxonomy adoption postdates the draft, and whole-taxonomy declaration serves completeness and demonstration, with `denied` defaults keeping unenforced flags inert                   |
+| Policy lives in `[permissions]` in `trusted-server.toml`, published via `ts config push` (§3.1)                                                     | Policy is `permissions.yaml`, compiled into the build with `include_str!`, parsed once and covered by tests                                                                                                                           | The runtime config push and activation apparatus does not exist, so publishing runtime policy without it would recreate the hazards the draft cataloged. Runtime policy is deferred follow-up |
+| Every group carries a required `regime` class read by auction dispatch (§3.2)                                                                       | No regime field exists                                                                                                                                                                                                                | Its only consumer, regime-gated dispatch, was not migrated, and the field returns with that work                                                                                               |
+| Overrides name explicit acquisition rules, replacing the `+`/`-` sigils (§3.2)                                                                      | Adopted. A detailed rule's `permissions` map assigns `granted`, `requires_signal`, or `denied` per Data Use                                                                                                                           | The draft's requirement, expressed in the YAML schema. `requires_signal` is now expressible per rule                                                                                       |
+| Two fallbacks: policy `rules.default` for unmatched countries, `default_country` only for the static no-geo mode (§5.4)                             | One required `[geo] default_country` covers unmatched and unresolved requests in every mode, startup-validated, and a failed lookup floors separately                                                                                     | One deployer knob is simpler, and the safety-critical separation kept is failure vs absence, carried by `GeoStatus`                                                                            |
 | Validation checks assigned ISO 3166-1 codes, assigned subdivisions, and a group identifier grammar (§3.3)                                           | Validation covers unknown groups, permissions, acquisitions, revoke rules, incomplete groups, case-duplicate rule keys, and unknown fields on detailed rules                                                                          | Smaller surface shipped first; the EU/EEA coverage test guards the shipped table against the typo class; ISO-assignment checks are future hardening                                        |
 | Three-class signal taxonomy with regime-scoped grant acceptance; the US posture is `requires_signal` with GPP/USP non-opt-out values as grants (§4) | TCF is the only grant source; the US posture is a `granted` baseline that opt-outs revoke; explicit non-opt-out values grant nothing                                                                                                  | A simpler two-signal model without regimes; the cost, no-signal US traffic is allowed by baseline rather than blocked pending a signal, is a deliberate policy choice in the shipped file  |
 | Malformed-present blocks grants per record family and mapped section (§4.4, §4.5)                                                                   | Any present-but-undecodable record revokes every Data Use for the request                                                                                                                                                             | Strictly more restrictive simplification; per-family scoping needs the full §4.5 decoder work                                                                                              |

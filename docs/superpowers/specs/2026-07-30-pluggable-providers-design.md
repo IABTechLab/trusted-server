@@ -96,16 +96,16 @@ default_country = "FR"          # required (section 6)
 ```
 
 **The `host-signals` EC provider** (identity from HMAC over the host TLS JA4
-and HTTP/2 fingerprints plus the client IP) was deliberately dropped from the
+and HTTP/2 signals plus the client IP) was deliberately dropped from the
 2026-07-31 draft. It has since shipped in PR #1044 as an opt-in built-in
 (`[ec.providers.host-signals]`), implemented against the host-agnostic
 `HostSignals` capability rather than a Fastly API, so any host that supplies
-the fingerprints can run it and a host that supplies none cannot build it.
-When the host supplies no fingerprint at all the provider defers with a
+the signals can run it and a host that supplies none cannot build it.
+When the host supplies no signal at all the provider defers with a
 warning instead of degrading to an IP-only identifier under the host-signals
 name. **An open review question stands on whether this provider should ship
 in the series at all**, because its identifier shape shares the built-in
-HMAC grammar and a sign-off row defers host fingerprint processing. The
+HMAC grammar and a sign-off row defers host signal processing. The
 question is flagged for the series review and this spec does not present
 the provider as settled either way.
 
@@ -124,7 +124,7 @@ an EC value through the selected provider:
 | **Create**          | EC generation on first eligible request, and the client-cycle resolve endpoint                                                                                                                                                                                    | The provider returns the identifier (`generate` server-side, `resolve_from_client` for the client cycle) and only core writes the cookie, after enforcing the global bounds below.                                                                                                                                                                                                                                                    |
 | **Recognize**       | Reading `ts-ec` back from the request, deciding `ec_was_present`, withdrawal checks, and every path that hands the value onward: the origin URL in `append_ec_id`, the click-target URL in `handle_first_party_click`, and the proxied body an integration builds | `accepts_id` answers whether a value is a well-formed identifier the provider issues. A value the selected provider does not recognize is treated as absent, so it is never used or egressed, while the raw cookie value stays visible to withdrawal handling. The egress paths reach the same answer through `edge_cookie::recognized_ec_id`, and a deployment with no provider selected recognizes nothing and so egresses nothing. |
 | **KV key**          | Identity-graph row reads and writes                                                                                                                                                                                                                               | `normalize_id_for_kv` returns the key form. The default lowercases the built-in HMAC hash segment and preserves the suffix, keeping today's keys. An opaque or case-sensitive provider overrides to the identity function so distinct identifiers never collapse into one row.                                                                                                                                                        |
-| **Withdraw**        | Expiring the cookie and writing revocation markers                                                                                                                                                                                                                | The identifiers eligible for a **graph tombstone** are exactly those the selected provider owns, dispatched on the `{code}~` prefix first and then `accepts_id`, never a shape check the provider cannot influence. Expiring the **cookie** is broader: it keys off the raw cookie being present, so it still fires for an identifier the selected provider does not own (see the switching case, §6.1).                              |
+| **Withdraw**        | Expiring the cookie and writing revocation markers                                                                                                                                                                                                                | The identifiers eligible for a **graph tombstone** are exactly those the selected provider owns, dispatched on the `{code}~` prefix first and then `accepts_id`, never a shape check the provider cannot influence. Expiring the **cookie** is broader, because it keys off the raw cookie being present, so it still fires for an identifier the selected provider does not own (see the switching case, §6.1).                              |
 
 **Invariant:** for every provider `P` and every identifier `id` created by
 `P`, `id` round-trips read-back byte for byte. A test in `ec/mod.rs` proves
@@ -152,7 +152,7 @@ straddle the envelope never count each other, and `cluster_size` under-reports
 for as long as both populations coexist.
 
 That undercount is accepted rather than bridged, for three reasons.
-`cluster_size` is reported in the identify response and gates nothing: the
+`cluster_size` is reported in the identify response and gates nothing, and the
 only place its value is read at all is a cache short circuit in
 `evaluate_cluster` that tests whether a value is stored, not what it is, and
 the `cluster_trust_threshold` and `cluster_recheck_secs` settings that a
@@ -192,7 +192,7 @@ wrong place, because what a provider may see is not the control. What a provider
 may do with what it sees is the control, and that is the permission model.
 
 So `RequestInfo` carries everything the request carries, whether or not code in
-this repository reads it yet. The rule stands for behavioural traits, where a
+this repository reads it yet. The rule stands for behavioral traits, where a
 method with no caller really is dead weight. How the surface observed in PR #838
 resolved in the implementation:
 
@@ -269,9 +269,9 @@ providers cannot silently mix identity populations, and a withdrawal always
 acts on a key that can only belong to one provider. The built-in HMAC
 provider creates `hmac~<64 hex>.<6 alphanumeric>` and dual-reads its
 pre-envelope bare form for one release cycle so deployed cookies keep
-working; the bare form belongs to hmac alone. Codes are allocated
+working, and the bare form belongs to hmac alone. Codes are allocated
 append-only in `provider-code-registry.md`, and a leading digit is valid
-(`51dd`).
+(`1a2b`).
 
 The draft's alternative shape (`parse` returning a typed `EcId`,
 `graph_key_suffix`, `cluster_prefix`, `verify`, and a version-carrying
@@ -328,14 +328,14 @@ structural:
   selection defaults.** Device classification is not an input to permission
   resolution. The neutral `builtin` classifier reads only the User-Agent
   and makes no host call. The draft went further and made selecting a
-  fingerprint-reading device provider a startup error pending a separate
+  host-signal-reading device provider a startup error pending a separate
   security design. The implementation instead ships `[device] provider =
 "fastly"` as a selectable opt-in. The Fastly adapter injects a
-  `HostSignals` service carrying the TLS JA4 and HTTP/2 fingerprints, and
+  `HostSignals` service carrying the TLS JA4 and HTTP/2 signals, and
   the provider uses them to strengthen the browser/bot gate that guards EC
   writes. Identity rows persist the derived classification fields (the JA4
   class segment and a 12-hex-character hash prefix of the HTTP/2 SETTINGS
-  fingerprint), not raw fingerprints, and the neutral default persists
+  signal), not raw signals, and the neutral default persists
   neither because the builtin provider produces no such fields.
 
 ## 6. Selection, validation, and failure modes
@@ -344,7 +344,7 @@ All configuration validation happens at **settings construction**
 (`Settings::finalize_deserialized` runs every check below), so a
 misconfiguration expressible in configuration alone is a startup error,
 never a silent behavior change. A selection that only the running host can
-satisfy (an injected vendor provider, or host fingerprints) fails loudly
+satisfy (an injected vendor provider, or host signals) fails loudly
 when the provider is built, stopping the request rather than degrading.
 
 | Configuration state                                                            | Behavior                                                                                                                                                                                                                                              |
@@ -354,7 +354,7 @@ when the provider is built, stopping the request rather than degrading.
 | `provider = "none"` (explicit stateless)                                       | Valid, and means exactly what omitting the selector means. Any configured provider block alongside it is a startup error, the same stray-block rule as below.                                                                                         |
 | A configured `[ec.providers.<key>]` block that is not the selected one         | **Startup error** (checked for the `hmac` block and every vendor block). An unreferenced block is almost always a mistyped selector or a stale block, and accepting it silently invites configuration drift.                                          |
 | A selected vendor key whose provider the adapter did not inject                | Loud failure when the provider is built, naming the key, so the deployment never silently runs stateless.                                                                                                                                             |
-| `provider = "host-signals"` on a host that supplies no fingerprints            | Loud failure when the provider is built. A host that cannot produce `HostSignals` cannot run the provider.                                                                                                                                            |
+| `provider = "host-signals"` on a host that supplies no signals            | Loud failure when the provider is built. A host that cannot produce `HostSignals` cannot run the provider.                                                                                                                                            |
 | `provider = "client-fixed"` in a production build                              | Startup error. The demonstration provider is compiled only behind the `client-fixed-demo` cargo feature.                                                                                                                                              |
 | No `provider`, no providers block                                              | Valid, the neutral default for that concern.                                                                                                                                                                                                          |
 | Deprecated `[ec] passphrase`                                                   | Migrated to `provider = "hmac"` with the passphrase in `[ec.providers.hmac]`, with a deprecation warning naming the new location. Both forms together are rejected so a half-edited file fails loudly instead of one form silently winning.           |
@@ -406,7 +406,7 @@ What a switch does, precisely:
   treated as absent. It never becomes the request's active identity, never
   egresses to a partner, and is rejected on the pull-sync, batch-sync and
   admin paths too. This is the §5 guarantee and it is the half of the
-  behavior that matters most: two providers' identity populations can never
+  behavior that matters most, which is that two providers' identity populations can never
   mix.
 - **The browser cookie.** A later withdrawal still expires the `ts-ec`
   cookie, because that path keys off the raw cookie being present rather
@@ -443,7 +443,7 @@ logged, none silent:
 | `generate` returns an error                                    | No identity this request. The organic caller logs at error level and the request proceeds stateless. No cookie is written.                                                 |
 | A provider creates an identifier outside the global bounds     | Rejected at create, never rewritten. The organic path yields no identity. The resolve endpoint returns 400.                                                                |
 | Identity-graph write fails at create                           | The create is undone (no identifier, no cookie), with the error logged. The resolve endpoint returns 503. The next eligible request retries.                               |
-| The host-signals provider finds no TLS/HTTP-2 fingerprints     | Defers with a warning. No identity this request, and no degraded IP-only identifier is created under the host-signals name.                                                |
+| The host-signals provider finds no TLS/HTTP-2 signals     | Defers with a warning. No identity this request, and no degraded IP-only identifier is created under the host-signals name.                                                |
 | Geo lookup **fails** (the provider errors)                     | Every permission resolves to the requires-signal floor, and the failure is logged at error level. The failure is **not** papered over with the `default_country` baseline. |
 | Geo resolves **no location**, or a country/region with no rule | The `[geo] default_country` baseline applies. This is the configured-default case, deliberately distinct from the failure row above (`GeoStatus` in `ec/consent.rs`).      |
 | An incoming cookie value fails the bounds at read-back         | Treated as absent, with a warning naming the source.                                                                                                                       |
@@ -462,12 +462,12 @@ The draft specified a delimiter-free physical key grammar with fixed-width
 segments, a provider-code registry, record classes for family revocation,
 authority state, negative-intent outbox, rowless withdrawal, and deployment
 metadata, wire schemas with known-answer vectors, and a per-field graph-row
-contract. The provider-code registry is now implemented: codes are
+contract. The provider-code registry is now implemented, with codes
 allocated in `provider-code-registry.md`, carried as the `{code}~` prefix
 of every created identifier, and therefore present in every graph key. The
 key grammar differs from the draft in one deliberate way, a tilde separator
 instead of delimiter-free fixed width, because pre-envelope bare
-identifiers remain deployed and a code such as `51dd` is valid hex, so
+identifiers remain deployed and a code such as `1a2b` is valid hex, so
 delimiter-free parsing could misread a legacy identifier during the
 migration window. The remainder (record classes, family revocation,
 authority state, outbox, rowless withdrawal, wire schemas, per-field
@@ -588,7 +588,7 @@ Implemented, in the crates named:
   acknowledgment.
 - Geo builder tests showing the default selects no geo, `none` selects no
   geo explicitly, and `platform` selects the host implementation.
-- Host-signals provider tests covering creating from fingerprints,
+- Host-signals provider tests covering creating from host signals,
   deferring without them, and the loud failure of a selected but
   uninjected vendor provider.
 
@@ -644,8 +644,8 @@ this revision describes.
 | Every selection key is closed and unknown keys are startup errors                                                                   | Device and geo keys are closed. EC vendor keys are open. Unknown blocks are captured as raw values in core, the adapter deserializes its own block, and a selected key with no injected provider fails loudly.                                                                                                               | Core never names a vendor, so a vendor provider adds no core change.                                                                                                      |
 | Capability mismatch is a startup error at adapter wiring time                                                                       | Configuration coherence fails at startup. A host-capability mismatch (missing `HostSignals`, uninjected vendor) fails loudly when the provider is built, stopping the request.                                                                                                                                               | The adapter capability declaration that would move the check to startup is deferred with the capability matrix.                                                           |
 | A creating provider with no identity-graph store is a startup error                                                                 | Not implemented. `ec_store` stays optional. The resolve endpoint refuses to create without a graph. The organic path persists rows whenever the graph is configured.                                                                                                                                                         | Portability adapters run without platform KV. Whether configuration should force the pairing is follow-up work.                                                           |
-| `[device] provider = "fastly"` is startup-rejected pending a separate security design                                               | Shipped as a selectable opt-in. The Fastly adapter injects `HostSignals`, the provider strengthens the browser/bot gate, and rows persist derived classes, not raw fingerprints.                                                                                                                                             | Selection is an explicit operator opt-in and the neutral default makes no host fingerprint call.                                                                          |
-| The `host-signals` EC provider is deliberately dropped and its selection rejected                                                   | Shipped in PR #1044 as an opt-in built-in that defers with a warning when the host supplies no signals. **Open, flagged for the series review**, not settled either way.                                                                                                                                                     | Its identifier shape shares the HMAC grammar, and a sign-off row defers host fingerprint processing, so the review decides whether the provider ships in the series.      |
+| `[device] provider = "fastly"` is startup-rejected pending a separate security design                                               | Shipped as a selectable opt-in. The Fastly adapter injects `HostSignals`, the provider strengthens the browser/bot gate, and rows persist derived classes, not raw signals.                                                                                                                                             | Selection is an explicit operator opt-in and the neutral default makes no host signal call.                                                                          |
+| The `host-signals` EC provider is deliberately dropped and its selection rejected                                                   | Shipped in PR #1044 as an opt-in built-in that defers with a warning when the host supplies no signals. **Open, flagged for the series review**, not settled either way.                                                                                                                                                     | Its identifier shape shares the HMAC grammar, and a sign-off row defers host signal processing, so the review decides whether the provider ships in the series.      |
 | Geo default flip sequenced into the later permission-model step, with an acknowledgment guard                                       | Landed as specified in the same series, with the default of none, `default_country` required and validated against `permissions.yaml`, the `assume_single_jurisdiction` acknowledgment, and a failed lookup resolving to the requires-signal floor with error logging (`GeoStatus`, resolved in core so all adapters agree). | The permission model shipped in PR #1045, so the constraints exist where the draft required them.                                                                         |
 | All adapters serve the full EC feature set identically                                                                              | Selector behavior is identical through the shared builders and core constructors. The EC API routes (identify, batch-sync, ec/resolve) are Fastly-only, documented in the Spin route list.                                                                                                                                   | The portability adapters do not yet wire platform KV, and the gap is documented rather than silent.                                                                       |
 | Conformance suite, adapter capability matrix, delimiter-free key grammar, `verify`, `legacy_providers`, `versions` / `mint_version` | None of these are in PR #1043 or #1044. All are tracked follow-up work, deferred, not silently dropped.                                                                                                                                                                                                                      | The shipped seam did not need them, and each returns with the feature that gives it a production caller, per the spec's own minimalism rule.                              |

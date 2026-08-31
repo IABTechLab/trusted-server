@@ -1128,7 +1128,7 @@ and active-scope-change rules. `security_cookie_same_site` accepts exactly
 emitted `Secure` attribute, and the cookie never carries `HttpOnly`.
 
 Both exposure booleans default to `false`. ClientID-to-origin additionally
-requires the owner-scoped overlay capability. Host fingerprints additionally
+requires the owner-scoped overlay capability. Host signals additionally
 require qualified JA4 availability and sign-offs 23/28. A selected adapter
 that cannot preserve admitted request-header field-line order or enforce the
 request/body limits fails startup for protection rather than synthesizing

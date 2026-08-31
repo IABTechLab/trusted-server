@@ -44,7 +44,7 @@ the code lands.
 ## 1. The problem, with the code that causes it
 
 Every claim here was read from `main` at b7fcb5d4c (28 August), which the
-seventh PR targets; the five series PRs do not touch these files.
+seventh PR targets, and the five series PRs do not touch these files.
 
 1. **The registry is closed.** `IntegrationRegistry::new` takes only
    `&Settings` and iterates a fixed table
@@ -137,7 +137,7 @@ modules so a vendor crate rebuild invalidates the server-side template
 cache. The registry verifies a carried module's declared hash against its source
 when it is built, so a stale literal is a startup error rather than a
 stale script served under a valid-looking URL. Covering carried modules in
-the template cache fingerprint means the publisher entry point needs the
+the template cache hash means the publisher entry point needs the
 registry, so it takes the configuration and the registry as one argument
 rather than two. The served script keeps its cache rule, being the
 `?v=<hash>` query matched at serve time (there is no integrity attribute on the tag today, and
@@ -271,7 +271,7 @@ Two more places every move must touch, found by mapping `main`:
   files included, so a vendor move that leaves its entry behind breaks the
   build rather than a test. The guard cannot derive its list from the
   registrations, because `include_str!` paths are fixed at compile time, so
-  this change drops the nine vendors' files from the guard instead: a module
+  this change drops the nine vendors' files from the guard instead, because a module
   crate is outside the core neutrality guarantee, and a move then deletes
   nothing there.
 - The `ts audit` command carries its own vendor table (detection patterns
@@ -326,7 +326,7 @@ that the project pays for today, most recently in PR #1054.
 ## 8. What implementing this found
 
 A probe integration built outside `trusted-server-core` and registered
-through an adapter exercised every seam end to end. Four things surfaced
+through an adapter exercised every seam end to end. Seven things surfaced
 that reading the code did not, and they are recorded here rather than left
 for each vendor to rediscover.
 
@@ -343,7 +343,7 @@ for each vendor to rediscover.
    crate keeps a literal beside its `include_str!`, and on a checkout that
    rewrites line endings the embedded file changes and the literal stops
    matching, which fails startup on that machine only. A generated helper
-   or a documented build-script recipe removes the trap; the probe pins the
+   or a documented build-script recipe removes the trap, and the probe pins the
    file's line endings and tests the literal, which every vendor would
    otherwise have to reinvent.
 3. **A provider is resolved more than once per request.** A proxy that
@@ -405,7 +405,7 @@ defines, and both should land before the first vendor is asked to use it.
 | 3   | A registration may carry its own browser JavaScript                                                                                                                        | Proposed             |
 | 4   | Deploy validation moves onto the registration                                                                                                                              | Proposed             |
 | 5   | The nine existing integrations migrate one PR each, on the schedule in §4                                                                                                  | Proposed             |
-| 6   | This change is complete in itself: after it, no vendor move needs a core change                                                                                            | Proposed             |
+| 6   | This change is complete in itself, so after it no vendor move needs a core change                                                                                            | Proposed             |
 | 7   | Identity, geo and device providers are capabilities of a module registration (§3.6), the #1043 review's rule applied to all three                                          | Proposed             |
 | 8   | No provider is built into core: HMAC and the User-Agent-only device provider are Tech Lab-owned modules configured under `[integrations.<id>]`, and core keeps only `none` | Proposed             |
 | 9   | This spec and its core implementation precede #1043; 51Degrees implements the core seam, the nine vendor moves in §4 stay one PR each                                      | Proposed             |
@@ -419,4 +419,4 @@ defines, and both should land before the first vendor is asked to use it.
 | 2026-08-28 | Corrected line references to `main` at b7fcb5d4c and added what mapping `main` found: composition of the served script moves into core (§3.2), registration enumeration and the auction-only `adserver_mock` case (§3.3), the duplicate-id gap (§3.1), the source-file guard and the `ts audit` vendor table (§4), the renderer risk (§7). |
 | 2026-08-28 | Recorded what implementing the seam found (§8): the operator CLI skips a vendor's deploy rules, a carried module's hash literal is fragile, providers resolve more than once per request, and one core reader still reads an APS payload. Recorded the construction-time hash check in §3.2.                                               |
 | 2026-08-28 | Adopted the #1043 review's registration shape for identity and applied its rule to geo and device, with no provider built into core (§3.6, §6 item 2, §8 rows 7 to 9). Recorded the relationship to #986 and reordered the series so this spec and its implementation come first.                                                          |
-| 2026-08-30 | Moved the five series design specs and the provider-code registry into this PR from PRs #1043 to #1047, so every normative document is reviewed before the code that implements it. Document content is unchanged; only this status line and this row are new.                                                                             |
+| 2026-08-30 | Moved the five series design specs and the provider-code registry into this PR from PRs #1043 to #1047, so every normative document is reviewed before the code that implements it. Document content is unchanged, and only this status line and this row are new.                                                                             |
