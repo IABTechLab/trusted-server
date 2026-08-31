@@ -327,9 +327,11 @@ This release is a direct configuration and protocol cutover:
    selected APS `hb_adid`.
 5. Disable publisher-native APS demand for the Trusted Server test cohort.
 
-There is no legacy runtime switch. Roll back by disabling `[auction]` or
-removing the APS provider, restoring native APS for the cohort, or deploying
-the prior binary.
+There is no legacy runtime switch. To roll back traffic, disable `[auction]` or
+remove the APS provider and restore native APS for the cohort. To roll back the
+binary, restore the old-schema configuration blob with the old binary. A prior
+binary rejects the new `[auction.bidders]` field even when auction execution is
+disabled.
 
 Changing `rendering_mode` does not update pages that are already loaded or stored in an HTML cache. A cached `trusted_server` page can continue requesting `/integrations/aps/renderer` after a native-mode deployment removes that route. A cached `publisher_native` page continues using its captured native mode after rollback. Coordinate the mode change with HTML cache expiry or purge and reload active test sessions before judging the result.
 

@@ -178,9 +178,9 @@ pub trait IntegrationConfig: DeserializeOwned + Validate {
 
     /// Validate the public field schema for an explicitly disabled config.
     ///
-    /// Integrations with removed fields override this hook using a disabled-safe
-    /// typed schema. The default preserves existing support for minimal disabled
-    /// blocks whose enabled-only required fields are omitted.
+    /// The default deserializes the integration's normal schema, except it
+    /// permits omitted enabled-only required fields. Override this only when a
+    /// disabled integration has a distinct public schema.
     ///
     /// # Errors
     ///
@@ -2686,6 +2686,17 @@ impl Settings {
     ///
     /// - [`TrustedServerError::Configuration`] if the JSON value is invalid or missing required fields
     pub fn from_json_value(value: JsonValue) -> Result<Self, Report<TrustedServerError>> {
+        if value
+            .get("auction")
+            .and_then(JsonValue::as_object)
+            .and_then(|auction| auction.get("providers"))
+            .is_some_and(JsonValue::is_array)
+        {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "Configuration field `auction.providers` uses the removed list schema; migrate to `[auction.providers.<id>]` map entries as described in the CHANGELOG.md breaking migration".to_string(),
+            }));
+        }
+
         let settings: Self =
             serde_json::from_value(value).change_context(TrustedServerError::Configuration {
                 message: "Failed to deserialize JSON configuration".to_string(),
@@ -3382,6 +3393,27 @@ mod tests {
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+
+    #[test]
+    fn json_settings_rejects_legacy_auction_provider_list_with_migration_guidance() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should load the test settings fixture");
+        let mut value = serde_json::to_value(settings)
+            .expect("should serialize the test settings fixture to JSON");
+        value["auction"]["providers"] = json!(["prebid"]);
+
+        let error = Settings::from_json_value(value)
+            .expect_err("should reject the removed auction provider list schema");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("auction.providers"),
+            "error should identify the removed field, got {rendered}"
+        );
+        assert!(
+            rendered.contains("CHANGELOG.md"),
+            "error should direct operators to the migration guidance, got {rendered}"
+        );
+    }
 
     #[test]
     fn auction_debug_comment_options_default_matches_serde_defaults() {

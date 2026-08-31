@@ -151,7 +151,7 @@ enabled = false
 # environment override. Set false to return unre-written winning-bid adm,
 # skipping proxy/click URL conversion and creative TSJS injection.
 # Sanitization is controlled separately by `sanitize_creatives` below.
-# Restore and push true before an older-binary rollback.
+# A rollback across schema versions requires the matching old-schema blob.
 rewrite_creatives = true
 # Strip executable markup (script/object/embed/form/...) from winning-bid adm,
 # removing those elements together with their inner content.

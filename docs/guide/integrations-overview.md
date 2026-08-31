@@ -333,34 +333,21 @@ Are you developing/testing integrations?
 
 ## Environment Variables
 
-All integrations can be configured via environment variables:
+EdgeZero overlays existing scalar leaves only. Use the
+`TRUSTED_SERVER__INTEGRATIONS__{INTEGRATION}__{SETTING}` pattern for integration
+leaves. Provider map keys preserve hyphens, so `pbs-main` uses `PBS-MAIN`, not
+`PBS_MAIN`. Shell assignment syntax cannot contain that hyphenated name; use
+`env` when running the CLI:
 
 ```bash
-# Pattern: TRUSTED_SERVER__INTEGRATIONS__{INTEGRATION}__{SETTING}
-
-# Existing Prebid browser-map leaves
-TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=2000
-TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=true
-
-# Existing provider-map leaves use the validated provider ID segment
-TRUSTED_SERVER__AUCTION__PROVIDERS__PBS_MAIN__ENDPOINT="https://prebid.example.com/openrtb2/auction"
-
-# Next.js
-TRUSTED_SERVER__INTEGRATIONS__NEXTJS__ENABLED=true
-
-# Permutive
-TRUSTED_SERVER__INTEGRATIONS__PERMUTIVE__ORGANIZATION_ID="neworg"
-TRUSTED_SERVER__INTEGRATIONS__PERMUTIVE__WORKSPACE_ID="workspace-123"
-
-# Sourcepoint
-TRUSTED_SERVER__INTEGRATIONS__SOURCEPOINT__ENABLED=true
-TRUSTED_SERVER__INTEGRATIONS__SOURCEPOINT__CDN_ORIGIN="https://cdn.privacy-mgmt.com"
-
-# Testlight
-TRUSTED_SERVER__INTEGRATIONS__TESTLIGHT__ENDPOINT="https://test.example.com"
+env 'TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=2000' \
+  'TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=true' \
+  'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__DEBUG=true' \
+  ts config validate
 ```
 
-See [Configuration Reference](./configuration.md) for complete details.
+Edit TOML and re-push it to change arrays, tables, maps, or rules. See
+[Configuration Reference](./configuration.md) for complete details.
 
 ## Custom Integrations
 

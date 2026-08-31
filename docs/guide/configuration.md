@@ -139,10 +139,11 @@ base TOML configuration by `ts config validate`, `ts config diff`, and
 stored in the app-config blob. Changing an environment variable requires
 rerunning validation and pushing the resolved config, not rebuilding the binary.
 
-EdgeZero v0.0.4 only overrides leaves that already exist in the parsed TOML; it
-does not create missing fields. Add newly introduced defaulted fields to an
-existing config before relying on their environment overrides. Pass `--no-env`
-to use file values without the overlay.
+EdgeZero v0.0.4 only overrides scalar leaves that already exist in the parsed
+TOML. It cannot replace arrays, tables, or map entries as a whole, and it does
+not create missing fields. Edit and re-push TOML for those values. Add newly
+introduced scalar fields to an existing config before relying on their
+environment overrides. Pass `--no-env` to use file values without the overlay.
 
 ### Format
 
@@ -156,39 +157,20 @@ TRUSTED_SERVER__SECTION__SUBSECTION__FIELD
 - Separator: `__` (double underscore)
 - Case: UPPERCASE
 - Sections: Match TOML hierarchy
+- Map keys: Preserve TOML punctuation. For example, provider key `pbs-main`
+  uses the `PBS-MAIN` segment, not `PBS_MAIN`.
 
-### Examples
-
-**Simple Field**:
-
-```bash
-TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
-```
-
-**Nested Field**:
+Shell assignment syntax cannot contain a hyphenated variable name. Use `env`
+to apply a provider override to a command:
 
 ```bash
-TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__ENDPOINT=https://prebid.example.com/openrtb2/auction
+env 'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__DEBUG=true' \
+  ts config validate
 ```
 
-**Array Field (JSON)**:
-
-```bash
-TRUSTED_SERVER__INTEGRATIONS__PREBID__CLIENT_SIDE_BIDDERS='["example-browser-a","example-browser-b"]'
-```
-
-**Array Field (Indexed)**:
-
-```bash
-TRUSTED_SERVER__INTEGRATIONS__PREBID__CLIENT_SIDE_BIDDERS__0=example-browser-a
-TRUSTED_SERVER__INTEGRATIONS__PREBID__CLIENT_SIDE_BIDDERS__1=example-browser-b
-```
-
-**Array Field (Comma-Separated)**:
-
-```bash
-TRUSTED_SERVER__INTEGRATIONS__PREBID__CLIENT_SIDE_BIDDERS=example-browser-a,example-browser-b
-```
+This example changes an existing scalar leaf. Edit TOML and run `ts config
+validate` followed by `ts config push` when changing an array, table, map, or
+rule.
 
 ## Publisher Configuration
 
@@ -1272,17 +1254,18 @@ suppress_seats = ["example-seat"]
 provider = "pbs-main"
 ```
 
-**Environment Override**:
+**Environment override**:
 
 ```bash
-TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true
-TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=1000
-TRUSTED_SERVER__INTEGRATIONS__PREBID__CLIENT_SIDE_BIDDERS=example-browser
-TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__ENDPOINT=https://prebid.example.com/openrtb2/auction
-TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG='{"debug":false,"test_mode":false,"consent_forwarding":"both"}'
+env 'TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true' \
+  'TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=1000' \
+  'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__DEBUG=true' \
+  ts config validate
 ```
 
-Environment overlays only replace leaves already present in TOML.
+Environment overlays only replace existing scalar leaves. Keep
+`client_side_bidders`, provider profile tables, bidder-parameter overrides, and
+rules in TOML, then validate and push the edited file.
 
 **Script Pattern Matching**:
 
@@ -1562,7 +1545,7 @@ timeout_ms = 500
 | `profile`        | No       | `standard`      | `standard`, `prebid-server`, or `aps`                         |
 | `endpoint`       | Yes      | None            | Absolute HTTPS URL with host and no credentials or fragment   |
 | `timeout_ms`     | No       | Profile default | Provider logical budget before the remaining-auction cap      |
-| `routing`        | No       | `explicit`      | `explicit` or `all_eligible`                                  |
+| `routing`        | No       | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles            |
 | `profile_config` | No       | `{}`            | Typed object owned by the selected profile                    |
 | `notifications`  | No       | No suppression  | Common `nurl`/`burl` suppression after response normalization |
 
@@ -1572,10 +1555,12 @@ profile default. Runtime uses `min(provider timeout, auction time remaining)`
 for launch decisions and OpenRTB `tmax`.
 
 `routing = "explicit"` sends only slots carrying a bidder assigned to that
-provider (plus trusted stored-request routes). `routing = "all_eligible"` sends
+provider, plus trusted stored-request routes. `routing = "all_eligible"` sends
 every banner-compatible slot to the provider, regardless of bidder routes. It
 does not disclose bidder parameters assigned to another provider. APS commonly
-uses `all_eligible` to preserve its whole-inventory participation.
+uses `all_eligible` to preserve its whole-inventory participation. The
+`prebid-server` profile rejects `all_eligible` because every PBS impression must
+carry routed bidder or stored-request demand.
 
 ### Bidder routes and bounds
 
@@ -1640,13 +1625,14 @@ rewriting and creative TSJS injection. See
 **Environment overrides** replace map leaves that already exist in TOML:
 
 ```bash
-TRUSTED_SERVER__AUCTION__ENABLED=true
-TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES=false
-TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES=true
-TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000
-TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__ENDPOINT=https://prebid.example.com/openrtb2/auction
-TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__TIMEOUT_MS=900
-TRUSTED_SERVER__AUCTION__MEDIATOR=adserver_mock
+env 'TRUSTED_SERVER__AUCTION__ENABLED=true' \
+  'TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES=false' \
+  'TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES=true' \
+  'TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000' \
+  'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__ENDPOINT=https://prebid.example.com/openrtb2/auction' \
+  'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__TIMEOUT_MS=900' \
+  'TRUSTED_SERVER__AUCTION__MEDIATOR=adserver_mock' \
+  ts config validate
 ```
 
 ## Creative Opportunities Configuration

@@ -323,37 +323,17 @@ Mediation is optional for APS. APS reduces to one candidate per impression befor
 
 ### Provider Interface
 
-All demand sources implement the `AuctionProvider` trait:
+Demand sources implement the async, platform-neutral
+[`AuctionProvider`](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/auction/provider.rs).
+The trait receives an `AuctionRequest` and `AuctionContext`, launches a request
+as a `ProviderRequestOutcome`, and parses a `PlatformResponse` into an
+`AuctionResponse`. It also supplies capability, timeout, enablement, and
+platform-backend metadata. Providers that need request-local response state use
+the context-aware parsing hooks instead of storing mutable state on the shared
+provider instance.
 
-```rust
-pub trait AuctionProvider: Send + Sync {
-    fn provider_name(&self) -> &str;
-
-    fn request_bids(
-        &self,
-        request: &AuctionRequest,
-        context: &AuctionContext<'_>,
-    ) -> Result<PendingRequest, Report<TrustedServerError>>;
-
-    fn parse_response(
-        &self,
-        response: fastly::Response,
-        response_time_ms: u64,
-    ) -> Result<AuctionResponse, Report<TrustedServerError>>;
-
-    fn supports_media_type(&self, media_type: &MediaType) -> bool;
-    fn timeout_ms(&self) -> u32;
-    fn is_enabled(&self) -> bool;
-    fn backend_name(&self) -> Option<String>;
-}
-```
-
-The trait uses a two-phase design:
-
-1. **`request_bids()`** — Builds and sends the HTTP request, returning a `PendingRequest` (Fastly's async handle)
-2. **`parse_response()`** — Called once the response arrives, parses the provider-specific format into a unified `AuctionResponse`
-
-This split enables true parallel execution: all requests launch first, then the orchestrator uses `select()` to process responses as they arrive.
+The orchestrator launches every request before collecting pending responses, so
+providers can run concurrently without depending on a Fastly-specific API.
 
 ### Prebid Provider
 
@@ -771,13 +751,15 @@ Common provider fields and defaults:
 | `profile`        | `standard`      | Typed OpenRTB behavior                                         |
 | `endpoint`       | Required        | Fixed absolute HTTPS endpoint                                  |
 | `timeout_ms`     | Profile default | PBS 1000 ms, APS 800 ms, standard inherits auction timeout     |
-| `routing`        | `explicit`      | `explicit` or `all_eligible`                                   |
+| `routing`        | `explicit`      | `explicit`, or `all_eligible` for non-PBS profiles             |
 | `profile_config` | `{}`            | Profile-owned typed settings                                   |
 | `notifications`  | No suppression  | Common `nurl`/`burl` suppression by all bids or returned seats |
 
 APS normally uses `all_eligible`, which sends every compatible banner slot but
 never another provider's bidder parameters. `explicit` providers receive only
-centrally routed or trusted stored-request demand.
+centrally routed or trusted stored-request demand. The `prebid-server` profile
+rejects `all_eligible` because PBS requires bidder or stored-request demand on
+each impression.
 
 Provider IDs must match `^[a-z][a-z0-9-]{0,62}$`. Bidder IDs are limited to 128
 UTF-8 bytes and cannot be the exact reserved browser envelope ID
@@ -821,19 +803,21 @@ not belong to the browser integration.
 ### Environment variable overrides
 
 The typed `ts config validate`, `ts config diff`, and `ts config push` flows can
-override leaves that already exist in TOML. EdgeZero v0.0.4 does not create
-missing leaves, so existing configs must add both `rewrite_creatives = true`
-and `sanitize_creatives = false` before relying on those overrides. An override
-for any missing leaf is silently ignored.
+override existing scalar leaves. EdgeZero v0.0.4 does not create missing leaves
+or replace arrays, tables, maps, or rules. Existing configs must add
+`rewrite_creatives = true` and `sanitize_creatives = false` before relying on
+those scalar overrides. Edit and re-push TOML for other values. Provider map
+keys preserve hyphens, so `pbs-main` uses the `PBS-MAIN` segment and needs
+`env` shell syntax:
 
 ```bash
-TRUSTED_SERVER__AUCTION__ENABLED=true
-TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES=true
-TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES=false
-TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000
-TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__ENDPOINT=https://prebid.example.com/openrtb2/auction
-TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__TIMEOUT_MS=900
-TRUSTED_SERVER__AUCTION__MEDIATOR=adserver_mock
+env 'TRUSTED_SERVER__AUCTION__ENABLED=true' \
+  'TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES=true' \
+  'TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES=false' \
+  'TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000' \
+  'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__DEBUG=true' \
+  'TRUSTED_SERVER__AUCTION__MEDIATOR=adserver_mock' \
+  ts config validate
 ```
 
 Before rolling back to a binary that does not know a creative-processing field,
@@ -913,7 +897,8 @@ fastly compute serve
 This example is useful when investigating raw Prebid Server requests and
 responses without spending the dump budget on winning creatives. Raw PBS
 `debug.httpcalls` and `resolvedrequest` metadata also require
-`debug = true` under `[integrations.prebid]`.
+`debug = true` under `[auction.providers.<id>.profile_config]` for the relevant
+Prebid Server provider.
 
 | Option                       | Default                                | Behavior                                                                                       |
 | ---------------------------- | -------------------------------------- | ---------------------------------------------------------------------------------------------- |

@@ -307,15 +307,13 @@ networkId = 99999
 pubid = "example-server-pub"
 ```
 
-**Environment variable**:
-
-```text
-TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__BID_PARAM_OVERRIDES='{"example-server":{"networkId":99999,"pubid":"example-server-pub"}}'
-```
+`bid_param_overrides` is a table, so EdgeZero environment overlays cannot
+replace it. Edit the TOML, then run `ts config validate` and `ts config push`.
 
 ### Bid Param Zone Overrides
 
-Use `bid_param_zone_overrides` for per-zone, per-bidder param overrides. This is designed for bidders like Kargo that use different server-to-server placement IDs per ad zone.
+Use `bid_param_zone_overrides` for per-zone, per-bidder param overrides when
+an adapter uses different server-to-server placement IDs per ad zone.
 
 The JS adapter reads the zone from `mediaTypes.banner.name` on each Prebid ad unit (e.g., `"header"`, `"in_content"`, `"fixed_bottom"`) and sends it alongside the bidder params. The server then uses this zone to look up the correct override. When `mediaTypes.banner.name` is not set, no zone is sent and zone overrides are skipped for that impression.
 
@@ -339,22 +337,19 @@ fixed_bottom = { placementId = "example-bottom-placement" }
 If the incoming request for zone `header` has:
 
 ```json
-{ "kargo": { "placementId": "client_side_abc" } }
+{ "example-server": { "placementId": "client-side-header-placement" } }
 ```
 
 the outgoing bidder params become:
 
 ```json
-{ "kargo": { "placementId": "_s2sHeaderPlacement" } }
+{ "example-server": { "placementId": "example-header-placement" } }
 ```
 
 For an unrecognized zone (e.g., `sidebar`), the incoming params are left unchanged.
 
-**Environment variable**:
-
-```text
-TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__BID_PARAM_ZONE_OVERRIDES='{"example-server":{"header":{"placementId":"example-header-placement"}}}'
-```
+`bid_param_zone_overrides` is a table, so EdgeZero environment overlays cannot
+replace it. Edit the TOML, then run `ts config validate` and `ts config push`.
 
 ### Bid Param Override Rules
 
@@ -368,7 +363,8 @@ Use `bid_param_override_rules` for the canonical ordered override format. Each r
 - Later matching rules win on overlapping keys
 - Compatibility fields from `bid_param_overrides` and `bid_param_zone_overrides` are normalized into earlier rules, so explicit canonical rules take precedence on conflicts
 - Within compat fields, `bid_param_overrides` is normalized before `bid_param_zone_overrides`, so zone overrides win on overlapping keys when both fields target the same bidder
-- `set` values may be `null`; `null` is inserted into outgoing bidder params wholesale — behavior varies by PBS adapter, so verify adapter handling before relying on this. Note: TOML has no null literal — null values are only reachable via the env-var JSON shape (e.g. `[{"when":{"bidder":"kargo"},"set":{"placementId":null}}]`)
+- `set` values use TOML values. TOML has no null literal, so operators cannot
+  configure null override values.
 
 **Example**:
 
@@ -379,11 +375,8 @@ when.zone = "header"
 set = { placementId = "example-header-placement", keep = "example" }
 ```
 
-**Environment variable**:
-
-```text
-TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__PROFILE_CONFIG__BID_PARAM_OVERRIDE_RULES='[{"when":{"bidder":"example-server","zone":"header"},"set":{"placementId":"example-header-placement","keep":"example"}}]'
-```
+`bid_param_override_rules` is an array, so EdgeZero environment overlays cannot
+replace it. Edit the TOML, then run `ts config validate` and `ts config push`.
 
 ## Refresh Auction GAM-Path Opt-Out
 
@@ -610,16 +603,19 @@ Optimize mobile ad serving with reduced JavaScript overhead.
 
 ## Implementation
 
-See [crates/trusted-server-core/src/integrations/prebid.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/prebid.rs) for full implementation.
+Production Prebid Server providers compile from
+`[auction.providers.<id>]` into a shared OpenRTB request and response driver.
+The browser integration lives in
+[crates/trusted-server-core/src/integrations/prebid.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/prebid.rs),
+while provider execution uses
+[crates/trusted-server-core/src/auction/provider.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/auction/provider.rs)
+and shared request construction uses
+[crates/trusted-server-core/src/auction/openrtb.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/auction/openrtb.rs).
+`PrebidAuctionProvider` remains test-only legacy parity code.
 
-### Key Components
+### OpenRTB request construction
 
-- **`PrebidIntegration`**: Handles script interception and HTML attribute rewriting to remove Prebid script references
-- **`PrebidAuctionProvider`**: Implements the `AuctionProvider` trait for the auction orchestrator
-
-### OpenRTB Request Construction
-
-The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
+The shared OpenRTB driver builds Prebid Server requests:
 
 - Converts ad slots to OpenRTB `imp` objects with bidder params
 - Sets bid floor and currency (`bidfloor`/`bidfloorcur`) from slot configuration

@@ -86,9 +86,15 @@ curl -i "https://edge.example.com/_ts/clear-tester"
 ### POST /auction
 
 Browser and programmatic auction endpoint. It accepts the Trusted Server ad-unit
-request shape and returns an OpenRTB response with sanitized creatives.
+request shape and returns an OpenRTB response with first-party processed
+creatives. Creative URLs are rewritten by default; set
+`[auction].sanitize_creatives = true` to strip executable markup.
 
 **Request Body:**
+
+Configured provider IDs appear in response metadata and provider responses.
+Consumers that previously matched the literal provider name `prebid` must use
+the configured provider ID, such as `pbs-main`.
 
 ```json
 {

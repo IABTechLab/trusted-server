@@ -1,4 +1,4 @@
-//! Auction configuration types (separated to avoid circular deps in build.rs).
+//! Auction configuration types shared by settings and auction planning.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -34,10 +34,10 @@ pub struct AuctionConfig {
     /// Rewrite winning-bid creative HTML to first-party endpoints (applied
     /// after sanitization when [`Self::sanitize_creatives`] is enabled).
     ///
-    /// The default must stay omitted from serialized config blobs: older
-    /// [`AuctionConfig`] schemas reject unknown fields during binary rollback.
-    /// An explicit `false` remains serialized and requires restoring a
-    /// compatible blob before rolling back.
+    /// The default stays omitted from serialized config blobs to avoid adding
+    /// this field when it has no effect. Any rollback across schema versions
+    /// still requires restoring the matching old-schema blob with the old
+    /// binary.
     #[serde(
         default = "default_rewrite_creatives",
         skip_serializing_if = "is_default_rewrite_creatives"
@@ -101,7 +101,7 @@ fn default_rewrite_creatives() -> bool {
     true
 }
 
-// This predicate preserves rollback compatibility by omitting the default field.
+// Omit the default field when it has no effect on the serialized config.
 fn is_default_rewrite_creatives(value: &bool) -> bool {
     *value == default_rewrite_creatives()
 }
@@ -118,10 +118,6 @@ fn default_allowed_context_keys() -> HashSet<String> {
     HashSet::new()
 }
 
-#[allow(
-    dead_code,
-    reason = "methods are used by the runtime crate but not by build.rs path inclusion"
-)]
 impl AuctionConfig {
     #[cfg(test)]
     pub(crate) fn legacy_provider_map(names: &[&str]) -> BTreeMap<ProviderId, ProviderConfig> {

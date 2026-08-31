@@ -114,21 +114,18 @@ Failed to parse environment variable: TRUSTED_SERVER__PUBLISHER__DOMAIN
 
 **Cause:** Environment variable format doesn't match expected type
 
-**Solution:** Use correct format for the field type:
+**Solution:** Override an existing scalar leaf with the expected type. Provider
+map keys preserve hyphens, so shell users must invoke the CLI through `env`:
 
 ```bash
-# For strings
-TRUSTED_SERVER__PUBLISHER__DOMAIN="example.com"
-
-# For numbers
-TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__TIMEOUT_MS=1000
-
-# For booleans
-TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true
-
-# For browser-side bidder arrays (comma-separated)
-TRUSTED_SERVER__INTEGRATIONS__PREBID__CLIENT_SIDE_BIDDERS="exampleBidder,exampleBrowserBidder"
+env 'TRUSTED_SERVER__PUBLISHER__DOMAIN=example.com' \
+  'TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__TIMEOUT_MS=1000' \
+  'TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true' \
+  ts config validate
 ```
+
+Edit TOML and re-push it for arrays, tables, maps, and rules; EdgeZero cannot
+override those values through environment variables.
 
 See [Configuration Reference](./configuration.md) for complete patterns.
 
