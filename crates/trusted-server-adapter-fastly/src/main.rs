@@ -159,9 +159,14 @@ fn edgezero_main(mut req: FastlyRequest) {
         || "unknown".to_owned(),
         |settings| settings.publisher.domain.clone(),
     );
+    let trusted_client_ip = settings_snapshot
+        .as_deref()
+        .and_then(|settings| settings.trusted_client_ip.as_ref());
 
-    // Strip client-spoofable forwarded headers before dispatch.
-    compat::sanitize_fastly_forwarded_headers(&mut req);
+    // Resolve the trusted client IP, then strip client-spoofable forwarded
+    // headers before dispatch. One call keeps resolution ahead of the
+    // sanitization that removes the headers it reads.
+    let resolved_client_ip = compat::resolve_and_sanitize_client_ip(&mut req, trusted_client_ip);
 
     // Re-inject a trusted TLS scheme signal after sanitization has stripped any
     // client-sent fastly-ssl header. Setting it from Fastly's native TLS
@@ -173,10 +178,8 @@ fn edgezero_main(mut req: FastlyRequest) {
         req.set_header("fastly-ssl", "1");
     }
 
-    // Capture client IP and method before the request is consumed by
-    // dispatch: nothing else survives to the freeze point in
-    // `send_edgezero_response`, which only receives the response.
-    let client_ip = req.get_client_ip_addr();
+    // Capture the method before dispatch consumes the request. The resolved
+    // client IP is retained below in `ClientInfo`.
     let request_method = req.get_method_str().to_owned();
 
     // Strip any client-supplied x-ts-tls-* headers before injecting the trusted
@@ -198,7 +201,8 @@ fn edgezero_main(mut req: FastlyRequest) {
     // Capture metadata from the original FastlyRequest before conversion. These
     // accessors only return real values on the client request, so store them in
     // request extensions for build_per_request_services and EC bot classification.
-    let client_info = client_info_from_request(&req);
+    let client_info = client_info_from_request(&req, resolved_client_ip);
+    let client_ip = client_info.client_ip;
     let device_signals = derive_device_signals(&req);
 
     // Dispatch directly through the EdgeZero router without an intermediate
@@ -526,6 +530,7 @@ struct SendContext {
 /// Outcome of handing a finalized response to the client.
 pub(crate) struct DeliveryOutcome {
     /// Response body size in bytes.
+    #[allow(dead_code)]
     pub bytes: u64,
     /// Whether delivery completed or failed partway. Collected as
     /// groundwork; not yet emitted on any surface.
