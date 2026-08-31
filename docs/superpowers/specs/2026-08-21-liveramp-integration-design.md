@@ -200,12 +200,43 @@ sibling settings such as `gpp` are copied into the update. A non-object or
 throwing effective value is not safe to merge: the shim logs a diagnostic and
 does not replace it.
 
-The automatic update uses the original Prebid `setConfig` function, while the
-installed wrappers continue passing all publisher consent fields through
-unchanged. Publisher configuration already applied before the shim therefore
-wins immediately. Queued configuration is processed afterward in queue order,
-and late `setConfig` or `mergeConfig` calls remain able to replace or extend the
-automatic minimum. The shim never re-applies its minimum after installation.
+The automatic update uses the original Prebid `setConfig` function and records
+that the shim owns the resulting IAB collector. Publisher configuration already
+applied before the shim therefore wins immediately. If a queued or late
+`setConfig` or `mergeConfig` call later supplies an own `gdpr` value, including
+`null` or `false`, ownership transfers to the publisher. Before forwarding that
+call, the shim sends `gdpr.enabled = false` through the original `setConfig` API.
+This invokes Prebid's supported consent reset path and removes the CMP event
+listener when its ID is already known. Together with the callback guard below,
+it prevents a later IAB event from overwriting publisher-owned static or custom
+consent.
+
+Prebid cannot remove an IAB listener before the CMP returns its listener ID. To
+cover that interval, the shim guards only the callback registered by its own
+automatic activation. After ownership transfers, a delayed first response is
+not forwarded into Prebid's consent handler; when it carries a listener ID, the
+guard asks the TCF API to remove that stale subscription. The page's current
+callable `__tcfapi` is used for removal, with the function captured at activation
+as a fallback for pages whose API disappears. The page's global `__tcfapi`
+function is restored immediately after activation, so publisher and CMP calls
+outside that subscription are unchanged.
+
+The cleanup update preserves effective sibling consent settings. A following
+publisher `setConfig` call retains its normal replacement semantics. Because
+Prebid's `mergeConfig` deep-merges with the temporary disabled value, the shim
+adds `enabled = true` only when the publisher supplied an object-valued `gdpr`
+whose `enabled` value is missing or `undefined`; this restores Prebid's normal
+enabled default without changing an explicit boolean publisher choice. The
+publisher merge is prepared before the cleanup update. If it cannot be safely
+inspected, cleanup is skipped so the temporary disabled value cannot leak into
+the publisher's effective configuration. The transfer occurs at most once,
+sibling-only consent updates do not claim GDPR ownership, and the shim never
+re-applies its automatic minimum afterward. Throwing configuration accessors
+are caught and logged rather than breaking shim installation. If effective
+consent state cannot be read or copied during transfer, the shim does not issue
+a replacement cleanup update that could erase unknown sibling state; the
+guarded callback still rejects stale automatic responses, and the publisher call
+is forwarded unchanged.
 
 ## 5. Approaches considered
 

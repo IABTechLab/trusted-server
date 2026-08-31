@@ -4,7 +4,7 @@
 
 **Goal:** Ensure server-managed Prebid User IDs activate the existing TCF enforcement modules when an IAB CMP is present, without overwriting publisher-owned consent configuration.
 
-**Architecture:** Add one focused browser-side helper in the existing Prebid shim. It reads effective Prebid consent configuration, recognizes any existing own `gdpr` property as publisher-owned, and otherwise installs only `gdpr.cmpApi = "iab"` when managed User IDs and a callable `window.__tcfapi` are present. Existing `setConfig`/`mergeConfig` wrappers continue to pass publisher consent configuration through unchanged, so effective, queued, and late publisher settings retain precedence.
+**Architecture:** Add one focused browser-side helper in the existing Prebid shim. It reads effective Prebid consent configuration, recognizes any existing own `gdpr` property as publisher-owned, and otherwise installs only `gdpr.cmpApi = "iab"` when managed User IDs and a callable `window.__tcfapi` are present. The `setConfig`/`mergeConfig` wrappers preserve publisher precedence; when a later call first claims GDPR ownership, they retire the automatically created IAB collector before forwarding the publisher value so stale CMP events cannot overwrite it.
 
 **Tech Stack:** TypeScript, Prebid.js 10.26.0, Vitest, JSDOM, generated external Prebid bundle, Markdown.
 
@@ -275,3 +275,42 @@ Review the complete diff for correctness, privacy regressions, scope, stale docu
 - [ ] **Step 7: Report readiness without pushing**
 
 Summarize commits, verification evidence, remaining external steps, and corrected PR-description text. Do not push or mark the PR ready.
+
+### Task 6: Retire automatic consent ownership safely
+
+**Files:**
+
+- Modify: `crates/trusted-server-js/lib/src/integrations/prebid/index.ts`
+- Modify: `crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts`
+- Modify: `crates/trusted-server-js/lib/test/prebid-consent-enforcement.test.mjs`
+- Modify: `docs/guide/integrations/prebid.md`
+- Modify: `docs/superpowers/specs/2026-08-21-liveramp-integration-design.md`
+
+- [ ] **Step 1: Reproduce the stale-listener failure in the real bundle**
+
+Start with shim-owned IAB consent, apply late publisher static denial, emit a
+later granting CMP event, and verify the test fails because the original CMP
+listener remains registered.
+
+- [ ] **Step 2: Add focused ownership-transfer tests**
+
+Require cleanup before publisher `setConfig`, cleanup exactly once before
+publisher `mergeConfig`, restoration of the normal enabled default for a merged
+object-valued GDPR config, and safe degradation for throwing effective consent
+accessors.
+
+- [ ] **Step 3: Implement one-time collector retirement**
+
+Track successful automatic activation. When a later publisher call claims GDPR
+ownership, send `gdpr.enabled = false` through the original Prebid `setConfig`
+before forwarding the publisher call. Preserve sibling consent state, avoid
+leaking the temporary disabled flag through `mergeConfig`, and never reactivate
+the automatic collector. Guard the automatically registered callback so a
+delayed first CMP response cannot bypass transfer before a listener ID exists;
+prepare merge normalization before cleanup, and skip replacement cleanup when
+unknown sibling state or the publisher merge cannot be inspected safely.
+
+- [ ] **Step 4: Verify focused and full JavaScript suites**
+
+Run the focused shim and generated-artifact suites, formatting, and the full
+Vitest suite with pinned Node 24.12.0. Then repeat diff hygiene and final review.

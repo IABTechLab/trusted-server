@@ -958,6 +958,33 @@ describe('prebid/installPrebidNpm', () => {
     );
   });
 
+  it('does not break installation when effective consent property access throws', () => {
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    const hostileConsent = new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor() {
+          throw new Error('example consent property trap');
+        },
+      }
+    );
+    testWindow.__tcfapi = vi.fn();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement') return hostileConsent;
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+
+    expect(() => installPrebidNpm()).not.toThrow();
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.consentManagement)).toBe(false);
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] effective consentManagement configuration could not be inspected',
+      expect.any(Error)
+    );
+  });
+
   it('lets queued and late publisher consent configuration retain precedence', () => {
     const queuedConsent = { gdpr: { cmpApi: 'static', timeout: 321 } };
     const lateConsent = { gdpr: null };
@@ -979,6 +1006,180 @@ describe('prebid/installPrebidNpm', () => {
     expect(
       mockSetConfig.mock.calls.filter(([value]) => value?.consentManagement?.gdpr?.cmpApi === 'iab')
     ).toHaveLength(1);
+  });
+
+  it('retires automatic IAB consent before late setConfig takes GDPR ownership', () => {
+    const publisherConsent = { gdpr: { cmpApi: 'static', consentData: { tcString: 'example' } } };
+    testWindow.__tcfapi = vi.fn();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    installPrebidNpm();
+    mockSetConfig.mockClear();
+
+    mockPbjs.setConfig({ consentManagement: publisherConsent });
+
+    expect(mockSetConfig.mock.calls).toEqual([
+      [{ consentManagement: { gdpr: { enabled: false } } }],
+      [{ consentManagement: publisherConsent }],
+    ]);
+  });
+
+  it('retires automatic IAB consent once before mergeConfig takes GDPR ownership', () => {
+    const publisherGdpr = { cmpApi: 'static', consentData: { tcString: 'example' } };
+    testWindow.__tcfapi = vi.fn();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    installPrebidNpm();
+    mockSetConfig.mockClear();
+    mockMergeConfig.mockClear();
+
+    mockPbjs.mergeConfig({ consentManagement: { gdpr: publisherGdpr } });
+    mockPbjs.mergeConfig({ consentManagement: { gdpr: { timeout: 500 } } });
+
+    expect(mockSetConfig).toHaveBeenCalledTimes(3);
+    expect(mockSetConfig.mock.calls[0]).toEqual([
+      { consentManagement: { gdpr: { enabled: false } } },
+    ]);
+    expect(mockMergeConfig.mock.calls[0][0]).toEqual({
+      consentManagement: { gdpr: { ...publisherGdpr, enabled: true } },
+    });
+    expect(mockMergeConfig.mock.calls[1][0]).toEqual({
+      consentManagement: { gdpr: { timeout: 500 } },
+    });
+  });
+
+  it('does not replace unknown consent siblings when retirement state cannot be read', () => {
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    const publisherConsent = { gdpr: { cmpApi: 'static', consentData: { tcString: 'example' } } };
+    let failConsentRead = false;
+    testWindow.__tcfapi = vi.fn();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement' && failConsentRead) {
+        throw new Error('example late consent read failure');
+      }
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+    installPrebidNpm();
+    mockSetConfig.mockClear();
+    mockMergeConfig.mockClear();
+    failConsentRead = true;
+
+    mockPbjs.mergeConfig({ consentManagement: publisherConsent });
+
+    expect(mockSetConfig).toHaveBeenCalledTimes(1);
+    expect(mockMergeConfig).toHaveBeenCalledWith({ consentManagement: publisherConsent });
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] effective consentManagement configuration could not be read',
+      expect.any(Error)
+    );
+  });
+
+  it('restores merged GDPR activation without probing a missing enabled descriptor', () => {
+    const publisherGdpr = new Proxy(
+      { cmpApi: 'static', consentData: { tcString: 'example' } },
+      {
+        getOwnPropertyDescriptor(target, property) {
+          if (property === 'enabled') throw new Error('example enabled descriptor trap');
+          return Reflect.getOwnPropertyDescriptor(target, property);
+        },
+      }
+    );
+    testWindow.__tcfapi = vi.fn();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    installPrebidNpm();
+    mockMergeConfig.mockClear();
+
+    expect(() =>
+      mockPbjs.mergeConfig({ consentManagement: { gdpr: publisherGdpr } })
+    ).not.toThrow();
+
+    expect(mockMergeConfig.mock.calls[0][0]).toEqual({
+      consentManagement: {
+        gdpr: {
+          cmpApi: 'static',
+          consentData: { tcString: 'example' },
+          enabled: true,
+        },
+      },
+    });
+  });
+
+  it('does not clean up before a merge whose enabled getter cannot be inspected', () => {
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    const publisherGdpr = new Proxy(
+      { cmpApi: 'static', consentData: { tcString: 'example' } },
+      {
+        get(target, property, receiver) {
+          if (property === 'enabled') throw new Error('example enabled getter trap');
+          return Reflect.get(target, property, receiver);
+        },
+      }
+    );
+    testWindow.__tcfapi = vi.fn();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    installPrebidNpm();
+    mockSetConfig.mockClear();
+    mockMergeConfig.mockClear();
+
+    mockPbjs.mergeConfig({ consentManagement: { gdpr: publisherGdpr } });
+
+    expect(mockSetConfig).toHaveBeenCalledTimes(1);
+    expect(mockMergeConfig).toHaveBeenCalledWith({
+      consentManagement: { gdpr: publisherGdpr },
+    });
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] publisher consentManagement merge could not be normalized',
+      expect.any(Error)
+    );
+  });
+
+  it('completes ownership transfer when cleanup throws after applying disabled state', () => {
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    const publisherGdpr = { cmpApi: 'static', consentData: { tcString: 'example' } };
+    testWindow.__tcfapi = vi.fn();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    installPrebidNpm();
+    mockSetConfig.mockClear();
+    mockMergeConfig.mockClear();
+    mockSetConfig.mockImplementation((config: { consentManagement?: { gdpr?: unknown } }) => {
+      if ((config.consentManagement?.gdpr as { enabled?: unknown })?.enabled === false) {
+        throw new Error('example cleanup subscriber failure');
+      }
+    });
+
+    mockPbjs.mergeConfig({ consentManagement: { gdpr: publisherGdpr } });
+    mockPbjs.mergeConfig({ consentManagement: { gdpr: { timeout: 500 } } });
+
+    expect(
+      mockSetConfig.mock.calls.filter(
+        ([config]) => config.consentManagement?.gdpr?.enabled === false
+      )
+    ).toHaveLength(1);
+    expect(mockMergeConfig.mock.calls[0][0]).toEqual({
+      consentManagement: { gdpr: { ...publisherGdpr, enabled: true } },
+    });
+    expect(mockMergeConfig.mock.calls[1][0]).toEqual({
+      consentManagement: { gdpr: { timeout: 500 } },
+    });
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] automatic IAB consent listener could not be retired',
+      expect.any(Error)
+    );
   });
 
   it('preserves effective User ID entries and replaces identityLink exactly once', () => {

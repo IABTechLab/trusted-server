@@ -149,7 +149,12 @@ When managed User IDs are configured and the page exposes a callable
 collector by adding only `consentManagement.gdpr.cmpApi = "iab"`. It does not
 set a timeout or force `defaultGdprScope`. An existing publisher-owned `gdpr`
 value always wins, sibling consent settings are preserved, and pages without a
-TCF API are unchanged.
+TCF API are unchanged. If queued or late publisher configuration later supplies
+its own `gdpr` value, the shim first deactivates the collector it created so the
+old IAB listener cannot overwrite the publisher's consent state. Ownership
+transfers once; the automatic collector is not re-enabled afterward. A delayed
+first CMP response is also ignored after transfer and removes its listener when
+the CMP finally supplies the listener ID.
 
 ## Debug Mode
 
@@ -564,10 +569,11 @@ enforceable: `consentManagement*` retrieves the consent data, while `tcfControl`
 registers activity controls that act on it. For managed User IDs, the shim
 activates the collector when `window.__tcfapi` is callable and the publisher has
 not already supplied a `consentManagement.gdpr` value. Under pinned Prebid's
-defaults, Purpose 1 and LiveRamp's GVL vendor consent (vendor 97) gate
-IdentityLink resolution and storage. Purpose 3 has no standalone default rule.
-Purpose 4 controls user-provided-data activity, but denying it alone does not
-block IdentityLink resolution or storage.
+defaults, a later publisher `gdpr` value takes ownership after the shim removes
+its automatically registered IAB listener. Purpose 1 and LiveRamp's GVL vendor
+consent (vendor 97) gate IdentityLink resolution and storage. Purpose 3 has no
+standalone default rule. Purpose 4 controls user-provided-data activity, but
+denying it alone does not block IdentityLink resolution or storage.
 
 Default EID transmission accepts a qualifying purpose and vendor basis from any
 of Purposes 2–10. Publishers can require Purpose 4 specifically by enabling

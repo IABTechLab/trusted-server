@@ -103,7 +103,10 @@ afterAll(() => {
 // `tcfControl` reads the CMP's structured `vendorData`, not the encoded string,
 // so the purpose and vendor grants below are what the rules actually evaluate.
 // The string only has to be present and non-empty.
-function tcData({ purpose1 = true, purpose3 = true, purpose4 = true, vendor97 = true } = {}) {
+function tcData(
+  { purpose1 = true, purpose3 = true, purpose4 = true, vendor97 = true } = {},
+  listenerId
+) {
   return {
     gdprApplies: true,
     tcString: 'CPexampleTCStringForTests',
@@ -120,6 +123,7 @@ function tcData({ purpose1 = true, purpose3 = true, purpose4 = true, vendor97 = 
     },
     publisher: { restrictions: {} },
     specialFeatureOptins: {},
+    ...(listenerId === undefined ? {} : { listenerId }),
   };
 }
 
@@ -129,7 +133,16 @@ function tcData({ purpose1 = true, purpose3 = true, purpose4 = true, vendor97 = 
  *
  * @returns the URLs the page requested and the cookies it managed to set.
  */
-async function runGdprPage(grants = {}, { publisherConsentManagement } = {}) {
+async function runGdprPage(
+  grants = {},
+  {
+    publisherConsentManagement,
+    latePublisherConsentManagement,
+    cmpEventAfterLateConfig,
+    deferInitialCmpResponse = false,
+    replaceTcfApiBeforeLateEvent = false,
+  } = {}
+) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
     url: 'https://pub.example.com/article',
     runScripts: 'outside-only',
@@ -160,11 +173,24 @@ async function runGdprPage(grants = {}, { publisherConsentManagement } = {}) {
     pageWindow.isSecureContext = true;
   }
 
+  const consentListeners = new Map();
+  let nextListenerId = 1;
+  let removedConsentListenerCount = 0;
+  let replacementApiRemoveCount = 0;
   const consentData = tcData(grants);
-  pageWindow.__tcfapi = (command, _version, callback) => {
-    if (command === 'addEventListener' || command === 'getTCData') {
+  pageWindow.__tcfapi = (command, _version, callback, parameter) => {
+    if (command === 'addEventListener') {
+      const listenerId = nextListenerId++;
+      consentListeners.set(listenerId, callback);
+      if (!deferInitialCmpResponse) {
+        callback(tcData(grants, listenerId), true);
+      }
+    } else if (command === 'getTCData') {
       callback(consentData, true);
     } else if (command === 'removeEventListener') {
+      if (consentListeners.delete(parameter)) {
+        removedConsentListenerCount += 1;
+      }
       callback(true, true);
     }
   };
@@ -200,6 +226,23 @@ async function runGdprPage(grants = {}, { publisherConsentManagement } = {}) {
   pageWindow.pbjs.setConfig(publisherConfig);
   pageWindow.eval(shimCode);
 
+  if (latePublisherConsentManagement !== undefined) {
+    pageWindow.pbjs.setConfig({ consentManagement: latePublisherConsentManagement });
+  }
+  if (replaceTcfApiBeforeLateEvent) {
+    pageWindow.__tcfapi = (command, _version, callback) => {
+      if (command === 'removeEventListener') {
+        replacementApiRemoveCount += 1;
+        callback(true, true);
+      }
+    };
+  }
+  if (cmpEventAfterLateConfig !== undefined) {
+    for (const [listenerId, callback] of consentListeners) {
+      callback(tcData(cmpEventAfterLateConfig, listenerId), true);
+    }
+  }
+
   pageWindow.pbjs.requestBids({ adUnits: [], bidsBackHandler: () => {} });
   await new Promise((resolve) => setTimeout(resolve, 50));
   await new Promise((resolve) => pageWindow.setTimeout(resolve, 400));
@@ -209,6 +252,8 @@ async function runGdprPage(grants = {}, { publisherConsentManagement } = {}) {
     requestedUrls,
     cookies: pageWindow.document.cookie,
     consentManagement: pageWindow.pbjs.getConfig('consentManagement'),
+    removedConsentListenerCount,
+    replacementApiRemoveCount,
   };
 }
 
@@ -268,5 +313,51 @@ describe('external bundle TCF enforcement', () => {
     );
 
     expect(consentManagement.gdpr).toEqual(publisherConsentManagement.gdpr);
+  });
+
+  it('retires automatic IAB consent when late static GDPR configuration takes ownership', async () => {
+    const deniedStaticConsent = {
+      gdpr: {
+        cmpApi: 'static',
+        consentData: tcData({ purpose1: false }),
+      },
+    };
+
+    const { requestedUrls, cookies, removedConsentListenerCount } = await runGdprPage(
+      {},
+      {
+        latePublisherConsentManagement: deniedStaticConsent,
+        cmpEventAfterLateConfig: {},
+      }
+    );
+
+    expect(removedConsentListenerCount).toBe(1);
+    expect(envelopeRequests(requestedUrls)).toEqual([]);
+    expect(cookies).not.toContain(LIVE_RAMP_STORAGE_NAME);
+    expect(cookies).not.toContain('_lr_retry_request');
+  });
+
+  it('ignores a delayed initial IAB response after static GDPR configuration takes ownership', async () => {
+    const deniedStaticConsent = {
+      gdpr: {
+        cmpApi: 'static',
+        consentData: tcData({ purpose1: false }),
+      },
+    };
+
+    const { requestedUrls, cookies, replacementApiRemoveCount } = await runGdprPage(
+      {},
+      {
+        latePublisherConsentManagement: deniedStaticConsent,
+        cmpEventAfterLateConfig: {},
+        deferInitialCmpResponse: true,
+        replaceTcfApiBeforeLateEvent: true,
+      }
+    );
+
+    expect(replacementApiRemoveCount).toBe(1);
+    expect(envelopeRequests(requestedUrls)).toEqual([]);
+    expect(cookies).not.toContain(LIVE_RAMP_STORAGE_NAME);
+    expect(cookies).not.toContain('_lr_retry_request');
   });
 });
