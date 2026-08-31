@@ -18,7 +18,7 @@ use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp;
 use trusted_server_core::auction::AuctionProviderBuilder;
 use trusted_server_core::config::validate_settings_for_deploy_with;
-use trusted_server_core::ec::provider::{EdgeCookieProvider as _, IdentityInput};
+use trusted_server_core::ec::provider::IdentityInput;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::OwnedRequestInfo;
 use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistration};
