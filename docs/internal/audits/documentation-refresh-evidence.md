@@ -139,6 +139,31 @@ updated approved baseline before work continues.
   status are recorded in the execution handoff because a commit cannot contain
   its own SHA.
 
+#### Task 1 completion receipt
+
+- Receipt timestamp: 2026-08-31T23:15:37Z.
+- Executor: `OpenAI Codex task agent task1_implementer`.
+- Approver: `aram356`.
+- Primary implementation commit:
+  `8588391b9e9d6f02d886c519836eedb84a37abd8`.
+- Review-fix commit:
+  `349fd46a38fac68d803bc80e1557b9cfddba6ac6`.
+- `npx prettier --write` on the four Task 1 records: passed.
+- `cd docs && npm run format`: passed.
+- `cd docs && npm run lint`: passed.
+- `cd docs && npm run build`: passed. VitePress emitted only the known
+  non-failing `vcl`-to-plain-text syntax-highlighting warning; generated
+  `.vitepress/.temp` output was removed and not staged.
+- `git diff --check` and pre-commit `git diff --cached --check`: passed.
+- Review-fix staged path set: exactly the spec, plan, decisions record, and
+  evidence record; no unintended untracked file or unstaged tracked byte.
+- Clean-status observation immediately before this evidence-only mutation:
+  `git status --porcelain` printed nothing.
+
+This immediately adjacent evidence-only commit cannot contain its own SHA.
+Its full SHA is reported in the execution handoff and independently verified
+by the controller and review; no recursive receipt commit follows.
+
 ### External delivery URLs and immutable identifiers
 
 | Item                              | PR or issue URL                                        | Target      | Fresh audited base                         | Validated head/tool                                        | Merge SHA | Evidence state                  |
