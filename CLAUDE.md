@@ -22,7 +22,7 @@ crates/
   trusted-server-cli/                   # Host-target `ts` operator CLI
   device/
     fastly/                             # trusted-server-device-fastly (opt-in TLS/H2 device provider)
-  edgecookie/                           # vendor Edge Cookie provider crates (built-in HMAC default is in core)
+  edgecookie/                           # vendor Edge Cookie provider crates (built-in HMAC provider is in core)
   geo/                                  # vendor geo provider crates (host geo is injected by the adapter)
   trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
@@ -304,7 +304,7 @@ impl core::error::Error for MyError {}
 
 Permissions are the primitive. A provider declares the permissions it requires
 (`required_permissions`) and the system decides whether each is _set_. Consent
-is only one of several ways a permission may be established. Country or
+is only one of many ways a permission may be established. Country or
 jurisdiction rules (a `Granted` group baseline), legitimate interest, or
 configuration can set a permission with no consent at all.
 
@@ -312,9 +312,10 @@ configuration can set a permission with no consent at all.
   "runs without any consent".
 - A gated provider **runs once its required permissions are set**, by whatever
   method.
+
 **Evidence is not rationed, use is.** Every provider and every integration sees
 all the evidence available for a request, including host signals such as the TLS
-JA4 and HTTP/2 fingerprints. The core never decides which vendor may see what,
+JA4 and HTTP/2 signals. The core never decides which vendor may see what,
 because withholding a signal from one vendor and not another discriminates
 between them, and the core stays neutral. What a vendor may *do* with the
 evidence is governed by the permissions it declares and the system sets. Access
@@ -366,15 +367,15 @@ Principles for adding or changing a provider:
   the default request path makes no host-specific calls.
 - **Providers read request evidence, not a fixed parameter set.** A provider must
   be able to see everything about the request it needs (User-Agent, headers, and
-  host signals such as the TLS JA4 and HTTP/2 fingerprints) through an evidence
+  host signals such as the TLS JA4 and HTTP/2 signals) through an evidence
   abstraction rather than a hard-coded struct of fields. Host signals come from
   the host (the Fastly SDK) and are opt-in, so a neutral provider triggers no
-  host fingerprint calls.
+  host signal calls.
 - **Providers are separated by capability but composed per request, and one may
   need another's output.** Geo resolves the country and region the permission
   model uses, and the permission model gates whether the Edge Cookie provider
   runs. Device signals gate Edge Cookie writes (the browser / bot gate). When
-  several vendor providers share a backend (for example a vendor's Edge Cookie,
+  multiple vendor providers share a backend (for example a vendor's Edge Cookie,
   geo, and device provider on one cloud pipeline) they share a single call per
   request rather than calling independently. Give a provider the inputs and
   upstream results it needs explicitly, rather than having it reach into globals.

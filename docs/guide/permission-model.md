@@ -42,7 +42,7 @@ The core does not encode any jurisdiction's law or any single policy. A provider
 advertises the technical permissions its data use requires, and the core runs
 the Edge Cookie provider only when every permission that provider requires is
 set. An Edge Cookie provider that requires nothing always runs, so a
-vendor-neutral default shows no consent dialogue and needs no per-request
+vendor-neutral default needs no consent prompt and no per-request
 policy interaction.
 
 Device and geo providers declare their required permissions through the same
@@ -84,7 +84,7 @@ flowchart LR
 ```
 
 A request's permissions are set by one or more **permission sources**. Consent
-is one source among several, not the basis for every permission:
+is one source among many, not the basis for every permission:
 
 - **Country and region.** The baseline position for a jurisdiction, from the geo
   provider, keyed by ISO 3166-1 with an optional region such as a US state. When
@@ -117,7 +117,7 @@ into the consumer.
 
 The permission names are IAB Privacy Taxonomy Data Uses, mapped from the IAB TCF
 Europe purposes and used **only** as technical identifiers. No CMP or TCF policy
-is implemented in the core. Two purposes have no Data Use yet, being purpose 1 (device
+is implemented in the core. Two purposes have no Data Use yet. Purpose 1 (device
 storage) uses a proposed `necessary.operations.storage` key, and purpose 11
 keeps its TCF identifier `select-basic-content`. Both are flagged for an upstream
 taxonomy addition. All eleven purposes are now resolved against the incoming
@@ -178,10 +178,11 @@ It has two parts. **Groups** are named baselines, each a set of permission flags
 **Rules** map a country, or a country and state, to a group. The keys are the
 codes a geo provider returns, matched case-insensitively. The country is an
 ISO 3166-1 alpha-2 code (`FR`), and a state adds the ISO 3166-2 subdivision code
-with no country prefix (`US/CA` is California). The Fastly and other geo
-providers both emit these codes directly. A region rule takes precedence over its
-country. A request that matches no rule, or whose country the geo provider could
-not resolve, uses the deployer's configured default country
+with no country prefix (`US/CA` is California). The Fastly geo provider emits
+these codes directly, and any other provider must do the same. A region rule
+takes precedence over its country. A request that matches no rule, or whose
+country the geo provider could not resolve, uses the deployer's configured
+default country
 (`[geo] default_country`). A default is required, so there is always one.
 
 The country and region rules set only the **baseline** position. They say what

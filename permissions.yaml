@@ -22,12 +22,16 @@
 #   country        ISO 3166-1 alpha-2 (for example FR, US, GB)
 #   country/state  adds the ISO 3166-2 subdivision code, with no country prefix
 #                  (for example US/CA for California)
-# The Fastly and other geo providers both emit these codes directly.
+# The Fastly geo provider emits these codes directly, and any other
+# provider must do the same.
 #
 # A request whose country/region matches no rule, or whose country the geo
-# provider cannot resolve, uses the deployer's default set in trusted-server.toml
-# as [geo] default_country. A default is required, so there is always a default
-# permission set; startup fails when none is configured.
+# provider resolves as no location, uses the deployer's default set in
+# trusted-server.toml as [geo] default_country. A default is required, so there
+# is always a default permission set, and startup fails when none is configured.
+# A geo provider that reports an outright lookup failure is the exception, as it
+# resolves every permission to the requires-signal floor rather than the
+# default, though no geo provider shipped today reports one.
 #
 # A permission flag is one of:
 #   granted          set without any signal (for example strictly necessary)
@@ -258,9 +262,10 @@ groups:
     necessary.operations.upgrades: denied
     necessary.operations.website_use: denied
 
-# Map a country, or a country and state (country/state), to a group. Add explicit
-# per-permission overrides with +permission (granted) or -permission (denied).
-# These win over the group baseline.
+# Map a country, or a country and state (country/state), to a group. A rule is
+# either a bare group name, or a map with `group:` and a `permissions:` map that
+# overrides individual Data Uses (each set to granted, requires_signal or
+# denied). The overrides win over the group baseline.
 rules:
   # European Union (27).
   AT: gdpr-eu

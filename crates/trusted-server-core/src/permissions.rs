@@ -25,7 +25,9 @@
 //! nothing) or the resolved country/region has no rule, resolution uses the
 //! deployer's configured default country (`[geo] default_country`). With none
 //! configured, a permission is set only when the incoming signals explicitly
-//! grant it.
+//! grant it. A geo provider that reports an outright lookup failure is the
+//! exception, resolving every permission to the requires-signal floor rather
+//! than the default, though no geo provider shipped today reports one.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -35,14 +37,15 @@ use serde::Deserialize;
 /// A technical permission a provider may require, labeled with its IAB Privacy
 /// Taxonomy Data Use, or its IAB TCF Europe purpose where no Data Use exists yet.
 ///
-/// Only the identifier is used, with no TCF or taxonomy policy implemented. Only
-/// [`Permission::StoreOnDevice`] (Purpose 1) and
-/// [`Permission::SelectPersonalisedAds`] (Purpose 4) are resolved against a
-/// signal today.
+/// Only the identifier is used, with no TCF or taxonomy policy implemented. Every
+/// named variant with a TCF purpose in `permissions.yaml` is resolved against
+/// the session's signals. Only [`Permission::StoreOnDevice`] (and
+/// [`Permission::SelectPersonalisedAds`] for sharing) gates a shipped provider
+/// today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Permission {
-    /// TCF Purpose 1, store and/or access information on a device. Resolved
-    /// against a session signal today. No IAB Privacy Taxonomy Data Use exists
+    /// TCF Purpose 1, store and/or access information on a device. It gates the
+    /// built-in Edge Cookie provider today. No IAB Privacy Taxonomy Data Use exists
     /// for device storage yet, so this uses a proposed `necessary.operations`
     /// key pending an upstream addition.
     StoreOnDevice,
@@ -260,7 +263,7 @@ impl PermissionSet {
         self.0 & other.0 == other.0
     }
 
-    /// Iterates the permissions in the set, in TCF purpose order.
+    /// Iterates the permissions in the set, in bit-index order.
     ///
     /// The built-ins read nothing from the full set; this serves a provider or
     /// diagnostic path that enumerates what is present.
@@ -296,7 +299,7 @@ pub enum Acquisition {
 /// What a session signal says about a permission, layered on top of the
 /// country/region baseline by the consent mapping.
 ///
-/// The core never reads consent directly. A caller maps its consent model (or
+/// This module never reads consent directly. A caller maps its consent model (or
 /// any other signal source) to a [`ConsentSignal`] per permission, and the
 /// permission model applies it: a [`Grant`](Self::Grant) sets a
 /// `RequiresSignal` permission, a [`Revoke`](Self::Revoke) drops a `Granted` one
@@ -534,13 +537,15 @@ impl PermissionMaps {
         })
     }
 
-    /// Builds the maps from a `permissions.yaml` document: named `groups` and
-    /// the `rules` that map a country or country/region to a group.
+    /// Builds the maps from a `permissions.yaml` document: named `groups`, the
+    /// `rules` that map a country or country/region to a group, and the
+    /// `signals` section that maps each session signal onto Data Uses.
     ///
     /// # Errors
     ///
-    /// Returns [`PermissionsError`] when the YAML is malformed or names an
-    /// unknown group, permission, or acquisition rule.
+    /// Returns [`PermissionsError`] when the YAML is malformed, names an unknown
+    /// group, permission, or acquisition flag, maps the same country or region
+    /// rule twice, or names an unknown Data Use in a signal's revoke list.
     pub fn from_yaml(yaml: &str) -> Result<Self, PermissionsError> {
         let file: RulesFile =
             serde_yaml_ng::from_str(yaml).map_err(|error| PermissionsError::Parse {
@@ -743,7 +748,8 @@ impl PermissionState {
 #[derive(Debug, Deserialize)]
 struct RulesFile {
     /// Named permission baselines, keyed by group name. Each group is a flat map
-    /// of `default` plus optional per-permission flags.
+    /// of per-permission flags, with an optional `default` shorthand for any
+    /// permission it omits.
     #[serde(default)]
     groups: BTreeMap<String, BTreeMap<String, String>>,
     /// Rules keyed by country (`FR`) or country and region (`US/CA`).
@@ -1273,19 +1279,19 @@ rules:
             "US (us) grants device storage"
         );
 
-        // CA references the eu group, but +necessary.operations.storage grants it, overriding
-        // the eu baseline.
+        // CA references the eu group, but its permissions map grants
+        // necessary.operations.storage, overriding the eu baseline.
         assert!(
             maps.baseline(Some("US"), Some("CA"), None, None)
                 .is_set(Permission::StoreOnDevice),
-            "+necessary.operations.storage grants it for CA, overriding the eu baseline"
+            "the permissions map grants necessary.operations.storage for CA, overriding the eu baseline"
         );
-        // -advertising_marketing.first_party.contextual denies it: not set even when a signal grants it.
+        // the permissions map denies advertising_marketing.first_party.contextual: not set even when a signal grants it.
         assert!(
             !maps
                 .resolve_with(Some("US"), Some("CA"), None, None, |_| ConsentSignal::Grant)
                 .is_set(Permission::SelectBasicAds),
-            "-advertising_marketing.first_party.contextual denies it even when a signal grants it"
+            "the permissions map denies advertising_marketing.first_party.contextual even when a signal grants it"
         );
 
         // An unmapped country with a default of `US` uses the us (granted) rule.
