@@ -304,9 +304,11 @@ impl EcContext {
 
         // The same two services are kept on the context so the resolve endpoint,
         // which runs later in the request with no `RuntimeServices` of its own,
-        // can reach the provider again.
+        // can reach the provider again. The provider arrives through the one
+        // seam a composition root threads it into, so the resolve endpoint sees
+        // the same instance this request resolved.
         let host_signals = services.host_signals();
-        let ec_provider = services.ec_provider();
+        let ec_provider = services.resolved_ec_provider();
 
         // Read back an existing identifier only when the selected provider
         // accepts its shape, so an opaque vendor identifier (for example a signed
