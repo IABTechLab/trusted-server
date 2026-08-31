@@ -24,7 +24,9 @@ Task 2 may begin only after Task 1 commits this approval.
 The narrower owner gates are also resolved:
 
 - `aram356` owns the temporary `fastly.toml` `service_id` allowlist exception;
-  its 2026-09-30 review date controls review or expiry, not the ops migration.
+  it expires at `2026-09-30T00:00:00Z`, and check mode fails at or after that
+  instant. Renewal requires a reviewed, committed replacement before expiry.
+  This is not the ops migration deadline.
 - Task 3 deletes `docs/public/CNAME` and retains the project-path base. PR (d)
   must merge before Task 4 imports the live publishing deltas into rc.
 - Task 12 archives `FAQ_POC.md` at
@@ -279,6 +281,10 @@ stack this on containment or automation PRs and do not add rc-only audit records
 
 - [ ] **Step 2: Execute exactly the selected branch**
 
+The selected branch is **delete**. The custom-domain instructions remain
+rejected/reference-only unless Task 1's CNAME decision is formally reopened
+and this plan is amended and re-approved.
+
 Delete path: remove `docs/public/CNAME` and keep the project-path `base`.
 Custom-domain path: first run
 `git grep -l -F 'https://iabtechlab.github.io/trusted-server'`; at the audited
@@ -308,8 +314,9 @@ git diff --cached --name-status "$AUDITED_MAIN_TIP"
 git commit -m "Resolve documentation site domain"
 ```
 
-Run exactly one staging branch. The delete path's cached set is exactly CNAME;
-the custom path's is exactly CNAME, config, and the recorded URL path. Review
+Run the selected delete staging branch. The delete path's cached set is exactly
+CNAME; the rejected custom path's reference set is exactly CNAME, config, and
+the recorded URL path. Review
 the full cached content and require `git diff --quiet` before committing.
 
 Immediately before merge, assert the exact recorded base. After deploy, the
@@ -506,7 +513,7 @@ Start from `git ls-files -z`; classify every path as text or binary without trea
 
 - [ ] **Step 3: Write scanner detector and allowlist tests**
 
-For domain, email, credential shape, service ID, encoded token, binary strings, lockfile structured fields, media metadata, and identifier/access-phrase denylist, add both a positive fixture and an owner/rationale/expiry allowlisted fixture. Prove expired entries, stale hashes, renamed files, and broad domain exemptions fail.
+For domain, email, credential shape, service ID, encoded token, binary strings, lockfile structured fields, media metadata, and identifier/access-phrase denylist, add both a positive fixture and an owner/rationale/expiry allowlisted fixture. Prove expired entries, stale hashes, renamed files, and broad domain exemptions fail. Encode the `fastly.toml` exception expiry as `2026-09-30T00:00:00Z`; check mode must fail at or after that instant. Renewal requires a reviewed, committed replacement before expiry and is independent of the ops migration deadline.
 
 - [ ] **Step 4: Implement deterministic scanning**
 
@@ -1050,8 +1057,11 @@ Replace `RequestWrapper` with real platform traits; remove Equativ, `.with_asset
 
 - [ ] **Step 4: Resolve FAQ and tombstones**
 
-Execute exactly one FAQ branch: retire deletes `FAQ_POC.md`; archive moves it
-to `docs/superpowers/archive/FAQ_POC.md`; rewrite moves it to
+The selected FAQ branch is **archive**: move `FAQ_POC.md` to
+`docs/superpowers/archive/FAQ_POC.md`. The retire and rewrite instructions
+remain rejected/reference-only unless Task 1's FAQ decision is formally
+reopened and this plan is amended and re-approved. For reference, retire
+deletes `FAQ_POC.md`; rewrite moves it to
 `docs/guide/faq.md`, verifies every answer against code, links it from the
 Guide landing page and Reference navigation, registers `/guide/faq` in
 `pages.toml`, and adds a built-page smoke for `guide/faq.html`. Every branch
@@ -1092,7 +1102,7 @@ If `html_processor.test.html` changes, run `cargo test-fastly html_processor`. R
 
 - [ ] **Step 9: Commit WP2**
 
-Stage the common WP2 paths first, then exactly one FAQ branch and only the
+Stage the common WP2 paths first, then the selected archive branch and only the
 conditional fixture paths that actually changed:
 
 ```bash
@@ -1108,7 +1118,9 @@ git add crates/trusted-server-core/src/html_processor.test.html
 git commit -m "Correct maintained documentation truth"
 ```
 
-The comments label mutually exclusive branch commands; execute one, not all.
+The comments preserve mutually exclusive reference branches; execute the
+archive command only unless the decision is formally reopened and this plan is
+amended and re-approved.
 If the mechanical inventory selects another human-facing comment path, add
 that one exact path to the reviewed list before running the checkpoint—never
 replace this list with `git add docs`, `git add .github`, or another directory.

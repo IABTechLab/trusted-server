@@ -27,13 +27,15 @@ import, must be append-only and timestamped in UTC. Each capture includes:
   branch API JSON.
 
 Tokens, credential-bearing headers, cookies, and unredacted secrets are never
-captured. Every request body, response body, and API JSON body carries its own
-SHA-256. A capture larger than 60 KiB is split into ordered chunks; each chunk
-records its byte length and SHA-256, and the capture records the aggregate
-byte length and SHA-256. Workflow, PR, issue, and artifact URLs are navigation
-aids only; pasted redacted bodies plus hashes are authoritative. Corrections
-append a new comment that names the superseded comment URL and capture ID;
-existing comments are never edited or deleted.
+captured. Every request body, response body, and applicable API JSON body
+includes its actual redacted content, byte length, and SHA-256. Each issue
+comment is at most 60 KiB. A larger capture is split into ordered chunks; each
+chunk includes its actual redacted content, index, byte length, and SHA-256,
+and the capture records the aggregate byte length and SHA-256. Workflow, PR,
+issue, and artifact URLs are navigation aids only; pasted redacted bodies plus
+hashes are authoritative. Corrections append a new comment that names the
+superseded comment URL and capture ID; existing comments are never edited or
+deleted.
 
 ### Capture template
 
@@ -58,11 +60,13 @@ Response status:
 Redacted response body:
 Response-body bytes / SHA-256:
 Snapshot detector / correlator / ID / ref / SHA:
-Graph API JSON bytes / SHA-256:
-Ruleset API JSON bytes / SHA-256:
-Protection and merge-queue API JSON bytes / SHA-256:
-Branch API JSON bytes / SHA-256:
-Chunk index / total, chunk bytes / SHA-256, aggregate bytes / SHA-256:
+Graph API redacted JSON body / bytes / SHA-256:
+Ruleset API redacted JSON body / bytes / SHA-256:
+Protection and merge-queue API redacted JSON body / bytes / SHA-256:
+Branch API redacted JSON body / bytes / SHA-256:
+Ordered chunk index / total:
+Ordered chunk redacted content / bytes / SHA-256:
+Aggregate bytes / SHA-256:
 Navigation URLs:
 Supersedes capture/comment:
 Result:
@@ -108,7 +112,8 @@ updated approved baseline before work continues.
 ### Task 1: decisions and immutable tips
 
 - Capture timestamp: 2026-08-31T22:55:52Z.
-- Actor: agent acting for approver `aram356`.
+- Executor: `OpenAI Codex task agent task1_implementer`.
+- Approver: `aram356`.
 - Operation: fetch refs, verify exact rc tip and ancestry, record starting
   `main` tip, and establish decision/evidence records.
 - Implementation start HEAD:
@@ -136,14 +141,29 @@ updated approved baseline before work continues.
 
 ### External delivery URLs and immutable identifiers
 
-| Item                              | PR or issue URL                  | Target      | Fresh audited base                         | Validated head/tool | Merge SHA | Evidence state |
-| --------------------------------- | -------------------------------- | ----------- | ------------------------------------------ | ------------------- | --------- | -------------- |
-| (a) rc implementation PR          | Pending verification of PR #1049 | `rc/202608` | `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` | Pending             | Pending   | Pending        |
-| (b) containment PR                | Pending                          | `main`      | Pending                                    | Pending             | Pending   | Pending        |
-| (c) validation-only controller PR | Pending                          | `main`      | Pending                                    | Pending             | Pending   | Pending        |
-| (d) CNAME deletion PR             | Pending                          | `main`      | Pending                                    | Pending             | Pending   | Pending        |
-| (c2) activation PR                | Pending                          | `main`      | Pending                                    | Pending             | Pending   | Epoch 2        |
-| (e) release-handoff PR            | Pending                          | `main`      | Pending                                    | Pending             | Pending   | Epoch 3        |
+| Item                              | PR or issue URL                                        | Target      | Fresh audited base                         | Validated head/tool                                        | Merge SHA | Evidence state                  |
+| --------------------------------- | ------------------------------------------------------ | ----------- | ------------------------------------------ | ---------------------------------------------------------- | --------- | ------------------------------- |
+| (a) rc implementation PR          | https://github.com/IABTechLab/trusted-server/pull/1049 | `rc/202608` | `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` | Remote capture: `b904b3aeb5af26a536afadcbfb2d70af36bca5a2` | Pending   | OPEN, draft; refresh after push |
+| (b) containment PR                | Pending                                                | `main`      | Pending                                    | Pending                                                    | Pending   | Pending                         |
+| (c) validation-only controller PR | Pending                                                | `main`      | Pending                                    | Pending                                                    | Pending   | Pending                         |
+| (d) CNAME deletion PR             | Pending                                                | `main`      | Pending                                    | Pending                                                    | Pending   | Pending                         |
+| (c2) activation PR                | Pending                                                | `main`      | Pending                                    | Pending                                                    | Pending   | Epoch 2                         |
+| (e) release-handoff PR            | Pending                                                | `main`      | Pending                                    | Pending                                                    | Pending   | Epoch 3                         |
+
+#### PR (a) pre-push metadata capture
+
+- Capture timestamp: 2026-08-31T23:12:46Z.
+- URL: https://github.com/IABTechLab/trusted-server/pull/1049.
+- State: OPEN, draft.
+- Base: ref `rc/202608`, SHA
+  `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`.
+- Remote head: ref `spec-docs-refresh`, captured SHA
+  `b904b3aeb5af26a536afadcbfb2d70af36bca5a2`.
+- Author and assignee: `aram356`.
+
+This is a timestamped pre-push remote capture. It does not assert that Task 1
+or its follow-up commits exist on the remote head. Refresh every field after
+those commits are pushed and before using PR #1049 as a validation input.
 
 ### Cross-worktree handoff: PRs (b), (c), and (d)
 
@@ -156,11 +176,16 @@ by both URL and literal value.
 Handoff ID / PR label: (b), (c), or (d)
 Source PR / tracking issue URL:
 Source capture IDs:
+Source capture timestamp (UTC):
+Source capture actor:
 Source worktree path:
 Branch name:
+Source PR state / draft:
 Fresh audited_main_tip:
 Exact PR base SHA:
 Exact PR head SHA:
+Trusted tool / source SHA:
+Base-controlled controller ref / SHA:
 Merge SHA:
 Changed paths and modes:
 Local commands and results:
@@ -224,11 +249,11 @@ no-diff proof is incomplete.
 Every exception requires an owner, narrow rationale, and review or expiry date.
 Expired or ownerless entries fail the checkpoint.
 
-| Type / path                                 | Value classification   | Owner                 | Rationale                                      | Review or expiry                 | State    |
-| ------------------------------------------- | ---------------------- | --------------------- | ---------------------------------------------- | -------------------------------- | -------- |
-| `fastly.toml` `service_id`                  | Service ID             | `aram356`             | Temporary checked-in operational identifier    | 2026-09-30 review/expiry control | Approved |
-| Task 15 temporary public-page ownership     | Page/orphan transition | Pending Task 15 owner | Page registered before Task 16 final ownership | Expires at Task 16               | Pending  |
-| Spin manual smoke, only if CI cannot run it | Manual evidence        | Pending               | Runner capability gap                          | Time-bounded date required       | Pending  |
+| Type / path                                 | Value classification   | Owner                 | Rationale                                                                                                              | Review or expiry           | State    |
+| ------------------------------------------- | ---------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------- | -------------------------- | -------- |
+| `fastly.toml` `service_id`                  | Service ID             | `aram356`             | Check mode fails at or after expiry; renewal requires a reviewed committed replacement; not the ops migration deadline | `2026-09-30T00:00:00Z`     | Approved |
+| Task 15 temporary public-page ownership     | Page/orphan transition | Pending Task 15 owner | Page registered before Task 16 final ownership                                                                         | Expires at Task 16         | Pending  |
+| Spin manual smoke, only if CI cannot run it | Manual evidence        | Pending               | Runner capability gap                                                                                                  | Time-bounded date required | Pending  |
 
 ### Follow-up issues
 

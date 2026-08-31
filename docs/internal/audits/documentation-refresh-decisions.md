@@ -28,9 +28,10 @@ commit. A later `main` PR must not reuse the starting `audited_main_tip` after
 - Selection: retain the checked-in `fastly.toml` `service_id` only through a
   typed, temporary scanner allowlist entry.
 - Owner: `aram356`.
-- Next review: 2026-09-30.
-- Control: the review date requires renewal or expiry of the exception. It is
-  not an ops migration deadline, and the migration does not block this refresh.
+- Expiry: `2026-09-30T00:00:00Z`.
+- Control: check mode fails at or after the expiry instant. Renewal requires a
+  reviewed, committed replacement before expiry. This is not the ops migration
+  deadline, and the migration does not block this refresh.
 
 ### 2. CNAME
 
@@ -103,14 +104,29 @@ evidence.
 Populate each pending field with the exact URL and immutable identifiers at
 the named checkpoint. Do not infer a value from a branch name.
 
-| Item                              | Target      | URL                              | Fresh audited base                         | Head or merge SHA | State         |
-| --------------------------------- | ----------- | -------------------------------- | ------------------------------------------ | ----------------- | ------------- |
-| (a) rc implementation PR          | `rc/202608` | Pending verification of PR #1049 | `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` | Pending           | Open          |
-| (b) containment PR                | `main`      | Pending                          | Pending                                    | Pending           | Not started   |
-| (c) validation-only controller PR | `main`      | Pending                          | Pending                                    | Pending           | Not started   |
-| (d) CNAME deletion PR             | `main`      | Pending                          | Pending                                    | Pending           | Not started   |
-| (c2) activation PR                | `main`      | Pending                          | Pending                                    | Pending           | Not started   |
-| (e) release-handoff PR            | `main`      | Pending                          | Pending                                    | Pending           | Release-owned |
+| Item                              | Target      | URL                                                    | Fresh audited base                         | Head or merge SHA                                          | State                           |
+| --------------------------------- | ----------- | ------------------------------------------------------ | ------------------------------------------ | ---------------------------------------------------------- | ------------------------------- |
+| (a) rc implementation PR          | `rc/202608` | https://github.com/IABTechLab/trusted-server/pull/1049 | `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` | Remote capture: `b904b3aeb5af26a536afadcbfb2d70af36bca5a2` | OPEN, draft; refresh after push |
+| (b) containment PR                | `main`      | Pending                                                | Pending                                    | Pending                                                    | Not started                     |
+| (c) validation-only controller PR | `main`      | Pending                                                | Pending                                    | Pending                                                    | Not started                     |
+| (d) CNAME deletion PR             | `main`      | Pending                                                | Pending                                    | Pending                                                    | Not started                     |
+| (c2) activation PR                | `main`      | Pending                                                | Pending                                    | Pending                                                    | Not started                     |
+| (e) release-handoff PR            | `main`      | Pending                                                | Pending                                    | Pending                                                    | Release-owned                   |
+
+### PR (a) pre-push metadata capture
+
+- Capture timestamp: 2026-08-31T23:12:46Z.
+- URL: https://github.com/IABTechLab/trusted-server/pull/1049.
+- State: OPEN, draft.
+- Base: ref `rc/202608`, SHA
+  `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`.
+- Remote head: ref `spec-docs-refresh`, captured SHA
+  `b904b3aeb5af26a536afadcbfb2d70af36bca5a2`.
+- Author and assignee: `aram356`.
+
+This is a timestamped pre-push remote capture. It does not assert that Task 1
+or its follow-up commits exist on the remote head. Refresh every field after
+those commits are pushed and before using PR #1049 as a validation input.
 
 ## External issue records
 

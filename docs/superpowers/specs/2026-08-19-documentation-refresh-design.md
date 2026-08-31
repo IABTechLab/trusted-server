@@ -238,9 +238,10 @@ Truth-pass acceptance and parity checks operate on defined source sets:
   scrubbed from the public repository regardless of build exclusion.
 - Sensitive real-world values are removed or covered by the typed,
   expiring allowlist. The `fastly.toml` `service_id` is its one approved,
-  time-bounded exception: `aram356` owns it through its 2026-09-30 review.
-  That date controls review or expiry of the exception; it is not an ops
-  migration deadline.
+  time-bounded exception: `aram356` owns it until it expires at
+  `2026-09-30T00:00:00Z`. Check mode fails at or after that instant. Renewal
+  requires a reviewed, committed replacement before expiry. This is not the
+  ops migration deadline.
 - CI catches regressions: docs build (already live on rc), rustdoc with
   broken-intra-doc-link denial, doctests, and semantic parity bound to the
   reader-facing markdown.
@@ -748,8 +749,10 @@ and [default-branch-only security-update PRs](https://docs.github.com/en/code-se
 - `fastly.toml`: empty `authors` list; label the key fixtures
   consistently as local test fixtures; comment the four KV stores; remove
   the `test-prebid-eids.sh` comment. `service_id` stays under its
-  owner-controlled allowlist entry through the 2026-09-30 review; the review
-  date is not a migration deadline.
+  owner-controlled allowlist entry until it expires at
+  `2026-09-30T00:00:00Z`. Check mode fails at or after that instant; renewal
+  requires a reviewed, committed replacement before expiry. This is not the
+  ops migration deadline.
 - `docs/package.json`: `"private": true`, license Apache-2.0.
 - `CLAUDE.md` policy amendment lands HERE (not WP6): the sensitive-data
   policy gains the owner-approved exception taxonomy (vendor URL,
@@ -1461,9 +1464,10 @@ they do not require a follow-on repository evidence PR.
 ## Owner decisions and remaining non-blocking questions
 
 1. `fastly.toml` `service_id`: approved as a temporary allowlist exception.
-   Owner: `aram356`. Next review: 2026-09-30. The date controls review or
-   expiry of the exception; it is not a migration deadline. The ops migration
-   remains non-blocking.
+   Owner: `aram356`. It expires at `2026-09-30T00:00:00Z`; check mode fails at
+   or after that instant. Renewal requires a reviewed, committed replacement
+   before expiry. This is not the ops migration deadline, which remains
+   non-blocking.
 2. CNAME: delete `docs/public/CNAME` and retain the project-path base. Owner:
    `aram356`. Decision date: 2026-08-31. The custom-domain alternative was
    rejected for this refresh. Rollback never restores the placeholder; it
