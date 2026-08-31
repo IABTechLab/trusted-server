@@ -358,7 +358,7 @@ impl EcContext {
         // re-deriving it.
         let permissions = consent::assemble_permissions(settings, &consent, geo_status);
         let storage_acquisition = consent::storage_acquisition(settings, geo_status);
-        // With no provider selected nothing may mint or use an identifier, so
+        // With no provider selected nothing may create or use an identifier, so
         // the gate is closed rather than open by default.
         let ec_allowed = selected_provider
             .as_ref()
@@ -1687,7 +1687,7 @@ mod tests {
     fn hmac_mints_a_coded_identifier_and_dual_reads_the_legacy_bare_form() {
         let mut settings = create_test_settings();
         // A granted-baseline default jurisdiction, so the storage permission
-        // is set with no signal and the mint runs.
+        // is set with no signal and the creation runs.
         settings.geo.default_country = Some("US/CA".to_owned());
         let req = create_test_request(&[]);
         let services = crate::platform::test_support::noop_services_with_client_ip(
