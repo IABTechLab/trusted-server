@@ -358,10 +358,10 @@ connecting to the host in `origin_url`.
 
 **Purpose**: Secret-store key name for the HMAC-SHA256 value used to sign proxy URLs.
 
-The referenced value is resolved from `trusted_server_secrets` at startup. It
-must be at least 32 bytes, so generate it with a cryptographically secure random
-source. Keep that value confidential, rotate it only intentionally, and never
-put it in the TOML file or pushed app-config blob.
+The referenced value is resolved from `trusted_server_secrets` at startup.
+Generate it with a cryptographically secure random source; at least 32 random
+bytes are recommended. Keep that value confidential, rotate it only
+intentionally, and never put it in the TOML file or pushed app-config blob.
 
 **Usage**:
 
