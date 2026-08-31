@@ -891,13 +891,14 @@ pub fn build_shared_provider(
 
 /// The Edge Cookie provider to use for this request.
 ///
-/// Resolving `[ec] provider` reads no request data, so an adapter that resolved
-/// it once while it built application state and threaded the result into
-/// [`RuntimeServices::resolved_ec_provider`](crate::platform::RuntimeServices::resolved_ec_provider)
-/// gets that same instance back here, and nothing is resolved or constructed
-/// again on the request path. An adapter that threaded nothing resolves here
-/// instead, from the same settings and the same injected provider, which is
-/// what the core tests and any embedder driving core directly do.
+/// A provider reaches the request path through one seam only. An adapter
+/// resolves `[ec] provider` once while it builds application state and threads
+/// the answer into
+/// [`RuntimeServices::resolved_ec_provider`](crate::platform::RuntimeServices::resolved_ec_provider),
+/// and that same instance comes back here with nothing resolved or constructed
+/// again on the request path. When nothing was threaded, this builds from
+/// `[ec]` settings alone, which is what a deployment selecting only a built-in
+/// provider does.
 ///
 /// # Errors
 ///
@@ -910,7 +911,7 @@ pub fn request_provider(
     if let Some(resolved) = services.resolved_ec_provider() {
         return Ok(Some(resolved));
     }
-    build_shared_provider(ec, services.ec_provider())
+    build_shared_provider(ec, None)
 }
 
 /// Adapts an injected, shared [`EdgeCookieProvider`] to the owned `Box` that

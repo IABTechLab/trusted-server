@@ -190,12 +190,6 @@ pub struct RuntimeServices {
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
     /// Per-request client metadata extracted at the entry point.
     pub(crate) client_info: ClientInfo,
-    /// A vendor or host Edge Cookie provider the adapter injects, selected when
-    /// `[ec] provider` names it. `None` when only the built-in provider is in
-    /// use. This is the seam that lets a vendor Edge Cookie provider live in its
-    /// own crate and be injected, so core never names a vendor (the same
-    /// pattern as [`geo`](Self::geo)).
-    pub(crate) ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
     /// The Edge Cookie provider this deployment already resolved from
     /// `[ec] provider` while it built application state.
     ///
@@ -288,17 +282,6 @@ impl RuntimeServices {
     #[must_use]
     pub fn client_info(&self) -> &ClientInfo {
         &self.client_info
-    }
-
-    /// Returns the adapter-injected Edge Cookie provider, when one is wired.
-    ///
-    /// `None` when the deployment uses only the built-in provider (which core
-    /// builds itself). A vendor or host provider is injected here by the
-    /// adapter, so [`build_provider`](crate::ec::provider::build_provider) can
-    /// return it without core naming the vendor.
-    #[must_use]
-    pub fn ec_provider(&self) -> Option<Arc<dyn EdgeCookieProvider>> {
-        self.ec_provider.clone()
     }
 
     /// Returns the Edge Cookie provider the composition root already resolved,
@@ -402,7 +385,6 @@ pub struct RuntimeServicesBuilder {
     geo: Option<Arc<dyn PlatformGeo>>,
     auction_telemetry_sink: Option<Arc<dyn AuctionTelemetrySink>>,
     client_info: Option<ClientInfo>,
-    ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
     resolved_ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
 }
 
@@ -419,7 +401,6 @@ impl RuntimeServicesBuilder {
             geo: None,
             auction_telemetry_sink: None,
             client_info: None,
-            ec_provider: None,
             resolved_ec_provider: None,
         }
     }
@@ -500,24 +481,12 @@ impl RuntimeServicesBuilder {
         self
     }
 
-    /// Set the adapter-injected Edge Cookie provider.
-    ///
-    /// Optional: leave it unset for a deployment that uses only the built-in
-    /// providers. Set it to inject a vendor or host provider selected by
-    /// `[ec] provider`, so the provider lives in its own crate and core never
-    /// names it.
-    #[must_use]
-    pub fn ec_provider(mut self, ec_provider: Arc<dyn EdgeCookieProvider>) -> Self {
-        self.ec_provider = Some(ec_provider);
-        self
-    }
-
     /// Set the Edge Cookie provider the composition root already resolved.
     ///
-    /// Optional, and different from [`ec_provider`](Self::ec_provider), which
-    /// is the vendor provider offered to the selector as an input. This one is
-    /// the output, the provider the selector actually chose, so setting it
-    /// keeps the request path from resolving the same settings a second time.
+    /// Optional. This is the provider the selector actually chose, so setting
+    /// it keeps the request path from resolving the same settings a second
+    /// time. It is the single seam through which a vendor or host Edge Cookie
+    /// provider reaches the request path.
     #[must_use]
     pub fn resolved_ec_provider(mut self, provider: Arc<dyn EdgeCookieProvider>) -> Self {
         self.resolved_ec_provider = Some(provider);
@@ -564,7 +533,6 @@ impl RuntimeServicesBuilder {
             client_info: self
                 .client_info
                 .expect("should set client_info before building RuntimeServices"),
-            ec_provider: self.ec_provider,
             resolved_ec_provider: self.resolved_ec_provider,
         }
     }

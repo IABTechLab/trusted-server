@@ -688,9 +688,8 @@ pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
 }
 
-/// Build a [`RuntimeServices`] with an injected Edge Cookie provider, so a test
-/// can exercise the adapter-injection path an opaque-identifier vendor provider
-/// reaches core through.
+/// Build a [`RuntimeServices`] carrying an Edge Cookie provider, so a test can
+/// exercise the seam an opaque-identifier vendor provider reaches core through.
 pub(crate) fn noop_services_with_ec_provider(
     ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
 ) -> RuntimeServices {
@@ -718,9 +717,7 @@ pub(crate) fn noop_services_with_ec_provider_without_client_ip(
 /// composition root already resolved, the way a production adapter threads it.
 ///
 /// Use this to check that the request path reuses that instance rather than
-/// resolving `[ec] provider` for itself. [`noop_services_with_ec_provider`]
-/// is the other half of the pair, offering a vendor provider as an input to
-/// the selector instead of the selector's answer.
+/// resolving `[ec] provider` for itself.
 pub(crate) fn noop_services_with_resolved_ec_provider(
     resolved: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
 ) -> RuntimeServices {
@@ -754,7 +751,7 @@ fn noop_services_with_ec_provider_and_ip(
             client_ip,
             ..ClientInfo::default()
         })
-        .ec_provider(ec_provider)
+        .resolved_ec_provider(ec_provider)
         .build()
 }
 
