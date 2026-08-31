@@ -1,7 +1,7 @@
 # Design Spec: Integration Response-Header Hook
 
 **Status:** Not implemented in the series. PR #1047 carries the
-documentation set only; the hook was removed from the earlier draft of that
+documentation set only. The hook was removed from the earlier draft of that
 PR because it has no consumer, which is this spec's own §-rule for
 speculative surface. The spec is retained as the design bar for the hook
 when its first consumer arrives (an integration that must set response
@@ -32,7 +32,7 @@ governed by this spec, §4a is the normative PR-specific delta and supersedes
 that baseline wherever its generic request/effect API, header ordering,
 session-by-header behavior, endpoint/request surface, cookie lifecycle,
 challenge transport, or response-pointer behavior conflicts. The baseline
-continues to provide historical context; it is not a second normative source
+continues to provide historical context. It is not a second normative source
 for those surfaces.
 
 Integrations can today rewrite request-path behavior (proxies, attribute
@@ -61,18 +61,18 @@ processed.
   which **core validates and applies**,
   attributing each to its integration id. PR #838's shape handed the
   integration an unrestricted `&mut HeaderMap`, which makes §3's collision
-  policy unenforceable by construction: core cannot validate or attribute
+  policy unenforceable by construction, because core cannot validate or attribute
   writes it never sees. An API that cannot express a violation beats one
   that promises to catch it.
 - **Every adapter calls the apply point** on its outbound-response path for
   processed documents. The call site lives in shared response-finalization
-  code where one exists; where adapters finalize independently, each adapter
+  code where one exists. Where adapters finalize independently, each adapter
   gains the call and a test proving it.
 - **Ordering is three stages, and the last one is inviolable:** core
   response-header handling (EC Set-Cookie emission, EC header clearing,
   privacy headers) → integration operations → **final cache/privacy
   invariant enforcement**, which no integration operation can override.
-  Running the hook dead-last would be wrong: current `main` deliberately
+  Running the hook dead-last would be wrong, because current `main` deliberately
   runs cookie-cache protection _after_ arbitrary header changes, stripping
   surrogate caching and forcing private/no-store on any response that sets
   a cookie, a hook applied after that recheck could combine an appended
@@ -82,7 +82,7 @@ processed.
   cookie rule. Core **snapshots the complete pre-hook cache restriction
   state**, whether the restriction came from core's own classification
   (processed auction HTML is marked private even when no cookie is
-  emitted; today's final helper returns early without `Set-Cookie`) **or
+  emitted, and today's final helper returns early without `Set-Cookie`) **or
   from the origin** (an origin-supplied `private, no-store` that core
   merely passed through), and the post-hook response may only be
   **equal or stronger** on the privacy axis: integrations can tighten
@@ -92,7 +92,7 @@ processed.
   are orthogonal constraints (RFC 9111: `no-cache` permits shared
   storage subject to revalidation; `private` forbids shared storage), so
   "replace `private` with the stronger `no-cache`" would make a
-  personalized response shared-storable. The merge: each of the **six sticky directives**, `no-store`, `no-cache`,
+  personalized response shared-storable. Under the merge, each of the **six sticky directives**, `no-store`, `no-cache`,
   `private`, `must-revalidate`, `proxy-revalidate`, `no-transform`, is
   present-in-snapshot-or-mutation ⇒ present-in-final (this
   "snapshot or mutation ⇒ final" rule scopes to exactly these six), with two refinements. First, `must-understand` is the deliberate
@@ -127,14 +127,14 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   a matching rule four adapters would implement identically).
   Merging them per-directive on unrestricted responses was a hole (an
   unrestricted `CDN-Cache-Control: max-age=60` could become a year), and
-  they are additionally stripped from any restricted response; and the
+  they are additionally stripped from any restricted response, and the
   final `Vary` is the **union of the complete snapshot `Vary` set**,
   origin-supplied members included, not only core-required ones, and
   the mutation. Ordering is normative so the final `Vary` reaches TS's
   own cache key, not just the wire: **mutation/invariant → final `Vary`
   computation → cache-key construction → body/metadata commit**, with
   three identity rules. Cache matching uses the **exact final publisher
-  request** (post-overlay view; keying from the redacted view would
+  request** (post-overlay view, because keying from the redacted view would
   collapse personalized variants).
 
   The final `Vary` name list has one cross-adapter grammar. Core collects every
@@ -145,7 +145,7 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   empty member or invalid token introduced by a mutation invalidates that
   batch. If the reverted snapshot itself is malformed, the invariant replaces
   the final value with `Vary: *`, forces `no-store`, and writes no cache
-  artifact. `*` in either source likewise dominates every other member: the
+  artifact. `*` in either source likewise dominates every other member, so the
   normalized result is the single `*` and is uncacheable. For an ordinary
   list, the wire response emits one lowercase `, `-joined value, while the
   variant descriptor stores `vary_names` as the exact sorted JSON array of
@@ -154,11 +154,11 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
 
   A normalized name nominates one request header. Digest construction obtains
   **all** values for that header from the exact final publisher request after
-  overlay, preserving received field-line order and value octets; it does not
+  overlay, preserving received field-line order and value octets. It does not
   comma-fold, trim, or split those request values. The `<name>` bytes in the
   HMAC input below are always the normalized lowercase ASCII name, and a name
-  is digested once even if it appeared repeatedly in `Vary`. Known-answer
-  normalization fixture: snapshot/mutation lines `Vary: X-Tenant ,
+  is digested once even if it appeared repeatedly in `Vary`. In the known-answer
+  normalization fixture, snapshot/mutation lines `Vary: X-Tenant ,
   Accept-Encoding` and `Vary: accept-encoding` produce wire value
   `accept-encoding, x-tenant` and descriptor value
   `["accept-encoding", "x-tenant"]`, then digest each nominated request
@@ -187,10 +187,10 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   [{ "id": "<id>", "key_base64url": "<unpadded>" }] }`. `keys` is
   sorted by `id`, contains 1..4 unique entries, rejects unknown fields,
   and every value decodes to exactly 32 CSPRNG bytes. An id is derived,
-  not operator-invented: the first 16 lowercase hex characters of
-  SHA-256 over the raw key bytes; a supplied mismatch or one id bound to
+  not operator-invented, and is the first 16 lowercase hex characters of
+  SHA-256 over the raw key bytes. A supplied mismatch or one id bound to
   different bytes is fatal. The current id must exist in the array.
-  Every cache entry stores its id; raw keys never enter config, cache
+  Every cache entry stores its id. Raw keys never enter config, cache
   artifacts, logs, or metrics. Startup **fails** when response caching is
   enabled and the keyring/current key does not resolve (digests are never
   computed unkeyed).
@@ -207,22 +207,22 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   still-unknown ID, malformed descriptor, missing artifact, expiry, or revision
   mismatch is a miss for that descriptor, never a comparison under another
   key. Multiple matching descriptors are corruption and make the entire base
-  lookup a miss with a metric; index order never chooses a winner.
+  lookup a miss with a metric. Index order never chooses a winner.
 
   Publication writes and verifies the immutable artifact first, then CAS-adds
   or replaces its complete descriptor in the index. Rekeying or a changed
   `Vary` set inserts the new artifact/descriptor before removing the old
-  descriptor; a crash may leave a safely unreachable artifact or two
+  descriptor. A crash may leave a safely unreachable artifact or two
   nonmatching descriptors but cannot point to a partial artifact. Index
   capacity eviction removes expired descriptors first and otherwise the
-  least-recently-used complete descriptor; it never rewrites a digest under a
+  least-recently-used complete descriptor. It never rewrites a digest under a
   new key ID. This is the one meaning of “insert-new-then-index-update rekey” in
   the capability matrix and 304 rules.
 
   Rotation atomically replaces the secret entry with a new valid keyring
   containing the new current key **and all still-live previous keys**. Fleet
-  propagation may be mixed only in the safe direction: a process with the old
-  keyring can write/read the old id; the variant index exposes that id before
+  propagation may be mixed only in the safe direction, where a process with the old
+  keyring can write/read the old id. The variant index exposes that id before
   lookup, so a process seeing an unknown descriptor id refreshes the keyring
   once, then treats a still-unknown descriptor as a cache miss. It never
   guesses, probes with the current key, or computes unkeyed. A previous key may
@@ -250,13 +250,13 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   are independent axes, so no single most-restrictive point exists):
   the response is treated as **uncacheable for the storage decision**
   (`no-store`-equivalent in the invariant) and any mutation batch
-  merging against the malformed value is rejected whole; among
-  well-formed values, duplicate directives keep the strongest; quoted and unquoted
-  forms are equivalent; conflicting `max-age` values keep the smallest;
+  merging against the malformed value is rejected whole. Among
+  well-formed values, duplicate directives keep the strongest, quoted and unquoted
+  forms are equivalent, conflicting `max-age` values keep the smallest, and
   unknown extension directives are dropped **from mutations only, while
   unknown directives already in the snapshot are preserved verbatim** (a
   downstream cache may honor a restrictive extension TS does not
-  recognize; dropping it would weaken origin policy, RFC 9111 §5.2.3);
+  recognize, so dropping it would weaken origin policy, RFC 9111 §5.2.3);
   `Expires` participates in the freshness bound via **RFC 9111 §4.2.1's
   freshness-lifetime algorithm, referenced directly**: the
   `Expires`-derived lifetime is `Expires − Date` (absent `Date` →
@@ -270,7 +270,7 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   origin's shorter or already-expired `Expires`; and `Vary: *` is
   treated as uncacheable-by-shared-caches (no-store-equivalent for the
   invariant). Conformance fixtures cover each rule. Middle-stage placement also keeps
-  the earlier property: an integration mutation is not silently stripped
+  the earlier property. An integration mutation is not silently stripped
   by ordinary core handling, only by the invariant pass, which logs the
   downgrade it applies.
 
@@ -294,14 +294,14 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   consent/privacy headers core emits; (b) reserved cookie _names_ within `Set-Cookie`, `ts-ec`,
   `ts-eids`, and the other `ts-*` cookies core owns. **Cookie operations are deferred out of the v1 hook, headers only.**
   The write-side gate alone ("persistent cookies require P1") was shown
-  insufficient: it never modeled reading, using, forwarding, or
+  insufficient, because it never modeled reading, using, forwarding, or
   withdrawing the cookie, so a P1-granted-then-withdrawn integration
   cookie would keep arriving on every request with nothing required to
   expire, hide, or stop egressing it, and an advertising-identifier
   cookie needs P4 the contract never expressed. Rather than ship
   "inside the permission model" as a claim the model does not back,
   `append_set_cookie` and the typed cookie builder are **deferred** to a
-  follow-up spec whose entry bar is: declared per-cookie required
+  follow-up spec whose entry bar comprises declared per-cookie required
   permissions, a typed authorized request-side view, stripping from
   unauthorized integration/proxy inputs, mandatory expiry on destructive
   P1 withdrawal, and startup-unique (name, domain, path) ownership.
@@ -309,14 +309,14 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   construction rejects a duplicate ID (current code silently coalesces,
   which corrupts attribution and budgets), with a duplicate-ID test in
   the done-when. The registration's `behavior_revision` follows §2's bump
-  contract; configuration-dependent behavior is captured separately by the
+  contract. Configuration-dependent behavior is captured separately by the
   effective-config digest. Model-only activation is separate from both, so the
   **one cache revision tuple** contains exactly
   `integration_registry_revision`, `effective_config_revision`,
   `active_policy_digest`, `active_policy_ordinal`, `model_epoch`,
   `activation_generation`, and `hook_invariant_revision` from the strong active
   tuple at publication. Every processed artifact, mutation IR/read-set bundle,
-  variant descriptor, and variant-index update stores that complete tuple; a
+  variant descriptor, and variant-index update stores that complete tuple. A
   lookup, local conditional, HEAD update, or 304 replay requires byte-for-byte
   equality with current active. In particular, the `permissions_v2` model CAS
   misses every `pre_epic_v1` artifact even though config/policy bytes did not
@@ -331,7 +331,7 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   constants next to the definitions they protect, not duplicated in the
   hook.
 - For non-reserved headers, the mutator API distinguishes **append** from
-  **replace** explicitly; append/replace legality comes from a **core-owned field registry**,
+  **replace** explicitly. Append/replace legality comes from a **core-owned field registry**,
   not adapter judgment, and the v1 registry admits **inert fields
   only**: "headers-only" is not automatically permission-neutral, since
   `Link` (preload/prefetch), `Reporting-Endpoints`/NEL, CSP report
@@ -349,7 +349,7 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   merge), `Content-Language` (append), `X-Robots-Tag` (append),
   `Retry-After` (replace-only), `Content-Location` (replace-only);
   everything else known is classified reserved or rejected by the rules
-  above, and growing the admitted set is a spec change to this list (cookies: see the §3 deferral above). Replacing a
+  above, and growing the admitted set is a spec change to this list (for cookies, see the §3 deferral above). Replacing a
   header the origin set is a deliberate act, visible in the mutator's code.
 - Later registrations see earlier mutations (order = registration order,
   which is deterministic).
@@ -362,37 +362,37 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   a **cumulative final-response budget** (≤ 128 headers / ≤ 32 KiB total,
   counting `name: value` plus separators, within any lower adapter
   ceiling, and those ceilings are the enumerated capability cells **below**,
-  with the counting rule fixed exactly: counted bytes = Σ over emitted
+  with the counting rule fixed exactly, where counted bytes = Σ over emitted
   fields of `len(name) + 2 + len(value) + 2` (the `": "` and CRLF
   separators), validated against core's budget at startup so a batch
-  that passes core can never fail only on one adapter; a snapshot
+  that passes core can never fail only on one adapter. A snapshot
   already **over** the core budget before any mutation rejects every
   ordinary batch, the budget bounds additions and never bricks an
   over-budget origin response, which passes through and is counted;
   security follows the replacement/reserve rule below)
   bounds the sum across integrations. The budget has normative priority
-  partitions: ordinary mutators may consume at most **112 headers / 24 KiB**,
+  partitions, where ordinary mutators may consume at most **112 headers / 24 KiB**,
   reserving 16 headers / 8 KiB for the core-owned security channel. Ordinary
   batches remain registration-ordered within their partition. A security
   `Continue` batch uses the reserve and, if necessary, evicts whole accepted
-  ordinary batches in reverse registration order until it fits; it never
+  ordinary batches in reverse registration order until it fits. It never
   removes half a batch and never drops origin fields. Ordinary output can
   therefore never crowd out security effects. If the immutable origin head
   plus the security batch alone exceeds the full budget, the security batch
   is rejected atomically and the request follows the documented security
   fail-open path with a dedicated metric, origin fields are not silently
   sacrificed. A security `Respond` owns a replacement
-  response: all ordinary mutation batches are discarded and the challenge
+  response. All ordinary mutation batches are discarded and the challenge
   is validated against the full 128-header / 32-KiB budget. A base publisher
   response already over the full budget still passes unchanged, but no
-  ordinary mutation applies; security `Continue` applies only if the final
+  ordinary mutation applies. Security `Continue` applies only if the final
   response fits after all ordinary batches are removed. These are separate
   outcomes and metrics.
 
   | Adapter    | Header-count / total-bytes ceiling (capability cell)                                                                                                   |
   | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
   | Axum       | no platform ceiling below the core budget (native HTTP stack), cell fixed at ≥ 128 headers / ≥ 32 KiB                                                  |
-  | Fastly     | **qualification-pending**: the measured platform ceiling is recorded in this cell by the adapter-qualification commit; unrecorded ⇒ hook startup fails |
+  | Fastly     | **qualification-pending**: the measured platform ceiling is recorded in this cell by the adapter-qualification commit, and unrecorded ⇒ hook startup fails |
   | Cloudflare | **qualification-pending**: same rule                                                                                                                   |
   | Spin       | **qualification-pending**: same rule                                                                                                                   |
 
@@ -400,31 +400,31 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   error (shrink the core budget or raise the ceiling, never a silent
   per-adapter divergence).
 
-  Hook/cache eligibility has the following concrete adapter cells; any
+  Hook/cache eligibility has the following concrete adapter cells, and any
   `qualification-pending` cell fails startup when the depending feature is
   selected:
 
   | Capability                                                                                         | Fastly                                                                                  | Axum (dev)                                          | Cloudflare                     | Spin                             |
   | -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | --------------------------------------------------- | ------------------------------ | -------------------------------- |
-  | Runtime secret lookup for Vary-HMAC/DataDome                                                       | wired secret store; qualify key-rotation behavior                                       | dev secret binding required                         | qualify Workers secret binding | qualify component secret binding |
-  | Persisted processed artifact + mutation IR/read sets                                               | qualification-pending                                                                   | in-process dev implementation required; non-durable | qualification-pending          | qualification-pending            |
+  | Runtime secret lookup for Vary-HMAC/DataDome                                                       | wired secret store, and qualify key-rotation behavior                                       | dev secret binding required                         | qualify Workers secret binding | qualify component secret binding |
+  | Persisted processed artifact + mutation IR/read sets                                               | qualification-pending                                                                   | in-process dev implementation required, non-durable | qualification-pending          | qualification-pending            |
   | Atomic artifact/metadata entry commit                                                              | qualification-pending                                                                   | implementation required                             | qualification-pending          | qualification-pending            |
   | `Vary` variant index + insert-new-then-index-update rekey                                          | qualification-pending                                                                   | implementation required                             | qualification-pending          | qualification-pending            |
   | DataDome field-line order, trusted IP/port, fixed HTTPS backend/no-redirect, and exact form limits | qualification-pending                                                                   | qualification-pending                               | qualification-pending          | qualification-pending            |
-  | SecurityUse JA4 request evidence                                                                   | platform value available; exact-field/payload qualification and sign-offs 23/28 pending | unavailable                                         | unavailable                    | unavailable                      |
+  | SecurityUse JA4 request evidence                                                                   | platform value available, with exact-field/payload qualification and sign-offs 23/28 pending | unavailable                                         | unavailable                    | unavailable                      |
 
   The qualification commit records storage lifetime, maximum object size,
   concurrency semantics, torn-write behavior, and fault-injection evidence;
   “platform has KV” is not a qualifying cell.
   `expose_host_fingerprints_to_vendor = true` also requires a qualified
-  SecurityUse JA4 cell; unsupported or pending is a startup error, while the
+  SecurityUse JA4 cell. Unsupported or pending is a startup error, while the
   default `false` remains portable.
 
   Each mutator receives an **immutable, redacted snapshot of the
   response head** (status and headers as of its turn, prior integrations'
-  accepted operations applied) as its read context; it never holds a
+  accepted operations applied) as its read context. It never holds a
   mutable reference (§2). Redaction is a security boundary, not
-  tidiness: the hook runs after core queues the EC `Set-Cookie`, so an
+  tidiness, because the hook runs after core queues the EC `Set-Cookie`, so an
   unredacted view would hand a mutator the raw EC to copy into
   `X-Vendor-Identity` or its own cookie, walking around
   `AuthorizedIdentity<PartnerEgress>` entirely. The snapshot therefore
@@ -434,7 +434,7 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   Each registration also declares the complete set of response fields its
   decision may read, including status as a distinguished input. Core records
   the union with the accepted operation batch. Undeclared reads are a hard
-  conformance failure in tests; an integration unable to declare a complete
+  conformance failure in tests. An integration unable to declare a complete
   read set marks itself `revalidation = "refetch"`, which forbids IR replay
   after any origin metadata change.
   Operations arrive as **attributed batches bound to a registration
@@ -443,7 +443,7 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   ordinary response mutators, one global order, core finalization →
   ordinary mutators → security effects → invariant pass, so the
   security layer's precedence over publisher-facing mutations holds through
-  both position and its reserved/response-owning budget rule; the current flat effects vector satisfies neither
+  both position and its reserved/response-owning budget rule. The current flat effects vector satisfies neither
   attribution nor budgets and will be restructured accordingly. Validation
   and budgeting are **atomic per batch**: a batch that exceeds its
   budget is rejected whole (logged, attributed), never partially
@@ -464,15 +464,15 @@ Which responses the hook runs on, enumerated so two implementations cannot
 diverge silently:
 
 In this table, **persisted post-hook finals** means the cache-safe ordinary
-artifact only: origin metadata plus accepted ordinary mutation IR and the
+artifact only, comprising origin metadata plus accepted ordinary mutation IR and the
 cache/privacy invariant result, with `Set-Cookie`, core request-specific
 identity fields, security-channel effects, and origin validators excluded.
-The security request filter evaluates every request before cache selection; a
+The security request filter evaluates every request before cache selection. A
 fresh `Respond` bypasses the artifact, while a fresh `Continue` batch is
 applied to the persisted ordinary artifact and the invariant pass reruns before
 emission. This applies equally to ordinary hits, local conditionals,
 origin-revalidation 304s, and HEAD. Therefore "`Set-Cookie` is never replayed"
-means never replayed from storage; a freshly validated per-request typed cookie
+means never replayed from storage. A freshly validated per-request typed cookie
 operation may still emit on that response. Security `Respond` outputs are
 always `private, no-store` and never become artifacts.
 
@@ -497,11 +497,11 @@ fixture, never a runtime wildcard.
 | Processed HTML document (rewritten by TS)         | Yes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | Streamed processed document                       | Yes, operations apply to the header block before first byte                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | Pass-through proxy response (not processed)       | No, TS is a transparent proxy for it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| Served-from-cache processed document              | Serves the **persisted post-hook finals** captured at cache fill (revision-versioned; mismatch = miss), mutators run at fill/processing time only, so a normal hit and a conditional hit return identical policy metadata **by construction**, with no purity or determinism assumption about mutators                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Served-from-cache processed document              | Serves the **persisted post-hook finals** captured at cache fill (revision-versioned, mismatch = miss), mutators run at fill/processing time only, so a normal hit and a conditional hit return identical policy metadata **by construction**, with no purity or determinism assumption about mutators                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | Redirect (3xx)                                    | No                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | Error responses TS itself generates (4xx/5xx)     | No                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `304 Not Modified` for a processed representation | **Persisted-metadata pass**: a cached processed 200 stores its final post-hook headers, accepted mutation-operation batches, and the union of every mutator's declared response-field read set (the persisted mutation IR), versioned by §3's complete cache revision tuple, including model epoch and logical activation generation. A local conditional hit re-emits persisted finals only when the complete tuple matches current active. An origin-revalidation 304 is staged and diffed against separately stored origin-side metadata. (a) Any byte-coupled field changed (`Content-Encoding`, `Content-Type`, validators, digests) → invalidate and fetch/process a full 200. (b) A changed metadata field that intersects any persisted mutator read set, or an artifact/mutator lacking a complete read-set declaration, is also unsafe → full 200 refetch and ordinary hook execution; deterministic replay of old operations cannot stand in for re-evaluating a decision made from changed inputs. (c) If every changed field is outside every declared read set and belongs to the enumerated safe-update set (`Cache-Control`, reserved CDN cache fields, `Expires`, `Date`, `Age`, `Vary`, registry-admitted mutable fields), replay the persisted deterministic operations over updated origin metadata and rerun invariants. Updated origin metadata, finals, IR, read sets, and complete revision tuple publish in one atomic entry commit; changed `Vary` uses insert-new-entry-then-index-update ordering. (d) No change → re-emit persisted finals. Artifact absence or any tuple mismatch triggers an unconditional recovery fetch so TS obtains bytes. For processed-document GET/HEAD routes, TS is explicitly the authoritative server for the transformed representation: after processing the full 200 it evaluates RFC 9110 §13 preconditions against **processed** validators; this is not evaluation of origin validators by an intermediary cache. Other methods are never eligible for this recovery path. `Set-Cookie` and origin validators are never replayed. Absent metadata → cache miss |
-| `HEAD` of a processed document                    | **Serves the persisted GET artifact when one exists**, parity with GET/304 by construction, since RFC 9111 §4.3.5 lets HEAD metadata update a stored GET response and mutators are not required to be deterministic; with no persisted artifact, HEAD is processed like a GET (headers only) and its finals stored as a **distinct head-only artifact type that never satisfies a later GET**, when a stored GET artifact exists a HEAD may **update** it only when the comparison, made against the separately stored **origin-side** metadata, never the processed artifact's (origin and rewritten lengths differ by construction, so the processed length is never the comparand and HEAD metadata never touches processed-side headers), finds validators and origin `Content-Length` matching and no byte-coupled representation field changed (RFC 9111 §4.3.5); qualifying updates land origin-side under the same atomic-commit discipline as the 304 rules, and any mismatch **invalidates** the stored GET artifact rather than updating it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `304 Not Modified` for a processed representation | **Persisted-metadata pass**: a cached processed 200 stores its final post-hook headers, accepted mutation-operation batches, and the union of every mutator's declared response-field read set (the persisted mutation IR), versioned by §3's complete cache revision tuple, including model epoch and logical activation generation. A local conditional hit re-emits persisted finals only when the complete tuple matches current active. An origin-revalidation 304 is staged and diffed against separately stored origin-side metadata. (a) Any byte-coupled field changed (`Content-Encoding`, `Content-Type`, validators, digests) → invalidate and fetch/process a full 200. (b) A changed metadata field that intersects any persisted mutator read set, or an artifact/mutator lacking a complete read-set declaration, is also unsafe → full 200 refetch and ordinary hook execution, because deterministic replay of old operations cannot stand in for re-evaluating a decision made from changed inputs. (c) If every changed field is outside every declared read set and belongs to the enumerated safe-update set (`Cache-Control`, reserved CDN cache fields, `Expires`, `Date`, `Age`, `Vary`, registry-admitted mutable fields), replay the persisted deterministic operations over updated origin metadata and rerun invariants. Updated origin metadata, finals, IR, read sets, and complete revision tuple publish in one atomic entry commit, and changed `Vary` uses insert-new-entry-then-index-update ordering. (d) No change → re-emit persisted finals. Artifact absence or any tuple mismatch triggers an unconditional recovery fetch so TS obtains bytes. For processed-document GET/HEAD routes, TS is explicitly the authoritative server for the transformed representation, and after processing the full 200 it evaluates RFC 9110 §13 preconditions against **processed** validators. This is not evaluation of origin validators by an intermediary cache. Other methods are never eligible for this recovery path. `Set-Cookie` and origin validators are never replayed. Absent metadata → cache miss |
+| `HEAD` of a processed document                    | **Serves the persisted GET artifact when one exists**, parity with GET/304 by construction, since RFC 9111 §4.3.5 lets HEAD metadata update a stored GET response and mutators are not required to be deterministic. With no persisted artifact, HEAD is processed like a GET (headers only) and its finals stored as a **distinct head-only artifact type that never satisfies a later GET**, when a stored GET artifact exists a HEAD may **update** it only when the comparison, made against the separately stored **origin-side** metadata, never the processed artifact's (origin and rewritten lengths differ by construction, so the processed length is never the comparand and HEAD metadata never touches processed-side headers), finds validators and origin `Content-Length` matching and no byte-coupled representation field changed (RFC 9111 §4.3.5); qualifying updates land origin-side under the same atomic-commit discipline as the 304 rules, and any mismatch **invalidates** the stored GET artifact rather than updating it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | Informational `1xx`, `204`, `205`, `206`          | No, enumerated so adapters do not infer independently                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
 This deliberately narrows #782's general "outbound response" phrasing to
@@ -515,19 +515,19 @@ The security channel (today: DataDome) runs under a distinct, typed
 it never authorizes TS-controlled advertising identity, graph linkage, partner egress,
 other integrations, or general raw-value observability. Request-scoped raw
 security evidence may be disclosed only to the fixed DataDome Protection API
-endpoint and only from that integration's explicit field allowlist; it is not
+endpoint and only from that integration's explicit field allowlist. It is not
 persisted in the identity graph, exposed to publisher origin or other
 integrations, or emitted in logs. It carries its own configured retention and
 deletion path. An advertising opt-out does not erase a
 strictly security-scoped identifier, while an authenticated deletion request
 or expiry under the security retention policy does. This is not a general
 exception. The path-only `Request` remains publisher-originated data and is
-explicitly covered by vendor retention/DSR sign-off; query strings and full
+explicitly covered by vendor retention/DSR sign-off. Query strings and full
 referrers are never in the security view. Every degree of freedom is closed:
 
 - **Host evidence is not a back door to the device provider.**
   `[device] provider = "fastly"` is an explicit opt-in selection (#1044) and
-  the hook does not widen it: no JA4-derived classification is stored by a
+  the hook does not widen it, and no JA4-derived classification is stored by a
   mutator. If DataDome's Protection API is allowed to receive
   request-scoped `TlsProtocol`/`JA4` evidence, its registration enumerates each field,
   proves vendor necessity and payload bounds, and keeps it ephemeral under
@@ -539,10 +539,10 @@ referrers are never in the security view. Every degree of freedom is closed:
   server-side DataDome identifier mapping. On an authenticated TS deletion
   request it excludes the route from vendor validation, emits a typed
   `datadome` cookie deletion, and sends no ClientID to DataDome for that
-  request; re-presentation retries deletion. A lost browser response can leave
+  request, and re-presentation retries deletion. A lost browser response can leave
   the cookie until its configured `security_cookie_max_age`, which is the
   bounded residual sign-off 23 accepts. This operation does **not** claim to
-  erase data already held by DataDome: vendor-side retention and data-subject
+  erase data already held by DataDome, because vendor-side retention and data-subject
   deletion require a named contractual/API procedure in the decision record.
   If no such vendor procedure exists, operator documentation says so and may
   not describe TS cookie deletion as vendor-data deletion.
@@ -552,10 +552,10 @@ referrers are never in the security view. Every degree of freedom is closed:
   operation, and the registration is not a placeholder, for DataDome
   it pins, **aligned to documented vendor behavior where hardening was
   not intended**: cookie name exactly `datadome`; one configured ownership
-  tuple for every set and deletion: path exactly `/` and
+  tuple for every set and deletion, with path exactly `/` and
   `security_cookie_domain = "host-only"` (default) or one explicit normalized
   ASCII domain. Host-only mode requires the vendor `Domain` attribute to be
-  absent; explicit-domain mode requires it to equal the configured domain
+  absent. Explicit-domain mode requires it to equal the configured domain
   exactly, TS never accepts a different domain and never rewrites one scope
   into another. The explicit value cannot exceed the registrable domain,
   computed against the **vendored
@@ -569,11 +569,11 @@ referrers are never in the security view. Every degree of freedom is closed:
   are separate requirements) and a vendor cookie using `Expires` is
   normalized to its Max-Age equivalent (both present → `Max-Age` wins,
   per RFC 10025); a normalized lifetime exceeding the ceiling rejects
-  the whole operation batch; and the parser is total: repeated `Cookie`
+  the whole operation batch. The parser is total, where repeated `Cookie`
   request fields are joined with `"; "` (semicolon-space, the
   order-preserving join of RFC 10025) before parsing, and
   **duplicate `datadome` pairs after the join make the request-side
-  identity ambiguous: treated as cookie-absent for the vendor call and
+  identity ambiguous, so they are treated as cookie-absent for the vendor call and
   counted**, while cookies under other names pass through untouched;
   `Set-Cookie` fields are **never combined**, and a vendor response
   carrying more than one `datadome` `Set-Cookie` field, a `Set-Cookie`
@@ -584,7 +584,7 @@ referrers are never in the security view. Every degree of freedom is closed:
   each reject the operation batch (the vendor cookie is well-formed;
   strictness is safe). `Expires` normalizes as
   `Max-Age = max(0, floor(expires − now))` whole seconds on the server
-  wall clock at parse time (the shared skew-bounded basis; a result of
+  wall clock at parse time (the shared skew-bounded basis, where a result of
   0 is a deletion), and the 512-byte limit measures the **normalized**
   serialized `name=value` plus attributes in bytes;
   `Max-Age` is capped by required operator configuration
@@ -595,18 +595,18 @@ referrers are never in the security view. Every degree of freedom is closed:
   Where the contract **is** deliberately narrower than the vendor, the
   spec-pinned pointer allowlist starting at ClientID-only against
   DataDome's mandatory response-directed mapping set, that reduction
-  needs explicit product **and vendor** acceptance: sign-off item 28;
-  a violating operation is rejected whole (the batch rule). **Both
+  needs explicit product **and vendor** acceptance under sign-off item 28. A
+  violating operation is rejected whole (the batch rule). **Both
   sessionByHeader is startup-rejected in v1, one state, not three**:
   TS never sends `X-DataDome-X-Set-Cookie: true`; a vendor
   `X-Set-Cookie` **invalidates the batch → Continue** (its matrix cell, since
   a session mode the fleet never requested must not half-apply); and an incoming
   browser `X-DataDome-ClientID` is **not forwarded to the vendor**
   (cookie-only session identity, an earlier revision translated
-  `X-Set-Cookie` into an ordinary cookie, which is not equivalent:
+  `X-Set-Cookie` into an ordinary cookie, which is not equivalent, because
   header-session clients expect JavaScript to receive `X-Set-Cookie`
   and `X-DD-B`, and the higher-priority header session would never see
-  a cookie update; the older DataDome spec's "always send
+  a cookie update. The older DataDome spec's "always send
   X-DataDome-X-Set-Cookie when the header ID is used" is superseded for
   v1 by this section). Supporting header mode later means the full vendor
   protocol, typed owner-scoped `X-Set-Cookie`/`X-DD-B` forwarding,
@@ -617,7 +617,7 @@ referrers are never in the security view. Every degree of freedom is closed:
   cookie to be readable by its JavaScript and warns against `HttpOnly`,
   so **every same-origin page script can observe it**, and a Respond
   serves vendor-owned HTML under the publisher origin (vendor scripts
-  with same-origin access to cookies, storage, and APIs; publisher CSP
+  with same-origin access to cookies, storage, and APIs, while publisher CSP
   can conversely break the challenge). Those browser-side observers,
   same-origin vendor code, CSP interaction, and challenge redirects
   enter **sign-offs 23/28** for ratification (both decision records
@@ -627,28 +627,28 @@ referrers are never in the security view. Every degree of freedom is closed:
   other integrations' request views, publisher-origin proxy forwarding,
   proxy/click/Testlight upstreams, auction/page-bids request
   serialization, and logs (redaction list), each surface a tested row
-  of the inventory; only the security channel itself observes it; vendor
-  egress goes only to the fixed DataDome Protection API authority and path;
-  redirects are not followed; deletion is always possible
-  through the `SecurityUse` lifecycle; and advertising withdrawal never
+  of the inventory. Only the security channel itself observes it. Vendor
+  egress goes only to the fixed DataDome Protection API authority and path.
+  Redirects are not followed. Deletion is always possible
+  through the `SecurityUse` lifecycle, and advertising withdrawal never
   grants access to or reuses the identifier. No other request filter
   inherits the cookie capability.
 - **Cookie ownership makes deletion total for the scope TS creates.** While
   DataDome is enabled, `datadome` is a security-owned name across the final
-  response: before the security batch applies, core removes and meters every
-  origin, core, cached, or ordinary-mutator `Set-Cookie` for that name;
-  unrelated cookie names remain separate field lines. Only the typed security
+  response, and before the security batch applies, core removes and meters every
+  origin, core, cached, or ordinary-mutator `Set-Cookie` for that name.
+  Unrelated cookie names remain separate field lines. Only the typed security
   operation may emit it. Authenticated deletion emits the same configured
   `(name, domain mode/domain, path)` tuple with `Max-Age=0`; it does not guess a
   scope from the request cookie, whose wire form carries no Domain or Path.
   Candidate validation rejects a change of domain mode/domain while the
   previous active DataDome configuration can still have a live cookie. The
   supported migration is disable + wait at least the previous
-  `security_cookie_max_age` + activate the new scope; a faster scope change
+  `security_cookie_max_age` + activate the new scope. A faster scope change
   requires a separate bounded deletion-fan-out design. The permission spec
   §5.5 whole-settings serve fence applies before cookie processing. A bounded
   old-generation admission validation may survive only during the pre-promotion
-  drain; the register's promotion-not-before plus member quiescence proves it
+  drain. The register's promotion-not-before plus member quiescence proves it
   and every admitted effect ended before the activation CAS. After that CAS,
   no instance may emit, refresh, or delete a `datadome` cookie until it has
   loaded and leased the exact new active tuple. A stale instance stops at serve
@@ -659,11 +659,11 @@ referrers are never in the security view. Every degree of freedom is closed:
 - **The incoming `X-DataDome-ClientID` request header is owner-only,
   like the cookie.** DataDome prioritizes the header over the cookie,
   so leaving it in the shared request would hand other integrations and
-  upstream routing the same identifier the cookie boundary strips: core
+  upstream routing the same identifier the cookie boundary strips, so core
   **removes it from the shared request** before integrations and
   upstream routing run, it joins `RedactedRequestView`'s enumerated
   strip set (providers spec), **and in v1 it is stripped for the
-  vendor too: the Protection API request's ClientID derives only from
+  vendor too, because the Protection API request's ClientID derives only from
   the `datadome` cookie, never from the incoming header** (DataDome's
   contract requires `X-DataDome-X-Set-Cookie: true` whenever a
   header-supplied ClientID is forwarded, so forwarding the header under
@@ -674,27 +674,27 @@ referrers are never in the security view. Every degree of freedom is closed:
   sent. Only DataDome-returned overlay data reaches the publisher,
   never the raw browser-supplied header.
 - **The pointer protocol has a total parser contract**, adapters
-  cannot differ where malformed batches fail open: the pointer list is
+  cannot differ where malformed batches fail open, where the pointer list is
   tokenized by the vendor's documented space separation, repeated
   pointer header fields are concatenated with a single SP before
   tokenizing, tokens split on runs of SP/HTAB, empty tokens ignored,
-  then names are ASCII-lowercased before duplicate detection; duplicate
+  then names are ASCII-lowercased before duplicate detection. Duplicate
   names after normalization, invalid names, more than 16 pointers, or
   more than 4 KiB of pointer payload render the batch invalid
   (→ Continue, the vendor's fail-open). **Pointed-field multiplicity is
   closed**: for singleton fields (`Location`, `Content-Type`,
   `X-DataDome`, `X-DD-B`, `X-Set-Cookie`) more than one instance in the
   vendor response invalidates the batch atomically, never a
-  first/last/join choice an adapter makes; list-valued fields
+  first/last/join choice an adapter makes. List-valued fields
   (`Cache-Control`, `Pragma`) are joined per RFC 9110 §5.3 before their
-  matrix outcome applies; `Set-Cookie` multiplicity follows the typed
+  matrix outcome applies. `Set-Cookie` multiplicity follows the typed
   cookie rule (exactly one `datadome` field, above). No both-source
   priority rule exists in v1: the header session form (`X-Set-Cookie`)
   is matrix-governed as batch-invalid, so "header form wins" is
   unreachable and deleted.
 - **Request-header pointers are a positive, enumerated allowlist with no
   default publisher-origin identifier exposure.**
-  "Documented enrichment headers" is not enforceable; the registration
+  "Documented enrichment headers" is not enforceable. The registration
   enumerates the exact names from the **inline DataDome field contract in
   §4a.2**, spec-pinned
   today to exactly **`X-DataDome-ClientID`**, admitted only when the
@@ -707,12 +707,12 @@ referrers are never in the security view. Every degree of freedom is closed:
   resolving what was a contradiction. When the opt-in is false, the
   vendor-returned ClientID is discarded and the publisher origin is not
   an identifier observer. When true, it applies only to an owner-scoped
-  publisher-upstream overlay, never the shared request; startup logs the
+  publisher-upstream overlay, never the shared request. Startup logs the
   additional consumer, operator documentation must disclose its purpose
   and retention, and a fixture proves no other surface can read it.
   Everything else, authentication,
   `Cookie`, `Forwarded`/`X-Forwarded-*`, other identity, consent, and
-  routing-authority fields, is rejected by name and by class: a
+  routing-authority fields, is rejected by name and by class, because a
   compromised endpoint must not replace origin credentials, inject
   `ts-ec`, or spoof client location.
 - **Browser-response headers are decision-scoped through the single
@@ -729,7 +729,7 @@ referrers are never in the security view. Every degree of freedom is closed:
   decision (challenge/deny) owns its body but may describe it with
   **`Content-Type` only**, encoding and validator fields
   (`Content-Encoding`, `ETag`, `Last-Modified`, digests) stay reserved
-  even for Respond: challenge bodies are simple and uncacheable, the
+  even for Respond, because challenge bodies are simple and uncacheable, the
   allowlist does not admit those fields, and ambiguity here decides
   whether a challenge enforces or silently fails open (batch rejection →
   Continue). If the vendor ever requires more, it arrives as a reviewed
@@ -740,10 +740,10 @@ referrers are never in the security view. Every degree of freedom is closed:
   deadline of 3000 ms on the instance's monotonic clock, measured from
   immediately before vendor-backend acquisition/dispatch to the final
   body byte**, meaning connection setup and request send are inside the
-  window; the 1500 ms first-byte bound (the older spec's figure, now
+  window, and the 1500 ms first-byte bound (the older spec's figure, now
   first-byte only) runs from the same origin on the same clock. At
   expiry the decision is final (batch fails → Continue) and the vendor
-  request is canceled; cancellation and resource cleanup complete
+  request is canceled. Cancellation and resource cleanup complete
   asynchronously and never delay the response. TS sends
   `Accept-Encoding: identity`, and because that does not _guarantee_
   identity coding, a response arriving with any `Content-Encoding` is
@@ -756,7 +756,7 @@ referrers are never in the security view. Every degree of freedom is closed:
   vendor does not guarantee method-invariant challenge bodies, so the
   validated HEAD bytes cannot establish the GET length (a
   vendor-guaranteed equivalence, if ever ratified, may restore the
-  field as a reviewed change; the older DataDome spec's HEAD handling
+  field as a reviewed change, and the older DataDome spec's HEAD handling
   remains superseded). Exceeding
   size, first-byte, or total deadline fails the batch → Continue.
 - **One pointer contract, one place.** The single normative
@@ -768,7 +768,7 @@ referrers are never in the security view. Every degree of freedom is closed:
   the vendor's documented `Set-Cookie X-DD-B` allow-example while
   another invalidated the whole batch). No `X-DD-*` wildcard exists:
   every name is enumerated, `X-DD-B` included and forwarded exactly once
-  as the vendor's documented cookie-mode browser-response signal; it is
+  as the vendor's documented cookie-mode browser-response signal. It is
   never copied into publisher-upstream or another integration. The
   documented vendor responses (both the challenge example and the
   `Set-Cookie X-DD-B` allow example) are **verbatim fixtures asserting
@@ -783,29 +783,29 @@ referrers are never in the security view. Every degree of freedom is closed:
 - **One global order:** core finalization → ordinary mutators →
   security effects → **final cache/privacy invariant pass,
   unconditionally last**. Security precedence over publisher-facing
-  mutations comes from its position, not a "wins" rule; nothing outranks
+  mutations comes from its position, not a "wins" rule. Nothing outranks
   the invariant pass, or a challenge could combine `Set-Cookie` with
   public caching. The older DataDome spec's "applies last, after
   finalization" wording is **superseded by this order**. That baseline remains
-  unchanged; this PR-specific section prevents an implementation from placing
+  unchanged. This PR-specific section prevents an implementation from placing
   DataDome after the invariant pass and reopening the
   public-cache-plus-cookie bug.
 - The channel adopts the shared layers: structured attributed batches
   (§3, atomic per batch, a 302 must never lose `Location` to a budget
   while keeping its cookie), reserved header names, budgets, and the
-  invariant pass, with one sequencing rule fail-open depends on: the
+  invariant pass, with one sequencing rule fail-open depends on, where the
   complete challenge batch is **validated and budgeted before the
   Respond decision commits**, so a rejection converts to Continue while
-  the publisher route is still available; discovering the rejection
+  the publisher route is still available, because discovering the rejection
   after Respond has short-circuited routing would leave nothing to fail
   open _to_.
 
 ### 4a.1 Public Suffix List snapshot (normative)
 
 The vendored Mozilla PSL revision used for registrable-domain
-computation in §4a: the implementation PR vendors the list file
+computation in §4a, and the implementation PR vendors the list file
 and records its upstream commit hash here. Rules: ICANN **and** private
-sections apply; hostnames are IDNA-mapped before matching; IP literals
+sections apply, hostnames are IDNA-mapped before matching, and IP literals
 and single-label hosts have no registrable domain (cookie falls back to
 host-only). Updating the snapshot is a reviewed spec change.
 
@@ -821,7 +821,7 @@ host-only). Updating the snapshot is a reviewed spec change.
 The implementation copies the source bytes at that commit without editing
 and writes the lowercase 64-hex SHA-256 plus one trailing LF (no filename or
 other fields) to the required hash path. CI verifies the bytes, hash, and
-commit reference together; updating any one without the others fails. The
+commit reference together. Updating any one without the others fails. The
 provenance file is canonical JSON with exactly
 `{upstream_repository, upstream_commit_oid, upstream_commit_tree_oid,
 source_path, source_blob_oid, source_sha256_hex}`. The vendoring PR description
@@ -849,7 +849,7 @@ this subsection means that DataDome protection is enabled, not that an operator 
 supply an authority. Redirect following is disabled. No TS-controlled
 advertising identifier, consent-store key, graph value, request query, or full
 referrer is admitted. The normalized publisher URL path remains disclosed and
-may itself contain publisher-chosen data; sign-offs 23/28 must classify that
+may itself contain publisher-chosen data. Sign-offs 23/28 must classify that
 surface, its retention, and DSR handling rather than calling the entire URL
 identity-free.
 
@@ -859,7 +859,7 @@ Core-derived fields:
 - `RequestModuleName`, `ModuleVersion`, `TimeRequest`, `Port`
 - `ServerName`, `ServerRegion`
 - `ClientID` from the single unambiguous `datadome` cookie only. The form key
-  is always present because the Protection API declares it mandatory; its
+  is always present because the Protection API declares it mandatory. Its
   value is the empty string when no unambiguous cookie exists
 - `CookiesLen`, `AuthorizationLen`, and `PostParamLen` as lengths only
 - `HeadersList`, containing only the source header names admitted by the
@@ -875,7 +875,7 @@ Core derives those fields identically on every qualified adapter:
 - `Key` is the resolved DataDome server secret and is never obtained from
   request/config text; `IP` and `Port` are the remote address and TCP source
   port from trusted connection metadata. Missing `Key`, `IP`, or `Port` skips
-  the call through the metered fail-open path; no sentinel is synthesized
+  the call through the metered fail-open path. No sentinel is synthesized
 - `Method` is the validated HTTP method token; `Protocol` is exactly `http` or
   `https` from the adapter request URI; `Host` is the normalized ASCII request
   authority with a non-default port retained; `ServerHostname` is trusted TLS
@@ -889,11 +889,11 @@ Core derives those fields identically on every qualified adapter:
   Unix timestamp in decimal microseconds, captured once before integration
   processing and constrained to `0..=2^53-1`
 - `ServerName` is the adapter-qualified deployment/service name and
-  `ServerRegion` is its adapter-qualified region code; either is omitted when
+  `ServerRegion` is its adapter-qualified region code. Either is omitted when
   the platform cannot supply it without request input
 - `CookiesLen`, `AuthorizationLen`, and `PostParamLen` are decimal byte counts
   of the received field/body surfaces before redaction. Overflow beyond an
-  unsigned 64-bit count skips the call; it never wraps or truncates
+  unsigned 64-bit count skips the call. It never wraps or truncates
 
 Exact request-header value mappings:
 
@@ -918,7 +918,7 @@ Exact request-header value mappings:
 Request-field multiplicity is normalized **before** parsing, truncation, and
 form encoding, and adapters expose every received field line rather than a
 preselected first/last value. Every admitted value line must contain valid HTTP
-field-value octets **and** valid UTF-8 after OWS removal; otherwise the vendor
+field-value octets **and** valid UTF-8 after OWS removal, otherwise the vendor
 call is skipped through the metered fail-open path, because adapter-specific
 byte-to-string replacement is forbidden:
 
@@ -942,14 +942,14 @@ byte-to-string replacement is forbidden:
   Repetition skips the vendor call before either length or `HeadersList` is
   constructed. `AuthorizationLen` is the byte length of the one
   OWS-normalized value. `PostParamLen` is always the byte length of the body
-  actually presented to core, not the numeric `content-length` value; a
+  actually presented to core, not the numeric `content-length` value. A
   malformed or body-inconsistent `content-length` is rejected by the shared
   HTTP request boundary before integrations run.
 - Multiple `cookie` field lines are permitted. Core OWS-normalizes them and
   joins them in received order with the literal bytes `; ` for the shared RFC
   cookie parser. `CookiesLen` is the byte length of that canonical joined
   value. `ClientID` is populated only when the parsed result contains exactly
-  one syntactically valid `datadome` pair; malformed cookie syntax or duplicate
+  one syntactically valid `datadome` pair. Malformed cookie syntax or duplicate
   `datadome` pairs produces the required empty `ClientID` value without
   exposing another cookie. The original cookie values never enter the vendor
   payload.
@@ -957,10 +957,10 @@ byte-to-string replacement is forbidden:
   every admitted received field line in original line order, so repeated list
   fields and cookie lines remain repeated. A rejected request produces no
   `HeadersList` and no vendor call. Per-field caps apply to the single
-  normalized value; the 24,576-byte cap applies after complete form encoding.
+  normalized value. The 24,576-byte cap applies after complete form encoding.
 
 For an optional mapped value, zero received lines omits both source and mapped
-field; one or more lines whose OWS-normalized values are all empty omits the
+field. One or more lines whose OWS-normalized values are all empty omits the
 mapped form field but retains each received source name in `HeadersList`. If at
 least one list-valued line is nonempty, empty siblings remain represented in
 the exact received-order `, ` join. Mandatory `ClientID` and the three length
@@ -971,10 +971,10 @@ every host and assert byte-identical form fields, lengths, `HeadersList`, and
 reject/omit outcomes. The corpus includes repeated list fields, identical and
 different singleton duplicates, multiple cookies, duplicate `datadome`
 cookies, empty values, invalid octets, and headers whose individual values
-contain commas; invalid UTF-8 is a skip, never replacement decoding.
+contain commas. Invalid UTF-8 is a skip, never replacement decoding.
 
 `true-client-ip`, `x-forwarded-for`, and `x-real-ip` are not admitted in v1.
-The trusted `IP` field already supplies connection provenance; copying raw
+The trusted `IP` field already supplies connection provenance, and copying raw
 forwarding headers would let a client or unqualified proxy manufacture vendor
 evidence. A future adapter-normalized forwarding chain requires a separately
 named typed field and vendor sign-off, never reuse of the raw header mapping.
@@ -999,7 +999,7 @@ list.
 
 The following limits are bytes of the decoded field value before form
 encoding. Truncation is UTF-8-boundary-safe. `XForwardedForIP` alone truncates
-from the end; every other bounded field retains its prefix:
+from the end, while every other bounded field retains its prefix:
 
 - 8 bytes: `SecCHDeviceMemory`, `SecCHUAMobile`,
   `SecFetchStorageAccess`, `SecFetchUser`
@@ -1022,12 +1022,12 @@ unbounded per-field by the vendor table but remain subject to the total bound.
 The complete `application/x-www-form-urlencoded` body, including field names,
 `=`/`&` separators, and percent-encoding expansion, must be at most **24,576
 bytes**. Core constructs and measures the whole payload before issuing the
-request. It does not silently drop optional fields to fit: overflow skips the
+request. It does not silently drop optional fields to fit. Overflow skips the
 vendor call and takes the same metered fail-open `Continue` path as a transport
 failure.
 
 This is deliberately narrower than DataDome's currently documented required
-surface: notably, it withholds `CookiesList` and omits empty source-header
+surface. Notably, it withholds `CookiesList` and omits empty source-header
 fields. Product/vendor sign-off 28 therefore requires written confirmation
 that this exact reduced profile is supported. Until that confirmation and
 adapter conformance fixtures exist, the DataDome integration is not
@@ -1042,38 +1042,38 @@ is rejected.
 
 | Header                | Direction                   | Scope                                                                                                                                                                  |
 | --------------------- | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `X-DataDome-ClientID` | response → upstream overlay | Disabled by default; admitted only with `expose_client_id_to_origin = true`. Owner-scoped publisher overlay only, never the shared request view or another integration |
+| `X-DataDome-ClientID` | response → upstream overlay | Disabled by default. Admitted only with `expose_client_id_to_origin = true`. Owner-scoped publisher overlay only, never the shared request view or another integration |
 
 #### 4a.2.3 The single pointer matrix (normative, decision × session mode × pointer)
 
 This is the one authoritative browser-response contract. Session mode
-is **cookie** in v1 (sessionByHeader is startup-rejected; a header-mode
+is **cookie** in v1 (sessionByHeader is startup-rejected, and a header-mode
 column is added by the sign-off-23 opt-in, never implicitly). No
 wildcard rows exist, every accepted name is enumerated, and **every
 cell terminates in exactly one outcome**.
 
 | Pointer             | Respond (cookie mode)                                                                                                                                              | Continue (cookie mode)                        |
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------- |
-| `Set-Cookie`        | typed `datadome` cookie operation (hook spec §4a parser; exactly one `datadome` field)                                                                             | typed `datadome` cookie operation             |
+| `Set-Cookie`        | typed `datadome` cookie operation (hook spec §4a parser, exactly one `datadome` field)                                                                             | typed `datadome` cookie operation             |
 | `X-Set-Cookie`      | **invalidate the batch → Continue** (mode mismatch: TS never requests header sessions in v1; a vendor response asserting one must not half-apply)                  | **invalidate the batch** → effects dropped    |
 | `Location`          | forward on a 3xx Respond, replace; **on a non-3xx Respond → invalidate the batch → Continue** (a redirect field without a redirect status is a malformed decision) | **invalidate the batch** (effects dropped)    |
 | `Content-Type`      | forward (owns its body), replace                                                                                                                                   | **invalidate the batch** (effects dropped)    |
-| `Cache-Control`     | restricted merge; invariant pass last                                                                                                                              | **invalidate the batch** (effects dropped)    |
+| `Cache-Control`     | restricted merge, invariant pass last                                                                                                                              | **invalidate the batch** (effects dropped)    |
 | `Pragma`            | drop-individually, logged (response `Pragma` has no standardized meaning, RFC 9111 §5.4)                                                                           | drop-individually, logged                     |
 | `X-DataDome`        | forward, owner-scoped typed telemetry                                                                                                                              | forward, owner-scoped typed telemetry         |
-| `X-DD-B`            | forward as a browser-response security signal; never copy to publisher-upstream or another integration                                                             | forward as a browser-response security signal |
+| `X-DD-B`            | forward as a browser-response security signal, never copy to publisher-upstream or another integration                                                             | forward as a browser-response security signal |
 | anything not listed | invalidate the batch → Continue                                                                                                                                    | invalidate → effects dropped                  |
 
 Singleton-field multiplicity (`Location`, `Content-Type`, `X-DataDome`,
 `X-DD-B`, `X-Set-Cookie` appearing more than once) invalidates the
-batch atomically; list-valued fields (`Cache-Control`, `Pragma`) join
+batch atomically. List-valued fields (`Cache-Control`, `Pragma`) join
 per RFC 9110 §5.3 before their cell applies (hook spec §4a).
 
 `X-DD-B` is security-owned when DataDome is enabled. Before applying the fresh
 security batch, core removes every pre-existing instance from the origin,
 cached ordinary artifact, 304 metadata update, core response, or ordinary
 mutator. A valid pointed vendor value then uses **replace-all** and the final
-response cardinality must be exactly one; if the fresh vendor batch does not
+response cardinality must be exactly one. If the fresh vendor batch does not
 point to it, final cardinality is zero. Append is never allowed. Fixtures cover
 origin collision, cache-hit collision, 304 collision, repeated vendor fields,
 and one valid fresh value, proving “exactly once” at final emission rather than
@@ -1081,7 +1081,7 @@ merely inside the vendor batch.
 
 **Fixtures**: DataDome's documented challenge response (`Set-Cookie`,
 `Pragma`, `X-DataDome`, `Cache-Control`) asserts the decision stays
-**Respond** with exactly the mapped fields; the documented allow example
+**Respond** with exactly the mapped fields. The documented allow example
 (`Set-Cookie X-DD-B`) asserts Continue proceeds with the cookie applied
 and `X-DD-B` forwarded exactly once, neither fixture may fail open.
 
@@ -1109,7 +1109,7 @@ expose_client_id_to_origin = false
 expose_host_fingerprints_to_vendor = false
 ```
 
-The Protection API authority is not configurable: it is the core-owned
+The Protection API authority is not configurable. It is the core-owned
 `https://api-fastly.datadome.co/validate-request` endpoint defined in §4a.2.1,
 with redirects disabled. The baseline `protection_api_origin` field is a
 startup error under this delta, as are `sessionByHeader`, `session_by_header`,
@@ -1149,7 +1149,7 @@ different evidence.
    on, with cookie emission v1 reserves.
 3. **At least one real consumer ships in the same PR**, an existing
    integration registering a mutator for a real need (or, failing a real
-   need, the feature waits; scaffolding with only self-referential tests is
+   need, the feature waits, and scaffolding with only self-referential tests is
    dead code and will be removed).
 4. Every adapter applies mutations on its outbound path, with a per-adapter
    route test asserting an integration-set header appears in the response.
@@ -1190,14 +1190,14 @@ ordinary mutator API.
 
 ## 6. Divergences from issue #782
 
-This spec supersedes #782 on the following points; the issue is updated to
+This spec supersedes #782 on the following points. The issue is updated to
 reference this spec when the implementing PR (the hook's return with its
 first consumer, §7) merges:
 
 | #782 says                                          | This spec says                                                                                                       | Why                                                                                                                  |
 | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| Mutations apply to the outbound response generally | Eligibility is the explicit §3a matrix, centered on processed documents                                              | Pass-through/error/304 mutation has different semantics per adapter; enumerating beats implying                      |
-| Ship the trait + registry + adapter application    | Additionally: structured operations API (§2), reserved surface (§3), and a real consumer in the same PR (§4, item 3) | PR #838 shipped the trait with zero call sites; an unrestricted `&mut HeaderMap` cannot enforce any collision policy |
+| Mutations apply to the outbound response generally | Eligibility is the explicit §3a matrix, centered on processed documents                                              | Pass-through/error/304 mutation has different semantics per adapter, and enumerating beats implying                      |
+| Ship the trait + registry + adapter application    | Additionally: structured operations API (§2), reserved surface (§3), and a real consumer in the same PR (§4, item 3) | PR #838 shipped the trait with zero call sites, and an unrestricted `&mut HeaderMap` cannot enforce any collision policy |
 
 ## 7. Disposition (2026-08-25)
 
@@ -1211,7 +1211,7 @@ first consumer, §7) merges:
   that must set response headers, for example `Accept-CH` client-hint
   requests or detection results such as §4a's security channel. The
   returning PR implements this spec, not PR #838's shape.
-- Recorded for that future design, from review of the earlier draft: the
+- Recorded for that future design, from review of the earlier draft. The
   `&mut HeaderMap` shape concern stands. Handing a mutator a mutable
   header map makes §3's collision policy unenforceable by construction,
   because core cannot validate or attribute writes it never sees, so the
