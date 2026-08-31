@@ -307,10 +307,7 @@ describe('external bundle TCF enforcement', () => {
       gdpr: { cmpApi: 'iab', timeout: 123, defaultGdprScope: true },
     };
 
-    const { consentManagement } = await runGdprPage(
-      {},
-      { publisherConsentManagement }
-    );
+    const { consentManagement } = await runGdprPage({}, { publisherConsentManagement });
 
     expect(consentManagement.gdpr).toEqual(publisherConsentManagement.gdpr);
   });
