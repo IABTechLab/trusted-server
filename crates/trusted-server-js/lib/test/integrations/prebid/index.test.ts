@@ -1380,6 +1380,32 @@ describe('prebid/installPrebidNpm', () => {
     ]);
   });
 
+  it('continues installation when reading effective User ID entries throws', () => {
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'userSync.userIds') throw new Error('example User ID accessor failure');
+      return undefined;
+    });
+
+    expect(() => installPrebidNpm()).not.toThrow();
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+    expect(mockRegisterBidAdapter).toHaveBeenCalledTimes(1);
+    expect(mockProcessQueue).toHaveBeenCalledTimes(1);
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] effective User ID entries could not be read; managed User ID entries not seeded',
+      expect.any(Error)
+    );
+
+    // The wrappers remain installed even when the initial seed read fails.
+    mockPbjs.setConfig({ userSync: { userIds: [{ name: 'sharedId' }] } });
+    expect(mockSetConfig.mock.calls.at(-1)?.[0].userSync.userIds).toEqual([
+      { name: 'sharedId' },
+      EXPECTED_MANAGED_USER_ID,
+    ]);
+  });
+
   it('passes the publisher config through when normalization throws', () => {
     const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
     testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };

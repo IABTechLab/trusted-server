@@ -303,9 +303,14 @@ function readConfiguredUserIdNames(): string[] {
     return [];
   }
 
-  return configuredUserIdNamesFromConfig(getConfig('userSync.userIds')).concat(
-    configuredUserIdNamesFromConfig(getConfig())
-  );
+  try {
+    return configuredUserIdNamesFromConfig(getConfig('userSync.userIds')).concat(
+      configuredUserIdNamesFromConfig(getConfig())
+    );
+  } catch (error) {
+    log.error('[tsjs-prebid] effective User ID configuration could not be read', error);
+    return [];
+  }
 }
 
 /** Warn-once flag for an unstamped User ID manifest; reset by installPrebidNpm. */
@@ -1463,8 +1468,18 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     managedPbjs[MANAGED_USER_IDS_SET_CONFIG_SENTINEL] = true;
 
     if (typeof getConfig === 'function') {
-      const effectiveUserIds = configuredUserIdEntries(getConfig.call(pbjs, 'userSync.userIds'));
-      pbjs.setConfig({ userSync: { userIds: effectiveUserIds } } as PbjsConfig);
+      let effectiveUserIds: PrebidUserIdConfigEntry[] | undefined;
+      try {
+        effectiveUserIds = configuredUserIdEntries(getConfig.call(pbjs, 'userSync.userIds'));
+      } catch (error) {
+        log.error(
+          '[tsjs-prebid] effective User ID entries could not be read; managed User ID entries not seeded',
+          error
+        );
+      }
+      if (effectiveUserIds) {
+        pbjs.setConfig({ userSync: { userIds: effectiveUserIds } } as PbjsConfig);
+      }
     } else {
       // Without getConfig the effective User ID entries cannot be read, and
       // seeding the managed entries alone would silently drop every publisher
