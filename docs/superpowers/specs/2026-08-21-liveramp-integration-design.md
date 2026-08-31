@@ -6,11 +6,11 @@
 
 **Initiative:** [#55 — Monetization integrations](https://github.com/IABTechLab/trusted-server/issues/55)
 
-**Status:** Draft PR implemented; managed browser-consent hardening designed
+**Status:** Draft PR implemented; external live validation partially complete
 
 **Date:** 2026-08-21
 
-**Revised:** 2026-08-28
+**Revised:** 2026-08-31
 
 ## 1. Executive summary
 
@@ -43,8 +43,11 @@ The GitHub issue hierarchy is:
 #55 Initiative: Monetization integrations
 └── #354 Epic: LiveRamp integration
     └── #355 Task: Investigate and document LiveRamp integration
-        └── IABTechLab/uid2-optout#385: Get test credentials from LR team
 ```
+
+The work also references `IABTechLab/uid2-optout#385`, which tracked access to
+LiveRamp test credentials. It is a related cross-repository dependency, not part
+of the trusted-server issue hierarchy.
 
 The three trusted-server issues have empty or placeholder bodies, so their
 comments and linked documentation define the operative requirements.
@@ -71,15 +74,16 @@ recommended path is feasible, implementation follows the approved design.
 
 ### 2.3 Credential dependency
 
-Issue #355 has a cross-repository child,
+The work references the cross-repository tracking issue
 [IABTechLab/uid2-optout#385](https://github.com/IABTechLab/uid2-optout/issues/385),
 named “Get test credentials from LR team.” The implementation owner has since
 confirmed access to a test Placement ID and a MITM-assisted browser validation
 environment. Those values remain outside the repository.
 
 Automated tests must not depend on LiveRamp configuration. A live Placement ID
-and a LiveRamp-approved test origin are required for final end-to-end browser
-verification, but their availability is no longer an implementation blocker.
+and a LiveRamp-approved test origin remain necessary for the outstanding live
+validation matrix, but their availability is no longer an implementation
+blocker.
 
 ## 3. Terminology and product boundaries
 
@@ -161,8 +165,8 @@ diagnostics retain the same defense for externally supplied or stale artifacts.
 
 Bundling Prebid's consent collector and activity-control modules makes browser
 enforcement available, but does not activate it. Prebid activates the TCF path
-only after `consentManagement.gdpr` is configured. The managed User ID path must
-therefore initialize the standard IAB collector when all of the following are
+only after `consentManagement.gdpr` is configured. The managed User ID path
+therefore initializes the standard IAB collector when all of the following are
 true:
 
 - at least one managed User ID entry is configured;
@@ -170,10 +174,10 @@ true:
 - the page exposes the IAB `__tcfapi`.
 
 The shim performs this check before seeding managed User IDs and before
-`processQueue()`. It must preserve every publisher-owned consent setting and
-must not force GDPR scope or add a CMP configuration on pages without the TCF
-API. This keeps the browser behavior vendor-neutral and avoids imposing GDPR
-latency or defaults on non-TCF publishers.
+`processQueue()`. It preserves every publisher-owned consent setting and does
+not force GDPR scope or add a CMP configuration on pages without the TCF API.
+This keeps the browser behavior vendor-neutral and avoids imposing GDPR latency
+or defaults on non-TCF publishers.
 
 The effective value returned by `pbjs.getConfig("consentManagement")` is the
 source of truth at installation time. If it is an object with its own `gdpr`
@@ -700,6 +704,21 @@ Run outside CI against a LiveRamp-approved non-production origin:
 
 Record only booleans, source names, counts, and status codes. Do not capture or
 publish live envelopes.
+
+Sanitized browser validation completed on the approved publisher origin:
+
+- an unresolved browser identity returned HTTP 204 and exposed no LiveRamp EID;
+- a resolvable test identity returned HTTP 200, stored an envelope, and exposed
+  one `liveramp.com` EID; and
+- automated generated-bundle coverage proves denied Purpose 1 or vendor 97
+  consent suppresses the IdentityLink request and browser storage without
+  publisher-side Prebid consent configuration.
+
+The full live-validation acceptance criterion remains pending. A controlled
+environment must still confirm live denied-consent behavior, unapproved-origin
+degradation, the resulting `user.ext.eids` on the Prebid Server request, and
+later EC/KV ingestion. These checks require publisher and LiveRamp test
+conditions and are not replaced by the automated artifact suite.
 
 ## 12. Documentation changes
 

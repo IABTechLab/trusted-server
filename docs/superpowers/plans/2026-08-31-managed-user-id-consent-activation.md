@@ -21,6 +21,7 @@
 ### Task 1: Add failing shim unit tests
 
 **Files:**
+
 - Modify: `crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts:65-105`
 - Modify: `crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts:244-252`
 - Test: `crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts:835-1130`
@@ -97,6 +98,7 @@ git commit -m "Test managed User ID consent activation"
 ### Task 2: Implement the minimum non-clobbering TCF setup
 
 **Files:**
+
 - Modify: `crates/trusted-server-js/lib/src/integrations/prebid/index.ts:130-210`
 - Modify: `crates/trusted-server-js/lib/src/integrations/prebid/index.ts:1187-1241`
 - Test: `crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts`
@@ -139,6 +141,7 @@ git commit -m "Activate TCF for managed User IDs"
 ### Task 3: Complete generated-artifact enforcement coverage
 
 **Files:**
+
 - Modify: `crates/trusted-server-js/lib/test/prebid-consent-enforcement.test.mjs:115-205`
 
 - [ ] **Step 1: Add artifact-level preservation coverage**
@@ -166,6 +169,7 @@ git commit -m "Prove managed-only TCF enforcement"
 ### Task 4: Align documentation and PR handoff text
 
 **Files:**
+
 - Modify: `docs/guide/integrations/prebid.md:130-145`
 - Modify: `docs/guide/integrations/prebid.md:540-565`
 - Modify: `docs/guide/integrations/prebid.md:620-635`
@@ -210,6 +214,7 @@ git commit -m "Align LiveRamp consent and validation status"
 ### Task 5: Full verification and final review
 
 **Files:**
+
 - Review: all changes from the pre-plan HEAD through the final HEAD
 
 - [ ] **Step 1: Run the full JavaScript suite with the pinned Node version**

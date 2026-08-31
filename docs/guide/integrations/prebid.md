@@ -144,6 +144,13 @@ rule, and Purpose 4 controls user-provided-data activity rather than
 IdentityLink resolution. Validate a regenerated bundle against a live CMP before
 rolling it out broadly.
 
+When managed User IDs are configured and the page exposes a callable
+`window.__tcfapi`, the Trusted Server shim activates Prebid's standard IAB GDPR
+collector by adding only `consentManagement.gdpr.cmpApi = "iab"`. It does not
+set a timeout or force `defaultGdprScope`. An existing publisher-owned `gdpr`
+value always wins, sibling consent settings are preserved, and pages without a
+TCF API are unchanged.
+
 ## Debug Mode
 
 When `debug = true`, the Prebid integration enables additional diagnostics on both the outgoing OpenRTB request and the incoming response.
@@ -554,11 +561,13 @@ Server supplies.
 The generated bundle carries Prebid's `tcfControl` module alongside the
 `consentManagement*` modules. That pairing is what makes the TCF signal
 enforceable: `consentManagement*` retrieves the consent data, while `tcfControl`
-registers activity controls that act on it. Under pinned Prebid's defaults,
-Purpose 1 and LiveRamp's GVL vendor consent (vendor 97) gate IdentityLink
-resolution and storage. Purpose 3 has no standalone default rule. Purpose 4
-controls user-provided-data activity, but denying it alone does not block
-IdentityLink resolution or storage.
+registers activity controls that act on it. For managed User IDs, the shim
+activates the collector when `window.__tcfapi` is callable and the publisher has
+not already supplied a `consentManagement.gdpr` value. Under pinned Prebid's
+defaults, Purpose 1 and LiveRamp's GVL vendor consent (vendor 97) gate
+IdentityLink resolution and storage. Purpose 3 has no standalone default rule.
+Purpose 4 controls user-provided-data activity, but denying it alone does not
+block IdentityLink resolution or storage.
 
 Default EID transmission accepts a qualifying purpose and vendor basis from any
 of Purposes 2–10. Publishers can require Purpose 4 specifically by enabling
@@ -631,6 +640,11 @@ server-to-server ATS API.
 | The managed module is missing from the bundle      | Existing diagnostics report the missing module; auctions continue       |
 | The origin is not approved by LiveRamp             | Resolution yields no usable EID; the auction continues                  |
 | EC/KV is unavailable                               | A current-request EID can still reach `/auction`; persistence degrades  |
+
+The TCF rows assume either the managed-ID automatic setup described above or a
+publisher-owned Prebid GDPR configuration. A CMP API and its policy remain
+publisher responsibilities; Trusted Server does not synthesize consent or GDPR
+applicability.
 
 ### Credential-based validation
 
