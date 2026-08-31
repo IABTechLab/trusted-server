@@ -11,6 +11,38 @@ use crate::settings::Settings;
 
 const BASIC_AUTH_REALM: &str = r#"Basic realm="Trusted Server""#;
 
+/// Marks the single `Authorization` value Trusted Server validated.
+///
+/// The shared template cache may exempt this value from its normal authorization
+/// bypass. [`enforce_basic_auth`] clears any existing marker before checking and
+/// inserts a digest-bound marker only after successful authentication.
+#[derive(Debug, Clone)]
+pub(crate) struct EdgeTerminatedAuthorization([u8; 32]);
+
+impl EdgeTerminatedAuthorization {
+    fn digest(value: &[u8]) -> [u8; 32] {
+        Sha256::digest(value).into()
+    }
+
+    pub(crate) fn matches(&self, headers: &http::HeaderMap) -> bool {
+        let mut values = headers.get_all(header::AUTHORIZATION).iter();
+        let Some(value) = values.next() else {
+            return false;
+        };
+        values.next().is_none() && self.0 == Self::digest(value.as_bytes())
+    }
+
+    /// Builds the marker without performing a credential check.
+    ///
+    /// Test-only. Production code obtains this marker exclusively by passing
+    /// [`enforce_basic_auth`], which is what makes it meaningful.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn for_test(value: &str) -> Self {
+        Self(Self::digest(value.as_bytes()))
+    }
+}
+
 /// Enforces HTTP Basic authentication for configured handler paths.
 ///
 /// Returns `Ok(None)` when the request does not target a protected handler or
@@ -24,14 +56,36 @@ const BASIC_AUTH_REALM: &str = r#"Basic realm="Trusted Server""#;
 /// the reserved admin namespace fail closed if no handler matches, providing
 /// defense in depth for malformed and parameterized paths.
 ///
+/// # Request mutation
+///
+/// Takes `req` mutably because it owns [`EdgeTerminatedAuthorization`]. Any
+/// inherited marker is cleared on entry, and a fresh one is inserted only on the
+/// success path, so the marker present after this call always describes this
+/// call's own decision. Nothing else about the request is touched — in
+/// particular the `Authorization` header is left in place and still reaches the
+/// publisher origin.
+///
+/// That last point is a stated assumption: a credential this edge terminates is
+/// treated as reader-neutral, which holds unless the origin *also* authenticates
+/// on the same header. An origin that does so declares `Vary: Authorization`,
+/// which the template-cache store refuses as an uncovered `Vary` name. An origin
+/// that varies on `Authorization` without declaring it would defeat any HTTP
+/// cache, and is out of scope here.
+///
 /// # Errors
 ///
 /// Returns an error when handler configuration is invalid, such as an
 /// un-compilable path regex.
 pub fn enforce_basic_auth(
     settings: &Settings,
-    req: &Request<EdgeBody>,
+    req: &mut Request<EdgeBody>,
 ) -> Result<Option<Response<EdgeBody>>, Report<TrustedServerError>> {
+    // Cleared before any early return so no inherited marker can survive a call
+    // that did not itself validate a credential. Without this, a request marked
+    // upstream and then routed to an unprotected path would keep an assertion
+    // nothing checked.
+    req.extensions_mut().remove::<EdgeTerminatedAuthorization>();
+
     let path = req.uri().path();
     let Some(handler) = settings.handler_for_path(path)? else {
         if Settings::is_admin_path(path) {
@@ -42,7 +96,7 @@ pub fn enforce_basic_auth(
         return Ok(None);
     };
 
-    let Some((username, password)) = extract_credentials(req) else {
+    let Some((username, password, authorization_digest)) = extract_credentials(req) else {
         return Ok(Some(unauthorized_response()));
     };
 
@@ -59,6 +113,10 @@ pub fn enforce_basic_auth(
         .ct_eq(&Sha256::digest(password.as_bytes()));
 
     if bool::from(username_match & password_match) {
+        // Record that TS itself consumed this credential, so the shared template
+        // cache can distinguish it from a credential meant for the origin.
+        req.extensions_mut()
+            .insert(EdgeTerminatedAuthorization(authorization_digest));
         Ok(None)
     } else {
         log::warn!("Basic auth failed for path: {}", req.uri().path());
@@ -66,11 +124,14 @@ pub fn enforce_basic_auth(
     }
 }
 
-fn extract_credentials(req: &Request<EdgeBody>) -> Option<(String, String)> {
-    let header_value = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())?;
+fn extract_credentials(req: &Request<EdgeBody>) -> Option<(String, String, [u8; 32])> {
+    let mut header_values = req.headers().get_all(header::AUTHORIZATION).iter();
+    let header_value = header_values.next()?;
+    if header_values.next().is_some() {
+        return None;
+    }
+    let authorization_digest = EdgeTerminatedAuthorization::digest(header_value.as_bytes());
+    let header_value = header_value.to_str().ok()?;
 
     let mut parts = header_value.splitn(2, ' ');
     let scheme = parts.next()?.trim();
@@ -90,7 +151,7 @@ fn extract_credentials(req: &Request<EdgeBody>) -> Option<(String, String)> {
     let username = credentials_parts.next()?.to_owned();
     let password = credentials_parts.next()?.to_owned();
 
-    Some((username, password))
+    Some((username, password, authorization_digest))
 }
 
 fn unauthorized_response() -> Response<EdgeBody> {
@@ -134,9 +195,9 @@ mod tests {
         let settings = create_test_settings();
 
         for path in ["/_ts/admin%2Fec", "/_ts/admin%2fec"] {
-            let req = build_request(Method::GET, &format!("https://example.com{path}"));
+            let mut req = build_request(Method::GET, &format!("https://example.com{path}"));
 
-            let response = enforce_basic_auth(&settings, &req)
+            let response = enforce_basic_auth(&settings, &mut req)
                 .expect("should evaluate auth")
                 .unwrap_or_else(|| panic!("should challenge {path}"));
 
@@ -149,12 +210,158 @@ mod tests {
     }
 
     #[test]
-    fn no_challenge_for_non_protected_path() {
+    fn valid_credentials_mark_the_request_as_edge_terminated() {
         let settings = create_test_settings();
-        let req = build_request(Method::GET, "https://example.com/open");
+        let mut req = build_request(Method::GET, "https://example.com/secure");
+        let encoded = STANDARD.encode("user:pass");
+        set_authorization(&mut req, &format!("Basic {encoded}"));
 
         assert!(
-            enforce_basic_auth(&settings, &req)
+            enforce_basic_auth(&settings, &mut req)
+                .expect("should evaluate auth")
+                .is_none(),
+            "valid credentials should be admitted"
+        );
+        let marker = req
+            .extensions()
+            .get::<EdgeTerminatedAuthorization>()
+            .expect("should mark a credential this edge consumed");
+        assert!(
+            marker.matches(req.headers()),
+            "the marker should match the unchanged validated authorization"
+        );
+
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer publisher-origin-credential"),
+        );
+        let marker = req
+            .extensions()
+            .get::<EdgeTerminatedAuthorization>()
+            .expect("should retain the marker after an unrelated mutation");
+        assert!(
+            !marker.matches(req.headers()),
+            "the marker must not match a replacement authorization value"
+        );
+    }
+
+    #[test]
+    fn repeated_authorization_values_are_rejected_without_a_marker() {
+        let settings = create_test_settings();
+        let mut req = build_request(Method::GET, "https://example.com/secure");
+        let encoded = STANDARD.encode("user:pass");
+        set_authorization(&mut req, &format!("Basic {encoded}"));
+        req.headers_mut().append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer publisher-origin-credential"),
+        );
+
+        let response = enforce_basic_auth(&settings, &mut req)
+            .expect("should evaluate auth")
+            .expect("should challenge an ambiguous credential");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            req.extensions()
+                .get::<EdgeTerminatedAuthorization>()
+                .is_none(),
+            "a repeated authorization field must remain pass-through rather than being marked safe"
+        );
+    }
+
+    #[test]
+    fn an_inherited_marker_is_cleared_on_an_unprotected_path() {
+        // The marker asserts "this edge already checked a credential". A request
+        // routed to a path no handler protects was never checked here, so a marker
+        // it arrived with must not survive to grant shared-template eligibility.
+        let settings = create_test_settings();
+        let mut req = build_request(Method::GET, "https://example.com/open");
+        set_authorization(&mut req, "Basic dXNlcjpwYXNz");
+        req.extensions_mut()
+            .insert(EdgeTerminatedAuthorization::for_test("Basic dXNlcjpwYXNz"));
+
+        assert!(
+            enforce_basic_auth(&settings, &mut req)
+                .expect("should evaluate auth")
+                .is_none(),
+            "an unprotected path should not challenge"
+        );
+        assert!(
+            req.extensions()
+                .get::<EdgeTerminatedAuthorization>()
+                .is_none(),
+            "a marker no credential check produced must not survive this call"
+        );
+    }
+
+    #[test]
+    fn an_inherited_marker_is_cleared_when_credentials_are_rejected() {
+        let settings = create_test_settings();
+        let mut req = build_request(Method::GET, "https://example.com/secure");
+        let encoded = STANDARD.encode("user:wrong-pass");
+        set_authorization(&mut req, &format!("Basic {encoded}"));
+        req.extensions_mut()
+            .insert(EdgeTerminatedAuthorization::for_test(
+                "Basic dXNlcjp3cm9uZy1wYXNz",
+            ));
+
+        let response = enforce_basic_auth(&settings, &mut req)
+            .expect("should evaluate auth")
+            .expect("should challenge");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            req.extensions()
+                .get::<EdgeTerminatedAuthorization>()
+                .is_none(),
+            "a failed check must strip an inherited marker rather than honour it"
+        );
+    }
+
+    #[test]
+    fn a_non_protected_path_leaves_authorization_unmarked() {
+        let settings = create_test_settings();
+        let mut req = build_request(Method::GET, "https://example.com/open");
+        set_authorization(&mut req, "Basic dXNlcjpwYXNz");
+
+        assert!(
+            enforce_basic_auth(&settings, &mut req)
+                .expect("should evaluate auth")
+                .is_none(),
+            "an unprotected path should not challenge"
+        );
+        assert!(
+            req.extensions()
+                .get::<EdgeTerminatedAuthorization>()
+                .is_none(),
+            "a credential no handler consumed is pass-through and must stay disqualifying"
+        );
+    }
+
+    #[test]
+    fn rejected_credentials_leave_the_request_unmarked() {
+        let settings = create_test_settings();
+        let mut req = build_request(Method::GET, "https://example.com/secure");
+        let encoded = STANDARD.encode("user:wrong-pass");
+        set_authorization(&mut req, &format!("Basic {encoded}"));
+
+        let response = enforce_basic_auth(&settings, &mut req)
+            .expect("should evaluate auth")
+            .expect("should challenge");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            req.extensions()
+                .get::<EdgeTerminatedAuthorization>()
+                .is_none(),
+            "a failed credential must never be marked as terminated"
+        );
+    }
+
+    #[test]
+    fn no_challenge_for_non_protected_path() {
+        let settings = create_test_settings();
+        let mut req = build_request(Method::GET, "https://example.com/open");
+
+        assert!(
+            enforce_basic_auth(&settings, &mut req)
                 .expect("should evaluate auth")
                 .is_none()
         );
@@ -163,9 +370,9 @@ mod tests {
     #[test]
     fn challenge_when_missing_credentials() {
         let settings = create_test_settings();
-        let req = build_request(Method::GET, "https://example.com/secure");
+        let mut req = build_request(Method::GET, "https://example.com/secure");
 
-        let response = enforce_basic_auth(&settings, &req)
+        let response = enforce_basic_auth(&settings, &mut req)
             .expect("should evaluate auth")
             .expect("should challenge");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -184,7 +391,7 @@ mod tests {
         set_authorization(&mut req, &format!("Basic {token}"));
 
         assert!(
-            enforce_basic_auth(&settings, &req)
+            enforce_basic_auth(&settings, &mut req)
                 .expect("should evaluate auth")
                 .is_none()
         );
@@ -197,7 +404,7 @@ mod tests {
         let token = STANDARD.encode("wrong:wrong");
         set_authorization(&mut req, &format!("Basic {token}"));
 
-        let response = enforce_basic_auth(&settings, &req)
+        let response = enforce_basic_auth(&settings, &mut req)
             .expect("should evaluate auth")
             .expect("should challenge");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -211,7 +418,7 @@ mod tests {
         let token = STANDARD.encode("wrong-user:pass");
         set_authorization(&mut req, &format!("Basic {token}"));
 
-        let response = enforce_basic_auth(&settings, &req)
+        let response = enforce_basic_auth(&settings, &mut req)
             .expect("should evaluate auth")
             .expect("should challenge");
         assert_eq!(
@@ -228,7 +435,7 @@ mod tests {
         let token = STANDARD.encode("user:wrong-pass");
         set_authorization(&mut req, &format!("Basic {token}"));
 
-        let response = enforce_basic_auth(&settings, &req)
+        let response = enforce_basic_auth(&settings, &mut req)
             .expect("should evaluate auth")
             .expect("should challenge");
         assert_eq!(
@@ -244,7 +451,7 @@ mod tests {
         let mut req = build_request(Method::GET, "https://example.com/secure");
         set_authorization(&mut req, "Bearer token");
 
-        let response = enforce_basic_auth(&settings, &req)
+        let response = enforce_basic_auth(&settings, &mut req)
             .expect("should evaluate auth")
             .expect("should challenge");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -269,7 +476,7 @@ mod tests {
         set_authorization(&mut req, &format!("Basic {token}"));
 
         assert!(
-            enforce_basic_auth(&settings, &req)
+            enforce_basic_auth(&settings, &mut req)
                 .expect("should evaluate auth")
                 .is_none(),
             "should allow admin path with correct credentials"
@@ -283,7 +490,7 @@ mod tests {
         let token = STANDARD.encode("admin:wrong");
         set_authorization(&mut req, &format!("Basic {token}"));
 
-        let response = enforce_basic_auth(&settings, &req)
+        let response = enforce_basic_auth(&settings, &mut req)
             .expect("should evaluate auth")
             .expect("should challenge admin path with wrong credentials");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -312,9 +519,9 @@ mod tests {
             "https://example.com/_ts/page-bids?path=/article",
             "https://example.com/_ts/api/v1/identify",
         ] {
-            let req = build_request(Method::GET, path);
+            let mut req = build_request(Method::GET, path);
 
-            let response = enforce_basic_auth(&settings, &req)
+            let response = enforce_basic_auth(&settings, &mut req)
                 .expect("should evaluate auth")
                 .unwrap_or_else(|| panic!("should challenge {path} under a `^/_ts` handler"));
             assert_eq!(
@@ -328,9 +535,9 @@ mod tests {
     #[test]
     fn challenge_admin_path_with_missing_credentials() {
         let settings = create_test_settings();
-        let req = build_request(Method::POST, "https://example.com/_ts/admin/keys/rotate");
+        let mut req = build_request(Method::POST, "https://example.com/_ts/admin/keys/rotate");
 
-        let response = enforce_basic_auth(&settings, &req)
+        let response = enforce_basic_auth(&settings, &mut req)
             .expect("should evaluate auth")
             .expect("should challenge admin path with missing credentials");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -354,12 +561,12 @@ mod tests {
         let settings: Settings =
             toml::from_str(&config).expect("should deserialize settings without finalization");
         let ec_id = format!("{}.abc123", "a".repeat(64));
-        let req = build_request(
+        let mut req = build_request(
             Method::GET,
             &format!("https://example.com/_ts/admin/ec/{ec_id}"),
         );
 
-        let error = enforce_basic_auth(&settings, &req)
+        let error = enforce_basic_auth(&settings, &mut req)
             .expect_err("should fail closed without a matching admin handler");
         assert!(
             error.to_string().contains("no configured handler"),
@@ -375,10 +582,10 @@ mod tests {
         );
         let settings: Settings =
             toml::from_str(&config).expect("should deserialize settings without finalization");
-        let req = build_request(Method::GET, "https://example.com/_ts/administrator");
+        let mut req = build_request(Method::GET, "https://example.com/_ts/administrator");
 
         assert!(
-            enforce_basic_auth(&settings, &req)
+            enforce_basic_auth(&settings, &mut req)
                 .expect("should evaluate auth")
                 .is_none(),
             "should not classify a similar prefix as the admin namespace"
