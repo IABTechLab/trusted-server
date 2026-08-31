@@ -1227,6 +1227,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct EvidenceCapturingProvider {
         seen: std::sync::Mutex<Option<(String, String)>>,
+        seen_client_ip: std::sync::Mutex<Option<String>>,
     }
 
     impl EdgeCookieProvider for EvidenceCapturingProvider {
@@ -1246,6 +1247,11 @@ mod tests {
             let query_id = request_info.query_param("id").unwrap_or_default();
             let cookie = request_info.header("cookie").unwrap_or_default().to_owned();
             *self.seen.lock().expect("should lock seen evidence") = Some((query_id, cookie));
+            *self
+                .seen_client_ip
+                .lock()
+                .expect("should lock the seen client IP") =
+                Some(request_info.client_ip().to_owned());
             Ok(GeneratedEdgeCookie {
                 id: Some("evidence-ec".to_owned()),
                 response_headers: Vec::new(),
@@ -1381,7 +1387,10 @@ mod tests {
         // The requirement for a client IP belongs to the provider that uses
         // one, not to core. A provider deriving identity from the request
         // query and cookies runs on a host that cannot determine a client IP,
-        // and still mints.
+        // and still creates an identifier. This also pins what the provider is
+        // handed in that case, which is the documented unavailable value rather
+        // than something else, because a provider cannot decide how to behave
+        // without knowing what absence looks like.
         let provider = Arc::new(EvidenceCapturingProvider::default());
         let mut settings = create_test_settings();
         settings.ec.provider = Some(EcProviderSelection::from("evidence"));
@@ -1407,6 +1416,15 @@ mod tests {
             ec.ec_value(),
             Some("t0ev~evidence-ec"),
             "the identifier should be committed with no client IP available"
+        );
+        assert_eq!(
+            provider
+                .seen_client_ip
+                .lock()
+                .expect("should lock the seen client IP")
+                .clone(),
+            Some(String::new()),
+            "a host that cannot determine a client IP should hand the provider              the documented unavailable value, which is the empty string"
         );
     }
 
