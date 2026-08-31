@@ -319,14 +319,25 @@ fn build_access_events_request(
 ///
 /// # Errors
 ///
-/// Returns `Err` when the access-log APPEND token cannot be loaded, the
-/// backend cannot be registered, the request cannot be built or sent, or the
-/// Tinybird Events API responds with a non-2xx status.
+/// Returns `Err` when the row exceeds the configured request-body limit, the
+/// access-log APPEND token cannot be loaded, the backend cannot be registered,
+/// the request cannot be built or sent, or the Tinybird Events API responds
+/// with a non-2xx status.
 pub(crate) async fn emit_access_event(
     client: &dyn PlatformHttpClient,
     target: &TinybirdEventsTarget,
     row: String,
 ) -> Result<(), Report<TrustedServerError>> {
+    let body_len = row.len();
+    if body_len > target.max_body_bytes {
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: format!(
+                "Tinybird access telemetry request body has {body_len} bytes, exceeding {} byte limit",
+                target.max_body_bytes
+            ),
+        }));
+    }
+
     let token = load_access_token(target)?;
     let auth_header = FastlyTinybirdAuctionTelemetrySink::authorization_header(&token)?;
     let backend_name = FastlyPlatformBackend
@@ -881,6 +892,31 @@ mod tests {
                 .expect("should lock recorded requests")
                 .is_empty(),
             "should not send oversized row batches"
+        );
+    }
+
+    #[test]
+    fn access_emitter_rejects_oversized_row_before_sending() {
+        let mut config = enabled_config();
+        config.max_body_bytes = 1024;
+        let target = TinybirdEventsTarget::from_access_config(config);
+        let http_client = RecordingHttpClient::respond_with(202);
+        let row = "x".repeat(1025);
+
+        let result = futures::executor::block_on(emit_access_event(&http_client, &target, row));
+
+        let error = result.expect_err("should reject a row above the configured body limit");
+        assert!(
+            error.to_string().contains("1024"),
+            "error should name the configured body limit: {error}"
+        );
+        assert!(
+            http_client
+                .requests
+                .lock()
+                .expect("should lock recorded requests")
+                .is_empty(),
+            "should not send an oversized access row"
         );
     }
 
