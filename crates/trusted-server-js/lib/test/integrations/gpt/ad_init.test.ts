@@ -3276,6 +3276,40 @@ describe('installTsRenderBridge', () => {
     expect(outerWrapper.style.height).toBe('90px');
   });
 
+  it.each([
+    ['width', '1px', '120px', '728px', '120px'],
+    ['height', '640px', '1px', '640px', '90px'],
+  ] as const)(
+    'changes only a collapsed %s on an ancestor',
+    async (_dimension, initialWidth, initialHeight, expectedWidth, expectedHeight) => {
+      const tsjs = (window as TestWindow).tsjs!;
+      tsjs.bids.homepage_header.adm = '<div>Fictional creative</div>';
+      tsjs.bids.homepage_header.w = 728;
+      tsjs.bids.homepage_header.h = 90;
+      delete tsjs.bids.homepage_header.nurl;
+      delete tsjs.bids.homepage_header.burl;
+      const bridgeListener = await captureBridgeListener();
+      const collapsed = createCollapsedTrustedSlotIframe();
+      const outerWrapper = document.createElement('div');
+      outerWrapper.style.width = initialWidth;
+      outerWrapper.style.height = initialHeight;
+      collapsed.slot.insertBefore(outerWrapper, collapsed.wrapper);
+      outerWrapper.appendChild(collapsed.wrapper);
+
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+          ports: [{ postMessage: vi.fn() }],
+          source: collapsed.iframe.contentWindow!,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      expect(outerWrapper.style.width).toBe(expectedWidth);
+      expect(outerWrapper.style.height).toBe(expectedHeight);
+    }
+  );
+
   it.each(['fixed', 'anchor', 'expanded', 'oversized'] as const)(
     'does not resize a %s Universal Creative shell',
     async (guard) => {
@@ -4340,6 +4374,48 @@ describe('installTsRenderBridge', () => {
     expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
     expect(beaconSpy).not.toHaveBeenCalled();
     beaconSpy.mockRestore();
+  });
+
+  it('keeps cache response and billing evidence when shell resizing throws', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs!.gptDiagnosticsRecorder = {
+      recordTrustedServerCreativeRequest: vi.fn().mockReturnValue(55),
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
+    fetchStub.mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve(JSON.stringify({ adm: '<div>Creative</div>' })),
+    } as Response);
+
+    const bridgeListener = await captureBridgeListener();
+    const collapsed = createCollapsedTrustedSlotIframe();
+    const postMessage = vi.fn();
+    const computedStyleSpy = vi.spyOn(window, 'getComputedStyle').mockImplementation(() => {
+      throw new Error('style unavailable');
+    });
+
+    try {
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+          ports: [{ postMessage }],
+          source: collapsed.source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+      expect(postMessage).toHaveBeenCalledOnce();
+      expect(recordTrustedServerCreativeResponse).toHaveBeenCalledWith(55);
+      expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+      expect(beaconSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      computedStyleSpy.mockRestore();
+      beaconSpy.mockRestore();
+    }
   });
 
   it('records only response_post_failed when posting cached markup throws', async () => {

@@ -51,9 +51,9 @@ has not claimed first. `adInit()` may write `ts_initial=1`, apply `hb_*` targeti
 request an existing slot only after it atomically claims an untouched slot.
 
 Publisher auction claims use unique, expiring registration tokens. The matching
-callback moves only its token to delivery-pending and attaches returned ad IDs.
-Overlapping auctions cannot clear each other's tokens. Exact ad-ID delivery consumes
-only its matching registration. A code-only delivery consumes a registration only
+callback associates returned ad IDs with only its registration in Prebid's delivery
+correlation state. Overlapping auctions cannot clear each other's tokens. Exact ad-ID
+delivery consumes only its matching registration. A code-only delivery consumes a registration only
 when exactly one current candidate matches; ambiguous ordinary deliveries run a new
 auction, while ambiguous TS-owned suppressing deliveries fail closed without deleting
 their tombstones. If TS claimed first, the GPT refresh wrapper filters one correlated

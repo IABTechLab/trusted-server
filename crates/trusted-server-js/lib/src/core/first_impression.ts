@@ -241,9 +241,7 @@ export function registerPublisherFirstImpressionAuctions(
     const auction: FirstImpressionPublisherAuction = {
       token,
       adUnitCode,
-      phase: 'auctioning',
       expiresAt: now + FIRST_IMPRESSION_LEASE_MS,
-      adIds: [],
       suppressDelivery: claim.owner === 'trusted_server',
     };
     claim.publisherAuctions[token] = auction;
@@ -272,20 +270,6 @@ function findPublisherAuction(
     if (auction) return { state, claim, auction };
   }
   return undefined;
-}
-
-/** Move one publisher auction to delivery-pending without disturbing overlaps. */
-export function markPublisherFirstImpressionDeliveryPending(
-  ts: TsjsApi,
-  token: string,
-  adIds: string[],
-  now = Date.now()
-): void {
-  const found = findPublisherAuction(ts, token, now);
-  if (!found) return;
-  found.auction.phase = 'delivery_pending';
-  found.auction.adIds = [...new Set(adIds)];
-  if (found.claim.owner === 'publisher') found.claim.phase = 'delivery_pending';
 }
 
 /** Release exactly one publisher auction token after failure, timeout, or removal. */

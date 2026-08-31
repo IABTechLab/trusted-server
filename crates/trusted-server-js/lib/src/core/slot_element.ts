@@ -49,6 +49,9 @@ export function resolveSlotElementByDivId(divId: string): SlotElementResolution 
     return { element: null, prefixMatchCount: 0, activeMatchCount: 0 };
   }
 
+  // An exact ID is already unambiguous, so hidden exact elements still resolve.
+  // Prefixes may match several elements and require visibility and layout tiers
+  // before one candidate can be trusted.
   const exact = document.getElementById(divId);
   if (exact) {
     return { element: exact, prefixMatchCount: 1, activeMatchCount: 1 };
@@ -57,6 +60,7 @@ export function resolveSlotElementByDivId(divId: string): SlotElementResolution 
   const prefixMatches = Array.from(document.querySelectorAll<HTMLElement>('[id]')).filter(
     (element) => element.id.startsWith(divId) && !element.id.endsWith('-container')
   );
+  // A unique lazy slot may not have layout yet, but its ancestors must be visible.
   if (prefixMatches.length === 1 && isElementVisible(prefixMatches[0]!)) {
     return {
       element: prefixMatches[0]!,

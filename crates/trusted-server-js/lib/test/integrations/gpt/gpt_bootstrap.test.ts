@@ -269,9 +269,7 @@ describe('gpt_bootstrap.js fallback', () => {
           original: {
             token: 'original',
             adUnitCode: element.id,
-            phase: 'auctioning',
             expiresAt: 5_100,
-            adIds: [],
             suppressDelivery: false,
           },
         },
@@ -336,9 +334,7 @@ describe('gpt_bootstrap.js fallback', () => {
         late: {
           token: 'late',
           adUnitCode: element.id,
-          phase: 'delivery_pending',
           expiresAt: 0,
-          adIds: ['late-ad'],
           suppressDelivery: true,
         },
       },
@@ -434,9 +430,7 @@ describe('gpt_bootstrap.js fallback', () => {
         foreign: {
           token: 'foreign',
           adUnitCode: element.id,
-          phase: 'delivery_pending',
           expiresAt: 0,
-          adIds: ['foreign-ad'],
           suppressDelivery: true,
         },
       },

@@ -285,8 +285,27 @@ function resizeCollapsedCreativeFrame(
   frame.iframe.style.width = `${width}px`;
   frame.iframe.style.height = `${height}px`;
   for (const ancestor of collapsedAncestors) {
-    ancestor.style.width = `${width}px`;
-    ancestor.style.height = `${height}px`;
+    if (hasCollapsedDimension(ancestor, 'width')) ancestor.style.width = `${width}px`;
+    if (hasCollapsedDimension(ancestor, 'height')) ancestor.style.height = `${height}px`;
+  }
+}
+
+function safelyResizeCollapsedCreativeFrame(
+  source: MessageEventSource | null,
+  frame: MessageSourceFrame,
+  width: number,
+  height: number,
+  generation: number,
+  stillOwnsCreative: () => boolean
+): void {
+  try {
+    resizeCollapsedCreativeFrame(source, frame, width, height, generation, stillOwnsCreative);
+  } catch (err) {
+    try {
+      log.warn(`[tsjs-gpt] creative shell resize failed for '${frame.root.id}'`, err);
+    } catch {
+      // Resize and logging failures must not replace successful delivery evidence.
+    }
   }
 }
 
@@ -1992,19 +2011,19 @@ export function installTsRenderBridge(): void {
                 height: validatedRenderer.height,
               })
             );
-            resizeCollapsedCreativeFrame(
-              e.source,
-              sourceFrame,
-              validatedRenderer.width,
-              validatedRenderer.height,
-              generation,
-              stillOwnsCreative
-            );
-            return creativeFrameIsCurrent(e.source, sourceFrame, generation, stillOwnsCreative);
           } catch (err) {
             log.warn(`[tsjs-gpt] APS Prebid response post failed for '${adId}'`, err);
             return false;
           }
+          safelyResizeCollapsedCreativeFrame(
+            e.source,
+            sourceFrame,
+            validatedRenderer.width,
+            validatedRenderer.height,
+            generation,
+            stillOwnsCreative
+          );
+          return creativeFrameIsCurrent(e.source, sourceFrame, generation, stillOwnsCreative);
         },
       });
       if (typeof dispatched === 'boolean') {
@@ -2071,24 +2090,19 @@ export function installTsRenderBridge(): void {
                   height: validatedRenderer.height,
                 })
               );
-              resizeCollapsedCreativeFrame(
-                e.source,
-                sourceSlotFrame,
-                validatedRenderer.width,
-                validatedRenderer.height,
-                generation,
-                stillOwnsCreative
-              );
-              return creativeFrameIsCurrent(
-                e.source,
-                sourceSlotFrame,
-                generation,
-                stillOwnsCreative
-              );
             } catch (err) {
               log.warn(`[tsjs-gpt] APS server response post failed for '${slotId}'`, err);
               return false;
             }
+            safelyResizeCollapsedCreativeFrame(
+              e.source,
+              sourceSlotFrame,
+              validatedRenderer.width,
+              validatedRenderer.height,
+              generation,
+              stillOwnsCreative
+            );
+            return creativeFrameIsCurrent(e.source, sourceSlotFrame, generation, stillOwnsCreative);
           },
         })
       );
@@ -2139,7 +2153,7 @@ export function installTsRenderBridge(): void {
         log.warn(`[tsjs-gpt] pbRender bridge: response post failed for '${slotId}'`, err);
         return;
       }
-      resizeCollapsedCreativeFrame(
+      safelyResizeCollapsedCreativeFrame(
         e.source,
         sourceSlotFrame,
         width,
@@ -2217,19 +2231,19 @@ export function installTsRenderBridge(): void {
                 height: cachedHeight,
               })
             );
-            resizeCollapsedCreativeFrame(
-              e.source,
-              sourceSlotFrame,
-              cachedWidth,
-              cachedHeight,
-              generation,
-              stillOwnsCreative
-            );
           } catch (err) {
             safelyRecordCreativeFailure(attemptId, 'response_post_failed');
             log.warn(`[tsjs-gpt] pbRender bridge: response post failed for '${slotId}'`, err);
             return;
           }
+          safelyResizeCollapsedCreativeFrame(
+            e.source,
+            sourceSlotFrame,
+            cachedWidth,
+            cachedHeight,
+            generation,
+            stillOwnsCreative
+          );
           if (!creativeFrameIsCurrent(e.source, sourceSlotFrame, generation, stillOwnsCreative)) {
             return;
           }
