@@ -396,11 +396,13 @@ impl RuntimeServices {
     /// Adapters use this to apply the module-supplied provider selected by
     /// `[ec] provider`, the same way they apply a module's geo provider, so a
     /// vendor declares identity on its registration rather than through a
-    /// second extension mechanism.
+    /// second extension mechanism. The registry already matched the selector
+    /// against the registered modules, so the module's provider is the
+    /// resolved answer and lands on the one seam the request path reads.
     #[must_use]
     pub fn with_ec_provider(self, ec_provider: Arc<dyn EdgeCookieProvider>) -> Self {
         Self {
-            ec_provider: Some(ec_provider),
+            resolved_ec_provider: Some(ec_provider),
             ..self
         }
     }

@@ -780,7 +780,7 @@ pub(crate) fn services_with_ec_provider_and_config_store(
             client_ip: Some("203.0.113.10".parse().expect("should parse test client IP")),
             ..ClientInfo::default()
         })
-        .ec_provider(ec_provider)
+        .resolved_ec_provider(ec_provider)
         .build()
 }
 
