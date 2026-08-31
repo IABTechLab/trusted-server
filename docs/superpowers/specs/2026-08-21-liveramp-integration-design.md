@@ -6,7 +6,7 @@
 
 **Initiative:** [#55 — Monetization integrations](https://github.com/IABTechLab/trusted-server/issues/55)
 
-**Status:** Draft PR implemented; bundle-consistency guard designed
+**Status:** Draft PR implemented; managed browser-consent hardening designed
 
 **Date:** 2026-08-21
 
@@ -148,18 +148,32 @@ The following capabilities already exist on `main`:
 - The external bundle manifest and runtime diagnostics already identify which
   Prebid User ID modules were compiled into the bundle.
 
-### 4.1 Current gap
+### 4.1 Bundle consistency
 
-The draft implementation configures operator-owned User ID entries through the
-vendor-neutral `managed_user_ids` surface, but commit `2f89a222` removed the
-earlier LiveRamp-specific bundle guard. As a result, `ts prebid bundle` can
-produce an artifact whose manifest omits the module required by a managed
-entry. Runtime diagnostics warn after deployment, but the build itself succeeds
-and updates deployable hash metadata.
+The implementation validates managed entries against the checked-in User ID
+module registry during `ts prebid bundle`. The CLI resolves each managed config
+name through the registry, rejects unknown or ambiguous names, invalidates any
+stale manifest before generation, and confirms that the fresh manifest contains
+every required module before updating deployable hash metadata. Runtime
+diagnostics retain the same defense for externally supplied or stale artifacts.
 
-The checked-in registry already maps each Prebid config name to its bundle
-module. The CLI can therefore validate the generated manifest without adding a
-vendor name or maintaining a second mapping.
+### 4.2 Browser consent activation
+
+Bundling Prebid's consent collector and activity-control modules makes browser
+enforcement available, but does not activate it. Prebid activates the TCF path
+only after `consentManagement.gdpr` is configured. The managed User ID path must
+therefore initialize the standard IAB collector when all of the following are
+true:
+
+- at least one managed User ID entry is configured;
+- the publisher has not already configured `consentManagement.gdpr`; and
+- the page exposes the IAB `__tcfapi`.
+
+The shim performs this check before seeding managed User IDs and before
+`processQueue()`. It must preserve every publisher-owned consent setting and
+must not force GDPR scope or add a CMP configuration on pages without the TCF
+API. This keeps the browser behavior vendor-neutral and avoids imposing GDPR
+latency or defaults on non-TCF publishers.
 
 ## 5. Approaches considered
 
@@ -457,6 +471,11 @@ ingestion provide reuse on later requests.
 - Prebid's User ID and consent-management modules remain responsible for
   deciding whether the browser may call LiveRamp. LiveRamp must be configured
   correctly in the publisher's CMP/GVL posture.
+- When managed User IDs are active and the publisher exposes `__tcfapi`, the
+  Trusted Server shim activates Prebid's standard IAB GDPR collector if the
+  publisher has not already configured one. Existing publisher
+  `consentManagement.gdpr` settings always win. Pages without `__tcfapi` are
+  unchanged, and Trusted Server does not synthesize GDPR applicability.
 - Correction applied during implementation: `consentManagementTcf` only
   _retrieves_ the TC string. Enforcement lives in Prebid's `tcfControl`
   activity-control module, which the generated external bundle did not carry.
@@ -691,6 +710,9 @@ Issue #355's implementation portion is complete when:
   Server path without exposing envelope contents;
 - existing consent, validation, merge, cookie, and EC/KV behavior is preserved;
 - automated Rust and TypeScript tests pass;
+- a generated-bundle test proves that a denied TCF signal blocks managed
+  IdentityLink network access and storage without a publisher-side Prebid
+  consent configuration;
 - operator documentation explains setup, timing, privacy, failure behavior,
   and live verification;
 - live configuration validation is completed and recorded without Placement ID
