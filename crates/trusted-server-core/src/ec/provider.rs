@@ -228,8 +228,8 @@ pub enum ReservedResponseEffect {
     #[display("sets a header in the reserved `x-ts-` namespace")]
     ReservedHeader,
 
-    /// A message framing or hop-by-hop header.
-    #[display("sets a message framing or hop-by-hop header")]
+    /// A framing, hop-by-hop, or caching header core manages.
+    #[display("sets a framing, hop-by-hop, or caching header core manages")]
     FramingHeader,
 }
 
