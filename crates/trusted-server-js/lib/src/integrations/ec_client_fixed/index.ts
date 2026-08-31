@@ -35,8 +35,9 @@ export function hasResolvedMarker(cookieString: string): boolean {
 }
 
 // Posts the fixed known word to the resolve endpoint when no resolved marker is
-// present. Returns the word posted, or null when nothing was sent (a resolve
-// already succeeded, or the environment lacks `document`/`fetch`).
+// present. Returns the word posted, or null when nothing was sent or the post
+// failed (a resolve already succeeded, the environment lacks
+// `document`/`fetch`, or the request threw).
 export async function resolveEdgeCookie(): Promise<string | null> {
   if (typeof document === 'undefined' || typeof fetch !== 'function') {
     return null;

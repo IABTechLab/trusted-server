@@ -170,7 +170,7 @@ fn publisher_fallback_methods() -> [Method; 7] {
 //
 // The EC API routes that the Fastly entry point registers — POST
 // `/_ts/api/v1/batch-sync`, GET/OPTIONS `/_ts/api/v1/identify`, POST
-// `/_ts/api/v1/ec/resolve` — are
+// `/_ts/api/v1/ec/resolve`, are
 // intentionally absent here, matching the Axum and Cloudflare adapters: those
 // handlers require a platform KV `ec_store` (and, for batch-sync, a partner
 // registry and rate limiter) that the portability adapters do not yet wire.

@@ -106,7 +106,7 @@ pub fn set_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>, ec_
     }
 }
 
-/// Sets an Edge Cookie minted by a client-cycle provider on the response.
+/// Sets an Edge Cookie created by a client-cycle provider on the response.
 ///
 /// Unlike [`set_ec_cookie`], the value is treated as opaque: it need not match
 /// the canonical HMAC id shape, because a client-cycle provider's identifier
@@ -124,7 +124,7 @@ pub(crate) fn set_provider_ec_cookie(
 ) {
     if !ec_id_has_only_allowed_chars(value) {
         log::error!(
-            "Rejecting provider Edge Cookie value of {} bytes: empty, over {} bytes, or              outside the identifier alphabet",
+            "Rejecting provider Edge Cookie value of {} bytes: empty, over {} bytes, or outside the identifier alphabet",
             value.len(),
             MAX_EC_ID_LEN,
         );
@@ -442,7 +442,7 @@ foo=bar",
         // A base64url value (RFC 4648 section 5, unpadded) fits the identifier
         // alphabet exactly and must be preserved verbatim. Standard base64
         // (`+`, `/`, `=`) is outside the alphabet, so a provider that carries
-        // binary data re-encodes it as base64url before minting.
+        // binary data re-encodes it as base64url before creating the cookie value.
         let value = "abcDEF123-_x";
         set_provider_ec_cookie(&settings, &mut response, value);
 

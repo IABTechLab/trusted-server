@@ -190,7 +190,7 @@ Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. 
 
 ### POST /\_ts/api/v1/ec/resolve
 
-Resolve endpoint for client-side Edge Cookie providers. The page posts a value that the provider verifies and mints into the Edge Cookie. Used only when a client-side provider is selected (for example the `client-fixed` demo). Server-side providers such as HMAC do not use it.
+Resolve endpoint for client-side Edge Cookie providers. The page posts a value that the provider verifies and creates the Edge Cookie value. Used only when a client-side provider is selected (for example the `client-fixed` demo). Server-side providers such as HMAC do not use it.
 
 **Auth:** None. This is a first-party POST from the page. The provider is responsible for verifying the posted value before trusting it.
 

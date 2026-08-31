@@ -5,14 +5,14 @@
 //! browser. When the page has its result it posts the value here, and this
 //! endpoint hands it to the configured provider's
 //! [`resolve_from_client`](super::provider::EdgeCookieProvider::resolve_from_client)
-//! to mint the Edge Cookie.
+//! to create the Edge Cookie.
 //!
 //! The endpoint is provider-agnostic: it bounds the body, gates on the
 //! permission model (the same gate as organic generation), calls the provider,
 //! and sets the cookie on its own response so the value is live for every
 //! subsequent first-party request. Whether the posted value is trustworthy is
 //! the provider's responsibility. The payload arrives from the browser, so a
-//! real provider verifies it (for example an OWID signature) before minting.
+//! real provider verifies it (for example an OWID signature) before creating one.
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
@@ -41,21 +41,23 @@ const MAX_BODY_SIZE: usize = 64 * 1024;
 /// The request must carry an `Origin` on the publisher's domain (this endpoint
 /// sets identity state, so a foreign page must not be able to drive it) and a
 /// `text/plain` or `application/json` body. Gates on the configured provider's
-/// required permissions, then asks the provider to mint an Edge Cookie from
-/// the posted payload. A minted identifier is persisted to the identity graph
+/// required permissions, then asks the provider to create an Edge Cookie from
+/// the posted payload. A created identifier is persisted to the identity graph
 /// before the cookie is set, so withdrawal reaches a client-set identity the
-/// same way it reaches an edge-minted one; with no graph available nothing is
-/// minted, matching the organic path's rule against phantom cookies. On
+/// same way it reaches an edge-created one. With no graph available this
+/// endpoint sets no cookie at all, which is stricter than the organic
+/// generation path, where the identifier is committed and only the row write
+/// is skipped. On
 /// success the EC cookie and its `non-HttpOnly` resolved marker are set and the
 /// status is `200`.
 ///
 /// Rejections: `403` for a missing or foreign `Origin`, `415` for another
-/// content type, `413` for an oversized body, `400` when the provider mints an
+/// content type, `413` for an oversized body, `400` when the provider creates an
 /// identifier outside the identifier bounds, `409` when the request already
 /// carries a different identity (a resolve must not silently replace one), and
 /// `503` when the identity-graph write fails. When the permission gate is
 /// closed, no provider is configured, no graph is available, or the provider
-/// mints nothing, the response is `204` with no cookie. Every response this
+/// creates nothing, the response is `204` with no cookie. Every response this
 /// handler builds carries `Cache-Control: no-store`; a provider or
 /// configuration error propagates to the adapter's error response instead,
 /// and so does a provider asking for a response header inside core's reserved
@@ -131,14 +133,14 @@ pub fn handle_ec_resolve(
         "EC resolve handled (provider={}): id {}",
         provider.id(),
         if generated.id.is_some() {
-            "minted"
+            "created"
         } else {
-            "not minted"
+            "not created"
         },
     );
 
     // Check every response header the provider asked for against core's
-    // reserved surface, exactly as the organic mint path does in
+    // reserved surface, exactly as the organic generation path does in
     // `EcContext::generate_with_provider`. A provider may set its own cookies
     // and headers, but not a managed `ts-` cookie, a header in the `x-ts-`
     // namespace, or a framing or hop-by-hop header. Without this a
@@ -167,13 +169,13 @@ pub fn handle_ec_resolve(
         return Ok(response);
     };
 
-    // The same identifier bounds as the organic mint path: reject, never
-    // rewrite. A provider that minted an out-of-bounds identifier is a bad
+    // The same identifier bounds as the organic generation path: reject, never
+    // rewrite. A provider that created an out-of-bounds identifier is a bad
     // request from the client's perspective, because the posted payload
     // produced an unusable identity.
     if !ec_id_has_only_allowed_chars(&ec_id) {
         log::error!(
-            "EC resolve rejected: provider `{}` minted an identifier outside the bounds",
+            "EC resolve rejected: provider `{}` created an identifier outside the bounds",
             provider.id(),
         );
         return Ok(status_only(StatusCode::BAD_REQUEST));
@@ -181,7 +183,7 @@ pub fn handle_ec_resolve(
 
     // A resolve must not silently replace an identity the request already
     // carries. The page script does not post when an identity exists, so a
-    // different minted identifier here is a conflict to surface, not paper
+    // different identifier here is a conflict to surface, not paper
     // over.
     if let Some(existing) = ec_context.ec_value()
         && existing != ec_id
@@ -194,12 +196,13 @@ pub fn handle_ec_resolve(
     }
 
     // Persist the identity-graph row before setting the cookie, keyed by the
-    // provider's canonical form, exactly like the organic mint path. Without
-    // a row, withdrawal could never reach this identity, so with no graph
-    // available nothing is minted (the organic path applies the same rule
-    // against phantom cookies).
+    // provider's canonical form, exactly like the organic generation path.
+    // Without a row, withdrawal could never reach this identity, so with no
+    // graph available this endpoint creates no cookie at all, which is stricter
+    // than the organic generation path, where the identifier is committed and
+    // only the row write is skipped.
     let Some(graph) = kv else {
-        log::warn!("EC resolve skipped: no identity graph available, so no cookie is minted");
+        log::warn!("EC resolve skipped: no identity graph available, so no cookie is created");
         return Ok(status_only(StatusCode::NO_CONTENT));
     };
     let now = super::current_timestamp();
@@ -361,7 +364,7 @@ mod tests {
     }
 
     /// A **test-only** provider modeling a client-generated, first-party
-    /// identifier (a `UUID`) that the browser mints and posts back for the server
+    /// identifier (a `UUID`) that the browser creates and posts back for the server
     /// to set. It is not a production provider and exists only to exercise the
     /// client-set Edge Cookie value path from end to end. The edge defers, the
     /// page posts a value, and it must round-trip as the cookie and the KV key.
@@ -388,7 +391,7 @@ mod tests {
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
-            // The identifier is minted in the browser, so the edge derives nothing.
+            // The identifier is created in the browser, so the edge derives nothing.
             Ok(GeneratedEdgeCookie::default())
         }
 
@@ -419,7 +422,7 @@ mod tests {
         }
     }
 
-    /// The identifier [`ResolveHeaderProvider`] mints when asked to.
+    /// The identifier [`ResolveHeaderProvider`] creates when asked to.
     const HEADER_PROVIDER_ID: &str = "5c3a1b70-2f4d-4a19-9c6e-7b0d18e4a221";
 
     /// A **test-only** provider that returns caller-chosen response headers
@@ -520,7 +523,7 @@ mod tests {
     #[test]
     fn resolve_rejects_a_reserved_response_effect_on_the_minted_path() {
         // The same check has to cover the 200 path, where the provider does
-        // mint and core is about to write its own cookie and headers.
+        // create and core is about to write its own cookie and headers.
         let graph = in_memory_graph();
         let outcome =
             resolve_with_header_provider(&[("x-ts-ec", "forged-value")], true, Some(&graph));
@@ -553,7 +556,7 @@ mod tests {
         assert_eq!(
             response.status(),
             StatusCode::OK,
-            "a minted identifier should return 200"
+            "a created identifier should return 200"
         );
 
         let cookies: Vec<&str> = response
@@ -581,7 +584,7 @@ mod tests {
             .collect();
         assert!(
             cache_control.contains(&"no-store"),
-            "a provider header must not drop the no-store an identity response carries, got              {cache_control:?}"
+            "a provider header must not drop the no-store an identity response carries, got {cache_control:?}"
         );
     }
 
@@ -612,7 +615,7 @@ mod tests {
             .expect("should run generation");
         assert!(
             ec.ec_value().is_none(),
-            "a client-set provider defers minting to the browser"
+            "a client-set provider defers creation to the browser"
         );
 
         // 2. The page generates its identifier and posts it to the resolve
@@ -858,7 +861,7 @@ mod tests {
         assert_eq!(
             response.status(),
             StatusCode::NO_CONTENT,
-            "with no graph there is no row to persist, so nothing is minted"
+            "with no graph there is no row to persist, so nothing is created"
         );
         assert!(
             response.headers().get(header::SET_COOKIE).is_none(),

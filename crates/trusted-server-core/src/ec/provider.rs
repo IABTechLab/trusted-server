@@ -133,9 +133,12 @@ pub const HOST_SIGNALS_PROVIDER_KEY: &str = "host-signals";
 
 /// The configuration name of the client-fixed demonstration provider.
 ///
-/// An ordinary name in the same open-ended namespace as [`HMAC_PROVIDER_KEY`],
-/// and nothing branches on it outside the resolution in [`build_provider`]. It
-/// is also `ClientFixedProvider`'s `id`, and it goes with that resolution arm
+/// An ordinary name in the same open-ended namespace as [`HMAC_PROVIDER_KEY`].
+/// The resolution in [`build_provider`] matches it, as does its startup
+/// counterpart `check_named_provider_configuration`, and the integration
+/// registry adds the client-cycle page-script module when the name is
+/// selected. It is also `ClientFixedProvider`'s `id`, and it goes with that
+/// resolution arm
 /// when the demonstration provider becomes a module of its own. The provider
 /// type is not linked here because it is compiled in only under the
 /// `client-fixed-demo` cargo feature, while this name is always spelled.
@@ -198,14 +201,15 @@ pub struct IdentityInput<'a> {
 /// Inputs available to [`EdgeCookieProvider::resolve_from_client`].
 ///
 /// Carries the value a client produced and posted to the Edge Cookie resolve
-/// endpoint, alongside the same gating context as [`IdentityInput`]. Request data
-/// reaches the provider through its injected services. Unlike trusted edge-derived
+/// endpoint, alongside the same gating context as [`IdentityInput`]. The posted
+/// value reaches the provider as [`payload`](Self::payload), not through
+/// anything injected into the provider. Unlike trusted edge-derived
 /// data, [`payload`](Self::payload) arrives from the browser, so an
 /// implementation must verify it before deriving an identifier from it.
 pub struct ClientResolveInput<'a> {
     /// The raw body the client posted to the resolve endpoint. For a vendor
     /// provider this is its own JSON envelope; for the built-in
-    /// [`ClientFixedProvider`] demo it is the fixed known word the page script
+    /// `ClientFixedProvider` demo it is the fixed known word the page script
     /// posts.
     pub payload: &'a [u8],
 
@@ -660,9 +664,10 @@ impl<'a> AcceptedProviders<'a> {
 /// - **Server-side** (for example [`HmacProvider`]): derives the identifier at
 ///   the edge in [`generate`](Self::generate), and the page response sets the
 ///   cookie. Nothing client-side is involved.
-/// - **Client-side** (for example [`ClientFixedProvider`]): defers in
+/// - **Client-side** (for example `ClientFixedProvider`): defers in
 ///   [`generate`](Self::generate) (returns `id: None`), runs its own JavaScript
-///   in the browser, and mints from the value the page posts back in
+///   in the browser, and creates the identifier from the value the page posts
+///   back in
 ///   [`resolve_from_client`](Self::resolve_from_client), whose response sets the
 ///   cookie.
 ///
@@ -704,8 +709,8 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
     /// Derives an Edge Cookie identifier from the request evidence in
     /// `request_info` and the gating context in `input`.
     ///
-    /// A server-side provider mints here. A client-side provider defers here
-    /// (returns `id: None`) and mints later in
+    /// A server-side provider creates here. A client-side provider defers here
+    /// (returns `id: None`) and creates later in
     /// [`resolve_from_client`](Self::resolve_from_client) from the value the page
     /// posts back.
     ///
@@ -768,7 +773,7 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
     /// trigger client-side work), and the page posts its result back here. The
     /// payload arrives from the browser, so an implementation MUST verify it
     /// (for example checking a signature) before trusting it. The default
-    /// returns no identifier, so a provider that mints entirely server-side
+    /// returns no identifier, so a provider that creates entirely server-side
     /// (such as [`HmacProvider`]) need not implement it.
     ///
     /// # Errors
@@ -921,7 +926,7 @@ impl EdgeCookieProvider for HostSignalProvider {
 ///
 /// Kept cookie-safe (no characters [`set_provider_ec_cookie`] would reject) so
 /// it can be used as the Edge Cookie value verbatim. The page script posts this
-/// exact string; the provider mints only when the posted value matches. The
+/// exact string; the provider creates only when the posted value matches. The
 /// client copy lives in
 /// `crates/trusted-server-js/lib/src/integrations/ec_client_fixed`.
 ///
@@ -933,14 +938,14 @@ const EXPECTED_VALUE: &str = "an-ec";
 ///
 /// Client and server share one fixed, known word (`EXPECTED_VALUE`). When no
 /// Edge Cookie is present the page script (delivered through the tsjs bundle)
-/// posts that word to `POST /_ts/api/v1/ec/resolve`, and this provider mints the
+/// posts that word to `POST /_ts/api/v1/ec/resolve`, and this provider creates the
 /// Edge Cookie only when the posted value matches. It defers from
 /// [`generate`](EdgeCookieProvider::generate) so the page renders with no Edge
-/// Cookie until the client reports back, then verifies and mints in
+/// Cookie until the client reports back, then verifies and creates in
 /// [`resolve_from_client`](EdgeCookieProvider::resolve_from_client).
 ///
 /// The value is verifiable precisely because it is a known constant, which is
-/// the point of the demo: it exercises verify-before-mint. It is useless in
+/// the point of the demo: it exercises verify-before-create. It is useless in
 /// production, because a fixed value is not an identity and every client posts
 /// the same word, so it is for demonstration and testing only. A real
 /// client-side provider verifies a real payload (for example an OWID signature)
@@ -973,7 +978,7 @@ impl EdgeCookieProvider for ClientFixedProvider {
         &self,
         input: &ClientResolveInput<'_>,
     ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
-        // Verify the posted value against the known shared word, then mint it as
+        // Verify the posted value against the known shared word, then create it as
         // the Edge Cookie. A value that does not match yields no Edge Cookie.
         // This stands in for a real provider's verification (for example
         // checking a signature) before it trusts a client-supplied value.
@@ -2094,7 +2099,7 @@ mod tests {
         assert_eq!(
             generated.id.as_deref(),
             Some(EXPECTED_VALUE),
-            "the known shared word should verify and mint the Edge Cookie"
+            "the known shared word should verify and create the Edge Cookie"
         );
     }
 
@@ -2110,7 +2115,7 @@ mod tests {
             .expect("should resolve");
         assert!(
             generated.id.is_none(),
-            "a value that does not match the known word should mint no Edge Cookie"
+            "a value that does not match the known word should create no Edge Cookie"
         );
     }
 

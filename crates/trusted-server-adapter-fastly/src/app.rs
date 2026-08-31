@@ -726,8 +726,8 @@ async fn run_named_route(
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
         NamedRouteHandler::EcResolve => {
             // The resolve endpoint persists the identity-graph row before
-            // minting, so it takes the same bot-gated graph as generation: an
-            // unrecognized client gets no graph, and therefore no mint.
+            // creating, so it takes the same bot-gated graph as generation: an
+            // unrecognized client gets no graph, and therefore no new Edge Cookie.
             handle_ec_resolve(&state.settings, req, &ec.ec_context, ec.kv_graph.as_ref())
         }
         NamedRouteHandler::Auction => {

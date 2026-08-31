@@ -165,14 +165,16 @@ pub struct EcContext {
     /// [`EcContext::generate_if_needed`] is called.
     device_signals: Option<DeviceSignals>,
     /// The host-signal service for this request, when the host supplies one
-    /// (the Fastly adapter registers the TLS/HTTP-2 fingerprints). `None` on a
+    /// (the Fastly adapter registers the TLS and HTTP/2 signals). `None` on a
     /// host that exposes none. Injected into a provider that needs it when the
     /// provider is built.
     host_signals: Option<Arc<dyn HostSignals>>,
     /// The adapter-injected Edge Cookie provider, when one is wired for this
-    /// request. Captured once from [`RuntimeServices`] at construction and
-    /// passed to [`build_provider`] on every path, so a vendor or host provider
-    /// resolves without core naming it. `None` for built-in-only deployments.
+    /// request. Captured once from [`RuntimeServices`] at construction and read
+    /// on every path that builds a provider (the organic path through
+    /// `request_provider`, the resolve path through `build_provider`), so a
+    /// vendor or host provider resolves without core naming it. `None` for
+    /// built-in-only deployments.
     ec_provider: Option<Arc<dyn crate::ec::provider::EdgeCookieProvider>>,
     /// The selected Edge Cookie provider (built-in or injected), built once at
     /// construction. Core asks it whether an identifier is well formed
@@ -753,7 +755,7 @@ impl EcContext {
         self.client_ip.as_deref()
     }
 
-    /// Returns the host-computed client fingerprints captured for this request,
+    /// Returns the host-computed client signals captured for this request,
     /// when the host supplies them.
     ///
     /// The resolve path rebuilds the provider with the same injected services
