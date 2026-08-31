@@ -56,7 +56,10 @@ struct ProviderLaunchState {
 }
 
 /// Outcome of attempting to dispatch split-phase auction provider requests.
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Dispatched carries in-flight requests while failure preserves provider responses"
+)]
 pub enum DispatchAuctionOutcome {
     /// No provider request was started and no provider failure was observed.
     NotStarted,
@@ -531,6 +534,17 @@ impl AuctionOrchestratorHarness {
                 Ok(result) => result,
                 Err(error) => {
                     log::warn!("Planned provider select failed: {:?}", error);
+                    let mut transport_failures = launches
+                        .drain()
+                        .map(|(_, state)| {
+                            provider_transport_failed_response(
+                                state.provider.provider_name(),
+                                state.started_at.elapsed().as_millis() as u64,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    transport_failures.sort_by(|left, right| left.provider.cmp(&right.provider));
+                    responses.extend(transport_failures);
                     break;
                 }
             };
@@ -748,6 +762,8 @@ impl AuctionOrchestratorHarness {
             (None, local_winners())
         };
         let unroutable_bidder_count = routed.diagnostics().unroutable_bidder_count();
+        // lgtm[rust/cleartext-logging]
+        // This logs only a bounded routing count, never request data or secrets.
         log::info!(
             "Auction routing diagnostics: unroutable_bidder_count={}",
             unroutable_bidder_count
@@ -1151,6 +1167,8 @@ impl AuctionOrchestrator {
             let provider = match self.providers.get(*provider_name) {
                 Some(p) => p,
                 None => {
+                    // lgtm[rust/cleartext-logging]
+                    // This logs a configured provider identifier, not request data or secrets.
                     log::warn!("Provider '{}' not registered, skipping", provider_name);
                     continue;
                 }
@@ -1205,6 +1223,8 @@ impl AuctionOrchestrator {
                 services: context.services,
             };
 
+            // lgtm[rust/cleartext-logging]
+            // This logs a configured provider identifier and timeout, not request data or secrets.
             log::info!(
                 "Launching bid request to '{}' with a {}ms budget",
                 provider.provider_name(),
@@ -1785,7 +1805,10 @@ impl AuctionOrchestrator {
             auction_start,
             timeout_ms: context.timeout_ms,
             floor_prices: self.floor_prices_by_slot(request),
-            provider_request_context: Box::new(snapshot_context_request(context.request)),
+            // Planned providers carry their typed parse state, so collection
+            // does not need to retain the inbound client request. Keep the
+            // explicit request boundary empty across the origin wait.
+            provider_request_context: Box::new(Request::new(EdgeBody::empty())),
             request: request.clone(),
             planned_unused_bidder_params,
             planned_unroutable_bidder_count,
@@ -1893,6 +1916,8 @@ impl AuctionOrchestrator {
             // Match the synchronous path's strict deadline semantics: do not
             // invoke even an immediate provider after the budget reaches zero.
             if effective_timeout == 0 {
+                // lgtm[rust/cleartext-logging]
+                // This logs a configured provider identifier and timeout, not request data or secrets.
                 log::warn!(
                     "Auction timeout ({}ms) exhausted before launching '{}' — skipping",
                     context.timeout_ms,
@@ -1966,6 +1991,8 @@ impl AuctionOrchestrator {
                         ));
                         continue;
                     }
+                    // lgtm[rust/cleartext-logging]
+                    // This logs configured provider and backend identifiers plus a timeout, not request data or secrets.
                     log::info!(
                         "Dispatching bid request to '{}' (backend: {}, budget: {}ms)",
                         provider.provider_name(),
@@ -2017,6 +2044,8 @@ impl AuctionOrchestrator {
             };
         }
 
+        // lgtm[rust/cleartext-logging]
+        // This logs bounded request counts and a timeout, not request data or secrets.
         log::info!(
             "Dispatched {} SSP request(s) with {} immediate response(s) (timeout: {}ms)",
             pending_requests.len(),
@@ -2340,6 +2369,8 @@ impl AuctionOrchestrator {
                     };
                 }
                 let mediator_start = Instant::now();
+                // lgtm[rust/cleartext-logging]
+                // This logs a configured mediator identifier and timeout values, not request data or secrets.
                 log::info!(
                     "Running mediator '{}' with {}ms logical budget and {}ms transport timeout (A_deadline remaining: {}ms, configured: {}ms)",
                     mediator.provider_name(),
@@ -2563,7 +2594,7 @@ mod tests {
 
     use super::{
         AuctionOrchestrator, AuctionOrchestratorHarness, DispatchedAuction, ERROR_TYPE_TIMEOUT,
-        OrchestrationResult,
+        ERROR_TYPE_TRANSPORT, OrchestrationResult,
     };
 
     fn planned_config(providers: &[(&str, RoutingMode)], signing: bool) -> AuctionPlanConfig {
@@ -5075,6 +5106,101 @@ mod tests {
                 "provider-b should succeed — error was correctly isolated to provider-a"
             );
         });
+    }
+
+    #[tokio::test]
+    async fn harness_outer_select_error_materializes_all_launches_as_transport_failures() {
+        let http = Arc::new(OuterSelectErrorHttpClient::new());
+        http.push_response(204, Vec::new());
+        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let services = build_services_with_backend_and_http_client(
+            Arc::clone(&backend) as Arc<_>,
+            Arc::clone(&http) as Arc<_>,
+        );
+        let plan = Arc::new(
+            AuctionPlan::compile(planned_config(
+                &[("provider-a", RoutingMode::AllEligible)],
+                false,
+            ))
+            .expect("should compile planned auction"),
+        );
+        let harness = AuctionOrchestratorHarness::new(plan, None);
+        let request = planned_request();
+        let settings = create_test_settings();
+        let inbound = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 777,
+            transport_timeout_ms: 777,
+            provider_responses: None,
+            services: &services,
+        };
+
+        let result = harness
+            .run_auction(&request, &context)
+            .await
+            .expect("should collect a harness auction after select failure");
+
+        assert_eq!(
+            result.provider_responses.len(),
+            1,
+            "should report one provider response"
+        );
+        assert_eq!(
+            result.provider_responses[0].status,
+            BidStatus::Error,
+            "outer select failure should report an error"
+        );
+        assert_eq!(
+            result.provider_responses[0].metadata["error_type"], ERROR_TYPE_TRANSPORT,
+            "harness should match production transport classification"
+        );
+    }
+
+    #[tokio::test]
+    async fn planned_dispatch_does_not_snapshot_inbound_headers() {
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response(204, Vec::new());
+        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let services = build_services_with_backend_and_http_client(
+            Arc::clone(&backend) as Arc<_>,
+            Arc::clone(&http) as Arc<_>,
+        );
+        let plan = Arc::new(
+            AuctionPlan::compile(planned_config(
+                &[("provider-a", RoutingMode::AllEligible)],
+                false,
+            ))
+            .expect("should compile planned auction"),
+        );
+        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+        let request = planned_request();
+        let settings = create_test_settings();
+        let inbound = http::Request::builder()
+            .header(http::header::AUTHORIZATION, "Bearer should-not-be-retained")
+            .header(http::header::COOKIE, "session=should-not-be-retained")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build inbound request");
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 777,
+            transport_timeout_ms: 777,
+            provider_responses: None,
+            services: &services,
+        };
+
+        let DispatchAuctionOutcome::Dispatched(dispatched) =
+            orchestrator.dispatch_auction(&request, &context).await
+        else {
+            panic!("should dispatch planned provider");
+        };
+
+        assert!(
+            dispatched.provider_request_context.headers().is_empty(),
+            "planned dispatch should retain an empty request context"
+        );
     }
 
     #[tokio::test]

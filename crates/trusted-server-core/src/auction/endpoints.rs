@@ -190,6 +190,23 @@ pub async fn handle_auction(
             ec_id,
             None,
         )?;
+        let observation = AuctionObservationContext::from_auction_request(
+            AuctionSource::AuctionApi,
+            &auction_request,
+            ec_context,
+        );
+        let elapsed_ms = observation.elapsed_ms();
+        emit_auction_events_best_effort_lazy(services, || {
+            build_auction_events(
+                observation,
+                AuctionTerminalOutcome::Skipped {
+                    reason: "auction_disabled",
+                    elapsed_ms,
+                },
+            )
+        })
+        .await;
+
         let empty_result = OrchestrationResult {
             provider_responses: Vec::new(),
             mediator_response: None,
@@ -804,6 +821,68 @@ mod tests {
             "disabling publisher templates must not disable direct /auction"
         );
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn disabled_auction_endpoint_emits_skipped_telemetry_without_provider_work() {
+        let settings = create_test_settings();
+        let config = AuctionConfig {
+            enabled: false,
+            providers: AuctionConfig::legacy_provider_map(&["panic_provider"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(PanicOnBidProvider));
+        let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+        let services = services_with_telemetry(Arc::clone(&telemetry_sink));
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let body = json!({
+            "adUnits": [{
+                "code": "div-gpt-ad-1",
+                "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+            }]
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.example/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should serialize disabled-auction body"),
+            ))
+            .expect("should build disabled-auction request");
+
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &ec_context,
+            &services,
+            request,
+        )
+        .await
+        .expect("disabled auction should return a no-bid response");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "disabled auction should return a 200 no-bid response"
+        );
+        let batches = telemetry_sink
+            .batches
+            .lock()
+            .expect("should lock telemetry batches");
+        assert_eq!(batches.len(), 1, "should emit one telemetry batch");
+        let rows = batches[0].rows();
+        assert_eq!(rows.len(), 1, "should emit one skipped summary row");
+        assert_eq!(rows[0].event_kind, "summary", "should emit a summary row");
+        assert_eq!(rows[0].terminal_status.as_deref(), Some("skipped"));
+        assert_eq!(
+            rows[0].terminal_reason.as_deref(),
+            Some("auction_disabled"),
+            "should identify the disabled auction policy"
+        );
     }
 
     #[tokio::test]

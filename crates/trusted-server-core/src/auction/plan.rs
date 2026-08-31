@@ -595,7 +595,6 @@ fn canonicalize_endpoint(
     if profile_id == "prebid-server" {
         normalize_prebid_server_endpoint(&mut endpoint);
     }
-    endpoint.set_fragment(None);
     Ok(CanonicalProviderEndpoint(endpoint))
 }
 

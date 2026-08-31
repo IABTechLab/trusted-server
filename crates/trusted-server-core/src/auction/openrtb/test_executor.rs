@@ -41,7 +41,7 @@ pub(super) async fn execute_standard_fixture(
         return Err(Report::new(TrustedServerError::Auction {
             message: "Fictional standard backend ensure did not match prediction".to_string(),
         }));
-    };
+    }
     let body = serde_json::to_vec(request).change_context(TrustedServerError::Auction {
         message: "Failed to serialize fictional standard request".to_string(),
     })?;

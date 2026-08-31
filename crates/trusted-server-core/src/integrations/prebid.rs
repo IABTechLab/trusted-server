@@ -8217,7 +8217,7 @@ set = { networkId = 42 }
 
     fn planned_prebid_input_with_formats(
         slot_ids: &[&str],
-        formats: Vec<AdFormat>,
+        formats: &[AdFormat],
     ) -> ProviderAuctionInput {
         let provider_id = ProviderId::from_str("pbs-instance").expect("should parse provider ID");
         let bidder_id = BidderId::from_str("exampleBidder").expect("should parse bidder ID");
@@ -8257,7 +8257,7 @@ set = { networkId = 42 }
                             json!({"placement": "example-placement"}),
                         )]),
                     );
-                    slot.formats.clone_from(&formats);
+                    slot.formats = formats.to_vec();
                     slot
                 })
                 .collect(),
@@ -8272,7 +8272,7 @@ set = { networkId = 42 }
     fn planned_prebid_input(slot_ids: &[&str]) -> ProviderAuctionInput {
         planned_prebid_input_with_formats(
             slot_ids,
-            vec![AdFormat {
+            &[AdFormat {
                 media_type: MediaType::Banner,
                 width: 300,
                 height: 250,
@@ -8550,7 +8550,7 @@ set = { networkId = 42 }
                 height: 50,
             },
         ];
-        let input = planned_prebid_input_with_formats(&["requested"], formats);
+        let input = planned_prebid_input_with_formats(&["requested"], &formats);
         let ambiguous = futures::executor::block_on(parse_planned_prebid_response(
             "pbs-instance",
             &profile,

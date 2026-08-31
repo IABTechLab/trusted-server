@@ -208,7 +208,7 @@ fn deserialize_profile<T>(id: &str, value: &Value) -> Result<T, Report<TrustedSe
 where
     T: for<'de> Deserialize<'de>,
 {
-    serde_json::from_value(value.clone())
+    T::deserialize(value)
         .map_err(|error| configuration_error(format!("invalid `{id}` profile_config: {error}")))
 }
 

@@ -1863,11 +1863,15 @@ impl IntegrationHeadInjector for ApsRendererIntegration {
     }
 }
 
-/// Register the APS static renderer endpoint when APS is enabled.
+/// Register renderer support when the auction plan contains an APS provider.
+///
+/// Browser integration enablement does not control server-side APS rendering.
+/// An absent or disabled browser block uses trusted-server rendering. An enabled
+/// browser block may select publisher-native rendering.
 ///
 /// # Errors
 ///
-/// Returns an error when enabled APS configuration is invalid.
+/// Returns an error when APS browser configuration is invalid.
 pub fn register_for_plan(
     settings: &Settings,
     plan: &crate::auction::AuctionPlan,
@@ -3051,6 +3055,61 @@ mod tests {
         let response = futures::executor::block_on(integration.handle(&settings, &services, post))
             .expect("should reject unsupported method");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    fn plan_with_aps_profile() -> crate::auction::AuctionPlan {
+        crate::auction::AuctionPlan::compile(AuctionPlanConfig {
+            timeout_ms: 1_000,
+            providers: BTreeMap::from([(
+                "aps".parse().expect("should parse APS provider ID"),
+                ProviderConfig {
+                    protocol: "openrtb-2.6".to_string(),
+                    profile: "aps".to_string(),
+                    endpoint: default_endpoint(),
+                    timeout_ms: None,
+                    routing: RoutingMode::AllEligible,
+                    notifications: NotificationConfig::default(),
+                    profile_config: serde_json::json!({"account_id":"example-account"}),
+                },
+            )]),
+            ..AuctionPlanConfig::default()
+        })
+        .expect("should compile APS plan")
+    }
+
+    #[test]
+    fn aps_plan_registers_trusted_server_renderer_without_enabled_browser_config() {
+        for disabled_browser_config in [false, true] {
+            let mut settings = create_test_settings();
+            if disabled_browser_config {
+                settings
+                    .integrations
+                    .insert_config(
+                        APS_INTEGRATION_ID,
+                        &json!({
+                            "enabled": false,
+                            "rendering_mode": "publisher_native"
+                        }),
+                    )
+                    .expect("should insert disabled APS browser config");
+            }
+
+            let registration = register_for_plan(&settings, &plan_with_aps_profile())
+                .expect("should register APS renderer support")
+                .expect("should return APS renderer registration");
+
+            assert_eq!(
+                registration.proxies.len(),
+                1,
+                "APS plan should register trusted-server renderer route"
+            );
+            assert!(
+                registration.head_injectors[0]
+                    .tsjs_script_tag_attributes()
+                    .is_empty(),
+                "disabled or absent browser config should not select publisher-native rendering"
+            );
+        }
     }
 
     #[test]

@@ -55,16 +55,16 @@ fn config_with_endpoint(profile: &str, profile_config: Value, endpoint: &str) ->
                 profile_config,
             },
         )]),
-        bidders: prebid_server
-            .then(|| {
-                BTreeMap::from([(
-                    BidderId::from_str("exampleBidder").expect("should parse bidder ID"),
-                    BidderRouteConfig {
-                        provider: provider_id,
-                    },
-                )])
-            })
-            .unwrap_or_default(),
+        bidders: if prebid_server {
+            BTreeMap::from([(
+                BidderId::from_str("exampleBidder").expect("should parse bidder ID"),
+                BidderRouteConfig {
+                    provider: provider_id,
+                },
+            )])
+        } else {
+            BTreeMap::new()
+        },
         mediator: None,
         request_signing: None,
     }
@@ -273,7 +273,12 @@ fn pbs_body_consent_respects_source_and_forwarding_mode() {
         ("both", ConsentSource::Cookie, true),
     ] {
         let mut canonical = canonical_parity_auction_request();
-        canonical.user.consent.as_mut().expect("consent").source = source;
+        canonical
+            .user
+            .consent
+            .as_mut()
+            .expect("should have consent context")
+            .source = source;
         let value = serde_json::to_value(build_with_request(
             "prebid-server",
             json!({"consent_forwarding": mode}),

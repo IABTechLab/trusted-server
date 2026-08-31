@@ -143,7 +143,10 @@ pub(crate) fn resolve_bid_dimensions(
 
 /// Result of request construction before transport.
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Ready carries the full built request by design"
+)]
 pub(crate) enum OpenRtbBuildOutcome {
     Ready(OpenRtbRequest),
     NoImpressions,

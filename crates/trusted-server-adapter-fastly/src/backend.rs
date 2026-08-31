@@ -206,7 +206,6 @@ impl<'a> BackendConfig<'a> {
     /// # Errors
     ///
     /// Returns an error if the host is empty.
-    #[allow(dead_code, reason = "retained for backend-name parity tests")]
     pub fn predict_name(self) -> Result<String, Report<TrustedServerError>> {
         self.predict_backend().map(|prediction| prediction.name)
     }

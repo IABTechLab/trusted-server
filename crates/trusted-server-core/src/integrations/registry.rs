@@ -819,7 +819,10 @@ impl IntegrationRegistry {
         }
         for builder in crate::integrations::builders() {
             if let Some(registration) = (builder.build)(settings)? {
-                debug_assert_eq!(registration.integration_id, builder.id);
+                debug_assert_eq!(
+                    registration.integration_id, builder.id,
+                    "integration builder ID should match registration ID"
+                );
                 registrations.push(registration);
             }
         }
