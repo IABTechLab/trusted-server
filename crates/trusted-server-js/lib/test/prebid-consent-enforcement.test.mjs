@@ -190,7 +190,6 @@ async function runGdprPage(grants = {}) {
 
   pageWindow.eval(bundleCode);
   pageWindow.pbjs.setConfig({
-    consentManagement: { gdpr: { cmpApi: 'iab', timeout: 500, defaultGdprScope: true } },
     // Resolve User IDs before the auction so one auction is enough to observe
     // whether IdentityLink ran.
     userSync: { auctionDelay: 300, syncEnabled: false },

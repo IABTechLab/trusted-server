@@ -87,6 +87,7 @@ interface ApsPrebidTestEntry {
 
 interface PrebidTestWindow {
   pbjs?: unknown;
+  __tcfapi?: unknown;
   tsjs?: {
     apsPrebidRenderers?: Record<string, ApsPrebidTestEntry>;
     [key: string]: unknown;
@@ -456,6 +457,7 @@ describe('prebid/installPrebidNpm', () => {
     document.cookie = 'ts-eids=; Path=/; Max-Age=0';
     delete testWindow.__tsjs_prebid;
     delete testWindow.__tsjs_prebid_diagnostics;
+    delete testWindow.__tcfapi;
     delete testWindow.tsjs;
     delete mockPbjs['__tsApsBidResponseListenerInstalled'];
     delete mockPbjs['__tsManagedUserIdsSetConfigInstalled'];
@@ -833,12 +835,148 @@ describe('prebid/installPrebidNpm', () => {
   it('leaves the public config APIs unchanged when no User IDs are managed', () => {
     const originalSetConfig = mockPbjs.setConfig;
     const originalMergeConfig = mockPbjs.mergeConfig;
+    testWindow.__tcfapi = vi.fn();
 
     installPrebidNpm();
 
     expect(mockPbjs.setConfig).toBe(originalSetConfig);
     expect(mockPbjs.mergeConfig).toBe(originalMergeConfig);
     expect(mockSetConfig.mock.calls.some(([value]) => value?.userSync?.userIds)).toBe(false);
+  });
+
+  it('activates IAB GDPR consent before managed User IDs and the publisher queue', () => {
+    testWindow.__tcfapi = vi.fn();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+
+    installPrebidNpm();
+
+    const consentCallIndex = mockSetConfig.mock.calls.findIndex(
+      ([value]) => value?.consentManagement?.gdpr?.cmpApi === 'iab'
+    );
+    const managedCallIndex = mockSetConfig.mock.calls.findIndex(
+      ([value]) => value?.userSync?.userIds
+    );
+    expect(consentCallIndex).toBeGreaterThanOrEqual(0);
+    expect(mockSetConfig.mock.calls[consentCallIndex][0]).toEqual({
+      consentManagement: { gdpr: { cmpApi: 'iab' } },
+    });
+    expect(consentCallIndex).toBeLessThan(managedCallIndex);
+    expect(mockSetConfig.mock.invocationCallOrder[consentCallIndex]).toBeLessThan(
+      mockProcessQueue.mock.invocationCallOrder[0]
+    );
+  });
+
+  it('does not activate managed consent without a callable TCF API', () => {
+    testWindow.__tcfapi = true;
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+
+    installPrebidNpm();
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.consentManagement)).toBe(false);
+  });
+
+  it('preserves sibling consent settings when activating managed GDPR consent', () => {
+    const gpp = { cmpApi: 'iab', timeout: 750 };
+    testWindow.__tcfapi = vi.fn();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement') return { gpp };
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+
+    installPrebidNpm();
+
+    expect(mockSetConfig).toHaveBeenCalledWith({
+      consentManagement: { gpp, gdpr: { cmpApi: 'iab' } },
+    });
+  });
+
+  it.each([
+    ['an object', { cmpApi: 'static', timeout: 123 }],
+    ['null', null],
+    ['false', false],
+  ])('preserves an effective publisher-owned GDPR value when it is %s', (_label, gdpr) => {
+    testWindow.__tcfapi = vi.fn();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement') return { gdpr };
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+
+    installPrebidNpm();
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.consentManagement)).toBe(false);
+  });
+
+  it.each([
+    ['null', null],
+    ['false', false],
+    ['a string', 'invalid'],
+    ['an array', []],
+  ])('does not replace unsafe effective consent state when it is %s', (_label, consent) => {
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    testWindow.__tcfapi = vi.fn();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement') return consent;
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+
+    installPrebidNpm();
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.consentManagement)).toBe(false);
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] effective consentManagement configuration is not mergeable'
+    );
+  });
+
+  it('does not replace consent state when reading it throws', () => {
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    testWindow.__tcfapi = vi.fn();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) => {
+      if (key === 'consentManagement') throw new Error('example consent accessor failure');
+      if (key === 'userSync.userIds') return [];
+      return undefined;
+    });
+
+    installPrebidNpm();
+
+    expect(mockSetConfig.mock.calls.some(([value]) => value?.consentManagement)).toBe(false);
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] effective consentManagement configuration could not be read',
+      expect.any(Error)
+    );
+  });
+
+  it('lets queued and late publisher consent configuration retain precedence', () => {
+    const queuedConsent = { gdpr: { cmpApi: 'static', timeout: 321 } };
+    const lateConsent = { gdpr: null };
+    testWindow.__tcfapi = vi.fn();
+    testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [] : undefined
+    );
+    mockPbjs.que = [() => mockPbjs.setConfig({ consentManagement: queuedConsent })];
+    mockProcessQueue.mockImplementation(() => {
+      for (const callback of mockPbjs.que.splice(0)) callback();
+    });
+
+    installPrebidNpm();
+    mockPbjs.mergeConfig({ consentManagement: lateConsent });
+
+    expect(mockSetConfig).toHaveBeenCalledWith({ consentManagement: queuedConsent });
+    expect(mockMergeConfig).toHaveBeenCalledWith({ consentManagement: lateConsent });
+    expect(mockSetConfig.mock.calls.filter(([value]) => value?.consentManagement)).toHaveLength(2);
   });
 
   it('preserves effective User ID entries and replaces identityLink exactly once', () => {
