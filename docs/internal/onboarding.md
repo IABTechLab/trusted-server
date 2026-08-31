@@ -5,13 +5,13 @@ For project usage, start with the public guides.
 
 ## Start here
 
-- [What is Trusted Server?](/guide/what-is-trusted-server)
-- [Architecture](/guide/architecture)
-- [Getting Started](/guide/getting-started)
-- [Configuration](/guide/configuration)
-- [Testing](/guide/testing)
-- [Integrations Overview](/guide/integrations-overview)
-- [Integration Guide](/guide/integration-guide)
+- [What is Trusted Server?](../guide/what-is-trusted-server.md)
+- [Architecture](../guide/architecture.md)
+- [Getting Started](../guide/getting-started.md)
+- [Configuration](../guide/configuration.md)
+- [Testing](../guide/testing.md)
+- [Integrations Overview](../guide/integrations-overview.md)
+- [Integration Guide](../guide/integration-guide.md)
 
 ## Local setup
 
@@ -35,8 +35,8 @@ For project usage, start with the public guides.
 
 - Follow [CONTRIBUTING.md](https://github.com/IABTechLab/trusted-server/blob/main/CONTRIBUTING.md)
   when preparing changes.
-- Use the [Testing guide](/guide/testing) for test commands.
-- Use the [Integration Guide](/guide/integration-guide) when adding an
+- Use the [Testing guide](../guide/testing.md) for test commands.
+- Use the [Integration Guide](../guide/integration-guide.md) when adding an
   integration.
 - Report bugs and request changes through the repository's public
   [GitHub issues](https://github.com/IABTechLab/trusted-server/issues).
