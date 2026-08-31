@@ -175,6 +175,34 @@ must not force GDPR scope or add a CMP configuration on pages without the TCF
 API. This keeps the browser behavior vendor-neutral and avoids imposing GDPR
 latency or defaults on non-TCF publishers.
 
+The effective value returned by `pbjs.getConfig("consentManagement")` is the
+source of truth at installation time. If it is an object with its own `gdpr`
+property, that property is publisher-owned and the shim leaves it untouched
+regardless of its value, including `null`, `false`, or a partial object. If the
+effective value is absent, or is an object without its own `gdpr` property, the
+shim adds only:
+
+```js
+{
+  consentManagement: {
+    ...existingConsentManagement,
+    gdpr: { cmpApi: "iab" },
+  },
+}
+```
+
+Prebid's timeout and `defaultGdprScope` defaults remain authoritative. Existing
+sibling settings such as `gpp` are copied into the update. A non-object or
+throwing effective value is not safe to merge: the shim logs a diagnostic and
+does not replace it.
+
+The automatic update uses the original Prebid `setConfig` function, while the
+installed wrappers continue passing all publisher consent fields through
+unchanged. Publisher configuration already applied before the shim therefore
+wins immediately. Queued configuration is processed afterward in queue order,
+and late `setConfig` or `mergeConfig` calls remain able to replace or extend the
+automatic minimum. The shim never re-applies its minimum after installation.
+
 ## 5. Approaches considered
 
 ### 5.1 Selected: vendor-neutral managed User IDs with bundle validation
@@ -636,7 +664,24 @@ LiveRamp-named fixture proving that a `liveramp.com` EID:
 - is ingested into the configured `liveramp.com` EC partner namespace on a
   later request.
 
-### 11.6 Live configuration validation
+### 11.6 Managed browser-consent activation
+
+Extend the generated-artifact test before changing production code. The matrix
+must prove:
+
+- managed User IDs plus a callable `__tcfapi`, with no publisher-side Prebid
+  consent configuration, activates `gdpr.cmpApi = "iab"` and blocks the
+  IdentityLink request and storage when Purpose 1 or vendor 97 is denied;
+- no managed User IDs results in no automatic consent configuration;
+- a missing or non-callable `__tcfapi` results in no automatic consent
+  configuration;
+- an already-effective publisher `gdpr` value is preserved, including an
+  object and an explicit non-object value;
+- existing sibling consent settings are preserved when the minimum is added;
+- queued and late publisher GDPR configuration retains precedence; and
+- the shim does not re-apply the automatic minimum after publisher changes.
+
+### 11.7 Live configuration validation
 
 Run outside CI against a LiveRamp-approved non-production origin:
 
