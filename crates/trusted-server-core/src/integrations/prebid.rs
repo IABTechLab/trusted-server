@@ -1338,13 +1338,13 @@ impl IntegrationAttributeRewriter for PrebidIntegration {
 }
 
 fn serialize_injected_prebid_config(payload: &impl Serialize) -> String {
-    // Escape `</` to prevent breaking out of the script tag.
+    // JSON appears in script raw-text, where every less-than sign must be escaped.
     serde_json::to_string(payload)
         .unwrap_or_else(|error| {
             log::warn!("Prebid: failed to serialize client config: {error}");
             "{}".to_string()
         })
-        .replace("</", "<\\/")
+        .replace('<', "\\u003c")
 }
 
 fn injected_prebid_config_script(config_json: &str) -> String {
@@ -3430,6 +3430,24 @@ mod tests {
         create_test_settings()
     }
 
+    #[test]
+    fn injected_prebid_config_escapes_every_less_than_sign() {
+        let config_json = serialize_injected_prebid_config(&json!({
+            "accountId": "x<!--<script",
+        }));
+        let script = injected_prebid_config_script(&config_json);
+
+        assert!(
+            config_json.contains(r#"x\u003c!--\u003cscript"#),
+            "should escape every less-than sign in JSON script data: {config_json}"
+        );
+        assert_eq!(
+            script.matches('<').count(),
+            2,
+            "should leave less-than signs only in the outer script element: {script}"
+        );
+    }
+
     fn base_config() -> LegacyPrebidServerConfig {
         LegacyPrebidServerConfig {
             enabled: true,
@@ -3782,9 +3800,8 @@ server_url = "https://prebid.example/openrtb2/auction"
         );
     }
 
-    /* Legacy mixed-config canonicalization test replaced by browser-only registration tests.
     #[test]
-    fn startup_validation_and_runtime_build_canonicalize_excluded_gam_ad_unit_path_suffixes() {
+    fn planned_registration_canonicalizes_excluded_gam_ad_unit_path_suffixes() {
         let mut settings = make_settings();
         settings
             .integrations
@@ -3801,39 +3818,32 @@ server_url = "https://prebid.example/openrtb2/auction"
                 }),
             )
             .expect("should replace Prebid test configuration");
-
-        let config = validate_config_for_startup(&settings)
-            .expect("should validate Prebid configuration")
-            .expect("should return enabled Prebid configuration");
-
-        assert_eq!(
-            config.excluded_gam_ad_unit_path_suffixes,
-            ["/trackingonly", "/measurement-only"],
-            "should retain only the first declaration of each suffix"
+        let plan = Arc::new(
+            crate::auction::compile_auction_plan(&settings).expect("should compile auction plan"),
         );
-
-        let integration = build(&settings)
-            .expect("should build Prebid integration")
-            .expect("should return enabled Prebid integration");
+        let registry = IntegrationRegistry::with_plan(&settings, plan)
+            .expect("should build integration registry");
         let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
+        let context = IntegrationHtmlContext {
             request_host: "pub.example",
             request_scheme: "https",
             origin_host: "origin.example",
             document_state: &document_state,
         };
-        let inserts = integration.head_inserts(&ctx);
+
+        let inserts = registry.head_inserts(&context);
+        let config_insert = inserts
+            .iter()
+            .find(|insert| insert.contains("window.__tsjs_prebid"))
+            .expect("should inject planned Prebid config");
 
         assert!(
-            inserts[0].contains(
+            config_insert.contains(
                 r#""excludedGamAdUnitPathSuffixes":["/trackingonly","/measurement-only"]"#
             ),
-            "should inject the canonical suffix list: {}",
-            inserts[0]
+            "should inject the canonical suffix list: {config_insert}"
         );
     }
-
-    */
     #[test]
     fn excluded_gam_ad_unit_path_suffixes_reject_invalid_values() {
         for (suffix, expected_message) in [
@@ -4160,6 +4170,28 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
+    fn external_bundle_registration_requires_bundle_url() {
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config("prebid", &json!({ "enabled": true }))
+            .expect("should update prebid config");
+        let plan = Arc::new(
+            crate::auction::compile_auction_plan(&settings).expect("should compile auction plan"),
+        );
+
+        let error = match IntegrationRegistry::with_plan(&settings, plan) {
+            Ok(_) => panic!("should reject missing external bundle URL"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("external_bundle_url"),
+            "error should mention missing external bundle URL: {error:?}"
+        );
+    }
+
+    #[test]
     fn external_bundle_registration_allows_sha256_without_sri() {
         let mut settings = make_settings();
         settings
@@ -4220,31 +4252,6 @@ external_bundle_sri = "sha384-AAAA"
         );
     }
 
-    /* Browser-only Prebid permits no managed external bundle URL.
-    #[test]
-    fn external_bundle_registration_requires_bundle_url() {
-        let mut settings = make_settings();
-        settings
-            .integrations
-            .insert_config(
-                "prebid",
-                &json!({
-                    "enabled": true,
-                }),
-            )
-            .expect("should update prebid config");
-
-        let err = match IntegrationRegistry::with_plan(&settings, Arc::new(crate::auction::compile_auction_plan(&settings).expect("should compile auction plan"))) {
-            Ok(_) => panic!("should reject missing URL"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string().contains("external_bundle_url"),
-            "error should mention missing external bundle URL: {err:?}"
-        );
-    }
-
-    */
     #[test]
     fn external_bundle_registration_uses_proxy_allowed_domains() {
         let mut settings = make_settings();
@@ -4581,22 +4588,24 @@ external_bundle_sri = "sha384-AAAA"
         );
     }
 
-    /* Startup validation now uses the browser-only public config path.
     #[test]
-    fn external_bundle_startup_validation_requires_proxy_allowed_domains() {
+    fn external_bundle_registration_requires_proxy_allowed_domains() {
         let mut settings = make_settings();
         settings.proxy.allowed_domains.clear();
+        let plan = Arc::new(
+            crate::auction::compile_auction_plan(&settings).expect("should compile auction plan"),
+        );
 
-        let err = validate_config_for_startup(&settings)
-            .expect_err("should reject external bundle without proxy allowlist");
+        let error = match IntegrationRegistry::with_plan(&settings, plan) {
+            Ok(_) => panic!("should reject external bundle without proxy allowlist"),
+            Err(error) => error,
+        };
 
         assert!(
-            err.to_string().contains("proxy.allowed_domains"),
-            "error should mention proxy.allowed_domains: {err:?}"
+            error.to_string().contains("proxy.allowed_domains"),
+            "error should mention proxy.allowed_domains: {error:?}"
         );
     }
-
-    */
     #[test]
     fn external_bundle_handler_fetches_and_sanitizes_with_platform_client() {
         futures::executor::block_on(async {
@@ -4972,7 +4981,7 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_escapes_closing_script_tags_in_values() {
+    fn head_injector_escapes_less_than_signs_in_values() {
         let mut config = base_config();
         config.account_id = Some("</script><script>alert(1)</script>".to_string());
         let integration = PrebidIntegration::new(config);
@@ -4987,8 +4996,8 @@ external_bundle_sri = "sha384-AAAA"
         let inserts = integration.head_inserts(&ctx);
         let script = &inserts[0];
         assert!(
-            script.contains(r#""accountId":"<\/script><script>alert(1)<\/script>""#),
-            "should escape closing script tags inside JSON values: {}",
+            script.contains(r#""accountId":"\u003c/script>\u003cscript>alert(1)\u003c/script>""#),
+            "should escape every less-than sign inside JSON values: {}",
             script
         );
     }

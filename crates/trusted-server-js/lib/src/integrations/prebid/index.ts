@@ -671,7 +671,6 @@ function foldedBidderParams(
 /** Capture immutable request-scoped bidder and zone data before the shim mutates an ad unit. */
 function capturePublisherAdUnitSnapshot(
   unit: TrustedServerAdUnit,
-  clientSideBidders: Set<string>,
   serverSideBidders: Set<string>
 ): PublisherAdUnitSnapshot | undefined {
   if (typeof unit.code !== 'string' || unit.code.length === 0) return undefined;
@@ -688,9 +687,7 @@ function capturePublisherAdUnitSnapshot(
       continue;
     }
     if (!serverSideBidders.has(bid.bidder)) {
-      if (clientSideBidders.has(bid.bidder)) {
-        clientSideBids.push({ bidder: bid.bidder, params: copyParams(bid.params) });
-      }
+      clientSideBids.push({ bidder: bid.bidder, params: copyParams(bid.params) });
       continue;
     }
     rawBidderParams[bid.bidder] = copyParams(bid.params);
@@ -710,27 +707,25 @@ function capturePublisherAdUnitSnapshot(
 }
 
 /**
- * Collect the configured client-side bidder entries for a refreshing slot.
+ * Collect browser-owned bidder entries for a refreshing slot.
  *
  * Synthetic refresh ad units carry only the `trustedServer` bid. The
- * `requestBids` shim preserves a client-side bidder only when its bid entry is
- * already present on the ad unit, so without re-attaching them here publishers
- * that split demand between server-side and native Prebid adapters would lose
- * all client-side demand on refresh/scroll impressions. A live exact
- * `pbjs.adUnits` match is authoritative; request-scoped snapshots are used only
- * when no live unit exists.
+ * `requestBids` shim preserves every bidder not owned by the server plan when
+ * its bid entry is already present on the ad unit, so re-attach those bidders
+ * here. A live exact `pbjs.adUnits` match is authoritative; request-scoped
+ * snapshots are used only when no live unit exists.
  */
 function clientSideBidsForRefresh(
   candidateCodes: Array<string | undefined>
 ): Array<{ bidder: string; params: Record<string, unknown> }> {
-  const clientSideBidders = new Set(getInjectedConfig()?.clientSideBidders ?? []);
+  const serverSideBidders = new Set(injectedServerSideBidderCodes());
   const match = findRefreshAdUnit(candidateCodes);
   if (match) {
-    if (clientSideBidders.size === 0 || !Array.isArray(match.bids)) return [];
+    if (!Array.isArray(match.bids)) return [];
 
     const bids: Array<{ bidder: string; params: Record<string, unknown> }> = [];
     for (const bid of match.bids) {
-      if (bid?.bidder && clientSideBidders.has(bid.bidder)) {
+      if (bid?.bidder && bid.bidder !== ADAPTER_CODE && !serverSideBidders.has(bid.bidder)) {
         bids.push({ bidder: bid.bidder, params: copyParams(bid.params) });
       }
     }
@@ -1019,7 +1014,7 @@ function collectAuctionEids(): AuctionEid[] | undefined {
  */
 function apsRendererCarrier(bid: Record<string, unknown>): unknown {
   const renderer = bid[APS_RENDERER_FIELD];
-  if (renderer !== undefined) return renderer;
+  if (renderer != null) return renderer;
   const meta = bid['meta'];
   if (meta !== null && typeof meta === 'object') {
     return (meta as Record<string, unknown>)[APS_RENDERER_FIELD];
@@ -1212,7 +1207,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     // Ensure every ad unit has a trustedServer bid entry
     for (const unit of adUnits) {
       if (!syntheticRefreshAdUnits.has(unit)) {
-        const snapshot = capturePublisherAdUnitSnapshot(unit, clientSideBidders, serverSideBidders);
+        const snapshot = capturePublisherAdUnitSnapshot(unit, serverSideBidders);
         if (snapshot && unit.code) {
           storePublisherAdUnitSnapshot(unit.code, snapshot);
         }

@@ -532,6 +532,27 @@ describe('prebid/installPrebidNpm', () => {
     );
   });
 
+  it('falls back to the meta APS renderer when the top-level carrier is null', () => {
+    installPrebidNpm();
+
+    const bidResponseListener = mockOnEvent.mock.calls.find(
+      ([eventName]) => eventName === 'bidResponse'
+    )?.[1] as ((bid: Record<string, unknown>) => void) | undefined;
+    expect(bidResponseListener).toBeTypeOf('function');
+
+    const renderer = apsRenderer();
+    bidResponseListener!({
+      adapterCode: 'trustedServer',
+      bidderCode: 'aps',
+      adId: 'null-carrier-ad-id',
+      adUnitCode: 'div-aps',
+      trustedServerRenderer: null,
+      meta: { trustedServerRenderer: renderer },
+    });
+
+    expect(testWindow.tsjs?.apsPrebidRenderers?.['null-carrier-ad-id']?.renderer).toEqual(renderer);
+  });
+
   it('registers APS renderer via meta when Prebid strips the custom top-level field', () => {
     installPrebidNpm();
 
@@ -1745,7 +1766,7 @@ describe('prebid/installRefreshHandler', () => {
     mockPbjs.setTargetingForGPTAsync = undefined;
   });
 
-  it('includes configured client-side bidders in refresh ad units', () => {
+  it('includes every browser-owned bidder in refresh ad units', () => {
     testWindow.__tsjs_prebid = {
       clientSideBidders: ['rubicon'],
       serverSideBidders: ['appnexus', 'exampleServer', 'kargo'],
@@ -1757,6 +1778,7 @@ describe('prebid/installRefreshHandler', () => {
         bids: [
           { bidder: 'trustedServer', params: {} },
           { bidder: 'rubicon', params: { accountId: 1, siteId: 2, zoneId: 3 } },
+          { bidder: 'publisherBrowserBidder', params: { placement: 'browser' } },
         ],
       },
     ];
@@ -1796,6 +1818,7 @@ describe('prebid/installRefreshHandler', () => {
             bids: [
               { bidder: 'trustedServer', params: { zone: 'homepage' } },
               { bidder: 'rubicon', params: { accountId: 1, siteId: 2, zoneId: 3 } },
+              { bidder: 'publisherBrowserBidder', params: { placement: 'browser' } },
             ],
           }),
         ],
@@ -3027,6 +3050,42 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
         { bidder: 'exampleBrowser', params: { placement: 'browser-two' } },
       ],
     });
+  });
+
+  it('preserves unowned browser bidders in snapshot-backed refreshes', () => {
+    testWindow.__tsjs_prebid = { serverSideBidders: ['exampleServer'] };
+    const code = 'example-unowned-browser-bidder-slot';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { pubads } = installGpt([slot]);
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: [
+        {
+          code,
+          bids: [
+            { bidder: 'exampleServer', params: { placement: 'server' } },
+            { bidder: 'publisherBrowserBidder', params: { placement: 'browser' } },
+          ],
+        },
+      ],
+    } as unknown as RequestBidsArg);
+
+    pubads.refresh([slot]);
+
+    expect(mockPbjs.adUnits).toEqual([]);
+    expect(refreshAdUnitFromLastRequest().bids).toEqual([
+      {
+        bidder: 'trustedServer',
+        params: { bidderParams: { exampleServer: { placement: 'server' } } },
+      },
+      { bidder: 'publisherBrowserBidder', params: { placement: 'browser' } },
+    ]);
   });
 
   it('isolates nested bidder-param objects and arrays from later publisher mutation', () => {
