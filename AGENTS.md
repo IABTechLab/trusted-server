@@ -93,8 +93,10 @@ spin up --from crates/trusted-server-adapter-spin
 ### Testing & Quality
 
 ```bash
-# Run all Rust tests — use workspace aliases (see .cargo/config.toml)
-# default-members = [fastly] so Viceroy can locate the binary via `cargo run --bin`.
+# Run all Rust tests — use workspace aliases (bare `cargo test` fails at the
+# workspace root: it compiles the Fastly adapter for the host target).
+# See .cargo/config.toml; default-members = [fastly] so Viceroy can locate
+# the binary via `cargo run --bin`.
 cargo test-fastly      # Fastly adapter + core (wasm32-wasip1 via Viceroy)
 cargo test-axum        # Axum dev server adapter (native)
 cargo test-cloudflare  # Cloudflare Workers adapter (native host)
