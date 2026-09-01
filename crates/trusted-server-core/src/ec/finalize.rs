@@ -6,15 +6,17 @@
 use std::collections::HashSet;
 
 use edgezero_core::body::Body as EdgeBody;
+use error_stack::Report;
 use http::Response;
 
 use super::consent::{ec_consent_granted, ec_consent_withdrawn};
+use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
 use super::EcContext;
 use super::cookies::{expire_ec_cookie, set_ec_cookie};
 use super::generation::is_valid_ec_id;
-use super::kv::KvIdentityGraph;
+use super::kv::{KvIdentityGraph, TombstoneOutcome};
 use super::log_id;
 use super::prebid_eids::ingest_eid_cookies;
 use super::registry::PartnerRegistry;
@@ -51,34 +53,14 @@ pub fn ec_finalize_response(
     let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
 
     if !consent_allows_ec {
-        // Always strip EC-specific response headers when consent is not
-        // currently usable for this request. This covers both explicit
-        // revocation and fail-closed cases such as missing geo or undecodable
-        // consent input.
-        clear_ec_headers_on_response(response, Some(registry));
-
-        // Only expire the browser cookie and tombstone the identity-graph row
-        // when the request carries an explicit withdrawal signal.
-        if consent_withdrawn && ec_context.cookie_was_present() {
-            expire_ec_cookie(settings, response);
-
-            // Compute once for the authoritative identity-graph tombstones.
-            let ids_to_withdraw = withdrawal_ec_ids(ec_context);
-
-            // The identity-graph tombstone is the authoritative withdrawal marker
-            // for subsequent EC behavior.
-            if let Some(graph) = kv {
-                apply_withdrawal_tombstones(&ids_to_withdraw, |ec_id| {
-                    if let Err(err) = graph.write_withdrawal_tombstone(ec_id) {
-                        log::error!(
-                            "Failed to write withdrawal tombstone for EC ID '{}': {err:?}",
-                            log_id(ec_id),
-                        );
-                    }
-                });
-            }
-        }
-
+        finalize_unusable_consent(
+            settings,
+            ec_context,
+            kv,
+            registry,
+            consent_withdrawn,
+            response,
+        );
         return;
     }
 
@@ -150,6 +132,79 @@ fn partner_response_header(source_domain: &str) -> String {
 pub fn clear_ec_on_response(settings: &Settings, response: &mut Response<EdgeBody>) {
     expire_ec_cookie(settings, response);
     clear_ec_headers_on_response(response, None);
+}
+
+/// Finalizes a response whose consent does not currently permit an EC.
+///
+/// Covers explicit revocation and fail-closed cases alike, such as missing geo
+/// or undecodable consent input: EC response headers always come off. The
+/// browser cookie is expired and the identity-graph row tombstoned only when
+/// the request carries an explicit withdrawal signal, so a visitor who has
+/// simply not decided yet is not stripped of an identity they already hold.
+fn finalize_unusable_consent(
+    settings: &Settings,
+    ec_context: &EcContext,
+    kv: Option<&KvIdentityGraph>,
+    registry: &PartnerRegistry,
+    consent_withdrawn: bool,
+    response: &mut Response<EdgeBody>,
+) {
+    clear_ec_headers_on_response(response, Some(registry));
+
+    if !(consent_withdrawn && ec_context.cookie_was_present()) {
+        return;
+    }
+
+    expire_ec_cookie(settings, response);
+
+    // Compute once for the authoritative identity-graph tombstones.
+    let ids_to_withdraw = withdrawal_ec_ids(ec_context);
+
+    // The identity-graph tombstone is the authoritative withdrawal marker
+    // for subsequent EC behavior.
+    if let Some(graph) = kv {
+        apply_withdrawal_tombstones(&ids_to_withdraw, |ec_id| {
+            log_tombstone_outcome(ec_id, graph.write_withdrawal_tombstone(ec_id));
+        });
+    }
+}
+
+/// Records what happened to one withdrawal tombstone.
+///
+/// An unknown identity is expected traffic rather than a fault: the identifier
+/// comes from a client-supplied cookie, so it may name something this
+/// deployment never issued. An unconfirmed identity is different: the store
+/// could not answer, so a real row may have gone unmarked and that is logged as
+/// an error. The browser cookie is expired in every case, and that is the
+/// primary enforcement.
+fn log_tombstone_outcome(
+    ec_id: &str,
+    outcome: Result<TombstoneOutcome, Report<TrustedServerError>>,
+) {
+    match outcome {
+        Ok(TombstoneOutcome::Written) => {}
+        Ok(TombstoneOutcome::UnknownIdentity) => {
+            log::debug!(
+                "Skipping withdrawal tombstone for unknown EC ID '{}'",
+                log_id(ec_id),
+            );
+        }
+        Ok(TombstoneOutcome::Unconfirmed) => {
+            // Unlike an unknown identity, this is a fault worth surfacing: the
+            // store could not be read, so a real identity may have gone
+            // untombstoned for the batch-sync window.
+            log::error!(
+                "Could not confirm EC ID '{}' to tombstone it; the browser cookie is still expired",
+                log_id(ec_id),
+            );
+        }
+        Err(err) => {
+            log::error!(
+                "Failed to write withdrawal tombstone for EC ID '{}': {err:?}",
+                log_id(ec_id),
+            );
+        }
+    }
 }
 
 fn withdrawal_ec_ids(ec_context: &EcContext) -> HashSet<String> {
@@ -388,6 +443,87 @@ mod tests {
         assert!(
             set_cookie.contains("Max-Age=0"),
             "should expire the EC cookie"
+        );
+    }
+
+    #[test]
+    fn finalize_withdrawal_does_not_create_a_row_for_an_unheld_identity() {
+        let settings = create_test_settings();
+        // The cookie value is chosen by the client, so a withdrawal naming an
+        // identity this deployment never issued must not put a row in the
+        // identity graph.
+        let ec_id = sample_ec_id("zz9999");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let ec_context =
+            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent);
+        let kv = KvIdentityGraph::in_memory("test-store");
+        let mut response = empty_response();
+        let registry = PartnerRegistry::from_config(&[]).expect("should build registry");
+
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            Some(&kv),
+            &registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        assert!(
+            kv.get(&ec_id).expect("should read back").is_none(),
+            "should not write a tombstone for an identity that was never issued"
+        );
+        let set_cookie = get_header_str(&response, "set-cookie").unwrap_or_default();
+        assert!(
+            set_cookie.contains("Max-Age=0"),
+            "should still expire the browser cookie, which is the primary enforcement"
+        );
+    }
+
+    #[test]
+    fn finalize_withdrawal_tombstones_a_held_identity() {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("held01");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let ec_context =
+            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent);
+        let kv = KvIdentityGraph::in_memory("test-store");
+        kv.create(
+            &ec_id,
+            &crate::ec::kv_types::KvEntry::minimal("p.example", "uid", 1),
+        )
+        .expect("should seed the identity");
+        let mut response = empty_response();
+        let registry = PartnerRegistry::from_config(&[]).expect("should build registry");
+
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            Some(&kv),
+            &registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        let (entry, _) = kv
+            .get(&ec_id)
+            .expect("should read back")
+            .expect("should still hold the identity");
+        assert!(
+            !entry.consent.ok,
+            "a genuine withdrawal must still tombstone the identity"
         );
     }
 
