@@ -317,6 +317,28 @@ The three delivery choices are exclusive and the last call wins, so a builder ch
 
 A module may declare a geo, identity or device provider that no selector chooses, which is a configuration a deployment can hold while it switches providers, so the registry logs a warning naming the unselected capability rather than refusing to start.
 
+### What a Module Sees of the Permission State
+
+Trusted Server resolves the permission state for a request once, at the start
+of the request cycle, and hands it to a module in two places rather than having
+the module derive its own.
+
+- A request filter receives `permissions: Option<&PermissionState>` on its
+  `RequestFilterInput`, next to the geo result. The filter step runs on the
+  Fastly adapter today, and there the state is built before any filter runs.
+- A page module reads `window.tsjs.permissions`, an object `{"set": [...]}` of
+  the Data Use names set for the request, and waits on `tsjs.whenPermissions()`
+  because the value arrives at `<head>` open under inline assembly and at the
+  `</body>` seam under a shared template. A module declares the permissions it
+  requires in its own source, the same names its server-side provider declares,
+  and does nothing with identity and contacts no vendor until the promise
+  resolves with those names in the set. The client-fixed demo script under
+  `integrations/ec_client_fixed` is the worked example.
+
+A device provider a module supplies must require no permission, because no
+per-request device gate exists yet; a module that declares one is refused at
+startup. See the permission model guide for the model itself.
+
 ### How an Adapter Composes It In
 
 The Axum, Cloudflare and Spin adapters take the builders as arguments, so no adapter names a vendor.

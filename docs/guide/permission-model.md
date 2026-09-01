@@ -47,12 +47,16 @@ vendor-neutral default needs no consent prompt and no per-request
 policy interaction.
 
 Device and geo providers declare their required permissions through the same
-method, and the core does not yet gate either of them on what they declare, so
-for those two the declaration is recorded rather than enforced. The only place
-a declaration currently decides whether a provider runs is the Edge Cookie
-path, in `ec/mod.rs`. Treat a device or geo declaration as a statement of
-intent until that gap is closed, and do not rely on it to keep a provider from
-running.
+method. The built-in and host providers require none. A device provider that
+an integration module supplies and that declares any permission is refused at
+startup, with a message naming the module and the permissions it declared,
+because device classification runs before the permission state for the request
+is assembled and there is no per-request gate that could honor the
+declaration. Refusing it is preferred to recording a requirement that never
+binds. A geo declaration is not consulted, because geo runs first and supplies
+the country the permission baseline depends on. The only declaration that
+decides whether a provider runs per request is the Edge Cookie provider's, in
+`ec/mod.rs`.
 
 ## Evidence is not rationed, use is
 
@@ -388,7 +392,9 @@ its own, so there is a single decision per request.
 **Server side.** An integration request filter receives
 `permissions: Option<&PermissionState>` on its `RequestFilterInput`, alongside
 the geo result it already receives, so a filter can skip or narrow what it does
-when a permission it depends on is unset. None of the shipped filters changes
+when a permission it depends on is unset. Request filters run on the Fastly
+adapter today, which is the only adapter that runs the filter step, and there
+the state is built before the filters run. None of the shipped filters changes
 its behavior on that input yet, so for now the state is carried and available
 rather than acted on.
 
@@ -409,13 +415,14 @@ the `permissions.yaml` keys and `Permission::as_str()`.
 Delivery follows the pattern already used for `adSlots` and `bids`, and the
 timing depends on how the page is assembled. Under inline assembly the value is
 injected as a `<script>` at the open of `<head>`, before the tsjs bundle, on
-every HTML document, so it is there before any page module runs. Under
+every HTML document that has a `<head>`, so it is there before any page module
+runs. Under
 shared-template (ESI) assembly the `<head>` is part of a template shared across
 visitors and must carry nothing request-scoped, so the value is spliced into the
 per-request script at the `</body>` seam instead. A permissions-only seam script
-is emitted even when the ad stack did not run, so a visitor whose consent was
-denied or who was classified as a bot still receives the state, empty in that
-case rather than missing.
+is emitted even when the ad stack did not run, so a visitor who was
+classified as a bot, or for whom the auction was gated off, still receives the
+state resolved for the request rather than nothing.
 
 Because the arrival point moves, a page module must not read `tsjs.permissions`
 directly at load. TSJS core defaults the value to `{ set: [] }` and exposes
@@ -423,8 +430,13 @@ directly at load. TSJS core defaults the value to `{ set: [] }` and exposes
 immediately in the head-first case or at the body seam, with a
 `DOMContentLoaded` fallback. That promise is the waiting point for a vendor page
 module, which does nothing with identity and contacts no vendor until the
-promise resolves. Wiring the existing integrations' JavaScript to wait on it is
-follow-up work.
+promise resolves. If nothing arrived by `DOMContentLoaded` the promise resolves
+with the empty state, which a module reads as nothing set. The client-fixed
+demo page script does exactly this. It declares the same Data Use its
+server-side provider requires, `necessary.operations.storage`, and posts to the
+resolve endpoint only when the promise resolves with that Data Use in the set,
+so it is the pattern a vendor page module follows. Wiring the other existing
+integration scripts to wait on the promise is follow-up work.
 
 The page cannot work this out for itself. Consent is only one of the ways a
 permission is set, and the country and region baselines and the deployer's

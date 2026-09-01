@@ -964,9 +964,15 @@ fn resolve_device_provider(
     if let Some(provider) = resolved.as_ref()
         && provider.required_permissions() != crate::permissions::PermissionSet::none()
     {
+        let declared = provider
+            .required_permissions()
+            .iter()
+            .map(crate::permissions::Permission::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
         let message = format!(
-            "integration module `{}` declares a device provider with required permissions, \
-             and Trusted Server has no per-request gate that can enforce them yet, so the \
+            "integration module `{}` declares a device provider requiring `{declared}`, \
+             and Trusted Server has no per-request gate that can enforce that yet, so the \
              selection is refused rather than silently ignored",
             selector.unwrap_or_default(),
         );
@@ -3773,7 +3779,10 @@ mod tests {
             "the failure should name the module, got: {rendered}"
         );
         assert!(
-            rendered.contains("required permissions"),
+            rendered.contains(&format!(
+                "requiring `{}`",
+                crate::permissions::Permission::StoreOnDevice.as_str()
+            )),
             "the failure should say why it was refused, got: {rendered}"
         );
     }

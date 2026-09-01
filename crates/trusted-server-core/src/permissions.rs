@@ -5,8 +5,11 @@
 //! signals and the country it resolves to, and refuses to run the Edge Cookie
 //! provider when its required permissions are not set. The device and geo
 //! providers declare their requirements through the same method, and the
-//! built-in ones require none; gating their execution on that declaration is
-//! follow-up work.
+//! built-in and host ones require none. A device provider supplied by an
+//! integration module that declares any permission is refused at startup,
+//! because no per-request device gate exists yet to honor it. A geo
+//! declaration is not consulted, because geo runs before the permissions are
+//! assembled and supplies the country they depend on.
 //!
 //! The vocabulary is the IAB Privacy Taxonomy Data Uses, mapped from the IAB TCF
 //! Europe purposes and used **only** as a technical identifier for a permission.
