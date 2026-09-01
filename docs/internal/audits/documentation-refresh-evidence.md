@@ -317,8 +317,141 @@ implementation stays on `spec-docs-refresh` and PR #1049.
 
 #### Task 2 — Transfer the reviewed containment commits
 
-Pending. Authenticate closed PR #1104 and the two reviewed source commits,
-then record exact transferred paths and byte identity on #1049.
+- Capture timestamp: 2026-09-01T09:24:44Z.
+- Executor: `OpenAI Codex task agent task2_transfer_containment`.
+- Package start HEAD:
+  `43145751bb4c4286802fbc59624844bed8a73dfc`.
+- Approved paths: `docs/.vitepress/config.mts`, `docs/guide/index.md`,
+  `docs/guide/onboarding.md`, `docs/internal/onboarding.md`, plus this
+  evidence-only ledger update.
+- `git fetch origin rc/202608 spec-docs-refresh`: exited 0 and fetched both
+  named branches from `github.com:IABTechLab/trusted-server`.
+- Before mutation,
+  `git rev-parse HEAD origin/spec-docs-refresh origin/rc/202608` returned, in
+  order, `43145751bb4c4286802fbc59624844bed8a73dfc`,
+  `43145751bb4c4286802fbc59624844bed8a73dfc`, and
+  `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`.
+- `git merge-base origin/rc/202608 origin/spec-docs-refresh` returned
+  `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`, and
+  `git merge-base --is-ancestor origin/rc/202608 origin/spec-docs-refresh`
+  exited 0. The immutable rc tip was therefore exact and ancestral to the
+  package-start branch.
+- Source PR: https://github.com/IABTechLab/trusted-server/pull/1104; state
+  `CLOSED`; base branch `main`; base SHA
+  `d516a9e94249e10cbc36e41beb4269f9255cf407`; source branch
+  `docs-public-containment`; head SHA
+  `e6554f24f58f6122fb806ce25432f66033765c65`.
+- Exact authentication command:
+  `gh pr view 1104 --repo IABTechLab/trusted-server --json url,state,baseRefName,baseRefOid,headRefName,headRefOid,commits`.
+  It exited 0 and returned the required two commits in order:
+  `34b0613dc603ba6529396dad4dd4b7e68b1e11a9` with subject
+  `Contain internal documentation pages`, then
+  `e6554f24f58f6122fb806ce25432f66033765c65` with subject
+  `Fix internal onboarding links`; the returned base, head, URL, and state
+  matched the values above.
+- `git cat-file -e '34b0613dc603ba6529396dad4dd4b7e68b1e11a9^{commit}'`
+  and
+  `git cat-file -e 'e6554f24f58f6122fb806ce25432f66033765c65^{commit}'`
+  each exited 0. `git log --reverse --format='%H %s'
+d516a9e94249e10cbc36e41beb4269f9255cf407..e6554f24f58f6122fb806ce25432f66033765c65`
+  returned exactly those two authenticated SHA/subject pairs and no others.
+- `git diff --name-only
+d516a9e94249e10cbc36e41beb4269f9255cf407..e6554f24f58f6122fb806ce25432f66033765c65`
+  returned exactly the four reviewed source paths:
+  `docs/.vitepress/config.mts`, `docs/guide/index.md`,
+  `docs/guide/onboarding.md`, and `docs/internal/onboarding.md`.
+- `git cherry-pick 34b0613dc603ba6529396dad4dd4b7e68b1e11a9`
+  completed without a conflict and produced
+  `06d916fcc839a67c7f4bb9fc4445e17ea0a10e56` with the unchanged subject
+  `Contain internal documentation pages`.
+- `git cherry-pick e6554f24f58f6122fb806ce25432f66033765c65`
+  completed without a conflict and produced
+  `5dcf84bd0bebf8e6297822d0435e737bb7b4e2ed` with the unchanged subject
+  `Fix internal onboarding links`.
+- Conflict status: none. No manual conflict resolution was performed.
+- `git diff --name-status
+43145751bb4c4286802fbc59624844bed8a73dfc..HEAD` returned exactly
+  `M docs/.vitepress/config.mts`, `M docs/guide/index.md`,
+  `D docs/guide/onboarding.md`, and `A docs/internal/onboarding.md`.
+- `git diff --quiet e6554f24f58f6122fb806ce25432f66033765c65
+HEAD -- docs/.vitepress/config.mts docs/guide/index.md
+docs/guide/onboarding.md docs/internal/onboarding.md` exited 0. The source
+  and transferred blobs were byte-identical: config
+  `0ec992096fe4b1e3e097269a039f81868c76694c`, guide index
+  `8a2c00d049e6a8e54d25cab3183802a74a26c35a`, and internal onboarding
+  `7a84844e79c4e13688f5476086e89011946cc74e`; guide onboarding was absent
+  from both trees.
+- From `docs`, `npm ci` exited 0 and reported `added 346 packages in 3s`;
+  `npm run lint` exited 0 after `eslint .`; `npm run format` exited 0 with
+  `All matched files use Prettier code style!`; and `npm run build` exited 0
+  with `build complete in 4.86s.` VitePress emitted only the known non-failing
+  `vcl`-to-`txt` syntax-highlighting fallback.
+- The exact built-file assertion, run from `docs`, was:
+
+  ```sh
+  test -z "$(find .vitepress/dist -type f | rg '/(superpowers|internal|epics)/|/guide/onboarding[.]html$|/README[.]html$|/business-use-cases[.]html$|/assets/(superpowers_|internal_|epics_|guide_onboarding[.]md[.]|README[.]md[.]|business-use-cases[.]md[.])')"
+  ```
+
+  It exited 0 and printed nothing. The exact page-manifest assertion was:
+
+  ```sh
+  node -e 'const h=require("./.vitepress/dist/hashmap.json"); const x=Object.keys(h).filter((k)=>/^(superpowers_|internal_|epics_|guide_onboarding[.]md$|README[.]md$|business-use-cases[.]md$)/.test(k)); console.log("forbidden manifest entries="+x.length); if(x.length) process.exit(1)'
+  ```
+
+  It exited 0 and printed `forbidden manifest entries=0`. The exact built-href
+  assertion was:
+
+  ```sh
+  test -z "$(rg -o --no-filename 'href=\"[^\"]+\"' .vitepress/dist --glob '*.html' | rg -i 'href=\"(?:/trusted-server)?/(?:superpowers|internal|epics)(?:[/.?#\"]|$)|href=\"(?:/trusted-server)?/(?:guide/onboarding|README|business-use-cases)(?:[/.?#\"]|$)')"
+  ```
+
+  It exited 0 and printed nothing. A supplemental per-family assertion
+  recursively enumerated `.vitepress/dist`, read `hashmap.json`, extracted
+  every HTML `href`, and failed on any excluded route, page-manifest entry, or
+  route/asset file. It exited 0 with these exact results:
+  `superpowers/**: sources=135, route/assets=0, manifest=0, hrefs=0`;
+  `internal/**: sources=4, route/assets=0, manifest=0, hrefs=0`;
+  `epics/**: sources=1, route/assets=0, manifest=0, hrefs=0`;
+  `guide/onboarding.md: sources=0, route/assets=0, manifest=0, hrefs=0`;
+  `README.md: sources=1, route/assets=0, manifest=0, hrefs=0`; and
+  `business-use-cases.md: sources=1, route/assets=0, manifest=0, hrefs=0`.
+
+- The exact required-artifact assertion was:
+
+  ```sh
+  test -f .vitepress/dist/index.html && rg -q '<title>Trusted Server</title>' .vitepress/dist/index.html && rg -q 'The New Execution Layer for Publishers' .vitepress/dist/index.html && test -f .vitepress/dist/guide/index.html && rg -q '<title>Guide | Trusted Server</title>' .vitepress/dist/guide/index.html && rg -q '<h1 id="guide"' .vitepress/dist/guide/index.html && test -f .vitepress/dist/guide/api-reference.html && rg -q '<title>API Reference | Trusted Server</title>' .vitepress/dist/guide/api-reference.html && rg -q 'Quick reference for all Trusted Server HTTP endpoints[.]' .vitepress/dist/guide/api-reference.html
+  ```
+
+  It exited 0 and printed nothing, proving the Home, Guide, and API artifacts
+  exist and contain both required identifying markers.
+
+- The exact onboarding-link assertion was:
+
+  ```sh
+  test "$(rg -o '\.\./[^)# ]+' internal/onboarding.md | wc -l | tr -d ' ')" = 9 && while IFS= read -r link; do test -f "internal/$link" && git ls-files --error-unmatch -- ":(top)docs/${link#../}" >/dev/null || exit 1; done < <(rg -o '\.\./[^)# ]+' internal/onboarding.md)
+  ```
+
+  It exited 0 and printed nothing. All 9/9 repository-relative links resolved
+  to tracked targets; the seven unique targets were
+  `docs/guide/what-is-trusted-server.md`, `docs/guide/architecture.md`,
+  `docs/guide/getting-started.md`, `docs/guide/configuration.md`,
+  `docs/guide/testing.md`, `docs/guide/integrations-overview.md`, and
+  `docs/guide/integration-guide.md`.
+
+- Removed only generated `docs/.vitepress/.temp` after the artifact checks.
+  `git diff --check` then exited 0, and `git status --porcelain=v1
+--untracked-files=all` printed nothing before this evidence-only mutation.
+- `npx prettier --write
+internal/audits/documentation-refresh-evidence.md` exited 0 and reported
+  `internal/audits/documentation-refresh-evidence.md 41ms`; the following
+  `npm run format` exited 0 with
+  `All matched files use Prettier code style!`.
+- This is local build and repository evidence only. It is not a live Pages,
+  deployment, or CNAME receipt, and it does not complete any release-pending
+  row.
+- Evidence-only commit message: `Record documentation containment transfer`.
+  Its SHA and push result are reported in the execution handoff because a
+  commit cannot record its own identifier.
 
 #### Task 3 — Complete WP1 CNAME and policy hygiene
 
