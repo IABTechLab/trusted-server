@@ -66,17 +66,18 @@ fail and the service will return its startup-error response.
 
 ## Key Sections
 
-| Section             | Purpose                                      |
-| ------------------- | -------------------------------------------- |
-| `[publisher]`       | Domain, origin, proxy settings               |
-| `[ec]`              | Edge Cookie (EC) ID generation               |
-| `[tester_cookie]`   | Optional tester-cookie endpoint              |
-| `[proxy]`           | Proxy SSRF allowlist and asset routes        |
-| `[cache]`           | Static/rehosted asset cache policy rules     |
-| `[image_optimizer]` | Reusable Image Optimizer profile sets        |
-| `[request_signing]` | Ed25519 request signing                      |
-| `[auction]`         | Auction orchestration                        |
-| `[integrations.*]`  | Partner integrations (Prebid, Next.js, etc.) |
+| Section               | Purpose                                      |
+| --------------------- | -------------------------------------------- |
+| `[publisher]`         | Domain, origin, proxy settings               |
+| `[trusted_client_ip]` | Authenticated client-IP forwarding           |
+| `[ec]`                | Edge Cookie (EC) ID generation               |
+| `[tester_cookie]`     | Optional tester-cookie endpoint              |
+| `[proxy]`             | Proxy SSRF allowlist and asset routes        |
+| `[cache]`             | Static/rehosted asset cache policy rules     |
+| `[image_optimizer]`   | Reusable Image Optimizer profile sets        |
+| `[request_signing]`   | Ed25519 request signing                      |
+| `[auction]`           | Auction orchestration                        |
+| `[integrations.*]`    | Partner integrations (Prebid, Next.js, etc.) |
 
 ## Example: Production Setup
 
@@ -352,6 +353,102 @@ a zero-byte cap fails every non-empty publisher response.
 ```bash
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 ```
+
+## Trusted Client IP Configuration
+
+Use this optional section when a trusted CDN service forwards requests to the
+Fastly service running Trusted Server. It lets Trusted Server use the reader's
+address instead of the immediate fronting edge node's address. Only the Fastly
+adapter honours this section; the Cloudflare, Spin, and Axum adapters validate
+it but keep using their own runtime client address.
+
+### `[trusted_client_ip]`
+
+| Field           | Type   | Required | Description                                                                       |
+| --------------- | ------ | -------- | --------------------------------------------------------------------------------- |
+| `ip_header`     | String | Yes      | Header containing exactly one reader IP address                                   |
+| `auth_header`   | String | Yes      | Header containing exactly one shared-secret value                                 |
+| `shared_secret` | String | Yes      | Secret shared with the trusted front door, 32+ ASCII graphic bytes, no whitespace |
+
+All three fields are required when the section exists. When the section is
+absent, Trusted Server continues to use the immediate peer address, and
+`ts config push` omits the section from the published config blob so instances
+running an older binary keep accepting the blob.
+
+::: warning Deploy the code before pushing the config
+Once the section is configured, the pushed blob carries it, and `Settings`
+rejects unknown fields. A binary that predates trusted client-IP support fails
+to load a blob containing this section and returns its startup-error response.
+Upgrade every instance before pushing a config that enables the section, and
+restore a config without the section before rolling instances back. Getting
+this order wrong takes the service down rather than degrading it.
+:::
+
+```toml
+[trusted_client_ip]
+ip_header = "x-ts-client-ip"
+auth_header = "x-ts-client-ip-auth"
+shared_secret = "replace-with-a-random-shared-secret"
+```
+
+Prefer a dedicated `x-` name for `ip_header`, as shown. `fastly-client-ip` is
+also accepted and suits a fronting service dedicated to Trusted Server, but on
+a service carrying other traffic a dedicated name means the front door never
+modifies `Fastly-Client-IP`, so other consumers of that header keep working
+unchanged. See [Fastly Setup](/guide/fastly#cdn-fronted-client-ip) for the
+front-door configuration this section depends on.
+
+The front door must overwrite both headers on every request it forwards to
+Trusted Server, and must remove client-supplied copies on its other routes.
+Trusted Server accepts the forwarded address only when the request has exactly
+one `auth_header` value that matches `shared_secret` byte-for-byte and exactly
+one `ip_header` value that parses directly as IPv4 or IPv6. Values are not
+trimmed or normalized. Missing, empty, duplicate, non-UTF-8, mismatched, or malformed
+values do not reject the request; Trusted Server safely falls back to the
+immediate peer address. Both configured headers are removed before routing.
+
+Header names are validated case-insensitively. `ip_header` must be
+`fastly-client-ip` or start with `x-`, while `auth_header` must start with `x-`.
+The names must differ. Neither field may use a header name reserved for
+Trusted Server's own internal signals (for example `x-forwarded-for`,
+`x-geo-info-available`, `x-ts-ec`, `x-ts-tls-protocol`, or `x-ts-tls-cipher`);
+the full reserved set is the internal-header list that Trusted Server strips
+before forwarding to third parties. These restrictions exclude standard
+sensitive headers such as `Host`, `Content-Length`, `Cookie`, and
+`Authorization`, as well as every Trusted Server internal header. Choose
+dedicated `x-` names that no other application or routing logic uses, because
+Trusted Server removes the configured headers before routing.
+
+Generate `shared_secret` with a cryptographically secure random generator,
+encode it as hex or base64url, store the same value only in the front door and
+Trusted Server configuration, and never commit it. The value is redacted from
+configuration debug output. Configuration requires at least 32 ASCII graphic
+bytes (`!` through `~`) with no whitespace, controls, DEL, or non-ASCII bytes,
+and startup fails when the value is still the documented placeholder.
+
+Independently of this section, the Fastly adapter treats `fastly-client-ip` as
+client-spoofable and strips it at request entry, so Trusted Server no longer
+forwards an inbound `Fastly-Client-IP` to the publisher origin. This applies
+even when `[trusted_client_ip]` is absent. Check whether the origin reads that
+header before deploying.
+
+Redaction protects debug output and validation errors; it does not move the
+value into a platform secret store. `ts config push` serializes the value in the
+Trusted Server application-config blob, so restrict access to that configuration
+store. Every adapter removes the configured IP and authentication headers before
+routing, although only Fastly uses them for client-IP resolution.
+
+**Environment Overrides**:
+
+```bash
+TRUSTED_SERVER__TRUSTED_CLIENT_IP__IP_HEADER=x-ts-client-ip
+TRUSTED_SERVER__TRUSTED_CLIENT_IP__AUTH_HEADER=x-ts-client-ip-auth
+TRUSTED_SERVER__TRUSTED_CLIENT_IP__SHARED_SECRET=replace-with-a-random-shared-secret
+```
+
+Because the typed environment overlay cannot create a missing section, add
+`[trusted_client_ip]` and all three fields to the TOML before using these
+overrides.
 
 ## Tester Cookie Configuration
 
@@ -656,6 +753,11 @@ from ID-shaped samples: a pattern such as
 matcher (`^/_ts/admin`, or `^/_ts/admin/ec/` alongside the other admin
 patterns).
 
+Handler expressions match the raw URI path, while a publisher origin may decode
+percent-encoded aliases before routing. For a whole-site staging gate, use
+`path = "^/"`; do not rely on a decoded-path prefix such as `^/secure` to protect
+equivalent origin paths.
+
 Startup also fails when any handler — admin or not — uses a placeholder or
 well-known weak password (`changeme`, `password`, `admin`, or a
 `replace-with-…` template value). Handler selection is first-match-wins, so a
@@ -809,20 +911,19 @@ Controls first-party proxy security settings and path-based asset routes.
 
 ### `[proxy]`
 
-| Field               | Type          | Required             | Description                                            |
-| ------------------- | ------------- | -------------------- | ------------------------------------------------------ |
-| `allowed_domains`   | Array[String] | No (default: `[]`)   | Redirect destinations the proxy is permitted to follow |
-| `certificate_check` | Boolean       | No (default: `true`) | Verify TLS certificates when proxying HTTPS origins    |
-| `asset_routes`      | Array[Table]  | No (default: `[]`)   | Path prefixes proxied directly to configured origins   |
+| Field               | Type          | Required             | Description                                                 |
+| ------------------- | ------------- | -------------------- | ----------------------------------------------------------- |
+| `allowed_domains`   | Array[String] | No (default: `[]`)   | Hosts permitted for signing, initial fetches, and redirects |
+| `certificate_check` | Boolean       | No (default: `true`) | Verify TLS certificates when proxying HTTPS origins         |
+| `asset_routes`      | Array[Table]  | No (default: `[]`)   | Path prefixes proxied directly to configured origins        |
 
 **Example**:
 
 ```toml
 [proxy]
 allowed_domains = [
-  "tracker.com",         # Exact match
-  "*.adserver.com",      # Wildcard: adserver.com and all subdomains
-  "*.trusted-cdn.net",
+  "assets.example.com",  # Exact match
+  "*.cdn.example.com",   # Wildcard: cdn.example.com and all subdomains
 ]
 ```
 
@@ -830,32 +931,32 @@ allowed_domains = [
 
 ```bash
 # JSON array
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS='["tracker.com","*.adserver.com"]'
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS='["assets.example.com","*.cdn.example.com"]'
 
 # Indexed
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__0="tracker.com"
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__1="*.adserver.com"
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__0="assets.example.com"
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__1="*.cdn.example.com"
 
 # Comma-separated
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS="tracker.com,*.adserver.com"
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS="assets.example.com,*.cdn.example.com"
 ```
 
 ### Field Details
 
 #### `allowed_domains`
 
-**Purpose**: Allowlist of redirect destinations the proxy is permitted to follow.
+**Purpose**: Allowlist of target hosts permitted for `/first-party/sign` and `/first-party/proxy`. When `integrations.prebid.external_bundle_url` is configured, this list must cover its host and any HTTPS redirect targets.
 
-**Behavior**: When the proxy receives an HTTP redirect (301/302/303/307/308) during a request to `/first-party/proxy`, the redirect target host is checked against this list. A redirect whose host is not matched is blocked with a 403 error.
+**Behavior**: Trusted Server checks the parsed host before signing a target, before fetching the initial proxy target, and before following each HTTP redirect (301/302/303/307/308). A host that does not match the list is blocked with a 403 error.
 
-**Default — open mode**: When `allowed_domains` is absent or empty, every redirect destination is allowed. This default is intentional for zero-config development but should not be used in production.
+**Default - open mode**: When `allowed_domains` is absent or empty and no external Prebid bundle is configured, every valid host is allowed for signing, initial fetches, and redirects. Configuring an external Prebid bundle with an empty list fails deploy validation. Open mode supports zero-config development but should not be used in production.
 
 **Pattern Matching**:
 
-| Pattern         | Matches                                             | Does not match     |
-| --------------- | --------------------------------------------------- | ------------------ |
-| `tracker.com`   | `tracker.com`                                       | `sub.tracker.com`  |
-| `*.tracker.com` | `tracker.com`, `sub.tracker.com`, `a.b.tracker.com` | `evil-tracker.com` |
+| Pattern              | Matches                                                            | Does not match           |
+| -------------------- | ------------------------------------------------------------------ | ------------------------ |
+| `assets.example.com` | `assets.example.com`                                               | `sub.assets.example.com` |
+| `*.cdn.example.com`  | `cdn.example.com`, `static.cdn.example.com`, `a.b.cdn.example.com` | `evil-cdn.example.com`   |
 
 - `"example.com"` — exact match only.
 - `"*.example.com"` — matches the base domain and any subdomain at any depth.
@@ -864,13 +965,13 @@ TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS="tracker.com,*.adserver.com"
 - The `*` wildcard requires a dot boundary: `*.example.com` does **not** match `evil-example.com`.
 
 ::: danger Production Recommendation
-Always configure `allowed_domains` in production. Without an explicit allowlist, a signed proxy URL can be used to follow redirects to arbitrary hosts, creating an SSRF risk.
+Always configure `allowed_domains` in production. Without an explicit allowlist, clients can sign and fetch valid URLs for arbitrary hosts, including redirect targets.
 
 ```toml
 [proxy]
 allowed_domains = [
-  "*.your-ad-network.com",
-  "tracker.your-partner.com",
+  "assets.example.com",
+  "*.cdn.example.com",
 ]
 ```
 
@@ -1609,9 +1710,10 @@ The cache fails closed. A template is stored only for a `GET` with a processable
 `200 text/html` origin response, a supported content encoding, and explicit
 positive shared freshness. `private`, `no-store`, `no-cache`, exhausted or
 malformed freshness, `Set-Cookie`, `Vary: *`, `Vary: Cookie`, uncovered `Vary`
-names, response-bound CSP nonces, authorization, diagnostics sessions, range or
-conditional requests, positive or malformed request `max-age`, `min-fresh`, and
-unsupported CDN-specific cache policy fields all bypass the template cache. Fastly
+names, response-bound CSP nonces, pass-through or ambiguous authorization,
+diagnostics sessions, range or conditional requests, positive or malformed
+request `max-age`, `min-fresh`, and unsupported CDN-specific cache policy fields
+all bypass the template cache. Fastly
 `Surrogate-Control` is the narrow exception: the template cache accepts exactly one positive
 `max-age` plus optional valid `stale-while-revalidate` and `stale-if-error`
 delta-seconds. Restrictive, duplicated, malformed, or unknown directives fail
@@ -1628,6 +1730,14 @@ response and runs a new per-reader auction. Explicit `no-cache`, `no-store`,
 positive or malformed request `max-age`, range, and conditional requests still bypass the template cache.
 Check `X-TS-Template-Cache: hit` to verify template reuse.
 
+Authorization has one narrow exception. A request carrying exactly the same
+single Basic credential that Trusted Server just validated at the edge may share
+a template; pass-through, repeated, appended, or replaced values still bypass.
+Trusted Server does not remove the validated header, so it remains forwarded to
+the publisher origin. If the origin uses that credential to select response
+content, it must declare `Vary: Authorization`; that response is deliberately not
+stored as a shared template.
+
 `template_cache_vary` is necessary because lookup occurs before the origin can
 return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
 origin identity, complete template-shaping settings, TSJS content, and schema
@@ -1636,13 +1746,14 @@ not: the stored template is decoded identity and the assembled result is encoded
 for each reader with `Vary: Accept-Encoding`. This assumes the origin's
 `Accept-Encoding` variants differ only by HTTP content coding, as normal
 compression negotiation does. Do not enable ESI for an origin that changes the
-document's meaning based on `Accept-Encoding`. Never put `Cookie` in
-`template_cache_vary`; startup rejects it because a per-cookie object is not a
-reader-neutral template. With `origin_is_cookie_independent = false` (the safe
-default), all cookie-bearing requests bypass. With it set to `true`, an origin
-`Vary: Cookie` still overrides the assertion and refuses storage.
-Every other name the origin emits in `Vary` must appear in the configured list;
-an uncovered name safely refuses template storage.
+document's meaning based on `Accept-Encoding`. Never put `Cookie` or
+`Authorization` in `template_cache_vary`; startup rejects both because raw cookie
+or credential values are not reader-neutral template dimensions. With
+`origin_is_cookie_independent = false` (the safe default), all cookie-bearing
+requests bypass. With it set to `true`, an origin `Vary: Cookie` still overrides
+the assertion and refuses storage. Every other name the origin emits in `Vary`
+must appear in the configured list; an uncovered name safely refuses template
+storage.
 
 For a canary, inspect `X-TS-Template-Cache`. Its bounded values are `hit`,
 `miss-stored`, `miss-store-error`, `miss-reserved`, `bypass-request`,

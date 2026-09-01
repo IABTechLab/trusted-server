@@ -5,17 +5,20 @@ use glob::{MatchOptions, Pattern};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
+use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::Duration;
+use subtle::ConstantTimeEq as _;
 use url::Url;
 use validator::{Validate, ValidationError};
 
 use crate::auction_config_types::AuctionConfig;
 use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
+use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
@@ -121,6 +124,51 @@ impl Publisher {
         Self::PROXY_SECRET_PLACEHOLDERS
             .iter()
             .any(|p| p.eq_ignore_ascii_case(proxy_secret))
+    }
+
+    /// Reserved example publisher values copied verbatim from the config
+    /// template. They deserialize fine but must be replaced before deploying.
+    const PLACEHOLDER_DOMAINS: &[&str] = &["example.com"];
+    const PLACEHOLDER_COOKIE_DOMAINS: &[&str] = &[".example.com"];
+    /// Reserved example origin hosts. Matched against the parsed URL host so a
+    /// spelling that resolves to the same host (an explicit `:443`, a trailing
+    /// slash, a different scheme) cannot slip past the placeholder check.
+    const PLACEHOLDER_ORIGIN_HOSTS: &[&str] = &["origin.example.com"];
+
+    /// Returns `true` if `domain` is the unedited template placeholder
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_domain(domain: &str) -> bool {
+        Self::PLACEHOLDER_DOMAINS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(domain.trim()))
+    }
+
+    /// Returns `true` if `cookie_domain` is the unedited template placeholder
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_cookie_domain(cookie_domain: &str) -> bool {
+        Self::PLACEHOLDER_COOKIE_DOMAINS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(cookie_domain.trim()))
+    }
+
+    /// Returns `true` if `origin_url` resolves to an unedited template
+    /// placeholder host (case-insensitive).
+    ///
+    /// The comparison is on the parsed URL host, not the raw string, so
+    /// equivalent spellings of the reserved host - an explicit default port, a
+    /// trailing slash, or a different scheme - are all rejected.
+    #[must_use]
+    pub fn is_placeholder_origin_url(origin_url: &str) -> bool {
+        Url::parse(origin_url.trim())
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .is_some_and(|host| {
+                Self::PLACEHOLDER_ORIGIN_HOSTS
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(&host))
+            })
     }
 
     /// Extracts the host (including port if present) from the `origin_url`.
@@ -232,6 +280,15 @@ impl IntegrationSettings {
             },
         )?;
 
+        // Field validation runs only for integrations that resolve to enabled.
+        // An integration whose `enabled` flag is omitted falls back to its
+        // serde default, which the explicit-`false` fast path above cannot
+        // observe. Validating before this check would reject documented
+        // template placeholders in sections that are not actually turned on.
+        if !config.is_enabled() {
+            return Ok(None);
+        }
+
         config.validate().map_err(|err| {
             Report::new(TrustedServerError::Configuration {
                 message: format!(
@@ -239,10 +296,6 @@ impl IntegrationSettings {
                 ),
             })
         })?;
-
-        if !config.is_enabled() {
-            return Ok(None);
-        }
 
         Ok(Some(config))
     }
@@ -625,6 +678,34 @@ pub struct RequestSigning {
     pub enabled: bool,
     pub config_store_id: String,
     pub secret_store_id: String,
+}
+
+impl RequestSigning {
+    /// Reserved example store-id values from the config template, plus the
+    /// empty string, that must not be deployed while request signing is enabled.
+    pub const STORE_ID_PLACEHOLDERS: &[&str] = &[
+        "<management-config-store-id>",
+        "<management-secret-store-id>",
+    ];
+
+    /// Returns `true` if `store_id` is empty or a known template placeholder
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_store_id(store_id: &str) -> bool {
+        let store_id = store_id.trim();
+        store_id.is_empty()
+            || Self::STORE_ID_PLACEHOLDERS
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(store_id))
+    }
+
+    /// Returns `true` if `store_id` cannot be deployed as-is: a placeholder, or
+    /// a value with surrounding whitespace that the key-management routes would
+    /// forward to the management API verbatim.
+    #[must_use]
+    pub fn is_unusable_store_id(store_id: &str) -> bool {
+        Self::is_placeholder_store_id(store_id) || store_id != store_id.trim()
+    }
 }
 
 fn default_request_signing_enabled() -> bool {
@@ -1573,15 +1654,17 @@ pub struct Proxy {
     /// Set to false for local development with self-signed certificates.
     #[serde(default = "default_certificate_check")]
     pub certificate_check: bool,
-    /// Permitted redirect target domains for the first-party proxy.
+    /// Permitted signing, initial fetch, and redirect target domains for the
+    /// first-party proxy.
     ///
     /// Supports exact hostname match (`"example.com"`) and subdomain wildcard
     /// prefix (`"*.example.com"`, which also matches the apex `example.com`).
     /// Matching is case-insensitive.
     ///
-    /// When empty (the default), redirect destinations are not restricted.
-    /// Configure this in production to prevent SSRF via redirect chains
-    /// initiated by signed first-party proxy URLs.
+    /// When empty (the default), proxy hosts are not restricted. Configure this
+    /// in production to constrain signed and fetched first-party proxy targets.
+    /// When `integrations.prebid.external_bundle_url` is configured, this list
+    /// must include its host and any HTTPS redirect targets.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub allowed_domains: Vec<String>,
     /// Path-prefix-based asset proxy routes evaluated before publisher fallback.
@@ -1638,7 +1721,7 @@ impl Proxy {
 
         if self.allowed_domains.is_empty() {
             log::debug!(
-                "proxy.allowed_domains is empty: all redirect destinations are permitted (open mode)"
+                "proxy.allowed_domains is empty: all signing, initial fetch, and redirect hosts are permitted (open mode)"
             );
         }
 
@@ -2596,6 +2679,108 @@ pub struct TesterCookieConfig {
     pub enabled: bool,
 }
 
+/// Authenticated forwarding configuration for a trusted client IP header.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+#[validate(schema(function = validate_trusted_client_ip))]
+pub struct TrustedClientIpConfig {
+    /// Header containing the client IP address supplied by the trusted edge.
+    pub ip_header: String,
+    /// Header containing the shared-secret authentication value.
+    pub auth_header: String,
+    /// Shared secret required before accepting the forwarded client IP address.
+    #[validate(custom(function = validate_redacted_not_empty))]
+    pub shared_secret: Redacted<String>,
+}
+
+impl TrustedClientIpConfig {
+    /// Placeholder shared secrets shipped in the example configuration and docs.
+    pub const SHARED_SECRET_PLACEHOLDERS: &[&str] = &["replace-with-a-random-shared-secret"];
+
+    /// Minimum accepted `shared_secret` length.
+    ///
+    /// Matches `Ec::MIN_PASSPHRASE_LENGTH`. This secret is the only gate on
+    /// forging the client address that geolocation, EC identity derivation, and
+    /// bot protection consume, so it is held to the same strength as the EC
+    /// passphrase.
+    const MIN_SHARED_SECRET_LENGTH: usize = Ec::MIN_PASSPHRASE_LENGTH;
+
+    /// Returns `true` if `shared_secret` matches a known placeholder value
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_shared_secret(shared_secret: &str) -> bool {
+        Self::SHARED_SECRET_PLACEHOLDERS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(shared_secret))
+    }
+
+    /// Returns whether `candidate` exactly matches the configured shared secret.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::redacted::Redacted;
+    /// use trusted_server_core::settings::TrustedClientIpConfig;
+    ///
+    /// let config = TrustedClientIpConfig {
+    ///     ip_header: "fastly-client-ip".to_owned(),
+    ///     auth_header: "x-trusted-client-auth".to_owned(),
+    ///     shared_secret: Redacted::new("fictional-shared-secret-0123456789".to_owned()),
+    /// };
+    ///
+    /// assert!(config.authenticates("fictional-shared-secret-0123456789"));
+    /// assert!(!config.authenticates("fictional-wrong-secret"));
+    /// ```
+    #[must_use]
+    pub fn authenticates(&self, candidate: &str) -> bool {
+        let configured_digest = Sha256::digest(self.shared_secret.expose().as_bytes());
+        let candidate_digest = Sha256::digest(candidate.as_bytes());
+
+        configured_digest.ct_eq(&candidate_digest).into()
+    }
+}
+
+fn validate_trusted_client_ip(config: &TrustedClientIpConfig) -> Result<(), ValidationError> {
+    let ip_header = http::HeaderName::from_bytes(config.ip_header.as_bytes())
+        .map_err(|_| ValidationError::new("invalid_trusted_client_ip_header"))?;
+    let auth_header = http::HeaderName::from_bytes(config.auth_header.as_bytes())
+        .map_err(|_| ValidationError::new("invalid_trusted_client_ip_auth_header"))?;
+
+    if ip_header == auth_header {
+        return Err(ValidationError::new("identical_trusted_client_ip_headers"));
+    }
+
+    for header in [&ip_header, &auth_header] {
+        if INTERNAL_HEADERS.contains(&header.as_str()) {
+            return Err(ValidationError::new("reserved_trusted_client_ip_header"));
+        }
+    }
+
+    if ip_header.as_str() != "fastly-client-ip" && !ip_header.as_str().starts_with("x-") {
+        return Err(ValidationError::new("unsafe_trusted_client_ip_header"));
+    }
+    if !auth_header.as_str().starts_with("x-") {
+        return Err(ValidationError::new("unsafe_trusted_client_ip_auth_header"));
+    }
+
+    let shared_secret = config.shared_secret.expose();
+    if shared_secret.len() < TrustedClientIpConfig::MIN_SHARED_SECRET_LENGTH {
+        return Err(ValidationError::new(
+            "short_trusted_client_ip_shared_secret",
+        ));
+    }
+    if !shared_secret
+        .bytes()
+        .all(|byte| matches!(byte, b'!'..=b'~'))
+    {
+        return Err(ValidationError::new(
+            "invalid_trusted_client_ip_shared_secret",
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -2603,6 +2788,17 @@ pub struct Settings {
     pub publisher: Publisher,
     #[serde(default)]
     pub tester_cookie: TesterCookieConfig,
+    /// Optional authenticated trusted client IP forwarding configuration.
+    ///
+    /// `None` must stay omitted from serialized config blobs: `Settings`
+    /// schemas that predate this field reject unknown keys, so emitting
+    /// `trusted_client_ip: null` would make an unchanged `ts config push`
+    /// break older instances during rollout or rollback. A configured value
+    /// remains serialized and requires restoring a compatible blob before
+    /// rolling back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub trusted_client_ip: Option<TrustedClientIpConfig>,
     #[serde(default)]
     #[validate(nested)]
     pub ec: Ec,
@@ -2618,6 +2814,7 @@ pub struct Settings {
     #[validate(nested)]
     pub rewrite: Rewrite,
     #[serde(default)]
+    #[validate(nested)]
     pub auction: AuctionConfig,
     #[serde(default)]
     pub consent: ConsentConfig,
@@ -2816,6 +3013,13 @@ impl Settings {
         if Publisher::is_placeholder_proxy_secret(self.publisher.proxy_secret.expose()) {
             insecure_fields.push("publisher.proxy_secret".to_owned());
         }
+        if let Some(trusted_client_ip) = &self.trusted_client_ip
+            && TrustedClientIpConfig::is_placeholder_shared_secret(
+                trusted_client_ip.shared_secret.expose(),
+            )
+        {
+            insecure_fields.push("trusted_client_ip.shared_secret".to_owned());
+        }
         for partner in &self.ec.partners {
             if EcPartner::is_placeholder_api_token(partner.api_token.expose()) {
                 insecure_fields.push(format!("ec.partners[{}].api_token", partner.source_domain));
@@ -2824,6 +3028,31 @@ impl Settings {
         for handler in &self.handlers {
             if Handler::is_placeholder_password(handler.password.expose()) {
                 insecure_fields.push(format!("handlers[{}].password", handler.path));
+            }
+        }
+        if Publisher::is_placeholder_domain(&self.publisher.domain) {
+            insecure_fields.push("publisher.domain".to_owned());
+        }
+        if Publisher::is_placeholder_cookie_domain(&self.publisher.cookie_domain) {
+            insecure_fields.push("publisher.cookie_domain".to_owned());
+        }
+        if Publisher::is_placeholder_origin_url(&self.publisher.origin_url) {
+            insecure_fields.push("publisher.origin_url".to_owned());
+        }
+        // Checked whenever the block is present, not just when it is enabled:
+        // the key rotate/deactivate admin routes are registered unconditionally
+        // and read these store IDs without consulting `enabled`, so placeholder
+        // IDs behind a disabled block would still reach key management at
+        // runtime. Surrounding whitespace is rejected too: the placeholder check
+        // trims for comparison but the raw value is what `signing_store_ids`
+        // forwards to `KeyRotationManager`, so a padded id would validate yet
+        // reach the management API unusable.
+        if let Some(request_signing) = &self.request_signing {
+            if RequestSigning::is_unusable_store_id(&request_signing.config_store_id) {
+                insecure_fields.push("request_signing.config_store_id".to_owned());
+            }
+            if RequestSigning::is_unusable_store_id(&request_signing.secret_store_id) {
+                insecure_fields.push("request_signing.secret_store_id".to_owned());
             }
         }
 
@@ -3353,6 +3582,519 @@ mod tests {
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+
+    fn trusted_client_ip_toml(ip_header: &str, auth_header: &str, shared_secret: &str) -> String {
+        format!(
+            "{}\n[trusted_client_ip]\nip_header = \"{ip_header}\"\nauth_header = \"{auth_header}\"\nshared_secret = \"{shared_secret}\"\n",
+            crate_test_settings_str()
+        )
+    }
+
+    #[test]
+    fn trusted_client_ip_is_absent_by_default() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without trusted client IP configuration");
+
+        assert!(
+            settings.trusted_client_ip.is_none(),
+            "should leave trusted client IP configuration disabled by default"
+        );
+    }
+
+    /// Mirrors the `Settings` schema of the revision that predates
+    /// `trusted_client_ip`: every key that revision knew, and
+    /// `deny_unknown_fields` so an extra key fails deserialization exactly as an
+    /// older binary would reject a pushed config blob.
+    // The fields exist to model the accepted key set, never to be read.
+    #[allow(dead_code)]
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BaseRevisionSettings {
+        #[serde(default)]
+        publisher: serde::de::IgnoredAny,
+        #[serde(default)]
+        tester_cookie: serde::de::IgnoredAny,
+        #[serde(default)]
+        ec: serde::de::IgnoredAny,
+        #[serde(default)]
+        integrations: serde::de::IgnoredAny,
+        #[serde(default)]
+        handlers: serde::de::IgnoredAny,
+        #[serde(default)]
+        response_headers: serde::de::IgnoredAny,
+        #[serde(default)]
+        request_signing: serde::de::IgnoredAny,
+        #[serde(default)]
+        rewrite: serde::de::IgnoredAny,
+        #[serde(default)]
+        auction: serde::de::IgnoredAny,
+        #[serde(default)]
+        consent: serde::de::IgnoredAny,
+        #[serde(default)]
+        cache: serde::de::IgnoredAny,
+        #[serde(default)]
+        proxy: serde::de::IgnoredAny,
+        #[serde(default)]
+        creative_opportunities: serde::de::IgnoredAny,
+        #[serde(default)]
+        image_optimizer: serde::de::IgnoredAny,
+        #[serde(default)]
+        tinybird: serde::de::IgnoredAny,
+        #[serde(default)]
+        debug: serde::de::IgnoredAny,
+    }
+
+    #[test]
+    fn trusted_client_ip_is_omitted_from_serialized_config_when_unset() {
+        // `ts config push` serializes `Settings` verbatim. Emitting the key —
+        // even as `null` — makes a `deny_unknown_fields` binary from the base
+        // revision reject the blob during rollout or rollback.
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without trusted client IP configuration");
+
+        let value = serde_json::to_value(&settings).expect("should serialize settings");
+
+        assert!(
+            value.get("trusted_client_ip").is_none(),
+            "unset trusted_client_ip should not be serialized, got {value}"
+        );
+    }
+
+    #[test]
+    fn serialized_default_config_stays_readable_by_the_base_revision_schema() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without trusted client IP configuration");
+
+        let value = serde_json::to_value(&settings).expect("should serialize settings");
+
+        serde_json::from_value::<BaseRevisionSettings>(value)
+            .expect("base revision schema should accept a config blob with no trusted client IP");
+    }
+
+    #[test]
+    fn trusted_client_ip_parses_and_redacts_shared_secret_in_debug_output() {
+        let settings = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        ))
+        .expect("should parse valid trusted client IP configuration");
+        let config = settings
+            .trusted_client_ip
+            .expect("should retain trusted client IP configuration");
+
+        assert_eq!(config.ip_header, "fastly-client-ip");
+        assert_eq!(config.auth_header, "x-trusted-client-auth");
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("[REDACTED]"),
+            "should redact trusted client IP shared secret in debug output"
+        );
+        assert!(
+            !debug.contains("fictional-shared-secret-0123456789"),
+            "should not expose trusted client IP shared secret in debug output"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_accepts_x_prefixed_ip_header() {
+        let settings = Settings::from_toml(&trusted_client_ip_toml(
+            "x-trusted-client-ip",
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        ))
+        .expect("should accept an x-prefixed trusted client IP header");
+        let config = settings
+            .trusted_client_ip
+            .expect("should retain trusted client IP configuration");
+
+        assert_eq!(
+            config.ip_header, "x-trusted-client-ip",
+            "should retain the x-prefixed trusted client IP header"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_authentication_requires_an_exact_match() {
+        let settings = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            "fictional-shared-secret-0123456789",
+        ))
+        .expect("should parse valid trusted client IP configuration");
+        let config = settings
+            .trusted_client_ip
+            .expect("should retain trusted client IP configuration");
+
+        assert!(
+            config.authenticates("fictional-shared-secret-0123456789"),
+            "should authenticate an exact shared secret match"
+        );
+        assert!(
+            !config.authenticates("fictional-wrong-secret"),
+            "should reject a different shared secret"
+        );
+        assert!(
+            !config.authenticates(" fictional-shared-secret-0123456789"),
+            "should reject a leading-whitespace shared secret"
+        );
+        assert!(
+            !config.authenticates("fictional-shared-secret-0123456789 "),
+            "should reject a trailing-whitespace shared secret"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_identical_header_names() {
+        for (ip_header, auth_header) in [
+            ("x-trusted-client", "x-trusted-client"),
+            ("X-Trusted-Client", "x-trusted-client"),
+        ] {
+            let error = Settings::from_toml(&trusted_client_ip_toml(
+                ip_header,
+                auth_header,
+                "fictional-shared-secret-0123456789",
+            ))
+            .expect_err("should reject identical trusted client IP header names");
+
+            assert!(
+                format!("{error:?}").contains("identical_trusted_client_ip_headers"),
+                "should identify duplicate trusted client IP header names"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_unsafe_header_names() {
+        for (ip_header, auth_header, expected_code) in [
+            (
+                "host",
+                "x-trusted-client-auth",
+                "unsafe_trusted_client_ip_header",
+            ),
+            (
+                "fastly-client-ip",
+                "authorization",
+                "unsafe_trusted_client_ip_auth_header",
+            ),
+        ] {
+            let error = Settings::from_toml(&trusted_client_ip_toml(
+                ip_header,
+                auth_header,
+                "fictional-shared-secret-0123456789",
+            ))
+            .expect_err("should reject unsafe trusted client IP header names");
+            let message = format!("{error:?}");
+
+            assert!(
+                message.contains(expected_code),
+                "should identify unsafe trusted client IP header names"
+            );
+            assert!(
+                !message.contains("fictional-shared-secret-0123456789"),
+                "should not include the shared secret in validation errors"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_reserved_internal_headers() {
+        for (ip_header, auth_header) in [
+            ("x-ts-tls-protocol", "x-trusted-client-auth"),
+            ("x-ts-tls-cipher", "x-trusted-client-auth"),
+            ("fastly-client-ip", "x-ts-tls-protocol"),
+            ("fastly-client-ip", "x-ts-tls-cipher"),
+            ("x-forwarded-for", "x-trusted-client-auth"),
+            ("x-geo-info-available", "x-trusted-client-auth"),
+            ("fastly-client-ip", "x-ts-ec"),
+        ] {
+            let error = Settings::from_toml(&trusted_client_ip_toml(
+                ip_header,
+                auth_header,
+                "fictional-shared-secret-0123456789",
+            ))
+            .expect_err("should reject reserved internal headers");
+
+            assert!(
+                format!("{error:?}").contains("reserved_trusted_client_ip_header"),
+                "should identify reserved internal headers"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_empty_secret_malformed_names_and_incomplete_sections() {
+        let empty_secret = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            "",
+        ));
+        assert!(
+            empty_secret.is_err(),
+            "should reject an empty trusted client IP shared secret"
+        );
+
+        for (ip_header, auth_header, expected_code) in [
+            (
+                "invalid header",
+                "x-trusted-client-auth",
+                "invalid_trusted_client_ip_header",
+            ),
+            (
+                "fastly-client-ip",
+                "invalid header",
+                "invalid_trusted_client_ip_auth_header",
+            ),
+        ] {
+            let error = Settings::from_toml(&trusted_client_ip_toml(
+                ip_header,
+                auth_header,
+                "fictional-shared-secret-0123456789",
+            ))
+            .expect_err("should reject malformed trusted client IP header names");
+            assert!(
+                format!("{error:?}").contains(expected_code),
+                "should identify malformed trusted client IP header names"
+            );
+        }
+
+        for section in [
+            "[trusted_client_ip]\nauth_header = \"x-trusted-client-auth\"\nshared_secret = \"fictional-shared-secret-0123456789\"",
+            "[trusted_client_ip]\nip_header = \"fastly-client-ip\"\nshared_secret = \"fictional-shared-secret-0123456789\"",
+            "[trusted_client_ip]\nip_header = \"fastly-client-ip\"\nauth_header = \"x-trusted-client-auth\"",
+            "[trusted_client_ip]\nip_header = \"fastly-client-ip\"\nauth_header = \"x-trusted-client-auth\"\nshared_secret = \"fictional-shared-secret-0123456789\"\nunknown_field = true",
+        ] {
+            let result =
+                Settings::from_toml(&format!("{}\n{section}\n", crate_test_settings_str()));
+            assert!(
+                result.is_err(),
+                "should reject incomplete or unknown trusted client IP configuration"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_control_byte_auth_header_without_exposing_secret() {
+        let mut settings = serde_json::to_value(
+            Settings::from_toml(&crate_test_settings_str())
+                .expect("should parse base settings for JSON validation"),
+        )
+        .expect("should serialize base settings for JSON validation");
+        settings["trusted_client_ip"] = json!({
+            "ip_header": "fastly-client-ip",
+            "auth_header": "x-trusted\u{0000}client-auth",
+            "shared_secret": "fictional-control-byte-secret-0123",
+        });
+
+        let error = Settings::from_json_value(settings)
+            .expect_err("should reject a control byte in the trusted client IP auth header");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("invalid_trusted_client_ip_auth_header"),
+            "should identify the malformed trusted client IP auth header"
+        );
+        assert!(
+            !message.contains("fictional-control-byte-secret-0123"),
+            "should not expose the trusted client IP shared secret in validation errors"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_a_31_byte_shared_secret_without_exposing_it() {
+        let shared_secret = "1234567890123456789012345678901";
+        let error = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            shared_secret,
+        ))
+        .expect_err("should reject a shared secret below the minimum length");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("short_trusted_client_ip_shared_secret"),
+            "should identify the undersized trusted client IP shared secret"
+        );
+        assert!(
+            !message.contains(shared_secret),
+            "should not expose the undersized trusted client IP shared secret"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_accepts_an_exactly_32_byte_ascii_graphic_shared_secret() {
+        let shared_secret = "0123456789abcdef0123456789ABCDEF";
+        let settings = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            shared_secret,
+        ))
+        .expect("should accept an exactly 32-byte ASCII graphic shared secret");
+        let config = settings
+            .trusted_client_ip
+            .expect("should retain trusted client IP configuration");
+
+        assert_eq!(
+            config.shared_secret.expose(),
+            shared_secret,
+            "should retain the accepted shared secret"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_a_non_ascii_shared_secret_without_exposing_it() {
+        let shared_secret = "ascii-graphic-secret-0123456789é";
+        let error = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            shared_secret,
+        ))
+        .expect_err("should reject a non-ASCII shared secret that exceeds 32 bytes");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("invalid_trusted_client_ip_shared_secret"),
+            "should identify the non-header-safe trusted client IP shared secret"
+        );
+        assert!(
+            !message.contains(shared_secret),
+            "should not expose the non-ASCII trusted client IP shared secret"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_a_shared_secret_with_an_embedded_space_without_exposing_it() {
+        let shared_secret = "valid-shared-secret-with space-012345";
+        let error = Settings::from_toml(&trusted_client_ip_toml(
+            "fastly-client-ip",
+            "x-trusted-client-auth",
+            shared_secret,
+        ))
+        .expect_err("should reject a shared secret containing an ASCII space");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("invalid_trusted_client_ip_shared_secret"),
+            "should identify the non-header-safe trusted client IP shared secret"
+        );
+        assert!(
+            !message.contains(shared_secret),
+            "should not expose the shared secret containing an ASCII space"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_a_shared_secret_with_an_embedded_tab_without_exposing_it() {
+        let shared_secret = "valid-shared-secret-with\t-tab-012345";
+        let mut settings = serde_json::to_value(
+            Settings::from_toml(&crate_test_settings_str())
+                .expect("should parse base settings for JSON validation"),
+        )
+        .expect("should serialize base settings for JSON validation");
+        settings["trusted_client_ip"] = json!({
+            "ip_header": "fastly-client-ip",
+            "auth_header": "x-trusted-client-auth",
+            "shared_secret": shared_secret,
+        });
+
+        let error = Settings::from_json_value(settings)
+            .expect_err("should reject a shared secret containing a horizontal tab");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("invalid_trusted_client_ip_shared_secret"),
+            "should identify the non-header-safe trusted client IP shared secret"
+        );
+        assert!(
+            !message.contains(shared_secret),
+            "should not expose the shared secret containing a horizontal tab"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_a_shared_secret_with_del_without_exposing_it() {
+        let shared_secret = "valid-shared-secret-with\u{007f}-del-012345";
+        let mut settings = serde_json::to_value(
+            Settings::from_toml(&crate_test_settings_str())
+                .expect("should parse base settings for JSON validation"),
+        )
+        .expect("should serialize base settings for JSON validation");
+        settings["trusted_client_ip"] = json!({
+            "ip_header": "fastly-client-ip",
+            "auth_header": "x-trusted-client-auth",
+            "shared_secret": shared_secret,
+        });
+
+        let error = Settings::from_json_value(settings)
+            .expect_err("should reject a shared secret containing DEL");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("invalid_trusted_client_ip_shared_secret"),
+            "should identify the non-header-safe trusted client IP shared secret"
+        );
+        assert!(
+            !message.contains(shared_secret),
+            "should not expose the shared secret containing DEL"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_a_shared_secret_with_a_control_byte_without_exposing_it() {
+        let shared_secret = "valid-shared-secret-with\u{0001}-control-012345";
+        let mut settings = serde_json::to_value(
+            Settings::from_toml(&crate_test_settings_str())
+                .expect("should parse base settings for JSON validation"),
+        )
+        .expect("should serialize base settings for JSON validation");
+        settings["trusted_client_ip"] = json!({
+            "ip_header": "fastly-client-ip",
+            "auth_header": "x-trusted-client-auth",
+            "shared_secret": shared_secret,
+        });
+
+        let error = Settings::from_json_value(settings)
+            .expect_err("should reject a shared secret containing a control byte");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("invalid_trusted_client_ip_shared_secret"),
+            "should identify the non-header-safe trusted client IP shared secret"
+        );
+        assert!(
+            !message.contains(shared_secret),
+            "should not expose the shared secret containing a control byte"
+        );
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_placeholder_shared_secrets() {
+        for placeholder in TrustedClientIpConfig::SHARED_SECRET_PLACEHOLDERS {
+            assert!(
+                TrustedClientIpConfig::is_placeholder_shared_secret(placeholder),
+                "should detect placeholder shared secret '{placeholder}'"
+            );
+            assert!(
+                TrustedClientIpConfig::is_placeholder_shared_secret(&placeholder.to_uppercase()),
+                "should detect placeholder shared secret case-insensitively"
+            );
+
+            let settings = Settings::from_toml(&trusted_client_ip_toml(
+                "fastly-client-ip",
+                "x-trusted-client-auth",
+                placeholder,
+            ))
+            .expect("should parse a placeholder trusted client IP shared secret");
+            let error = settings
+                .reject_placeholder_secrets()
+                .expect_err("should reject a placeholder trusted client IP shared secret");
+
+            assert!(
+                format!("{error:?}").contains("trusted_client_ip.shared_secret"),
+                "should name the placeholder trusted client IP shared secret field"
+            );
+        }
+    }
 
     #[test]
     fn auction_debug_comment_options_default_matches_serde_defaults() {
@@ -4403,6 +5145,79 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
+    fn is_placeholder_domain_rejects_known_placeholders_case_insensitively() {
+        for placeholder in Publisher::PLACEHOLDER_DOMAINS {
+            assert!(
+                Publisher::is_placeholder_domain(placeholder),
+                "should detect placeholder domain '{placeholder}'"
+            );
+        }
+        assert!(
+            Publisher::is_placeholder_domain(" Example.COM "),
+            "should detect trimmed, mixed-case placeholder domain"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_domain_accepts_non_placeholder() {
+        assert!(
+            !Publisher::is_placeholder_domain("publisher.test"),
+            "should accept a real publisher domain"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_cookie_domain_rejects_known_placeholders_case_insensitively() {
+        for placeholder in Publisher::PLACEHOLDER_COOKIE_DOMAINS {
+            assert!(
+                Publisher::is_placeholder_cookie_domain(placeholder),
+                "should detect placeholder cookie_domain '{placeholder}'"
+            );
+        }
+        assert!(
+            Publisher::is_placeholder_cookie_domain(" .Example.COM "),
+            "should detect trimmed, mixed-case placeholder cookie_domain"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_cookie_domain_accepts_non_placeholder() {
+        assert!(
+            !Publisher::is_placeholder_cookie_domain(".publisher.test"),
+            "should accept a real cookie domain"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_origin_url_rejects_equivalent_spellings_of_reserved_host() {
+        for reserved in [
+            "https://origin.example.com",
+            "https://origin.example.com/",
+            "https://origin.example.com:443",
+            "http://origin.example.com",
+            "https://Origin.Example.com",
+            " https://origin.example.com ",
+        ] {
+            assert!(
+                Publisher::is_placeholder_origin_url(reserved),
+                "should reject origin_url resolving to the reserved host: '{reserved}'"
+            );
+        }
+    }
+
+    #[test]
+    fn is_placeholder_origin_url_accepts_non_placeholder() {
+        assert!(
+            !Publisher::is_placeholder_origin_url("https://origin.publisher.test"),
+            "should accept a real origin url"
+        );
+        assert!(
+            !Publisher::is_placeholder_origin_url("https://cdn.example.com"),
+            "should accept a different host under the same example domain"
+        );
+    }
+
+    #[test]
     fn is_placeholder_handler_password_rejects_known_template_value() {
         assert!(
             Handler::is_placeholder_password("replace-with-admin-password-32-bytes"),
@@ -4425,6 +5240,26 @@ origin_host_header_overide = "www.example.com""#,
         assert!(
             format!("{err:?}").contains("handlers"),
             "error should mention handler password field"
+        );
+    }
+
+    #[test]
+    fn is_unusable_store_id_rejects_placeholders_empty_and_padded_values() {
+        for placeholder in RequestSigning::STORE_ID_PLACEHOLDERS {
+            assert!(
+                RequestSigning::is_unusable_store_id(placeholder),
+                "should reject placeholder store id '{placeholder}'"
+            );
+        }
+        for bad in ["", "   ", " 01GCFG ", "01GCFG "] {
+            assert!(
+                RequestSigning::is_unusable_store_id(bad),
+                "should reject unusable store id '{bad}'"
+            );
+        }
+        assert!(
+            !RequestSigning::is_unusable_store_id("01GCFG"),
+            "should accept a clean store id"
         );
     }
 
