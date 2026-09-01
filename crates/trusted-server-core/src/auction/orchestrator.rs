@@ -4060,7 +4060,8 @@ mod tests {
                 .expect("current adapters should accept completed late mediator responses");
             assert!(
                 current_mediator.response_time_ms >= 50,
-                "mediator timing should preserve actual elapsed duration"
+                "mediator timing should preserve actual elapsed duration, got {} ms",
+                current_mediator.response_time_ms
             );
             assert_eq!(current.winning_bids["slot-1"].bidder, "mediated");
 
@@ -5771,7 +5772,7 @@ mod tests {
         );
         http.push_response(200, b"{}".to_vec());
         http.push_select_success();
-        http.push_select_error();
+        http.push_wait_error();
         let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
@@ -6210,8 +6211,8 @@ mod tests {
         assert_eq!(debug["uri"], "https://aps.example/e/pb/bid");
         assert_eq!(
             debug["responseheaders"],
-            serde_json::json!({}),
-            "async stub does not preserve queued response headers"
+            serde_json::json!({"content-type": ["application/json"]}),
+            "async stub should preserve queued response headers"
         );
         assert!(
             debug["requestbody"]
