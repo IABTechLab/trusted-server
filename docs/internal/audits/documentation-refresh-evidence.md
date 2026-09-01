@@ -232,8 +232,8 @@ as a hosted validation input.
 - Reviewed source commits:
   `34b0613dc603ba6529396dad4dd4b7e68b1e11a9` and
   `e6554f24f58f6122fb806ce25432f66033765c65`.
-- Retention: its source branch exists only for later transfer into #1049 in
-  Task 2.
+- Retention: its source branch remains only as historical provenance; its
+  reviewed commits were transferred into #1049 in Task 2.
 - External result: no live merge or deploy receipt exists; none is claimed.
 
 ### Release-pending external evidence
