@@ -2,9 +2,7 @@
 
 - **Schema version:** 1
 - **Created:** 2026-08-31
-- **Epoch 1 system of record:** this append-only repository ledger
-- **Epoch 2 system of record:** canonical c2 tracking issue, URL pending
-- **Epoch 3 system of record:** canonical release-handoff issue, URL pending
+- **Implementation system of record:** this append-only repository ledger
 
 This ledger records evidence, not plans or inferred outcomes. A pending field
 is not proof. Command output may be summarized only when the command, exact
@@ -12,8 +10,10 @@ commit, result, and authoritative raw-capture location are also recorded.
 
 ## Durable capture contract
 
-Every Epoch 2 or Epoch 3 issue capture, and every Epoch 1 external handoff
-import, must be append-only and timestamped in UTC. Each capture includes:
+This contract applies only to real external captures. Local builds, fixture
+runs, simulations, and mocked API output belong in package checkpoints and
+cannot be represented as external receipts. Every external capture must be
+append-only and timestamped in UTC. Each capture includes:
 
 - schema version, actor, operation, and timestamp;
 - exact commit and ref, plus PR number and exact head, base, and trusted-tool
@@ -23,8 +23,8 @@ import, must be append-only and timestamped in UTC. Each capture includes:
 - response status and redacted response body;
 - dependency snapshot detector, correlator, snapshot ID, ref, and SHA when
   applicable; and
-- the applicable dependency-graph, ruleset, branch-protection, merge-queue, or
-  branch API JSON.
+- the applicable dependency-graph, ruleset, branch-protection, or branch API
+  JSON.
 
 Tokens, credential-bearing headers, cookies, and unredacted secrets are never
 captured. Every request body, response body, and applicable API JSON body
@@ -62,7 +62,7 @@ Response-body bytes / SHA-256:
 Snapshot detector / correlator / ID / ref / SHA:
 Graph API redacted JSON body / bytes / SHA-256:
 Ruleset API redacted JSON body / bytes / SHA-256:
-Protection and merge-queue API redacted JSON body / bytes / SHA-256:
+Protection API redacted JSON body / bytes / SHA-256:
 Branch API redacted JSON body / bytes / SHA-256:
 Ordered chunk index / total:
 Ordered chunk redacted content / bytes / SHA-256:
@@ -74,8 +74,9 @@ Result:
 
 ## Package checkpoint template
 
-Copy this block into the matching Epoch 1 section before each package starts.
-One block covers one reviewed package or adjacent evidence-only commit.
+Copy this block into the matching implementation section before each package
+starts. One block covers one reviewed package or adjacent evidence-only
+commit.
 
 ```text
 Task / package:
@@ -102,14 +103,14 @@ Post-commit clean-status result:
 Correction reference:
 ```
 
-## Epoch 1: pre-merge implementation evidence
+## Pre-merge implementation evidence
 
-Epoch 1 retains exact evidence while `origin/rc/202608` equals
+This ledger retains exact evidence while `origin/rc/202608` equals
 `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` and the implementation branch
 contains that commit. Any rc advance requires a focused delta audit and an
 updated approved baseline before work continues.
 
-### Task 1: decisions and immutable tips
+### Prior approval package: decisions and immutable tips
 
 - Capture timestamp: 2026-08-31T22:55:52Z.
 - Executor: `OpenAI Codex task agent task1_implementer`.
@@ -139,7 +140,7 @@ updated approved baseline before work continues.
   status are recorded in the execution handoff because a commit cannot contain
   its own SHA.
 
-#### Task 1 completion receipt
+#### Prior approval package completion receipt
 
 - Receipt timestamp: 2026-08-31T23:15:37Z.
 - Executor: `OpenAI Codex task agent task1_implementer`.
@@ -164,93 +165,99 @@ This immediately adjacent evidence-only commit cannot contain its own SHA.
 Its full SHA is reported in the execution handoff and independently verified
 by the controller and review; no recursive receipt commit follows.
 
-### External delivery URLs and immutable identifiers
+### Task 1: align program records to the single PR
 
-| Item                              | PR or issue URL                                        | Target      | Fresh audited base                         | Validated head/tool                                        | Merge SHA | Evidence state                  |
-| --------------------------------- | ------------------------------------------------------ | ----------- | ------------------------------------------ | ---------------------------------------------------------- | --------- | ------------------------------- |
-| (a) rc implementation PR          | https://github.com/IABTechLab/trusted-server/pull/1049 | `rc/202608` | `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` | Remote capture: `b904b3aeb5af26a536afadcbfb2d70af36bca5a2` | Pending   | OPEN, draft; refresh after push |
-| (b) containment PR                | Pending                                                | `main`      | Pending                                    | Pending                                                    | Pending   | Pending                         |
-| (c) validation-only controller PR | Pending                                                | `main`      | Pending                                    | Pending                                                    | Pending   | Pending                         |
-| (d) CNAME deletion PR             | Pending                                                | `main`      | Pending                                    | Pending                                                    | Pending   | Pending                         |
-| (c2) activation PR                | Pending                                                | `main`      | Pending                                    | Pending                                                    | Pending   | Epoch 2                         |
-| (e) release-handoff PR            | Pending                                                | `main`      | Pending                                    | Pending                                                    | Pending   | Epoch 3                         |
-
-#### PR (a) pre-push metadata capture
-
-- Capture timestamp: 2026-08-31T23:12:46Z.
-- URL: https://github.com/IABTechLab/trusted-server/pull/1049.
-- State: OPEN, draft.
-- Base: ref `rc/202608`, SHA
+- Capture timestamp: 2026-09-01T07:41:54Z.
+- Executor: `OpenAI Codex task agent task1_single_pr_records`.
+- Package start HEAD:
+  `01bf84a4beb4a1be4f26965478a0211f59392962`.
+- Approved paths: the design, decision record, and this evidence record.
+- `git fetch origin rc/202608 spec-docs-refresh`: passed; both named refs were
+  fetched from `github.com:IABTechLab/trusted-server`.
+- `test "$(git rev-parse origin/rc/202608)" = 07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`:
+  exited 0.
+- `git merge-base --is-ancestor 07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf HEAD`:
+  exited 0.
+- `git rev-parse origin/rc/202608`:
   `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`.
-- Remote head: ref `spec-docs-refresh`, captured SHA
-  `b904b3aeb5af26a536afadcbfb2d70af36bca5a2`.
-- Author and assignee: `aram356`.
+- `git rev-parse origin/spec-docs-refresh`:
+  `01bf84a4beb4a1be4f26965478a0211f59392962`.
+- `gh pr view 1049 --json url,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid`:
+  passed with the exact JSON recorded in the live metadata capture below.
+- Minimal change: approved the reviewed spec, made #1049 the only
+  implementation row, retained #1104 only as closed reviewed source, removed
+  obsolete delivery machinery, and defined durable release-pending rows.
+- Initial `npm run format && npm run lint && npm run build`: stopped at
+  `npm run format` because the two edited audit files required Prettier.
+- `npx prettier --check internal/audits/documentation-refresh-decisions.md internal/audits/documentation-refresh-evidence.md`:
+  reproduced the two-file formatting failure.
+- `npx prettier --write internal/audits/documentation-refresh-decisions.md internal/audits/documentation-refresh-evidence.md`:
+  formatted exactly those two files.
+- `npm run format && npm run lint && npm run build`: passed from `docs`.
+  VitePress completed in 11.07 seconds with only the known non-failing `vcl`
+  syntax-highlighting fallback.
+- Generated cleanup: removed only `docs/.vitepress/.temp`.
+- `git diff --check`: passed.
+- `git ls-files --others --exclude-standard`: printed nothing after generated
+  cleanup.
+- Enclosing commit message: `Align documentation refresh records to one PR`.
+  Its SHA and push result are reported in the execution handoff because the
+  commit cannot contain its own SHA.
 
-This is a timestamped pre-push remote capture. It does not assert that Task 1
-or its follow-up commits exist on the remote head. Refresh every field after
-those commits are pushed and before using PR #1049 as a validation input.
+### Implementation PR and immutable identifiers
 
-### Cross-worktree handoff: PRs (b), (c), and (d)
+PR #1049 is the only implementation row. The captured remote head is evidence
+of the named observation only, not a permanent final SHA.
 
-While each tightly scoped `main` branch is open, its branch-specific evidence
-stays in its PR description or named tracking issue. Do not add rc-only audit
-records to that branch. The next named rc checkpoint imports every field below
-by both URL and literal value.
+| Implementation PR                                      | Target      | Audited base                               | Captured remote head                       | Capture time         | State       |
+| ------------------------------------------------------ | ----------- | ------------------------------------------ | ------------------------------------------ | -------------------- | ----------- |
+| https://github.com/IABTechLab/trusted-server/pull/1049 | `rc/202608` | `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` | `01bf84a4beb4a1be4f26965478a0211f59392962` | 2026-09-01T07:35:08Z | OPEN, draft |
 
-```text
-Handoff ID / PR label: (b), (c), or (d)
-Source PR / tracking issue URL:
-Source capture IDs:
-Source capture timestamp (UTC):
-Source capture actor:
-Source worktree path:
-Branch name:
-Source PR state / draft:
-Fresh audited_main_tip:
-Exact PR base SHA:
-Exact PR head SHA:
-Trusted tool / source SHA:
-Base-controlled controller ref / SHA:
-Merge SHA:
-Changed paths and modes:
-Local commands and results:
-Hosted check names, apps, run IDs, attempts, jobs, and results:
-Ruleset / protection / merge-queue capture IDs and body SHA-256 values:
-Live receipt or smoke commands, endpoints, expected content, and results:
-Rollback owner and tested rollback path:
-Imported by rc task / package start HEAD:
-Import timestamp / actor:
-Imported literal values checked against source:
-Import commit SHA:
-```
+#### PR #1049 live metadata capture
 
-Required import checkpoints:
+- Capture timestamp: 2026-09-01T07:35:08Z.
+- Command:
+  `gh pr view 1049 --json url,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid`.
+- Result:
+  `{"baseRefName":"rc/202608","baseRefOid":"07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf","headRefName":"spec-docs-refresh","headRefOid":"01bf84a4beb4a1be4f26965478a0211f59392962","isDraft":true,"state":"OPEN","url":"https://github.com/IABTechLab/trusted-server/pull/1049"}`.
 
-- PR (b): import into Task 4 after live containment smoke.
-- PR (d): import into Task 4 after project-URL smoke.
-- PR (c): import in the adjacent Task 11 rc evidence checkpoint.
+Refresh this capture after package commits are pushed and before using PR #1049
+as a hosted validation input.
 
-### Branch-protection, ruleset, and queue snapshots
+### Superseded reviewed source PR
 
-| Checkpoint               | Capture ID / URL | Exact `main` SHA | Required contexts and apps                           | Strict   | Merge queue          | Bypass policy | Body SHA-256 |
-| ------------------------ | ---------------- | ---------------- | ---------------------------------------------------- | -------- | -------------------- | ------------- | ------------ |
-| Before PR (c)            | Pending          | Pending          | Pending                                              | Pending  | Must report disabled | Pending       | Pending      |
-| Immediately after PR (c) | Pending          | Pending          | Includes `docs/automation-delta` from GitHub Actions | Required | Disabled             | Pending       | Pending      |
-| Epoch 1 final reproval   | Pending          | Pending          | Pending exact inventory                              | Required | Disabled             | Pending       | Pending      |
+- PR: https://github.com/IABTechLab/trusted-server/pull/1104.
+- State: closed and superseded.
+- Base: `d516a9e94249e10cbc36e41beb4269f9255cf407`.
+- Reviewed source commits:
+  `34b0613dc603ba6529396dad4dd4b7e68b1e11a9` and
+  `e6554f24f58f6122fb806ce25432f66033765c65`.
+- Retention: its source branch exists only for later transfer into #1049 in
+  Task 2.
+- External result: no live merge or deploy receipt exists; none is claimed.
 
-### First-success smokes and public delivery
+### Release-pending external evidence
 
-| Surface                              | Exact commit/ref | Command or operation                                    | Expected oracle                                                                 | Receipt / result |
-| ------------------------------------ | ---------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------- | ---------------- |
-| Pages containment                    | PR (b) merge     | Live URL matrix                                         | Excluded paths 404; root, Guide, and reference page return expected 200 content | Pending          |
-| CNAME deletion                       | PR (d) merge     | Project-path live URL matrix                            | Canonical page and assets resolve under project path; placeholder absent        | Pending          |
-| Axum                                 | Pending          | `scripts/smoke-axum.sh`                                 | Non-health publisher response satisfies the documented strong oracle            | Pending          |
-| Fastly                               | Pending          | `scripts/smoke-fastly.sh`                               | Local push and required secrets yield a non-health publisher response           | Pending          |
-| Cloudflare                           | Pending          | `scripts/smoke-cloudflare.sh`                           | Envelope transfer yields a non-health publisher response                        | Pending          |
-| Spin                                 | Pending          | `scripts/smoke-spin.sh` or time-bounded manual contract | Local push and variables yield a non-health publisher response                  | Pending          |
-| Controller read-only dispatch        | Pending          | `validate_rc`                                           | Exact trusted rc SHA passes; no writer or attestation job runs                  | Pending          |
-| Controller protected-delta rejection | Pending          | Unauthorized protected-file fixture                     | Required status blocks merge                                                    | Pending          |
-| Controller unrelated-PR pass         | Pending          | Net-empty protected-delta fixture                       | Required status reports success without privileged PR checkout                  | Pending          |
+Only real post-`main` operations can complete these rows. Each completion uses
+the durable capture contract, including the actual redacted bodies, byte
+lengths, and SHA-256 hashes. Local builds, CI simulations, fixtures, and mocked
+API output cannot complete a row.
+
+| Surface                     | Required real external capture                                                                                                             | State                       |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------- |
+| Pages and CNAME             | Deployed `main` SHA; live URL/content/header matrix; project-path asset behavior; observed CNAME and canonical-URL behavior                | `release-pending`           |
+| First scheduled link run    | Default-branch run ID, attempt, jobs, URLs, app identities, bounded artifact, concurrency/timeout result, and issue-reconciliation outcome | `release-pending`           |
+| Dependency submission/graph | Authenticated `main` SHA; submission request and response; 201 result; detector/correlator; graph API body; triage owner and SLA           | `release-pending`           |
+| Optional `main` protection  | Only if maintainers opt in: exact contexts/apps, strictness, bypass policy, API bodies, and planted-failure block                          | `release-pending`, optional |
+
+### First-success adapter smokes
+
+| Surface    | Exact commit/ref | Command or operation                                    | Expected oracle                                                       | Receipt / result |
+| ---------- | ---------------- | ------------------------------------------------------- | --------------------------------------------------------------------- | ---------------- |
+| Axum       | Pending          | `scripts/smoke-axum.sh`                                 | Non-health publisher response satisfies the documented strong oracle  | Pending          |
+| Fastly     | Pending          | `scripts/smoke-fastly.sh`                               | Local push and required secrets yield a non-health publisher response | Pending          |
+| Cloudflare | Pending          | `scripts/smoke-cloudflare.sh`                           | Envelope transfer yields a non-health publisher response              | Pending          |
+| Spin       | Pending          | `scripts/smoke-spin.sh` or time-bounded manual contract | Local push and variables yield a non-health publisher response        | Pending          |
 
 ### Generated-diff proof
 
@@ -258,16 +265,14 @@ Each generator records its command, first-run changed paths, second-run exit
 status, and exact clean-diff assertion. “Generated” without a second-run
 no-diff proof is incomplete.
 
-| Generator / region               | Source SHA | First-run output | Second-run command | Clean-diff assertion | Result  |
-| -------------------------------- | ---------- | ---------------- | ------------------ | -------------------- | ------- |
-| Tracked/source classification    | Pending    | Pending          | Pending            | Pending              | Pending |
-| Settings reference               | Pending    | Pending          | Pending            | Pending              | Pending |
-| Route/API reference              | Pending    | Pending          | Pending            | Pending              | Pending |
-| Integration/support matrix       | Pending    | Pending          | Pending            | Pending              | Pending |
-| CLI help goldens                 | Pending    | Pending          | Pending            | Pending              | Pending |
-| Gate consumers                   | Pending    | Pending          | Pending            | Pending              | Pending |
-| c2 and inverse patches           | Pending    | Pending          | Pending            | Pending              | Pending |
-| Release retarget/disable patches | Pending    | Pending          | Pending            | Pending              | Pending |
+| Generator / region            | Source SHA | First-run output | Second-run command | Clean-diff assertion | Result  |
+| ----------------------------- | ---------- | ---------------- | ------------------ | -------------------- | ------- |
+| Tracked/source classification | Pending    | Pending          | Pending            | Pending              | Pending |
+| Settings reference            | Pending    | Pending          | Pending            | Pending              | Pending |
+| Route/API reference           | Pending    | Pending          | Pending            | Pending              | Pending |
+| Integration/support matrix    | Pending    | Pending          | Pending            | Pending              | Pending |
+| CLI help goldens              | Pending    | Pending          | Pending            | Pending              | Pending |
+| Gate consumers                | Pending    | Pending          | Pending            | Pending              | Pending |
 
 ### Exceptions and waivers
 
@@ -277,7 +282,7 @@ Expired or ownerless entries fail the checkpoint.
 | Type / path                                 | Value classification   | Owner                 | Rationale                                                                                                              | Review or expiry           | State    |
 | ------------------------------------------- | ---------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------- | -------------------------- | -------- |
 | `fastly.toml` `service_id`                  | Service ID             | `aram356`             | Check mode fails at or after expiry; renewal requires a reviewed committed replacement; not the ops migration deadline | `2026-09-30T00:00:00Z`     | Approved |
-| Task 15 temporary public-page ownership     | Page/orphan transition | Pending Task 15 owner | Page registered before Task 16 final ownership                                                                         | Expires at Task 16         | Pending  |
+| Task 13 temporary public-page ownership     | Page/orphan transition | Pending Task 13 owner | Page registered before Task 14 final ownership                                                                         | Expires at Task 14         | Pending  |
 | Spin manual smoke, only if CI cannot run it | Manual evidence        | Pending               | Runner capability gap                                                                                                  | Time-bounded date required | Pending  |
 
 ### Follow-up issues
@@ -302,157 +307,88 @@ disposition, owner, and labels. Do not replace these rows with umbrella issues.
 
 ### Package sections
 
-Every section below receives a completed package checkpoint block. A task with
-an isolated `main` PR records its rc import checkpoint separately.
+Every section below receives a completed package checkpoint block. All
+implementation stays on `spec-docs-refresh` and PR #1049.
 
-#### Task 2 — PR (b) public-site containment
+#### Task 2 — Transfer the reviewed containment commits
 
-Pending. Evidence source: cross-worktree handoff; import at Task 4.
+Pending. Authenticate closed PR #1104 and the two reviewed source commits,
+then record exact transferred paths and byte identity on #1049.
 
-#### Task 3 — PR (d) CNAME deletion
+#### Task 3 — Complete WP1 CNAME and policy hygiene
 
-Pending. Evidence source: cross-worktree handoff; import at Task 4.
+Pending. Record CNAME deletion, public-site containment, policy updates, and
+local artifact proof. Live Pages/CNAME remains release-pending.
 
-#### Task 4 — WP1 rc import and hygiene
-
-Pending. Must import PRs (b) and (d), prove byte identity, and complete the
-Task 1 bootstrap exception checks.
-
-#### Task 5 — docs-parity model and repository scaffolding
+#### Task 4 — Scaffold the standalone `docs-parity` crate
 
 Pending. Record each atomic fixture cycle and the bootstrap exception checks.
 
-#### Task 6 — exhaustive classification and sensitive scanner
+#### Task 5 — Close tracked-file classification and sensitive-data scanning
 
-Pending. Must bootstrap the complete then-current repository and enforce the
+Pending. Bootstrap the complete then-current repository and enforce the
 approved service-ID exception.
 
-#### Task 7 — Markdown ownership, links, and generated regions
+#### Task 6 — Implement generated regions, Markdown ownership, and link checks
 
-Pending. Record each atomic fixture cycle.
+Pending. Record each atomic fixture cycle and generated second-run no-diff.
 
-#### Task 8 — settings extraction and template harness
-
-Pending. Record each atomic fixture cycle.
-
-#### Task 9 — integrations, routes, and adapter support
-
-Pending. Record each atomic fixture cycle and any behavior-preserving private
-route seam.
-
-#### Task 10 — CLI help, snippets, gates, workflows, and snapshots
-
-Pending. Preserve the planned adjacent source and golden commits and record
-both clean checkpoints.
-
-#### Task 11 — PR (c) validation-only controller
-
-Pending. Keep branch evidence external while open, then import exact values in
-the adjacent rc evidence commit before Task 12.
-
-#### Task 12 — WP2 truth pass and FAQ archive
-
-Pending. Record full source/disposition equality, scanner results, tombstone
-smokes, and the selected archive move.
-
-#### Task 13 — WP3 configuration reference
+#### Task 7 — Extract settings semantics and execute the example harness
 
 Pending. Record generated reference equality, compiled probes, and template
 round-trip proof.
 
-#### Task 14 — WP4 API contracts
+#### Task 8 — Check integration capabilities and adapter routes
+
+Pending. Record each atomic fixture cycle and any behavior-preserving private
+route seam.
+
+#### Task 9 — Check CLI help, snippets, gates, and workflow foundations
+
+Pending. Preserve the planned adjacent source and golden commits and record
+both clean checkpoints.
+
+#### Task 10 — Complete WP2 truth pass and dispositions
+
+Pending. Record full source/disposition equality, scanner results, tombstone
+smokes, and the selected archive move.
+
+#### Task 11 — Complete WP3 configuration reference and template
+
+Pending. Record generated reference equality, compiled probes, template
+round-trip proof, and bounded PR-description publication.
+
+#### Task 12 — Complete WP4 generated API contracts
 
 Pending. Record route-set equality, adapter predicates, generated no-diff, and
 adapter regression suites for any private seam.
 
-#### Task 15 — deployment guides and first-success smokes
+#### Task 13 — Add deployment guides and recurring first-success smokes
 
 Pending. Record all four smoke contracts, exact tool versions, cleanup, and
 any time-bounded Spin exception.
 
-#### Task 16 — WP5 product coverage and navigation
+#### Task 14 — Complete WP5 product coverage and navigation
 
 Pending. Record page/orphan ownership, diagram prose equivalents, snippet
-checks, and removal of the Task 15 transition exception.
+checks, and removal of the Task 13 transition exception.
 
-#### Task 17 — WP6 root and crate documentation
+#### Task 15 — Complete WP6 root and crate documentation
 
 Pending. Apply and verify the factual-governance fallback.
 
-#### Task 18 — WP7 rustdoc and JSDoc
+#### Task 16 — Complete WP7 rustdoc and JSDoc
 
 Pending. Record the rustdoc matrix, doctests, JSDoc fixtures, and JS checks.
 
-#### Task 19 — WP8b enforcement and release controls
+#### Task 17 — Activate final CI and release-pending controls
 
-Pending. Record every workflow negative fixture, generated consumer proof,
-follow-up issue row, c2 issue URL, release-handoff issue URL, and reviewed
-patch/runbook hashes.
+Pending. Record workflow negative fixtures, generated consumer proof,
+follow-up issue rows, and the release runbook. Real release receipts remain in
+the release-pending table until observed after the result reaches `main`.
 
-#### Task 20 — final Epoch 1 acceptance
+#### Task 18 — Close PR #1049 implementation
 
 Pending. Record the exact final rc baseline, full local and hosted gates,
-required-check topology, generated no-diff, smokes, all external handoffs,
-clean package shape, final PR head, and implementation-ready approval.
-
-## Epoch 2: activation evidence schema
-
-- **Canonical c2 tracking issue URL:** Pending; Task 19 must populate it before
-  activation.
-- **Owner:** Pending before c2 opens.
-
-The issue uses the durable capture contract above. Required captures:
-
-1. #1049 merge result, `merged_rc_tip`, current `origin/rc/202608`, and any
-   focused delta audit producing `validated_rc_tip`.
-2. Read-only `validate_rc` dispatch at `ref: main`, exact `tool_sha`, run and
-   job identity, and proof that no writer or attestation ran.
-3. c2 PR URL, fresh `audited_main_tip`, exact base/head/tool SHAs, protected
-   path modes/blob IDs, cached candidate diff, and trusted validation result.
-4. Automatic pending status and exact manual success replacement, including
-   context, source app, head/base binding, and just-before-merge reassertion.
-5. c2 merge SHA and first `refresh_dependency_snapshot` dispatch.
-6. Redacted snapshot request, 201 response, stable detector/correlator,
-   snapshot ID, authenticated rc ref/SHA, graph API JSON, alert-triage owner,
-   runbook URL, and two-business-day SLA.
-7. One genuine scheduled run, including link reader, schedule-only issue
-   writer, snapshot reader/writer, reconciliation, timeout/concurrency state,
-   and resulting issue/snapshot state.
-8. Reverse-c2 patch proof for both protected modes/blobs and, if invoked,
-   drain/cancel and same-identity empty-snapshot receipts.
-9. Activation decision. It must not claim lifecycle closure.
-
-No Epoch 2 repository evidence-only branch or commit is permitted.
-
-## Epoch 3: release-handoff evidence schema
-
-- **Canonical release-handoff issue URL:** Pending; Task 19 must populate it
-  before activation closes.
-- **Owner:** Pending before activation closes.
-
-The issue uses the durable capture contract above. Required captures:
-
-1. Selected normal or abandonment path, reviewed patch/runbook hashes, owner,
-   exact `validated_rc_tip`, freeze timestamp, bypass policy, and repeated
-   freeze checks.
-2. On normal release, current-main base versus frozen-rc-head modes/blob IDs
-   for both protected paths and the net-empty result; otherwise the separately
-   reviewed repair/sync PR evidence.
-3. PR (e) URL, fresh `audited_main_tip`, exact head/base/tool SHAs, automatic
-   pending status, manual validation success, and just-before-merge binding.
-4. PR (e) merge SHA and proof that no further temporary snapshot submission
-   path remains.
-5. Enumeration of every queued or in-progress same-identity run, wait/cancel
-   result, optional separately scoped `actions: write` actor, and proof the
-   empty same-identity snapshot is the final submission.
-6. Redacted retirement request and 201 response, exact merge SHA/ref,
-   detector/correlator/snapshot ID, dependency-graph replacement or
-   disappearance, and all body hashes.
-7. Final ruleset, required-context, strictness, merge-queue, live Pages/CNAME,
-   branch API, and rc-deletion captures.
-8. Normal-path full WP8 activation and maintenance allow/reject proofs, or
-   abandonment-path removal of the nonreporting context plus the next-PR
-   non-stranding proof.
-9. Lifecycle-closed decision only after every selected-path gate passes.
-
-No Epoch 3 repository evidence-only branch or commit is permitted.
+generated no-diff, smokes, follow-up dispositions, clean package shape, final
+PR head, and implementation approval without claiming release-pending effects.

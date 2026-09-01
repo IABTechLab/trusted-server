@@ -6,20 +6,20 @@
 
 This record fixes the owner-gated choices for the documentation refresh. It
 does not record operational receipts; those belong in
-`documentation-refresh-evidence.md` or the named post-merge tracking issues.
+`documentation-refresh-evidence.md` and its referenced external captures.
 
 ## Audited tips
 
-| Name                        | Full commit SHA                            | Use                                                                |
-| --------------------------- | ------------------------------------------ | ------------------------------------------------------------------ |
-| `audited_target_tip`        | `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` | Exact required `origin/rc/202608` tip for Epoch 1                  |
-| `implementation_start_head` | `b904b3aeb5af26a536afadcbfb2d70af36bca5a2` | Task 1 worktree HEAD before this approval commit                   |
-| Starting `audited_main_tip` | `d516a9e94249e10cbc36e41beb4269f9255cf407` | Initial reference only; each later `main` PR records a fresh value |
+| Name                        | Full commit SHA                            | Use                                                           |
+| --------------------------- | ------------------------------------------ | ------------------------------------------------------------- |
+| `audited_target_tip`        | `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` | Exact required `origin/rc/202608` tip for every package       |
+| `implementation_start_head` | `01bf84a4beb4a1be4f26965478a0211f59392962` | Program-record alignment package start on `spec-docs-refresh` |
 
-Task 1 fetched `origin/rc/202608` and `origin/main` on 2026-08-31. The rc ref
-equaled `audited_target_tip`, and the implementation branch contained that
-commit. A later `main` PR must not reuse the starting `audited_main_tip` after
-`main` advances.
+The program-record alignment package fetched `origin/rc/202608` and
+`origin/spec-docs-refresh` on 2026-09-01. The rc ref equaled
+`audited_target_tip`, and the implementation branch contained that commit.
+Every later package repeats both checks and stops for a focused delta audit if
+the target advances.
 
 ## Owner-gated decisions
 
@@ -80,19 +80,19 @@ commit. A later `main` PR must not reuse the starting `audited_main_tip` after
 
 `aram356` approved the following on 2026-08-31:
 
-- five PRs through activation: rc PR (a), containment PR (b), validation-only
-  controller PR (c), CNAME deletion PR (d), and activation PR (c2);
-- the separately owned release-handoff PR (e) and both reviewed outcome paths;
-- temporary `main` branch protection requiring the literal
-  `docs/automation-delta` status with strict/up-to-date enforcement;
-- merge queues disabled on `main` through PR (e); and
-- the external dependency-snapshot retirement API call under the design's
-  freeze, drain/cancel, same-identity empty-snapshot, receipt, graph-check, and
-  branch-deletion controls.
+- all repository implementation work remains on `spec-docs-refresh` and
+  existing PR #1049, targeted at `rc/202608`;
+- no separate containment, CNAME, controller, activation, or release-handoff
+  implementation PR is created;
+- PR #1104 remains closed and superseded, with only its two reviewed source
+  commits retained for transfer into #1049 during Task 2; and
+- live Pages/CNAME behavior, the first real schedule, dependency submission
+  and graph visibility, and any optional `main` protection change remain
+  external release operations.
 
-The rollback and exact-SHA binding requirements in the design remain
-mandatory. This approval does not authorize weaker substitutes or link-only
-evidence.
+The immutable-baseline, exact-SHA binding, and durable external-capture
+requirements in the design remain mandatory. Local builds and fixture output
+may prove repository behavior but cannot substitute for release receipts.
 
 ### 8. CodeQL rc push coverage
 
@@ -101,48 +101,46 @@ evidence.
 
 ## Delivery records
 
-Populate each pending field with the exact URL and immutable identifiers at
-the named checkpoint. Do not infer a value from a branch name.
+PR #1049 is the only implementation row. Its head is a timestamped remote
+capture, not a permanent final SHA.
 
-| Item                              | Target      | URL                                                    | Fresh audited base                         | Head or merge SHA                                          | State                           |
-| --------------------------------- | ----------- | ------------------------------------------------------ | ------------------------------------------ | ---------------------------------------------------------- | ------------------------------- |
-| (a) rc implementation PR          | `rc/202608` | https://github.com/IABTechLab/trusted-server/pull/1049 | `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` | Remote capture: `b904b3aeb5af26a536afadcbfb2d70af36bca5a2` | OPEN, draft; refresh after push |
-| (b) containment PR                | `main`      | Pending                                                | Pending                                    | Pending                                                    | Not started                     |
-| (c) validation-only controller PR | `main`      | Pending                                                | Pending                                    | Pending                                                    | Not started                     |
-| (d) CNAME deletion PR             | `main`      | Pending                                                | Pending                                    | Pending                                                    | Not started                     |
-| (c2) activation PR                | `main`      | Pending                                                | Pending                                    | Pending                                                    | Not started                     |
-| (e) release-handoff PR            | `main`      | Pending                                                | Pending                                    | Pending                                                    | Release-owned                   |
+| Implementation PR                                      | Target      | Audited base                               | Captured remote head                       | Capture time         | State       |
+| ------------------------------------------------------ | ----------- | ------------------------------------------ | ------------------------------------------ | -------------------- | ----------- |
+| https://github.com/IABTechLab/trusted-server/pull/1049 | `rc/202608` | `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` | `01bf84a4beb4a1be4f26965478a0211f59392962` | 2026-09-01T07:35:08Z | OPEN, draft |
 
-### PR (a) pre-push metadata capture
+### PR #1049 metadata capture
 
-- Capture timestamp: 2026-08-31T23:12:46Z.
+- Capture timestamp: 2026-09-01T07:35:08Z.
 - URL: https://github.com/IABTechLab/trusted-server/pull/1049.
 - State: OPEN, draft.
 - Base: ref `rc/202608`, SHA
   `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`.
 - Remote head: ref `spec-docs-refresh`, captured SHA
-  `b904b3aeb5af26a536afadcbfb2d70af36bca5a2`.
-- Author and assignee: `aram356`.
+  `01bf84a4beb4a1be4f26965478a0211f59392962`.
 
-This is a timestamped pre-push remote capture. It does not assert that Task 1
-or its follow-up commits exist on the remote head. Refresh every field after
-those commits are pushed and before using PR #1049 as a validation input.
+This capture does not assert the eventual final head. Refresh it after package
+commits are pushed and before using PR #1049 as a hosted validation input.
 
-## External issue records
+### Superseded reviewed source
 
-| Record                         | Canonical URL | Owner                            | State     |
-| ------------------------------ | ------------- | -------------------------------- | --------- |
-| c2 activation tracking issue   | Pending       | Pending before c2 opens          | Not filed |
-| Release-handoff tracking issue | Pending       | Pending before activation closes | Not filed |
+PR #1104 is closed and superseded. Its base is
+`d516a9e94249e10cbc36e41beb4269f9255cf407`. The reviewed source commits are
+`34b0613dc603ba6529396dad4dd4b7e68b1e11a9` and
+`e6554f24f58f6122fb806ce25432f66033765c65`. Its source branch exists only for
+their later transfer into #1049 in Task 2. PR #1104 has no live merge or deploy
+receipt, and this record claims none.
 
-## Branch-protection and ruleset records
+## Release-pending records
 
-The detailed JSON and body hashes belong in the evidence record or canonical
-post-merge issue. Mirror only the decision-relevant values here.
+These rows require real post-`main` external captures under the evidence
+ledger's durable hashed-body contract.
 
-| Checkpoint                | Capture reference | Required contexts                           | Strict/up-to-date                  | Merge queue               | Bypass policy |
-| ------------------------- | ----------------- | ------------------------------------------- | ---------------------------------- | ------------------------- | ------------- |
-| Before PR (c)             | Pending           | Pending inventory                           | Pending                            | Must be disabled          | Pending       |
-| After PR (c)              | Pending           | Includes `docs/automation-delta`            | Required                           | Disabled                  | Pending       |
-| After PR (e), normal path | Pending           | `docs/automation-delta` plus full WP8 suite | Required                           | Pending owner disposition | Pending       |
-| After PR (e), abandonment | Pending           | No nonreporting automation context          | Restored from captured prior state | Pending owner disposition | Pending       |
+| Surface                     | Required external evidence                                                                                                    | State                       |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
+| Pages and CNAME             | Deployed `main` SHA, live response matrix and headers, project-path assets, and observed CNAME behavior                       | `release-pending`           |
+| First scheduled link run    | Default-branch run, attempt, jobs, URLs, app identities, bounded artifact, and resulting issue-reconciliation state           | `release-pending`           |
+| Dependency submission/graph | Authenticated `main` SHA, redacted submission and response bodies with hashes, detector/correlator, and graph API JSON        | `release-pending`           |
+| Optional `main` protection  | Only if maintainers opt in: exact contexts/apps, strictness, bypass policy, API bodies with hashes, and planted-failure proof | `release-pending`, optional |
+
+Local builds, CI simulations, mocked API responses, and fixture output cannot
+complete any release-pending row.

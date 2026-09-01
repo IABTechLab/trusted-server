@@ -2,7 +2,9 @@
 
 **Date:** 2026-08-19
 **Revised:** 2026-08-31 (single-PR delivery revision)
-**Status:** Draft revision; single-PR architecture approved, written review pending
+**Status:** Approved for implementation
+**Written-spec approval date:** 2026-08-31
+**Written-spec approval owner:** `aram356`
 **Scope:** Documentation and doc tooling. No runtime behavior changes.
 **Baseline:** audited_target_tip `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`
 (2026-08-28). The bulk
@@ -335,10 +337,9 @@ finishing this PR.
 
 ### Final-state automation
 
-The multi-stage `main` controller, `docs/automation-delta` attestation,
-activation patch, temporary rc dependency snapshot, retirement snapshot, and
-release retarget/disable paths are removed. They existed only to protect
-independent default-branch delivery PRs, which this design no longer uses.
+The superseded multi-stage controller and independent default-branch delivery
+machinery are not part of this program. They existed only to protect delivery
+PRs that this design no longer uses.
 
 PR #1049 instead commits one final steady-state automation design:
 
