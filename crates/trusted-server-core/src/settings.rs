@@ -2524,11 +2524,9 @@ pub struct DebugConfig {
     /// Content and verbosity of the `auction_html_comment` dump. Ignored
     /// when `auction_html_comment` is false.
     ///
-    /// The default table must stay omitted from serialized config blobs:
-    /// [`DebugConfig`] denies unknown fields, so an older binary rejects a blob
-    /// carrying this table during a mixed-version deployment or rollback. Any
-    /// non-default table still serializes and requires restoring a compatible
-    /// blob before rolling back.
+    /// The default table stays omitted from serialized config blobs to avoid
+    /// emitting redundant configuration. Any non-default table still
+    /// serializes.
     #[serde(
         default,
         skip_serializing_if = "is_default_auction_debug_comment_options"
@@ -2548,6 +2546,10 @@ pub struct DebugConfig {
     /// un-sanitized creative for diagnostics, so never enable in production.
     #[serde(default)]
     pub inject_adm_for_testing: bool,
+
+    /// Enable the host-only render-trace debug cookie route at `GET /_ts/trace`.
+    #[serde(default)]
+    pub trace_route_enabled: bool,
 }
 
 /// Metadata keys safe to surface in the `ts-debug` auction comment.
@@ -2560,7 +2562,7 @@ pub struct DebugConfig {
 /// `metadata_keys` is a subset selector against this const, never a way to
 /// add new keys.
 pub(crate) const AUCTION_DEBUG_METADATA_ALLOWLIST: &[&str] =
-    &["error_type", "http_status", "message"];
+    &["drop_reasons", "error_type", "http_status", "message"];
 
 /// Provider-controlled diagnostic keys exposed only by `Upstream` or `Full`.
 ///
@@ -2587,7 +2589,7 @@ fn default_auction_debug_metadata_keys() -> Vec<String> {
         .collect()
 }
 
-// This predicate preserves rollback compatibility by omitting the default table.
+// Omit the default table from serialized configuration.
 fn is_default_auction_debug_comment_options(value: &AuctionDebugCommentOptions) -> bool {
     *value == AuctionDebugCommentOptions::default()
 }
@@ -2981,6 +2983,12 @@ impl Settings {
         settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
 
+        for pattern in settings.reserved_aps_handler_patterns()? {
+            log::warn!(
+                "Basic Auth handler `{pattern}` matches the reserved /integrations/aps route family; reserved APS renderer and live-runner requests bypass configured handlers"
+            );
+        }
+
         if settings.auction.enabled && !settings.auction.rewrite_creatives {
             log::warn!(
                 "Auction creative rewriting disabled; creative assets and clicks may contact third-party hosts directly"
@@ -3047,14 +3055,13 @@ impl Settings {
         Ok(())
     }
 
-    /// Returns compiled creative opportunity slots when template delivery is enabled.
+    /// Returns compiled creative opportunity slots.
     #[must_use]
     pub fn creative_opportunity_slots(
         &self,
     ) -> &[crate::creative_opportunities::CreativeOpportunitySlot] {
         self.creative_opportunities
             .as_ref()
-            .filter(|co| co.enabled)
             .map(|co| co.slot.as_slice())
             .unwrap_or(&[])
     }
@@ -3190,6 +3197,39 @@ impl Settings {
         }
 
         Ok(None)
+    }
+
+    /// Return handler patterns that match a representative reserved APS path.
+    ///
+    /// Reserved APS resources are dispatched before configured Basic Auth
+    /// handlers. This startup-only check makes that precedence visible without
+    /// attempting undecidable general regex-intersection analysis.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if a handler regex does not compile.
+    pub(crate) fn reserved_aps_handler_patterns(
+        &self,
+    ) -> Result<Vec<&str>, Report<TrustedServerError>> {
+        const REPRESENTATIVE_PATHS: &[&str] = &[
+            "/integrations/aps",
+            "/integrations/aps/renderer/v2",
+            "/integrations/aps/runner.js",
+        ];
+        let mut patterns = Vec::new();
+        for handler in &self.handlers {
+            let mut overlaps = false;
+            for path in REPRESENTATIVE_PATHS {
+                if handler.matches_path(path)? {
+                    overlaps = true;
+                    break;
+                }
+            }
+            if overlaps {
+                patterns.push(handler.path.as_str());
+            }
+        }
+        Ok(patterns)
     }
 
     /// Returns whether `path` is within the reserved Trusted Server admin
@@ -4215,6 +4255,7 @@ mod tests {
         assert_eq!(
             opts.metadata_keys,
             vec![
+                "drop_reasons".to_string(),
                 "error_type".to_string(),
                 "http_status".to_string(),
                 "message".to_string(),
@@ -4330,32 +4371,12 @@ mod tests {
 
     #[test]
     fn default_auction_debug_comment_options_stay_out_of_serialized_config() {
-        // Rollback contract: `DebugConfig` denies unknown fields, so the
-        // previous binary rejects a config blob carrying a table it does not
-        // know. Defaults must therefore serialize to nothing.
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct LegacyDebugConfig {
-            #[serde(default)]
-            ja4_endpoint_enabled: bool,
-            #[serde(default)]
-            auction_html_comment: bool,
-            #[serde(default)]
-            inject_adm_for_testing: bool,
-        }
-
         let value = serde_json::to_value(DebugConfig::default())
             .expect("should serialize the default debug config");
         assert!(
             value.get("auction_html_comment_options").is_none(),
             "default options table should not be serialized, got {value}"
         );
-
-        let legacy: LegacyDebugConfig = serde_json::from_value(value)
-            .expect("legacy schema should accept the default debug payload");
-        assert!(!legacy.ja4_endpoint_enabled);
-        assert!(!legacy.auction_html_comment);
-        assert!(!legacy.inject_adm_for_testing);
 
         let configured = DebugConfig {
             auction_html_comment: true,
@@ -4480,6 +4501,23 @@ mod tests {
         );
 
         settings.validate().expect("Failed to validate settings");
+    }
+
+    #[test]
+    fn settings_identifies_handlers_shadowed_by_reserved_aps_routes() {
+        let toml = format!(
+            "{}\n[[handlers]]\npath = \"^/integrations/aps\"\nusername = \"aps-user\"\npassword = \"aps-pass\"\n",
+            crate_test_settings_str()
+        );
+
+        let settings = Settings::from_toml(&toml).expect("should parse APS-overlapping handler");
+
+        assert_eq!(
+            settings
+                .reserved_aps_handler_patterns()
+                .expect("should inspect compiled handler patterns"),
+            vec!["^/integrations/aps"]
+        );
     }
 
     #[test]
@@ -7408,6 +7446,7 @@ proxy_secret = "secret"
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
+enabled = true
 gam_network_id = "21765378893"
 auction_timeout_ms = 500
 section_root = "home"
@@ -7422,10 +7461,6 @@ formats = [{ width = 300, height = 250 }]
         let co = settings
             .creative_opportunities
             .expect("should have creative_opportunities");
-        assert!(
-            co.enabled,
-            "creative-opportunity templates should default to enabled"
-        );
         assert_eq!(co.gam_network_id, "21765378893");
         assert_eq!(co.auction_timeout_ms, Some(500));
         assert_eq!(
@@ -7433,45 +7468,6 @@ formats = [{ width = 300, height = 250 }]
             Some(0),
             "startup finalization should materialize the dynamic-template compatibility marker"
         );
-    }
-
-    #[test]
-    fn settings_disables_creative_opportunity_slots_when_configured_off() {
-        let toml = format!(
-            "{}\n[creative_opportunities]\nenabled = false\ngam_network_id = \"21765378893\"\n\n[[creative_opportunities.slot]]\nid = \"atf\"\npage_patterns = [\"/\"]\nformats = [{{ width = 300, height = 250 }}]\n",
-            crate_test_settings_str()
-        );
-        let settings = Settings::from_toml(&toml).expect("should parse disabled templates");
-        assert!(
-            settings.creative_opportunity_slots().is_empty(),
-            "disabled template delivery should expose no runtime slots"
-        );
-    }
-
-    #[test]
-    fn settings_creative_opportunity_enabled_flag_supports_environment_override() {
-        let toml = format!(
-            "{}\n[creative_opportunities]\nenabled = true\ngam_network_id = \"21765378893\"\n",
-            crate_test_settings_str()
-        );
-        let env_key = format!(
-            "{}{}CREATIVE_OPPORTUNITIES{}ENABLED",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        temp_env::with_var(env_key, Some("false"), || {
-            let settings = Settings::from_toml_and_env(&toml)
-                .expect("should parse template enabled environment override");
-            assert!(
-                !settings
-                    .creative_opportunities
-                    .expect("should have creative opportunities")
-                    .enabled,
-                "environment override should disable template delivery"
-            );
-        });
     }
 
     #[test]
@@ -7492,6 +7488,7 @@ proxy_secret = "secret"
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
+enabled = true
 gam_network_id = "21765378893"
 
 [[creative_opportunities.slot]]
@@ -7528,6 +7525,7 @@ proxy_secret = "secret"
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
+enabled = true
 gam_network_id = "21765378893"
 "#;
         let slot_key = format!(
@@ -7570,6 +7568,7 @@ proxy_secret = "secret"
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
+enabled = true
 gam_network_id = "21765378893"
 
 [[creative_opportunities.slot]]

@@ -440,19 +440,6 @@ mod tests {
     use crate::test_support::tests::crate_test_settings_str;
     use edgezero_core::app_config::AppConfigMeta;
 
-    #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    #[allow(dead_code)]
-    struct LegacyCreativeOpportunitiesConfig {
-        gam_network_id: String,
-        #[serde(default)]
-        auction_timeout_ms: Option<u32>,
-        #[serde(default)]
-        price_granularity: serde_json::Value,
-        #[serde(default)]
-        slot: Vec<serde_json::Value>,
-    }
-
     fn app_config_with_creative_opportunities(
         gam_unit_path: Option<&str>,
     ) -> TrustedServerAppConfig {
@@ -461,6 +448,7 @@ mod tests {
             r#"
 
 [creative_opportunities]
+enabled = true
 gam_network_id = "99999"
 
 [[creative_opportunities.slot]]
@@ -809,49 +797,6 @@ formats = [{ width = 300, height = 250 }]
             !slot.contains_key("section_segment"),
             "push deserialization should not add runtime-only compiled fields"
         );
-    }
-
-    #[test]
-    fn static_gam_unit_template_is_accepted_by_legacy_schema() {
-        let creative_opportunities = serialized_creative_opportunities(Some("/99999/example/home"));
-
-        serde_json::from_value::<LegacyCreativeOpportunitiesConfig>(creative_opportunities)
-            .expect("should accept static GAM unit template");
-    }
-
-    #[test]
-    fn absent_gam_unit_template_is_accepted_by_legacy_schema() {
-        let creative_opportunities = serialized_creative_opportunities(None);
-
-        assert!(
-            creative_opportunities.get("enabled").is_none(),
-            "default template switch should be omitted for legacy binaries"
-        );
-        serde_json::from_value::<LegacyCreativeOpportunitiesConfig>(creative_opportunities)
-            .expect("should accept absent GAM unit template");
-    }
-
-    #[test]
-    fn disabled_creative_opportunities_flag_is_rejected_by_legacy_schema() {
-        let mut toml = crate_test_settings_str();
-        toml.push_str(
-            r#"
-
-[creative_opportunities]
-enabled = false
-gam_network_id = "99999"
-"#,
-        );
-        let app_config: TrustedServerAppConfig =
-            toml::from_str(&toml).expect("should deserialize app config wrapper");
-        let creative_opportunities = serde_json::to_value(app_config)
-            .expect("should serialize app config wrapper")
-            .get("creative_opportunities")
-            .cloned()
-            .expect("should contain creative opportunities");
-
-        serde_json::from_value::<LegacyCreativeOpportunitiesConfig>(creative_opportunities)
-            .expect_err("legacy binaries should reject an explicit disabled switch");
     }
 
     #[test]

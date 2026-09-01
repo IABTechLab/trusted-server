@@ -75,6 +75,7 @@ use crate::integrations::{
     IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, IntegrationRequestFilter,
     RequestFilterDecision, RequestFilterInput, UPSTREAM_SDK_MAX_RESPONSE_BYTES,
     collect_body_bounded, collect_response_bounded, ensure_integration_backend,
+    html_script_nonce_attribute,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::redacted::Redacted;
@@ -893,9 +894,10 @@ impl IntegrationHeadInjector for DataDomeIntegration {
                 "{}".to_string()
             })
             .replace("</", "<\\/");
+        let nonce_attribute = html_script_nonce_attribute(ctx.csp_nonce).unwrap_or_default();
 
         vec![format!(
-            "<script>window.ddjskey={key};window.ddoptions={options};</script><script src=\"{tag_url}\" async></script>"
+            "<script{nonce_attribute}>window.ddjskey={key};window.ddoptions={options};</script><script{nonce_attribute} src=\"{tag_url}\" async></script>"
         )]
     }
 }
@@ -983,7 +985,8 @@ pub fn register(
     let mut builder = IntegrationRegistration::builder(DATADOME_INTEGRATION_ID)
         .with_proxy(integration.clone())
         .with_attribute_rewriter(integration.clone())
-        .with_head_injector(integration.clone());
+        .with_head_injector(integration.clone())
+        .with_empty_browser_config_v1()?;
 
     if integration.config.enable_protection {
         builder = builder.with_request_filter(integration);
@@ -1190,6 +1193,7 @@ mod tests {
             request_host: "publisher.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",
+            csp_nonce: None,
             document_state,
         }
     }
@@ -1412,7 +1416,10 @@ mod tests {
         config.client_side_configuration = serde_json::json!({ "ajaxListenerPath": true });
         let integration = DataDomeIntegration::new(config);
         let document_state = crate::integrations::IntegrationDocumentState::default();
-        let ctx = html_context_for_tests(&document_state);
+        let ctx = IntegrationHtmlContext {
+            csp_nonce: Some("response-nonce_123="),
+            ..html_context_for_tests(&document_state)
+        };
 
         let inserts = integration.head_inserts(&ctx);
 
@@ -1426,8 +1433,14 @@ mod tests {
             "should serialize DataDome client-side options"
         );
         assert!(
-            inserts[0].contains("<script src=\"/integrations/datadome/tags.js\" async></script>"),
+            inserts[0].contains(
+                "<script nonce=\"response-nonce_123=\" src=\"/integrations/datadome/tags.js\" async></script>"
+            ),
             "should load the configured DataDome tag URL"
+        );
+        assert!(
+            inserts[0].starts_with("<script nonce=\"response-nonce_123=\">"),
+            "should propagate the response nonce to DataDome inline configuration"
         );
     }
 

@@ -1,6 +1,19 @@
 import { test, expect, type Page } from "@playwright/test";
 import { readState, runtimeUrl } from "../../helpers/state.js";
 
+const KERNEL_API_NAMES = [
+  "_internal",
+  "_registerIntegration",
+  "addAdUnits",
+  "boot",
+  "diagnostics",
+  "log",
+  "que",
+  "releaseId",
+  "requestAds",
+  "version",
+] as const;
+
 test.beforeEach(async ({}, testInfo) => {
   const state = readState();
   if (state.framework !== "nextjs") {
@@ -22,6 +35,38 @@ async function waitForHydration(page: Page): Promise<void> {
   });
 }
 
+async function captureKernel(page: Page): Promise<void> {
+  await page.waitForFunction(
+    () => (window as any).tsjs?._internal?.state === "kernel",
+  );
+  expect(
+    await page.evaluate(() => {
+      const browserWindow = window as any;
+      browserWindow.__initialTsjsReference = browserWindow.tsjs;
+      return {
+        names: Object.getOwnPropertyNames(browserWindow.tsjs).sort(),
+        legacy: Object.prototype.hasOwnProperty.call(
+          browserWindow.tsjs,
+          "gptDiagnostics",
+        ),
+      };
+    }),
+  ).toEqual({ names: KERNEL_API_NAMES, legacy: false });
+}
+
+async function expectSameKernel(page: Page): Promise<void> {
+  expect(
+    await page.evaluate(() => {
+      const browserWindow = window as any;
+      return {
+        sameOwner: browserWindow.tsjs === browserWindow.__initialTsjsReference,
+        state: browserWindow.tsjs?._internal?.state,
+        names: Object.getOwnPropertyNames(browserWindow.tsjs).sort(),
+      };
+    }),
+  ).toEqual({ sameOwner: true, state: "kernel", names: KERNEL_API_NAMES });
+}
+
 test.describe("Next.js client-side navigation", () => {
   test("4-page SPA navigation chain preserves script injection without full reload", async ({
     page,
@@ -33,6 +78,7 @@ test.describe("Next.js client-side navigation", () => {
 
     // Script present on initial load
     await expect(page.locator("script#trustedserver-js")).toHaveCount(1);
+    await captureKernel(page);
 
     // Wait for the client router to hydrate before clicking any links.
     await waitForHydration(page);
@@ -50,16 +96,19 @@ test.describe("Next.js client-side navigation", () => {
     await page.click('#site-nav a[href="/about"]');
     await page.waitForURL("**/about", { waitUntil: "domcontentloaded" });
     await expect(page.locator("script#trustedserver-js")).toHaveCount(1);
+    await expectSameKernel(page);
 
     // Navigate: About → Dashboard
     await page.click('#site-nav a[href="/dashboard"]');
     await page.waitForURL("**/dashboard", { waitUntil: "domcontentloaded" });
     await expect(page.locator("script#trustedserver-js")).toHaveCount(1);
+    await expectSameKernel(page);
 
     // Navigate: Dashboard → Contact
     await page.click('#site-nav a[href="/contact"]');
     await page.waitForURL("**/contact", { waitUntil: "domcontentloaded" });
     await expect(page.locator("script#trustedserver-js")).toHaveCount(1);
+    await expectSameKernel(page);
 
     // Prove all navigations were true SPA — no document-level requests fired
     expect(documentRequests).toEqual([]);

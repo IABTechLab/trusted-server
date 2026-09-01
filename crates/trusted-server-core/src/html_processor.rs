@@ -20,7 +20,6 @@ use crate::integrations::{
     IntegrationHtmlContext, IntegrationHtmlPostProcessor, IntegrationRegistry,
     IntegrationScriptContext, ScriptRewriteAction,
 };
-use crate::publisher::build_empty_bids_script;
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
@@ -54,6 +53,7 @@ struct HtmlWithPostProcessing {
     origin_host: String,
     request_host: String,
     request_scheme: String,
+    csp_nonce: Option<String>,
     document_state: IntegrationDocumentState,
 }
 
@@ -108,6 +108,7 @@ impl StreamProcessor for HtmlWithPostProcessing {
             request_host: &self.request_host,
             request_scheme: &self.request_scheme,
             origin_host: &self.origin_host,
+            csp_nonce: self.csp_nonce.as_deref(),
             document_state: &self.document_state,
         };
 
@@ -167,12 +168,9 @@ impl StreamProcessor for HtmlWithPostProcessing {
 /// §6.7.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum BodyCloseInjection {
-    /// Emit nothing because no slots matched under the inline path.
+    /// Emit nothing on the inline path.
     #[default]
     None,
-    /// Read the auction result from `ad_bids_state` and inject it, falling back to
-    /// an empty payload. Today's shipped behaviour.
-    InlineBids,
     /// Emit this markup verbatim — an inert marker the assembly step splits on.
     /// Must be identical for every request that reaches the transform, or the
     /// cached template is not shared-safe.
@@ -186,12 +184,12 @@ pub struct HtmlProcessorConfig {
     pub request_host: String,
     pub request_scheme: String,
     pub integrations: IntegrationRegistry,
-    /// Pre-computed `<script>(window.tsjs=window.tsjs||{}).adSlots=...;</script>`.
-    /// Injected at `<head>` open. `None` when no slots matched.
+    /// Pre-computed canonical browser-slot JSON used to build the immutable boot
+    /// auction projection. `None` when no slots matched.
     pub ad_slots_script: Option<String>,
     /// Shared auction result — written by auction task before HTML processing begins.
     /// Handler reads this in `el.on_end_tag()` on the body element.
-    /// `None` means no auction ran; inject empty `tsjs.bids = {}` as fallback.
+    /// `None` means no auction ran; inject an empty boot auction projection.
     pub ad_bids_state: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Maximum bytes the post-processing accumulator may buffer before the
     /// processor aborts. Mirrors `publisher.max_buffered_body_bytes` so the
@@ -199,16 +197,16 @@ pub struct HtmlProcessorConfig {
     pub max_buffered_body_bytes: usize,
     /// Request-scoped conditional diagnostics delivery decision.
     pub gpt_diagnostics: Option<GptDiagnosticsRequestDecision>,
-    /// What the `</body>` seam injects. Decided by the caller rather than inferred
-    /// from [`Self::ad_slots_script`].
+    /// What the `</body>` seam injects for shared-template assembly.
     pub body_close: BodyCloseInjection,
+    /// Server-owned request-scoped render-trace overlay decision.
+    pub render_trace_overlay: bool,
     /// Whether to omit Trusted Server's automatic `DataDome` client-side tag.
     pub suppress_datadome_client_side_tag: bool,
-    /// Set when the document delivers a response-bound CSP nonce in its own markup.
-    ///
-    /// `None` on every path that cannot store a shared template, so an ordinary inline
-    /// request does not pay for handlers whose only consumer is the template-cache gate.
+    /// Set when publisher markup contains a response-bound CSP nonce.
     pub csp_nonce_observed: Option<Arc<AtomicBool>>,
+    /// Unique nonce admitted by the response's enforcing CSP headers, if any.
+    pub csp_nonce: Option<String>,
 }
 
 impl HtmlProcessorConfig {
@@ -231,8 +229,10 @@ impl HtmlProcessorConfig {
             max_buffered_body_bytes: settings.publisher.max_buffered_body_bytes,
             gpt_diagnostics: None,
             body_close: BodyCloseInjection::None,
+            render_trace_overlay: false,
             suppress_datadome_client_side_tag: false,
             csp_nonce_observed: None,
+            csp_nonce: None,
         }
     }
 
@@ -272,13 +272,24 @@ impl HtmlProcessorConfig {
         self
     }
 
-    /// Watch the document for a response-bound CSP nonce delivered in its own markup.
-    ///
-    /// Pass `Some` only when the completed transform may be stored as a shared template;
-    /// nothing else reads the observation.
+    /// Watch publisher markup for response-bound CSP nonces before template storage.
     #[must_use]
     pub fn with_csp_nonce_observer(mut self, observed: Option<Arc<AtomicBool>>) -> Self {
         self.csp_nonce_observed = observed;
+        self
+    }
+
+    /// Attach the exact response-header CSP nonce to Trusted Server script tags.
+    #[must_use]
+    pub fn with_csp_nonce(mut self, nonce: Option<String>) -> Self {
+        self.csp_nonce = nonce;
+        self
+    }
+
+    /// Attach the server-owned request-scoped render-trace overlay decision.
+    #[must_use]
+    pub fn with_render_trace_overlay(mut self, active: bool) -> Self {
+        self.render_trace_overlay = active;
         self
     }
 
@@ -368,13 +379,14 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     });
 
     let injected_tsjs = Rc::new(Cell::new(false));
-    let injected_bids = Arc::new(AtomicBool::new(false));
+    let injected_body_close = Arc::new(AtomicBool::new(false));
     let integration_registry = config.integrations.clone();
     let script_rewriters = integration_registry.script_rewriters();
-    let ad_slots_script = config.ad_slots_script.clone();
-    let body_close = config.body_close.clone();
     let ad_bids_state = config.ad_bids_state.clone();
     let gpt_diagnostics = config.gpt_diagnostics.clone();
+    let body_close = config.body_close.clone();
+    let render_trace_overlay = config.render_trace_overlay;
+    let csp_nonce = config.csp_nonce.clone();
 
     // No source-comment neutralization here: rewriting a publisher comment that happens
     // to match the reserved marker would change publisher content bytes. Collisions are
@@ -383,13 +395,13 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let mut document_content_handlers = Vec::new();
     if let BodyCloseInjection::Marker(marker) = &body_close {
         let marker = marker.clone();
-        let injected_bids = Arc::clone(&injected_bids);
+        let injected_body_close = Arc::clone(&injected_body_close);
         document_content_handlers.push(end!(move |document_end| {
             // HTML fragments and malformed-but-renderable documents may never expose a
             // body end tag. Always mint a transform-owned terminal seam in that case;
             // otherwise source bytes equal to the reserved marker could be mistaken for
             // ownership by the post-transform exact-count validator.
-            if !injected_bids.swap(true, Ordering::SeqCst) {
+            if !injected_body_close.swap(true, Ordering::SeqCst) {
                 document_end.append(&marker, ContentType::Html);
             }
             Ok(())
@@ -403,111 +415,136 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let integrations = integration_registry.clone();
             let patterns = patterns.clone();
             let document_state = document_state.clone();
-            let ad_slots_script = ad_slots_script.clone();
+            let ad_bids_state = ad_bids_state.clone();
             let gpt_diagnostics = gpt_diagnostics.clone();
+            let body_close = body_close.clone();
+            let csp_nonce = csp_nonce.clone();
             move |el| {
                 if !injected_tsjs.get() {
-                    let mut snippet = String::new();
-                    // Inject ad slots script first so it appears before tsjs bundle.
-                    if let Some(ref slots_script) = ad_slots_script {
-                        snippet.push_str(slots_script);
+                    // A shared C2 template must contain no request-scoped boot
+                    // data. Its single inert marker receives the complete boot
+                    // fragment during per-reader assembly at the body seam.
+                    if matches!(body_close, BodyCloseInjection::Marker(_)) {
+                        return Ok(());
+                    }
+                    let mut interstitial = String::new();
+                    // The server has already interpreted and removed the reserved
+                    // directive. This request-scoped inline cleanup only updates the
+                    // browser-visible URL and must run before publisher/core code.
+                    if let Some(cleanup_tag) = gpt_diagnostics
+                        .as_ref()
+                        .and_then(|decision| decision.url_cleanup_script_tag(csp_nonce.as_deref()))
+                    {
+                        interstitial.push_str(&cleanup_tag);
                     }
                     let ctx = IntegrationHtmlContext {
                         request_host: &patterns.request_host,
                         request_scheme: &patterns.request_scheme,
                         origin_host: &patterns.origin_host,
+                        csp_nonce: csp_nonce.as_deref(),
                         document_state: &document_state,
                     };
-                    // First inject integration-specific config (e.g., window.__tsjs_prebid)
-                    // so it's available when the bundle's auto-init code reads it.
+                    let diagnostics_requested = gpt_diagnostics
+                        .as_ref()
+                        .is_some_and(GptDiagnosticsRequestDecision::active);
+                    let creative = integrations.tsjs_creative_boot();
+                    let selection = crate::integrations::TsjsCatalogSelectionV1 {
+                        creative_enabled: creative.enabled,
+                        creative_click_guard: creative.click_guard,
+                        creative_render_guard: creative.render_guard,
+                        gpt_diagnostics_active: diagnostics_requested,
+                        render_trace_overlay,
+                    };
+                    let manifest_ids = integrations.tsjs_catalog_module_ids(selection);
+                    let diagnostics_active = manifest_ids.contains(&"gpt_diagnostics");
+                    let integration_configs = match integrations
+                        .tsjs_integration_configs_v1(&manifest_ids)
+                    {
+                        Ok(configs) => configs,
+                        Err(error) => {
+                            log::error!("invalid TSJS integration config projection: {error:?}");
+                            return Ok(());
+                        }
+                    };
+                    let state = ad_bids_state
+                        .lock()
+                        .expect("should lock boot projection state");
+                    let state_value = state.as_deref();
+                    let (debug_comment, projection_json) = match state_value {
+                        Some(value) if value.starts_with("<!-- ts-debug:") => {
+                            value.rsplit_once('\n').map_or(
+                                (Some(value), tsjs::EMPTY_AUCTION_PROJECTION_JSON_V1),
+                                |(debug, json)| (Some(debug), json),
+                            )
+                        }
+                        Some(value) => (None, value),
+                        None => (None, tsjs::EMPTY_AUCTION_PROJECTION_JSON_V1),
+                    };
+                    if let Some(debug_comment) = debug_comment {
+                        interstitial.push_str(debug_comment);
+                        interstitial.push('\n');
+                    }
+                    // Non-TSJS vendor tags remain ordinary integration head inserts.
                     for insert in integrations.head_inserts(&ctx) {
-                        snippet.push_str(&insert);
+                        interstitial.push_str(&insert);
                     }
-                    if let Some(bootstrap) = gpt_diagnostics
-                        .as_ref()
-                        .and_then(GptDiagnosticsRequestDecision::bootstrap_script)
-                    {
-                        snippet.push_str(&bootstrap);
-                    }
-                    // Main bundle: core + non-deferred integrations (synchronous).
-                    let immediate_ids = integrations.js_module_ids_immediate();
-                    let script_attributes = integrations.tsjs_script_tag_attributes();
-                    snippet.push_str(&tsjs::tsjs_script_tag_with_attributes(
-                        &immediate_ids,
-                        &script_attributes,
-                    ));
-                    // Active diagnostics loads synchronously after core so its
-                    // GPT listeners precede publisher scripts in the origin head.
-                    if let Some(module_tag) = gpt_diagnostics
-                        .as_ref()
-                        .and_then(GptDiagnosticsRequestDecision::module_script_tag)
-                    {
-                        snippet.push_str(&module_tag);
-                    }
-                    // Deferred bundles: large modules like prebid loaded after
-                    // HTML parsing completes. Empty when none are enabled.
-                    let deferred_ids = integrations.js_module_ids_deferred();
-                    snippet.push_str(&tsjs::tsjs_deferred_script_tags(&deferred_ids));
-                    el.prepend(&snippet, ContentType::Html);
+                    let publisher_origin = patterns.replacement_url();
+                    let boot = tsjs::tsjs_bootstrap_fragment_with_nonce_and_interstitial_v1(
+                        tsjs::TsjsBootScriptConfigV1 {
+                            module_ids: &manifest_ids,
+                            integration_configs: &integration_configs,
+                            auction_projection_json: projection_json,
+                            creative,
+                            render_trace_overlay,
+                            gpt_diagnostics_active: diagnostics_active,
+                        },
+                        &publisher_origin,
+                        csp_nonce.as_deref(),
+                        &interstitial,
+                    )
+                    .or_else(|error| {
+                        log::error!("invalid TSJS document boot projection: {error:?}");
+                        tsjs::tsjs_bootstrap_fragment_with_nonce_and_interstitial_v1(
+                            tsjs::TsjsBootScriptConfigV1 {
+                                module_ids: &manifest_ids,
+                                integration_configs: &integration_configs,
+                                auction_projection_json: tsjs::EMPTY_AUCTION_PROJECTION_JSON_V1,
+                                creative,
+                                render_trace_overlay,
+                                gpt_diagnostics_active: diagnostics_active,
+                            },
+                            &publisher_origin,
+                            csp_nonce.as_deref(),
+                            &interstitial,
+                        )
+                    })
+                    .unwrap_or_default();
+                    el.prepend(&boot, ContentType::Html);
                     injected_tsjs.set(true);
                 }
                 Ok(())
             }
         }),
-        // Inject tsjs.bids before </body> via end_tag_handlers — only when
-        // slots matched this URL. When no slots matched, skip injection entirely
-        // so the publisher's existing client-side Prebid/GPT flow is unmodified
-        // (dual-mode rollout: calling tsjs.adInit with empty slots would invoke
-        // enableSingleRequest/enableServices and conflict with the publisher's GPT init).
-        // Guard with AtomicBool so the script is only injected once even if
-        // the origin HTML contains multiple <body> elements (e.g. template fragments).
+        // Emit the shared-template marker immediately before the first body end
+        // tag. A document-end handler above provides the malformed-HTML fallback.
         element!("body", {
-            let state = ad_bids_state.clone();
-            let injected_bids = injected_bids.clone();
             let body_close = body_close.clone();
+            let injected_body_close = Arc::clone(&injected_body_close);
             move |el| {
-                if matches!(body_close, BodyCloseInjection::None) {
+                let BodyCloseInjection::Marker(marker) = &body_close else {
                     return Ok(());
-                }
-                let state = state.clone();
-                let injected_bids = injected_bids.clone();
-                let body_close = body_close.clone();
+                };
                 if let Some(handlers) = el.end_tag_handlers() {
+                    let marker = marker.clone();
+                    let injected_body_close = Arc::clone(&injected_body_close);
                     let handler: EndTagHandler<'static> =
                         Box::new(move |end_tag: &mut EndTag<'_>| {
-                            if injected_bids.swap(true, Ordering::SeqCst) {
-                                return Ok(());
+                            if !injected_body_close.swap(true, Ordering::SeqCst) {
+                                end_tag.before(&marker, ContentType::Html);
                             }
-                            let markup = match &body_close {
-                                // Verbatim, and identical on every request that
-                                // reaches the transform — that is what makes the
-                                // cached template shared-safe.
-                                BodyCloseInjection::Marker(marker) => marker.clone(),
-                                BodyCloseInjection::InlineBids => {
-                                    let script_guard = state.lock().expect("should lock bid state");
-                                    match &*script_guard {
-                                        Some(s) => s.clone(),
-                                        None => build_empty_bids_script(),
-                                    }
-                                }
-                                // Unreachable: the element handler returned early
-                                // above. Kept exhaustive rather than using `_` so a
-                                // new variant is a compile error here.
-                                BodyCloseInjection::None => return Ok(()),
-                            };
-                            end_tag.before(&markup, ContentType::Html);
                             Ok(())
                         });
                     handlers.push(handler);
-                } else if matches!(body_close, BodyCloseInjection::InlineBids) {
-                    // No end tag (implicitly closed or EOF `<body>`): lol_html
-                    // cannot attach an end-tag handler, so tsjs.bids/adInit() are
-                    // never injected even though adSlots was injected at `<head>`.
-                    // The whole server-side ad feature then silently fails to
-                    // render — warn so the failure is diagnosable.
-                    log::warn!(
-                        "`<body>` has no end tag (implicitly closed or EOF); tsjs.bids and adInit() were not injected — server-side ads will not render"
-                    );
                 }
                 Ok(())
             }
@@ -798,6 +835,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         origin_host: config.origin_host,
         request_host: config.request_host,
         request_scheme: config.request_scheme,
+        csp_nonce: config.csp_nonce,
         document_state,
     }
 }
@@ -810,7 +848,7 @@ mod tests {
         IntegrationHeadInjector, IntegrationHtmlContext,
     };
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{bootstrap_transport, create_test_settings};
     use serde_json::json;
     use std::io::Cursor;
     use std::sync::Arc;
@@ -823,6 +861,7 @@ mod tests {
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_owned(),
             request_host: "test.example.com".to_owned(),
@@ -832,6 +871,7 @@ mod tests {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            render_trace_overlay: false,
             suppress_datadome_client_side_tag: false,
         }
     }
@@ -891,7 +931,7 @@ mod tests {
     }
 
     #[test]
-    fn integration_head_injector_prepends_after_tsjs_once() {
+    fn controller_precedes_live_head_inserts_which_precede_selected_runtime() {
         struct TestHeadInjector;
 
         impl IntegrationHeadInjector for TestHeadInjector {
@@ -899,14 +939,18 @@ mod tests {
                 "test"
             }
 
-            fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-                vec!["<script>window.__testHeadInjector=true;</script>".to_owned()]
+            fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+                let nonce = ctx.csp_nonce.expect("should receive response CSP nonce");
+                vec![format!(
+                    "<script nonce=\"{nonce}\">window.__testHeadInjector=true;</script>"
+                )]
             }
         }
 
         let html = "<html><head><title>Test</title></head><body></body></html>";
 
         let mut config = create_test_config();
+        config.csp_nonce = Some("response-nonce_123=".to_owned());
         config.integrations = IntegrationRegistry::from_rewriters_with_head_injectors(
             Vec::new(),
             Vec::new(),
@@ -928,7 +972,9 @@ mod tests {
         let processed = String::from_utf8(output).expect("output should be valid UTF-8");
 
         let tsjs_marker = "id=\"trustedserver-js\"";
+        let controller_marker = "const __TSJS_SERVER_BOOT_TRANSPORT_V1__=";
         let head_marker = "window.__testHeadInjector=true";
+        let nonce_marker = "<script nonce=\"response-nonce_123=\">window.__testHeadInjector=true";
 
         assert_eq!(
             processed.matches(tsjs_marker).count(),
@@ -940,6 +986,10 @@ mod tests {
             1,
             "should inject head snippet once"
         );
+        assert!(
+            processed.contains(nonce_marker),
+            "server-generated integration scripts must share the response CSP nonce"
+        );
 
         let tsjs_index = processed
             .find(tsjs_marker)
@@ -947,13 +997,20 @@ mod tests {
         let head_index = processed
             .find(head_marker)
             .expect("should include head snippet");
+        let controller_index = processed
+            .find(controller_marker)
+            .expect("should include the bootstrap controller");
         let title_index = processed
             .find("<title>")
             .expect("should keep existing head content");
 
         assert!(
+            controller_index < head_index,
+            "the authenticated controller must run before any live integration insert"
+        );
+        assert!(
             head_index < tsjs_index,
-            "should inject config before tsjs bundle so auto-init can read it"
+            "live upstream tags must remain before the selected parser runtime"
         );
         assert!(
             tsjs_index < title_index,
@@ -962,83 +1019,17 @@ mod tests {
     }
 
     #[test]
-    fn integration_head_injector_marks_only_attribution_enabled_gpt_bundle() {
-        fn process(gpt_config: Option<(bool, bool)>) -> String {
-            let integrations = if let Some((enabled, gam_attribution_enabled)) = gpt_config {
-                let mut settings = create_test_settings();
-                settings
-                    .integrations
-                    .insert_config(
-                        "gpt",
-                        &json!({
-                            "enabled": enabled,
-                            "gam_attribution_enabled": gam_attribution_enabled
-                        }),
-                    )
-                    .expect("should insert GPT config");
-                IntegrationRegistry::new(&settings).expect("should build GPT registry")
-            } else {
-                IntegrationRegistry::empty_for_tests()
-            };
-            let mut config = create_test_config();
-            config.integrations = integrations;
-            let mut processor = create_html_processor(config);
-            let output = processor
-                .process_chunk(b"<html><head></head><body></body></html>", true)
-                .expect("should process HTML");
-
-            String::from_utf8(output).expect("should produce valid UTF-8")
-        }
-
-        let attributed = process(Some((true, true)));
-        let unattributed = process(Some((true, false)));
-        let disabled_gpt = process(Some((false, true)));
-        let without_gpt = process(None);
-
-        for html in [&attributed, &unattributed, &disabled_gpt, &without_gpt] {
-            assert_eq!(
-                html.matches("id=\"trustedserver-js\"").count(),
-                1,
-                "should emit exactly one publisher bundle tag: {html}"
-            );
-        }
-        assert!(
-            attributed.contains("data-ts-gam-attribution=\"true\""),
-            "should mark only an attribution-enabled GPT publisher bundle"
-        );
-        assert!(
-            !unattributed.contains("data-ts-gam-attribution"),
-            "should leave an attribution-disabled GPT publisher bundle unmarked"
-        );
-        assert!(
-            !disabled_gpt.contains("data-ts-gam-attribution"),
-            "should let the GPT master switch suppress attribution metadata"
-        );
-        assert!(
-            !without_gpt.contains("data-ts-gam-attribution"),
-            "should leave a non-GPT publisher bundle unmarked"
-        );
-
-        let head_insert_index = attributed
-            .find("window.__tsjs_installGptShim")
-            .expect("should include the GPT head insert");
-        let publisher_bundle_index = attributed
-            .find("id=\"trustedserver-js\"")
-            .expect("should include the publisher bundle");
-        assert!(
-            head_insert_index < publisher_bundle_index,
-            "should keep integration head inserts before the publisher bundle"
-        );
-    }
-
-    #[test]
-    fn active_gpt_diagnostics_loads_standalone_after_unified_bundle_once() {
+    fn active_gpt_diagnostics_uses_unified_transport_and_inline_url_cleanup() {
         let html = "<html><head><title>Test</title></head><body></body></html>";
         let mut settings = create_test_settings();
         settings
             .integrations
             .insert_config("gpt_diagnostics", &json!({ "enabled": true }))
             .expect("should insert GPT diagnostics config");
+        settings
+            .integrations
+            .insert_config("gpt", &json!({}))
+            .expect("should insert the GPT event provider config");
 
         let mut request = http::Request::builder()
             .method(http::Method::GET)
@@ -1073,42 +1064,138 @@ mod tests {
             .process(Cursor::new(html.as_bytes()), &mut output)
             .expect("should process HTML");
         let processed = String::from_utf8(output).expect("should produce valid UTF-8");
-        let bootstrap_marker = "__tsjs_gpt_diagnostics_active";
         let bundle_marker = "id=\"trustedserver-js\"";
-        let diagnostics_marker = "tsjs-gpt_diagnostics.min.js";
+        let diagnostics_script_marker = "tsjs-gpt_diagnostics.min.js";
+        let cleanup_asset_marker = "tsjs-gpt_diagnostics-bootstrap.min.js";
+        let cleanup_program_marker = "history.replaceState";
 
         assert_eq!(
-            processed.matches(bootstrap_marker).count(),
-            1,
-            "should inject the diagnostics bootstrap once"
+            processed.matches("__tsjs_gpt_diagnostics_active").count(),
+            0,
+            "server boot data must be the only browser-visible activation result"
         );
         assert_eq!(
             processed.matches(bundle_marker).count(),
             1,
             "should inject the immediate TSJS bundle once"
         );
+        let transport = bootstrap_transport(&processed);
         assert_eq!(
-            processed.matches(diagnostics_marker).count(),
+            transport["boot"]["manifest"]["integrations"]
+                .as_array()
+                .expect("manifest integrations should be an array")
+                .iter()
+                .filter(|entry| entry["id"] == "gpt_diagnostics")
+                .count(),
             1,
-            "should inject one standalone diagnostics module"
+            "should select diagnostics once in immutable boot data"
         );
-        let bootstrap_index = processed
-            .find(bootstrap_marker)
-            .expect("should include diagnostics bootstrap");
+        assert_eq!(
+            processed.matches(diagnostics_script_marker).count(),
+            0,
+            "should not emit a standalone diagnostics module"
+        );
+        assert_eq!(processed.matches(cleanup_asset_marker).count(), 0);
+        assert_eq!(processed.matches(cleanup_program_marker).count(), 1);
+        let cleanup_index = processed
+            .find(cleanup_program_marker)
+            .expect("should include the request-scoped inline cleanup");
         let bundle_index = processed
             .find(bundle_marker)
-            .expect("should include immediate TSJS bundle");
-        let diagnostics_index = processed
-            .find(diagnostics_marker)
-            .expect("should include standalone diagnostics module");
+            .expect("should include the selected TSJS artifact");
         assert!(
-            bootstrap_index < bundle_index,
-            "should activate before core executes"
+            cleanup_index < bundle_index,
+            "request-scoped URL cleanup must run before publisher/core work"
         );
-        assert!(
-            bundle_index < diagnostics_index,
-            "should load diagnostics after core"
+        assert_eq!(transport["boot"]["diagnostics"]["gpt"]["active"], true);
+    }
+
+    #[test]
+    fn shared_template_is_reader_neutral_across_request_scoped_boot_inputs() {
+        const MARKER: &str = "<!--ts-ad-seam-->";
+        const HTML: &[u8] =
+            b"<html><head><title>Test</title></head><body><p>content</p></body></html>";
+
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt_diagnostics", &json!({ "enabled": true }))
+            .expect("should insert GPT diagnostics config");
+        settings
+            .integrations
+            .insert_config("gpt", &json!({}))
+            .expect("should insert the GPT event provider config");
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should build integration registry");
+
+        let mut request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://publisher.example/page?ts_console=1")
+            .header("sec-fetch-dest", "document")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build activation request");
+        let diagnostics =
+            crate::integrations::gpt_diagnostics::prepare_request(&settings, &mut request)
+                .expect("should prepare diagnostics request");
+
+        let render = |ad_slots_script: Option<String>,
+                      projection: Option<String>,
+                      diagnostics: Option<GptDiagnosticsRequestDecision>,
+                      render_trace_overlay: bool| {
+            let config = HtmlProcessorConfig {
+                csp_nonce_observed: None,
+                csp_nonce: None,
+                body_close: BodyCloseInjection::Marker(MARKER.to_string()),
+                origin_host: "origin.example.com".to_string(),
+                request_host: "example.com".to_string(),
+                request_scheme: "https".to_string(),
+                integrations: registry.clone(),
+                ad_slots_script,
+                ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(projection)),
+                max_buffered_body_bytes: 16 * 1024 * 1024,
+                gpt_diagnostics: diagnostics,
+                render_trace_overlay,
+                suppress_datadome_client_side_tag: false,
+            };
+            let mut processor = create_html_processor(config);
+            String::from_utf8(
+                processor
+                    .process_chunk(HTML, true)
+                    .expect("should process shared template"),
+            )
+            .expect("shared template should be UTF-8")
+        };
+
+        let baseline = render(None, None, None, false);
+        let varied = render(
+            Some("request-specific-slot-data".to_string()),
+            Some(
+                r#"{"version":1,"auction":{"version":1,"auctionId":"request-specific-auction","results":[]},"slots":[],"bids":[]}"#
+                    .to_string(),
+            ),
+            Some(diagnostics),
+            true,
         );
+
+        assert_eq!(
+            varied, baseline,
+            "shared template bytes must not depend on request-scoped boot inputs"
+        );
+        assert_eq!(baseline.matches(MARKER).count(), 1);
+        for forbidden in [
+            "request-specific-slot-data",
+            "request-specific-auction",
+            "__TSJS_SERVER_BOOT_INPUT_V1__",
+            "trustedserver-js",
+            "history.replaceState",
+            ".adSlots",
+            ".bids=",
+        ] {
+            assert!(
+                !baseline.contains(forbidden),
+                "shared template must not contain request-scoped `{forbidden}`: {baseline}"
+            );
+        }
     }
 
     #[test]
@@ -1172,62 +1259,6 @@ mod tests {
         assert_eq!(config.origin_host, "origin.test-publisher.com");
         assert_eq!(config.request_host, "proxy.example.com");
         assert_eq!(config.request_scheme, "https");
-    }
-
-    #[test]
-    fn suppressed_datadome_tag_preserves_and_rewrites_publisher_tag() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "datadome",
-                &json!({
-                    "enabled": true,
-                    "client_side_key": "test-client-key",
-                }),
-            )
-            .expect("should configure DataDome integration");
-        let registry = IntegrationRegistry::new(&settings)
-            .expect("should create integration registry with DataDome");
-        let config = HtmlProcessorConfig::from_settings(
-            &settings,
-            &registry,
-            "origin.example.com",
-            "test.example.com",
-            "https",
-        )
-        .with_datadome_client_tag_suppression(true);
-        let mut processor = create_html_processor(config);
-
-        let output = processor
-            .process_chunk(
-                br#"<html><head><script id="publisher-datadome" src="https://js.datadome.co/tags.js"></script></head><body>content</body></html>"#,
-                true,
-            )
-            .expect("should process HTML");
-        let html = String::from_utf8(output).expect("should produce UTF-8 HTML");
-
-        assert!(
-            !html.contains("window.ddjskey"),
-            "should omit the DataDome client configuration"
-        );
-        assert!(
-            html.contains("id=\"publisher-datadome\""),
-            "should preserve the publisher-originated DataDome tag"
-        );
-        assert!(
-            html.contains("src=\"/integrations/datadome/tags.js\""),
-            "should rewrite the publisher-originated DataDome tag"
-        );
-        assert!(
-            !html.contains("https://js.datadome.co/tags.js"),
-            "should remove the original third-party DataDome URL"
-        );
-        assert_eq!(
-            html.matches("/integrations/datadome/tags.js").count(),
-            1,
-            "should leave exactly one publisher-originated DataDome tag"
-        );
     }
 
     #[test]
@@ -1579,6 +1610,7 @@ mod tests {
             origin_host: String::new(),
             request_host: String::new(),
             request_scheme: String::new(),
+            csp_nonce: None,
             document_state: IntegrationDocumentState::default(),
         };
 
@@ -1621,6 +1653,7 @@ mod tests {
             origin_host: String::new(),
             request_host: String::new(),
             request_scheme: String::new(),
+            csp_nonce: None,
             document_state: IntegrationDocumentState::default(),
         };
 
@@ -1678,6 +1711,7 @@ mod tests {
             origin_host: String::new(),
             request_host: String::new(),
             request_scheme: String::new(),
+            csp_nonce: None,
             document_state: IntegrationDocumentState::default(),
         };
 
@@ -1726,6 +1760,7 @@ mod tests {
             origin_host: String::new(),
             request_host: String::new(),
             request_scheme: String::new(),
+            csp_nonce: None,
             document_state: IntegrationDocumentState::default(),
         };
 
@@ -1776,6 +1811,7 @@ mod tests {
             origin_host: String::new(),
             request_host: String::new(),
             request_scheme: String::new(),
+            csp_nonce: None,
             document_state: IntegrationDocumentState::default(),
         };
 
@@ -1813,9 +1849,10 @@ mod tests {
     }
 
     #[test]
-    fn injects_ad_slots_at_head_open() {
+    fn ignores_the_removed_legacy_ad_slots_transport() {
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1828,6 +1865,7 @@ mod tests {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            render_trace_overlay: false,
             suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
@@ -1838,13 +1876,14 @@ mod tests {
             )
             .expect("should process");
         let html = std::str::from_utf8(&output).expect("should be utf8");
-        assert!(
-            html.contains("window.tsjs=window.tsjs||{}"),
-            "should inject ad slots namespace at head-open"
+        assert_eq!(
+            bootstrap_transport(html)["boot"]["abi"],
+            1,
+            "should inject the sealed hard-cutover boot at head-open"
         );
         assert!(
-            html.contains(".adSlots=JSON.parse"),
-            "should inject adSlots at head-open"
+            !html.contains(".adSlots"),
+            "must not emit the removed adSlots surface"
         );
         assert!(
             !html.contains("__ts_request_id"),
@@ -1889,12 +1928,68 @@ mod tests {
     }
 
     #[test]
-    fn injects_ts_bids_before_body_close() {
-        let bids_script = r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
-        let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
+    fn injects_exact_boot_projection_before_core_without_legacy_slot_or_bid_surfaces() {
+        let projection = r#"{"version":1,"auction":{"version":1,"auctionId":"auction-1","results":[{"slot":"slot-a","outcome":"no_bid"}]},"slots":[],"bids":[]}"#;
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
-            body_close: BodyCloseInjection::InlineBids,
+            csp_nonce: None,
+            origin_host: "origin.example.com".to_owned(),
+            request_host: "example.com".to_owned(),
+            request_scheme: "https".to_owned(),
+            integrations: IntegrationRegistry::default(),
+            ad_slots_script: Some(
+                "<script>(window.tsjs=window.tsjs||{}).adSlots=['legacy'];</script>".to_owned(),
+            ),
+            ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(Some(projection.to_owned()))),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
+            gpt_diagnostics: None,
+            body_close: BodyCloseInjection::None,
+            render_trace_overlay: false,
+            suppress_datadome_client_side_tag: false,
+        };
+        let mut processor = create_html_processor(config);
+        let output = processor
+            .process_chunk(
+                b"<html><head></head><body><body>x</body></body></html>",
+                true,
+            )
+            .expect("should process HTML");
+        let html = std::str::from_utf8(&output).expect("should produce UTF-8");
+        let boot = html
+            .find("const __TSJS_SERVER_BOOT_TRANSPORT_V1__=")
+            .expect("should emit exact sealed server boot transport");
+        let core = html
+            .find("id=\"trustedserver-js\"")
+            .expect("should emit core bundle");
+
+        assert!(boot < core, "boot transport must precede core execution");
+        let transport = bootstrap_transport(html);
+        assert_eq!(
+            transport["boot"]["auctionProjection"]["auction"]["auctionId"],
+            "auction-1"
+        );
+        assert_eq!(
+            transport["boot"]["creative"],
+            json!({"version":1,"enabled":true,"clickGuard":true,"renderGuard":false})
+        );
+        assert!(html.contains(r#"performance.mark("tsjs:bids-script")"#));
+        assert_eq!(
+            html.matches("const __TSJS_SERVER_BOOT_TRANSPORT_V1__=")
+                .count(),
+            1
+        );
+        assert!(!html.contains(".adSlots"));
+        assert!(!html.contains(".bids="));
+    }
+
+    #[test]
+    fn injects_projection_in_boot_before_core_instead_of_bids_at_body_close() {
+        let projection = r#"{"version":1,"auction":{"version":1,"auctionId":"auction-body","results":[]},"slots":[],"bids":[]}"#;
+        let state = std::sync::Arc::new(std::sync::Mutex::new(Some(projection.to_owned())));
+        let config = HtmlProcessorConfig {
+            csp_nonce_observed: None,
+            csp_nonce: None,
+            body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
@@ -1905,6 +2000,7 @@ mod tests {
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            render_trace_overlay: false,
             suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
@@ -1912,28 +2008,29 @@ mod tests {
             .process_chunk(b"<html><head></head><body>content</body></html>", true)
             .expect("should process");
         let html = std::str::from_utf8(&output).expect("should be utf8");
-        assert!(
-            html.contains("window.tsjs=window.tsjs||{}"),
-            "should inject _ts namespace for bids before </body>"
+        assert_eq!(
+            bootstrap_transport(html)["boot"]["auctionProjection"]["auction"]["auctionId"],
+            "auction-body",
+            "should inject the exact projection into immutable boot"
         );
-        assert!(
-            html.contains(".bids=JSON.parse"),
-            "should inject bids before </body>"
-        );
-        let bids_pos = html
-            .find("window.tsjs=window.tsjs||{}")
-            .expect("bids namespace should be in output");
-        let body_close_pos = html.find("</body>").expect("</body> should be in output");
-        assert!(bids_pos < body_close_pos, "bids must appear before </body>");
+        let boot_pos = html
+            .find("const __TSJS_SERVER_BOOT_TRANSPORT_V1__=")
+            .expect("sealed server boot transport should be in output");
+        let core_pos = html
+            .find("id=\"trustedserver-js\"")
+            .expect("core should be in output");
+        assert!(boot_pos < core_pos, "projection boot must precede core");
+        assert!(!html.contains(".bids="));
     }
 
     #[test]
-    fn injects_ts_bids_only_once_with_multiple_body_elements() {
-        let bids_script = r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
-        let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
+    fn injects_boot_only_once_with_multiple_body_elements() {
+        let projection = r#"{"version":1,"auction":{"version":1,"auctionId":"auction-many-bodies","results":[]},"bids":[]}"#;
+        let state = std::sync::Arc::new(std::sync::Mutex::new(Some(projection.to_owned())));
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
-            body_close: BodyCloseInjection::InlineBids,
+            csp_nonce: None,
+            body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
@@ -1944,19 +2041,25 @@ mod tests {
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            render_trace_overlay: false,
             suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         // Malformed HTML with two <body> elements (common in CMS template pages)
         let output = processor
-            .process_chunk(b"<html><body><body>content</body></body></html>", true)
+            .process_chunk(
+                b"<html><head></head><body><body>content</body></body></html>",
+                true,
+            )
             .expect("should process");
         let html = std::str::from_utf8(&output).expect("should be utf8");
         assert_eq!(
-            html.matches(".bids=JSON.parse").count(),
+            html.matches("const __TSJS_SERVER_BOOT_TRANSPORT_V1__=")
+                .count(),
             1,
-            "should inject tsjs.bids exactly once even with multiple <body> elements"
+            "should inject immutable boot exactly once even with multiple body elements"
         );
+        assert!(!html.contains(".bids="));
     }
 
     #[test]
@@ -1973,6 +2076,7 @@ mod tests {
         let request_host = "proxy.test-publisher.example.com";
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.test-publisher.example.com".to_string(),
             request_host: request_host.to_string(),
@@ -1982,6 +2086,7 @@ mod tests {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            render_trace_overlay: false,
             suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
@@ -2013,7 +2118,7 @@ mod tests {
             .expect("should process HTML");
         let output_str = std::str::from_utf8(&output).expect("should be valid UTF-8");
 
-        let script_count = output_str.matches("/static/tsjs=").count();
+        let script_count = output_str.matches("id=\"trustedserver-js\"").count();
         assert_eq!(
             script_count, 1,
             "script tag must appear exactly once, found {script_count} occurrences"
@@ -2021,13 +2126,12 @@ mod tests {
     }
 
     #[test]
-    fn injects_empty_ts_bids_when_slots_matched_but_auction_returned_nothing() {
-        // Slots matched (ad_slots_script is Some) but auction task never wrote a result
-        // (state is None) — e.g. auction timed out with zero bids. Fallback to {}.
+    fn injects_safe_empty_projection_when_auction_returned_nothing() {
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
-            body_close: BodyCloseInjection::InlineBids,
+            csp_nonce: None,
+            body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
@@ -2038,6 +2142,7 @@ mod tests {
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            render_trace_overlay: false,
             suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
@@ -2045,20 +2150,25 @@ mod tests {
             .process_chunk(b"<html><head></head><body>content</body></html>", true)
             .expect("should process");
         let html = std::str::from_utf8(&output).expect("should be utf8");
-        assert!(
-            html.contains("JSON.parse(\"{}\")"),
-            "should inject empty bids fallback when auction produced nothing"
+        assert_eq!(
+            bootstrap_transport(html)["boot"]["auctionProjection"],
+            json!({
+                "version": 1,
+                "auction": {"version": 1, "auctionId": "initial", "results": []},
+                "slots": [],
+                "bids": []
+            }),
+            "should inject the exact safe empty initial projection"
         );
+        assert!(!html.contains(".bids="));
     }
 
     #[test]
-    fn does_not_inject_ts_bids_when_no_slots_matched() {
-        // No slots matched this URL — ad_slots_script is None. tsjs.bids must be
-        // omitted entirely so the publisher's existing client-side GPT flow is
-        // unmodified (spec §8: "Existing client-side Prebid/GPT flow runs unmodified").
+    fn emits_empty_boot_but_no_legacy_bids_when_no_slots_matched() {
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2068,6 +2178,7 @@ mod tests {
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            render_trace_overlay: false,
             suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
@@ -2075,15 +2186,19 @@ mod tests {
             .process_chunk(b"<html><head></head><body>content</body></html>", true)
             .expect("should process");
         let html = std::str::from_utf8(&output).expect("should be utf8");
-        assert!(
-            !html.contains("JSON.parse"),
-            "should NOT inject tsjs.bids when no slots matched"
+        assert_eq!(
+            html.matches("const __TSJS_SERVER_BOOT_TRANSPORT_V1__=")
+                .count(),
+            1,
+            "every document should receive one complete server boot input"
         );
+        assert!(!html.contains(".bids="));
     }
 
     fn marker_mode_config(marker: &str, observer: Option<Arc<AtomicBool>>) -> HtmlProcessorConfig {
         HtmlProcessorConfig {
             csp_nonce_observed: observer,
+            csp_nonce: None,
             body_close: BodyCloseInjection::Marker(marker.to_string()),
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2094,6 +2209,7 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            render_trace_overlay: false,
         }
     }
 
@@ -2220,6 +2336,7 @@ mod tests {
         const MARKER: &str = "<!--reserved-template-cache-seam-->";
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            csp_nonce: None,
             body_close: BodyCloseInjection::Marker(MARKER.to_string()),
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2229,6 +2346,7 @@ mod tests {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            render_trace_overlay: false,
             suppress_datadome_client_side_tag: false,
         };
         let source =

@@ -33,4 +33,9 @@ if [ -z "$WORKER_VERSION" ]; then
   echo "error: could not determine the worker crate version from Cargo.lock" >&2
   exit 1
 fi
-cargo install -q --force --version "=$WORKER_VERSION" worker-build && worker-build --release
+cargo install -q --force --version "=$WORKER_VERSION" worker-build
+if [ -n "${TS_WORKER_BUILD_FEATURES:-}" ]; then
+  worker-build --release . --features "$TS_WORKER_BUILD_FEATURES"
+else
+  worker-build --release
+fi

@@ -319,8 +319,8 @@ provider = "pbs-main"
 # inventory_domain = "publisher.example"
 # inventory_page_origin = "https://www.publisher.example"
 #
-# Browser renderer ownership is configured separately via [integrations.aps]
-# (see the Integrations section below).
+# The compiled APS provider plan also owns browser renderer and live-runner
+# route registration; there is no separate browser integration table.
 
 # Server-side ad slot templates + creative-opportunity auction. Kept active.
 [creative_opportunities]
@@ -573,7 +573,6 @@ enabled = false
 # this is set true.
 gam_attribution_enabled = false
 # script_url = "https://ads.example.com/gpt.js"
-# cache_ttl_seconds = 3600
 # rewrite_script = true
 
 # GPT runtime diagnostics browser overlay. Optional and enabled manually (not
@@ -581,16 +580,6 @@ gam_attribution_enabled = false
 # query param + session cookie.
 # [integrations.gpt_diagnostics]
 # enabled = true
-
-# Amazon Publisher Services (APS/TAM) browser renderer ownership. APS server
-# behavior (endpoint, account id, timeouts, script creatives) is declared on an
-# `aps`-profile [auction.providers.<name>] table in the auction section above.
-# Winning-bid renderer. Default `trusted_server` uses TS's opaque static renderer
-# route; set `publisher_native` only for the controlled publisher-origin
-# friendly-frame experiment.
-# [integrations.aps]
-# enabled = true
-# rendering_mode = "trusted_server"
 
 # Google Tag Manager first-party proxy. Kept active but disabled so `ts audit`
 # can fill container_id and flip `enabled` when GTM is detected. `container_id`

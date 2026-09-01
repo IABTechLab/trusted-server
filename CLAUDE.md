@@ -36,7 +36,7 @@ Supporting files: `edgezero.toml`, `fastly.toml`,
 | WASM target | `wasm32-wasip1`                          |
 | Node        | 24.12.0 (from `.tool-versions`)          |
 | Fastly CLI  | 15.1.0 (from `.tool-versions`)           |
-| Viceroy     | 0.17.0 (from `.tool-versions`)           |
+| Viceroy     | 0.19.0 (from `.tool-versions`)           |
 | Wasmtime    | 44.0.1 (from `.tool-versions`)           |
 
 ---
@@ -139,7 +139,7 @@ cd crates/trusted-server-js/lib && node build-all.mjs
 ### Install prerequisites
 
 ```bash
-cargo install viceroy --version 0.17.0 --locked --force
+cargo install viceroy --version 0.19.0 --locked --force
 ```
 
 ---

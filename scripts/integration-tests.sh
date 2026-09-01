@@ -7,7 +7,7 @@
 #
 # Prerequisites:
 #   - Docker running
-#   - Viceroy installed: cargo install viceroy --version 0.17.0 --locked --force
+#   - Viceroy installed: cargo install viceroy --version 0.19.0 --locked --force
 #   - wasm32-wasip1 target: rustup target add wasm32-wasip1
 #
 set -euo pipefail

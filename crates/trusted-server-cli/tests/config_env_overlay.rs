@@ -47,11 +47,12 @@ fn migrated_project() -> MigratedProject {
     let mut document = LEGACY_CONFIG
         .parse::<DocumentMut>()
         .expect("should parse legacy integration config");
-    // EdgeZero environment overlays cannot create missing TOML leaves,
-    // so a migrated config must carry every leaf whose environment override is
+    // EdgeZero environment overlays cannot create missing TOML leaves, so a
+    // migrated config must carry every leaf whose environment override is
     // expected to take effect.
     document["auction"]["rewrite_creatives"] = value(true);
     document["auction"]["sanitize_creatives"] = value(false);
+    document["integrations"]["gpt"]["gam_attribution_enabled"] = value(false);
     document["creative_opportunities"]["enabled"] = value(true);
     document["creative_opportunities"]["gam_network_id"] = value("123456789");
     document["auction"]["providers"]["pbs-main"] = toml_edit::table();
@@ -165,7 +166,7 @@ fn migrated_config_applies_boolean_environment_overrides() {
     assert_eq!(
         envelope["data"]["integrations"]["gpt"]["gam_attribution_enabled"],
         serde_json::Value::Bool(true),
-        "pushed config should contain the GAM attribution environment override"
+        "pushed config should contain the GAM attribution environment override: {envelope}"
     );
     assert_eq!(
         envelope["data"]["creative_opportunities"]["enabled"],

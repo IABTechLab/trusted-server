@@ -132,9 +132,8 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, handle_page_bids,
-    handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
-    publisher_response_into_streaming_response,
+    AuctionDispatch, PAGE_BIDS_PATH, handle_page_bids, handle_publisher_request,
+    handle_tsjs_dynamic, page_bids_preflight_denied, publisher_response_into_streaming_response,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -143,6 +142,7 @@ use trusted_server_core::request_signing::{
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
+use trusted_server_core::trace_cookie::handle_trace_mode;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
@@ -193,6 +193,25 @@ pub(crate) fn build_state(
     stores: &RuntimeStoreConfig,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     build_state_from_settings(load_settings_from_config_store(stores)?)
+}
+
+pub(crate) async fn dispatch_reserved_for_state(
+    state: &Arc<AppState>,
+    req: Request,
+) -> Option<Response> {
+    if !state.registry.has_reserved_path(req.uri().path()) {
+        return None;
+    }
+    let ctx = RequestContext::new(req, edgezero_core::params::PathParams::default());
+    let services = build_per_request_services(state, &ctx);
+    Some(
+        state
+            .registry
+            .handle_reserved_proxy(&state.settings, &services, ctx.into_request())
+            .await
+            .expect("reserved path should have a hard-cutover handler")
+            .unwrap_or_else(|report| http_error(&report)),
+    )
 }
 
 pub(crate) fn load_settings_from_config_store(
@@ -322,8 +341,8 @@ fn publisher_fallback_methods() -> [Method; 7] {
     ]
 }
 
-fn uses_dynamic_tsjs_fallback(method: &Method, path: &str) -> bool {
-    *method == Method::GET && path.starts_with("/static/tsjs=")
+fn uses_dynamic_tsjs_fallback(_method: &Method, path: &str) -> bool {
+    path.starts_with("/static/tsjs=")
 }
 
 // ---------------------------------------------------------------------------
@@ -667,6 +686,7 @@ async fn run_named_route(
         }
         NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
+        NamedRouteHandler::TraceMode => handle_trace_mode(&state.settings, req.uri().query()),
         NamedRouteHandler::Auction => {
             // The auction reads consent data, so the consent KV store must be
             // available — fail closed with 503 when it is configured but
@@ -1086,6 +1106,7 @@ enum NamedRouteHandler {
     Identify,
     SetTester,
     ClearTester,
+    TraceMode,
     Auction,
     PageBids,
     FirstPartyProxy,
@@ -1187,6 +1208,11 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         handler: NamedRouteHandler::ClearTester,
     },
     NamedRoute {
+        path: "/_ts/trace",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::TraceMode,
+    },
+    NamedRoute {
         path: "/auction",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::Auction,
@@ -1198,15 +1224,12 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         primary_methods: &[Method::GET, Method::OPTIONS],
         handler: NamedRouteHandler::PageBids,
     },
-    // Deprecated double-underscore alias. tsjs bundles served before the
-    // `/_ts/page-bids` rename keep requesting this path from already-loaded
-    // pages and browser caches; dropping it would strand SPA navigations
-    // without ads until those bundles age out. See `PAGE_BIDS_LEGACY_PATH`;
-    // removal is tracked by IABTechLab/trusted-server#970.
+    // A removed route must be denied here, before the publisher fallback, so
+    // its response is always a local unknown-route result rather than an alias.
     NamedRoute {
-        path: PAGE_BIDS_LEGACY_PATH,
-        primary_methods: &[Method::GET, Method::OPTIONS],
-        handler: NamedRouteHandler::PageBids,
+        path: "/__ts/page-bids",
+        primary_methods: LEGACY_ADMIN_DENY_METHODS,
+        handler: NamedRouteHandler::LegacyAdminDenied,
     },
     NamedRoute {
         path: "/first-party/proxy",
@@ -1358,19 +1381,20 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    #[cfg(feature = "aps-runner-proxy-integration-test")]
+    use super::dispatch_reserved_for_state;
     use super::{
-        AppState, AuctionDispatch, EcContext, EdgeCacheHeader, HandlerFuture, NAMED_ROUTES,
-        NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RuntimeStoreConfig,
-        TrustedServerApp, build_orchestrator_with_plan, build_per_request_services,
-        build_state_from_settings, compile_auction_plan, handle_publisher_request,
-        publisher_response_into_streaming_response, startup_error_router,
+        AppState, AuctionDispatch, EcContext, EdgeCacheHeader, EnvConfig, HandlerFuture,
+        NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_PATH, RuntimeStoreConfig, TrustedServerApp,
+        build_orchestrator_with_plan, build_per_request_services, build_state_from_settings,
+        compile_auction_plan, handle_publisher_request, publisher_response_into_streaming_response,
+        startup_error_router,
     };
     use base64::Engine as _;
     use bytes::Bytes;
     use edgezero_core::app::Hooks as _;
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
-    use edgezero_core::env_config::EnvConfig;
     use edgezero_core::http::{Method, Response, StatusCode, header, request_builder};
     use edgezero_core::key_value_store::NoopKvStore;
     use edgezero_core::params::PathParams;
@@ -1551,6 +1575,11 @@ mod tests {
             username = "admin"
             password = "admin-pass"
 
+            [[handlers]]
+            path = "^/integrations/aps"
+            username = "aps-user"
+            password = "aps-pass"
+
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
@@ -1571,6 +1600,11 @@ mod tests {
             [integrations.prebid]
             enabled = true
             external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
+
+            [integrations.aps]
+            enabled = true
+            account_id = "route-test-aps-account"
+            allow_script_creatives = true
 
             [auction]
             enabled = true
@@ -1617,6 +1651,103 @@ mod tests {
                 )
                 .into_bytes()
         );
+    }
+
+    #[cfg(feature = "aps-runner-proxy-integration-test")]
+    fn route_reserved(request: edgezero_core::http::Request) -> Response {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        block_on(dispatch_reserved_for_state(&state, request))
+            .expect("APS family should be reserved")
+    }
+
+    #[cfg(feature = "aps-runner-proxy-integration-test")]
+    #[test]
+    fn aps_cutover_renderer_and_family_failures_are_local() {
+        let response = route_reserved(empty_request(Method::GET, "/integrations/aps/renderer/v2"));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        assert!(!response.headers().contains_key("x-frame-options"));
+        let body = response.into_body().into_bytes().unwrap_or_default();
+        let body = std::str::from_utf8(&body).expect("renderer should be UTF-8");
+        assert!(body.contains("TS APS Bootstrap Ready"));
+        assert!(body.contains("TS APS Bootstrap Configure"));
+        assert!(body.contains("/integrations/aps/runner.js"));
+        assert!(body.contains("data:text/html;charset=utf-8,"));
+        assert!(!body.contains("client.aps.amazon-adsystem.com"));
+
+        for (method, path, expected) in [
+            (
+                Method::POST,
+                "/integrations/aps/runner.js",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                Method::TRACE,
+                "/integrations/aps/renderer/v2",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                Method::CONNECT,
+                "/integrations/aps/renderer/v2",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                Method::from_bytes(b"PROPFIND").expect("PROPFIND should be a valid method"),
+                "/integrations/aps/renderer/v2",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                Method::GET,
+                "/integrations/aps/renderer",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
+                "/integrations/aps/renderer/v1",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
+                "/integrations/aps/runner/v1.js",
+                StatusCode::NOT_FOUND,
+            ),
+            (Method::GET, "/integrations/aps", StatusCode::NOT_FOUND),
+        ] {
+            let mut request = empty_request(method.clone(), path);
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                "Bearer must-not-reach-publisher"
+                    .parse()
+                    .expect("should parse authorization header"),
+            );
+            let response = route_reserved(request);
+            assert_eq!(response.status(), expected, "{method} {path}");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert!(!response.headers().contains_key(HEADER_X_GEO_INFO_AVAILABLE));
+            if expected == StatusCode::METHOD_NOT_ALLOWED {
+                assert_eq!(response.headers()[header::ALLOW], "GET");
+            }
+            assert!(
+                response
+                    .into_body()
+                    .into_bytes()
+                    .unwrap_or_default()
+                    .is_empty()
+            );
+        }
+
+        let response = route(
+            &test_router(),
+            empty_request(Method::GET, "/integrations/apsx"),
+        );
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// Builds a router whose `AppState` uses a registry containing the given
@@ -1720,8 +1851,27 @@ mod tests {
 
     #[test]
     fn startup_registers_aps_renderer_route() {
-        let mut settings = test_settings();
-        settings.auction.providers.clear();
+        let mut settings = Settings::from_toml(
+            r#"
+                [[handlers]]
+                path = "^/_ts/admin"
+                username = "admin"
+                password = "admin-password"
+
+                [publisher]
+                domain = "publisher.example"
+                cookie_domain = ".publisher.example"
+                origin_url = "https://origin.publisher.example"
+                proxy_secret = "fictional-proxy-secret"
+
+                [ec]
+                passphrase = "fictional-secret-key-32-bytes-minimum"
+
+                [auction]
+                enabled = true
+            "#,
+        )
+        .expect("should parse APS startup settings");
         settings.auction.providers.insert(
             "aps-main".parse().expect("should parse APS provider ID"),
             trusted_server_core::auction::ProviderConfig {
@@ -1738,11 +1888,10 @@ mod tests {
         let state = build_state_from_settings(settings)
             .expect("Fastly startup should register APS renderer");
         assert!(
-            state.registry.has_route(
-                &edgezero_core::http::Method::GET,
-                "/integrations/aps/renderer"
-            ),
-            "Fastly startup registry should expose the APS renderer"
+            state
+                .registry
+                .has_reserved_path("/integrations/aps/renderer/v2"),
+            "Fastly startup registry should reserve the APS v2 renderer"
         );
     }
 
@@ -1785,18 +1934,18 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_tsjs_fallback_is_get_only() {
+    fn dynamic_tsjs_fallback_rejects_every_wrong_method_locally() {
         assert!(
             super::uses_dynamic_tsjs_fallback(&Method::GET, "/static/tsjs=tsjs-unified.js"),
             "GET should use the dynamic tsjs shortcut"
         );
         assert!(
-            !super::uses_dynamic_tsjs_fallback(&Method::HEAD, "/static/tsjs=tsjs-unified.js"),
-            "HEAD should fall through to the publisher/integration fallback"
+            super::uses_dynamic_tsjs_fallback(&Method::HEAD, "/static/tsjs=tsjs-unified.js"),
+            "HEAD should use the local TSJS rejection path"
         );
         assert!(
-            !super::uses_dynamic_tsjs_fallback(&Method::OPTIONS, "/static/tsjs=tsjs-unified.js"),
-            "OPTIONS should fall through to the publisher/integration fallback"
+            super::uses_dynamic_tsjs_fallback(&Method::OPTIONS, "/static/tsjs=tsjs-unified.js"),
+            "OPTIONS should use the local TSJS rejection path"
         );
     }
 
@@ -1925,83 +2074,29 @@ mod tests {
     }
 
     #[test]
-    fn admin_ec_lookup_routes_are_registered() {
-        // Both lookup shapes must be explicitly routed to the admin EC
-        // handler: the bare cookie-based route and the parameterized route.
-        // Leaving either unrouted would fall through to the publisher
-        // fallback, forwarding the caller's `Authorization` header to the
-        // origin.
-        for path in ["/_ts/admin/ec", "/_ts/admin/ec/{id}"] {
-            let route = NAMED_ROUTES
-                .iter()
-                .find(|route| route.path == path)
-                .unwrap_or_else(|| panic!("{path} must be a named route"));
-            assert!(
-                matches!(route.handler, NamedRouteHandler::AdminEcLookup),
-                "{path} must map to the admin EC lookup handler"
-            );
-            assert_eq!(
-                route.primary_methods,
-                &[Method::GET],
-                "{path} must have GET as its only primary method"
-            );
-        }
-
-        let eids_route = NAMED_ROUTES
-            .iter()
-            .find(|route| route.path == "/_ts/admin/eids")
-            .expect("should register /_ts/admin/eids as a named route");
-        assert!(
-            matches!(eids_route.handler, NamedRouteHandler::AdminEidsLookup),
-            "/_ts/admin/eids must map to the admin EIDs lookup handler"
-        );
-        assert_eq!(
-            eids_route.primary_methods,
-            &[Method::GET],
-            "/_ts/admin/eids must have GET as its only primary method"
-        );
-    }
-
-    #[test]
-    fn page_bids_serves_canonical_path_and_deprecated_alias() {
-        // The SPA re-auction endpoint lives at the canonical single-underscore
-        // `/_ts/page-bids`, matching every other internal route. The deprecated
-        // `/__ts/page-bids` alias must stay registered to the same handler with
-        // the same methods until pre-rename tsjs bundles age out of browser
-        // caches — dropping it would leave those clients without ads on SPA
-        // navigations.
-        //
-        // The paths are literals, not `PAGE_BIDS_PATH` / `PAGE_BIDS_LEGACY_PATH`.
-        // Looking a route up by the same const it was registered with is
-        // tautological: it keeps passing if the const's value changes, which is
-        // exactly the break that would silently desync the server from the tsjs
-        // client's hardcoded fetch path. Pin the consts to their literals too so
-        // a rename has to be deliberate.
+    fn page_bids_keeps_the_canonical_handler_and_denies_the_removed_alias_locally() {
+        // The hard cutover exposes only the canonical single-underscore page-bids
+        // handler. The removed path is an explicit local 404, never an alias or
+        // publisher-fallback route.
         assert_eq!(
             PAGE_BIDS_PATH, "/_ts/page-bids",
             "canonical page-bids path must match the path tsjs fetches"
         );
-        assert_eq!(
-            PAGE_BIDS_LEGACY_PATH, "/__ts/page-bids",
-            "legacy alias must match the path pre-rename tsjs bundles fetch"
-        );
-
-        for path in ["/_ts/page-bids", "/__ts/page-bids"] {
-            let route = NAMED_ROUTES
-                .iter()
-                .find(|route| route.path == path)
-                .unwrap_or_else(|| panic!("{path} should be registered"));
-
-            assert!(
-                matches!(route.handler, NamedRouteHandler::PageBids),
-                "{path} must map to the page-bids handler"
-            );
-            assert_eq!(
-                route.primary_methods,
-                &[Method::GET, Method::OPTIONS],
-                "{path} must handle GET and OPTIONS directly, not fall through to the publisher"
-            );
-        }
+        let route = NAMED_ROUTES
+            .iter()
+            .find(|route| route.path == "/_ts/page-bids")
+            .expect("canonical page-bids path should be registered");
+        assert!(matches!(route.handler, NamedRouteHandler::PageBids));
+        assert_eq!(route.primary_methods, &[Method::GET, Method::OPTIONS]);
+        let removed = NAMED_ROUTES
+            .iter()
+            .find(|route| route.path == "/__ts/page-bids")
+            .expect("removed page-bids path should be denied locally");
+        assert!(matches!(
+            removed.handler,
+            NamedRouteHandler::LegacyAdminDenied
+        ));
+        assert_eq!(removed.primary_methods, super::LEGACY_ADMIN_DENY_METHODS);
     }
 
     #[test]
@@ -2950,6 +3045,7 @@ mod tests {
                     enabled = true
 
                     [creative_opportunities]
+                    enabled = true
                     gam_network_id = "99999"
                     assembly_mode = "esi"
 

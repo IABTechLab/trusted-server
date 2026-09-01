@@ -19,6 +19,7 @@ crate-type = ["cdylib", "rlib"]
 default = []
 # Keep for explicit `cargo check --features cloudflare --target wasm32-unknown-unknown`
 cloudflare = ["edgezero-adapter-cloudflare/cloudflare", "dep:worker"]
+aps-runner-proxy-integration-test = ["trusted-server-core/test-utils"]
 
 [dependencies]
 async-trait = { workspace = true }

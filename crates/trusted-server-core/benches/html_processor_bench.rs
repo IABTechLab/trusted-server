@@ -8,6 +8,7 @@ use trusted_server_core::streaming_processor::StreamProcessor as _;
 fn make_config() -> HtmlProcessorConfig {
     HtmlProcessorConfig {
         csp_nonce_observed: None,
+        csp_nonce: None,
         origin_host: "origin.bench.example.com".to_string(),
         request_host: "proxy.bench.example.com".to_string(),
         request_scheme: "https".to_string(),
@@ -16,11 +17,9 @@ fn make_config() -> HtmlProcessorConfig {
         ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
         max_buffered_body_bytes: 16 * 1024 * 1024,
         gpt_diagnostics: None,
-        // The benchmark measures URL rewriting, not ad injection, and
-        // `ad_slots_script` is `None` here — matching the previous behaviour,
-        // which inferred no body-close work from that.
-        body_close: BodyCloseInjection::None,
+        render_trace_overlay: false,
         suppress_datadome_client_side_tag: false,
+        body_close: BodyCloseInjection::None,
     }
 }
 

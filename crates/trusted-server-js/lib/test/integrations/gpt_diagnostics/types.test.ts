@@ -12,7 +12,6 @@ import type {
   GptDiagnosticsResponseClass,
   GptDiagnosticsSlotExport,
   Size,
-  TsjsApi,
 } from '../../../src/core/types';
 
 describe('GPT diagnostics public types', () => {
@@ -49,31 +48,6 @@ describe('GPT diagnostics public types', () => {
     expectTypeOf(readOnlyApi).toEqualTypeOf<GptDiagnosticsApi>();
   });
 
-  it('accepts legacy V1 snapshots without attribution evidence', () => {
-    const legacySnapshot: GptDiagnosticsExportV1 = {
-      version: 1,
-      capturedAt: '2026-08-04T00:00:00.000Z',
-      page: { origin: 'https://example.com', pathname: '/' },
-      slots: [],
-      callbackIssues: [],
-      coverage: {
-        slotRequested: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
-        slotResponseReceived: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
-        slotRenderEnded: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
-        slotOnload: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
-        impressionViewable: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
-        slotVisibilityChanged: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
-      },
-      metadata: {
-        droppedCallbacks: 0,
-        evictedSlots: 0,
-        evictedRequestCycles: 0,
-      },
-    };
-
-    expect(legacySnapshot.version).toBe(1);
-  });
-
   it('keeps evidence writers off the operator API and on the internal channel', () => {
     expectTypeOf<keyof GptDiagnosticsApi>().toEqualTypeOf<
       'snapshot' | 'export' | 'subscribe' | 'show' | 'hide'
@@ -84,10 +58,6 @@ describe('GPT diagnostics public types', () => {
       | 'recordTrustedServerCreativeRequest'
       | 'recordTrustedServerCreativeResponse'
       | 'recordTrustedServerCreativeFailure'
-    >();
-    expectTypeOf<TsjsApi['gptDiagnostics']>().toEqualTypeOf<GptDiagnosticsApi | undefined>();
-    expectTypeOf<TsjsApi['gptDiagnosticsRecorder']>().toEqualTypeOf<
-      GptDiagnosticsRecorder | undefined
     >();
   });
 
@@ -180,11 +150,9 @@ describe('GPT diagnostics public types', () => {
     expectTypeOf(evidenceCycle.requestedSlotSizes).toEqualTypeOf<ReadonlyArray<Size> | undefined>();
     expectTypeOf(evidenceCycle.observedSlotSize).toEqualTypeOf<Size | undefined>();
     expectTypeOf(evidenceSnapshot.attributionIssues).toEqualTypeOf<
-      GptDiagnosticsAttributionIssue[] | undefined
+      readonly Readonly<GptDiagnosticsAttributionIssue>[]
     >();
-    expectTypeOf(evidenceSnapshot.metadata.droppedAttributionIssues).toEqualTypeOf<
-      number | undefined
-    >();
+    expectTypeOf(evidenceSnapshot.metadata.droppedAttributionIssues).toEqualTypeOf<number>();
     expectTypeOf<GptDiagnosticsAttributionIssueReason>().toEqualTypeOf<
       | 'creative_request_without_slot'
       | 'creative_request_without_cycle'

@@ -1,0 +1,32 @@
+spin_manifest_version = 2
+
+[application]
+name = "trusted-server-aps-runner-proxy-integration"
+version = "0.1.0"
+
+[variables]
+v_trusted_x5fserver_x5fconfig = { required = true }
+aps_runner_proxy_test_endpoint = { required = true }
+v_trusted_x5fserver_x5fsecrets_v_integration_x5fadmin_x5fpassword = { required = true, secret = true }
+v_trusted_x5fserver_x5fsecrets_v_integration_x5fproxy_x5fsecret = { required = true, secret = true }
+v_trusted_x5fserver_x5fsecrets_v_integration_x5fec_x5fpassphrase = { required = true, secret = true }
+v_trusted_x5fserver_x5fsecrets_v_integration_x5fpartner_x5ftoken_x5falpha = { required = true, secret = true }
+v_trusted_x5fserver_x5fsecrets_v_integration_x5fpartner_x5ftoken_x5fbravo = { required = true, secret = true }
+
+[[trigger.http]]
+route = "/..."
+component = "trusted-server"
+
+[component.trusted-server]
+source = "__APS_RUNNER_PROXY_WASM__"
+allowed_outbound_hosts = ["http://127.0.0.1:*"]
+key_value_stores = ["default"]
+
+[component.trusted-server.variables]
+v_trusted_x5fserver_x5fconfig = "{{ v_trusted_x5fserver_x5fconfig }}"
+aps_runner_proxy_test_endpoint = "{{ aps_runner_proxy_test_endpoint }}"
+v_trusted_x5fserver_x5fsecrets_v_integration_x5fadmin_x5fpassword = "{{ v_trusted_x5fserver_x5fsecrets_v_integration_x5fadmin_x5fpassword }}"
+v_trusted_x5fserver_x5fsecrets_v_integration_x5fproxy_x5fsecret = "{{ v_trusted_x5fserver_x5fsecrets_v_integration_x5fproxy_x5fsecret }}"
+v_trusted_x5fserver_x5fsecrets_v_integration_x5fec_x5fpassphrase = "{{ v_trusted_x5fserver_x5fsecrets_v_integration_x5fec_x5fpassphrase }}"
+v_trusted_x5fserver_x5fsecrets_v_integration_x5fpartner_x5ftoken_x5falpha = "{{ v_trusted_x5fserver_x5fsecrets_v_integration_x5fpartner_x5ftoken_x5falpha }}"
+v_trusted_x5fserver_x5fsecrets_v_integration_x5fpartner_x5ftoken_x5fbravo = "{{ v_trusted_x5fserver_x5fsecrets_v_integration_x5fpartner_x5ftoken_x5fbravo }}"
