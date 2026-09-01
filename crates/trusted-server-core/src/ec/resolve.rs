@@ -243,10 +243,11 @@ pub fn handle_ec_resolve(
 /// Whether the request's `Origin` is one this deployment authorizes to set
 /// identity.
 ///
-/// The comparison is on the whole serialized origin, being the scheme, the
-/// lowercased host and the effective port. `https://{publisher.domain}` is
-/// always accepted and `[ec] resolve_allowed_origins` adds further exact
-/// origins. A subdomain of the publisher is not accepted unless it is listed,
+/// The comparison is the same-origin test of RFC 6454 §5, so two origins
+/// match only when their scheme, host and port triples (RFC 6454 §4) are
+/// equal, with a missing port standing for the scheme's default. See
+/// [`origins_match`]. `https://{publisher.domain}` is always accepted and
+/// `[ec] resolve_allowed_origins` adds further origins. A subdomain of the publisher is not accepted unless it is listed,
 /// because the Edge Cookie is scoped to the parent domain, so a delegated or
 /// compromised sibling host would otherwise be able to fix an identity that
 /// lands on the apex and every sibling with it.
@@ -274,21 +275,31 @@ fn origin_is_publisher(req: &Request<EdgeBody>, settings: &Settings) -> bool {
         .any(|allowed| origins_match(origin, allowed))
 }
 
-/// Whether two serialized origins are the same origin.
+/// Whether two serialized origins are the same origin under RFC 6454.
 ///
-/// The scheme and host are compared case-insensitively because both are
-/// case-insensitive in a URL, and everything else has to match byte for byte.
-/// A port is part of the origin, so `https://example.com:8443` and
-/// `https://example.com` are different origins and neither is normalized away.
+/// Each side must be a serialized origin as RFC 6454 §6.1 defines it, being
+/// a scheme, `://` and a host with an optional port and nothing after it, so a
+/// value carrying a path, query or fragment is not an origin and never
+/// matches. The two are then compared as the scheme, host and port triple of
+/// RFC 6454 §4, which is the same-origin test of §5. The scheme and host are
+/// case-insensitive and a missing port stands for the scheme's default, so a
+/// configured `https://www.example.com:443` matches the `https://www.example.com`
+/// a browser sends, while `http://` or another port never matches. The
+/// opaque `null` origin (RFC 6454 §6.2) is never the same as anything.
 fn origins_match(candidate: &str, allowed: &str) -> bool {
-    let split = |origin: &str| -> Option<(String, String)> {
-        let (scheme, rest) = origin.split_once("://")?;
-        if rest.is_empty() || rest.contains('/') {
+    let parse = |origin: &str| -> Option<url::Origin> {
+        let url = url::Url::parse(origin).ok()?;
+        let is_bare_origin = url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && !origin.trim_end().ends_with('/');
+        if !is_bare_origin {
             return None;
         }
-        Some((scheme.to_ascii_lowercase(), rest.to_ascii_lowercase()))
+        let origin = url.origin();
+        origin.is_tuple().then_some(origin)
     };
-    match (split(candidate), split(allowed)) {
+    match (parse(candidate), parse(allowed)) {
         (Some(candidate), Some(allowed)) => candidate == allowed,
         _ => false,
     }
@@ -901,6 +912,43 @@ mod tests {
             StatusCode::OK,
             "an operator should be able to authorize the origin their pages are served from"
         );
+    }
+
+    #[test]
+    fn origins_match_follows_rfc_6454() {
+        // Same triple, so the same origin (RFC 6454 §5), however it is written.
+        for (candidate, allowed) in [
+            ("https://www.example.com", "https://www.example.com:443"),
+            ("https://www.example.com", "HTTPS://WWW.EXAMPLE.COM"),
+            ("http://www.example.com", "http://www.example.com:80"),
+            (
+                "https://www.example.com:8443",
+                "https://www.example.com:8443",
+            ),
+        ] {
+            assert!(
+                origins_match(candidate, allowed),
+                "{candidate} and {allowed} should be the same origin"
+            );
+        }
+        // A different scheme, host or port is a different origin, and a value
+        // that is not a serialized origin (RFC 6454 §6.1) never matches.
+        for (candidate, allowed) in [
+            ("http://www.example.com", "https://www.example.com"),
+            ("https://www.example.com:8443", "https://www.example.com"),
+            ("https://sub.www.example.com", "https://www.example.com"),
+            ("https://www.example.com/", "https://www.example.com"),
+            ("https://www.example.com/path", "https://www.example.com"),
+            ("https://www.example.com?x=1", "https://www.example.com"),
+            ("null", "https://www.example.com"),
+            ("null", "null"),
+            ("www.example.com", "www.example.com"),
+        ] {
+            assert!(
+                !origins_match(candidate, allowed),
+                "{candidate} and {allowed} should not be the same origin"
+            );
+        }
     }
 
     #[test]

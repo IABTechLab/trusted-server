@@ -521,11 +521,13 @@ pub struct Ec {
     ///
     /// The endpoint always accepts `https://{publisher.domain}` and nothing
     /// else by default. A publisher whose pages are served from another origin,
-    /// `www` being the common case, lists those origins here. Each entry is
-    /// compared as a whole serialized origin, so the scheme, the host and any
-    /// non-default port all have to match. A suffix or subdomain match is never
-    /// performed, because control of a DNS namespace does not make every host
-    /// under it a trusted identity-setting origin.
+    /// `www` being the common case, lists those origins here. Each entry is a
+    /// serialized origin (RFC 6454 §6.1) and is compared with the request's
+    /// `Origin` by the same-origin test of RFC 6454 §5, so the scheme, the host
+    /// and the port all have to match, with a missing port meaning the scheme's
+    /// default. A suffix or subdomain match is never performed, because control
+    /// of a DNS namespace does not make every host under it a trusted
+    /// identity-setting origin.
     #[serde(default)]
     pub resolve_allowed_origins: Vec<String>,
     #[serde(default)]
