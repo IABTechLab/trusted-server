@@ -1215,7 +1215,7 @@ different evidence.
 
 ## 5. Size and sequencing
 
-The ordinary mutator API in §§2–3 is a modest headers-only feature with no
+The ordinary mutator API in §2 to §3 is a modest headers-only feature with no
 provider or permission-model coupling. It lands only with the real consumer
 required by §4 item 3; without one, scaffolding does not ship. The separately
 typed security channel in §4a is already that consumer's PR-specific contract:
