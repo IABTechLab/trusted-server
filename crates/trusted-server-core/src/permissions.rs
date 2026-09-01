@@ -17,22 +17,32 @@
 //! revokes each purpose, and a US-style opt-out revokes), and the Data Uses
 //! with no TCF purpose keep their configured baseline.
 //!
-//! How a permission is acquired varies by country, so resolution is keyed on the
-//! ISO 3166-1 country code a geo provider returns. [`PermissionMaps::standard`]
-//! loads the default country and region rules from the embedded
+//! How a permission is acquired varies by place, so the policy is written as a
+//! tree of places: the top of the tree stands for the whole world, countries
+//! sit under it keyed by ISO 3166-1 alpha-2 code, and a country's regions sit
+//! under that country keyed by ISO 3166-2 subdivision code.
+//! [`PermissionMaps::standard`] loads that tree from the embedded
 //! `permissions.yaml` (see `DEFAULT_PERMISSION_RULES`).
-//! When no country is identified (no geo provider, or a lookup that resolves
-//! nothing) or the resolved country/region has no rule, resolution uses the
-//! deployer's configured default country (`[geo] default_country`). With none
-//! configured, a permission is set only when the incoming signals explicitly
-//! grant it. A geo provider that reports an outright lookup failure is the
-//! exception, resolving every permission to the requires-signal floor rather
-//! than the default, though no geo provider shipped today reports one.
+//!
+//! Resolution takes the most specific match and falls back to the node above:
+//! the request's region when it is listed, otherwise its country, otherwise
+//! the top of the tree. So a request with no country at all (no geo provider,
+//! or a lookup that resolved nothing), and a request whose country has no rule,
+//! both resolve to the top node's group. The top node also declares the
+//! `jurisdiction` the consent gates use for a visitor whose place could not be
+//! resolved (see [`PermissionMaps::default_jurisdiction`]). A geo provider that
+//! reports an outright lookup failure is the exception, resolving every
+//! permission to the requires-signal floor rather than the top node (see
+//! [`PermissionMaps::floor_with`]), though no geo provider shipped today
+//! reports one.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use serde::Deserialize;
+use serde_yaml_ng::Value;
+
+use crate::consent::jurisdiction::Jurisdiction;
 
 /// A technical permission a provider may require, labeled with its IAB Privacy
 /// Taxonomy Data Use, or its IAB TCF Europe purpose where no Data Use exists yet.
@@ -453,19 +463,22 @@ fn build_signal_policy(spec: &SignalsSpec) -> Result<SignalPolicy, PermissionsEr
     Ok(policy)
 }
 
-/// Looks up the [`CountryRules`] for a request's country and region.
+/// The place tree from `permissions.yaml`, flattened for lookup.
 ///
 /// `by_country` is keyed on the ISO 3166-1 alpha-2 code a geo provider returns
-/// (upper-cased). [`PermissionMaps::standard`] populates it with a default set
-/// of country rules. `by_region` keeps optional, finer rules keyed by country
-/// and region (for example a US state), which take precedence over the country
-/// entry. A request whose country and region match no entry resolves to `None`
-/// from [`rules_for`](Self::rules_for); the caller substitutes the deployer's
-/// configured default country (see [`resolve_with`](Self::resolve_with)).
+/// (upper-cased). `by_region` keeps the finer rules written under a country,
+/// keyed by country and region (for example a US state), which take precedence
+/// over the country entry. `default_rules` is the top node's group, the answer
+/// for a request whose country and region are both unlisted, and for a request
+/// with no place at all.
 #[derive(Debug, Clone, Default)]
 pub struct PermissionMaps {
     by_country: BTreeMap<String, CountryRules>,
     by_region: BTreeMap<String, CountryRules>,
+    jurisdiction_by_country: BTreeMap<String, Jurisdiction>,
+    jurisdiction_by_region: BTreeMap<String, Jurisdiction>,
+    default_rules: Option<CountryRules>,
+    default_jurisdiction: Option<Jurisdiction>,
     signals: SignalPolicy,
 }
 
@@ -518,6 +531,64 @@ impl PermissionMaps {
         self
     }
 
+    /// Registers the top node's rules, which apply to a request whose country
+    /// and region are both unlisted, and to a request with no place at all.
+    ///
+    /// A map built without one resolves such a request at the requires-signal
+    /// floor, which is what [`PermissionMaps::empty`] does. Every map parsed
+    /// from a `permissions.yaml` has one, because the top node's `group` is
+    /// required.
+    #[must_use]
+    pub fn with_default_rules(mut self, rules: CountryRules) -> Self {
+        self.default_rules = Some(rules);
+        self
+    }
+
+    /// Registers the top node's jurisdiction, the consent handling for a
+    /// visitor whose place could not be resolved.
+    #[must_use]
+    pub fn with_default_jurisdiction(mut self, jurisdiction: Jurisdiction) -> Self {
+        self.default_jurisdiction = Some(jurisdiction);
+        self
+    }
+
+    /// The jurisdiction the policy declares for a visitor whose place the geo
+    /// provider could not resolve, taken from the top of the `rules:` tree.
+    ///
+    /// The consent gates resolve a jurisdiction from the request's place, so
+    /// with no place they would resolve [`Jurisdiction::Unknown`] and fail
+    /// closed even where the policy has declared what to do. This is that
+    /// declaration. A map with no top node (see [`PermissionMaps::empty`])
+    /// reports [`Jurisdiction::Unknown`].
+    #[must_use]
+    pub fn default_jurisdiction(&self) -> Jurisdiction {
+        self.default_jurisdiction.clone().unwrap_or_default()
+    }
+
+    /// The jurisdiction that applies to `country` and `region`.
+    ///
+    /// Walks the tree the same way [`rules_or_default`](Self::rules_or_default)
+    /// does: the region when it is listed, otherwise the country, otherwise the
+    /// top node. Inheritance is settled when the file is parsed, so every
+    /// listed place already carries the jurisdiction it inherits.
+    #[must_use]
+    pub fn jurisdiction_for(&self, country: Option<&str>, region: Option<&str>) -> Jurisdiction {
+        if let (Some(country), Some(region)) = (country, region)
+            && let Some(jurisdiction) = self
+                .jurisdiction_by_region
+                .get(&region_key(country, region))
+        {
+            return jurisdiction.clone();
+        }
+        if let Some(jurisdiction) = country
+            .map(str::to_ascii_uppercase)
+            .and_then(|code| self.jurisdiction_by_country.get(&code))
+        {
+            return jurisdiction.clone();
+        }
+        self.default_jurisdiction()
+    }
+
     /// The built-in default rules, parsed from the embedded `permissions.yaml`
     /// (see `DEFAULT_PERMISSION_RULES`).
     ///
@@ -538,14 +609,17 @@ impl PermissionMaps {
     }
 
     /// Builds the maps from a `permissions.yaml` document: named `groups`, the
-    /// `rules` that map a country or country/region to a group, and the
-    /// `signals` section that maps each session signal onto Data Uses.
+    /// `rules` tree of places, and the `signals` section that maps each session
+    /// signal onto Data Uses.
     ///
     /// # Errors
     ///
-    /// Returns [`PermissionsError`] when the YAML is malformed, names an unknown
-    /// group, permission, or acquisition flag, maps the same country or region
-    /// rule twice, or names an unknown Data Use in a signal's revoke list.
+    /// Returns [`PermissionsError`] when the YAML is malformed, the top of the
+    /// `rules` tree omits `group` or `jurisdiction`, a node below the top is
+    /// neither a group name nor a block carrying `group`, a node names an
+    /// unknown group, permission, or acquisition flag, two sibling place codes
+    /// name the same place, or a signal's revoke list names an unknown Data
+    /// Use.
     pub fn from_yaml(yaml: &str) -> Result<Self, PermissionsError> {
         let file: RulesFile =
             serde_yaml_ng::from_str(yaml).map_err(|error| PermissionsError::Parse {
@@ -559,37 +633,17 @@ impl PermissionMaps {
         }
 
         let mut maps = Self::empty();
-        // Rule keys are matched case-insensitively at lookup, so two spellings
-        // of one country or region would silently overwrite each other. Reject
-        // the collision instead.
-        let mut seen_rule_keys: BTreeMap<String, &str> = BTreeMap::new();
-        for (key, spec) in &file.rules {
-            if let Some(first) = seen_rule_keys.insert(key.to_ascii_uppercase(), key) {
-                return Err(PermissionsError::DuplicateRule {
-                    first: first.to_owned(),
-                    second: key.clone(),
-                });
-            }
-            let rules = match spec {
-                RuleSpec::Group(name) => resolve_group(&groups, name)?,
-                RuleSpec::Detailed(detail) => apply_modifications(
-                    resolve_group(&groups, &detail.group)?,
-                    &detail.permissions,
-                )?,
-            };
-            // A `country/region` key (for example `US/CA`) layers a region rule
-            // on top of its country; a bare `country` key sets the country rule.
-            match key.split_once('/') {
-                Some((country, region)) => maps = maps.with_region(country, region, rules),
-                None => maps = maps.with_country(key, rules),
-            }
-        }
+        build_rules_tree(&mut maps, &groups, &file.rules)?;
         maps.signals = build_signal_policy(&file.signals)?;
         Ok(maps)
     }
 
-    /// Returns the rules that apply to `country` and `region`, preferring a
-    /// region entry, then the country entry, or `None` when neither matches.
+    /// Returns the rules written for `country` and `region` exactly, preferring
+    /// a region entry, then the country entry, or `None` when neither is listed.
+    ///
+    /// This is the literal tree lookup with no fallback to the top node. Use
+    /// [`rules_or_default`](Self::rules_or_default) for the resolution a
+    /// request actually gets.
     #[must_use]
     pub fn rules_for(&self, country: Option<&str>, region: Option<&str>) -> Option<&CountryRules> {
         if let (Some(country), Some(region)) = (country, region)
@@ -602,51 +656,62 @@ impl PermissionMaps {
             .and_then(|code| self.by_country.get(&code))
     }
 
-    /// The rules for `country`/`region`, falling back to the configured default
-    /// location when the request's own country and region match no rule.
+    /// The rules a request resolves to: its region, else its country, else the
+    /// top node of the tree.
     ///
-    /// Returns `None` only when neither resolves (no default configured, or the
-    /// default itself has no rule), which the caller treats as the
-    /// requires-signal floor. In a validated deployment this is unreachable: a
-    /// default is required and checked at startup by
-    /// [`GeoConfig::validate_default_country`](crate::settings::GeoConfig::validate_default_country),
-    /// so a resolvable default always exists. The floor remains the behavior for
-    /// an unconfigured map, exercised by unit tests rather than reached at
-    /// runtime.
+    /// Returns `None` only for a map with no top node, which the caller treats
+    /// as the requires-signal floor. Every map parsed from a `permissions.yaml`
+    /// has one, because the top node's `group` is required, so this is
+    /// unreachable in a deployment and exists for maps built by hand in tests.
     pub(crate) fn rules_or_default(
         &self,
         country: Option<&str>,
         region: Option<&str>,
-        default_country: Option<&str>,
-        default_region: Option<&str>,
     ) -> Option<&CountryRules> {
         self.rules_for(country, region)
-            .or_else(|| self.rules_for(default_country, default_region))
+            .or(self.default_rules.as_ref())
     }
 
-    /// Resolves the permission state for a request: the country/region baseline
+    /// Resolves the permission state for a request: the place baseline
     /// augmented by a session signal.
     ///
     /// `country` and `region` are what a geo provider returns (`region` may be
-    /// `None`). `default_country`/`default_region` are the deployer's configured
-    /// default location, used when the request's own country and region match no
-    /// rule. When neither matches (no default configured, or the default has no
-    /// rule) every permission is `RequiresSignal`, so nothing is set without a
-    /// signal. `signal` maps each permission to a [`ConsentSignal`]; the caller
-    /// derives it from its consent model so this module stays independent of how
-    /// a signal is decoded. A `Granted` baseline is set unless the signal is
-    /// `Revoke`, a `RequiresSignal` baseline is set only on `Grant`, and `Denied`
-    /// is never set.
+    /// `None`). Whatever the tree does not answer falls back to the node above,
+    /// ending at the top node, so an unlisted country and a request with no
+    /// country at all both resolve to the top node's group. `signal` maps each
+    /// permission to a [`ConsentSignal`]; the caller derives it from its consent
+    /// model so this module stays independent of how a signal is decoded. A
+    /// `Granted` baseline is set unless the signal is `Revoke`, a
+    /// `RequiresSignal` baseline is set only on `Grant`, and `Denied` is never
+    /// set.
     #[must_use]
     pub fn resolve_with(
         &self,
         country: Option<&str>,
         region: Option<&str>,
-        default_country: Option<&str>,
-        default_region: Option<&str>,
         signal: impl Fn(Permission) -> ConsentSignal,
     ) -> PermissionState {
-        let rules = self.rules_or_default(country, region, default_country, default_region);
+        Self::resolve_rules(self.rules_or_default(country, region), signal)
+    }
+
+    /// Resolves every permission at the requires-signal floor, whatever the
+    /// policy tree says.
+    ///
+    /// This is the state for a geo provider that reported an outright lookup
+    /// failure. The request's place is unknown in a way the policy's top node
+    /// must not paper over, so nothing is set unless the session's signals
+    /// grant it.
+    #[must_use]
+    pub fn floor_with(signal: impl Fn(Permission) -> ConsentSignal) -> PermissionState {
+        Self::resolve_rules(None, signal)
+    }
+
+    /// Applies `signal` against `rules`, or against the requires-signal floor
+    /// when no rules resolved.
+    fn resolve_rules(
+        rules: Option<&CountryRules>,
+        signal: impl Fn(Permission) -> ConsentSignal,
+    ) -> PermissionState {
         let acquisition =
             |permission| rules.map_or(Acquisition::RequiresSignal, |r| r.rule_for(permission));
         let set = Permission::all()
@@ -667,19 +732,11 @@ impl PermissionMaps {
     /// signal.
     ///
     /// Permissions exist without a consent model, so this is the set of
-    /// `Granted` permissions for the location (or the configured default), and is
-    /// what a request resolves to when no signal is present.
+    /// `Granted` permissions for the place (or the top node it falls back to),
+    /// and is what a request resolves to when no signal is present.
     #[must_use]
-    pub fn baseline(
-        &self,
-        country: Option<&str>,
-        region: Option<&str>,
-        default_country: Option<&str>,
-        default_region: Option<&str>,
-    ) -> PermissionState {
-        self.resolve_with(country, region, default_country, default_region, |_| {
-            ConsentSignal::Neutral
-        })
+    pub fn baseline(&self, country: Option<&str>, region: Option<&str>) -> PermissionState {
+        self.resolve_with(country, region, |_| ConsentSignal::Neutral)
     }
 
     /// Convenience over [`resolve_with`](Self::resolve_with) for a boolean
@@ -689,10 +746,9 @@ impl PermissionMaps {
     pub fn resolve(
         &self,
         country: Option<&str>,
-        default_country: Option<&str>,
         signal: impl Fn(Permission) -> bool,
     ) -> PermissionState {
-        self.resolve_with(country, None, default_country, None, |permission| {
+        self.resolve_with(country, None, |permission| {
             if signal(permission) {
                 ConsentSignal::Grant
             } else {
@@ -788,9 +844,11 @@ struct RulesFile {
     /// permission it omits.
     #[serde(default)]
     groups: BTreeMap<String, BTreeMap<String, String>>,
-    /// Rules keyed by country (`FR`) or country and region (`US/CA`).
+    /// The `rules` tree of places. Walked by [`build_rules_tree`] rather than
+    /// deserialized into a fixed shape, because every key below the reserved
+    /// words is a place code chosen by the policy owner.
     #[serde(default)]
-    rules: BTreeMap<String, RuleSpec>,
+    rules: Value,
     /// How each session signal maps onto Data Uses.
     #[serde(default)]
     signals: SignalsSpec,
@@ -864,28 +922,14 @@ fn default_true() -> bool {
     true
 }
 
-/// A rule entry: either a bare group name, or a group with explicit
-/// per-permission acquisition overrides applied on top.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum RuleSpec {
-    /// A bare group name, for example `gdpr-eu`.
-    Group(String),
-    /// A group with per-permission overrides.
-    Detailed(DetailedRuleSpec),
-}
+/// The reserved key naming a node's permission group.
+const KEY_GROUP: &str = "group";
 
-/// A rule with a `permissions` map of Data Use to acquisition rule
-/// (`granted`, `requires_signal`, or `denied`), each overriding the group's
-/// baseline for that Data Use. Unknown keys are rejected so a mistyped field
-/// fails loudly.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DetailedRuleSpec {
-    group: String,
-    #[serde(default)]
-    permissions: BTreeMap<String, String>,
-}
+/// The reserved key naming the top node's jurisdiction.
+const KEY_JURISDICTION: &str = "jurisdiction";
+
+/// The reserved key holding a node's per-permission overrides.
+const KEY_PERMISSIONS: &str = "permissions";
 
 /// Resolves an acquisition rule name to its [`Acquisition`].
 fn parse_acquisition(value: &str) -> Result<Acquisition, PermissionsError> {
@@ -970,12 +1014,235 @@ fn apply_modifications(
     Ok(rules)
 }
 
+/// One node of the `rules` tree, resolved into its rules, the jurisdiction it
+/// names (when it names one), and the child place codes written beside them.
+struct RuleNode<'a> {
+    /// The node's group, with any `permissions` overrides applied.
+    rules: CountryRules,
+    /// The `jurisdiction:` value written on this node, or `None` when the node
+    /// inherits the one above it.
+    jurisdiction: Option<&'a str>,
+    /// The child place codes, in document order, each still unparsed.
+    children: Vec<(&'a str, &'a Value)>,
+}
+
+/// Parses one node of the `rules` tree.
+///
+/// A node written as a plain string is the shorthand: the string is its group,
+/// it names no jurisdiction, and it has no children. A node written as a block
+/// must carry a `group:` line, may carry a `jurisdiction:` line and a
+/// `permissions:` map of overrides, and may carry child place codes beside
+/// them. `path` names the node for error messages (`"US"`, `"US/CA"`, or the
+/// top of the tree).
+fn parse_rule_node<'a>(
+    groups: &BTreeMap<String, CountryRules>,
+    path: &str,
+    value: &'a Value,
+) -> Result<RuleNode<'a>, PermissionsError> {
+    match value {
+        Value::String(name) => Ok(RuleNode {
+            rules: resolve_group(groups, name)?,
+            jurisdiction: None,
+            children: Vec::new(),
+        }),
+        Value::Mapping(map) => {
+            let group = map.get(KEY_GROUP).and_then(Value::as_str).ok_or_else(|| {
+                PermissionsError::MissingGroup {
+                    path: path.to_owned(),
+                }
+            })?;
+            let mut rules = resolve_group(groups, group)?;
+            if let Some(overrides) = map.get(KEY_PERMISSIONS) {
+                let overrides: BTreeMap<String, String> =
+                    serde_yaml_ng::from_value(overrides.clone()).map_err(|error| {
+                        PermissionsError::Parse {
+                            message: format!("`{KEY_PERMISSIONS}` under `{path}`: {error}"),
+                        }
+                    })?;
+                rules = apply_modifications(rules, &overrides)?;
+            }
+            let jurisdiction =
+                match map.get(KEY_JURISDICTION) {
+                    Some(value) => Some(value.as_str().ok_or_else(|| {
+                        PermissionsError::UnknownJurisdiction {
+                            value: format!("{value:?}"),
+                        }
+                    })?),
+                    None => None,
+                };
+            let mut children = Vec::new();
+            for (key, child) in map {
+                let key = key.as_str().ok_or_else(|| PermissionsError::InvalidRule {
+                    path: path.to_owned(),
+                })?;
+                if key == KEY_GROUP || key == KEY_PERMISSIONS || key == KEY_JURISDICTION {
+                    continue;
+                }
+                children.push((key, child));
+            }
+            Ok(RuleNode {
+                rules,
+                jurisdiction,
+                children,
+            })
+        }
+        _ => Err(PermissionsError::InvalidRule {
+            path: path.to_owned(),
+        }),
+    }
+}
+
+/// Resolves a `jurisdiction:` value written on the node at `path`.
+///
+/// `region` is the node's own ISO 3166-2 code, or `None` for the top of the
+/// tree and for a country. `us-state` carries no code of its own, because the
+/// node naming it is the state, so it is rejected wherever there is no region
+/// to name.
+fn parse_jurisdiction(
+    path: &str,
+    region: Option<&str>,
+    value: &str,
+) -> Result<Jurisdiction, PermissionsError> {
+    if value == "us-state" && region.is_none() {
+        return Err(PermissionsError::MisplacedUsState {
+            path: path.to_owned(),
+        });
+    }
+    Jurisdiction::from_policy_name(value, region).ok_or_else(|| {
+        PermissionsError::UnknownJurisdiction {
+            value: value.to_owned(),
+        }
+    })
+}
+
+/// Walks the `rules` tree into `maps`: the top node, then the country nodes
+/// under it, then the region nodes under each country.
+///
+/// Each node's group and jurisdiction are settled here, so a node that names
+/// neither is stored carrying what it inherits from the node above it. The top
+/// node must name both, which is what makes inheritance always terminate.
+///
+/// The tree is three levels deep, because a geo provider returns a country and
+/// a region and nothing finer, so a place written under a region is rejected
+/// rather than silently ignored.
+fn build_rules_tree(
+    maps: &mut PermissionMaps,
+    groups: &BTreeMap<String, CountryRules>,
+    rules: &Value,
+) -> Result<(), PermissionsError> {
+    const TOP: &str = "the top of the tree";
+
+    if !matches!(rules, Value::Mapping(_)) {
+        return Err(PermissionsError::MissingGroup {
+            path: TOP.to_owned(),
+        });
+    }
+    let top = parse_rule_node(groups, TOP, rules)?;
+    let name = top
+        .jurisdiction
+        .ok_or(PermissionsError::MissingJurisdiction)?;
+    let top_jurisdiction = parse_jurisdiction(TOP, None, name)?;
+    maps.default_rules = Some(top.rules);
+    maps.default_jurisdiction = Some(top_jurisdiction.clone());
+
+    // Place codes are matched without regard to case at lookup, so two
+    // spellings of one place would silently overwrite each other. Reject the
+    // collision instead, among the siblings at each level.
+    let mut seen_countries: BTreeMap<String, &str> = BTreeMap::new();
+    for (country, node) in top.children {
+        check_duplicate(&mut seen_countries, country)?;
+        let node = parse_rule_node(groups, country, node)?;
+        let jurisdiction = match node.jurisdiction {
+            Some(name) => parse_jurisdiction(country, None, name)?,
+            None => top_jurisdiction.clone(),
+        };
+        let code = country.to_ascii_uppercase();
+        maps.by_country.insert(code.clone(), node.rules);
+        maps.jurisdiction_by_country
+            .insert(code, jurisdiction.clone());
+
+        let mut seen_regions: BTreeMap<String, &str> = BTreeMap::new();
+        for (region, child) in node.children {
+            let path = format!("{country}/{region}");
+            check_duplicate(&mut seen_regions, region)?;
+            let child = parse_rule_node(groups, &path, child)?;
+            if !child.children.is_empty() {
+                return Err(PermissionsError::NestedTooDeep { path });
+            }
+            let child_jurisdiction = match child.jurisdiction {
+                Some(name) => parse_jurisdiction(&path, Some(region), name)?,
+                None => jurisdiction.clone(),
+            };
+            let key = region_key(country, region);
+            maps.by_region.insert(key.clone(), child.rules);
+            maps.jurisdiction_by_region.insert(key, child_jurisdiction);
+        }
+    }
+    Ok(())
+}
+
+/// Records a place code among its siblings, erroring when another spelling of
+/// the same code is already there.
+fn check_duplicate<'a>(
+    seen: &mut BTreeMap<String, &'a str>,
+    key: &'a str,
+) -> Result<(), PermissionsError> {
+    if let Some(first) = seen.insert(key.to_ascii_uppercase(), key) {
+        return Err(PermissionsError::DuplicateRule {
+            first: first.to_owned(),
+            second: key.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Parses the compiled `permissions.yaml`, so startup validation can reject a
+/// malformed policy with a configuration error instead of panicking on the
+/// first lookup.
+///
+/// # Errors
+///
+/// Returns the same [`PermissionsError`] values [`PermissionMaps::from_yaml`]
+/// does, most usefully a top node that omits `group` or `jurisdiction`.
+pub fn validate_default_policy() -> Result<(), PermissionsError> {
+    PermissionMaps::from_yaml(DEFAULT_PERMISSION_RULES).map(|_| ())
+}
+
 /// An error parsing a `permissions.yaml` document.
 #[derive(Debug, derive_more::Display)]
 pub enum PermissionsError {
-    /// Two rule keys are the same country or region spelled differently.
-    #[display("rule keys `{first}` and `{second}` name the same location; keep one")]
+    /// Two sibling place codes are the same place spelled differently.
+    #[display("place codes `{first}` and `{second}` name the same place, so keep one")]
     DuplicateRule { first: String, second: String },
+    /// A node of the `rules` tree carried no `group`.
+    #[display(
+        "the rule for `{path}` needs a `group:` line (or write the group name on its own, as `GB: gdpr-uk`)"
+    )]
+    MissingGroup { path: String },
+    /// The top of the `rules` tree carried no `jurisdiction`.
+    #[display(
+        "the top of the `rules` tree needs a `jurisdiction:` line, naming the consent handling for a visitor whose place cannot be resolved"
+    )]
+    MissingJurisdiction,
+    /// A node with no region of its own named `us-state`.
+    #[display(
+        "the rule for `{path}` names `jurisdiction: us-state`, which only a region may name, because the region is the state"
+    )]
+    MisplacedUsState { path: String },
+    /// A `jurisdiction` value named something the consent model cannot
+    /// represent.
+    #[display(
+        "unknown jurisdiction `{value}` (expected gdpr, us-state, non-regulated, or unknown)"
+    )]
+    UnknownJurisdiction { value: String },
+    /// A node of the `rules` tree was neither a group name nor a block.
+    #[display("the rule for `{path}` must be a group name or a block with a `group:` line")]
+    InvalidRule { path: String },
+    /// A place was written under a region, deeper than a geo provider resolves.
+    #[display(
+        "the rule for `{path}` has places written under it; the tree stops at a region, because that is the finest place a geo provider returns"
+    )]
+    NestedTooDeep { path: String },
     /// The YAML was malformed or did not match the expected shape.
     #[display("failed to parse permission rules: {message}")]
     Parse { message: String },
@@ -1092,17 +1359,17 @@ mod tests {
 
     #[test]
     fn the_floor_sets_a_permission_only_when_a_signal_grants_it() {
-        // Empty maps and no default: every permission is the requires-signal
+        // Empty maps and no top node: every permission is the requires-signal
         // floor, set only when a signal grants it.
         let maps = PermissionMaps::default();
 
-        let denied = maps.resolve(Some("GB"), None, |_| false);
+        let denied = maps.resolve(Some("GB"), |_| false);
         assert!(
             !denied.is_set(Permission::StoreOnDevice),
             "the floor should not set necessary.operations.storage without a signal"
         );
 
-        let granted = maps.resolve(Some("GB"), None, |p| p == Permission::StoreOnDevice);
+        let granted = maps.resolve(Some("GB"), |p| p == Permission::StoreOnDevice);
         assert!(
             granted.is_set(Permission::StoreOnDevice),
             "the floor should set necessary.operations.storage once a signal grants it"
@@ -1110,46 +1377,65 @@ mod tests {
     }
 
     #[test]
-    fn unknown_country_uses_the_configured_default() {
-        // A map with a granted "us" rule, used as the default for unknown geo.
+    fn the_floor_ignores_the_top_node_even_where_one_grants() {
+        // A policy whose top node grants everything, so the only way the floor
+        // can leave the permission unset is by never consulting the tree. This
+        // is the geo lookup failure case.
         let maps = PermissionMaps::empty()
-            .with_country("us", CountryRules::with_default(Acquisition::Granted));
-        // No country, default US: the US (granted) rule applies.
+            .with_default_rules(CountryRules::with_default(Acquisition::Granted));
         assert!(
-            maps.resolve(None, Some("US"), |_| false)
-                .is_set(Permission::StoreOnDevice),
-            "the configured default should set permissions when geo gives no country"
+            maps.baseline(None, None).is_set(Permission::StoreOnDevice),
+            "the top node grants storage, or this test proves nothing"
         );
-        // No country and no default: the requires-signal floor sets nothing.
         assert!(
-            !maps
-                .resolve(None, None, |_| false)
+            !PermissionMaps::floor_with(|_| ConsentSignal::Neutral)
                 .is_set(Permission::StoreOnDevice),
-            "with no default, an unknown country sets nothing without a signal"
+            "the floor must not fall back to the top node"
         );
     }
 
     #[test]
-    fn a_matching_country_is_used_over_the_default() {
-        // US grants; the default points at an opt-in "de" rule.
+    fn an_unlisted_country_uses_the_top_node() {
+        // A map whose top node grants, so an unlisted country is answered by
+        // it rather than by the floor.
+        let maps = PermissionMaps::empty()
+            .with_default_rules(CountryRules::with_default(Acquisition::Granted));
+        assert!(
+            maps.resolve(Some("ZZ"), |_| false)
+                .is_set(Permission::StoreOnDevice),
+            "an unlisted country should resolve at the top node"
+        );
+        // No country at all resolves the same way.
+        assert!(
+            maps.resolve(None, |_| false)
+                .is_set(Permission::StoreOnDevice),
+            "no country should resolve at the top node too"
+        );
+        // With no top node the requires-signal floor sets nothing.
+        assert!(
+            !PermissionMaps::empty()
+                .resolve(None, |_| false)
+                .is_set(Permission::StoreOnDevice),
+            "with no top node, an unlisted country sets nothing without a signal"
+        );
+    }
+
+    #[test]
+    fn a_matching_country_is_used_over_the_top_node() {
+        // US grants; the top node requires a signal.
         let maps = PermissionMaps::empty()
             .with_country("us", CountryRules::with_default(Acquisition::Granted))
-            .with_country(
-                "de",
-                CountryRules::with_default(Acquisition::RequiresSignal),
-            );
-        // US has its own rule, used directly even when a default is configured.
+            .with_default_rules(CountryRules::with_default(Acquisition::RequiresSignal));
         assert!(
-            maps.resolve(Some("US"), Some("DE"), |_| false)
+            maps.resolve(Some("US"), |_| false)
                 .is_set(Permission::StoreOnDevice),
-            "a country with its own rule uses it, not the default"
+            "a country with its own rule uses it, not the top node"
         );
-        // An unmapped country falls through to the default (de, requires signal).
         assert!(
             !maps
-                .resolve(Some("ZZ"), Some("DE"), |_| false)
+                .resolve(Some("ZZ"), |_| false)
                 .is_set(Permission::StoreOnDevice),
-            "an unmapped country uses the default rule"
+            "an unlisted country falls back to the top node"
         );
     }
 
@@ -1159,7 +1445,7 @@ mod tests {
         let rules = CountryRules::with_default(Acquisition::Granted)
             .with_rule(Permission::StoreOnDevice, Acquisition::Denied);
         let maps = PermissionMaps::empty().with_country("zz", rules);
-        let state = maps.resolve(Some("ZZ"), None, |_| true);
+        let state = maps.resolve(Some("ZZ"), |_| true);
 
         assert!(
             !state.is_set(Permission::StoreOnDevice),
@@ -1196,7 +1482,7 @@ mod tests {
             .with_country("zz", CountryRules::with_default(Acquisition::Granted));
         assert!(
             granted
-                .resolve(Some("ZZ"), None, |_| false)
+                .resolve(Some("ZZ"), |_| false)
                 .is_set(Permission::StoreOnDevice),
             "a granted default should set with no signal"
         );
@@ -1207,13 +1493,13 @@ mod tests {
         );
         assert!(
             !opt_in
-                .resolve(Some("ZZ"), None, |_| false)
+                .resolve(Some("ZZ"), |_| false)
                 .is_set(Permission::StoreOnDevice),
             "a requires-signal default should not be set without a signal"
         );
         assert!(
             opt_in
-                .resolve(Some("ZZ"), None, |p| p == Permission::StoreOnDevice)
+                .resolve(Some("ZZ"), |p| p == Permission::StoreOnDevice)
                 .is_set(Permission::StoreOnDevice),
             "a requires-signal default should set once a signal grants it"
         );
@@ -1227,7 +1513,7 @@ mod tests {
         assert!(
             PermissionMaps::empty()
                 .with_country("zz", granted)
-                .resolve(Some("ZZ"), None, |_| false)
+                .resolve(Some("ZZ"), |_| false)
                 .is_set(Permission::StoreOnDevice),
             "a Granted rule is set with no signal"
         );
@@ -1238,7 +1524,7 @@ mod tests {
         assert!(
             !PermissionMaps::empty()
                 .with_country("zz", denied)
-                .resolve(Some("ZZ"), None, |_| true)
+                .resolve(Some("ZZ"), |_| true)
                 .is_set(Permission::StoreOnDevice),
             "a Denied rule is never set even with a signal"
         );
@@ -1249,17 +1535,17 @@ mod tests {
         let maps = PermissionMaps::standard();
         assert!(
             !maps
-                .resolve(Some("DE"), None, |_| false)
+                .resolve(Some("DE"), |_| false)
                 .is_set(Permission::StoreOnDevice),
             "an EU country should not set necessary.operations.storage without a signal"
         );
         assert!(
-            maps.resolve(Some("DE"), None, |p| p == Permission::StoreOnDevice)
+            maps.resolve(Some("DE"), |p| p == Permission::StoreOnDevice)
                 .is_set(Permission::StoreOnDevice),
             "an EU country should set necessary.operations.storage once a signal grants it"
         );
         assert!(
-            maps.resolve(Some("GB"), None, |_| false)
+            maps.resolve(Some("GB"), |_| false)
                 .is_set(Permission::StoreOnDevice),
             "the UK should grant necessary.operations.storage without a signal"
         );
@@ -1270,7 +1556,7 @@ mod tests {
         let maps = PermissionMaps::standard();
         for code in ["US", "AU"] {
             assert!(
-                maps.resolve(Some(code), None, |_| false)
+                maps.resolve(Some(code), |_| false)
                     .is_set(Permission::StoreOnDevice),
                 "{code} should grant necessary.operations.storage by default"
             );
@@ -1279,7 +1565,7 @@ mod tests {
         // floor and sets nothing without a signal.
         assert!(
             !maps
-                .resolve(Some("ZZ"), None, |_| false)
+                .resolve(Some("ZZ"), |_| false)
                 .is_set(Permission::StoreOnDevice),
             "an unmapped country with no default sets nothing without a signal"
         );
@@ -1290,11 +1576,11 @@ mod tests {
         // US grants necessary.operations.storage by default; an opt-out signal revokes it.
         let maps = PermissionMaps::standard();
         assert!(
-            maps.baseline(Some("US"), None, None, None)
+            maps.baseline(Some("US"), None)
                 .is_set(Permission::StoreOnDevice),
             "the US baseline should set necessary.operations.storage"
         );
-        let revoked = maps.resolve_with(Some("US"), None, None, None, |p| {
+        let revoked = maps.resolve_with(Some("US"), None, |p| {
             if p == Permission::StoreOnDevice {
                 ConsentSignal::Revoke
             } else {
@@ -1317,12 +1603,12 @@ mod tests {
         );
         assert!(
             !maps
-                .baseline(Some("US"), Some("CA"), None, None)
+                .baseline(Some("US"), Some("CA"))
                 .is_set(Permission::StoreOnDevice),
             "the CA region rule should require a signal, overriding the US baseline"
         );
         assert!(
-            maps.baseline(Some("US"), Some("NY"), None, None)
+            maps.baseline(Some("US"), Some("NY"))
                 .is_set(Permission::StoreOnDevice),
             "a state with no region entry should follow the US baseline"
         );
@@ -1337,25 +1623,30 @@ groups:
   us:
     default: granted
 rules:
+  group: eu
+  jurisdiction: gdpr
   FR: eu
-  US: us
-  US/CA:
-    group: eu
-    permissions:
-      necessary.operations.storage: granted
-      advertising_marketing.first_party.contextual: denied
+  US:
+    group: us
+    jurisdiction: non-regulated
+    CA:
+      group: eu
+      jurisdiction: us-state
+      permissions:
+        necessary.operations.storage: granted
+        advertising_marketing.first_party.contextual: denied
 "#;
         let maps = PermissionMaps::from_yaml(yaml).expect("should parse the rules");
 
         // Bare group references.
         assert!(
             !maps
-                .baseline(Some("FR"), None, None, None)
+                .baseline(Some("FR"), None)
                 .is_set(Permission::StoreOnDevice),
             "FR (eu) requires a signal for device storage"
         );
         assert!(
-            maps.baseline(Some("US"), None, None, None)
+            maps.baseline(Some("US"), None)
                 .is_set(Permission::StoreOnDevice),
             "US (us) grants device storage"
         );
@@ -1363,41 +1654,406 @@ rules:
         // CA references the eu group, but its permissions map grants
         // necessary.operations.storage, overriding the eu baseline.
         assert!(
-            maps.baseline(Some("US"), Some("CA"), None, None)
+            maps.baseline(Some("US"), Some("CA"))
                 .is_set(Permission::StoreOnDevice),
             "the permissions map grants necessary.operations.storage for CA, overriding the eu baseline"
         );
-        // the permissions map denies advertising_marketing.first_party.contextual: not set even when a signal grants it.
+        // The permissions map denies advertising_marketing.first_party.contextual,
+        // so it is not set even when a signal grants it.
         assert!(
             !maps
-                .resolve_with(Some("US"), Some("CA"), None, None, |_| ConsentSignal::Grant)
+                .resolve_with(Some("US"), Some("CA"), |_| ConsentSignal::Grant)
                 .is_set(Permission::SelectBasicAds),
             "the permissions map denies advertising_marketing.first_party.contextual even when a signal grants it"
         );
 
-        // An unmapped country with a default of `US` uses the us (granted) rule.
-        assert!(
-            maps.baseline(Some("ZZ"), None, Some("US"), None)
-                .is_set(Permission::StoreOnDevice),
-            "an unmapped country uses the configured default (us, granted)"
-        );
-        // With no default, an unmapped country hits the requires-signal floor.
+        // An unlisted country falls back to the top node (eu, requires signal).
         assert!(
             !maps
-                .baseline(Some("ZZ"), None, None, None)
+                .baseline(Some("ZZ"), None)
                 .is_set(Permission::StoreOnDevice),
-            "with no default, an unmapped country sets nothing"
+            "an unlisted country should use the top node"
+        );
+    }
+
+    /// A two-group policy the tree tests below vary, with `g` granting
+    /// everything and `strict` requiring a signal for everything.
+    const TEST_GROUPS: &str = "groups:\n  g:\n    default: granted\n  \
+                               strict:\n    default: requires_signal\n";
+
+    #[test]
+    fn a_shorthand_node_is_a_group_with_nothing_below_it() {
+        let yaml = format!(
+            "{TEST_GROUPS}\
+rules:
+  group: strict
+  jurisdiction: gdpr
+  GB: g
+"
+        );
+        let maps = PermissionMaps::from_yaml(&yaml).expect("a shorthand node should parse");
+        assert_eq!(
+            maps.rules_for(Some("GB"), None)
+                .expect("GB should have a rule")
+                .rule_for(Permission::StoreOnDevice),
+            Acquisition::Granted,
+            "the shorthand string should name the node's group"
+        );
+        assert_eq!(
+            maps.jurisdiction_for(Some("GB"), None),
+            Jurisdiction::Gdpr,
+            "a shorthand node should inherit the top node's jurisdiction"
         );
     }
 
     #[test]
-    fn from_yaml_rejects_unknown_group() {
-        let err = PermissionMaps::from_yaml("groups: {}\nrules:\n  US: nope\n")
-            .expect_err("a rule naming an undefined group should be rejected");
-        assert!(
-            matches!(err, PermissionsError::UnknownGroup { .. }),
-            "should report an unknown group, got {err:?}"
+    fn a_block_node_carries_children_beside_its_group() {
+        let yaml = format!(
+            "{TEST_GROUPS}\
+rules:
+  group: g
+  jurisdiction: gdpr
+  US:
+    group: g
+    jurisdiction: non-regulated
+    CA:
+      group: strict
+      jurisdiction: us-state
+"
         );
+        let maps = PermissionMaps::from_yaml(&yaml).expect("a block node should parse");
+        assert_eq!(
+            maps.rules_for(Some("US"), Some("CA"))
+                .expect("US/CA should have a rule")
+                .rule_for(Permission::StoreOnDevice),
+            Acquisition::RequiresSignal,
+            "the region child should carry its own group"
+        );
+        assert_eq!(
+            maps.rules_or_default(Some("US"), Some("NV"))
+                .expect("an unlisted region should fall back to its country")
+                .rule_for(Permission::StoreOnDevice),
+            Acquisition::Granted,
+            "an unlisted region should resolve at its country node"
+        );
+    }
+
+    #[test]
+    fn from_yaml_rejects_a_block_without_a_group() {
+        let yaml = format!(
+            "{TEST_GROUPS}\
+rules:
+  group: g
+  jurisdiction: gdpr
+  US:
+    jurisdiction: non-regulated
+"
+        );
+        let err =
+            PermissionMaps::from_yaml(&yaml).expect_err("a block with no group should be rejected");
+        assert!(
+            matches!(&err, PermissionsError::MissingGroup { path } if path == "US"),
+            "should report the missing group for US, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_yaml_rejects_a_top_node_without_a_group() {
+        let yaml = format!("{TEST_GROUPS}rules:\n  jurisdiction: gdpr\n  US: g\n");
+        let err = PermissionMaps::from_yaml(&yaml)
+            .expect_err("a top node with no group should be rejected");
+        assert!(
+            matches!(err, PermissionsError::MissingGroup { .. }),
+            "should report the missing top group, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_yaml_rejects_a_top_node_without_a_jurisdiction() {
+        let yaml = format!("{TEST_GROUPS}rules:\n  group: g\n  US: g\n");
+        let err = PermissionMaps::from_yaml(&yaml)
+            .expect_err("a top node with no jurisdiction should be rejected");
+        assert!(
+            matches!(err, PermissionsError::MissingJurisdiction),
+            "should report the missing top jurisdiction, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_yaml_rejects_an_unknown_jurisdiction() {
+        let yaml = format!("{TEST_GROUPS}rules:\n  group: g\n  jurisdiction: ccpa\n");
+        let err = PermissionMaps::from_yaml(&yaml)
+            .expect_err("an unknown jurisdiction should be rejected");
+        assert!(
+            matches!(err, PermissionsError::UnknownJurisdiction { .. }),
+            "should report the unknown jurisdiction, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_yaml_rejects_us_state_above_a_region() {
+        // `us-state` names no code of its own, so only a region can carry it.
+        let top = format!("{TEST_GROUPS}rules:\n  group: g\n  jurisdiction: us-state\n");
+        assert!(
+            matches!(
+                PermissionMaps::from_yaml(&top)
+                    .expect_err("us-state at the top should be rejected"),
+                PermissionsError::MisplacedUsState { .. }
+            ),
+            "the top of the tree names no state"
+        );
+        let country = format!(
+            "{TEST_GROUPS}\
+rules:
+  group: g
+  jurisdiction: gdpr
+  US:
+    group: g
+    jurisdiction: us-state
+"
+        );
+        assert!(
+            matches!(
+                PermissionMaps::from_yaml(&country)
+                    .expect_err("us-state on a country should be rejected"),
+                PermissionsError::MisplacedUsState { .. }
+            ),
+            "a country names no state"
+        );
+    }
+
+    #[test]
+    fn from_yaml_rejects_a_place_written_under_a_region() {
+        let yaml = format!(
+            "{TEST_GROUPS}\
+rules:
+  group: g
+  jurisdiction: gdpr
+  US:
+    group: g
+    CA:
+      group: g
+      LA:
+        group: g
+"
+        );
+        let err = PermissionMaps::from_yaml(&yaml).expect_err("a fourth level should be rejected");
+        assert!(
+            matches!(err, PermissionsError::NestedTooDeep { .. }),
+            "should report the tree being too deep, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_jurisdiction_is_inherited_and_can_be_overridden_at_each_level() {
+        let yaml = format!(
+            "{TEST_GROUPS}\
+rules:
+  group: g
+  jurisdiction: gdpr
+  GB: g
+  US:
+    group: g
+    jurisdiction: non-regulated
+    CA:
+      group: g
+      jurisdiction: us-state
+    NY: g
+"
+        );
+        let maps = PermissionMaps::from_yaml(&yaml).expect("should parse the tree");
+        assert_eq!(
+            maps.jurisdiction_for(Some("GB"), None),
+            Jurisdiction::Gdpr,
+            "a country naming none should inherit the top node"
+        );
+        assert_eq!(
+            maps.jurisdiction_for(Some("US"), None),
+            Jurisdiction::NonRegulated,
+            "a country naming its own should override the top node"
+        );
+        assert_eq!(
+            maps.jurisdiction_for(Some("US"), Some("NY")),
+            Jurisdiction::NonRegulated,
+            "a region naming none should inherit its country"
+        );
+        assert_eq!(
+            maps.jurisdiction_for(Some("US"), Some("CA")),
+            Jurisdiction::UsState("CA".to_owned()),
+            "a region naming us-state should name itself as the state"
+        );
+        assert_eq!(
+            maps.jurisdiction_for(Some("ZZ"), None),
+            Jurisdiction::Gdpr,
+            "an unlisted country should inherit the top node"
+        );
+        assert_eq!(
+            maps.default_jurisdiction(),
+            Jurisdiction::Gdpr,
+            "no place at all should resolve the top node"
+        );
+    }
+
+    #[test]
+    fn place_codes_are_matched_without_regard_to_case() {
+        let yaml = format!(
+            "{TEST_GROUPS}\
+rules:
+  group: strict
+  jurisdiction: gdpr
+  us:
+    group: strict
+    jurisdiction: non-regulated
+    ca:
+      group: g
+      jurisdiction: us-state
+"
+        );
+        let maps = PermissionMaps::from_yaml(&yaml).expect("should parse lower-case place codes");
+        assert!(
+            maps.baseline(Some("US"), Some("CA"))
+                .is_set(Permission::StoreOnDevice),
+            "an upper-case request should match a lower-case rule"
+        );
+        assert_eq!(
+            maps.jurisdiction_for(Some("US"), Some("CA")),
+            Jurisdiction::UsState("CA".to_owned()),
+            "the state code should be upper-cased whatever case the file uses"
+        );
+    }
+
+    #[test]
+    fn the_settled_example_resolves_as_documented() {
+        // The example in the permissions.yaml header, kept here so the file's
+        // own teaching example is proven rather than asserted.
+        let yaml = r#"
+groups:
+  gdpr-eu:
+    default: requires_signal
+  gdpr-uk:
+    default: requires_signal
+  us-notice:
+    default: granted
+  us-opt-out:
+    default: granted
+rules:
+  group: gdpr-eu
+  jurisdiction: gdpr
+  GB: gdpr-uk
+  US:
+    group: us-notice
+    jurisdiction: non-regulated
+    CA:
+      group: us-opt-out
+      jurisdiction: us-state
+    NY: us-notice
+"#;
+        let maps = PermissionMaps::from_yaml(yaml).expect("the header example should parse");
+        for (country, region, jurisdiction) in [
+            (Some("GB"), None, Jurisdiction::Gdpr),
+            (Some("US"), None, Jurisdiction::NonRegulated),
+            (Some("US"), Some("NY"), Jurisdiction::NonRegulated),
+            (
+                Some("US"),
+                Some("CA"),
+                Jurisdiction::UsState("CA".to_owned()),
+            ),
+            (Some("JP"), None, Jurisdiction::Gdpr),
+            (None, None, Jurisdiction::Gdpr),
+        ] {
+            assert_eq!(
+                maps.jurisdiction_for(country, region),
+                jurisdiction,
+                "{country:?}/{region:?} should resolve as the header documents"
+            );
+        }
+        assert!(
+            !maps
+                .baseline(Some("GB"), None)
+                .is_set(Permission::StoreOnDevice),
+            "GB takes the gdpr-uk group, which requires a signal in this example"
+        );
+        assert!(
+            maps.baseline(Some("US"), Some("NY"))
+                .is_set(Permission::StoreOnDevice),
+            "NY takes us-notice, which grants"
+        );
+    }
+
+    #[test]
+    fn the_shipped_policy_reproduces_the_retired_consent_lists() {
+        // The 31 GDPR countries and the 20 US privacy states the consent
+        // configuration used to carry as compiled defaults now live in the
+        // policy tree, so the shipped file must resolve each the same way.
+        let maps = PermissionMaps::standard();
+        let gdpr_countries = [
+            "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE",
+            "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE", "IS",
+            "LI", "NO", "GB",
+        ];
+        assert_eq!(
+            gdpr_countries.len(),
+            31,
+            "the retired list held 27 EU, 3 EEA and the UK"
+        );
+        for country in gdpr_countries {
+            assert_eq!(
+                maps.jurisdiction_for(Some(country), None),
+                Jurisdiction::Gdpr,
+                "`{country}` should resolve the GDPR jurisdiction"
+            );
+        }
+
+        let privacy_states = [
+            "CA", "VA", "CO", "CT", "UT", "MT", "OR", "TX", "FL", "DE", "IA", "NE", "NH", "NJ",
+            "TN", "MN", "MD", "IN", "KY", "RI",
+        ];
+        assert_eq!(
+            privacy_states.len(),
+            20,
+            "the retired list held 20 states with a comprehensive privacy law"
+        );
+        for state in privacy_states {
+            assert_eq!(
+                maps.jurisdiction_for(Some("US"), Some(state)),
+                Jurisdiction::UsState(state.to_owned()),
+                "`US/{state}` should resolve its own state jurisdiction"
+            );
+        }
+
+        // A state with no law of its own inherits the US node, and the US with
+        // no region does the same.
+        for region in [Some("WY"), Some("NY"), None] {
+            assert_eq!(
+                maps.jurisdiction_for(Some("US"), region),
+                Jurisdiction::NonRegulated,
+                "`US/{region:?}` should inherit the country node"
+            );
+        }
+        assert_eq!(
+            maps.jurisdiction_for(Some("AU"), None),
+            Jurisdiction::NonRegulated,
+            "Australia should carry its own non-regulated jurisdiction"
+        );
+        assert_eq!(
+            maps.default_jurisdiction(),
+            Jurisdiction::Gdpr,
+            "an unresolved place should take the top node's GDPR jurisdiction"
+        );
+    }
+
+    #[test]
+    fn a_us_state_keeps_the_country_permission_baseline() {
+        // Each listed state carries the same group as the country node, so
+        // adding the states for the jurisdiction changed no permission.
+        let maps = PermissionMaps::standard();
+        for state in ["CA", "TX", "DE", "RI", "WY"] {
+            assert!(
+                maps.baseline(Some("US"), Some(state))
+                    .is_set(Permission::StoreOnDevice),
+                "`US/{state}` should keep the US opt-out storage baseline"
+            );
+        }
     }
 
     #[test]
@@ -1421,10 +2077,12 @@ rules:
         for permission in Permission::all() {
             group.push_str(&format!("    {permission}: granted\n"));
         }
-        let yaml = format!("{group}rules:\n  US: everything\n");
+        let yaml = format!(
+            "{group}rules:\n  group: everything\n  jurisdiction: unknown\n  US: everything\n"
+        );
         let maps = PermissionMaps::from_yaml(&yaml).expect("an explicit group should parse");
         assert!(
-            maps.baseline(Some("US"), None, None, None)
+            maps.baseline(Some("US"), None)
                 .is_set(Permission::MarketResearch),
             "every listed permission should take its flag"
         );
@@ -1454,7 +2112,7 @@ rules:
 
     #[test]
     fn from_yaml_rejects_a_non_acquisition_override_value() {
-        let yaml = "groups:\n  g:\n    default: granted\nrules:\n  US:\n    group: g\n    permissions:\n      necessary.operations.storage: enabled\n";
+        let yaml = "groups:\n  g:\n    default: granted\nrules:\n  group: g\n  jurisdiction: unknown\n  US:\n    group: g\n    permissions:\n      necessary.operations.storage: enabled\n";
         let err = PermissionMaps::from_yaml(yaml)
             .expect_err("an unknown acquisition value should be rejected");
         assert!(
@@ -1465,7 +2123,7 @@ rules:
 
     #[test]
     fn from_yaml_rejects_duplicate_rule_keys_differing_only_by_case() {
-        let yaml = "groups:\n  g:\n    default: granted\nrules:\n  us: g\n  US: g\n";
+        let yaml = "groups:\n  g:\n    default: granted\nrules:\n  group: g\n  jurisdiction: unknown\n  us: g\n  US: g\n";
         let err = PermissionMaps::from_yaml(yaml)
             .expect_err("two spellings of one country should be rejected");
         assert!(
@@ -1476,7 +2134,7 @@ rules:
 
     #[test]
     fn a_detailed_rule_can_set_requires_signal_per_permission() {
-        let yaml = "groups:\n  g:\n    default: granted\nrules:\n  US:\n    group: g\n    permissions:\n      necessary.operations.storage: requires_signal\n";
+        let yaml = "groups:\n  g:\n    default: granted\nrules:\n  group: g\n  jurisdiction: unknown\n  US:\n    group: g\n    permissions:\n      necessary.operations.storage: requires_signal\n";
         let maps = PermissionMaps::from_yaml(yaml).expect("should parse the override map");
         let rules = maps
             .rules_for(Some("US"), None)
@@ -1497,7 +2155,7 @@ rules:
     fn every_eu_and_eea_member_requires_a_signal_for_storage() {
         // The shipped permissions.yaml must cover all 27 EU member states and
         // the three EEA members, each resolving storage as requires-signal, so
-        // no member state silently falls to the deployer default.
+        // no member state silently falls to the top of the tree.
         let maps = PermissionMaps::standard();
         for country in [
             "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE",
@@ -1522,6 +2180,8 @@ groups:
   g:
     default: requires_signal
 rules:
+  group: g
+  jurisdiction: gdpr
   FR: g
 signals:
   tcf:
@@ -1568,6 +2228,8 @@ groups:
   g:
     default: requires_signal
 rules:
+  group: g
+  jurisdiction: gdpr
   FR: g
 signals:
   us_opt_out:

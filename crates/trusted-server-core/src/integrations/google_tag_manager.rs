@@ -1577,7 +1577,6 @@ container_id = "GTM-PARSED"
 upstream_url = "https://custom.gtm.example"
 
 [geo]
-default_country = "FR"
 assume_single_jurisdiction = true
 "#;
         let settings = Settings::from_toml(toml_str).expect("should parse TOML");
@@ -1615,7 +1614,6 @@ passphrase = "test-secret-key-32-bytes-minimum"
 container_id = "GTM-DEFAULT"
 
 [geo]
-default_country = "FR"
 assume_single_jurisdiction = true
 "#;
         let settings = Settings::from_toml(toml_str).expect("should parse TOML");

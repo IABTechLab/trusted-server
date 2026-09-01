@@ -25,7 +25,6 @@ pub mod tests {
             # A gdpr-eu country, where every permission requires a signal. This
             # reproduces the prior no-default floor, so existing tests are
             # unaffected by the now-required default.
-            default_country = "FR"
             # Tests run with no geo provider, so single-jurisdiction operation
             # is acknowledged the same way a deployment would.
             assume_single_jurisdiction = true

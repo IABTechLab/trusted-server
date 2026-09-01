@@ -171,11 +171,11 @@ where
 ///
 /// The geo lookup runs inside
 /// [`EcContext::read_from_request_resolving_geo`], so every adapter reports the
-/// same distinction: no location falls back to the configured
-/// `[geo] default_country` baseline, while a failed lookup resolves every
+/// same distinction: no location falls back to the top of the
+/// `permissions.yaml` rules tree, while a failed lookup resolves every
 /// permission at the requires-signal floor and is logged at error level.
 /// The platform geo is a no-op on the local Axum dev server, so a request there
-/// resolves at the default country unless it carries a signal.
+/// resolves at that top node unless it carries a signal.
 ///
 /// Mirrors the Fastly entry point, which keeps the report and answers with an
 /// error response: when the Edge Cookie context cannot be read the request
@@ -691,11 +691,9 @@ mod tests {
         [ec.providers.acme]
         endpoint = "https://ec.acme.example.com"
 
-        # An Edge Cookie provider is configured, so the permission model needs a
-        # default country, and single-jurisdiction operation acknowledged because
-        # no geo provider is selected.
+        # An Edge Cookie provider is configured, so single-jurisdiction
+        # operation is acknowledged because no geo provider is selected.
         [geo]
-        default_country = "FR"
         assume_single_jurisdiction = true
     "#;
 

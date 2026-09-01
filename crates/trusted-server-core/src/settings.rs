@@ -903,8 +903,8 @@ pub struct GeoConfig {
     ///
     /// No provider is the default: Trusted Server resolves no geolocation and
     /// makes no host geo call, so a default deployment is not tied to any host
-    /// geo service, and the permission baseline comes from
-    /// [`default_country`](Self::default_country). `provider = "none"` spells
+    /// geo service, and the permission baseline comes from the top of the
+    /// `rules` tree in `permissions.yaml`. `provider = "none"` spells
     /// the same choice explicitly. The host platform's own geo lookup is
     /// opt-in via `provider = "platform"`. Override it with the
     /// `TRUSTED_SERVER__geo__provider` environment variable so the same compiled
@@ -914,30 +914,11 @@ pub struct GeoConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
 
-    /// The country, or country and region, whose permission rules apply when the
-    /// geo provider returns no country, or returns a country/region that has no
-    /// rule in `permissions.yaml`. One value, the same form as a
-    /// `permissions.yaml` rule key, a country code (`US`) or country/region
-    /// (`US/CA`), matched case-insensitively.
-    ///
-    /// Required. There must always be a default permission set, so startup fails
-    /// when this is unset. The value must resolve to a rule in `permissions.yaml`,
-    /// both checked at startup by
-    /// [`validate_default_country`](Self::validate_default_country).
-    ///
-    /// Because it is required, any deployment running the permission model
-    /// serializes a `[geo]` section, so its pushed config blob is rejected by a
-    /// binary that predates this section. Rolling back to one needs a compatible
-    /// blob restored first, the same trade-off a configured
-    /// [`trusted_client_ip`](Settings::trusted_client_ip) carries.
-    #[serde(default)]
-    pub default_country: Option<String>,
-
     /// Acknowledges that, with no geo provider, every request is treated as
-    /// coming from [`default_country`](Self::default_country).
+    /// coming from the place at the top of the `permissions.yaml` `rules` tree.
     ///
     /// With geolocation off, a visitor from any other jurisdiction silently
-    /// receives the default jurisdiction's permission rules. A deployment that
+    /// receives that top node's permission rules. A deployment that
     /// runs an Edge Cookie provider without a geo provider must set this to
     /// `true`, checked at startup by
     /// [`validate_jurisdiction_acknowledgment`](Self::validate_jurisdiction_acknowledgment),
@@ -967,52 +948,35 @@ impl GeoConfig {
         }
     }
 
-    /// Validates that `default_country` is set and resolves to a rule in the
-    /// compiled `permissions.yaml`.
+    /// Validates that the compiled `permissions.yaml` parses and declares its
+    /// top node.
     ///
-    /// A default is required: it is the permission baseline for a request the geo
-    /// provider leaves unmatched, so there must always be one.
+    /// The top node is required: its `group` is the permission baseline for a
+    /// request the geo provider leaves unmatched, and its `jurisdiction` is the
+    /// consent handling for that same request, so there must always be one.
+    /// Checking it here turns a malformed policy into a configuration error at
+    /// startup rather than a panic on the first lookup.
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::Configuration`] when `default_country` is
-    /// unset, or is set but matches no country or country/region rule.
-    pub fn validate_default_country(&self) -> Result<(), Report<TrustedServerError>> {
-        let Some(spec) = self.default_country.as_deref() else {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: "[geo] default_country is required. There must always be a default \
-                          permission set, so set the country (`US`) or country/region \
-                          (`US/CA`) whose permissions.yaml rule applies to a request the geo \
-                          provider leaves unmatched"
-                    .to_owned(),
-            }));
-        };
-        let (country, region) = match spec.split_once('/') {
-            Some((country, region)) => (Some(country), Some(region)),
-            None => (Some(spec), None),
-        };
-        if crate::permissions::PermissionMaps::standard()
-            .rules_for(country, region)
-            .is_none()
-        {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "[geo] default_country `{spec}` matches no rule in permissions.yaml \
-                     (use a country code like `US` or country/region like `US/CA` that \
-                     has a rule)"
-                ),
-            }));
-        }
-        Ok(())
+    /// Returns [`TrustedServerError::Configuration`] when the compiled policy
+    /// fails to parse, most usefully when its top node omits `group` or
+    /// `jurisdiction`.
+    pub fn validate_permission_policy() -> Result<(), Report<TrustedServerError>> {
+        crate::permissions::validate_default_policy().map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("permissions.yaml is not usable: {error}"),
+            })
+        })
     }
 
     /// Validates that running jurisdiction consumers without geolocation is
     /// explicitly acknowledged.
     ///
-    /// With no geo provider, every request resolves to the
-    /// [`default_country`](Self::default_country) permission baseline, so a
-    /// visitor from any other jurisdiction silently receives the default
-    /// jurisdiction's rules. That is acceptable only as an explicit operator
+    /// With no geo provider, every request resolves to the permission baseline
+    /// at the top of the `permissions.yaml` `rules` tree, so a visitor from any
+    /// other jurisdiction silently receives that node's rules. That is
+    /// acceptable only as an explicit operator
     /// decision. When an Edge Cookie provider is configured (the permission
     /// model gates it by jurisdiction) and no geo provider is selected,
     /// [`assume_single_jurisdiction`](Self::assume_single_jurisdiction) must be
@@ -1035,9 +999,9 @@ impl GeoConfig {
         if geo_disabled && ec_active && !self.assume_single_jurisdiction {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: "[ec] provider is configured but no [geo] provider is selected, so \
-                          every request would be treated as [geo] default_country. Set \
-                          [geo] assume_single_jurisdiction = true to acknowledge \
-                          single-jurisdiction operation, or select a geo provider"
+                          every request would be treated as the top of the permissions.yaml \
+                          rules tree. Set [geo] assume_single_jurisdiction = true to \
+                          acknowledge single-jurisdiction operation, or select a geo provider"
                     .to_owned(),
             }));
         }
@@ -3416,7 +3380,7 @@ impl Settings {
         settings.ec.validate_provider_selection()?;
         settings.device.validate_provider_selection()?;
         settings.geo.validate_provider_selection()?;
-        settings.geo.validate_default_country()?;
+        GeoConfig::validate_permission_policy()?;
         settings
             .geo
             .validate_jurisdiction_acknowledgment(&settings.ec)?;
@@ -3429,26 +3393,21 @@ impl Settings {
             );
         }
 
-        // Log the configured default jurisdiction baseline once per settings
-        // load, so an operator can see which permissions the unmatched-request
-        // default grants without a signal.
-        if let Some(spec) = settings.geo.default_country.as_deref() {
-            let (country, region) = match spec.split_once('/') {
-                Some((country, region)) => (Some(country), Some(region)),
-                None => (Some(spec), None),
-            };
-            let baseline = crate::permissions::PermissionMaps::standard()
-                .baseline(country, region, country, region);
-            let granted: Vec<String> = baseline
-                .permissions()
-                .iter()
-                .map(|permission| permission.to_string())
-                .collect();
-            log::info!(
-                "Permission baseline: [geo] default_country = {spec}; granted without a signal: [{}]",
-                granted.join(", ")
-            );
-        }
+        // Log the policy's declared default once per settings load, so an
+        // operator can see which permissions an unmatched request is granted
+        // without a signal, and which jurisdiction its consent gates apply.
+        let maps = crate::permissions::PermissionMaps::standard();
+        let granted: Vec<String> = maps
+            .baseline(None, None)
+            .permissions()
+            .iter()
+            .map(|permission| permission.to_string())
+            .collect();
+        log::info!(
+            "Permission baseline: permissions.yaml top node, jurisdiction {}; granted without a signal: [{}]",
+            maps.default_jurisdiction(),
+            granted.join(", ")
+        );
 
         Ok(settings)
     }
@@ -5653,7 +5612,6 @@ mod tests {
 
         let platform = GeoConfig {
             provider: Some("platform".to_owned()),
-            default_country: None,
             assume_single_jurisdiction: false,
         };
         platform
@@ -5662,7 +5620,6 @@ mod tests {
 
         let none = GeoConfig {
             provider: Some("none".to_owned()),
-            default_country: None,
             assume_single_jurisdiction: false,
         };
         none.validate_provider_selection()
@@ -5670,7 +5627,6 @@ mod tests {
 
         let unknown = GeoConfig {
             provider: Some("acme".to_owned()),
-            default_country: None,
             assume_single_jurisdiction: false,
         };
         assert!(
@@ -5708,36 +5664,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_default_country_checks_against_permissions_yaml() {
-        // Unset is rejected: a default permission set is required, so startup
-        // fails without one.
-        assert!(
-            GeoConfig::default().validate_default_country().is_err(),
-            "an unset default country should be rejected"
-        );
-
-        // A country, and a country/region, that have a rule are accepted.
-        for spec in ["US", "FR", "US/CA"] {
-            let config = GeoConfig {
-                provider: None,
-                default_country: Some(spec.to_owned()),
-                assume_single_jurisdiction: false,
-            };
-            config
-                .validate_default_country()
-                .unwrap_or_else(|e| panic!("default `{spec}` should validate, got {e:?}"));
-        }
-
-        // A code with no rule is rejected at startup.
-        let bad = GeoConfig {
-            provider: None,
-            default_country: Some("ZZ".to_owned()),
-            assume_single_jurisdiction: false,
-        };
-        assert!(
-            bad.validate_default_country().is_err(),
-            "a default country with no rule should be rejected"
-        );
+    fn the_compiled_permission_policy_validates_at_startup() {
+        // The shipped permissions.yaml declares its top node, so startup
+        // accepts it. A policy that omitted `group` or `jurisdiction` would be
+        // rejected here rather than panicking on the first lookup, which the
+        // parser tests in `permissions` cover directly.
+        GeoConfig::validate_permission_policy()
+            .expect("the shipped permissions.yaml should validate at startup");
     }
 
     #[test]
@@ -6814,7 +6747,6 @@ origin_host_header_overide = "www.example.com""#,
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [geo]
-            default_country = "FR"
             assume_single_jurisdiction = true
             "#,
         )
@@ -6846,7 +6778,6 @@ origin_host_header_overide = "www.example.com""#,
             max_buffered_body_bytes = 0
 
             [geo]
-            default_country = "FR"
             assume_single_jurisdiction = true
 
             [ec]
@@ -8014,7 +7945,6 @@ origin_host_header_overide = "www.example.com""#,
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [geo]
-            default_country = "FR"
             assume_single_jurisdiction = true
 
             [request_signing]
@@ -8348,7 +8278,6 @@ origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
 [geo]
-default_country = "US"
 assume_single_jurisdiction = true
 
 [ec]
@@ -8439,7 +8368,6 @@ origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
 [geo]
-default_country = "US"
 assume_single_jurisdiction = true
 
 [ec]
@@ -8482,7 +8410,6 @@ origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
 [geo]
-default_country = "US"
 assume_single_jurisdiction = true
 
 [ec]
@@ -8531,7 +8458,6 @@ origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
 [geo]
-default_country = "US"
 assume_single_jurisdiction = true
 
 [ec]

@@ -77,6 +77,16 @@ pub struct ConsentPipelineInput<'a> {
     pub config: &'a ConsentConfig,
     /// Geolocation data from the request (for jurisdiction detection).
     pub geo: Option<&'a GeoInfo>,
+    /// The jurisdiction to apply when `geo` resolved no location.
+    ///
+    /// Jurisdiction is detected from geolocation, so with no location every
+    /// request would be [`Jurisdiction::Unknown`] and the consent gates would
+    /// fail closed even where the permission policy declares what to do. This
+    /// carries that declaration (see
+    /// [`PermissionMaps::default_jurisdiction`](crate::permissions::PermissionMaps::default_jurisdiction)).
+    /// Pass [`Jurisdiction::Unknown`] where no declaration applies, for example
+    /// after a failed geo lookup.
+    pub default_jurisdiction: jurisdiction::Jurisdiction,
     /// EC ID for KV Store consent persistence.
     ///
     /// When set along with `kv_store`, enables:
@@ -131,14 +141,14 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
     {
         // Jurisdiction is request-local: derive it from the current
         // geo rather than the value stored with the persisted entry.
-        ctx.jurisdiction = jurisdiction::detect_jurisdiction(input.geo, input.config);
+        ctx.jurisdiction = request_jurisdiction(input);
         log_consent_context(&ctx);
         return ctx;
     }
 
     // In proxy mode, skip decoding entirely.
     if input.config.mode == ConsentMode::Proxy {
-        let jur = jurisdiction::detect_jurisdiction(input.geo, input.config);
+        let jur = request_jurisdiction(input);
         let gpp_section_ids = signals
             .raw_gpp_sid
             .as_deref()
@@ -164,7 +174,7 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
     }
 
     let mut ctx = build_context_from_signals(&signals);
-    ctx.jurisdiction = jurisdiction::detect_jurisdiction(input.geo, input.config);
+    ctx.jurisdiction = request_jurisdiction(input);
     apply_tcf_conflict_resolution(&mut ctx, input.config);
     apply_expiration_check(&mut ctx, input.config);
     apply_gpc_us_privacy(&mut ctx, input.config);
@@ -178,6 +188,19 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
 
     log_consent_context(&ctx);
     ctx
+}
+
+/// The jurisdiction for a request: detected from its location when one
+/// resolved, otherwise the declaration the caller supplied.
+///
+/// Keeping the two in one place means every path through the pipeline (proxy
+/// mode, the KV read fallback, and the ordinary decode) answers the question
+/// the same way.
+fn request_jurisdiction(input: &ConsentPipelineInput<'_>) -> jurisdiction::Jurisdiction {
+    match input.geo {
+        Some(_) => jurisdiction::detect_jurisdiction(input.geo),
+        None => input.default_jurisdiction.clone(),
+    }
 }
 
 /// Marks TCF consent as expired when it exceeds the configured maximum age.
@@ -616,9 +639,8 @@ mod tests {
     use super::{
         ConsentPipelineInput, apply_expiration_check, apply_tcf_conflict_resolution,
         build_consent_context, build_context_from_signals, consent_allows_server_side_auction,
-        gate_eids_by_permissions, has_storage_optout_signal,
+        gate_eids_by_permissions, has_storage_optout_signal, jurisdiction::Jurisdiction,
     };
-    use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{
         ConsentContext, GppConsent, PrivacyFlag, RawConsentSignals, TcfConsent, UsPrivacy,
     };
@@ -816,6 +838,7 @@ mod tests {
             req: &req,
             config: &config,
             geo: None,
+            default_jurisdiction: Jurisdiction::Unknown,
             ec_id: None,
             kv_store: None,
         });
@@ -841,6 +864,7 @@ mod tests {
             req: &req,
             config: &config,
             geo: None,
+            default_jurisdiction: Jurisdiction::Unknown,
             ec_id: None,
             kv_store: None,
         });
@@ -871,6 +895,7 @@ mod tests {
             req: &req,
             config: &config,
             geo: None,
+            default_jurisdiction: Jurisdiction::Unknown,
             ec_id: None,
             kv_store: None,
         });
@@ -1061,6 +1086,7 @@ mod tests {
             req: &req,
             config: &config,
             geo: None,
+            default_jurisdiction: Jurisdiction::Unknown,
             ec_id: Some("test-ec-id"),
             kv_store: Some(&store),
         });
@@ -1092,6 +1118,7 @@ mod tests {
             req: &req,
             config: &config,
             geo: None,
+            default_jurisdiction: Jurisdiction::Unknown,
             ec_id: Some("test-ec-id"),
             kv_store: Some(&store),
         });
@@ -1103,6 +1130,7 @@ mod tests {
             req: &bare_req,
             config: &config,
             geo: None,
+            default_jurisdiction: Jurisdiction::Unknown,
             ec_id: Some("test-ec-id"),
             kv_store: Some(&store),
         });
@@ -1127,6 +1155,7 @@ mod tests {
             req: &req,
             config: &config,
             geo: None,
+            default_jurisdiction: Jurisdiction::Unknown,
             ec_id: None,
             kv_store: Some(&store),
         });
@@ -1142,7 +1171,7 @@ mod tests {
         // US maps to us-opt-out, where necessary.operations.storage and advertising_marketing.first_party.targeted
         // are granted with no signal, so bidstream EIDs are transmitted.
         let permissions =
-            crate::permissions::PermissionMaps::standard().resolve(Some("US"), None, |_| false);
+            crate::permissions::PermissionMaps::standard().resolve(Some("US"), |_| false);
         let eids = Some(vec!["eid-1".to_owned()]);
         assert!(
             gate_eids_by_permissions(eids, &permissions).is_some(),
@@ -1155,7 +1184,7 @@ mod tests {
         // FR maps to gdpr-eu, where every purpose is requires_signal, so with no
         // signal neither required permission is set and EIDs are stripped.
         let permissions =
-            crate::permissions::PermissionMaps::standard().resolve(Some("FR"), None, |_| false);
+            crate::permissions::PermissionMaps::standard().resolve(Some("FR"), |_| false);
         let eids = Some(vec!["eid-1".to_owned()]);
         assert!(
             gate_eids_by_permissions(eids, &permissions).is_none(),
@@ -1166,7 +1195,7 @@ mod tests {
     #[test]
     fn gate_eids_returns_none_for_empty_input() {
         let permissions =
-            crate::permissions::PermissionMaps::standard().resolve(Some("US"), None, |_| false);
+            crate::permissions::PermissionMaps::standard().resolve(Some("US"), |_| false);
         assert!(
             gate_eids_by_permissions::<String>(None, &permissions).is_none(),
             "no EIDs should resolve to None"

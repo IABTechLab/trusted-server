@@ -1,4 +1,5 @@
-# Country and region permission rules for Trusted Server's permission model.
+# The place rules for Trusted Server's permission model, and the jurisdiction
+# each place falls under.
 #
 # The vocabulary is not ours. The permissions are the IAB Tech Lab Privacy
 # Taxonomy Data Uses, with the IAB TCF Europe purposes mapped onto them where
@@ -13,26 +14,70 @@
 #
 # There are three parts:
 #   groups   named permission baselines, defined once and referenced by rules
-#   rules    map a country (FR) or country/state (US/CA) to a group, with optional
-#            explicit per-permission overrides
+#   rules    a tree of places, from the whole world down to a single region,
+#            each naming the group and the jurisdiction that apply there
 #   signals  how each session signal (TCF, US-style opt-out) maps onto Data Uses,
 #            so no signal-to-permission policy lives in the code
 #
-# Rule keys use the codes a geo provider returns, matched case-insensitively:
-#   country        ISO 3166-1 alpha-2 (for example FR, US, GB)
-#   country/state  adds the ISO 3166-2 subdivision code, with no country prefix
-#                  (for example US/CA for California)
-# The Fastly geo provider emits these codes directly, and any other
-# provider must do the same.
+# The rules tree
+# --------------
+# `rules` is one tree. Its top stands for the whole world, countries sit under
+# it, and a country's regions sit under that country:
 #
-# A request whose country/region matches no rule, or whose country the geo
-# provider resolves as no location, uses the deployer's default set in
-# trusted-server.toml as [geo] default_country. A default is required, so there
-# is always a default permission set, and startup fails when none is configured.
-# A geo provider that reports an outright lookup failure is the exception, as it
-# resolves every permission to the requires-signal floor rather than the
-# default, though no geo provider shipped today reports one.
+#   rules:
+#     group: gdpr-eu
+#     jurisdiction: gdpr       # inherited by every country not overriding it,
+#                              # and the answer when no country resolves
+#     GB: gdpr-uk              # inherits gdpr
+#     US:
+#       group: us-notice
+#       jurisdiction: non-regulated
+#       CA:
+#         group: us-opt-out
+#         jurisdiction: us-state
+#       NY: us-notice          # inherits non-regulated
 #
+# Every node names a `group`. Writing a plain group name (`GB: gdpr-uk`) is the
+# short form of a node with that group, no jurisdiction of its own, and nothing
+# below it. To give a node regions, or a jurisdiction, write it as a block with
+# a `group:` line and the rest beside it. A block with no `group:` line is an
+# error, because then the node says nothing.
+#
+# Any node may also name a `jurisdiction`, which is the consent handling that
+# applies there. A node that names none inherits the nearest one above it. The
+# top of the tree must name both `group` and `jurisdiction`, so inheritance
+# always ends somewhere, and the top node is also the answer for a visitor whose
+# place the geo provider could not resolve at all.
+#
+# A `jurisdiction` is one of:
+#   gdpr           the EU, EEA and UK regime
+#   us-state       a US state with a comprehensive privacy law. It carries no
+#                  state code, because the region naming it is the state, so
+#                  only a region may name it, never a country or the top
+#   non-regulated  a place with no matching regulation
+#   unknown        declining to name one
+#
+# Place codes are the codes a geo provider returns, matched without regard to
+# upper or lower case:
+#   country  ISO 3166-1 alpha-2 (for example FR, US, GB)
+#   region   ISO 3166-2 subdivision, with no country prefix (for example CA for
+#            California, written under US)
+# The Fastly geo provider emits these codes directly, and any other provider
+# must do the same. Those codes are at most three letters long, so a place code
+# can never be confused with the reserved words `group`, `jurisdiction` and
+# `permissions`. Where the tree puts a code also tells the two DE codes apart,
+# since ISO 3166-1 DE is Germany at the country level and ISO 3166-2 DE is
+# Delaware under US.
+#
+# The most specific place wins, and whatever a node does not answer falls back
+# to the node above it. A visitor is matched on their region if it is listed,
+# otherwise on their country, otherwise on the top of the tree. So the top node
+# is also the answer for a country nobody has written a rule for.
+#
+# A geo provider that reports an outright lookup failure is the exception. It
+# resolves every permission to the requires-signal floor, and its jurisdiction
+# to unknown, rather than to the top of the tree, though no geo provider shipped
+# today reports one.
 # A permission flag is one of:
 #   granted          set without any signal (for example strictly necessary)
 #   requires_signal  set only when a signal grants it (opt-in)
@@ -262,12 +307,18 @@ groups:
     necessary.operations.upgrades: denied
     necessary.operations.website_use: denied
 
-# Map a country, or a country and state (country/state), to a group. A rule is
-# either a bare group name, or a map with `group:` and a `permissions:` map that
-# overrides individual Data Uses (each set to granted, requires_signal or
-# denied). The overrides win over the group baseline.
+# The place tree. Each node names the `group` that applies there, and may name
+# the `jurisdiction` too, either as a plain group name or as a block with a
+# `group:` line and the rest beside it. See the header for the full format.
 rules:
-  # European Union (27).
+  # The whole world. `group` is the baseline for a visitor whose place the geo
+  # provider could not resolve, and `jurisdiction` is the consent handling for
+  # that same visitor. Both are required, and every country below inherits the
+  # jurisdiction unless it names its own.
+  group: gdpr-eu
+  jurisdiction: gdpr
+
+  # European Union (27). Each inherits the top node's gdpr jurisdiction.
   AT: gdpr-eu
   BE: gdpr-eu
   BG: gdpr-eu
@@ -301,20 +352,110 @@ rules:
   LI: gdpr-eu
   NO: gdpr-eu
 
+  # United Kingdom, which keeps the GDPR jurisdiction under its own regime.
   GB: gdpr-uk
-  AU: us-opt-out
 
-  # United States. Every state follows the country rule until a state entry
-  # overrides it: a country/state key takes precedence over the country, so add
-  # a row only where a state's law differs from the baseline, for example:
-  #   US/CA:
+  # Australia, where no GDPR or US state law applies.
+  AU:
+    group: us-opt-out
+    jurisdiction: non-regulated
+
+  # United States. Every state follows this country node until a region under it
+  # says otherwise, so a state appears below only where its own law applies. The
+  # regions listed are the states with an active comprehensive privacy law, each
+  # naming `us-state` so the consent gates treat the visitor as covered by it. A
+  # region may also carry a `permissions:` map to vary single Data Uses on top of
+  # its group, for example:
+  #   CA:
   #     group: us-opt-out
+  #     jurisdiction: us-state
   #     permissions:
   #       advertising_marketing.first_party.targeted: denied
-  # Each permissions entry maps a Data Use to granted, requires_signal, or
-  # denied, overriding the group's baseline for that Data Use. Or reference a
-  # stricter group.
-  US: us-opt-out
+  # Each `permissions` entry maps a Data Use to granted, requires_signal, or
+  # denied. Or name a stricter group.
+  US:
+    group: us-opt-out
+    jurisdiction: non-regulated
+    # California.
+    CA:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Virginia.
+    VA:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Colorado.
+    CO:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Connecticut.
+    CT:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Utah.
+    UT:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Montana.
+    MT:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Oregon.
+    OR:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Texas.
+    TX:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Florida.
+    FL:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Delaware.
+    DE:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Iowa.
+    IA:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Nebraska.
+    NE:
+      group: us-opt-out
+      jurisdiction: us-state
+    # New Hampshire.
+    NH:
+      group: us-opt-out
+      jurisdiction: us-state
+    # New Jersey.
+    NJ:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Tennessee.
+    TN:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Minnesota.
+    MN:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Maryland.
+    MD:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Indiana.
+    IN:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Kentucky.
+    KY:
+      group: us-opt-out
+      jurisdiction: us-state
+    # Rhode Island.
+    RI:
+      group: us-opt-out
+      jurisdiction: us-state
 
 # How each session signal maps onto Data Uses. The permission engine reads this,
 # so no signal-to-permission policy lives in the code. For each Data Use a signal

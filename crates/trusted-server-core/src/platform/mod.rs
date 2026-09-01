@@ -89,8 +89,8 @@ use crate::settings::Settings;
 /// choice explicitly), so a client IP is never sent to any host geo service
 /// and a default deployment is not tied to any host geo capability. Every geo
 /// consumer already treats [`GeoInfo`] as optional, so a `None` result
-/// degrades gracefully (the permission baseline falls back to the configured
-/// `[geo] default_country`, the auction omits geo, and so on).
+/// degrades gracefully (the permission baseline falls back to the top of the
+/// `permissions.yaml` rules tree, the auction omits geo, and so on).
 pub struct DisabledGeo;
 
 impl PlatformGeo for DisabledGeo {
@@ -103,7 +103,7 @@ impl PlatformGeo for DisabledGeo {
 ///
 /// Returns [`DisabledGeo`] when no provider is selected, so a default
 /// deployment makes no host geo call and the permission baseline comes from
-/// the configured `[geo] default_country`; `provider = "none"` spells the
+/// the top of the `permissions.yaml` rules tree. `provider = "none"` spells the
 /// same choice explicitly. The host platform's own geo lookup is opt-in:
 /// `provider = "platform"` returns `host_default`, which the adapter passes
 /// as its platform geo implementation. A selected-but-unknown provider is

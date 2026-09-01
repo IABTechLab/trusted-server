@@ -219,7 +219,6 @@ mod tests {
                 proxy_secret = "unit-test-proxy-secret"
 
                 [geo]
-                default_country = "US"
                 assume_single_jurisdiction = true
 
                 [ec]

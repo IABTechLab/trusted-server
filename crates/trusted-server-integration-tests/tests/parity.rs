@@ -49,7 +49,6 @@ fn test_settings() -> Settings {
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [geo]
-            default_country = "FR"
             assume_single_jurisdiction = true
         "#,
     )

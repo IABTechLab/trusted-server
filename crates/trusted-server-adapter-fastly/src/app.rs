@@ -1474,7 +1474,6 @@ mod tests {
                 passphrase = "test-passphrase-at-least-32-bytes!!"
 
                 [geo]
-                default_country = "FR"
                 assume_single_jurisdiction = true
 
                 [request_signing]
@@ -1550,7 +1549,6 @@ mod tests {
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [geo]
-            default_country = "FR"
             assume_single_jurisdiction = true
 
             [request_signing]
@@ -2010,7 +2008,6 @@ mod tests {
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [geo]
-            default_country = "FR"
             assume_single_jurisdiction = true
             "#,
         )
@@ -2670,7 +2667,6 @@ mod tests {
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [geo]
-            default_country = "FR"
             assume_single_jurisdiction = true
 
             [request_signing]
@@ -2933,11 +2929,9 @@ mod tests {
                     passphrase = "test-secret-key-32-bytes-minimum"
 
                     # The deprecated passphrase migrates to the hmac provider, so
-                    # the permission model needs a default country, and
-                    # single-jurisdiction operation acknowledged because no geo
-                    # provider is selected.
+                    # single-jurisdiction operation is acknowledged because no
+                    # geo provider is selected.
                     [geo]
-                    default_country = "FR"
                     assume_single_jurisdiction = true
 
                     [auction]
@@ -3100,7 +3094,6 @@ mod tests {
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [geo]
-            default_country = "FR"
             assume_single_jurisdiction = true
 
             [request_signing]

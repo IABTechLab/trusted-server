@@ -10,14 +10,9 @@ origin_url = "http://127.0.0.1:8888"
 proxy_secret = "integration-test-proxy-secret"
 
 # Viceroy does not resolve geolocation for the loopback test client, so the
-# request carries no country and default_country supplies the baseline the
-# permission model uses. US/CA is a US opt-out state (every purpose granted
-# without a signal), so the EC lifecycle scenarios can assert
-# permission-driven behavior, for example GPC suppressing use of the
-# identifier (identify answers 403) without expiring the ts-ec cookie, since
-# opt-outs are never destructive.
+# request carries no country and the top of the permissions.yaml rules tree
+# supplies the baseline the permission model uses.
 [geo]
-default_country = "US/CA"
 # Viceroy runs without a geo provider, so every request is the default
 # jurisdiction by design.
 assume_single_jurisdiction = true

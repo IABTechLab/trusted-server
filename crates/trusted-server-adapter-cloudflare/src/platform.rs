@@ -669,9 +669,10 @@ pub fn build_runtime_services(
 /// "unknown" sentinel) is treated as absent.
 ///
 /// The region is the ISO 3166-2 subdivision code from `cf-region-code`, for
-/// example `CA`, and not the subdivision name from `cf-region`, because the US
-/// state privacy rules in `[consent.us_states] privacy_states` are written as
-/// two-letter codes and a name would never match one.
+/// example `CA`, and not the subdivision name from `cf-region`, because the
+/// region nodes of the `permissions.yaml` rules tree, including the US states
+/// that carry `jurisdiction: us-state`, are written as two-letter codes and a
+/// name would never match one.
 struct CloudflareGeo {
     country: String,
     city: String,
@@ -816,13 +817,12 @@ mod tests {
     fn a_us_state_visitor_reaches_the_us_state_jurisdiction_and_its_opt_out() {
         // This adapter used to hardcode `region: None` and read no region
         // header, and the consequence ran all the way to the privacy outcome.
-        // `detect_jurisdiction` reaches its US branch only when the country is
-        // `US` and a region is present, so every US visitor fell through to
-        // `NonRegulated`, where `allows_ec_creation` returns true without ever
-        // reading `ctx.gpc`. A Sec-GPC opt-out was therefore ignored for every
-        // US visitor on Cloudflare.
-        let config = trusted_server_core::consent_config::ConsentConfig::default();
-
+        // `detect_jurisdiction` reaches a US state node of the policy tree
+        // only when the country is `US` and a region is present, so every US
+        // visitor fell through to the country node's `NonRegulated`, where
+        // `allows_ec_creation` returns true without ever reading `ctx.gpc`. A
+        // Sec-GPC opt-out was therefore ignored for every US visitor on
+        // Cloudflare.
         let ctx = make_ctx_with_headers(&[("cf-ipcountry", "US"), ("cf-region-code", "CA")]);
         let geo = build_geo(&ctx)
             .lookup(None)
@@ -835,7 +835,7 @@ mod tests {
         );
 
         let jurisdiction =
-            trusted_server_core::consent::jurisdiction::detect_jurisdiction(Some(&geo), &config);
+            trusted_server_core::consent::jurisdiction::detect_jurisdiction(Some(&geo));
         assert_eq!(
             jurisdiction,
             trusted_server_core::consent::jurisdiction::Jurisdiction::UsState("CA".to_owned()),
@@ -865,7 +865,7 @@ mod tests {
             "no region header should mean no region, not an invented one"
         );
         assert_eq!(
-            trusted_server_core::consent::jurisdiction::detect_jurisdiction(Some(&geo), &config),
+            trusted_server_core::consent::jurisdiction::detect_jurisdiction(Some(&geo)),
             trusted_server_core::consent::jurisdiction::Jurisdiction::NonRegulated,
             "with no region a US visitor cannot be placed in a privacy state"
         );

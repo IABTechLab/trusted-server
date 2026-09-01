@@ -234,10 +234,10 @@ impl EcContext {
     ///
     /// This is the constructor adapters use: it runs the geo lookup itself so
     /// a failed lookup is distinguished from "no location resolved". No
-    /// location falls back to the configured `[geo] default_country`
-    /// baseline, while a failure resolves every permission to the
-    /// requires-signal floor (see [`consent::GeoStatus`]) and is logged at
-    /// error level so an outage is visible.
+    /// location falls back to the permission policy's top node, while a
+    /// failure resolves every permission to the requires-signal floor (see
+    /// [`consent::GeoStatus`]) and is logged at error level so an outage is
+    /// visible.
     ///
     /// # Errors
     ///
@@ -330,23 +330,18 @@ impl EcContext {
             .client_ip
             .map(generation::normalize_ip);
 
-        // Jurisdiction detection for the consent gates follows the permission
-        // model's fallback: with no location resolved, the configured default
-        // country stands in, so a deployment that declared its jurisdiction is
-        // not treated as unknown. A failed lookup stays unknown, so the consent
-        // gates fail closed alongside the requires-signal floor.
-        let default_location = match geo_status {
-            consent::GeoStatus::NoLocation => consent::default_location_geo(settings),
-            consent::GeoStatus::Located(_) | consent::GeoStatus::Failed => None,
-        };
-        let consent_geo = geo_info.or(default_location.as_ref());
-
         // Build consent context from request-local cookies, headers, and geo.
+        // Jurisdiction detection follows the permission model's fallback: with
+        // no location resolved the policy's declared jurisdiction stands in, so
+        // a deployment that declared one is not treated as unknown, while a
+        // failed lookup stays unknown so the consent gates fail closed
+        // alongside the requires-signal floor.
         let consent = consent_mod::build_consent_context(&ConsentPipelineInput {
             jar: parsed.jar.as_ref(),
             req,
             config: &settings.consent,
-            geo: consent_geo,
+            geo: geo_info,
+            default_jurisdiction: consent::default_jurisdiction(geo_status),
             ec_id: None,
             kv_store: None,
         });
@@ -356,8 +351,8 @@ impl EcContext {
         // signals. Downstream consumers read the stored result via
         // [`EcContext::permissions`] and [`EcContext::ec_allowed`] rather than
         // re-deriving it.
-        let permissions = consent::assemble_permissions(settings, &consent, geo_status);
-        let storage_acquisition = consent::storage_acquisition(settings, geo_status);
+        let permissions = consent::assemble_permissions(&consent, geo_status);
+        let storage_acquisition = consent::storage_acquisition(geo_status);
         // With no provider selected nothing may create or use an identifier, so
         // the gate is closed rather than open by default.
         let ec_allowed = selected_provider
@@ -1685,15 +1680,15 @@ mod tests {
 
     #[test]
     fn hmac_mints_a_coded_identifier_and_dual_reads_the_legacy_bare_form() {
-        let mut settings = create_test_settings();
-        // A granted-baseline default jurisdiction, so the storage permission
-        // is set with no signal and the creation runs.
-        settings.geo.default_country = Some("US/CA".to_owned());
+        let settings = create_test_settings();
+        // Place the request in a US opt-out state, whose baseline grants the
+        // storage permission with no signal, so the creation runs.
+        let geo = us_opt_out_geo();
         let req = create_test_request(&[]);
         let services = crate::platform::test_support::noop_services_with_client_ip(
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)),
         );
-        let mut ec = EcContext::read_from_request(&settings, &req, &services)
+        let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
             .expect("should read EC context");
         ec.generate_if_needed(&settings, None)
             .expect("should generate");
@@ -1708,8 +1703,9 @@ mod tests {
         let legacy = format!("{}.ABC123", "a".repeat(64));
         let cookie = format!("ts-ec={legacy}");
         let req = create_test_request(&[("cookie", &cookie)]);
-        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
-            .expect("should read EC context");
+        let ec =
+            EcContext::read_from_request_with_geo(&settings, &req, &noop_services(), Some(&geo))
+                .expect("should read EC context");
         assert_eq!(
             ec.ec_value(),
             Some(legacy.as_str()),
@@ -1756,22 +1752,38 @@ mod tests {
         }
     }
 
+    /// A location in a US opt-out state, whose group grants every modeled
+    /// purpose without a signal. Used where a test needs a granted baseline.
+    fn us_opt_out_geo() -> GeoInfo {
+        GeoInfo {
+            city: String::new(),
+            country: "US".to_owned(),
+            continent: String::new(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: Some("CA".to_owned()),
+            asn: None,
+        }
+    }
+
     #[test]
     fn a_geo_provider_failure_resolves_permissions_at_the_requires_signal_floor() {
         use crate::permissions::Permission;
         use crate::platform::test_support::build_services_with_geo;
 
-        // A default country that grants storage, so the assertion can only
-        // pass by the failure reaching the floor rather than the default.
-        let mut settings = create_test_settings();
-        settings.geo.default_country = Some("US/CA".to_owned());
+        // A located request in a granted-baseline state, so the assertion can
+        // only pass by the failure reaching the floor rather than a tree node.
+        let settings = create_test_settings();
         let req = create_test_request(&[]);
+        let geo = us_opt_out_geo();
 
-        let granted = EcContext::read_from_request_resolving_geo(&settings, &req, &noop_services())
-            .expect("should read EC context with a geo provider that resolves nothing");
+        let granted =
+            EcContext::read_from_request_with_geo(&settings, &req, &noop_services(), Some(&geo))
+                .expect("should read EC context for a located request");
         assert!(
             granted.permissions().is_set(Permission::StoreOnDevice),
-            "the default country must grant storage, or this test proves nothing"
+            "the located baseline must grant storage, or this test proves nothing"
         );
 
         let services = build_services_with_geo(std::sync::Arc::new(FailingGeo));
@@ -1779,33 +1791,40 @@ mod tests {
             .expect("a failed lookup should resolve permissions, not fail the request");
         assert!(
             !failed.permissions().is_set(Permission::StoreOnDevice),
-            "a geo provider failure must resolve at the requires-signal floor, not the default"
+            "a geo provider failure must resolve at the requires-signal floor"
+        );
+        assert_eq!(
+            failed.consent().jurisdiction,
+            crate::consent::jurisdiction::Jurisdiction::Unknown,
+            "a failed lookup must not adopt the policy's declared jurisdiction"
         );
     }
 
     #[test]
-    fn no_location_resolves_the_consent_jurisdiction_from_the_default_country() {
+    fn the_resolved_place_decides_the_consent_jurisdiction() {
         use crate::consent::jurisdiction::Jurisdiction;
 
-        let mut settings = create_test_settings();
-        settings.geo.default_country = Some("US/CA".to_owned());
+        let settings = create_test_settings();
         let req = create_test_request(&[]);
-        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+
+        // No location at all: the policy's top node answers.
+        let unplaced = EcContext::read_from_request(&settings, &req, &noop_services())
             .expect("should read EC context");
         assert_eq!(
-            ec.consent().jurisdiction,
-            Jurisdiction::UsState("CA".to_owned()),
-            "with no location the default country should decide the jurisdiction"
+            unplaced.consent().jurisdiction,
+            Jurisdiction::Gdpr,
+            "with no place the top node's jurisdiction should apply"
         );
 
-        let mut settings = create_test_settings();
-        settings.geo.default_country = Some("FR".to_owned());
-        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
-            .expect("should read EC context");
+        // A listed US state names itself as the state.
+        let geo = us_opt_out_geo();
+        let located =
+            EcContext::read_from_request_with_geo(&settings, &req, &noop_services(), Some(&geo))
+                .expect("should read EC context");
         assert_eq!(
-            ec.consent().jurisdiction,
-            Jurisdiction::Gdpr,
-            "a GDPR default country should resolve the GDPR jurisdiction"
+            located.consent().jurisdiction,
+            Jurisdiction::UsState("CA".to_owned()),
+            "a listed US state should resolve its own state jurisdiction"
         );
     }
 

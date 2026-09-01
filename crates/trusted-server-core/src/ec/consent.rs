@@ -9,26 +9,26 @@
 //! re-deriving one.
 
 use crate::consent::ConsentContext;
+use crate::consent::jurisdiction::Jurisdiction;
 use crate::permissions::{
     Acquisition, ConsentSignal, OptOutSource, Permission, PermissionMaps, PermissionState,
     SignalPolicy,
 };
 use crate::platform::GeoInfo;
-use crate::settings::Settings;
 
 /// The outcome of the geo lookup for a request, separating "no location
 /// resolved" from "the lookup failed".
 ///
 /// The two must not collapse: with no location (the provider is disabled, or
-/// had no data for the address) the deployer's `[geo] default_country`
-/// baseline applies, but when the lookup errored the request's location is
-/// unknown in a way the deployer default must not paper over, so every
-/// permission resolves to the requires-signal floor instead.
+/// had no data for the address) the permission policy's top node applies, but
+/// when the lookup errored the request's place is unknown in a way that top
+/// node must not paper over, so every permission resolves to the
+/// requires-signal floor instead.
 #[derive(Debug, Clone, Copy)]
 pub enum GeoStatus<'a> {
     /// The provider resolved a location.
     Located(&'a GeoInfo),
-    /// The provider resolved no location, so the configured default applies.
+    /// The provider resolved no location, so the policy's top node applies.
     NoLocation,
     /// The lookup errored, so the requires-signal floor applies.
     Failed,
@@ -54,101 +54,74 @@ impl<'a> From<Option<&'a GeoInfo>> for GeoStatus<'a> {
     }
 }
 
-/// The configured `[geo] default_country` as a [`GeoInfo`], for jurisdiction
-/// detection when the geo provider resolves no location.
+/// The jurisdiction the consent gates apply to a request, from its resolved
+/// location or, with none, from the permission policy's top node.
 ///
 /// The consent gates (for example the server-side auction gate) detect a
 /// jurisdiction from geolocation. With no location they would resolve
-/// `Unknown` and fail closed even where the deployer has declared a default
-/// jurisdiction, so the same fallback the permission model applies is
-/// offered here: the default country and region stand in for the missing
-/// location. Only the country and region carry meaning; every other field is
-/// empty. A failed lookup must not use this (see [`GeoStatus::Failed`]), so
-/// the caller decides when to apply it.
+/// `Unknown` and fail closed even where the policy declares what to do, so the
+/// same fallback the permission model applies is offered here: the top node's
+/// `jurisdiction` stands in for the missing location. A failed lookup stays
+/// unknown, so the consent gates fail closed alongside the requires-signal
+/// floor.
 #[must_use]
-pub fn default_location_geo(settings: &Settings) -> Option<GeoInfo> {
-    let (country, region) = default_location(settings);
-    let country = country?;
-    Some(GeoInfo {
-        city: String::new(),
-        country: country.to_owned(),
-        continent: String::new(),
-        latitude: 0.0,
-        longitude: 0.0,
-        metro_code: 0,
-        region: region.map(str::to_owned),
-        asn: None,
-    })
-}
-
-/// Splits the configured `[geo] default_country` into its country and region
-/// parts (`US/CA` names a country and region, `US` a bare country).
-fn default_location(settings: &Settings) -> (Option<&str>, Option<&str>) {
-    match settings.geo.default_country.as_deref() {
-        Some(spec) => match spec.split_once('/') {
-            Some((country, region)) => (Some(country), Some(region)),
-            None => (Some(spec), None),
-        },
-        None => (None, None),
+pub fn default_jurisdiction(geo: GeoStatus<'_>) -> Jurisdiction {
+    match geo {
+        GeoStatus::NoLocation => PermissionMaps::standard().default_jurisdiction(),
+        GeoStatus::Located(_) | GeoStatus::Failed => Jurisdiction::Unknown,
     }
 }
 
-/// Assembles the permission state for a request: the country/region baseline
-/// from the default maps in `permissions.yaml`, augmented by the session's
-/// signals.
+/// Assembles the permission state for a request: the place baseline from the
+/// tree in `permissions.yaml`, augmented by the session's signals.
 ///
 /// Permissions exist without a consent model. With no signal present the result
 /// is simply the baseline for the request's country and region. When the geo
 /// provider resolves no location, or a country/region that has no rule, the
-/// deployer's configured `[geo] default_country` applies. A default is required,
-/// so it is always available. A failed lookup ([`GeoStatus::Failed`]) instead
-/// resolves every permission to the requires-signal floor, so an outage is
-/// handled protectively rather than as the deployer's default jurisdiction.
+/// policy's top node applies, and the top node's `group` is required so one is
+/// always available. A failed lookup ([`GeoStatus::Failed`]) instead resolves
+/// every permission to the requires-signal floor, so an outage is handled
+/// protectively rather than as the policy's declared default.
 #[must_use]
-pub fn assemble_permissions(
-    settings: &Settings,
-    consent: &ConsentContext,
-    geo: GeoStatus<'_>,
-) -> PermissionState {
+pub fn assemble_permissions(consent: &ConsentContext, geo: GeoStatus<'_>) -> PermissionState {
     let maps = PermissionMaps::standard();
-    let (default_country, default_region) = match geo {
-        GeoStatus::Failed => (None, None),
-        GeoStatus::Located(_) | GeoStatus::NoLocation => default_location(settings),
-    };
-    let info = geo.info();
-    maps.resolve_with(
-        info.map(|info| info.country.as_str()),
-        info.and_then(|info| info.region.as_deref()),
-        default_country,
-        default_region,
-        permission_signal(consent, maps.signals()),
-    )
+    let signal = permission_signal(consent, maps.signals());
+    match geo {
+        GeoStatus::Failed => PermissionMaps::floor_with(signal),
+        GeoStatus::Located(_) | GeoStatus::NoLocation => {
+            let info = geo.info();
+            maps.resolve_with(
+                info.map(|info| info.country.as_str()),
+                info.and_then(|info| info.region.as_deref()),
+                signal,
+            )
+        }
+    }
 }
 
 /// The acquisition rule for Edge Cookie storage in the request's resolved
 /// jurisdiction, used to scope destructive withdrawal.
 ///
 /// Resolves the same rules as [`assemble_permissions`] (the request's
-/// country/region, the configured default when unmatched, and the
-/// requires-signal floor when the lookup failed or nothing resolves) and
-/// returns the rule for [`Permission::StoreOnDevice`].
+/// country/region, the policy's top node when unmatched, and the
+/// requires-signal floor when the lookup failed) and returns the rule for
+/// [`Permission::StoreOnDevice`].
 #[must_use]
-pub fn storage_acquisition(settings: &Settings, geo: GeoStatus<'_>) -> Acquisition {
-    let maps = PermissionMaps::standard();
-    let (default_country, default_region) = match geo {
-        GeoStatus::Failed => (None, None),
-        GeoStatus::Located(_) | GeoStatus::NoLocation => default_location(settings),
-    };
-    let info = geo.info();
-    maps.rules_or_default(
-        info.map(|info| info.country.as_str()),
-        info.and_then(|info| info.region.as_deref()),
-        default_country,
-        default_region,
-    )
-    .map_or(Acquisition::RequiresSignal, |rules| {
-        rules.rule_for(Permission::StoreOnDevice)
-    })
+pub fn storage_acquisition(geo: GeoStatus<'_>) -> Acquisition {
+    match geo {
+        GeoStatus::Failed => Acquisition::RequiresSignal,
+        GeoStatus::Located(_) | GeoStatus::NoLocation => {
+            let info = geo.info();
+            PermissionMaps::standard()
+                .rules_or_default(
+                    info.map(|info| info.country.as_str()),
+                    info.and_then(|info| info.region.as_deref()),
+                )
+                .map_or(Acquisition::RequiresSignal, |rules| {
+                    rules.rule_for(Permission::StoreOnDevice)
+                })
+        }
+    }
 }
 
 /// Maps a consent context to a [`ConsentSignal`] for each permission, applying
@@ -286,16 +259,15 @@ mod tests {
 
     #[test]
     fn hmac_provider_is_blocked_without_a_storage_signal() {
-        // The test settings select the HMAC provider, which requires
-        // necessary.operations.storage. The configured default country (FR)
-        // resolves storage as requires-signal, so with no signal the
-        // permission is not set and the provider's requirement is not met.
         let settings = create_test_settings();
+        // The test settings select the HMAC provider, which requires
+        // necessary.operations.storage. The policy's top node resolves storage
+        // as requires-signal, so with no signal the permission is not set and
+        // the provider's requirement is not met.
         let provider = crate::ec::provider::build_provider(&settings.ec, None, None)
             .expect("should build the configured provider")
             .expect("should select the hmac provider");
-        let state =
-            assemble_permissions(&settings, &ConsentContext::default(), GeoStatus::NoLocation);
+        let state = assemble_permissions(&ConsentContext::default(), GeoStatus::NoLocation);
         assert!(
             !state.all_set(provider.required_permissions()),
             "the requires-signal default should not satisfy the HMAC provider without a signal"
@@ -319,13 +291,8 @@ mod tests {
     fn no_signal_uses_the_us_opt_out_baseline() {
         // US/CA maps to the us-opt-out group, where every purpose is granted
         // without a signal, so EC identity and bidstream EIDs are both permitted.
-        let settings = create_test_settings();
         let geo = us_ca_geo();
-        let state = assemble_permissions(
-            &settings,
-            &ConsentContext::default(),
-            GeoStatus::Located(&geo),
-        );
+        let state = assemble_permissions(&ConsentContext::default(), GeoStatus::Located(&geo));
         assert!(
             state.is_set(Permission::StoreOnDevice)
                 && state.is_set(Permission::SelectPersonalisedAds),
@@ -337,13 +304,12 @@ mod tests {
     fn gpc_revokes_the_granted_baseline_in_a_us_opt_out_state() {
         // A US-style opt-out drops a granted baseline with no jurisdiction match:
         // the map granted these purposes, and GPC revokes them.
-        let settings = create_test_settings();
         let consent = ConsentContext {
             gpc: true,
             ..ConsentContext::default()
         };
         let geo = us_ca_geo();
-        let state = assemble_permissions(&settings, &consent, GeoStatus::Located(&geo));
+        let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
         assert!(
             !state.is_set(Permission::StoreOnDevice)
                 && !state.is_set(Permission::SelectPersonalisedAds),
@@ -361,14 +327,13 @@ mod tests {
 
     #[test]
     fn gpc_suppresses_storage_even_with_a_consenting_tcf_record() {
-        let settings = create_test_settings();
         let consent = ConsentContext {
             tcf: Some(tcf_with_purposes(&[1, 4])),
             gpc: true,
             ..ConsentContext::default()
         };
         let geo = us_ca_geo();
-        let state = assemble_permissions(&settings, &consent, GeoStatus::Located(&geo));
+        let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
         assert!(
             !state.is_set(Permission::StoreOnDevice)
                 && !state.is_set(Permission::SelectPersonalisedAds),
@@ -378,7 +343,6 @@ mod tests {
 
     #[test]
     fn us_privacy_opt_out_suppresses_storage_even_with_a_consenting_tcf_record() {
-        let settings = create_test_settings();
         let consent = ConsentContext {
             tcf: Some(tcf_with_purposes(&[1, 4])),
             us_privacy: Some(crate::consent::types::UsPrivacy {
@@ -390,7 +354,7 @@ mod tests {
             ..ConsentContext::default()
         };
         let geo = us_ca_geo();
-        let state = assemble_permissions(&settings, &consent, GeoStatus::Located(&geo));
+        let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
         assert!(
             !state.is_set(Permission::StoreOnDevice)
                 && !state.is_set(Permission::SelectPersonalisedAds),
@@ -400,7 +364,6 @@ mod tests {
 
     #[test]
     fn gpp_sale_opt_out_suppresses_storage_even_with_a_consenting_tcf_record() {
-        let settings = create_test_settings();
         let consent = ConsentContext {
             tcf: Some(tcf_with_purposes(&[1, 4])),
             gpp: Some(crate::consent::types::GppConsent {
@@ -412,7 +375,7 @@ mod tests {
             ..ConsentContext::default()
         };
         let geo = us_ca_geo();
-        let state = assemble_permissions(&settings, &consent, GeoStatus::Located(&geo));
+        let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
         assert!(
             !state.is_set(Permission::StoreOnDevice)
                 && !state.is_set(Permission::SelectPersonalisedAds),
@@ -422,7 +385,6 @@ mod tests {
 
     #[test]
     fn gpc_suppresses_storage_even_when_us_privacy_reports_no_opt_out() {
-        let settings = create_test_settings();
         let consent = ConsentContext {
             gpc: true,
             us_privacy: Some(crate::consent::types::UsPrivacy {
@@ -434,7 +396,7 @@ mod tests {
             ..ConsentContext::default()
         };
         let geo = us_ca_geo();
-        let state = assemble_permissions(&settings, &consent, GeoStatus::Located(&geo));
+        let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
         assert!(
             !state.is_set(Permission::StoreOnDevice),
             "any one opt-out source should suppress, whatever the others say"
@@ -546,13 +508,12 @@ mod tests {
 
     #[test]
     fn a_malformed_tcf_record_blocks_baseline_grants() {
-        let settings = create_test_settings();
         let consent = ConsentContext {
             raw_tc_string: Some("not-a-tc-string".to_owned()),
             ..ConsentContext::default()
         };
         let geo = us_ca_geo();
-        let state = assemble_permissions(&settings, &consent, GeoStatus::Located(&geo));
+        let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
         assert!(
             !state.is_set(Permission::StoreOnDevice),
             "an unreadable record should block the granted baseline, not vanish"
@@ -577,14 +538,13 @@ mod tests {
 
     #[test]
     fn an_expired_tcf_record_is_not_treated_as_malformed() {
-        let settings = create_test_settings();
         let consent = ConsentContext {
             raw_tc_string: Some("CPc-old-string".to_owned()),
             expired: true,
             ..ConsentContext::default()
         };
         let geo = us_ca_geo();
-        let state = assemble_permissions(&settings, &consent, GeoStatus::Located(&geo));
+        let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
         assert!(
             state.is_set(Permission::StoreOnDevice),
             "expiry is its own explicit state, deliberately distinct from malformed"
@@ -592,40 +552,62 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Geo status: a failed lookup resolves at the requires-signal floor,
-    // while no location falls back to the configured default.
+    // Geo status: a failed lookup resolves at the requires-signal floor and
+    // never consults the tree, while no location resolves at the policy's top
+    // node.
     // ------------------------------------------------------------------
 
     #[test]
     fn a_failed_geo_lookup_resolves_to_the_requires_signal_floor() {
-        let mut settings = create_test_settings();
-        settings.geo.default_country = Some("US/CA".to_owned());
-        let state = assemble_permissions(&settings, &ConsentContext::default(), GeoStatus::Failed);
+        // The same request, located in a US opt-out state, grants storage
+        // without a signal. A failed lookup must not reach that rule, or any
+        // other, so nothing is set without a signal.
+        let geo = us_ca_geo();
+        assert!(
+            assemble_permissions(&ConsentContext::default(), GeoStatus::Located(&geo))
+                .is_set(Permission::StoreOnDevice),
+            "the located baseline must grant storage, or this test proves nothing"
+        );
+        let state = assemble_permissions(&ConsentContext::default(), GeoStatus::Failed);
         assert!(
             !state.is_set(Permission::StoreOnDevice),
-            "a lookup failure must not fall back to the deployer default baseline"
+            "a lookup failure must not fall back to any node of the policy tree"
         );
         assert_eq!(
-            storage_acquisition(&settings, GeoStatus::Failed),
+            storage_acquisition(GeoStatus::Failed),
             Acquisition::RequiresSignal,
             "the storage baseline follows the same floor on failure"
         );
     }
 
     #[test]
-    fn no_location_falls_back_to_the_configured_default() {
-        let mut settings = create_test_settings();
-        settings.geo.default_country = Some("US/CA".to_owned());
-        let state =
-            assemble_permissions(&settings, &ConsentContext::default(), GeoStatus::NoLocation);
+    fn no_location_falls_back_to_the_policy_top_node() {
+        // The shipped policy's top node is the gdpr-eu group, which requires a
+        // signal for storage, so an unplaced visitor gets no identifier until
+        // one arrives.
+        let state = assemble_permissions(&ConsentContext::default(), GeoStatus::NoLocation);
         assert!(
-            state.is_set(Permission::StoreOnDevice),
-            "no location should resolve at the configured default baseline"
+            !state.is_set(Permission::StoreOnDevice),
+            "the top node requires a signal for storage"
         );
         assert_eq!(
-            storage_acquisition(&settings, GeoStatus::NoLocation),
-            Acquisition::Granted,
-            "the storage baseline follows the default on no location"
+            storage_acquisition(GeoStatus::NoLocation),
+            Acquisition::RequiresSignal,
+            "the storage baseline follows the top node on no location"
+        );
+    }
+
+    #[test]
+    fn no_location_takes_the_jurisdiction_from_the_policy_top_node() {
+        assert_eq!(
+            default_jurisdiction(GeoStatus::NoLocation),
+            Jurisdiction::Gdpr,
+            "no location should resolve the top node's declared jurisdiction"
+        );
+        assert_eq!(
+            default_jurisdiction(GeoStatus::Failed),
+            Jurisdiction::Unknown,
+            "a failed lookup must not adopt the policy's declared jurisdiction"
         );
     }
 
@@ -635,14 +617,13 @@ mod tests {
         // purposes, not only Purpose 1 and Purpose 4. Consent to all purposes
         // except Purpose 7 (measure ad performance), in a US opt-out state where
         // the baseline granted them all, so a revoke is observable as a drop.
-        let settings = create_test_settings();
         let consented: Vec<usize> = (1..=11).filter(|&p| p != 7).collect();
         let consent = ConsentContext {
             tcf: Some(tcf_with_purposes(&consented)),
             ..ConsentContext::default()
         };
         let geo = us_ca_geo();
-        let state = assemble_permissions(&settings, &consent, GeoStatus::Located(&geo));
+        let state = assemble_permissions(&consent, GeoStatus::Located(&geo));
 
         // Purpose 2 is now resolved (it was neutral before), so consent sets it.
         assert!(

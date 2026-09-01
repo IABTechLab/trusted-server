@@ -1812,13 +1812,13 @@ mod tests {
         // No signal: the provider's required permission is not set, so Trusted
         // Server would not commit the Edge Cookie.
         assert!(
-            !maps.resolve(None, None, |_| false).all_set(required),
+            !maps.resolve(None, |_| false).all_set(required),
             "the floor should not run the Edge Cookie provider without the permission set"
         );
 
         // A grant signal for necessary.operations.storage: the provider's permission is now set.
         assert!(
-            maps.resolve(None, None, |p| p == Permission::StoreOnDevice)
+            maps.resolve(None, |p| p == Permission::StoreOnDevice)
                 .all_set(required),
             "the Edge Cookie provider runs once necessary.operations.storage is set"
         );

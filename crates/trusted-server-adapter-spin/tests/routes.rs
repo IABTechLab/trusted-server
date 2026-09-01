@@ -41,7 +41,6 @@ fn test_router() -> RouterService {
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [geo]
-            default_country = "FR"
             assume_single_jurisdiction = true
         "#,
     )
@@ -1006,11 +1005,9 @@ const UNINJECTED_PROVIDER_TOML: &str = r#"
     [ec.providers.acme]
     endpoint = "https://ec.acme.example.com"
 
-    # An Edge Cookie provider is configured, so the permission model needs a
-    # default country, and single-jurisdiction operation acknowledged because
-    # no geo provider is selected.
+    # An Edge Cookie provider is configured, so single-jurisdiction operation
+    # is acknowledged because no geo provider is selected.
     [geo]
-    default_country = "FR"
     assume_single_jurisdiction = true
 "#;
 

@@ -162,8 +162,8 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
 ///
 /// The geo lookup runs inside
 /// [`EcContext::read_from_request_resolving_geo`], so every adapter reports the
-/// same distinction: no location falls back to the configured
-/// `[geo] default_country` baseline, while a failed lookup resolves every
+/// same distinction: no location falls back to the top of the
+/// `permissions.yaml` rules tree, while a failed lookup resolves every
 /// permission at the requires-signal floor and is logged at error level.
 /// Geo comes from the Workers `cf` object when deployed.
 ///
@@ -692,11 +692,9 @@ mod tests {
         [ec.providers.acme]
         endpoint = "https://ec.acme.example.com"
 
-        # An Edge Cookie provider is configured, so the permission model needs a
-        # default country, and single-jurisdiction operation acknowledged because
-        # no geo provider is selected.
+        # An Edge Cookie provider is configured, so single-jurisdiction
+        # operation is acknowledged because no geo provider is selected.
         [geo]
-        default_country = "FR"
         assume_single_jurisdiction = true
     "#;
 
