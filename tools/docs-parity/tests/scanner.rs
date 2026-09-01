@@ -59,6 +59,31 @@ impl TestRepository {
         self.directory.path()
     }
 
+    fn add_text(&self, path: &str, contents: &str) {
+        let absolute = self.path().join(path);
+        if let Some(parent) = absolute.parent() {
+            fs::create_dir_all(parent).expect("should create tracked file parent");
+        }
+        fs::write(&absolute, contents).expect("should write additional tracked file");
+        run_git(self.path(), &["add", "-f", "--", path]);
+
+        let manifests = self.path().join("tools/docs-parity/manifests");
+        let tracked_path = manifests.join("tracked-files.toml");
+        let mut tracked = fs::read_to_string(&tracked_path).expect("should read tracked manifest");
+        tracked.push_str(&format!(
+            "\n[[files]]\npath = \"{path}\"\nkind = \"text\"\n"
+        ));
+        fs::write(tracked_path, tracked).expect("should extend tracked manifest");
+
+        let maintained_path = manifests.join("maintained-sources.toml");
+        let mut maintained =
+            fs::read_to_string(&maintained_path).expect("should read maintained manifest");
+        maintained.push_str(&format!(
+            "\n[[sources]]\npath = \"{path}\"\nmode = \"whole\"\ndisposition = \"include\"\n"
+        ));
+        fs::write(maintained_path, maintained).expect("should extend maintained manifest");
+    }
+
     fn write_allowlist(&self, contents: &str) {
         fs::write(
             self.path()
@@ -150,14 +175,15 @@ fn exception_for_contents(
 }
 
 fn governed_match(detector: &str, value: &str) -> String {
-    if !matches!(detector, "domain" | "binary_string" | "media_metadata") || !value.contains("://")
-    {
+    let domain_value = detector == "domain";
+    let embedded_url =
+        matches!(detector, "binary_string" | "media_metadata") && value.contains("://");
+    if !domain_value && !embedded_url {
         return value.to_owned();
     }
     value
         .split_once("://")
-        .expect("URL")
-        .1
+        .map_or(value, |(_scheme, remainder)| remainder)
         .split(['/', '?', '#'])
         .next()
         .expect("host")
@@ -325,6 +351,57 @@ fn bare_domain_detector_has_positive_and_typed_allowlisted_fixtures() {
 }
 
 #[test]
+fn bare_domain_findings_select_only_host_bytes() {
+    let value = format!("portal.{}/docs", "private-corp.internal");
+    let repository = TestRepository::new("notes.txt", value.as_bytes(), "text");
+
+    let result = repository.bootstrap();
+
+    assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+    let manifest = fs::read_to_string(
+        repository
+            .path()
+            .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+    )
+    .expect("should read bootstrap manifest");
+    let host = format!("portal.{}", "private-corp.internal");
+    assert!(
+        manifest.contains(&format!(
+            "selector = \"bytes:0-{}\"\nfingerprint = \"{}\"",
+            host.len(),
+            fingerprint(host.as_bytes())
+        )),
+        "bare-domain selector and fingerprint must cover only host bytes: {manifest}"
+    );
+}
+
+#[test]
+fn domain_fingerprint_matches_exact_selected_host_bytes() {
+    let host = "Portal.Private-Corp.Internal";
+    let value = format!("HTTPS://{host}/docs");
+    let repository = TestRepository::new("notes.txt", value.as_bytes(), "text");
+
+    let result = repository.bootstrap();
+
+    assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+    let manifest = fs::read_to_string(
+        repository
+            .path()
+            .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+    )
+    .expect("should read bootstrap manifest");
+    let start = value.find(host).expect("host should exist");
+    assert!(
+        manifest.contains(&format!(
+            "selector = \"bytes:{start}-{}\"\nfingerprint = \"{}\"",
+            start + host.len(),
+            fingerprint(host.as_bytes())
+        )),
+        "fingerprint must cover the exact selected bytes without case normalization: {manifest}"
+    );
+}
+
+#[test]
 fn bare_domain_detector_does_not_match_source_member_prefixes() {
     let contents = b"result.contains(value); output.status.code(); document.body.append(node);\nexample.com.evil\n";
     let repository = TestRepository::new("fixture.rs", contents, "text");
@@ -363,34 +440,43 @@ fn domain_detector_rejects_template_path_and_code_member_false_positives() {
 
 #[test]
 fn domain_detector_rejects_non_code_paths_and_markup_tokens_but_keeps_link_hosts() {
-    for (path, contents) in [
+    for (path, contents, references) in [
         (
-            "README.md",
-            [
-                "See build",
-                ".rs, `prediction",
-                ".name`, and ```state.settings.ec",
-                ".partners```.",
-            ]
-            .concat(),
+            "docs/README.md",
+            ["See build", ".rs and `CONTRIBUTING", ".md`."].concat(),
+            vec![
+                ["crates/example/build", ".rs"].concat(),
+                "CONTRIBUTING.md".to_owned(),
+            ],
         ),
         (
-            "README.md",
-            [
-                "[guide](getting-started",
-                ".md) and ../docs/configuration",
-                ".md",
-            ]
-            .concat(),
+            "docs/README.md",
+            ["[guide](getting-started", ".md) and configuration", ".md"].concat(),
+            vec![
+                ["docs/guide/getting-started", ".md"].concat(),
+                ["docs/guide/configuration", ".md"].concat(),
+            ],
         ),
-        (".dockerignore", ["dist/cache", ".name\n"].concat()),
+        (
+            ".dockerignore",
+            ["dist/cache", ".name\n"].concat(),
+            vec![["dist/cache", ".name"].concat()],
+        ),
         (
             "config.txt",
-            ["relative\\path", ".name and /var/tmp/file", ".dev"].concat(),
+            ["relative/path", ".name"].concat(),
+            vec![["relative/path", ".name"].concat()],
         ),
-        ("script.sh", ["# generated path build", ".rs\n"].concat()),
+        (
+            "script.sh",
+            ["# generated path build", ".rs\n"].concat(),
+            vec![["build", ".rs"].concat()],
+        ),
     ] {
         let repository = TestRepository::new(path, contents.as_bytes(), "text");
+        for reference in references {
+            repository.add_text(&reference, "no findings\n");
+        }
         let result = repository.scan();
         assert_eq!(
             status_code(&result),
@@ -399,12 +485,191 @@ fn domain_detector_rejects_non_code_paths_and_markup_tokens_but_keeps_link_hosts
             diagnostic(&result)
         );
     }
-    assert_detected(
-        "README.md",
-        b"[purpose](https://getpurpose.ai/docs)",
-        "text",
-        "domain",
+    let project_host = ["getpurpose", ".ai"].concat();
+    let link = format!("[purpose](https://{project_host}/docs)");
+    assert_detected("README.md", link.as_bytes(), "text", "domain");
+}
+
+#[test]
+fn domain_detector_uses_repository_paths_instead_of_suffix_or_markup_suppression() {
+    let service_host = ["service.example", ".rs"].concat();
+    let project_host = ["getpurpose", ".ai"].concat();
+    let untracked = ["untracked-guide", ".md"].concat();
+    let configuration = ["docs/configuration", ".md"].concat();
+    let contents = format!(
+        "README.md `build.rs` [configuration]({configuration}) CONTRIBUTING.md\n\
+         `{service_host}`\n\
+         {untracked}\n\
+         ```text\n{project_host}\n```\n\
+         `{project_host}` and {project_host}\n"
     );
+    let repository = TestRepository::new("README.md", contents.as_bytes(), "text");
+    for path in ["build.rs", configuration.as_str(), "CONTRIBUTING.md"] {
+        repository.add_text(path, "no findings\n");
+    }
+
+    let result = repository.bootstrap();
+
+    assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+    let manifest = fs::read_to_string(
+        repository
+            .path()
+            .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+    )
+    .expect("should read bootstrap manifest");
+    assert_eq!(
+        manifest.matches("detector = \"domain\"").count(),
+        5,
+        "two non-path public hosts and all three project hosts must remain findings: {manifest}"
+    );
+    assert_eq!(
+        manifest
+            .matches(&fingerprint(project_host.as_bytes()))
+            .count(),
+        3,
+        "Markdown markup must not suppress project domains: {manifest}"
+    );
+    assert!(
+        manifest.contains(&fingerprint(service_host.as_bytes())),
+        "source-looking public suffix must remain detectable when it is not a repository path: {manifest}"
+    );
+    assert!(
+        manifest.contains(&fingerprint(untracked.as_bytes())),
+        "a source-like suffix is not repository-path evidence by itself: {manifest}"
+    );
+}
+
+#[test]
+fn domain_detector_resolves_root_and_current_relative_path_tokens() {
+    let dot_md = ".md";
+    let dot_rs = ".rs";
+    for (path, contents, referenced_paths) in [
+        (
+            ["README", dot_md].concat(),
+            format!("See README{dot_md} and `CONTRIBUTING{dot_md}`.\n"),
+            vec![["CONTRIBUTING", dot_md].concat()],
+        ),
+        (
+            ["build", dot_rs].concat(),
+            format!("let path = \"build{dot_rs}\";\n"),
+            Vec::new(),
+        ),
+        (
+            ["docs/configuration", dot_md].concat(),
+            format!("[start](getting-started{dot_md}) and ../CONTRIBUTING{dot_md}\n"),
+            vec![
+                ["docs/getting-started", dot_md].concat(),
+                ["CONTRIBUTING", dot_md].concat(),
+            ],
+        ),
+        (
+            ".gitignore".to_owned(),
+            format!("docs/configuration{dot_md}\n"),
+            vec![["docs/configuration", dot_md].concat()],
+        ),
+        (
+            "script.sh".to_owned(),
+            format!("cat README{dot_md}\n"),
+            vec![["README", dot_md].concat()],
+        ),
+    ] {
+        let repository = TestRepository::new(&path, contents.as_bytes(), "text");
+        for referenced_path in referenced_paths {
+            repository.add_text(&referenced_path, "no findings\n");
+        }
+
+        let result = repository.scan();
+
+        assert_eq!(
+            status_code(&result),
+            SUCCESS,
+            "{path}: {}",
+            diagnostic(&result)
+        );
+    }
+}
+
+#[test]
+fn source_domain_context_persists_across_lines_and_rejects_members() {
+    let member_one = ["prediction", ".name"].concat();
+    let member_two = ["state.settings.ec", ".partners"].concat();
+    let member_three = ["document", ".body"].concat();
+    let member_four = ["result", ".contains"].concat();
+    let host = ["service.example", ".rs"].concat();
+    for (path, contents) in [
+        (
+            "main.rs",
+            format!(
+                "let plain = {member_one};\nlet nested = {member_two};\nlet body = {member_three};\nlet result = {member_four}(value);\nlet host = \"\n{host}\";\n// {host}\n"
+            ),
+        ),
+        (
+            "app.js",
+            format!(
+                "const plain = {member_one};\nconst nested = {member_two};\nconst body = {member_three};\nconst result = {member_four}(value);\nconst host = `\n{host}`;\n// {host}\n"
+            ),
+        ),
+    ] {
+        let repository = TestRepository::new(path, contents.as_bytes(), "text");
+
+        let result = repository.bootstrap();
+
+        assert_eq!(
+            status_code(&result),
+            SUCCESS,
+            "{path}: {}",
+            diagnostic(&result)
+        );
+        let manifest = fs::read_to_string(
+            repository
+                .path()
+                .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+        )
+        .expect("should read bootstrap manifest");
+        assert_eq!(
+            manifest.matches("detector = \"domain\"").count(),
+            2,
+            "only the string and comment hosts must be findings: {manifest}"
+        );
+    }
+}
+
+#[test]
+fn source_member_evidence_suppresses_documented_expressions_not_real_hosts() {
+    let member_one = ["prediction", ".name"].concat();
+    let member_two = ["state.settings.ec", ".partners"].concat();
+    let host = ["service.example", ".rs"].concat();
+    let contents = format!("`{member_one}` and `{member_two}` are members; `{host}` is a host.\n");
+    let repository = TestRepository::new("README.md", contents.as_bytes(), "text");
+    repository.add_text(
+        "src/main.rs",
+        &format!("let first = {member_one};\nlet second = {member_two};\n"),
+    );
+
+    let result = repository.bootstrap();
+
+    assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+    let manifest = fs::read_to_string(
+        repository
+            .path()
+            .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+    )
+    .expect("should read bootstrap manifest");
+    assert_eq!(
+        manifest.matches("detector = \"domain\"").count(),
+        1,
+        "only the real host must remain: {manifest}"
+    );
+    assert!(manifest.contains(&fingerprint(host.as_bytes())));
+}
+
+#[test]
+fn invalid_url_templates_do_not_create_domain_findings() {
+    let repository = TestRepository::new("main.rs", b"let url = \"http://{\";\n", "text");
+
+    let result = repository.scan();
+
+    assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
 }
 
 #[test]
@@ -636,6 +901,97 @@ fn structured_lockfiles_fail_closed_on_non_string_and_duplicate_url_fields() {
         let repository = TestRepository::new("Cargo.lock", contents.as_bytes(), "text");
         let result = repository.scan();
         assert_eq!(status_code(&result), ERROR, "{contents}");
+    }
+}
+
+#[test]
+fn cargo_lock_structural_fields_follow_toml_semantics() {
+    let sensitive = "https://private-corp.internal/index";
+    for contents in [
+        format!("version = 3\n'source' = '{sensitive}'\n"),
+        format!("version = 3\n\"source\" = \"{sensitive}\"\n"),
+        format!("version = 3\npackage.\"source\" = \"{sensitive}\"\n"),
+        format!("version = 3\npackage = {{ metadata = {{ source = \"{sensitive}\" }} }}\n"),
+        format!("version = 3\n[[package]]\nsource = \"{sensitive}\"\n"),
+    ] {
+        assert_detected("Cargo.lock", contents.as_bytes(), "text", "lockfile_field");
+    }
+}
+
+#[test]
+fn cargo_lock_ignores_field_decoys_in_comments_and_strings() {
+    for contents in [
+        "version = 3\n# source = \"https://private-corp.internal/index\"\n",
+        "version = 3\ndescription = 'source = \"https://private-corp.internal/index\"'\n",
+        "version = 3\nlabel = \"source\"\ndescription = \"https://private-corp.internal/index\"\n",
+    ] {
+        let repository = TestRepository::new("Cargo.lock", contents.as_bytes(), "text");
+
+        let result = repository.scan();
+
+        assert_eq!(
+            status_code(&result),
+            SUCCESS,
+            "field-like TOML text must not be structural: {contents}: {}",
+            diagnostic(&result)
+        );
+    }
+}
+
+#[test]
+fn cargo_lock_rejects_non_string_containers_and_duplicate_fields() {
+    for contents in [
+        "version = 3\nsource = []\n",
+        "version = 3\nsource = {}\n",
+        "version = 3\nsource = { url = \"https://private-corp.internal/index\" }\n",
+        "version = 3\nsource = \"https://one.private-corp.internal\"\nsource = \"https://two.private-corp.internal\"\n",
+        "version = 3\npackage = { source = \"https://one.private-corp.internal\", source = \"https://two.private-corp.internal\" }\n",
+    ] {
+        let repository = TestRepository::new("Cargo.lock", contents.as_bytes(), "text");
+
+        let result = repository.scan();
+
+        assert_eq!(
+            status_code(&result),
+            ERROR,
+            "unsupported or ambiguous field must fail closed: {contents}"
+        );
+    }
+}
+
+#[test]
+fn cargo_lock_structural_selector_uses_the_ast_value_span() {
+    let sensitive = "https://private-corp.internal/index";
+    let escaped = r#"https://private-corp.internal/\u0069ndex"#;
+    for (contents, raw) in [
+        (
+            format!("version = 3\ndescription = \"{sensitive}\"\nsource = \"{sensitive}\"\n"),
+            sensitive,
+        ),
+        (format!("version = 3\nsource = \"{escaped}\"\n"), escaped),
+    ] {
+        let repository = TestRepository::new("Cargo.lock", contents.as_bytes(), "text");
+
+        let result = repository.bootstrap();
+
+        assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+        let manifest = fs::read_to_string(
+            repository
+                .path()
+                .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+        )
+        .expect("should read bootstrap manifest");
+        let start = contents
+            .rfind(raw)
+            .expect("structural raw value should exist");
+        assert!(
+            manifest.contains(&format!(
+                "selector = \"bytes:{start}-{}\"\nfingerprint = \"{}\"",
+                start + raw.len(),
+                fingerprint(raw.as_bytes())
+            )),
+            "selector must identify and fingerprint exact raw string content: {manifest}"
+        );
     }
 }
 

@@ -481,6 +481,106 @@ fn unterminated_comment_grammar_states_fail_closed() {
 }
 
 #[test]
+fn toml_comment_lexer_handles_every_string_form_and_escape_rule() {
+    for (contents, comment) in [
+        (
+            "value = \"escaped \\\"# literal\" # guidance\n",
+            "# guidance",
+        ),
+        ("value = '# literal' # guidance\n", "# guidance"),
+        (
+            "value = \"\"\"first \\\n+# literal\nlast\"\"\" # guidance\n",
+            "# guidance",
+        ),
+        (
+            "value = '''first\n# literal\nlast''' # guidance\n",
+            "# guidance",
+        ),
+    ] {
+        let start = contents
+            .rfind(comment)
+            .expect("guidance comment should exist");
+        let selector = format!("bytes:{start}-{}", start + comment.len());
+        let repository = TestRepository::new();
+        repository.track("config.toml", contents.as_bytes());
+        repository.manifests(
+            &text_manifest("config.toml", 2048),
+            &comment_source("config.toml", "toml", &[(&selector, comment)]),
+        );
+
+        let result = repository.classify();
+
+        assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+    }
+}
+
+#[test]
+fn every_unterminated_toml_string_form_fails_closed() {
+    for contents in [
+        "value = \"open\n",
+        "value = 'open\n",
+        "value = \"\"\"open\n",
+        "value = '''open\n",
+        "value = \"escaped \\",
+    ] {
+        let repository = TestRepository::new();
+        repository.track("config.toml", contents.as_bytes());
+        repository.manifests(
+            &text_manifest("config.toml", 2048),
+            &comment_source("config.toml", "toml", &[]),
+        );
+
+        let result = repository.classify();
+
+        assert_eq!(
+            status_code(&result),
+            ERROR,
+            "unterminated TOML lexical state must fail: {contents}"
+        );
+    }
+}
+
+#[test]
+fn javascript_comment_lexer_tracks_regex_and_nested_template_interpolation() {
+    let contents =
+        "const value = `${outer ? /[/*]/.test(input) : `${inner ? \"}\" : value}`}`; // guidance\n";
+    let comment = "// guidance";
+    let start = contents
+        .find(comment)
+        .expect("guidance comment should exist");
+    let selector = format!("bytes:{start}-{}", start + comment.len());
+    let repository = TestRepository::new();
+    repository.track("build.mjs", contents.as_bytes());
+    repository.manifests(
+        &text_manifest("build.mjs", 2048),
+        &comment_source("build.mjs", "javascript", &[(&selector, comment)]),
+    );
+
+    let result = repository.classify();
+
+    assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+}
+
+#[test]
+fn malformed_javascript_template_escape_fails_closed() {
+    let contents = "const value = `${value\\``;\n";
+    let repository = TestRepository::new();
+    repository.track("build.mjs", contents.as_bytes());
+    repository.manifests(
+        &text_manifest("build.mjs", 2048),
+        &comment_source("build.mjs", "javascript", &[]),
+    );
+
+    let result = repository.classify();
+
+    assert_eq!(
+        status_code(&result),
+        ERROR,
+        "escaped template delimiter inside interpolation must not close the outer template"
+    );
+}
+
+#[test]
 fn comment_records_cannot_reference_unknown_or_whole_file_sources() {
     for maintained in [
         format!(

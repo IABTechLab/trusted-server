@@ -2292,6 +2292,60 @@ PY
   fail-closed. The plan and README now list the exact targets, full standalone
   suite, review flows, and authorized README staging scope.
 
+#### Task 5 parser re-review correction
+
+- Domain RED: the repository-path/markup fixture expected five findings but
+  the prior categorical suffix and Markdown suppression emitted one. The
+  persistent source-context fixture expected two literal/comment findings but
+  emitted none. A separate documented-member fixture emitted three findings
+  instead of the single real host. GREEN replaces those categories with a
+  repository-aware context: full path tokens must resolve to tracked,
+  repository-rooted, current-relative, basename/suffix, or repository-anchored
+  path evidence; source members are derived from persistent Rust/JavaScript
+  lexical regions. Markup alone never suppresses a public-suffix host.
+- Domain selectors and fingerprints cover the exact original host bytes for
+  URL and bare-host findings, including case. The reviewed 3,484-domain set had
+  zero selector/fingerprint mismatches. All three pre-existing project-host
+  occurrences are present. Representative path/member negatives are absent:
+  root README and contribution files, build/configuration/getting-started
+  paths, the two named nested settings/member chains, document-body access,
+  and result containment calls.
+- TOML RED: literal-quoted structural keys produced no finding under the
+  handwritten token loop. GREEN removes that loop and traverses immutable
+  `toml_edit` syntax trees through decoded tables, arrays of tables, dotted
+  keys, and nested inline tables. Allowed fields require string scalars and map
+  the syntax-tree value span to exact raw content bytes. Tests cover basic and
+  literal quoted keys, dotted/quoted keys, nested inline tables, arrays of
+  tables, comments/string decoys, non-string/container and duplicate failures,
+  escapes, and an identical earlier description value.
+- Grammar RED: an unterminated TOML basic string passed classification, while
+  a JavaScript regular-expression character class inside nested template
+  interpolation became a false block-comment span. GREEN uses one persistent
+  state-machine pass per grammar for both extraction and EOF validation. TOML
+  covers basic/literal and multiline forms; JavaScript covers nested
+  templates/interpolations, strings, comments, and regular expressions. Shell,
+  YAML, Rust raw strings/nested blocks, protobuf C-style comments, and Markdown
+  comments likewise fail closed on unsupported or unterminated state.
+- Final reviewed inventory before this evidence append contains 3,820 exact
+  findings: 3,484 domain, 286 structured lockfile field, 36 credential-shape,
+  12 binary string, one email, and one service ID. Classes are 3,757 vendor
+  URL, 36 hash-pinned fake credential fixture, 15 historical example, 11
+  project-owned public domain, and one service ID. The two additional
+  historical records are the exact deleted-CNAME occurrences newly visible
+  after categorical Markdown suppression was removed.
+- Classification remains 704 sources and 569 exact comment spans; the unified
+  lexer changed no reviewed real selector or disposition. Two classification
+  updates and two scanner bootstraps were byte-stable at manifest SHA-256
+  values `4734c0925182fffe79245344738fe3543d7408b71d16a20b9a45f8f6f984a266`
+  and `a1e86dacd141cd7180a6666327ae89536b0ffd49b58f4d17791aa8022b50239f`.
+  The root lock remained
+  `9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`;
+  `toml_edit` is isolated to the standalone tool lock.
+- Fresh pre-evidence gates passed: classification 29, scanner 55, CLI 19, and
+  the complete 104-test standalone suite, with zero failures. Format and
+  all-target/all-feature Clippy with warnings denied are re-run after this
+  evidence is scanned and restaged.
+
 #### Task 6 — Implement generated regions, Markdown ownership, and link checks
 
 Pending. Record each atomic fixture cycle and generated second-run no-diff.

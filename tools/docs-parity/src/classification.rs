@@ -661,31 +661,23 @@ fn extract_comments(
     grammar: &str,
 ) -> Result<Vec<CommentSpan>, Report<ClassificationError>> {
     match grammar {
-        "shell" => {
-            ensure_closed_hash_state(text, true)?;
-            Ok(extract_hash_comments(text, true, false))
-        }
-        "python" | "dockerfile" => Ok(extract_hash_comments(text, false, false)),
-        "toml" => Ok(extract_toml_comments(text)),
-        "yaml" => {
-            ensure_closed_yaml_state(text)?;
-            Ok(extract_yaml_comments(text))
-        }
-        "rust" | "javascript" | "protobuf" => {
-            ensure_closed_slash_state(text)?;
-            Ok(extract_slash_comments(text))
-        }
-        "markdown" => Ok(extract_markdown_comments(text)),
+        "shell" => scan_hash_comments(text, true),
+        "python" | "dockerfile" => scan_hash_comments(text, false),
+        "toml" => scan_toml_comments(text),
+        "yaml" => scan_yaml_comments(text),
+        "rust" => scan_rust_comments(text),
+        "javascript" => scan_javascript_comments(text),
+        "protobuf" => scan_c_style_comments(text),
+        "markdown" => scan_markdown_comments(text),
         _ => Err(Report::new(ClassificationError::InvalidManifest)
             .attach(format!("unsupported comment grammar: {grammar}"))),
     }
 }
 
-fn extract_hash_comments(
+fn scan_hash_comments(
     text: &str,
-    escaped_hash: bool,
-    whitespace_hash: bool,
-) -> Vec<CommentSpan> {
+    preserve_quotes_across_lines: bool,
+) -> Result<Vec<CommentSpan>, Report<ClassificationError>> {
     let bytes = text.as_bytes();
     let mut spans = Vec::new();
     let mut quote = None;
@@ -694,8 +686,9 @@ fn extract_hash_comments(
     while index < bytes.len() {
         let byte = bytes[index];
         if byte == b'\n' {
-            if !escaped_hash {
-                quote = None;
+            if quote.is_some() && !preserve_quotes_across_lines {
+                return Err(Report::new(ClassificationError::Incomplete)
+                    .attach("unterminated hash-comment grammar quote"));
             }
             escaped = false;
             index += 1;
@@ -706,7 +699,7 @@ fn extract_hash_comments(
             index += 1;
             continue;
         }
-        if byte == b'\\' && (quote == Some(b'"') || quote.is_none() && escaped_hash) {
+        if byte == b'\\' && (quote == Some(b'"') || quote.is_none()) {
             escaped = true;
             index += 1;
             continue;
@@ -720,10 +713,7 @@ fn extract_hash_comments(
             index += 1;
             continue;
         }
-        if byte == b'#'
-            && quote.is_none()
-            && (!whitespace_hash || index == 0 || bytes[index - 1].is_ascii_whitespace())
-        {
+        if byte == b'#' && quote.is_none() {
             let end = bytes[index..]
                 .iter()
                 .position(|b| *b == b'\n')
@@ -738,108 +728,15 @@ fn extract_hash_comments(
         }
         index += 1;
     }
-    spans
-}
-
-fn ensure_closed_hash_state(
-    text: &str,
-    preserve_newlines: bool,
-) -> Result<(), Report<ClassificationError>> {
-    let mut quote = None;
-    let mut escaped = false;
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if escaped {
-            escaped = false;
-            i += 1;
-            continue;
-        }
-        if b == b'\\' && quote != Some(b'\'') {
-            escaped = true;
-            i += 1;
-            continue;
-        }
-        if quote.is_none() && b == b'#' {
-            i = bytes[i..]
-                .iter()
-                .position(|v| *v == b'\n')
-                .map_or(bytes.len(), |n| i + n + 1);
-            continue;
-        }
-        if matches!(b, b'"' | b'\'') {
-            if quote == Some(b) {
-                quote = None
-            } else if quote.is_none() {
-                quote = Some(b)
-            }
-        }
-        if b == b'\n' && !preserve_newlines {
-            quote = None
-        }
-        i += 1;
-    }
-    if quote.is_some() {
+    if quote.is_some() || escaped {
         Err(Report::new(ClassificationError::Incomplete)
-            .attach("unterminated comment-grammar quote state"))
+            .attach("unterminated hash-comment grammar lexical state"))
     } else {
-        Ok(())
+        Ok(spans)
     }
 }
 
-fn ensure_closed_slash_state(text: &str) -> Result<(), Report<ClassificationError>> {
-    let mut block = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    let b = text.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if escaped {
-            escaped = false;
-            i += 1;
-            continue;
-        }
-        if quote.is_some() && b[i] == b'\\' {
-            escaped = true;
-            i += 1;
-            continue;
-        }
-        if quote.is_none() && block == 0 && i + 1 < b.len() && &b[i..i + 2] == b"//" {
-            i = b[i..]
-                .iter()
-                .position(|v| *v == b'\n')
-                .map_or(b.len(), |n| i + n + 1);
-            continue;
-        }
-        if quote.is_none() && i + 1 < b.len() && &b[i..i + 2] == b"/*" {
-            block += 1;
-            i += 2;
-            continue;
-        }
-        if block > 0 && i + 1 < b.len() && &b[i..i + 2] == b"*/" {
-            block -= 1;
-            i += 2;
-            continue;
-        }
-        if block == 0 && matches!(b[i], b'"' | b'\'' | b'`') {
-            if quote == Some(b[i]) {
-                quote = None
-            } else if quote.is_none() {
-                quote = Some(b[i])
-            }
-        }
-        i += 1
-    }
-    if block > 0 || quote.is_some() {
-        Err(Report::new(ClassificationError::Incomplete)
-            .attach("unterminated comment grammar lexical state"))
-    } else {
-        Ok(())
-    }
-}
-
-fn extract_toml_comments(text: &str) -> Vec<CommentSpan> {
+fn scan_toml_comments(text: &str) -> Result<Vec<CommentSpan>, Report<ClassificationError>> {
     let bytes = text.as_bytes();
     let mut spans = Vec::new();
     let mut i = 0;
@@ -856,6 +753,10 @@ fn extract_toml_comments(text: &str) -> Vec<CommentSpan> {
                 escaped = true;
                 i += 1;
                 continue;
+            }
+            if !multiline && bytes[i] == b'\n' {
+                return Err(Report::new(ClassificationError::Incomplete)
+                    .attach("unterminated single-line TOML string"));
             }
             let closes = if multiline {
                 i + 2 < bytes.len() && bytes[i..i + 3] == [delimiter; 3]
@@ -891,10 +792,15 @@ fn extract_toml_comments(text: &str) -> Vec<CommentSpan> {
         }
         i += 1;
     }
-    spans
+    if quote.is_some() || escaped {
+        Err(Report::new(ClassificationError::Incomplete)
+            .attach("unterminated TOML string lexical state"))
+    } else {
+        Ok(spans)
+    }
 }
 
-fn extract_yaml_comments(text: &str) -> Vec<CommentSpan> {
+fn scan_yaml_comments(text: &str) -> Result<Vec<CommentSpan>, Report<ClassificationError>> {
     let mut spans = Vec::new();
     let mut offset = 0;
     let mut block_indent = None;
@@ -953,66 +859,19 @@ fn extract_yaml_comments(text: &str) -> Vec<CommentSpan> {
         }
         offset += line.len();
     }
-    spans
-}
-
-fn ensure_closed_yaml_state(text: &str) -> Result<(), Report<ClassificationError>> {
-    let mut quote = None;
-    let mut escaped = false;
-    let mut block_indent = None;
-    for line in text.lines() {
-        let indent = line.len() - line.trim_start().len();
-        if block_indent.is_some_and(|n| line.trim().is_empty() || indent >= n) {
-            continue;
-        }
-        block_indent = None;
-        let b = line.as_bytes();
-        let mut i = 0;
-        while i < b.len() {
-            if escaped {
-                escaped = false;
-                i += 1;
-                continue;
-            }
-            if quote == Some(b'"') && b[i] == b'\\' {
-                escaped = true;
-                i += 1;
-                continue;
-            }
-            if matches!(b[i], b'"' | b'\'') {
-                if quote == Some(b[i]) {
-                    quote = None
-                } else if quote.is_none() {
-                    quote = Some(b[i])
-                };
-                i += 1;
-                continue;
-            }
-            if b[i] == b'#' && quote.is_none() && (i == 0 || b[i - 1].is_ascii_whitespace()) {
-                break;
-            }
-            i += 1
-        }
-        let plain = line.split('#').next().unwrap_or(line).trim_end();
-        if quote.is_none() && (plain.ends_with('|') || plain.ends_with('>')) {
-            block_indent = Some(indent + 1)
-        }
-    }
     if quote.is_some() {
         Err(Report::new(ClassificationError::Incomplete).attach("unterminated YAML quoted scalar"))
     } else {
-        Ok(())
+        Ok(spans)
     }
 }
 
-fn extract_slash_comments(text: &str) -> Vec<CommentSpan> {
+fn scan_c_style_comments(text: &str) -> Result<Vec<CommentSpan>, Report<ClassificationError>> {
     let bytes = text.as_bytes();
     let mut spans = Vec::new();
     let mut i = 0;
     let mut quote = None;
     let mut escaped = false;
-    let mut template_depth = 0usize;
-    let mut template_parents = Vec::new();
     while i < bytes.len() {
         let b = bytes[i];
         if escaped {
@@ -1025,34 +884,13 @@ fn extract_slash_comments(text: &str) -> Vec<CommentSpan> {
             i += 1;
             continue;
         }
-        if quote == Some(b'`') && i + 1 < bytes.len() && &bytes[i..i + 2] == b"${" {
-            template_parents.push(template_depth);
-            quote = None;
-            template_depth = 1;
-            i += 2;
-            continue;
+        if quote.is_some() && b == b'\n' {
+            return Err(Report::new(ClassificationError::Incomplete)
+                .attach("unterminated C-style quoted string"));
         }
-        if quote.is_none() && template_depth > 0 {
-            if b == b'{' {
-                template_depth += 1;
-                i += 1;
-                continue;
-            }
-            if b == b'}' {
-                template_depth -= 1;
-                i += 1;
-                if template_depth == 0 {
-                    quote = Some(b'`');
-                }
-                continue;
-            }
-        }
-        if matches!(b, b'\'' | b'"' | b'`') {
+        if matches!(b, b'\'' | b'"') {
             if quote == Some(b) {
                 quote = None;
-                if b == b'`' {
-                    template_depth = template_parents.pop().unwrap_or(0);
-                }
             } else if quote.is_none() {
                 quote = Some(b)
             };
@@ -1073,9 +911,11 @@ fn extract_slash_comments(text: &str) -> Vec<CommentSpan> {
             continue;
         }
         if quote.is_none() && i + 1 < bytes.len() && &bytes[i..i + 2] == b"/*" {
-            let end = text[i + 2..]
-                .find("*/")
-                .map_or(bytes.len(), |n| i + 2 + n + 2);
+            let Some(length) = text[i + 2..].find("*/") else {
+                return Err(Report::new(ClassificationError::Incomplete)
+                    .attach("unterminated C-style block comment"));
+            };
+            let end = i + 2 + length + 2;
             spans.push(CommentSpan {
                 start: i,
                 end,
@@ -1086,10 +926,286 @@ fn extract_slash_comments(text: &str) -> Vec<CommentSpan> {
         }
         i += 1;
     }
-    spans
+    if quote.is_some() || escaped {
+        Err(Report::new(ClassificationError::Incomplete)
+            .attach("unterminated C-style lexical state"))
+    } else {
+        Ok(spans)
+    }
 }
 
-fn extract_markdown_comments(text: &str) -> Vec<CommentSpan> {
+fn scan_rust_comments(text: &str) -> Result<Vec<CommentSpan>, Report<ClassificationError>> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if index + 1 < bytes.len() && &bytes[index..index + 2] == b"//" {
+            let end = bytes[index..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |length| index + length);
+            spans.push(CommentSpan {
+                start: index,
+                end,
+                contents: text[index..end].to_owned(),
+            });
+            index = end;
+            continue;
+        }
+        if index + 1 < bytes.len() && &bytes[index..index + 2] == b"/*" {
+            let start = index;
+            let mut depth = 1usize;
+            index += 2;
+            while index < bytes.len() && depth > 0 {
+                if index + 1 < bytes.len() && &bytes[index..index + 2] == b"/*" {
+                    depth += 1;
+                    index += 2;
+                } else if index + 1 < bytes.len() && &bytes[index..index + 2] == b"*/" {
+                    depth -= 1;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            if depth > 0 {
+                return Err(Report::new(ClassificationError::Incomplete)
+                    .attach("unterminated Rust block comment"));
+            }
+            spans.push(CommentSpan {
+                start,
+                end: index,
+                contents: text[start..index].to_owned(),
+            });
+            continue;
+        }
+        if let Some((content_start, hashes)) = rust_raw_string_start(bytes, index) {
+            let terminator = format!("\"{}", "#".repeat(hashes));
+            let Some(length) = text[content_start..].find(&terminator) else {
+                return Err(Report::new(ClassificationError::Incomplete)
+                    .attach("unterminated Rust raw string"));
+            };
+            index = content_start + length + terminator.len();
+            continue;
+        }
+        if bytes[index] == b'"' {
+            index = quoted_code_end(bytes, index, b'"', true).ok_or_else(|| {
+                Report::new(ClassificationError::Incomplete).attach("unterminated Rust string")
+            })?;
+            continue;
+        }
+        if bytes[index] == b'\''
+            && let Some(end) = quoted_code_end(bytes, index, b'\'', false)
+        {
+            index = end;
+            continue;
+        }
+        index += 1;
+    }
+    Ok(spans)
+}
+
+fn rust_raw_string_start(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut index = start;
+    if bytes.get(index) == Some(&b'b') {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'r') {
+        return None;
+    }
+    index += 1;
+    let hash_start = index;
+    while bytes.get(index) == Some(&b'#') {
+        index += 1;
+    }
+    (bytes.get(index) == Some(&b'"')).then_some((index + 1, index - hash_start))
+}
+
+fn quoted_code_end(bytes: &[u8], start: usize, delimiter: u8, multiline: bool) -> Option<usize> {
+    let mut index = start + 1;
+    let mut escaped = false;
+    while index < bytes.len() {
+        if escaped {
+            escaped = false;
+        } else if bytes[index] == b'\\' {
+            escaped = true;
+        } else if bytes[index] == delimiter {
+            return Some(index + 1);
+        } else if bytes[index] == b'\n' && !multiline {
+            return None;
+        }
+        index += 1;
+    }
+    None
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum JavascriptCommentMode {
+    Code,
+    SingleQuoted,
+    DoubleQuoted,
+    Template,
+    LineComment,
+    BlockComment,
+    RegularExpression,
+}
+
+fn scan_javascript_comments(text: &str) -> Result<Vec<CommentSpan>, Report<ClassificationError>> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut mode = JavascriptCommentMode::Code;
+    let mut comment_start = 0;
+    let mut escaped = false;
+    let mut regex_character_class = false;
+    let mut interpolation_depths = Vec::new();
+    let mut previous_code_byte = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match mode {
+            JavascriptCommentMode::Code => {
+                if index + 1 < bytes.len() && &bytes[index..index + 2] == b"//" {
+                    comment_start = index;
+                    mode = JavascriptCommentMode::LineComment;
+                    index += 2;
+                } else if index + 1 < bytes.len() && &bytes[index..index + 2] == b"/*" {
+                    comment_start = index;
+                    mode = JavascriptCommentMode::BlockComment;
+                    index += 2;
+                } else if matches!(byte, b'\'' | b'"') {
+                    mode = if byte == b'\'' {
+                        JavascriptCommentMode::SingleQuoted
+                    } else {
+                        JavascriptCommentMode::DoubleQuoted
+                    };
+                    index += 1;
+                } else if byte == b'`' {
+                    mode = JavascriptCommentMode::Template;
+                    index += 1;
+                } else if byte == b'/' && javascript_regex_can_start(previous_code_byte) {
+                    mode = JavascriptCommentMode::RegularExpression;
+                    regex_character_class = false;
+                    index += 1;
+                } else {
+                    if let Some(depth) = interpolation_depths.last_mut() {
+                        if byte == b'{' {
+                            *depth += 1;
+                        } else if byte == b'}' {
+                            *depth -= 1;
+                            if *depth == 0 {
+                                interpolation_depths.pop();
+                                mode = JavascriptCommentMode::Template;
+                                index += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    if !byte.is_ascii_whitespace() {
+                        previous_code_byte = Some(byte);
+                    }
+                    index += 1;
+                }
+            }
+            JavascriptCommentMode::SingleQuoted | JavascriptCommentMode::DoubleQuoted => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if (mode == JavascriptCommentMode::SingleQuoted && byte == b'\'')
+                    || (mode == JavascriptCommentMode::DoubleQuoted && byte == b'"')
+                {
+                    mode = JavascriptCommentMode::Code;
+                } else if byte == b'\n' {
+                    return Err(Report::new(ClassificationError::Incomplete)
+                        .attach("unterminated JavaScript quoted string"));
+                }
+                index += 1;
+            }
+            JavascriptCommentMode::Template => {
+                if escaped {
+                    escaped = false;
+                    index += 1;
+                } else if byte == b'\\' {
+                    escaped = true;
+                    index += 1;
+                } else if index + 1 < bytes.len() && &bytes[index..index + 2] == b"${" {
+                    interpolation_depths.push(1);
+                    previous_code_byte = Some(b'{');
+                    mode = JavascriptCommentMode::Code;
+                    index += 2;
+                } else if byte == b'`' {
+                    mode = JavascriptCommentMode::Code;
+                    previous_code_byte = Some(b'`');
+                    index += 1;
+                } else {
+                    index += 1;
+                }
+            }
+            JavascriptCommentMode::LineComment => {
+                if byte == b'\n' {
+                    spans.push(CommentSpan {
+                        start: comment_start,
+                        end: index,
+                        contents: text[comment_start..index].to_owned(),
+                    });
+                    mode = JavascriptCommentMode::Code;
+                }
+                index += 1;
+            }
+            JavascriptCommentMode::BlockComment => {
+                if index + 1 < bytes.len() && &bytes[index..index + 2] == b"*/" {
+                    let end = index + 2;
+                    spans.push(CommentSpan {
+                        start: comment_start,
+                        end,
+                        contents: text[comment_start..end].to_owned(),
+                    });
+                    mode = JavascriptCommentMode::Code;
+                    index = end;
+                } else {
+                    index += 1;
+                }
+            }
+            JavascriptCommentMode::RegularExpression => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'[' {
+                    regex_character_class = true;
+                } else if byte == b']' {
+                    regex_character_class = false;
+                } else if byte == b'/' && !regex_character_class {
+                    mode = JavascriptCommentMode::Code;
+                    previous_code_byte = Some(b'/');
+                } else if byte == b'\n' {
+                    return Err(Report::new(ClassificationError::Incomplete)
+                        .attach("unterminated JavaScript regular expression"));
+                }
+                index += 1;
+            }
+        }
+    }
+    if mode == JavascriptCommentMode::LineComment {
+        spans.push(CommentSpan {
+            start: comment_start,
+            end: bytes.len(),
+            contents: text[comment_start..].to_owned(),
+        });
+        mode = JavascriptCommentMode::Code;
+    }
+    if mode != JavascriptCommentMode::Code || !interpolation_depths.is_empty() || escaped {
+        Err(Report::new(ClassificationError::Incomplete)
+            .attach("unterminated JavaScript lexical state"))
+    } else {
+        Ok(spans)
+    }
+}
+
+fn javascript_regex_can_start(previous: Option<u8>) -> bool {
+    previous.is_none_or(|byte| b"=(:,![{;?+-*%&|^~<>".contains(&byte))
+}
+
+fn scan_markdown_comments(text: &str) -> Result<Vec<CommentSpan>, Report<ClassificationError>> {
     let mut spans = Vec::new();
     let mut remaining = text;
     let mut consumed = 0;
@@ -1097,12 +1213,8 @@ fn extract_markdown_comments(text: &str) -> Vec<CommentSpan> {
         let absolute_start = consumed + start;
         let after_start = &remaining[start..];
         let Some(end) = after_start.find("-->") else {
-            spans.push(CommentSpan {
-                start: absolute_start,
-                end: text.len(),
-                contents: after_start.to_owned(),
-            });
-            break;
+            return Err(Report::new(ClassificationError::Incomplete)
+                .attach("unterminated Markdown comment"));
         };
         let contents = &after_start[..end + 3];
         spans.push(CommentSpan {
@@ -1113,7 +1225,7 @@ fn extract_markdown_comments(text: &str) -> Vec<CommentSpan> {
         consumed = absolute_start + contents.len();
         remaining = &after_start[end + 3..];
     }
-    spans
+    Ok(spans)
 }
 
 fn operational_comment_grammar(path: &str) -> Option<&'static str> {

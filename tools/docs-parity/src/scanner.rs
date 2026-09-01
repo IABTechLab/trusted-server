@@ -10,6 +10,9 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest as _, Sha256};
+use toml_edit::{
+    Document as TomlDocument, Item as TomlItem, Table as TomlTable, Value as TomlValue,
+};
 
 use crate::classification::{self, FileKind};
 use crate::model::{Expiry, Owner, Rationale};
@@ -165,6 +168,21 @@ struct ScanState {
     allowlist: AllowlistManifest,
 }
 
+struct SourceLexicalContext {
+    literal_or_comment: Vec<bool>,
+}
+
+struct DomainContext {
+    tracked_paths: BTreeSet<String>,
+    source_members: BTreeSet<String>,
+}
+
+struct TomlLockScanner<'a> {
+    path: &'a str,
+    text: &'a str,
+    findings: Vec<Finding>,
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum TomlStringKind {
     Basic,
@@ -242,6 +260,7 @@ pub(crate) fn bootstrap(repository: &Repository) -> Result<(), Report<ScannerErr
 fn scan_repository(repository: &Repository) -> Result<ScanState, Report<ScannerError>> {
     let classified =
         classification::checked_files(repository).change_context(ScannerError::Classification)?;
+    let domain_context = DomainContext::build(repository, &classified)?;
     for path in [TRACKED_MANIFEST, MAINTAINED_MANIFEST] {
         let text = read_manifest_text(repository, path)?;
         reject_toml_comments(path, &text)?;
@@ -267,23 +286,23 @@ fn scan_repository(repository: &Repository) -> Result<ScanState, Report<ScannerE
                     core::str::from_utf8(&contents).change_context(ScannerError::Classification)?;
                 if is_lockfile(&file.path) {
                     result.extend(
-                        scan_text(&file.path, text, 0)
+                        scan_text(&file.path, text, 0, &domain_context)
                             .into_iter()
                             .filter(|finding| finding.detector != Detector::Domain),
                     );
                     result.extend(scan_lockfile(&file.path, text)?);
                 } else if !is_governance_manifest(&file.path) {
-                    result.extend(scan_text(&file.path, text, 0));
+                    result.extend(scan_text(&file.path, text, 0, &domain_context));
                 }
             }
             FileKind::Binary => {
-                let media_findings = scan_media_metadata(&file.path, &contents);
+                let media_findings = scan_media_metadata(&file.path, &contents, &domain_context);
                 let media_matches = media_findings
                     .iter()
                     .map(|finding| (finding.selector.as_str(), finding.matched.as_str()))
                     .collect::<BTreeSet<_>>();
                 result.extend(
-                    scan_binary(&file.path, &contents)
+                    scan_binary(&file.path, &contents, &domain_context)
                         .into_iter()
                         .filter(|finding| {
                             !media_matches
@@ -310,21 +329,27 @@ fn is_governance_manifest(path: &str) -> bool {
     )
 }
 
-fn scan_text(path: &str, text: &str, base_offset: usize) -> Vec<Finding> {
+fn scan_text(
+    path: &str,
+    text: &str,
+    base_offset: usize,
+    domain_context: &DomainContext,
+) -> Vec<Finding> {
     let mut result = Vec::new();
+    let lexical_context = SourceLexicalContext::for_path(path, text);
     for matched in url_regex().find_iter(text) {
         let value = trim_url(matched.as_str());
         let Some((host, host_start, host_end)) = extracted_host_span(value) else {
             continue;
         };
-        if !valid_public_host(&host) && !fictional_or_local_url(value) {
+        if !valid_public_host(&host.to_ascii_lowercase()) && !fictional_or_local_url(value) {
             continue;
         }
         if !fictional_or_local_url(value) {
             result.push(finding(
                 path,
                 Detector::Domain,
-                &host,
+                host,
                 base_offset + matched.start() + host_start,
                 base_offset + matched.start() + host_end,
             ));
@@ -334,24 +359,25 @@ fn scan_text(path: &str, text: &str, base_offset: usize) -> Vec<Finding> {
         if matched.start() > 0 && text.as_bytes()[matched.start() - 1] == b'@' {
             continue;
         }
-        if matched.start() > 0 && text.as_bytes()[matched.start() - 1] == b'/' {
-            continue;
-        }
         if preceding_token_is_url(text, matched.start()) {
             continue;
         }
-        if !bare_domain_context_allowed(path, text, matched.start(), matched.end()) {
+        if !bare_domain_context_allowed(
+            path,
+            text,
+            matched.start(),
+            matched.end(),
+            domain_context,
+            lexical_context.as_ref(),
+        ) {
             continue;
         }
         if !bare_domain_has_terminator(text, matched.end()) {
             continue;
         }
         let value = trim_url(matched.as_str());
-        let host = value
-            .split('/')
-            .next()
-            .unwrap_or(value)
-            .to_ascii_lowercase();
+        let raw_host = value.split('/').next().unwrap_or(value);
+        let host = raw_host.to_ascii_lowercase();
         if !valid_public_host(&host) {
             continue;
         }
@@ -359,9 +385,9 @@ fn scan_text(path: &str, text: &str, base_offset: usize) -> Vec<Finding> {
             result.push(finding(
                 path,
                 Detector::Domain,
-                value,
+                raw_host,
                 base_offset + matched.start(),
-                base_offset + matched.start() + value.len(),
+                base_offset + matched.start() + host.len(),
             ));
         }
     }
@@ -424,7 +450,7 @@ fn valid_public_host(host: &str) -> bool {
             && psl::domain_str(host).is_some()
 }
 
-fn extracted_host_span(value: &str) -> Option<(String, usize, usize)> {
+fn extracted_host_span(value: &str) -> Option<(&str, usize, usize)> {
     let scheme_end = value.find("://")? + 3;
     let authority_end = value[scheme_end..]
         .find(['/', '?', '#'])
@@ -435,78 +461,450 @@ fn extracted_host_span(value: &str) -> Option<(String, usize, usize)> {
     let host_len = host_port.find(':').unwrap_or(host_port.len());
     let start = scheme_end + user_end;
     let end = start + host_len;
-    (start < end).then(|| (value[start..end].to_ascii_lowercase(), start, end))
+    (start < end).then(|| (&value[start..end], start, end))
 }
 
-fn bare_domain_context_allowed(path: &str, text: &str, start: usize, end: usize) -> bool {
-    let candidate = &text[start..end];
-    if matches!(
-        candidate.rsplit('.').next(),
-        Some(
-            "rs" | "js"
-                | "jsx"
-                | "ts"
-                | "tsx"
-                | "mjs"
-                | "mts"
-                | "toml"
-                | "json"
-                | "md"
-                | "sh"
-                | "yaml"
-                | "yml"
-                | "html"
-                | "css"
-        )
-    ) {
+fn bare_domain_context_allowed(
+    path: &str,
+    text: &str,
+    start: usize,
+    end: usize,
+    domain_context: &DomainContext,
+    lexical_context: Option<&SourceLexicalContext>,
+) -> bool {
+    let candidate = trim_url(&text[start..end]);
+    let host = candidate
+        .split('/')
+        .next()
+        .unwrap_or(candidate)
+        .to_ascii_lowercase();
+    if domain_context.source_members.contains(&host)
+        || repository_path_token(path, text, start, end, &domain_context.tracked_paths)
+    {
         return false;
     }
-    if path.ends_with(".dockerignore") || path.ends_with(".gitignore") {
+    lexical_context.is_none_or(|context| context.allows(start))
+}
+
+fn repository_path_token(
+    current_path: &str,
+    text: &str,
+    start: usize,
+    end: usize,
+    tracked_paths: &BTreeSet<String>,
+) -> bool {
+    let bytes = text.as_bytes();
+    let mut token_start = start;
+    while token_start > 0 && path_token_byte(bytes[token_start - 1]) {
+        token_start -= 1;
+    }
+    let mut token_end = end;
+    while token_end < bytes.len() && path_token_byte(bytes[token_end]) {
+        token_end += 1;
+    }
+    let token = text[token_start..token_end]
+        .trim_end_matches('.')
+        .trim_start_matches('/');
+    if token.is_empty() || token.contains("//") {
         return false;
     }
-    if start > 0 && matches!(text.as_bytes()[start - 1], b'/' | b'\\') {
-        return false;
+
+    if tracked_paths.iter().any(|candidate| {
+        candidate == token
+            || candidate
+                .strip_suffix(token)
+                .is_some_and(|prefix| prefix.ends_with('/'))
+    }) {
+        return true;
     }
-    if matches!(
-        Path::new(path).extension().and_then(|v| v.to_str()),
-        Some("md" | "mdx")
-    ) {
-        let before = &text[..start];
-        if before.matches("```").count() % 2 == 1
-            || before[before.rfind('\n').map_or(0, |i| i + 1)..]
-                .matches('`')
-                .count()
-                % 2
-                == 1
-        {
-            return false;
+    if let Some((root, _remainder)) = token.split_once('/')
+        && tracked_paths
+            .iter()
+            .any(|candidate| candidate.starts_with(&format!("{root}/")))
+    {
+        return true;
+    }
+    let root_candidate = normalize_repository_path("", token);
+    if root_candidate
+        .as_ref()
+        .is_some_and(|candidate| tracked_paths.contains(candidate))
+    {
+        return true;
+    }
+    let parent = current_path
+        .rsplit_once('/')
+        .map_or("", |(parent, _name)| parent);
+    normalize_repository_path(parent, token)
+        .as_ref()
+        .is_some_and(|candidate| tracked_paths.contains(candidate))
+        || !token.contains('/')
+            && tracked_paths.iter().any(|candidate| {
+                Path::new(candidate)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some(token)
+            })
+}
+
+fn path_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/')
+}
+
+fn normalize_repository_path(base: &str, token: &str) -> Option<String> {
+    let mut components = base
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for component in token.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop()?;
+            }
+            component => components.push(component.to_owned()),
         }
     }
-    let code = matches!(
-        Path::new(path).extension().and_then(|v| v.to_str()),
-        Some("rs" | "js" | "jsx" | "ts" | "tsx" | "mjs" | "mts" | "c")
-    );
-    if !code {
-        return true;
+    (!components.is_empty()).then(|| components.join("/"))
+}
+
+impl SourceLexicalContext {
+    fn for_path(path: &str, text: &str) -> Option<Self> {
+        match Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+        {
+            Some("rs") => Some(Self {
+                literal_or_comment: rust_literal_and_comment_bytes(text),
+            }),
+            Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "mts") => Some(Self {
+                literal_or_comment: javascript_literal_and_comment_bytes(text),
+            }),
+            _ => None,
+        }
     }
-    let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
-    let prefix = &text[line_start..start];
-    if prefix.contains("//") || prefix.contains("/*") {
-        return true;
+
+    fn allows(&self, offset: usize) -> bool {
+        self.literal_or_comment
+            .get(offset)
+            .copied()
+            .unwrap_or(false)
     }
-    let quoted = prefix
-        .bytes()
-        .filter(|b| matches!(b, b'"' | b'\'' | b'`'))
-        .count()
-        % 2
-        == 1;
-    if !quoted {
-        return false;
+}
+
+impl DomainContext {
+    fn empty() -> Self {
+        Self {
+            tracked_paths: BTreeSet::new(),
+            source_members: BTreeSet::new(),
+        }
     }
-    !matches!(
-        candidate.rsplit('.').next(),
-        Some("rs" | "js" | "jsx" | "ts" | "tsx" | "mjs" | "mts" | "toml" | "json" | "md" | "sh")
-    )
+
+    fn build(
+        repository: &Repository,
+        classified: &[classification::ClassifiedFile],
+    ) -> Result<Self, Report<ScannerError>> {
+        let tracked_paths = classified
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut source_members = BTreeSet::new();
+        for file in classified.iter().filter(|file| file.kind == FileKind::Text) {
+            let normalized = NormalizedRelativePath::new(Path::new(&file.path))
+                .change_context(ScannerError::Classification)?;
+            let contents = repository
+                .read_tracked(&normalized)
+                .change_context(ScannerError::Classification)?;
+            let text =
+                core::str::from_utf8(&contents).change_context(ScannerError::Classification)?;
+            let Some(lexical_context) = SourceLexicalContext::for_path(&file.path, text) else {
+                continue;
+            };
+            for matched in bare_domain_regex().find_iter(text) {
+                if lexical_context.allows(matched.start())
+                    || matched.start() > 0 && text.as_bytes()[matched.start() - 1] == b'@'
+                    || preceding_token_is_url(text, matched.start())
+                    || !bare_domain_has_terminator(text, matched.end())
+                {
+                    continue;
+                }
+                let candidate = trim_url(matched.as_str());
+                let host = candidate
+                    .split('/')
+                    .next()
+                    .unwrap_or(candidate)
+                    .to_ascii_lowercase();
+                if valid_public_host(&host) {
+                    source_members.insert(host);
+                }
+            }
+        }
+        Ok(Self {
+            tracked_paths,
+            source_members,
+        })
+    }
+}
+
+fn mark_bytes(marked: &mut [bool], start: usize, end: usize) {
+    for byte in &mut marked[start..end] {
+        *byte = true;
+    }
+}
+
+fn rust_literal_and_comment_bytes(text: &str) -> Vec<bool> {
+    let bytes = text.as_bytes();
+    let mut marked = vec![false; bytes.len()];
+    let mut index = 0;
+    while index < bytes.len() {
+        if index + 1 < bytes.len() && &bytes[index..index + 2] == b"//" {
+            let end = bytes[index..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |length| index + length);
+            mark_bytes(&mut marked, index, end);
+            index = end;
+            continue;
+        }
+        if index + 1 < bytes.len() && &bytes[index..index + 2] == b"/*" {
+            let mut depth = 1usize;
+            let mut end = index + 2;
+            while end < bytes.len() && depth > 0 {
+                if end + 1 < bytes.len() && &bytes[end..end + 2] == b"/*" {
+                    depth += 1;
+                    end += 2;
+                } else if end + 1 < bytes.len() && &bytes[end..end + 2] == b"*/" {
+                    depth -= 1;
+                    end += 2;
+                } else {
+                    end += 1;
+                }
+            }
+            mark_bytes(&mut marked, index, end);
+            index = end;
+            continue;
+        }
+        if let Some((content_start, hashes)) = rust_raw_string_start(bytes, index) {
+            let terminator = format!("\"{}", "#".repeat(hashes));
+            let end = text[content_start..]
+                .find(&terminator)
+                .map_or(bytes.len(), |length| {
+                    content_start + length + terminator.len()
+                });
+            mark_bytes(&mut marked, index, end);
+            index = end;
+            continue;
+        }
+        if bytes[index] == b'"' {
+            let end = quoted_literal_end(bytes, index, b'"');
+            mark_bytes(&mut marked, index, end);
+            index = end;
+            continue;
+        }
+        if bytes[index] == b'\''
+            && let Some(end) = rust_character_end(bytes, index)
+        {
+            index = end;
+            continue;
+        }
+        index += 1;
+    }
+    marked
+}
+
+fn rust_raw_string_start(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut index = start;
+    if bytes.get(index) == Some(&b'b') {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'r') {
+        return None;
+    }
+    index += 1;
+    let hash_start = index;
+    while bytes.get(index) == Some(&b'#') {
+        index += 1;
+    }
+    (bytes.get(index) == Some(&b'"')).then_some((index + 1, index - hash_start))
+}
+
+fn quoted_literal_end(bytes: &[u8], start: usize, delimiter: u8) -> usize {
+    let mut index = start + 1;
+    let mut escaped = false;
+    while index < bytes.len() {
+        if escaped {
+            escaped = false;
+        } else if bytes[index] == b'\\' {
+            escaped = true;
+        } else if bytes[index] == delimiter {
+            return index + 1;
+        }
+        index += 1;
+    }
+    bytes.len()
+}
+
+fn rust_character_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut index = start + 1;
+    let mut escaped = false;
+    while index < bytes.len() && bytes[index] != b'\n' {
+        if escaped {
+            escaped = false;
+        } else if bytes[index] == b'\\' {
+            escaped = true;
+        } else if bytes[index] == b'\'' {
+            return Some(index + 1);
+        }
+        index += 1;
+    }
+    None
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum JavascriptLexicalMode {
+    Code,
+    SingleQuoted,
+    DoubleQuoted,
+    Template,
+    LineComment,
+    BlockComment,
+    RegularExpression,
+}
+
+fn javascript_literal_and_comment_bytes(text: &str) -> Vec<bool> {
+    let bytes = text.as_bytes();
+    let mut marked = vec![false; bytes.len()];
+    let mut mode = JavascriptLexicalMode::Code;
+    let mut escaped = false;
+    let mut regex_character_class = false;
+    let mut interpolation_depths = Vec::new();
+    let mut index = 0;
+    let mut previous_code_byte = None;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match mode {
+            JavascriptLexicalMode::Code => {
+                if index + 1 < bytes.len() && &bytes[index..index + 2] == b"//" {
+                    mode = JavascriptLexicalMode::LineComment;
+                    mark_bytes(&mut marked, index, index + 2);
+                    index += 2;
+                } else if index + 1 < bytes.len() && &bytes[index..index + 2] == b"/*" {
+                    mode = JavascriptLexicalMode::BlockComment;
+                    mark_bytes(&mut marked, index, index + 2);
+                    index += 2;
+                } else if matches!(byte, b'\'' | b'"') {
+                    mode = if byte == b'\'' {
+                        JavascriptLexicalMode::SingleQuoted
+                    } else {
+                        JavascriptLexicalMode::DoubleQuoted
+                    };
+                    marked[index] = true;
+                    index += 1;
+                } else if byte == b'`' {
+                    mode = JavascriptLexicalMode::Template;
+                    marked[index] = true;
+                    index += 1;
+                } else if byte == b'/' && javascript_regex_can_start(previous_code_byte) {
+                    mode = JavascriptLexicalMode::RegularExpression;
+                    marked[index] = true;
+                    index += 1;
+                } else {
+                    if let Some(depth) = interpolation_depths.last_mut() {
+                        if byte == b'{' {
+                            *depth += 1;
+                        } else if byte == b'}' {
+                            *depth -= 1;
+                            if *depth == 0 {
+                                interpolation_depths.pop();
+                                mode = JavascriptLexicalMode::Template;
+                                marked[index] = true;
+                                index += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    if !byte.is_ascii_whitespace() {
+                        previous_code_byte = Some(byte);
+                    }
+                    index += 1;
+                }
+            }
+            JavascriptLexicalMode::SingleQuoted | JavascriptLexicalMode::DoubleQuoted => {
+                marked[index] = true;
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if (mode == JavascriptLexicalMode::SingleQuoted && byte == b'\'')
+                    || (mode == JavascriptLexicalMode::DoubleQuoted && byte == b'"')
+                {
+                    mode = JavascriptLexicalMode::Code;
+                }
+                index += 1;
+            }
+            JavascriptLexicalMode::Template => {
+                marked[index] = true;
+                if escaped {
+                    escaped = false;
+                    index += 1;
+                } else if byte == b'\\' {
+                    escaped = true;
+                    index += 1;
+                } else if index + 1 < bytes.len() && &bytes[index..index + 2] == b"${" {
+                    marked[index + 1] = true;
+                    interpolation_depths.push(1);
+                    mode = JavascriptLexicalMode::Code;
+                    previous_code_byte = Some(b'{');
+                    index += 2;
+                } else if byte == b'`' {
+                    mode = JavascriptLexicalMode::Code;
+                    previous_code_byte = Some(b'`');
+                    index += 1;
+                } else {
+                    index += 1;
+                }
+            }
+            JavascriptLexicalMode::LineComment => {
+                if byte == b'\n' {
+                    mode = JavascriptLexicalMode::Code;
+                } else {
+                    marked[index] = true;
+                }
+                index += 1;
+            }
+            JavascriptLexicalMode::BlockComment => {
+                marked[index] = true;
+                if index + 1 < bytes.len() && &bytes[index..index + 2] == b"*/" {
+                    marked[index + 1] = true;
+                    mode = JavascriptLexicalMode::Code;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            JavascriptLexicalMode::RegularExpression => {
+                marked[index] = true;
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'[' {
+                    regex_character_class = true;
+                } else if byte == b']' {
+                    regex_character_class = false;
+                } else if byte == b'/' && !regex_character_class {
+                    mode = JavascriptLexicalMode::Code;
+                    previous_code_byte = Some(b'/');
+                }
+                index += 1;
+            }
+        }
+    }
+    marked
+}
+
+fn javascript_regex_can_start(previous: Option<u8>) -> bool {
+    previous.is_none_or(|byte| b"=(:,![{;?+-*%&|^~<>".contains(&byte))
 }
 
 fn bare_domain_has_terminator(text: &str, end: usize) -> bool {
@@ -539,10 +937,10 @@ fn preceding_token_is_url(text: &str, start: usize) -> bool {
         .is_some_and(|prefix| prefix.contains("://"))
 }
 
-fn scan_binary(path: &str, contents: &[u8]) -> Vec<Finding> {
+fn scan_binary(path: &str, contents: &[u8], domain_context: &DomainContext) -> Vec<Finding> {
     printable_strings(contents)
         .into_iter()
-        .flat_map(|(offset, text)| scan_text(path, &text, offset))
+        .flat_map(|(offset, text)| scan_text(path, &text, offset, domain_context))
         .map(|finding| match finding.detector {
             Detector::ServiceId => finding,
             _ => Finding {
@@ -553,7 +951,11 @@ fn scan_binary(path: &str, contents: &[u8]) -> Vec<Finding> {
         .collect()
 }
 
-fn scan_media_metadata(path: &str, contents: &[u8]) -> Vec<Finding> {
+fn scan_media_metadata(
+    path: &str,
+    contents: &[u8],
+    domain_context: &DomainContext,
+) -> Vec<Finding> {
     let metadata = if path.ends_with(".png") {
         png_metadata(contents)
     } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
@@ -563,7 +965,7 @@ fn scan_media_metadata(path: &str, contents: &[u8]) -> Vec<Finding> {
     };
     metadata
         .into_iter()
-        .flat_map(|(offset, text)| scan_text(path, &text, offset))
+        .flat_map(|(offset, text)| scan_text(path, &text, offset, domain_context))
         .map(|finding| match finding.detector {
             Detector::ServiceId => finding,
             _ => Finding {
@@ -576,10 +978,10 @@ fn scan_media_metadata(path: &str, contents: &[u8]) -> Vec<Finding> {
 
 fn scan_lockfile(path: &str, text: &str) -> Result<Vec<Finding>, Report<ScannerError>> {
     if path.ends_with("Cargo.lock") {
-        let _value: toml::Value = toml::from_str(text)
+        let document = TomlDocument::parse(text)
             .change_context(ScannerError::Finding)
             .attach(format!("cannot parse structured lockfile: {path}"))?;
-        scan_toml_lock_fields(path, text)
+        TomlLockScanner::new(path, text).scan(&document)
     } else if path.ends_with("package-lock.json") {
         let _value: JsonValue = serde_json::from_str(text)
             .change_context(ScannerError::Finding)
@@ -590,81 +992,130 @@ fn scan_lockfile(path: &str, text: &str) -> Result<Vec<Finding>, Report<ScannerE
     }
 }
 
-fn scan_toml_lock_fields(path: &str, text: &str) -> Result<Vec<Finding>, Report<ScannerError>> {
-    let bytes = text.as_bytes();
-    let mut findings = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_whitespace() || b"{}[],.".contains(&bytes[i]) {
-            i += 1;
-            continue;
+impl<'a> TomlLockScanner<'a> {
+    fn new(path: &'a str, text: &'a str) -> Self {
+        Self {
+            path,
+            text,
+            findings: Vec::new(),
         }
-        let (key, end) = if bytes[i] == b'"' {
-            let end = quoted_end(bytes, i).ok_or_else(|| {
-                Report::new(ScannerError::Finding).attach(format!("unterminated TOML key: {path}"))
-            })?;
-            let key: String = toml::from_str(&format!("value = {}", &text[i..=end]))
-                .ok()
-                .and_then(|v: toml::Value| v.get("value")?.as_str().map(str::to_owned))
-                .ok_or_else(|| {
-                    Report::new(ScannerError::Finding).attach("invalid quoted TOML key")
-                })?;
-            (key, end + 1)
-        } else {
-            let end = bytes[i..]
-                .iter()
-                .position(|b| !b.is_ascii_alphanumeric() && *b != b'_' && *b != b'-')
-                .map_or(bytes.len(), |n| i + n);
-            if end == i {
-                i += 1;
-                continue;
-            }
-            (text[i..end].to_owned(), end)
-        };
-        let mut cursor = end;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if cursor >= bytes.len() || bytes[cursor] != b'=' {
-            i = end;
-            continue;
-        }
-        if !lock_field(Some(&key)) {
-            i = end;
-            continue;
-        }
-        cursor += 1;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if cursor >= bytes.len() || bytes[cursor] != b'"' {
-            return Err(Report::new(ScannerError::Finding).attach(format!(
-                "unsupported structured lockfile field shape: {path}:{key}"
-            )));
-        }
-        let value_end = quoted_end(bytes, cursor).ok_or_else(|| {
-            Report::new(ScannerError::Finding)
-                .attach(format!("unterminated structured lockfile field: {path}"))
-        })?;
-        let raw = &text[cursor + 1..value_end];
-        let decoded: String = toml::from_str(&format!("value = {}", &text[cursor..=value_end]))
-            .ok()
-            .and_then(|v: toml::Value| v.get("value")?.as_str().map(str::to_owned))
-            .ok_or_else(|| {
-                Report::new(ScannerError::Finding).attach("invalid TOML lockfile string")
-            })?;
-        if sensitive_lock_value(&decoded) {
-            findings.push(finding(
-                path,
-                Detector::LockfileField,
-                raw,
-                cursor + 1,
-                value_end,
-            ));
-        }
-        i = value_end + 1;
     }
-    Ok(findings)
+
+    fn scan(mut self, document: &TomlDocument<&str>) -> Result<Vec<Finding>, Report<ScannerError>> {
+        self.scan_table(document.as_table())?;
+        Ok(self.findings)
+    }
+
+    fn scan_table(&mut self, table: &TomlTable) -> Result<(), Report<ScannerError>> {
+        for (key, item) in table.iter() {
+            self.scan_item(key, item)?;
+        }
+        Ok(())
+    }
+
+    fn scan_item(&mut self, key: &str, item: &TomlItem) -> Result<(), Report<ScannerError>> {
+        if lock_field(Some(key)) {
+            let value = item.as_value().ok_or_else(|| self.unsupported_shape(key))?;
+            return self.scan_lock_value(key, value);
+        }
+        match item {
+            TomlItem::None => Ok(()),
+            TomlItem::Value(value) => self.scan_nested_value(value),
+            TomlItem::Table(table) => self.scan_table(table),
+            TomlItem::ArrayOfTables(tables) => {
+                for table in tables.iter() {
+                    self.scan_table(table)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn scan_nested_value(&mut self, value: &TomlValue) -> Result<(), Report<ScannerError>> {
+        match value {
+            TomlValue::Array(values) => {
+                for value in values.iter() {
+                    self.scan_nested_value(value)?;
+                }
+                Ok(())
+            }
+            TomlValue::InlineTable(table) => {
+                for (key, value) in table.iter() {
+                    if lock_field(Some(key)) {
+                        self.scan_lock_value(key, value)?;
+                    } else {
+                        self.scan_nested_value(value)?;
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn scan_lock_value(
+        &mut self,
+        key: &str,
+        value: &TomlValue,
+    ) -> Result<(), Report<ScannerError>> {
+        let decoded = value.as_str().ok_or_else(|| self.unsupported_shape(key))?;
+        if !sensitive_lock_value(decoded) {
+            return Ok(());
+        }
+        let span = value.span().ok_or_else(|| {
+            Report::new(ScannerError::Finding).attach(format!(
+                "unmappable structured lockfile field: {}:{key}",
+                self.path
+            ))
+        })?;
+        let raw_span = toml_string_content_span(self.text, span).ok_or_else(|| {
+            Report::new(ScannerError::Finding).attach(format!(
+                "unmappable structured lockfile string: {}:{key}",
+                self.path
+            ))
+        })?;
+        let raw = self.text.get(raw_span.clone()).ok_or_else(|| {
+            Report::new(ScannerError::Finding).attach(format!(
+                "out-of-bounds structured lockfile string: {}:{key}",
+                self.path
+            ))
+        })?;
+        self.findings.push(finding(
+            self.path,
+            Detector::LockfileField,
+            raw,
+            raw_span.start,
+            raw_span.end,
+        ));
+        Ok(())
+    }
+
+    fn unsupported_shape(&self, key: &str) -> Report<ScannerError> {
+        Report::new(ScannerError::Finding).attach(format!(
+            "unsupported structured lockfile field shape: {}:{key}",
+            self.path
+        ))
+    }
+}
+
+fn toml_string_content_span(
+    text: &str,
+    span: std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    let token = text.get(span.clone())?;
+    let delimiter_length = if token.starts_with("\"\"\"") && token.ends_with("\"\"\"")
+        || token.starts_with("'''") && token.ends_with("'''")
+    {
+        3
+    } else if token.starts_with('"') && token.ends_with('"')
+        || token.starts_with('\'') && token.ends_with('\'')
+    {
+        1
+    } else {
+        return None;
+    };
+    (token.len() >= delimiter_length * 2)
+        .then_some(span.start + delimiter_length..span.end - delimiter_length)
 }
 
 fn scan_json_lock_fields(path: &str, text: &str) -> Result<Vec<Finding>, Report<ScannerError>> {
@@ -1021,7 +1472,7 @@ fn validate_governance_free_text(
 ) -> Result<(), Report<ScannerError>> {
     for record in &allowlist.exceptions {
         for (field, value) in [("owner", &record.owner), ("rationale", &record.rationale)] {
-            if !scan_text(ALLOWLIST_MANIFEST, value, 0).is_empty()
+            if !scan_text(ALLOWLIST_MANIFEST, value, 0, &DomainContext::empty()).is_empty()
                 || !scan_retired(ALLOWLIST_MANIFEST, value.as_bytes(), retired)?.is_empty()
             {
                 return Err(Report::new(ScannerError::InvalidGovernance).attach(format!(
