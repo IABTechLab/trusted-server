@@ -204,12 +204,16 @@ applied to that same visitor. The accepted values are the states of the
 `crates/trusted-server-core/src/consent/jurisdiction.rs`, which the rest of the
 stack already uses:
 
-| Value           | Meaning                                                                             |
-| --------------- | ----------------------------------------------------------------------------------- |
-| `gdpr`          | GDPR handling, being `Jurisdiction::Gdpr`, which appears in logs as `GDPR`          |
-| `us-<state>`    | A US state with a comprehensive privacy law, for example `us-ca`, logged as `US-CA` |
-| `non-regulated` | The location is known and matches no regulation, being `Jurisdiction::NonRegulated` |
-| `unknown`       | The jurisdiction cannot be determined, being `Jurisdiction::Unknown`                |
+| Value             | Meaning                                                                                               |
+| ----------------- | ----------------------------------------------------------------------------------------------------- |
+| `gdpr`            | GDPR handling, being `Jurisdiction::Gdpr`, which appears in logs as `GDPR`                            |
+| `us-state/<CODE>` | A US state with a comprehensive privacy law, for example `us-state/CA`, being `Jurisdiction::UsState` |
+| `non-regulated`   | The location is known and matches no regulation, being `Jurisdiction::NonRegulated`                   |
+| `unknown`         | The jurisdiction cannot be determined, being `Jurisdiction::Unknown`                                  |
+
+`Jurisdiction::from_policy_name` reads these, so anything else is a
+configuration error rather than a silent default. Write the value in lower
+case, and the state code after `us-state/` may be either case.
 
 Matching is most specific wins, falling back to the parent's `group`. Trusted
 Server tries the region node, then the country node, then the top node, and uses
