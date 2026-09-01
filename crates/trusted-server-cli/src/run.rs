@@ -216,6 +216,8 @@ mod tests {
             "7",
             "--domain",
             "edge.example",
+            "--path",
+            "/ready",
             "--staging",
             "--retry",
             "9",
@@ -227,6 +229,7 @@ mod tests {
         let Command::Healthcheck(healthcheck) = args.command else {
             panic!("expected healthcheck command");
         };
+        assert_eq!(healthcheck.path, "/ready");
         assert!(healthcheck.staging);
         assert_eq!(healthcheck.retry, 9);
         assert_eq!(healthcheck.retry_delay, 2);
@@ -567,6 +570,7 @@ mod tests {
             "fastly",
             "--store",
             "other_config_store",
+            "--no-env",
         ]);
         let Command::Config(ConfigCommand::Gc(gc)) = args.command else {
             panic!("expected config gc command");
@@ -576,6 +580,7 @@ mod tests {
             Some("other_config_store".to_owned()),
             "should retarget which store a sweep inspects"
         );
+        assert!(gc.no_env, "should disable environment overlays");
     }
 
     #[test]
