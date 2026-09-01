@@ -185,7 +185,9 @@ Every node of the tree has a `group`, and children are optional. A child key is
 a place code, so the keys directly under `rules:` are ISO 3166-1 alpha-2 country
 codes (`FR`, `US`, `GB`), and the keys beneath a country are ISO 3166-2 region
 codes with no country prefix (`CA` is California). Codes are matched
-case-insensitively, so `us` and `US` name the same place. These are the codes a
+case-insensitively, so `us` and `US` name the same place. Where a code sits
+also tells two identical codes apart, since `DE` at the first level is Germany
+and `DE` under `US` is Delaware. These are the codes a
 geo provider returns. The Fastly geo provider emits them directly, and any other
 provider must do the same.
 
@@ -223,8 +225,9 @@ Matching is most specific wins, and `group` and `jurisdiction` fall back the
 same way. Trusted Server tries the region node, then the country node, then the
 top node, taking the first `group` it finds and the first `jurisdiction` it
 finds, which need not come from the same node. A geo lookup **failure** is a
-different state from having no location, and it keeps the requires-signal floor
-described below rather than reaching the tree at all.
+different state from having no location. It keeps the requires-signal floor
+described below and its jurisdiction is `unknown`, rather than reaching the tree
+at all.
 
 ```yaml
 rules:
