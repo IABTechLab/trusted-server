@@ -72,55 +72,58 @@ static GTM_TAG_ID_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
         .expect("GTM tag ID regex should compile")
 });
 
-/// Regex pattern for matching and rewriting GTM and Google Analytics URLs.
-///
-/// Handles full and protocol-relative URL variants:
-/// - `https://www.googletagmanager.com/gtm.js?id=...`
-/// - `//www.googletagmanager.com/gtm.js?id=...`
-/// - `https://www.google-analytics.com/collect`
-/// - `//www.google-analytics.com/g/collect`
-/// - `https://analytics.google.com/g/collect`
-/// - `//analytics.google.com/g/collect`
-///
-/// **Requires `//` prefix** — bare domain strings like `"www.googletagmanager.com"`
-/// are intentionally NOT matched. gtag.js stores domains as bare strings and
-/// constructs URLs dynamically (`"https://" + domain + "/path"`). Rewriting
-/// the bare domain produces broken URLs like
-/// `https://integrations/google_tag_manager/path` because the script still
-/// prepends `"https://"`.
-///
-/// **Full URL matching for `analytics.google.com`** — Only full URLs with `//` prefix
-/// are matched and rewritten (e.g., `https://analytics.google.com/g/collect`).
-/// Bare domain strings are not matched due to the same dynamic URL construction issue.
-///
-/// Captures the proxied path, or a trailing `"` for a bare host reference, in the
-/// last group. Requiring one of those immediately after the host also prevents
-/// false matches on subdomains (e.g., `www.googletagmanager.com.evil.com`).
-///
-/// Only the paths this integration actually routes are rewritten. Matching the
-/// host alone would send every other path on these domains to a first-party URL
-/// with no route behind it, turning a working third-party request into a 404.
-/// The path list mirrors the one in
+/// Host alternation shared by the URL patterns below.
+const GTM_URL_HOSTS: &str =
+    r"(?:https?:)?//(?:www\.(?:googletagmanager|google-analytics)\.com|analytics\.google\.com)";
+/// The paths this integration actually routes, mirroring
 /// [`GoogleTagManagerIntegration::is_rewritable_url`].
+const GTM_URL_PATHS: &str = r"(?P<path>/gtm\.js|/gtag/js|/gtag\.js|/g/collect|/collect)";
+
+/// Matches a URL that is the entire input, as an attribute value is.
 ///
-/// A second group requires that the path be followed by something that ends a
-/// URL in the surrounding source — a quote, a backtick, an interpolation, a
-/// bracket, whitespace, or end of input — so a longer path that merely starts
-/// with a routed one (`/collectXYZ`, `/collect%58YZ`, `/collect:extra`) is left
-/// alone rather than rewritten to a first-party URL with no route behind it.
+/// There is no surrounding source to bound the URL here, so the whole string
+/// must be the URL.
+static GTM_WHOLE_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"^{GTM_URL_HOSTS}{GTM_URL_PATHS}(?P<query>\?.*)?$"
+    ))
+    .expect("GTM whole-URL regex should compile")
+});
+
+/// Matches a routed URL inside a quoted string, anchored on the quote that
+/// opens it.
 ///
-/// The extent of a URL here is set by the language it is embedded in, not by
-/// the RFC path grammar: characters such as `'`, `;` and `,` are legal in a
-/// path yet end the URL in real source. Listing the terminators rather than the
-/// continuations also fails safe, since an unrecognised byte leaves the URL
-/// third-party instead of rewriting it to a route that does not exist.
+/// The extent of a URL in source is set by the delimiter that encloses it, not
+/// by the URL grammar: `;`, `,`, `&`, `$`, `'` and parentheses are all legal in
+/// a path, so a pattern that treated them as terminators would rewrite
+/// `/collect;matrix` as though it were the routed `/collect` and point it at a
+/// first-party URL with no route behind it. Requiring the closing delimiter
+/// means the path must genuinely end where the routed path ends.
 ///
-/// The replacement target is `/integrations/google_tag_manager` + both captures.
-static GTM_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?:https?:)?//(?:www\.(?:googletagmanager|google-analytics)\.com|analytics\.google\.com)(/gtm\.js|/gtag/js|/gtag\.js|/g/collect|/collect|")((?:[?"'`\s;,)\]}&#<>\\$]|$))"#,
-    )
-    .expect("GTM URL regex should compile")
+/// A template literal may also be ended by an interpolation, so `${` closes one
+/// as a backtick does.
+static GTM_QUOTED_URL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [
+        (
+            r#"(?P<open>")"#,
+            r#"(?P<query>\?[^"]*)?"#,
+            r#"(?P<close>")"#,
+        ),
+        (r"(?P<open>')", r"(?P<query>\?[^']*)?", r"(?P<close>')"),
+        (
+            r"(?P<open>`)",
+            r"(?P<query>\?[^`$]*)?",
+            r"(?P<close>`|\$\{)",
+        ),
+    ]
+    .iter()
+    .map(|(open, query, close)| {
+        Regex::new(&format!(
+            "{open}{GTM_URL_HOSTS}{GTM_URL_PATHS}{query}{close}"
+        ))
+        .expect("GTM quoted-URL regex should compile")
+    })
+    .collect()
 });
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -374,10 +377,28 @@ impl GoogleTagManagerIntegration {
     /// Uses [`GTM_URL_PATTERN`] to handle all URL variants (https, protocol-relative)
     /// for `googletagmanager.com` and `google-analytics.com`.
     fn rewrite_gtm_urls(content: &str) -> String {
-        let replacement = format!("/integrations/{}$1$2", GTM_INTEGRATION_ID);
-        GTM_URL_PATTERN
-            .replace_all(content, replacement.as_str())
-            .into_owned()
+        let first_party = format!("/integrations/{GTM_INTEGRATION_ID}");
+
+        // An attribute value is the whole URL on its own.
+        if let Some(captures) = GTM_WHOLE_URL_PATTERN.captures(content) {
+            let path = &captures["path"];
+            let query = captures.name("query").map_or("", |m| m.as_str());
+            return format!("{first_party}{path}{query}");
+        }
+
+        let mut rewritten = content.to_owned();
+        for pattern in GTM_QUOTED_URL_PATTERNS.iter() {
+            rewritten = pattern
+                .replace_all(&rewritten, |captures: &regex::Captures<'_>| {
+                    let open = &captures["open"];
+                    let path = &captures["path"];
+                    let query = captures.name("query").map_or("", |m| m.as_str());
+                    let close = &captures["close"];
+                    format!("{open}{first_party}{path}{query}{close}")
+                })
+                .into_owned();
+        }
+        rewritten
     }
 
     /// Whether an attribute value URL should be rewritten to first-party.
@@ -1771,18 +1792,41 @@ mod tests {
     }
 
     #[test]
-    fn rewriter_handles_a_routed_path_at_every_terminator() {
-        for suffix in ["\"", "?id=X", "'", " ", ";", ")", ""] {
-            let input = format!("https://www.googletagmanager.com/gtm.js{suffix}");
+    fn rewriter_rewrites_a_routed_path_in_every_quoting_style() {
+        // The delimiter that encloses the URL is what bounds it, so each
+        // quoting style has to be recognised, with and without a query.
+        for (source, expected) in [
+            (
+                "var a = \"https://www.googletagmanager.com/gtm.js\";",
+                "var a = \"/integrations/google_tag_manager/gtm.js\";",
+            ),
+            (
+                "var a = 'https://www.googletagmanager.com/gtm.js?id=X';",
+                "var a = '/integrations/google_tag_manager/gtm.js?id=X';",
+            ),
+            (
+                "var a = `https://www.googletagmanager.com/gtm.js`;",
+                "var a = `/integrations/google_tag_manager/gtm.js`;",
+            ),
+            (
+                "var a = `https://www.googletagmanager.com/collect${q}`;",
+                "var a = `/integrations/google_tag_manager/collect${q}`;",
+            ),
+        ] {
+            let result = GoogleTagManagerIntegration::rewrite_gtm_urls(source);
 
-            let result = GoogleTagManagerIntegration::rewrite_gtm_urls(&input);
-
-            assert_eq!(
-                result,
-                format!("/integrations/google_tag_manager/gtm.js{suffix}"),
-                "should rewrite and preserve the terminator `{suffix}`"
-            );
+            assert_eq!(result, expected, "should rewrite `{source}`");
         }
+    }
+
+    #[test]
+    fn rewriter_rewrites_a_bare_url_as_an_attribute_value_would_be() {
+        // An attribute value is the whole URL, with no surrounding source.
+        let result = GoogleTagManagerIntegration::rewrite_gtm_urls(
+            "https://www.googletagmanager.com/gtm.js?id=X",
+        );
+
+        assert_eq!(result, "/integrations/google_tag_manager/gtm.js?id=X");
     }
 
     #[test]
@@ -1965,6 +2009,22 @@ mod tests {
             let result = GoogleTagManagerIntegration::rewrite_gtm_urls(source);
 
             assert_eq!(source, result, "should not rewrite a longer path: {source}");
+        }
+    }
+
+    #[test]
+    fn rewriter_leaves_legal_path_characters_that_look_like_delimiters() {
+        // `;`, `,`, `&`, `$`, parens and `'` are all legal in a path. Inside a
+        // quoted URL they continue the path rather than ending it, so none of
+        // these is the routed path and rewriting would produce a 404.
+        for tail in [
+            ";matrix", ",b", "&c", "$d", "(e)", "'f", "!g", "+h", "=i", "*j",
+        ] {
+            let source = format!("var x = \"https://www.google-analytics.com/collect{tail}\";");
+
+            let result = GoogleTagManagerIntegration::rewrite_gtm_urls(&source);
+
+            assert_eq!(source, result, "should not rewrite `/collect{tail}`");
         }
     }
 
@@ -3211,11 +3271,12 @@ container_id = "GTM-DEFAULT"
         let config = config_from_settings(&settings, &registry);
         let processor = create_html_processor(config);
 
-        // Use a very small chunk size to force fragmentation mid-domain.
+        // Chunks small enough to split a script mid-URL. Accumulation
+        // reassembles the text before it is rewritten, so the rewrite survives.
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
             output_compression: Compression::None,
-            chunk_size: 32,
+            chunk_size: 64,
         };
         let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
 
@@ -3234,6 +3295,54 @@ container_id = "GTM-DEFAULT"
         assert!(
             !processed.contains("googletagmanager.com"),
             "should not contain original GTM domain. Got: {processed}"
+        );
+    }
+
+    /// A chunk boundary inside the `"google"` prefix shared by both markers
+    /// defeats the accumulation gate, which is the trade-off already documented
+    /// on [`GTM_MIN_PREFIX_LEN`]. The URL then stays third-party rather than
+    /// being rewritten from a fragment, which cannot be done correctly: the
+    /// delimiter that bounds the URL is not in the fragment. Production uses an
+    /// 8 KB chunk size, where this does not arise.
+    #[test]
+    fn a_split_inside_the_shared_marker_prefix_leaves_the_url_third_party() {
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                "google_tag_manager",
+                &serde_json::json!({
+                    "enabled": true,
+                    "container_id": "GTM-SMALL1"
+                }),
+            )
+            .expect("should update config");
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let config = config_from_settings(&settings, &registry);
+        let processor = create_html_processor(config);
+        let mut pipeline = StreamingPipeline::new(
+            PipelineConfig {
+                input_compression: Compression::None,
+                output_compression: Compression::None,
+                chunk_size: 32,
+            },
+            processor,
+        );
+        let html_input = r#"<html><head><script>j.src='https://www.googletagmanager.com/gtm.js?id=GTM-SMALL1';</script></head><body></body></html>"#;
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html_input.as_bytes()), &mut output)
+            .expect("should process with tiny chunks");
+        let processed = String::from_utf8_lossy(&output);
+
+        assert!(
+            !processed.contains("/integrations/google_tag_manager/gtm.js"),
+            "a fragment cannot be rewritten correctly, so it must be left alone: {processed}"
+        );
+        assert!(
+            processed.contains("https://www.googletagmanager.com/gtm.js"),
+            "the original URL must survive intact: {processed}"
         );
     }
 
