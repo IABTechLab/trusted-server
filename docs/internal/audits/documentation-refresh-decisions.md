@@ -28,6 +28,8 @@ the target advances.
 - Selection: retain the checked-in `fastly.toml` `service_id` only through a
   typed, temporary scanner allowlist entry.
 - Owner: `aram356`.
+- Rationale: preserve the existing Fastly service binding during this refresh;
+  removing the source-controlled identifier is an independent operation.
 - Expiry: `2026-09-30T00:00:00Z`.
 - Control: check mode fails at or after the expiry instant. Renewal requires a
   reviewed, committed replacement before expiry. This is not the ops migration
@@ -98,6 +100,23 @@ may prove repository behavior but cannot substitute for release receipts.
 
 - State: explicitly non-blocking.
 - Selection: no additional decision is required for implementation to start.
+
+### 9. Sensitive-data exception taxonomy
+
+- Allowed types: vendor URL, hash-pinned fake-credential fixture, historical
+  example, service ID, and project-owned public domain.
+- Required fields: exact type and scope, owner, rationale, and expiry timestamp.
+- Control: ownerless, expired, broad, or untyped exceptions fail closed. An
+  allowed type is not a blanket exemption; each occurrence requires its own
+  narrow record.
+- Current historical-example exception: the exact
+  `your-custom-domain.com` literal occurs only in the approved
+  `docs/superpowers/specs/2026-08-19-documentation-refresh-design.md` audit and
+  this decision row. Owner: `aram356`. Rationale: preserve the approved audit's
+  exact record of the deleted placeholder CNAME. Expiry:
+  `2027-08-31T00:00:00Z`.
+- Current service-ID exception: the `fastly.toml` `service_id` record in
+  decision 1. These are the only two active WP1 sensitive-data exceptions.
 
 ## Delivery records
 

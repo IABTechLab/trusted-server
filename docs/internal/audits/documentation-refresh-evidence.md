@@ -286,7 +286,8 @@ Expired or ownerless entries fail the checkpoint.
 
 | Type / path                                 | Value classification   | Owner                 | Rationale                                                                                                              | Review or expiry           | State    |
 | ------------------------------------------- | ---------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------- | -------------------------- | -------- |
-| `fastly.toml` `service_id`                  | Service ID             | `aram356`             | Check mode fails at or after expiry; renewal requires a reviewed committed replacement; not the ops migration deadline | `2026-09-30T00:00:00Z`     | Approved |
+| `fastly.toml` `service_id`                  | Service ID             | `aram356`             | Preserve the existing service binding during this refresh; check mode fails at or after expiry; removal is independent | `2026-09-30T00:00:00Z`     | Approved |
+| Design record's deleted placeholder literal | Historical example     | `aram356`             | Preserve the approved audit's exact record of the deleted placeholder CNAME                                            | `2027-08-31T00:00:00Z`     | Approved |
 | Task 13 temporary public-page ownership     | Page/orphan transition | Pending Task 13 owner | Page registered before Task 14 final ownership                                                                         | Expires at Task 14         | Pending  |
 | Spin manual smoke, only if CI cannot run it | Manual evidence        | Pending               | Runner capability gap                                                                                                  | Time-bounded date required | Pending  |
 
@@ -1228,8 +1229,107 @@ internal/audits/documentation-refresh-evidence.md` exited 0 and reported
 
 #### Task 3 — Complete WP1 CNAME and policy hygiene
 
-Pending. Record CNAME deletion, public-site containment, policy updates, and
-local artifact proof. Live Pages/CNAME remains release-pending.
+- Capture timestamp: 2026-09-01T14:02:47Z.
+- Executor: `OpenAI Codex task agent task3_wp1_policy`.
+- Task start HEAD:
+  `e6441a86965735584c8bb31ceee8c1f115c243d5`; it equaled
+  `origin/spec-docs-refresh` after fetch. `origin/rc/202608` equaled
+  `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`, and that audited target was an
+  ancestor of the task start.
+- Approved path list: `docs/public/CNAME`, `docs/business-use-cases.md`,
+  `fastly.toml`, `docs/package.json`, `docs/package-lock.json`, `CLAUDE.md`,
+  `AGENTS.md`, `.github/pull_request_template.md`,
+  `.claude/commands/check-ci.md`, `.claude/commands/review-changes.md`,
+  `.claude/commands/test-all.md`, `.claude/commands/test-crate.md`,
+  `.claude/commands/verify.md`, this evidence record, and
+  `docs/internal/audits/documentation-refresh-decisions.md`.
+- Failing pre-change proof: an inline Node policy assertion at the task start
+  checked the business-use-case warning, package metadata, Fastly authors and
+  fixture comments, removal of the obsolete script reference, canonical gate
+  consumers, generated fallback equality, typed exception policy, CNAME
+  deletion, and retained project-path base. It exited 1 with 27 failures out of
+  28 assertions; only the existing `base: '/trusted-server'` assertion passed.
+
+##### CNAME deletion commit
+
+- Minimal change: deleted only `docs/public/CNAME`; the VitePress base remained
+  `/trusted-server`.
+- `npm run build`: passed from `docs`; VitePress completed in 4.87 seconds with
+  only the known non-failing `vcl` syntax-highlighting fallback.
+- Focused green proof: the source and built CNAME were absent; Home contained
+  both project-path `href` and `src` values; no built HTML used a root
+  `/assets/` URL; and no active, non-historical tracked file contained the
+  deleted placeholder domain.
+- Exact staged name-status from task start:
+  `D docs/public/CNAME`. `git diff --cached --check` passed, the unstaged
+  tracked-byte check passed, and the non-ignored untracked-path check passed
+  after removing only generated `docs/.vitepress/.temp`.
+- Commit: `5a7b389dae483bafdc189dd434f98a92b2305b6a` —
+  `Resolve documentation site domain`.
+
+##### Policy and hygiene commit
+
+- Package start HEAD:
+  `5a7b389dae483bafdc189dd434f98a92b2305b6a`.
+- Minimal change: added the source-level unverified-planning warning without
+  rewriting marketing copy; emptied Fastly authors; labeled the four KV stores
+  and key material as local test fixtures; removed the obsolete local-script
+  reference; retained the service ID only under its owned, expiring decision;
+  made the docs package private and Apache-2.0; added the exact approved
+  sensitive-data taxonomy; converted gate consumers to the canonical link;
+  corrected `tracing` to `log`; and added the marked AGENTS fallback region.
+- `npm install --package-lock-only --ignore-scripts`: passed and refreshed the
+  root package license plus npm's current peer metadata. npm intentionally does
+  not copy the package's `private` field into lockfile v3.
+- Generated fallback proof: the inline gate-region generator read the
+  `CLAUDE.md#ci-gates` body and replaced only the marked AGENTS region. Two
+  successive runs reported `changed: false` and the same SHA-256,
+  `b56a60860159e41fbd97ae4a2a8c34a4cccf24227064b8bc53075354cef45e50`.
+- Focused green policy assertion: the corrected inline Node assertion exited 0
+  with 30 of 30 checks passing. It also compared the generated AGENTS body
+  byte-for-byte with the canonical CLAUDE body.
+- Tracked-file privacy proof: an inline Node scan read all 689 paths returned by
+  `git ls-files -z`. Removed contacts, handles, internal-channel and access
+  phrases had zero occurrences. The only controlled values were the service ID
+  in `fastly.toml` and the deleted placeholder literal in the approved design
+  audit plus its narrow decision row. Both exceptions had an owner, rationale,
+  allowed type, exact scope, and future expiry; no broad exception shape was
+  present.
+- Documentation regression command:
+  `cd docs && npm ci && npm run lint && npm run format && npm run build` passed.
+  VitePress built 43 HTML files in 5.13 seconds with only the known non-failing
+  `vcl` fallback.
+- Artifact proof used Python's `HTMLParser` to inspect actual `href` and `src`
+  attributes. The corrected assertion found 3,425 local URLs and required all
+  of them to use `/trusted-server/`. Home, Guide, and API Reference HTML plus
+  two page assets each were present. `superpowers/**`, `internal/**`,
+  `epics/**`, `guide/onboarding.md`, `README.md`, and
+  `business-use-cases.md` had no route, page asset, or local URL. The source and
+  output CNAME were absent. The first artifact run used the guessed marker
+  `Trusted Server Guide` and failed only that assertion; source inspection
+  showed the approved H1 is `Guide`, and the corrected exact H1 assertion
+  passed with no violations.
+- Final checkpoint hygiene: the first post-evidence regression invocation
+  stopped at lint because the preceding build had recreated the generated
+  `docs/.vitepress/.temp` tree. The errors were confined to generated VitePress
+  JavaScript. After removing only that generated directory, the exact
+  `npm ci && npm run lint && npm run format && npm run build` sequence passed;
+  the final full-sequence build completed in 5.41 seconds. The corrected
+  artifact proof then repeated with the same counts and no violations.
+- Exact staged name-status from policy-package start: 14 `M` rows, exactly the
+  policy package's approved paths and no others. `git diff --cached --check`,
+  the repository-wide unstaged tracked-byte check, and the non-ignored
+  untracked-path check all passed. This evidence mutation was then restaged and
+  those checks repeated before commit.
+- Active exceptions: service ID, owner `aram356`, rationale recorded above,
+  expiry `2026-09-30T00:00:00Z`; historical placeholder example, owner
+  `aram356`, rationale restricted to preserving approved audit evidence,
+  expiry `2027-08-31T00:00:00Z`.
+- Live Pages, deployed canonical URLs, and observed CNAME behavior remain
+  `release-pending`. No local result in this package completes that row.
+- Enclosing policy commit message: `Clean documentation publishing policy`.
+  Its SHA and push result are reported in the execution handoff because a
+  commit cannot contain its own identifier.
 
 #### Task 4 — Scaffold the standalone `docs-parity` crate
 

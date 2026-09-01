@@ -17,13 +17,20 @@ If you cannot read `CLAUDE.md`, follow these rules:
 
 1. Present a plan and get approval before coding.
 2. Keep changes minimal — do not refactor unrelated code.
-3. Run tests after every code change — use the workspace aliases defined in `.cargo/config.toml`:
-   - `cargo test-fastly` — Fastly adapter + core (wasm32-wasip1 via Viceroy)
-   - `cargo test-axum` — Axum dev server adapter (native)
-   - `cargo test-cloudflare` — Cloudflare Workers adapter (native host)
-   Do NOT use bare `cargo test --workspace` — it will attempt to compile the Fastly adapter for the host target.
-4. Run `cargo fmt --all -- --check` and `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare`.
-5. Run JS tests with `cd crates/trusted-server-js/lib && npx vitest run` when touching JS/TS code.
-6. Use `error-stack` (`Report<E>`) for error handling — not anyhow, eyre, or thiserror.
-7. Use `log` macros (not `println!`) and `expect("should ...")` (not `unwrap()`).
-8. Target is `wasm32-wasip1` — no Tokio or OS-specific dependencies in core crates.
+
+<!-- BEGIN GENERATED CI GATES: source CLAUDE.md#ci-gates -->
+
+Every PR must pass:
+
+1. `cargo fmt --all -- --check`
+2. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare && cargo clippy-cloudflare-wasm && cargo clippy-spin-native && cargo clippy-spin-wasm`
+3. `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin`
+4. `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`
+5. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)
+6. JS format (`cd crates/trusted-server-js/lib && npm run format`)
+7. Docs format (`cd docs && npm run format`)
+<!-- END GENERATED CI GATES -->
+
+8. Use `error-stack` (`Report<E>`) for error handling — not anyhow, eyre, or thiserror.
+9. Use `log` macros (not `println!`) and `expect("should ...")` (not `unwrap()`).
+10. Target is `wasm32-wasip1` — no Tokio or OS-specific dependencies in core crates.

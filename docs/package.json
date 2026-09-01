@@ -1,8 +1,9 @@
 {
   "name": "trusted-server-docs",
   "version": "1.0.0",
+  "private": true,
   "description": "Documentation site for Trusted Server",
-  "license": "ISC",
+  "license": "Apache-2.0",
   "author": "",
   "type": "module",
   "scripts": {
