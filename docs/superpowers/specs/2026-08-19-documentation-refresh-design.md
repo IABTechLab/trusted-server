@@ -1,8 +1,8 @@
 # Documentation Refresh (Full Surface)
 
 **Date:** 2026-08-19
-**Revised:** 2026-08-31 (round 21)
-**Status:** Approved for implementation; owner decisions recorded 2026-08-31
+**Revised:** 2026-08-31 (single-PR delivery revision)
+**Status:** Draft revision; single-PR architecture approved, written review pending
 **Scope:** Documentation and doc tooling. No runtime behavior changes.
 **Baseline:** audited_target_tip `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`
 (2026-08-28). The bulk
@@ -25,11 +25,9 @@ advances without a rebase, so the guard is exact-tip: after fetching,
 `origin/rc/202608` must equal the recorded audited_target_tip AND the
 implementation branch must contain that commit; the same exact-tip
 assertion (never a merge-base comparison) repeats at the final rc-PR
-HEAD. The containment work targets `main`, so an audited_main_tip is
-recorded when the containment PR is cut and the same exact-tip assertion
-runs before that PR merges. If any assertion fails, rebase, re-audit the
-delta, and update this spec first. Rounds 1-8 of review history live in git; this
-revision supersedes their inventories.
+HEAD. If either assertion fails, rebase, re-audit the delta, and update this
+spec first. Rounds 1-8 of review history live in git; this revision supersedes
+their inventories and the round-21 multi-PR delivery graph.
 
 ## Context
 
@@ -261,9 +259,9 @@ Truth-pass acceptance and parity checks operate on defined source sets:
   from the build via `srcExclude` and carries a source-level unverified
   banner (WP1). Question 4 is closed to this disposition - an
   evidence-based rewrite is not an option inside this refresh, because
-  the delivery graph allocates no PR to remove the exclusion, restore
-  navigation, and smoke the page; republishing it is a separate future
-  effort with its own publishing PR and acceptance. `roadmap.md` gets a
+  the approved scope does not remove the exclusion, restore navigation, or
+  smoke the page; republishing it is a separate future publishing effort with
+  its own design and acceptance. `roadmap.md` gets a
   factual status pass only.
 - No release management. The 8 breaking `[Unreleased]` entries are a
   maintainer decision; the deterministic no-release CHANGELOG edit is:
@@ -279,473 +277,167 @@ Truth-pass acceptance and parity checks operate on defined source sets:
 
 ## Delivery shape
 
-The owner's standing instruction is one rc PR carrying spec plus work.
-`aram356` approved the concrete shape below on 2026-08-31, including four
-`main` PRs through activation, temporary branch-protection changes, the
-release follow-on, and package checkpoints.
+All repository changes for this refresh are delivered through the existing
+`spec-docs-refresh` branch and PR #1049, which continues to target
+`rc/202608`. No containment, CNAME, controller, activation, or release-handoff
+implementation PR is created. PR #1104 was closed as superseded; its reviewed
+containment commits are transferred to #1049 before the next package starts.
 
-Milestones (so "complete" has one meaning): **implementation-ready**
-after Epoch 1 - the `main` PRs (b)-(d) merged, and (a) #1049 complete,
-approved, all checks green, and ready to merge (it is not yet merged;
-Epoch 1 runs at its final pre-merge head while rc still equals the
-audited baseline); **activated** after Epoch 2 - (a) merged, then c2
-merged and a real scheduled run observed; **lifecycle-closed** after
-Epoch 3 - (e) merged and rc deleted. Enforcement acceptance is
-epoch-scoped: WP8b's Epoch 1 items (rc-required checks, demonstrated rc
-block, recorded full-suite `main` deferral, and the active
-automation-delta gate) gate implementation-ready; its Epoch 3
-items do not. THIS REFRESH CLOSES AT "activated"; Epoch 3 is
-owned, tracked, and specified here but belongs to release management,
-which is out of scope. The delivery graph through activation is five PRs -
-(a)-(d) plus the required post-merge activation PR (c2) - and one named
-release follow-on, (e), whose issue and reviewed runbooks this refresh
-must produce. Each default-branch PR (b), (c), (d), (c2), and (e) is a real
-PR with its own `audited_main_tip`; (a) instead uses the exact recorded
-`audited_target_tip` for `rc/202608`. The graph is: (a) the single rc PR (#1049)
-carrying the spec plus all packages; (b) the `main` containment PR;
-(c) a `main` automation PR, which lands the workflow in
-VALIDATION-ONLY form (`workflow_dispatch` plus a base-controlled
-`pull_request_target` automation-delta gate; no `schedule:` trigger, no rc-targeted Dependabot
-entries) because scheduled runs and Dependabot would otherwise inspect
-pre-refresh rc content and a docs-parity cargo root that does not yet
-exist on any target branch. The new workflow path is fixed as
-`.github/workflows/docs-links.yml`. Activation is a separate NAMED `main` PR (c2) - it mutates
-default-branch files, so it is a PR under this design's own protection
-model, not a checkpoint - that adds the `schedule:` trigger and the
-rc-targeted Dependabot entries and temporary rc dependency-snapshot jobs
-once #1049 has merged, with its own
-audited_main_tip. The schedule is the off-hour weekly cron
-`17 9 * * 1` (09:17 UTC Monday). The stateful schedule/manual-refresh
-path shares one fixed concurrency group with `cancel-in-progress: false`;
-the PR gate does not share that global group and is serialized per PR
-head/base pair. Explicit timeouts are 30 minutes for link checking, 20
-for validation/snapshot generation, and 5 for each write-only reporter;
-the rc-targeted
-Dependabot version-update entries are weekly as well. Scheduled
-workflows and Dependabot read their configuration from the DEFAULT
-branch, so both live on `main`; version updates use
-`target-branch: rc/202608`. Security updates always target the DEFAULT
-branch, and the dependency graph analyzes manifests from it, so while
-`tools/docs-parity` exists only on rc, the rc-targeted entry by itself
-would provide version-update PRs but NO Dependabot alerts or
-security-update PRs. The c2 dependency submission below is the alert
-mitigation; no part of this design claims that it makes security-update
-PRs target rc. The mitigation is not deferred to a
-deadline this refresh would close before reaching: c2 installs two
-SEPARATE, minimally permissioned jobs plus a non-validation
-`refresh_dependency_snapshot` operation. A read-only snapshot
-generator authenticates and checks out only the current rc tip and uses
-the trusted `docs-parity` subcommand to produce a schema-validated
-dependency snapshot artifact; it has `contents: read` only. A writer has
-`contents: write` as its only repository API permission, checks out no
-repository and executes no repository code, revalidates the artifact's
-schema and authenticated rc SHA, then submits it. This gives
-`tools/docs-parity` dependency-graph visibility and alerts from activation without
-putting a write token in any job that executes repository code. The
-snapshot uses the stable identity `job.correlator = docs-parity-rc-temporary`
-and `detector.name = trusted-server/docs-parity`, with `ref` set to
-`refs/heads/rc/202608` and `sha` equal to the authenticated tip. The operation accepts
-no caller-supplied SHA, authenticates the current protected rc tip, and
-runs immediately after c2 and after every merge that changes
-`tools/docs-parity/{Cargo.toml,Cargo.lock}`; the weekly run is a
-reconciliation backstop. Immediately before submission, the writer
-re-authenticates that the artifact SHA is still the current rc tip, so an
-older overlapping run cannot overwrite a newer snapshot. On both paths,
-(e) removes the temporary jobs and, after that merge has stopped rc snapshot
-submission, the release owner submits one empty snapshot with the SAME
-identity at the (e) merge SHA and `refs/heads/main`; the API receipt and
-dependency-graph disappearance/replacement are branch-deletion gates.
-Merely deleting the job is insufficient because GitHub retains the
-latest snapshot for a detector/correlator, and a stale user submission
-can outrank automatic manifest parsing. c2's
-acceptance includes first-successful-snapshot evidence, so the detection
-gap is closed at activation rather than carried as a 60-day exposure.
-The rc dependency-change checklist has a named owner and is not complete
-until that post-merge refresh receipt is attached. This is deliberately
-an operational post-merge control: duplicating a write-capable push
-workflow on rc would create a second controller and a cross-branch
-rollback hole. If the operation is missed, the weekly reconciliation
-is the backstop (subject to GitHub's normal schedule delays); a stale
-snapshot SHA or missed/failed run is recorded as a security-coverage
-incident, not described as continuous coverage.
-GitHub still raises automatic security-update PRs against the default
-branch only, where this rc-only manifest does not exist; the compensating
-control is a named alert-triage owner and runbook with a two-business-day
-SLA to open an rc patch PR. The rc-targeted entry configures version
-updates only; it does not configure security updates, and validation
-asserts exactly that rather than claiming coverage of both.
-Pre-merge acceptance is not circular and no untrusted code runs with
-privilege. A validation job runs with `contents: read` and
-`pull-requests: read` only, no secrets, and no mutating steps. Manual
-dispatch has a closed operation enum (four values after c2). Three operations
-are mutually exclusive, fail-closed validation MODES, because not every
-validation inspects a `main` PR:
+### Single-PR boundary
 
-PR (c)'s validation-only form exposes the first three values; c2 adds the
-fourth value and its jobs atomically.
+PR #1049 contains:
 
-- `validate_rc` - requires `tool_sha` ONLY (no `files_sha`; supplying
-  one is rejected). Used for the Epoch 1 dispatch against #1049's head
-  and the first Epoch 2 dispatch of `merged_rc_tip`: it exercises the
-  WP8 tooling itself.
-- `validate_main_pr` - requires `tool_sha`, `files_sha`, the PR number,
-  and the authenticated `base_sha` (see below). Used for c2, e, rollback-c2,
-  and a same-lifecycle controller repair/sync.
-  It also bootstraps any already-open ordinary `main` PR before the
-  context first becomes required; the net-empty-protected-delta fast path
-  still authenticates every supplied value.
-- `validate_main_maintenance` - requires `files_sha`, PR number, and
-  `base_sha`, and rejects `tool_sha`. It is present in (c) but cannot succeed
-  until the authenticated current `main` base is in the normal post-(e)
-  steady state: `tools/docs-parity` exists on `main`, the workflow and
-  Dependabot roots target `main`, and the temporary rc snapshot jobs and
-  refresh operation are absent. It then executes only the tool at that exact
-  current `main` SHA and statically validates a same-repository maintenance PR
-  limited to the two protected paths. This is the long-lived path for action
-  repins and Dependabot/workflow maintenance; it cannot authorize c2, e, or an
-  active-rc controller change.
+- this design, the implementation plan, decisions, and evidence ledger;
+- public-site containment, CNAME deletion, and all WP1-WP7 documentation;
+- the standalone `tools/docs-parity` tool, manifests, fixtures, and generated
+  records;
+- the final steady-state CI, external-link, dependency-snapshot, and
+  Dependabot configuration;
+- release-time operational instructions for effects that cannot occur while
+  the change exists only on `rc/202608`; and
+- one reviewable commit or small non-squashed series per package, with
+  immediately adjacent evidence-only commits when final identifiers cannot be
+  recorded inside the package commit.
 
-The fourth operation, `refresh_dependency_snapshot`, is not a validation
-mode: it rejects every SHA/PR input, derives the exact current rc tip
-itself, and can reach only the split snapshot reader/writer after c2.
-Missing, unknown, mixed, or operation-inapplicable inputs fail before any
-job with write permission starts.
+Every package starts from a clean tree, records its start SHA, stages an exact
+path allowlist, rejects untracked or unstaged candidate bytes, runs focused and
+repository-wide checks required by that package, and ends clean. All package
+commits are pushed to PR #1049. No implementation commit is routed through an
+individual PR.
 
-`validate_rc` and `validate_main_pr` use TWO independent, separately authorized
-SHAs, because one predicate cannot cover both the trusted tool and the files
-being inspected. `validate_main_maintenance` derives its trusted tool from the
-authenticated current `main` tip and accepts no caller-selected executable
-SHA:
+The immutable implementation baseline remains
+`07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`. Before the next package and at
+final PR head, fetch `origin/rc/202608` and require both exact-tip equality and
+ancestry. If the target advances, stop, audit the complete delta, update this
+design and its checked records, and re-review before continuing.
 
-- `tool_sha` - the code that EXECUTES. A full 40-character SHA that the
-  API reports as `head.sha` of pull request **#1049** in this same
-  repository with `base.ref == "rc/202608"`, open and non-draft; or the
-  current `origin/rc/202608` tip. From Epoch 2 on, `merged_rc_tip` is the
-  initial recorded value; it is accepted only while it still EQUALS the
-  remote tip. Any rc advance requires a focused delta audit and a new
-  recorded `validated_rc_tip`; ancestry alone is not sufficient because
-  the workflow blob and validator may have changed.
-  The open #1049 head is accepted ONLY by `validate_rc`. A
-  protected-delta `validate_main_pr` run rejects it and executes only a
-  protected rc tip after the API confirms #1049 merged; the
-  net-empty-protected-delta bootstrap path executes no supplied tool at all.
-- `files_sha` - data that is NEVER executed. A full 40-character SHA
-  that the API reports as the current `head.sha` of a named, OPEN pull
-  request targeting `main`. Protected automation deltas (c2/e, the reviewed
-  reverse-c2 rollback, or same-lifecycle repair/sync) must be same-repository; an ordinary
-  net-empty-protected-delta PR may be a fork
-  because its files remain data and the tool fast path is not executed.
-  Validation is over the candidate trees, not just head contents: the job
-  authenticates `base_sha` as the PR's current base; for c2/e/rollback-c2
-  it must also equal that delivery PR's recorded `audited_main_tip`. The
-  validator fetches those two exact commit objects into a separate bare object
-  store. Its canonical gate view is the NUL-delimited two-tree diff
-  `git diff --name-status base_sha files_sha` (no merge-base/three-dot
-  semantics), because branch histories can diverge while the proposed merge
-  leaves the protected blobs unchanged. It separately compares modes and blob
-  IDs for `.github/workflows/docs-links.yml` and `.github/dependabot.yml`.
-  A three-dot PR diff may be recorded for human review but never classifies
-  the protected merge result. An ordinary PR - including the normal
-  rc-to-`main` release PR - passes this gate only when both protected paths are
-  net-identical in base and head; unrelated unprotected changes do not turn
-  that into a protected delta. c2, either e path, rollback-c2, and
-  same-lifecycle repair/sync, and post-handoff maintenance use the two-tree full candidate diff and may change
-  at most the two named protected files, with no other changed paths, no
-  resulting blob larger than 384 KiB, and no candidate's resulting protected
-  blobs larger than 512 KiB in aggregate. Exceeding a count or byte limit fails
-  rather than truncating. The abandonment form of e deletes the workflow outright so
-  there is no head file to read. It enforces (i) an exact changed-file
-  allowlist, rejecting every extra path; (ii) a path-specific expected
-  patch shape - c2: only the weekly schedule activation, the named
-  Dependabot additions, and the two temporary dependency-snapshot jobs
-  plus their closed manual refresh operation, with the
-  resulting `.github/workflows/docs-links.yml` byte-for-byte equal to
-  that file at authenticated `tool_sha` so the later rc→`main` merge
-  cannot create an add/add workflow divergence; normal e:
-  only the rc-to-main retarget and removal of those two jobs and their
-  manual refresh operation;
-  abandonment e: only the reviewed removal of the workflow, Dependabot
-  entries, and temporary jobs; rollback-c2: the exact inverse activation
-  patch removing only c2's additions and restoring (c)'s validation-only
-  semantics without overwriting unrelated base changes; same-lifecycle
-  repair/sync: candidate protected blobs equal those at authenticated
-  `tool_sha`, the base and candidate stay in the same validation-only or
-  active-rc lifecycle state, and no schedule/target/snapshot/refresh transition
-  is allowed; post-handoff
-  maintenance: only the named protected paths, same-repository head, trusted
-  current-main tool, and no weakening of the controller-current-main check,
-  event/input closure, trust-zone separation, literal status context, artifact
-  bounds, or attestation binding; and (iii)
-  workflow AST invariants over the resulting file where one exists - permissions,
-  triggers, `uses` pins, `run` steps, secrets access, local actions,
-  cache/artifact usage, and checkout refs - not merely the presence of
-  an expected schedule. The workflow defaults every permission to
-  `none`, then grants only the job scopes named here; validation has no
-  OIDC, cache restore/save, artifact upload, or service-container path
-  through which PR-controlled data can cross trust zones. The trusted
-  tool checkout uses `persist-credentials: false`; PR file blobs are read with `git show`
-  from the separate object store, never checked out. The reader
-  canonicalizes paths, rejects unsafe tree modes and symlinks escaping
-  the tree, and reads blobs statically only - "nothing from the files
-  object store is executed" is an explicit workflow invariant, since executing an untrusted PR
-  checkout in a privileged context is the exact pattern GitHub warns
-  against.
+### Publishing and CNAME behavior
 
-No review-state notion of "approved" is used. The validation job has
-`pull-requests: read` in addition to `contents: read`, because complete,
-paginated PR state/authentication metadata require it; changed-file
-enumeration is deliberately local and uncapped by the PR-files API. This
-is read-only metadata access, not approval authority. Arbitrary refs,
-stale heads, stale bases, stale or non-`main` controller refs, other PRs'
-heads, a fork SHA used as executable code or for a protected delta, extra
-changed paths, mixed or partially supplied dispatch-mode inputs, and a
-`files_sha` from a closed or non-`main`-targeting PR are rejected, proven
-by negative workflow fixtures, one per rejected class.
+The containment delta and CNAME deletion are ordinary commits in #1049:
 
-Trust and binding: the controller is always the workflow version already
-merged at the CURRENT `main` tip (never the version at the PR head or a
-caller-selected dispatch ref - a PR or manual caller must not be able to
-edit, downgrade, or skip its own validator). Every `workflow_dispatch`
-request is sent with `ref: main`, and the first fail-closed bootstrap
-phase independently verifies through the repository API that the default
-branch is `main`, `github.ref == refs/heads/main`, and `github.sha` equals
-the authenticated current `main` tip before it accepts mode inputs or
-allows any write-scoped job to start. Scheduled runs get the same
-current-default-branch assertion. A dispatch against rc, a tag, an older
-`main` commit, or any other ref is rejected. `validate_rc` is manual,
-read-only validation and publishes no PR status. For every PR targeting
-`main`, the controller's base-branch `pull_request_target` gate runs for
-`opened`, `reopened`, `synchronize`, `edited`, and `ready_for_review`,
-with NO path filter. It never executes PR-head code or exposes PR data
-to a write-scoped job. If the
-net protected-file delta is empty by base-vs-head mode/blob comparison, it
-authenticates the event's current head and base and succeeds even when the
-three-dot history contains earlier copies of those files. If the net delta touches
-`.github/workflows/docs-links.yml` or `.github/dependabot.yml`, only the
-named c2/e/rollback-c2/repair-sync file sets or, only from a normal post-(e) steady-state
-base, the two-path maintenance set are accepted by the base controller's
-non-executing bootstrap; an obviously wrong protected-file set fails
-immediately. A candidate stays `pending` rather than receiving success. Manual
-`validate_main_pr` then pins the reviewed `validated_rc_tip` (initially
-`merged_rc_tip`, or the newly audited exact tip if rc advanced) and applies the
-full c2/e/rollback/repair-sync exact-diff and AST predicates. Manual
-`validate_main_maintenance` instead authenticates the post-handoff base and
-executes the tool already at that exact current `main` tip. Thus net-empty
-ordinary/release PRs pass automatically, lifecycle deltas and same-state
-repairs cannot merge on an unaudited rc tool revision, and later maintenance
-cannot reuse the lifecycle exceptions or a caller-selected tool.
+- `srcExclude` covers `superpowers/**`, `internal/**`, `epics/**`,
+  `guide/onboarding.md`, `README.md`, and `business-use-cases.md`;
+- the Guide landing and required navigation edits ship in the same PR;
+- onboarding moves to `docs/internal/onboarding.md` and is scrubbed even though
+  that destination is excluded;
+- `docs/public/CNAME` is deleted and the project-path VitePress base is
+  retained; and
+- the placeholder CNAME is never restored by rollback.
 
-Because validation holds `contents: read` and no write token it cannot
-publish a status itself. An ATTESTATION job has `statuses: write` only,
-no checkout, `needs:` validation, and `if: always()`. For every
-authenticated current PR head it publishes a COMMIT STATUS (not a Check
-Run) with the literal context `docs/automation-delta` from the GitHub
-Actions app identity against
-exactly that head: ordinary net-empty-delta automation reports success;
-an invalid delta or failed manual validation reports failure; a
-protected candidate awaiting manual validation reports pending; and only
-a successful authenticated `validate_main_pr` or
-`validate_main_maintenance`, under that operation's own predicates, can
-replace that pending state with success. The validator's first fail-closed phase authenticates and
-records the head/base pair, then emits only the authenticated head through
-an `if: always()` output step before the attestation consumes the later
-validation result, so an ordinary
-predicate failure still gets a failure status. If the current head
-cannot be authenticated, no status is
-published and the absent required context blocks the PR. Branch
-protection requires this context for ALL `main` PRs after (c) merges;
-before enabling it, the owner inventories every already-open `main` PR
-and retriggers or manually validates its current head so activation does
-not strand pre-existing work. Required contexts cannot be scoped to only
-c2 and e. While
-that context is required, protection also requires PR branches to be up
-to date with `main`, so a status bound to an earlier base cannot authorize
-a merge after `main` advances. Each PR carries a just-before-merge
-assertion that its head and base still equal the validated pair.
-Out-of-band evidence is NOT an equivalent fallback - it
-cannot block a merge; if the status cannot be published, the PR does not
-merge. Scheduled link checking follows the same reader/writer split:
-the read-only checker authenticates and checks out the configured branch
-tip, while the issue-management job has `issues: write` only, checks out
-no repository, executes no repository code, and consumes a bounded,
-schema-validated result artifact to deduplicate/close the issue. The link
-artifact is exactly one regular `link-results.json` member (no links, traversal,
-or extra members): downloaded archive at most 2 MiB, decoded JSON at most 1
-MiB, at most 500 findings, strings at most 2,048 UTF-8 bytes, and no unknown
-fields. The dependency-snapshot artifact is exactly one regular
-`dependency-snapshot.json` member under the same structural rules and is
-bounded to a 4 MiB archive, 2 MiB decoded JSON, 5,000 dependency records,
-2,048-byte strings, and no unknown fields; every overflow or schema mismatch
-fails before a writer starts. The
-dependency snapshot generator and writer use the split trust zones
-described above. Event guards are
-AST-tested: attestation runs only for `pull_request_target`, manual
-`validate_main_pr`, or manual `validate_main_maintenance`; issue management,
-snapshot generation, and snapshot
-submission are split so issue management runs only for `schedule`, while
-the snapshot pair runs only for `schedule` or the closed
-`refresh_dependency_snapshot` operation;
-manual `validate_rc` reaches none of the write-scoped jobs. No event
-payload or PR-controlled string is interpolated into a shell command;
-the only PR-derived values that cross
-into attestation are the validator's authenticated 40-character head SHA
-and fixed result enum (`success`, `failure`, or `pending`). Pre-merge,
-`validate_rc` runs the trusted tool from the rc PR head.
-(c2) is the owned post-merge activation PR to `main`, tracked as an
-issue filed in WP8b with a named owner: after #1049 merges into rc,
-record `merged_rc_tip` and `validated_rc_tip` as the same exact merge
-result, dispatch that exact SHA, then land the
-activation edit (weekly schedule + rc-targeted Dependabot roots + the
-temporary snapshot generator/writer and manual refresh operation).
-Because `main` does not yet contain `tools/docs-parity` or the WP8
-workflows, the TOOL cannot come from `main` (the dispatcher/controller
-still does): its validation job runs the
-dual-ref flow above - `tool_sha` = the exact audited `validated_rc_tip`,
-`files_sha` = the c2 PR head - statically validating the actual changed
-workflow and Dependabot file and binding the result to that SHA, and c2's acceptance
-additionally requires a successful real scheduled run after activation
-(including the schedule-only issue job), plus the submitted snapshot's
-source ref, exact rc SHA, external correlator/ID, and visible dependency
-graph result and the named alert-triage owner/runbook. The
-automation-delta context is already required on
-`main`; only the full WP8 documentation-check suite is deferred until the
-release merge puts its tooling there. That deferral is recorded in the
-WP8b branch-protection acceptance item. (e) The handoff PR to `main`, which GATES branch deletion rather than
-being triggered by it - deleting rc first would leave the schedule and
-Dependabot pointing at a dead branch, the exact state this design
-forbids. Immediately before the normal rc-to-`main` release PR merges, require
-the authenticated current-main base and rc head to have identical modes and
-blob IDs for both protected automation paths. The automatic net-empty gate
-then succeeds even though the three-dot history shows independent copies. If
-either path differs, stop: synchronize it through a separately reviewed
-controller-repair/sync PR and re-audit the exact rc tip; the broad release PR
-cannot carry or authorize that repair. Ordering, normal release: verify rc landed on `main` -> freeze
-rc writes at `validated_rc_tip` -> merge (e) retargeting to
-`main` -> drain/cancel every pre-(e) snapshot run -> submit and verify the empty retirement
-snapshot -> verify the automatic `main` graph -> only then delete rc.
-Ordering, abandonment: freeze rc writes at `validated_rc_tip` -> merge
-(e) disabling/removing the automation ->
-drain/cancel every pre-(e) snapshot run -> submit and verify the empty
-retirement snapshot -> only then delete rc.
-The retirement call is a reviewed release-runbook API operation using an
-owner-held token scoped to `contents: write`; it executes no repository
-code and records the 201 receipt, exact merge SHA, ref, detector, and
-correlator. "Freeze" is an owned release operation: pause the rc merge
-queue and direct updates, record the exact tip and bypass policy, and
-recheck it immediately before retirement and deletion; any movement
-invalidates the evidence and restarts (e) validation. The runbook lists
-and records every in-progress/queued run for the stable snapshot identity;
-it waits for them or uses a separately scoped `actions: write` owner token
-to cancel them. The empty snapshot is always the final submission. Normal path - the workflow checkout and Dependabot
-`target-branch` switch to `main`, and both temporary dependency-snapshot
-jobs plus their manual refresh operation are removed (the checkout could fall back dynamically but Dependabot's
-target is static, so a `main` edit is unavoidable), an XS retarget-and-cleanup
-edit. Abandonment path - rc is abandoned WITHOUT merging: retargeting is
-invalid because `main` then holds neither the refreshed docs nor
-`tools/docs-parity` and its cargo root, so the handoff instead DISABLES
-and removes the automation (schedule trigger, rc-targeted Dependabot
-entries, link workflow, both dependency-snapshot jobs, and their manual
-refresh operation) rather than pointing it at content that does
-not exist; transplanting the tooling to `main` is a separate,
-explicitly sized effort, never a silent XS edit. The two paths are mutually exclusive diffs, so this refresh does not
-open a single speculative draft: it produces a tracked issue plus two
-REVIEWED patch templates/runbooks (retarget, and disable/remove), and
-the concrete PR is opened from the matching runbook once the outcome is
-known, with the same dual-ref validation and SHA binding c2 uses applied to
-the concrete (e) diff before handoff. Both paths have a named owner, a
-sequencing row, and a verification item (the automation must never keep
-pointing at a dead or content-less branch); (d) the CNAME deletion
-PR to `main`, cut after the containment PR merges (the containment PR
-NEVER carries it - WP1's earlier allowance is superseded). Every
-delivery PR targeting `main` records its own fresh audited_main_tip and
-runs the exact-tip assertion before merge. The rc PR carries
-one reviewable commit (or small series) per package, with package-level
-review checkpoints: acceptance evidence is committed with the package or
-in an immediately adjacent evidence-only commit before the next package
-lands; generated-output changes use their own commits where review requires
-it; no checkpoint leaves a dirty evidence ledger; and no package commits are
-squashed on merge. Post-merge Epoch 2/3 evidence uses a durable issue-capture
-contract, not links alone. The Epoch 1 ledger predeclares the c2 and release
-issue URLs plus schema version. Each checkpoint appends one or more
-timestamped comments containing: actor, operation, exact commit/ref and PR
-head/base/tool SHAs, run ID/attempt/job URLs, request method/endpoint, redacted
-request body, response status and redacted body, detector/correlator/snapshot
-IDs, and the relevant dependency-graph, ruleset, protection, or branch API
-JSON. Each captured body carries its SHA-256; each comment is at most 60 KiB
-and larger captures are split into ordered chunks with per-chunk and aggregate
-hashes. Tokens and credential-bearing headers are never captured. Workflow
-and PR URLs are navigation aids; the pasted captures and hashes are the
-authoritative record when logs or artifacts expire. Corrections append a new
-comment naming the superseded comment and never overwrite the prior capture.
-GitHub Pages deploys only on pushes to `main`, so the containment subset ships
-first as a minimal
-separate PR straight to `main`: exactly the `srcExclude` change (covering
-`superpowers/**`, `internal/**`, `epics/**`, `guide/onboarding.md`,
-`README.md`, `business-use-cases.md`), the onboarding move/scrub, the
-filled Guide landing page, and the nav edits that removing pages forces
-(Guide link to the landing page; Business Value item dropped). Removing
-every link to an excluded source is a containment invariant. Neither the
-CNAME resolution nor the marketing-page disposition blocks or rides in it.
-After (b) and (d) merge and before the rc WP1 checkpoint, (a) imports exactly
-their reviewed publishing deltas from the recorded merge commits and proves
-the resulting paths byte-identical to those merges. For the delete CNAME path,
-this includes the deletion; for the custom-domain path, it includes the CNAME,
-base configuration, README, and every checked URL changed by (d). Later rc
-packages may change an imported path only where this spec names that work (for
-example, WP5's additional `config.mts` navigation); they start from the
-imported bytes. This prevents the eventual rc-to-main merge from silently
-losing or conflicting with the already-live containment/domain state.
-CodeQL gets `rc/*` PR triggers (WP8b) and joins the final gate list.
-Rollback treats exclusions and scrubbing as non-rollbackable security
-invariants: recovery reverts only the causal non-security commit or
-redeploys a known-good artifact that retains them. Before (c), record the
-complete prior `main` protection/ruleset state. If the controller fails,
-remove only the new `docs/automation-delta` requirement and restore the
-recorded strictness setting BEFORE disabling/reverting its workflow, then
-land the repaired validation-only controller and re-run both block/pass
-proofs before re-enabling the context. If c2's scheduled path fails,
-revert only its schedule/Dependabot/snapshot activation back to the
-validated (c) form; after that merge has stopped resubmission, retire any
-suspect dependency snapshot only after draining/canceling earlier runs,
-using the empty SAME-identity snapshot and recording its receipt. That rollback reopens the activated milestone and
-blocks release/rc→`main` merge work until a repaired c2 again makes the
-protected workflow byte-identical to the audited rc blob.
-CNAME recovery never restores the placeholder: fall back to the project
-URLs by deleting CNAME and re-running their smokes, or restore a
-previously verified custom-domain DNS/CNAME/TLS tuple without weakening
-the containment exclusions. `aram356` approved this delivery and rollback
-shape on 2026-08-31.
+GitHub Pages deploys only from `main`. Therefore #1049 acceptance proves
+containment and project-path behavior from a clean local/CI VitePress build,
+including exact included/excluded artifact assertions and link checks. It does
+not claim a live Pages deployment while the PR targets rc. After the normal rc
+release reaches `main`, the release owner runs the same URL/content matrix and
+records the deployment SHA, response headers, canonical URLs, and CNAME
+behavior. Those receipts are release evidence, not a prerequisite for
+finishing this PR.
 
-Platform semantics are implementation inputs, not folklore, and are
-revalidated when (c), c2, and (e) are cut: GitHub's
-[`pull_request_target` security model](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target),
-[event-associated workflow version/ref semantics](https://docs.github.com/en/actions/concepts/workflows-and-actions/workflows),
-[latest-SHA and merge-queue required-check behavior](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks),
-[PR-files API cap and permissions](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests-files),
-[dependency snapshot identity/permissions](https://docs.github.com/en/rest/dependency-graph/dependency-submission),
-and [default-branch-only security-update PRs](https://docs.github.com/en/code-security/tutorials/secure-your-dependencies/customizing-dependabot-prs).
+### Final-state automation
+
+The multi-stage `main` controller, `docs/automation-delta` attestation,
+activation patch, temporary rc dependency snapshot, retirement snapshot, and
+release retarget/disable paths are removed. They existed only to protect
+independent default-branch delivery PRs, which this design no longer uses.
+
+PR #1049 instead commits one final steady-state automation design:
+
+1. Pull-request jobs use `pull_request` and read-only permissions. They execute
+   deterministic docs-parity, generation, docs, rustdoc, doctest, JS, and
+   workflow-policy checks on #1049 without secrets or write tokens.
+2. Scheduled external-link checking and dependency-snapshot submission are
+   defined in their final `main` form. Scheduled jobs run only from the default
+   branch, so they remain operationally dormant until the rc release reaches
+   `main`.
+3. The scheduled link reader has `contents: read` only and emits a bounded,
+   schema-validated artifact. A separate no-checkout reporter has only the
+   issue permission it needs, deduplicates one owned issue, and auto-closes it
+   after a clean scheduled run.
+4. Dependency snapshot generation reads the authenticated default-branch
+   source and emits a bounded, schema-validated artifact. A separate
+   no-checkout writer has only `contents: write` and submits the fixed
+   detector/correlator identity after revalidating the artifact and source SHA.
+5. Manual refresh accepts no caller-supplied executable or tool SHA. It runs
+   the workflow and tooling committed on the authenticated default branch.
+6. Every action is pinned by full SHA; event, permission, checkout, cache,
+   artifact, archive-member, path, mode, symlink, size, and schema invariants
+   are enforced by static negative fixtures.
+
+The final workflow has no `pull_request_target`, status-attestation writer,
+caller-selected validation source, protected-file lifecycle state machine, or
+merge-queue-specific bypass surface. An unexpected `pull_request_target`,
+`merge_group`, status write, PR-code checkout in a writer, or caller-selected
+tool SHA fails the checked workflow policy.
+
+The final dependency configuration targets `main`. It has no temporary
+`rc/202608` Dependabot roots or snapshot identity to retire. The first real
+scheduled link run and dependency submission occur only after the normal
+release makes these files part of `main`. Release acceptance records the run
+and graph receipts; no follow-on implementation PR is required.
+
+### Branch protection and merge queues
+
+PR #1049 does not mutate `main` branch protection, seed statuses on unrelated
+PRs, disable merge queues, request a bypass, or claim that a workflow absent
+from `main` is already required there. Hosted checks on the exact #1049 head
+are recorded as implementation evidence.
+
+At the normal rc-to-`main` release, the release owner may make the final
+documented check contexts required only after confirming that each context has
+reported successfully from the expected GitHub App on the released commit.
+Any branch-protection change is an external release operation, not an
+individual implementation PR and not part of #1049 completion. Merge-queue
+support remains out of scope; enabling a queue with new required-check
+semantics requires its own future design.
+
+### Evidence and completion
+
+The repository evidence ledger is the system of record for #1049. It records
+the exact baseline and package SHAs, commands, generated no-diff proofs,
+hosted check URLs, smoke results, typed exceptions, and follow-up issues.
+Fields for live default-branch behavior are explicitly labeled
+`release-pending`; they are never filled with local substitutes.
+
+This refresh is implementation-complete when:
+
+- every WP1-WP8 repository package is committed and pushed to #1049;
+- the final #1049 head still satisfies the exact rc-baseline contract;
+- all required local and hosted checks for that head are green;
+- generated output is byte-stable on a second run;
+- the worktree is clean;
+- all follow-up issues have exact URLs or deduplicated dispositions; and
+- the release runbook contains the post-`main` Pages, scheduled-link,
+  dependency-graph, and optional branch-protection verification steps.
+
+Merging #1049, releasing rc to `main`, changing repository protection, and
+observing the first default-branch schedule are external release operations.
+They are not falsely reported as completed repository work. This distinction
+keeps the single PR executable without weakening the evidence standard.
+
+Platform semantics are revalidated when the final workflows are written:
+GitHub scheduled workflows use the default-branch version; pull-request jobs
+receive read-only permissions unless explicitly narrowed otherwise;
+dependency submission requires `contents: write`; and default-branch
+Dependabot configuration becomes active only after release. The implementation
+uses GitHub primary documentation as the source for those assertions.
 
 ## Work packages
 
 ### WP1: Publishing and policy hygiene
 
 - `srcExclude` + onboarding move/scrub + Guide landing page + nav edits
-  (contents fixed in Delivery shape); the containment PR to `main` ships
-  first and its post-deploy smoke asserts: excluded URLs 404; site root,
-  the Guide landing page, and one reference page return 200 with expected
-  content.
+  (contents fixed in Delivery shape) land directly in #1049. The package
+  asserts the exact excluded and required artifact sets from a clean build.
 - `business-use-cases.md` gains its source-level unverified banner
   (asserted by WP1 acceptance).
 - Delete `docs/public/CNAME` and re-smoke the project URLs. The rejected
   custom-domain branch would require `base: '/'`,
   Pages/DNS/TLS setup, canonical+asset smokes, and a
-  project-owned-public-domain allowlist classification. Because only
-  `main` deploys, an rc-only edit never reaches the live site: the
-  resolved disposition ships as its own `main`-target PR (delivery graph
-  item (d); the containment PR never carries it). The custom-domain
-  branch also inventories hard-coded Pages URLs (e.g. `README.md:11`)
-  rather than testing only canonical and asset responses. The selected
-  deletion plus its live smoke is a completion gate for this refresh.
+  project-owned-public-domain allowlist classification. The custom-domain
+  branch also inventories hard-coded Pages URLs (e.g. `README.md:11`) rather
+  than testing only canonical and asset responses. #1049 proves project-path
+  output locally and in CI; the live project-URL smoke is release-pending
+  until the rc changes reach `main`.
 - `fastly.toml`: empty `authors` list; label the key fixtures
   consistently as local test fixtures; comment the four KV stores; remove
   the `test-prebid-eids.sh` comment. `service_id` stays under its
@@ -766,12 +458,12 @@ and [default-branch-only security-update PRs](https://docs.github.com/en/code-se
   `AGENTS.md` gets a generated gate region (it is the fallback for agents
   that cannot read `CLAUDE.md`, so it carries the list).
 
-Acceptance: `vitepress build` output contains none of the excluded pages;
-the `main` containment PR is merged and its smoke passes; the CNAME deletion
-PR (d) is merged with its project-URL live smoke and its own
-audited_main_tip assertion; the banner is
-present; no internal contacts or access instructions anywhere in the repo;
-every command file links to (not copies) the canonical gates.
+Acceptance: a clean `vitepress build` contains none of the excluded pages and
+contains the required Home, Guide, and reference artifacts with expected
+content; the project-path base is preserved; the CNAME is absent; the banner
+is present; no internal contacts or access instructions remain anywhere in
+the repository; and every command file links to, rather than copies, the
+canonical gates. The live Pages and CNAME smoke is explicitly release-pending.
 
 ### WP2: Truth pass over existing content
 
@@ -1145,321 +837,208 @@ Acceptance: worklist complete; matrix builds warning-free with
 `RUSTDOCFLAGS="-D warnings"`; the WP8 jsdoc lint (mandatory, scoped as
 above) green.
 
-### WP8: Enforcement (WP8a scaffolding early, WP8b activation last)
+### WP8: Enforcement (WP8a scaffolding early, WP8b final wiring)
 
-WP8a (lands right after WP1):
+WP8a lands after WP1 and creates the checked foundation in #1049:
 
-- `tools/docs-parity` (outside the workspace, own committed lockfile,
-  Dependabot cargo entry, nested-lockfile cache key, own README, host
-  fmt/clippy/test): the Serde-aware AST extractor (field and
-  container/variant attributes including `rename_all`/`tag`/`content`/
-  `untagged`, fail-closed on unknown shape-changing attributes, companion
-  manifest for custom deserializers, validators, and nonliteral
-  defaults), generated-region generator (deterministic ordering, no-write
-  check mode, atomic updates), the Cloudflare builder parser (fail-closed
-  grammar above), CLI help goldens (both platforms, merged
-  platform-annotated union, description override table with owner/
-  rationale/expiry/source-text staleness check), snippet-manifest tooling
-  (all languages; graded modes incl. `expected_compile_failure` and
-  `expected_validation_failure`, each carrying a REQUIRED stable
-  diagnostic matcher - error class/path or message pattern - and
-  expected phase, so a typo, missing dependency, wrong working
-  directory, or unrelated parser error cannot satisfy the gate, with a
-  fixture proving that a correct nonzero exit with the WRONG diagnostic
-  fails, and a negative example failing CI when it unexpectedly becomes
-  valid; `illustrative_fragment` entries carry owner, rationale, and
-  expiry like manual waivers, not a permanent escape hatch; expiring
-  waivers), the domain/credential scanner + typed allowlist (with a
-  defined input contract: text-vs-binary classification comes from path
-  plus a checked classification manifest, never content sniffing alone -
-  a tracked file the manifest does not classify FAILS the scan (so a new
-  binary cannot appear unreviewed, and text renamed under an unknown
-  extension cannot dodge content inspection); an expected-text file that
-  is oversized or invalid UTF-8 FAILS rather than being skipped
-  (thresholds must not become evasion mechanisms); classified binaries
-  get an ASCII/UTF-8 strings scan, or a reviewed hash-pinned manifest
-  entry where strings scanning is meaningless; generated lockfiles are
-  not blanket-excluded - their structured URL/source/registry fields are
-  scanned while checksum and integrity strings are recognized
-  structurally; known media assets get metadata-string inspection;
-  base64 test fixtures distinguish via the hash-pinned fixture allowlist
-  class - results must be deterministic across platforms. Every detector
-  and encoding class (domain, email, credential shape, service ID,
-  encoded token, binary strings) gets both a synthesized positive
-  fixture and an allowlisted fixture proving the allowlist path. The
-  scanner also carries a reviewed identifier denylist class - known
-  organization names, personal handles, chat channels, project IDs, and
-  access-instruction phrases - seeded from what WP2's scrubbing removes,
-  because the pattern detectors alone cannot catch policy-relevant
-  content like internal handles once common hosts are allowlisted. The
-  stated guarantee is honest about the residual: semantic sensitivity
-  beyond the detector and denylist classes remains a human review
-  control exercised through the WP2 disposition process, not a scanner
-  promise), the maintained-source
-  manifest checker, and the gate manifest.
-- Author `.github/workflows/docs-links.yml` and its static security
-  fixtures here, before (c): the link/issue jobs are present but
-  unreachable without `schedule`; those dormant jobs already carry their
-  final permissions, conditions, 30/5-minute timeouts, fixed schedule/refresh
-  concurrency group, artifact schema, and pinned action references. The
-  base-controlled PR validator and attestation are live, including the
-  maintenance operation that remains fail-closed until the normal post-(e)
-  steady-state predicate is true, and the dependency-snapshot jobs are defined as
-  the reviewed c2 patch template rather than active in (c), paired with
-  a reviewed reverse-c2 rollback fixture. PR (c) copies
-  this validation-only controller to `main`; WP8b may tighten fixtures
-  but cannot introduce a new c2/e trust model after the controller has
-  already landed. PR (c) records the hash of the complete validation-only
-  workflow. From that point through c2, all non-activation bytes - including
-  the controller, attestation, and unreachable link/issue job definitions -
-  are frozen. WP8b may change only fixtures and the reviewed c2 activation
-  regions. A controller defect requires a separately reviewed repair PR and
-  new hash before c2; it cannot ride inside the activation delta.
-- The example harness, in eight explicit phases (secret resolution
-  alone cannot make the template valid: placeholder rejection also
-  covers the non-secret publisher fields `domain`, `cookie_domain`, and
-  `origin_url`): (1) parse the unchanged source template; (2) assert it
-  FAILS deploy validation for exactly the expected placeholder set;
-  (3) apply deterministic non-secret customization in memory, never by
-  editing the template; (4) assert the customized config passes deploy
-  validation with secret key names intact; (5) serialize and verify the
-  blob envelope; (6) resolve through a fake secret store; (7) assert
-  runtime validation passes post-resolution; (8) run each optional
-  block and profile through isolated positive and negative probes.
-  Enumerate every `[integrations.*]`
-  subtree (grouped by first-segment ID, nested tables in their parent)
-  and every `[auction.providers.<id>]` entry - commented or active,
-  enabled or disabled - deserializing into the typed structs with
-  ignored-key detection, running `Validate::validate`, the profile
-  compilers, and the deploy/startup checks via per-ID isolated `Settings`
-  fixtures with the integration/provider forced enabled (the runtime path
-  skips disabled blocks); valid and invalid compiled probes per profile.
-- Inventory equality tests live where visibility allows: module-local
-  `#[cfg(test)]` tests inside core assert set equality for the private
-  registries (builders, plan registrations, profile registry, mediator,
-  JS module sets - replacing the deploy-ID constant's one-directional
-  subset check) against the same checked records the tool renders from.
-  Capability parity is behavioral, not ID-level: the tests instantiate
-  each integration under the predicate fixture matrix and inspect the
-  resulting registration state (proxy routes, rewriters, injectors,
-  post-processors, request filters, JS mode), comparing observed
-  capabilities against the record - so a record claiming a capability
-  after its `with_*` call changes fails. APS plan-dependent registration
-  and the DataDome filter are asserted in both predicate states. In the
-  capability and adapter-support records, executable columns (fan-out,
-  routes, status behavior) are test-backed; "operational support" and
-  "release status" are manually owned fields with a named owner and
-  review date, never implied to be code-derived.
+- `tools/docs-parity` is a standalone Cargo workspace with its own committed
+  lockfile, README, host fmt/clippy/test commands, workspace lint policy, and
+  `error-stack` error flow. It is not a root-workspace member.
+- Repository enumeration begins with `git ls-files -z`. A checked manifest
+  classifies every tracked path as text or binary and gives every expected
+  text file a whole-file or extracted-comment disposition. Unknown paths,
+  unknown comment grammars, unsafe modes, symlink escapes, oversized expected
+  text, and invalid UTF-8 fail closed.
+- The scanner covers domain, email, credential shape, service ID, encoded
+  token, checked binary strings, media metadata, retired identifiers, and
+  structured lockfile URL/source/registry fields. Typed exceptions require a
+  narrow class, owner, rationale, content fingerprint, and expiry. The
+  `fastly.toml` service-ID entry expires at
+  `2026-09-30T00:00:00Z`; check mode fails at or after that instant.
+  Semantic sensitivity outside detector classes remains a human disposition,
+  not a scanner guarantee.
+- The Serde-aware settings extractor handles field, container, and variant
+  attributes including `rename`, `rename_all`, `alias`, `tag`, `content`,
+  `untagged`, `flatten`, `skip`, and `skip_serializing`. Unknown
+  shape-changing attributes fail closed. Checked companions cover custom
+  deserializers, nonliteral defaults, and validators and are proved by
+  compiled positive and negative probes.
+- Generated regions use named markers, deterministic ordering, atomic writes,
+  ownership markers for adjacent manual prose, a no-write check mode, and a
+  second-run byte-stability assertion.
+- Markdown checks cover relative files and anchors over all active sets,
+  duplicate headings, percent-encoded fragments, intended pages/navigation,
+  excluded-page links, tombstones, orphans, and diagram prose equivalents.
+- Integration, adapter-support, route, settings, CLI-help, README, gate, and
+  snippet records are checked as sets. Private registries use module-local
+  test seams rather than new public APIs. The Cloudflare route parser has a
+  closed grammar and fails on unknown builder constructs.
+- CLI help is captured from the same authenticated source commit on native
+  Linux and native macOS. Raw runner identity, `uname -a`, `rustc -vV`, Node
+  version, source SHA, and SHA-256 are recorded. Platform-only commands are
+  annotated; prose overrides require owner, rationale, expiry, and a source
+  fingerprint.
+- Every Markdown fence has a checked mode: executable,
+  expected compile/validation failure with phase and stable diagnostic, or
+  illustrative fragment with an expiring waiver. A nonzero exit with the
+  wrong diagnostic fails.
+- The example-template harness performs all eight phases: unchanged parse,
+  exact placeholder failure, deterministic in-memory non-secret
+  customization, deploy validation with secret names intact, envelope
+  serialization, fake-store resolution, runtime validation, and isolated
+  positive/negative probes for every optional integration and provider
+  profile.
 
-WP8b (lands last):
+WP8b lands last in the same PR and wires the final state:
 
-- Wire everything as blocking CI: rustdoc matrix, native doctests (with
-  pinned Node), generated-region clean-diff, snippet manifest, scanner,
-  jsdoc lint, gate-manifest check across every surface in its mode,
-  repo/orphan/tombstone inventory, disposition-set equality,
-  maintained-source manifest equality.
-- Link enforcement per set: VitePress covers only the built public set
-  (and after `srcExclude`, nothing internal), so `docs-parity` adds a
-  repository-relative path and anchor check over the active repo and
-  maintained internal sets; the scheduled external-link check's input
-  is all three active sets; each set gets its own synthesized dead-link
-  negative fixture. External checking sends no credentials, follows at most
-  five redirects and validates the final HTTPS/expected status, falls back
-  from unsupported HEAD to GET, and makes at most three total attempts for
-  429/5xx responses with 1-second then 2-second exponential delays.
-  `Retry-After` is honored only when it parses to at most 30 seconds; larger or
-  malformed values use the bounded local delay. An exact-URL/path exception
-  needs reason, owner,
-  and expiry; blanket domain skips are forbidden, expiry fails the gate,
-  and allowlisted/expired/redirect-loop fixtures exercise each path.
-- Complete the remaining workflow edits and lock their static assertions:
-  CodeQL `rc/*` PR triggers; `.tool-versions` in
-  deploy-docs paths; normalized setup-node cache keys (all workflows, to
-  lockfiles); Dependabot roots (github-actions, browser and Next.js
-  fixture npm, docs-parity cargo); Wrangler pinned in `.tool-versions`
-  (the same pin consumed locally and in CI); the scheduled external link
-  check already defined at `.github/workflows/docs-links.yml`, using a
-  checker pinned by action SHA (versions chosen from
-  current stable at implementation and recorded where pinned;
-  split read-only checker / no-checkout `issues: write` reporter, dedup,
-  auto-close, named owner,
-  fixture-tested); its base-controlled `pull_request_target` automation
-  delta gate, fail-closed dispatch modes, status-only attestation job,
-  and temporary split dependency-snapshot generator/writer described in
-  Delivery shape;
-  `[lints] workspace = true` for openrtb-codegen. Where a governance
-  value can be asserted deterministically (a YAML-parsing static test
-  over workflow triggers, cache keys, Dependabot roots), it is; the
-  remainder is review-time evidence explicitly listed in the PR
-  description.
-- `CLAUDE.md`/`AGENTS.md`/`TESTING.md`/`docs/guide/testing.md` gate
-  regions regenerated from the manifest in the same commit.
+- Blocking PR jobs run standalone docs-parity fmt/clippy/test/check, generated
+  clean-diff, settings/examples/inventory/snippets/scanner/local links,
+  README/JSDoc/workflow fixtures, the rustdoc matrix, native doctests, docs
+  lint/format/build, and the existing target-specific Rust and JS gates.
+- CodeQL covers `rc/*` pull requests. Node is pinned wherever Rust doc/build
+  paths invoke JS. Setup-node cache inputs name exact lockfiles, including the
+  standalone tool lockfile. `.tool-versions` pins Wrangler, and workflows
+  consume that pin rather than global latest.
+- Dependabot covers GitHub Actions, browser/Next.js fixture npm roots, docs
+  npm, the root Cargo workspace, and `tools/docs-parity` Cargo. Its committed
+  final target is `main`; no temporary rc target is introduced.
+- `.github/workflows/docs-links.yml` contains ordinary read-only
+  `pull_request` validation plus the final default-branch schedule and closed
+  manual refresh operation. It contains no `pull_request_target`,
+  `merge_group`, status writer, caller-selected executable SHA, or PR-code
+  execution in a privileged job.
+- Every new `uses` reference is pinned by full SHA with its source version
+  recorded. Workflow-policy fixtures parse YAML and reject unpinned actions,
+  expanded permissions, unsafe events, checkout/cache/service-container use
+  in writers, caller-selected tools, unbounded artifacts, unexpected paths or
+  modes, symlinks, archive traversal, and unknown schema fields.
+- The scheduled external-link reader uses `contents: read`, a fixed
+  non-canceling concurrency group, and a 30-minute timeout. It follows at most
+  five redirects, validates final HTTPS/status, falls back from unsupported
+  HEAD to GET, and makes at most three attempts for 429/5xx with 1-second then
+  2-second delays. `Retry-After` is honored only when valid and at most 30
+  seconds. Exact-URL exceptions require owner, reason, and expiry.
+- The no-checkout issue writer has only `issues: write` and a 5-minute timeout.
+  Its archive has exactly one regular `link-results.json` member, at most
+  2 MiB compressed and 1 MiB decoded, with at most 500 findings and
+  2,048-byte strings. It validates before writing, deduplicates one owned
+  issue, and auto-closes it after a clean run.
+- The dependency-snapshot reader uses `contents: read` and produces exactly
+  one regular `dependency-snapshot.json` member, at most 4 MiB compressed and
+  2 MiB decoded, with at most 5,000 records and 2,048-byte strings. The
+  no-checkout writer has only `contents: write`, revalidates the schema and
+  authenticated default-branch SHA, and submits the fixed
+  detector/correlator identity. The manual refresh accepts no SHA or PR input.
+- `CLAUDE.md`, `AGENTS.md`, `TESTING.md`, and
+  `docs/guide/testing.md` gate regions are generated from one checked manifest.
+  Command files, CONTRIBUTING, and the PR template are link-only consumers.
 
-Merge-blocking is a repository setting, not a workflow property: a
-failing check blocks merges only when the ruleset/branch protection
-requires it. WP8b therefore carries an externally owned, PATH-SPECIFIC
-acceptance item. (i) Epoch 1 - the full new WP8 checks are required on
-`rc/202608`, with one demonstrated failure actually preventing an rc
-merge. After (c) merges, first inventory and seed/retrigger the current
-head of every already-open `main` PR; then require the fixed
-`docs/automation-delta` status for every `main` PR and enable
-strict/up-to-date enforcement. Acceptance demonstrates both an
-unauthorized protected-file delta being blocked and an unrelated PR
-receiving success without a privileged PR checkout. Deferral applies
-only to the full WP8 suite on `main`, whose tool does not exist there
-yet. (ii) Normal Epoch 3, after the release merge puts the tooling on
-`main` - the full checks are activated there, with a separate
-demonstrated `main` block; the automation-delta status remains required and
-its current-main `validate_main_maintenance` path is proven with one allowed
-repin fixture and one AST-weakening rejection before lifecycle closure.
-(iii) Abandonment - full-suite activation is INAPPLICABLE; after (e)
-merges and removes its workflow, the automation-delta required context
-is removed from branch protection before any later `main` PR can merge,
-with evidence that no required context referencing a nonexistent
-workflow remains. Every path records the required context names and
-their GitHub App and bypass policy. This refresh does not implement a
-`merge_group` attestation: a merge-group status would need to bind every
-constituent PR's authenticated head/base/tool tuple, and reusing the ordinary
-shape check would create a bypass. Before (c), record and enforce that merge
-queues are disabled for `main`, as approved by `aram356` on 2026-08-31. If they
-are active, stop until they are disabled for this lifecycle or a separate
-reviewed design adds that binding to this spec, plan, and fixtures. Queue
-adoption stays blocked through (e). Static workflow tests
-reject an unexpected `merge_group` trigger, and branch-protection acceptance
-records the queue setting alongside required contexts.
+The scheduled and writer paths cannot execute from #1049 merely because they
+are present on rc: GitHub uses the default-branch workflow for schedules and
+manual availability. Their repository acceptance is static policy coverage,
+schema/parser tests, deterministic artifact fixtures, and final-state config
+inspection. The first real schedule, issue reconciliation, dependency
+submission, and graph proof are release-pending.
 
-Acceptance: the workflow suite has positive fixtures for an ordinary
-net-empty protected delta, a divergent-history/net-identical rc release PR,
-c2, both e paths, rollback-c2, same-lifecycle repair/sync, and post-handoff
-maintenance, plus negative fixtures for a repair that changes lifecycle state,
-pre-handoff maintenance, and an unexpected `merge_group` trigger.
-Every runtime
-gate also has a synthesized negative fixture (dead
-link, broken intra-doc link, failing doctest, invalid or unknown-keyed
-example block including a disabled integration table and a bad
-`profile_config`, planted non-allowlisted domain, unclassified or
-expired-waiver snippet fence, missing scoped JSDoc, inventory change
-without regenerated region including a macOS-only CLI divergence, missing
-README or unlisted orphan, gate mismatch in any manifest surface, removed
-ownership marker, stale PR base, extra automation-delta path, malformed
-or mixed dispatch modes, open-PR tool SHA supplied to `validate_main_pr`,
-non-`main` or stale-`main` manual controller dispatch, caller-selected
-maintenance tool, maintenance AST weakening, protected candidate
-receiving pending (never automatic success),
-stale snapshot artifact or malformed refresh operation reaching the writer,
-validation failure still producing a failing
-attestation, privileged job attempting a checkout or PR-code execution);
-the static workflow assertions pass; regenerating all
-regions and goldens at final HEAD produces no diff.
+Acceptance requires positive fixtures for the ordinary read-only PR path,
+scheduled link path, clean and finding-bearing issue reconciliation,
+dependency generation/submission, and manual refresh. It requires one negative
+fixture per trust or bounds class, including unexpected privileged events,
+status writes, caller-selected tools, untrusted checkout, stale source SHA,
+extra archive members, traversal, symlink/unsafe mode, unknown fields,
+oversized artifacts/strings/record counts, malformed `Retry-After`, redirect
+loops, retry exhaustion, credentials embedded in a URL, expired exceptions,
+wrong snippet diagnostics, generated drift, missing ownership markers, and a
+new unclassified tracked path.
+
+All real repository checks pass from a fully staged candidate, a second
+generation produces no diff, the root `Cargo.lock` remains unchanged by the
+standalone tool, and the final #1049 hosted check list records exact run URLs
+and GitHub App identities. Main branch-protection activation and the first
+scheduled receipts remain release operations under Delivery shape.
 
 ## Sequencing
 
-| Order | Package                                   | Size | Depends on                                                                                     |
-| ----- | ----------------------------------------- | ---- | ---------------------------------------------------------------------------------------------- |
-| 0     | WP1 containment subset → `main` PR (b)    | XS   | -                                                                                              |
-| 0c    | CNAME deletion PR (d)                     | XS   | (b) merged                                                                                     |
-| 1     | WP1 hygiene (full, rc PR)                 | S    | (b) and (d) merged; import their exact publishing deltas                                       |
-| 2     | WP8a scaffolding                          | L    | -                                                                                              |
-| 2b    | `main` automation PR (c), validation-only | S    | WP8a (workflow content exists); rc dispatch + base-controlled `main` automation-delta gate     |
-| 3     | WP2 truth pass                            | M    | WP8a (manifest, scanner)                                                                       |
-| 4     | WP3 config reference                      | L    | WP8a (extractor, harness)                                                                      |
-| 5     | WP4 API reference                         | M    | WP2, WP8a                                                                                      |
-| 6     | WP5 pages + nav                           | L    | WP2, WP3, WP8a                                                                                 |
-| 7     | WP6 root + READMEs                        | M    | WP2                                                                                            |
-| 8     | WP7 in-code docs                          | M    | -                                                                                              |
-| 9     | WP8b gate activation                      | M    | WP2-WP7                                                                                        |
-| 9b    | Post-merge activation PR (c2) → `main`    | S    | #1049 merged into rc; audited tip; dual-ref binding; scheduled run + first dependency snapshot |
-| 10    | Release handoff PR (e) → `main`           | XS   | gates rc deletion; removes temporary snapshot jobs; issue + two reviewed runbooks              |
+Every row is a package checkpoint on `spec-docs-refresh` and PR #1049.
 
-Orders 0-9 are Epoch 1 (this refresh reaches implementation-ready once
-they land). 9b is Epoch 2 and closes this refresh at activated. 10 is Epoch 3,
-owned and specified here but executed at release.
+| Order | Package                                     | Size | Depends on                                      |
+| ----- | ------------------------------------------- | ---- | ----------------------------------------------- |
+| 0     | Single-PR design, plan, decisions, evidence | S    | Owner approval                                  |
+| 1     | WP1 containment, CNAME, and hygiene         | S    | 0; transfer reviewed containment commits        |
+| 2     | WP8a docs-parity foundation                 | L    | 1                                               |
+| 3     | WP2 truth pass                              | M    | 2 classification, scanner, snippets, page model |
+| 4     | WP3 configuration reference                 | L    | 2 settings extractor and example harness        |
+| 5     | WP4 API reference                           | M    | 2 route/integration records; 3 truth pass       |
+| 6     | WP5 deployment and product coverage         | L    | 3-5                                             |
+| 7     | WP6 root and crate documentation            | M    | 3                                               |
+| 8     | WP7 rustdoc and JSDoc                       | M    | 2 inventory/fixtures                            |
+| 9     | WP8b final CI and scheduled automation      | M    | 2-8                                             |
+| 10    | Final #1049 acceptance                      | S    | 1-9                                             |
+
+No row waits for an individual `main` PR, imports a moving default-branch
+blob, or creates a second implementation branch. Packages remain separate
+commits so review and evidence can be resumed without squashing unrelated
+surfaces.
 
 ## Verification
 
-Verification runs in three epochs, because a single state cannot hold
-both "target still equals the audited baseline" and "#1049 has merged":
+### PR #1049 implementation acceptance
 
-**Epoch 1 - pre-merge, at the final rc-PR HEAD** (`origin/rc/202608`
-still equals audited_target_tip
-`07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`): all GitHub checks green (CodeQL with rc
-triggers, format including the docs build, the seven test.yml jobs, the
-four integration-test jobs, release builds, JS build/test); the WP8
-parity suite and negative fixtures green; regeneration produces no diff;
-`cd docs && npm run lint && npm run format && npm run build`; the rustdoc
-matrix locally; acceptance greps over the defined sets with output in the
-PR description; the four adapter first-success smokes (Axum env bridge,
-Fastly local push + secrets, Cloudflare envelope transfer, Spin local
-push + variables) executed as documented with commands and cleanup
-recorded; the `main` containment PR merged with its positive smoke, the
-`main` automation PR merged with a successful read-only validation
-dispatch against the rc PR head and validated Dependabot config; its
-fixed status then seeded/retriggered for every already-open `main` PR and
-made required for every `main` PR with strict/up-to-date enforcement,
-with both the unauthorized-protected-delta block and unrelated-PR pass
-demonstrated; and the CNAME deletion PR (d) merged with its project-URL live
-smoke (each `main` PR's audited_main_tip assertion having passed); every
-follow-up filed with a recorded URL or disposition; the release-handoff work
-(e) existing as a tracked issue
-plus two reviewed runbooks (retarget / disable-and-remove), with its
-owner and both path conditions recorded and branch deletion documented
-as gated by (e); and the exact-tip baseline assertion for
-`origin/rc/202608` (equal to the recorded audited_target_tip, contained
-in the branch) passing at this HEAD - not a merge-base comparison.
+At the final PR head, `origin/rc/202608` must still equal
+`07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` and the branch must contain that
+commit. Reachability without exact equality does not pass.
 
-**Epoch 2 - after #1049 merges into rc**: record `merged_rc_tip` as the
-exact merge result of #1049 and initialize `validated_rc_tip` to it;
-require that value to equal `origin/rc/202608` (if rc has advanced at
-all, audit the full delta and replace `validated_rc_tip` with the new
-exact tip; reachability alone does not pass); dispatch that exact SHA as
-`tool_sha` through the read-only validation job and record the result;
-open and merge the c2 activation PR to `main` (its own
-audited_main_tip; dual-checkout validation - trusted tool from the
-exact `validated_rc_tip`, files under test from the c2 head - covering the actual
-changed workflow and Dependabot file, including the temporary snapshot
-jobs - and a just-before-merge manual success replacing the automatic
-pending status on that exact head/base); immediately dispatch
-`refresh_dependency_snapshot` and record the first snapshot, then observe
-one successful real scheduled run, including the
-schedule-only issue job and a dependency snapshot whose rc ref, exact
-source SHA, external correlator/ID, and dependency-graph visibility are
-recorded (the scheduled submission reconciles the same stable identity);
-record the alert-triage owner, runbook URL, and
-two-business-day rc patch SLA as well. Because the receipts exist only after
-c2 merges and c2's repository diff is exactly two protected files, the
-canonical Epoch 2 record is the named c2 tracking issue using the durable
-capture contract above, with links to the c2 PR, workflow runs, status,
-snapshot receipt, and dependency-graph evidence.
-The Epoch 1 repository ledger contains the issue URL and required evidence
-schema; no post-merge evidence-only branch or unmodeled rc commit is created.
+Acceptance records and verifies:
 
-**Epoch 3 - at release, before rc deletion**: verify rc landed on
-`main` (or that it is being abandoned). On the normal release PR, first prove
-the current-main base and rc head have net-identical modes/blobs for both
-protected paths so the required automation context succeeds without treating
-their divergent history as a new delta; otherwise use the separate repair/sync
-path before the release merge. Then refresh `validated_rc_tip` to
-the exact current rc tip after auditing any delta and freeze all rc
-writes through branch deletion; open the concrete (e) PR from
-the matching runbook, validated the same dual-checkout way against its
-real diff, with the manual status successful on its current head/base;
-merge it; verify that the temporary dependency-snapshot jobs
-are gone; submit the empty snapshot at the exact (e) merge SHA using the
-stable temporary identity and record the 201 receipt; verify the stale rc
-submission disappeared (and, on normal release, that automatic parsing
-now exposes the `main` manifest); re-verify the retargeted (or removed)
-schedule and Dependabot roots, live Pages containment, and the selected CNAME
-behavior; only then is rc deleted. If the release merge happened,
-`main` now carries the tooling, so the deferred full-suite required-check
-activation on `main` is completed here per the WP8b protection item, and the
-post-handoff current-main maintenance mode is proven without weakening any AST
-invariant. If
-rc was abandoned, remove the now-nonreporting automation-delta required
-context immediately after (e) and verify the next `main` PR is not
-stranded. Post-merge Epoch 3 receipts live in the named release-handoff issue
-under the same durable capture contract and link to PR (e), workflow runs,
-retirement response, graph verification, ruleset changes, and branch deletion;
-they do not require a follow-on repository evidence PR.
+- all hosted checks on the exact final head, including CodeQL with rc triggers,
+  format/docs build, every target-specific Rust test/check job, integration
+  tests, release builds, JS lint/test/build, docs-parity, rustdoc, and
+  doctests;
+- standalone docs-parity fmt, clippy, full tests, `check --all`, and generated
+  second-run no-diff;
+- docs lint, format, build, exact excluded/included artifacts, local and anchor
+  links, navigation/page/orphan/tombstone equality, and project-path asset
+  behavior with CNAME absent;
+- source-classification closure and the all-tracked privacy/sensitive scan;
+- settings, routes, integrations, adapter support, CLI goldens, snippets,
+  gates, README, JSDoc, and workflow-policy equality;
+- the complete rustdoc matrix with warnings denied and native core doctests;
+- JS lint, formatting, Vitest, and build;
+- Axum, Fastly, Cloudflare, and Spin first-success smokes, or a named,
+  time-bounded manual Spin receipt only when the runner cannot execute Spin;
+- every follow-up issue URL or exact existing-issue disposition;
+- exact package commit/path shape, no unrelated runtime behavior change,
+  `git diff --check`, and a clean worktree; and
+- the final PR description with immutable run URLs, app identities, current
+  head/base SHAs, and clearly labeled release-pending operations.
+
+The VitePress proof is not described as a live deployment. Scheduled workflow
+fixtures are not described as a real cron run. Dependency artifact fixtures
+are not described as a submitted graph. Main protection is not described as
+changed.
+
+### Release-pending verification
+
+After the normal release makes the #1049 result part of `main`, the release
+owner follows the committed runbook and records:
+
+1. the deployed `main` SHA and Pages response matrix: excluded URLs are absent,
+   required URLs return expected content, assets use the project path, and the
+   placeholder/custom CNAME is absent;
+2. one real scheduled external-link run, including bounded artifact validation,
+   deduplicated issue behavior, concurrency, and timeout results;
+3. one dependency snapshot submission from the exact authenticated `main` SHA,
+   its 201 receipt, fixed detector/correlator, graph visibility, and triage
+   owner/SLA;
+4. final Dependabot roots and workflow action pins as observed on `main`; and
+5. only if maintainers choose to require the new checks, the exact context
+   names, source GitHub Apps, strictness, bypass policy, and one planted-failure
+   block after all contexts have reported on `main`.
+
+These are release operations, not additional implementation PRs and not
+conditions for claiming the repository work in #1049 complete. Any failed
+release-pending check opens a focused repair through the normal repository
+process; it does not retroactively authorize fabricated Epoch evidence.
 
 ## Owner decisions and remaining non-blocking questions
 
@@ -1486,12 +1065,12 @@ they do not require a follow-on repository evidence PR.
    approved on 2026-08-31: correct `ProjectGovernance.md` to current evidence
    (no minutes exist; releases are not continuous) without adding CODEOWNERS
    or minutes commitments. Naming owners remains a maintainer follow-up.
-7. Delivery shape: `aram356` approved on 2026-08-31 all five PRs through
-   activation, the temporary `main` `docs/automation-delta` required-status
-   and strict/up-to-date protection change, merge queues disabled on `main`
-   through (e), and the external dependency-snapshot retirement API call under
-   the specified runbook and control scheme. The rollback requirements in
-   Delivery shape remain mandatory.
+7. Delivery shape: superseded on 2026-08-31 by `aram356`. All repository work
+   is committed to `spec-docs-refresh` and PR #1049; no individual containment,
+   CNAME, controller, activation, or release-handoff implementation PR is
+   created. PR #1049 remains targeted at `rc/202608`. Live Pages, scheduled
+   workflow, dependency-graph, and optional `main` protection verification are
+   release-pending operations under Delivery shape, not implementation claims.
 8. CodeQL `push` coverage for `rc/*`: explicitly non-blocking.
 
 ## Follow-up issues to file (code, not docs)
