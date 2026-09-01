@@ -2124,8 +2124,92 @@ PY
 
 #### Task 5 — Close tracked-file classification and sensitive-data scanning
 
-Pending. Bootstrap the complete then-current repository and enforce the
-approved service-ID exception.
+- Capture timestamp: 2026-09-01T17:13:39Z.
+- Executor: `OpenAI Codex task agent task5_classification_scanner`.
+- Package start HEAD:
+  `d0e8399dddd87db7816eeba2c363b575c6e552ec`; the local and remote
+  `spec-docs-refresh` tips matched at package start.
+- Approved paths: the standalone tool manifest and lock, classification and
+  scanner modules, their CLI/library/model/repository seams, the four
+  governance manifests, classification and scanner integration tests, and
+  this evidence section. The root Cargo manifest and lock were excluded.
+- Classification RED: the first exhaustive integration run exited 101 because
+  `classify` did not exist. The synthesized unknown-text, unknown-binary,
+  invalid-UTF-8, oversized-text, Dockerfile, MJS, protobuf, unselected-comment,
+  unsupported-grammar, symlink-escape, and unclassified-span cases then drove
+  the closed manifest implementation. Separate update RED cases proved that a
+  new or moved comment span and an inferred binary kind cannot retain review
+  attestation.
+- Scanner RED: the first 16-fixture integration run failed because `scan` did
+  not exist. Subsequent focused RED runs covered all detector classes, exact
+  expiry, stale fingerprints, renamed paths, broad scopes, retired-record
+  shape, duplicate occurrences, moved byte scopes, project-host lookalikes,
+  governance-field self-amplification, comment-bearing governance, sensitive
+  governance prose, reviewed-bootstrap preservation, source-member/domain
+  prefix truncation, RFC-reserved hosts, source-expression credentials, and
+  URL substrings misread as email addresses. Each focused case passed after
+  its minimal implementation change; the scanner integration target then
+  passed 33 tests.
+- Classification review: `git ls-files -z` produced 705 exact tracked paths:
+  704 reviewed text files and one reviewed binary image. All 704 text paths
+  have source records: 669 whole-file and 35 extracted-comment sources. The
+  maintained set contains 645 explicit includes and 588 explicit typed
+  excludes; the latter are 135 historical, 6 machine-data, 49
+  non-documentation, 378 source-code, and 20 test-fixture dispositions. All
+  564 extracted comment spans have exact reviewed dispositions. Agent and
+  skill Markdown is whole-file included.
+- Privacy review: the final scanner manifest contains 3,678 exact byte-scoped
+  occurrences: 3,345 domains, 286 semantically parsed lockfile fields, 35
+  credential-shaped literals, 11 binary strings, and one service ID. There
+  are no repository email, encoded-token, media-metadata, or retired-plaintext
+  findings. Class counts are 3,618 vendor URLs, 35 hash-pinned fake credential
+  fixtures, 13 historical examples, 11 project-owned public domains, and one
+  service ID.
+- Credential disposition: all 35 exact literals were inspected at their
+  source locations. Twenty-five are inside Rust test modules, one is an
+  integration-test configuration, four are documentation secret-store key
+  examples, three are historical test plans, and two are commented template
+  key names. They are dummy literals, placeholder-rejection fixtures, an
+  industry-standard published signing example, or key identifiers; none is a
+  resolved production credential. Rust expressions and wrapper constructors
+  are excluded by regression tests rather than allowlisted.
+- Domain/email disposition: scheme URLs and boundary-terminated bare hosts
+  were reviewed by exact path and normalized host. RFC-reserved `.example`,
+  `.invalid`, `.test`, `.localhost`, and `example.com`/`example.net`/
+  `example.org` hosts are synthetic and consume no exception. Member-name and
+  suffix-prefix lookalikes fail detector fixtures. URL user-info and `@` image
+  filenames do not become email findings. Project hosts use the
+  `project_owned_public_domain` class; the deleted-CNAME audit has exactly two
+  historical records, both owned by `aram356`, with the approved rationale and
+  `2027-08-31T00:00:00Z` expiry.
+- Governance: the allowlist supports only the five approved classes. Every
+  record has exact path, detector, byte selector, content SHA-256, owner,
+  rationale, and expiry. Derived governance fields are structurally parsed
+  and not re-scanned as content; comments are rejected outside quoted TOML
+  strings, and owner/rationale text is scanned directly and cannot be
+  self-allowlisted. Ten reviewed retired identifier/access-phrase records are
+  SHA-256-only; the manifest and checked-in tests contain no retired plaintext.
+- Service exception: the sole record is scoped to `fastly.toml`, owned by
+  `aram356`, and expires exactly at `2026-09-30T00:00:00Z`. A deterministic
+  clock seam proves success immediately before and failure exactly at and
+  after the boundary.
+- Determinism and checks: two classification updates and two scanner
+  bootstraps were byte-stable. Bootstrap preserves a complete reviewed exact
+  set without writing, drops stale records, and reopens review for any new or
+  moved finding. Check mode performs no writes. Focused classification and
+  scanner commands, the full standalone suite, format, Clippy with warnings
+  denied, `classify --check`, and `scan --check` passed. `git diff --check`,
+  approved-path scope, generated no-diff, and tracked/untracked cleanliness
+  checks passed before the enclosing commit.
+- Workspace isolation: the root `Cargo.lock` SHA-256 remained
+  `9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`.
+  The standalone lock contains only the scanner/classifier dependency closure.
+- Semantic boundary: these mechanical detectors do not claim completeness for
+  human semantic sensitivity. Content outside their named classes still
+  requires reviewed human disposition.
+- Enclosing commit subject: `Enforce documentation source classification`.
+  Its SHA and push/PR receipt are reported in the execution handoff because a
+  commit cannot contain its own identifier.
 
 #### Task 6 — Implement generated regions, Markdown ownership, and link checks
 

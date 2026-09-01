@@ -1,0 +1,81 @@
+version = 1
+
+[[identifiers]]
+kind = "identifier"
+fingerprint = "sha256:9d155035a90b33ea3c44f8ebfc4bad1c3a806cc5e9236fe342d07d620ca5264a"
+normalized_length = 18
+word_count = 1
+case_insensitive = true
+whitespace_tolerant = false
+
+[[identifiers]]
+kind = "identifier"
+fingerprint = "sha256:a23c8f7a72d4ed48ef48e0d65fcb7e5b3de28b37bce3c18c4a027d38e5b97b69"
+normalized_length = 10
+word_count = 1
+case_insensitive = true
+whitespace_tolerant = false
+
+[[identifiers]]
+kind = "identifier"
+fingerprint = "sha256:47e9ab61971c8228ee3a5a7e4e7f492a8a7d2ed05000612351d2798a1ecfc5d5"
+normalized_length = 19
+word_count = 1
+case_insensitive = true
+whitespace_tolerant = false
+
+[[identifiers]]
+kind = "identifier"
+fingerprint = "sha256:262d2f5569ef006ffeb288d606696f930c70dbeec9986ae066554a1b7ba4348c"
+normalized_length = 24
+word_count = 1
+case_insensitive = true
+whitespace_tolerant = false
+
+[[identifiers]]
+kind = "access_phrase"
+fingerprint = "sha256:d7ead80b23e0925b55d81d235f4ec7789ef76bbc39b64bd4856858607005a45e"
+normalized_length = 36
+word_count = 6
+case_insensitive = true
+whitespace_tolerant = true
+
+[[identifiers]]
+kind = "access_phrase"
+fingerprint = "sha256:fabebfaf9f751578404dade1f6911c5211e55112155cd1eb37742ab5eeaa29f5"
+normalized_length = 20
+word_count = 4
+case_insensitive = true
+whitespace_tolerant = true
+
+[[identifiers]]
+kind = "access_phrase"
+fingerprint = "sha256:c85965885f1663af8d435525074cc6a70c1548b8e310220540502b6a0e35def2"
+normalized_length = 48
+word_count = 8
+case_insensitive = true
+whitespace_tolerant = true
+
+[[identifiers]]
+kind = "access_phrase"
+fingerprint = "sha256:3ced6222be77642263490f3cf2bd0a95b276965f2f85586d1d7a32c7c3219e0c"
+normalized_length = 24
+word_count = 4
+case_insensitive = true
+whitespace_tolerant = true
+
+[[identifiers]]
+kind = "access_phrase"
+fingerprint = "sha256:524b06e6a628b58b984b7e29c803bf378268afd683b9941d11b88c68251cdc58"
+normalized_length = 35
+word_count = 6
+case_insensitive = true
+whitespace_tolerant = true
+
+[[identifiers]]
+kind = "access_phrase"
+fingerprint = "sha256:2c40b81f8f43edb238641a6bd9c8439a028c11c83ffe46e6c5aee6190cc65210"
+normalized_length = 24
+word_count = 3
+case_insensitive = true
+whitespace_tolerant = true

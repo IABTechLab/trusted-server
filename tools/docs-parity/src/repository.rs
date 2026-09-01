@@ -55,11 +55,11 @@ impl NormalizedRelativePath {
         Ok(Self(normalized))
     }
 
-    fn as_path(&self) -> &Path {
+    pub(crate) fn as_path(&self) -> &Path {
         &self.0
     }
 
-    fn as_utf8(&self) -> Result<&str, Report<RepositoryError>> {
+    pub(crate) fn as_utf8(&self) -> Result<&str, Report<RepositoryError>> {
         self.0.to_str().ok_or_else(|| {
             Report::new(RepositoryError::UnsafeRelativePath)
                 .attach(format!("non-UTF-8 path: {}", self.0.display()))
@@ -150,6 +150,18 @@ impl Repository {
     }
 
     pub(crate) fn tracked_paths_record(&self) -> Result<Vec<u8>, Report<RepositoryError>> {
+        let paths = self.tracked_paths()?;
+        let mut record = Vec::new();
+        for path in paths {
+            record.extend_from_slice(path.as_utf8()?.as_bytes());
+            record.push(b'\n');
+        }
+        Ok(record)
+    }
+
+    pub(crate) fn tracked_paths(
+        &self,
+    ) -> Result<Vec<NormalizedRelativePath>, Report<RepositoryError>> {
         let output = Command::new("git")
             .args(["-C", self.root_text()?, "ls-files", "-z"])
             .output()
@@ -173,13 +185,18 @@ impl Repository {
             paths.push(path);
         }
         paths.sort_unstable();
+        Ok(paths)
+    }
 
-        let mut record = Vec::new();
-        for path in paths {
-            record.extend_from_slice(path.as_utf8()?.as_bytes());
-            record.push(b'\n');
-        }
-        Ok(record)
+    pub(crate) fn read_tracked(
+        &self,
+        path: &NormalizedRelativePath,
+    ) -> Result<Vec<u8>, Report<RepositoryError>> {
+        self.validate_existing(path, true)?;
+        let absolute = self.root.join(path.as_path());
+        fs::read(&absolute)
+            .change_context(RepositoryError::FileOperation)
+            .attach_with(|| format!("read tracked path: {}", absolute.display()))
     }
 
     pub(crate) fn read_optional(

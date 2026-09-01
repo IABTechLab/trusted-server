@@ -11,8 +11,10 @@ use error_stack::{Report, ResultExt as _};
 
 use crate::repository::{NormalizedRelativePath, Repository};
 
+pub mod classification;
 pub mod model;
 mod repository;
+pub mod scanner;
 
 /// Process exit code for a successful check or update.
 pub const EXIT_SUCCESS: i32 = 0;
@@ -29,6 +31,10 @@ pub enum DocsParityError {
     Repository,
     #[display("cannot read the current directory")]
     CurrentDirectory,
+    #[display("documentation source classification failed")]
+    Classification,
+    #[display("documentation sensitive-data scan failed")]
+    Scanner,
 }
 
 impl core::error::Error for DocsParityError {}
@@ -50,6 +56,34 @@ enum Command {
     Check(CheckArguments),
     /// Atomically update a generated tracked-path record.
     Update(UpdateArguments),
+    /// Check or update the closed tracked-file classification universe.
+    Classify(ClassifyArguments),
+    /// Check sensitive data or bootstrap exact review candidates.
+    Scan(ScanArguments),
+}
+
+#[derive(Args, Debug)]
+struct ClassifyArguments {
+    /// Validate manifests without changing repository bytes.
+    #[arg(long, conflicts_with = "update", required_unless_present = "update")]
+    check: bool,
+    /// Bootstrap or refresh deterministic candidate manifests.
+    #[arg(long, conflicts_with = "check", required_unless_present = "check")]
+    update: bool,
+}
+
+#[derive(Args, Debug)]
+struct ScanArguments {
+    /// Validate all tracked files without changing repository bytes.
+    #[arg(
+        long,
+        conflicts_with = "bootstrap",
+        required_unless_present = "bootstrap"
+    )]
+    check: bool,
+    /// Replace the allowlist with deterministic, unreviewed finding candidates.
+    #[arg(long, conflicts_with = "check", required_unless_present = "check")]
+    bootstrap: bool,
 }
 
 #[derive(Args, Debug)]
@@ -107,6 +141,39 @@ pub fn run_from_env() -> Result<Outcome, Report<DocsParityError>> {
     match cli.command {
         Command::Check(arguments) => check(&repository, arguments),
         Command::Update(arguments) => update(&repository, &arguments),
+        Command::Classify(arguments) => classify(&repository, &arguments),
+        Command::Scan(arguments) => scan(&repository, &arguments),
+    }
+}
+
+fn scan(
+    repository: &Repository,
+    arguments: &ScanArguments,
+) -> Result<Outcome, Report<DocsParityError>> {
+    if arguments.check {
+        scanner::check(repository).change_context(DocsParityError::Scanner)?;
+        Ok(Outcome::Clean)
+    } else {
+        debug_assert!(arguments.bootstrap, "clap should require one scanner mode");
+        scanner::bootstrap(repository).change_context(DocsParityError::Scanner)?;
+        Ok(Outcome::Updated)
+    }
+}
+
+fn classify(
+    repository: &Repository,
+    arguments: &ClassifyArguments,
+) -> Result<Outcome, Report<DocsParityError>> {
+    if arguments.check {
+        classification::check(repository).change_context(DocsParityError::Classification)?;
+        Ok(Outcome::Clean)
+    } else {
+        debug_assert!(
+            arguments.update,
+            "clap should require one classification mode"
+        );
+        classification::update(repository).change_context(DocsParityError::Classification)?;
+        Ok(Outcome::Updated)
     }
 }
 
