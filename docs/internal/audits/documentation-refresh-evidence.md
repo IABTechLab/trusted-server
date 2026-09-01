@@ -2046,7 +2046,54 @@ PY
 
 #### Task 4 — Scaffold the standalone `docs-parity` crate
 
-Pending. Record each atomic fixture cycle and the bootstrap exception checks.
+- Package start: `14ea4d99ffb726a75868f1ee1c74622f451f03d7` on
+  `spec-docs-refresh`. The package-start fetch reasserted
+  `origin/rc/202608` at
+  `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`, confirmed that commit as an
+  ancestor, and observed PR #1049 open and draft from `spec-docs-refresh` to
+  `rc/202608`.
+- Bootstrap RED: before a binary or library target existed,
+  `cargo test --manifest-path tools/docs-parity/Cargo.toml --test cli` ran ten
+  integration tests and failed all ten because the `docs-parity` binary was
+  absent. Exact assertion:
+  `should build the docs-parity binary for CLI integration tests`. The tests
+  covered deterministic help, unknown
+  subcommands, nested repository discovery, check/update exit codes and
+  no-write checking, outside and unsafe relative paths, an interrupted atomic
+  stage, and stable ordering. Adding the typed-governance contract before the
+  library existed produced `E0433` for the absent `docs_parity` crate.
+- Atomic and ordering GREEN: after the minimal implementation, the first run
+  passed ten cases and exposed one defect on the second stable update: exit 2
+  reported that the existing record was treated as an unsafe directory. Parent
+  validation was corrected to begin at the containing directory; the focused
+  stable-order test and the full then-eleven-test suite passed. The interruption
+  fixture pre-created `.tracked-paths.txt.docs-parity.tmp`; update exited 2 and
+  preserved the prior complete target bytes.
+- Boundary RED/GREEN: `C:outside.txt` initially exited 0 instead of 2, and a
+  tracked file below a world-writable intermediate directory initially exited
+  0 instead of 2. Focused tests then passed after portable drive-relative path
+  rejection and full existing-parent-chain validation were added. A tracked
+  symlink to an internal regular file passed; an escaping symlink and unsafe
+  tracked/output directory modes failed closed.
+- Final focused commands:
+
+  ```bash
+  cargo test --manifest-path tools/docs-parity/Cargo.toml --test cli
+  cargo fmt --manifest-path tools/docs-parity/Cargo.toml -- --check
+  cargo clippy --manifest-path tools/docs-parity/Cargo.toml --all-targets -- -D warnings
+  cargo run --manifest-path tools/docs-parity/Cargo.toml -- check
+  ```
+
+  Results: the integration command passed 14 tests, formatting and Clippy
+  passed, and the real-worktree check passed without writing repository files.
+
+- Workspace isolation: the standalone tool owns
+  `tools/docs-parity/Cargo.lock`; the root `Cargo.lock` SHA-256 was
+  `9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`
+  before and after the package. The tool lock SHA-256 was
+  `f45722ba1c96ddc8095308407102deb8c1ca33a64d140c1382abf692e111d5e3`.
+  No root workspace membership was added. Tasks 1-4 remain the approved
+  classification-manifest bootstrap exception.
 
 #### Task 5 — Close tracked-file classification and sensitive-data scanning
 
