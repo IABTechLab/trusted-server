@@ -738,6 +738,42 @@ impl PermissionState {
     pub const fn permissions(&self) -> PermissionSet {
         self.set
     }
+
+    /// The resolved state as the JSON the page receives in
+    /// `window.tsjs.permissions`.
+    ///
+    /// Names are the [`Permission::as_str`] Data Use identifiers, sorted so the
+    /// same state always serializes to the same bytes whatever order the set
+    /// was built in. An empty state
+    /// renders as `{"set":[]}`, which is an answer (nothing is set) rather than
+    /// a missing value, so page code never has to tell the two apart.
+    ///
+    /// This is the only place the page shape is spelled, so no caller writes
+    /// the JSON by hand.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::permissions::{
+    ///     Permission, PermissionSet, PermissionState,
+    /// };
+    ///
+    /// let state = PermissionState::new(
+    ///     PermissionSet::none().with(Permission::StoreOnDevice),
+    /// );
+    /// assert_eq!(
+    ///     state.page_json(),
+    ///     r#"{"set":["necessary.operations.storage"]}"#
+    /// );
+    ///
+    /// assert_eq!(PermissionState::default().page_json(), r#"{"set":[]}"#);
+    /// ```
+    #[must_use]
+    pub fn page_json(&self) -> String {
+        let mut names: Vec<&'static str> = self.set.iter().map(Permission::as_str).collect();
+        names.sort_unstable();
+        serde_json::json!({ "set": names }).to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -966,6 +1002,8 @@ impl core::error::Error for PermissionsError {}
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -1006,6 +1044,49 @@ mod tests {
                 "advertising_marketing.first_party.contextual"
             ],
             "iteration should be in stable bit-index order"
+        );
+    }
+
+    #[test]
+    fn page_json_lists_set_permissions_sorted_by_name() {
+        // Arrange: a state whose bit-index order is the reverse of its name
+        // order, so the sort is what the assertion sees.
+        let state = PermissionState::new(
+            PermissionSet::none()
+                .with(Permission::StoreOnDevice)
+                .with(Permission::SelectBasicAds),
+        );
+
+        // Act
+        let json = state.page_json();
+
+        // Assert
+        assert_eq!(
+            json,
+            json!({
+                "set": [
+                    "advertising_marketing.first_party.contextual",
+                    "necessary.operations.storage",
+                ]
+            })
+            .to_string(),
+            "should list every set permission by Data Use name, sorted"
+        );
+    }
+
+    #[test]
+    fn page_json_of_an_empty_state_is_an_empty_set() {
+        // Arrange
+        let state = PermissionState::default();
+
+        // Act
+        let json = state.page_json();
+
+        // Assert
+        assert_eq!(
+            json,
+            json!({ "set": [] }).to_string(),
+            "an empty state should render as an empty set, not as nothing"
         );
     }
 
