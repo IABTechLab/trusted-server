@@ -2081,6 +2081,20 @@ PY
   passed after both check and update inspected the directory entry with
   `symlink_metadata`: each exited 2, both symlink entries and link targets were
   unchanged, and no dangling target was created.
+- Quality hardening from `048ab3aa45f7deeb142ec3076e886eb3f80c7c4e`:
+  the Git-admin RED check returned drift exit 1 instead of safety exit 2 for
+  `.git/config`; after the fix, check and update both exited 2 and preserved the
+  exact config bytes. The portable-name RED case `line\nbreak.txt` exited 0;
+  the closed grammar then rejected controls, Windows-invalid characters,
+  backslashes, trailing dots/spaces, case-insensitive `.git` components, and
+  all reserved Windows device stems with extensions while continuing to allow
+  `.gitignore` and `.gitmodules`. Repository roots ending in a space or carriage
+  return failed when more than Git's single LF terminator was removed; stripping
+  exactly that LF made both focused cases pass. Expiry probes covered leap day,
+  year zero, and invalid month, day, hour, minute, and second values. Finally, a
+  standalone Cargo check targeting `wasm32-wasip1` failed with the intended
+  `docs-parity supports only Linux and macOS hosts` compile-time diagnostic,
+  proving there is no unsupported-host fallback.
 - Final focused commands:
 
   ```bash
@@ -2090,8 +2104,9 @@ PY
   cargo run --manifest-path tools/docs-parity/Cargo.toml -- check
   ```
 
-  Results: the integration command passed 15 tests, formatting and Clippy
-  passed, and the real-worktree check passed without writing repository files.
+  Results: the integration command passed 19 tests, formatting and Clippy
+  passed, and the README's absolute-manifest invocation passed from
+  `docs/guide` without writing repository files.
 
 - Workspace isolation: the standalone tool owns
   `tools/docs-parity/Cargo.lock`; the root `Cargo.lock` SHA-256 was

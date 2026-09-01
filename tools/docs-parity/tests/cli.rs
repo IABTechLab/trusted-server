@@ -94,6 +94,30 @@ fn governance_requires_typed_owner_rationale_and_expiry() {
 }
 
 #[test]
+fn expiry_rejects_invalid_calendar_and_clock_components() {
+    assert!(
+        Expiry::parse("2024-02-29T23:59:59Z").is_ok(),
+        "leap day should be valid in a leap year"
+    );
+    for invalid in [
+        "0000-01-01T00:00:00Z",
+        "2024-00-01T00:00:00Z",
+        "2024-13-01T00:00:00Z",
+        "2024-01-00T00:00:00Z",
+        "2024-04-31T00:00:00Z",
+        "2023-02-29T00:00:00Z",
+        "2024-01-01T24:00:00Z",
+        "2024-01-01T00:60:00Z",
+        "2024-01-01T00:00:60Z",
+    ] {
+        assert!(
+            Expiry::parse(invalid).is_err(),
+            "invalid expiry should fail: {invalid}"
+        );
+    }
+}
+
+#[test]
 fn help_is_deterministic() {
     let first = output(
         command_in(
@@ -179,6 +203,36 @@ fn repository_root_is_discovered_from_a_nested_directory() {
             .is_file(),
         "record should be rooted at the repository, not the nested directory"
     );
+}
+
+#[test]
+fn repository_root_preserves_trailing_whitespace() {
+    let parent = tempfile::tempdir().expect("should create repository parent");
+    for root_name in ["repository ", "repository\r"] {
+        let repository = parent.path().join(root_name);
+        let nested = repository.join("nested");
+        fs::create_dir_all(&nested).expect("should create trailing-whitespace repository");
+        fs::write(repository.join("source.txt"), "source\n").expect("should write tracked file");
+        run_git(&repository, &["init", "--quiet"]);
+        run_git(&repository, &["add", "--all"]);
+
+        let result = output(command_in(&nested).args([
+            "update",
+            "--tracked-paths-record",
+            "tracked-paths.txt",
+        ]));
+
+        assert_eq!(
+            status_code(&result),
+            SUCCESS,
+            "Git root with trailing whitespace should be preserved: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            repository.join("tracked-paths.txt").is_file(),
+            "record should be written inside the exact trailing-whitespace root"
+        );
+    }
 }
 
 #[test]
@@ -277,15 +331,85 @@ fn unsafe_relative_paths_are_rejected() {
 }
 
 #[test]
-fn portable_drive_relative_and_backslash_paths_are_rejected() {
-    let repository = TestRepository::new(&["source.txt"]);
+fn git_admin_paths_are_rejected_without_writes() {
+    let check_repository = TestRepository::new(&["source.txt"]);
+    let update_repository = TestRepository::new(&["source.txt"]);
+    let check_config = check_repository.path().join(".git/config");
+    let update_config = update_repository.path().join(".git/config");
+    let check_before = fs::read(&check_config).expect("should read check Git config");
+    let update_before = fs::read(&update_config).expect("should read update Git config");
 
-    for unsafe_path in ["C:outside.txt", "directory\\outside.txt"] {
+    let checked =
+        output(
+            check_repository
+                .command()
+                .args(["check", "--tracked-paths-record", ".git/config"]),
+        );
+    let updated = output(update_repository.command().args([
+        "update",
+        "--tracked-paths-record",
+        ".git/config",
+    ]));
+
+    assert_eq!(
+        status_code(&checked),
+        ERROR,
+        "check should reject the Git administrative directory"
+    );
+    assert_eq!(
+        status_code(&updated),
+        ERROR,
+        "update should reject the Git administrative directory"
+    );
+    assert_eq!(
+        fs::read(&check_config).expect("should reread check Git config"),
+        check_before,
+        "check should preserve exact Git config bytes"
+    );
+    assert_eq!(
+        fs::read(&update_config).expect("should reread update Git config"),
+        update_before,
+        "update should preserve exact Git config bytes"
+    );
+}
+
+#[test]
+fn portable_ambiguous_paths_are_rejected() {
+    let repository = TestRepository::new(&["source.txt"]);
+    let git_config = repository.path().join(".git/config");
+    let git_config_before = fs::read(&git_config).expect("should read Git config");
+    let mut unsafe_paths = vec![
+        "C:outside.txt".to_owned(),
+        "directory\\outside.txt".to_owned(),
+        "line\nbreak.txt".to_owned(),
+        "control\u{001f}.txt".to_owned(),
+        "record.txt:stream".to_owned(),
+        "record<copy>.txt".to_owned(),
+        "record>copy.txt".to_owned(),
+        "record\"copy.txt".to_owned(),
+        "record|copy.txt".to_owned(),
+        "record?copy.txt".to_owned(),
+        "record*copy.txt".to_owned(),
+        "record.".to_owned(),
+        "record ".to_owned(),
+        ".GiT/config".to_owned(),
+        "nested/.GIT/record.txt".to_owned(),
+    ];
+    for device in [
+        "CON", "PRN", "AUX", "NUL", "CLOCK$", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6",
+        "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
+        "LPT9",
+    ] {
+        unsafe_paths.push(device.to_owned());
+        unsafe_paths.push(format!("{}.txt", device.to_ascii_lowercase()));
+    }
+
+    for unsafe_path in unsafe_paths {
         let result =
             output(
                 repository
                     .command()
-                    .args(["update", "--tracked-paths-record", unsafe_path]),
+                    .args(["update", "--tracked-paths-record", &unsafe_path]),
             );
 
         assert_eq!(
@@ -293,9 +417,36 @@ fn portable_drive_relative_and_backslash_paths_are_rejected() {
             ERROR,
             "portable unsafe path should fail: {unsafe_path}"
         );
-        assert!(
-            !repository.path().join(unsafe_path).exists(),
-            "portable unsafe path should not be written: {unsafe_path}"
+        if !unsafe_path.to_ascii_lowercase().contains(".git/") {
+            assert!(
+                !repository.path().join(&unsafe_path).exists(),
+                "portable unsafe path should not be written: {unsafe_path}"
+            );
+        }
+    }
+    assert_eq!(
+        fs::read(&git_config).expect("should reread Git config"),
+        git_config_before,
+        "case-insensitive Git administrative paths should preserve config bytes"
+    );
+}
+
+#[test]
+fn git_prefixed_regular_files_are_allowed() {
+    let repository = TestRepository::new(&["source.txt"]);
+
+    for record in [".gitignore", ".gitmodules"] {
+        let result =
+            output(
+                repository
+                    .command()
+                    .args(["update", "--tracked-paths-record", record]),
+            );
+
+        assert_eq!(
+            status_code(&result),
+            SUCCESS,
+            "non-administrative Git-prefixed file should be allowed: {record}"
         );
     }
 }

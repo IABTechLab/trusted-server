@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write as _};
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -71,10 +71,32 @@ fn safe_component(value: &OsStr) -> bool {
     let Some(value) = value.to_str() else {
         return false;
     };
-    let bytes = value.as_bytes();
-    let has_portable_drive_prefix =
-        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
-    !value.contains('\\') && !has_portable_drive_prefix
+    !value.eq_ignore_ascii_case(".git")
+        && !value.ends_with(['.', ' '])
+        && !value.chars().any(|character| {
+            character.is_control()
+                || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\\')
+        })
+        && !is_windows_device_name(value)
+}
+
+fn is_windows_device_name(value: &str) -> bool {
+    let stem = value
+        .split_once('.')
+        .map_or(value, |(stem, _extension)| stem)
+        .trim_end_matches(['.', ' ']);
+    if ["CON", "PRN", "AUX", "NUL", "CLOCK$"]
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+    {
+        return true;
+    }
+
+    let bytes = stem.as_bytes();
+    bytes.len() == 4
+        && bytes[3].is_ascii_digit()
+        && (b'1'..=b'9').contains(&bytes[3])
+        && (bytes[..3].eq_ignore_ascii_case(b"COM") || bytes[..3].eq_ignore_ascii_case(b"LPT"))
 }
 
 pub(crate) struct Repository {
@@ -103,9 +125,12 @@ impl Repository {
                 .attach(String::from_utf8_lossy(&output.stderr).trim().to_owned()));
         }
 
-        let root_text = core::str::from_utf8(&output.stdout)
-            .change_context(RepositoryError::Discovery)?
-            .trim_end();
+        let root_bytes = output.stdout.strip_suffix(b"\n").ok_or_else(|| {
+            Report::new(RepositoryError::Discovery)
+                .attach("Git repository root output has no line terminator")
+        })?;
+        let root_text =
+            core::str::from_utf8(root_bytes).change_context(RepositoryError::Discovery)?;
         let root = fs::canonicalize(root_text)
             .change_context(RepositoryError::Discovery)
             .attach_with(|| format!("repository root: {root_text}"))?;
@@ -186,7 +211,7 @@ impl Repository {
         let temporary = temporary_path(&absolute)?;
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         options.mode(0o600);
         let mut file = options
             .open(&temporary)
@@ -342,12 +367,12 @@ fn temporary_path(target: &Path) -> Result<PathBuf, Report<RepositoryError>> {
     Ok(target.with_file_name(temporary_name))
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn unsafe_mode(metadata: &fs::Metadata) -> bool {
     metadata.permissions().mode() & 0o022 != 0
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn unsafe_mode(_metadata: &fs::Metadata) -> bool {
-    false
+    std::process::abort()
 }

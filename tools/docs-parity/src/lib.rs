@@ -1,5 +1,8 @@
 //! Checked documentation records and repository-safe generation.
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("docs-parity supports only Linux and macOS hosts");
+
 use std::env;
 use std::path::PathBuf;
 
