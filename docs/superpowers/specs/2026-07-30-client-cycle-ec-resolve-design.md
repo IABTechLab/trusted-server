@@ -10,7 +10,7 @@ defers, and why the feature is normative rather than deferred.
 **Author:** Engineering (revised against the implementation, 2026-08-25)
 **Issue references:** #778 (series), successor spec of the 2026-07-31 draft
 **Related specs:** `2026-07-30-pluggable-providers-design.md`
-**Last updated:** 2026-08-25
+**Last updated:** 2026-09-01
 
 > **Context.** PR #838 shipped, undeclared and unspec'd, a second provider
 > _type_: a "client-cycle" EC provider whose identifier is established by a
@@ -211,23 +211,33 @@ the bar for the vendor-scheme implementation:
   asynchronous vendor contact, including BFCache restoration), and its
   injection is keyed off the provider selection exactly as the demo's is
   today.
-- **How the resolved permissions reach the browser is not designed here.**
-  The requirement above assumes the page can read the server's decision,
-  and nothing in v1 carries that decision to the page. The binding
-  constraint is that the JavaScript bundle is composed at startup and
-  served under a content hash, so one body is shared across every visitor
-  and cannot carry per-visitor permission state, which means the signal
-  has to be per request. The candidate carriers are a response header on
-  the document, a value injected into the document during HTML
-  processing, a first-party endpoint the page fetches, and a
-  non-HttpOnly cookie set alongside the marker. This spec names them and
-  deliberately does not choose between them. Whichever is chosen, the
-  server's resolved permission decision is the authority, and an in-page
-  CMP read is only a withdrawal re-check layered under it and never a
-  substitute for it, because a page-side read can narrow what the server
-  resolved and must never widen it. Designing the mechanism is out of
-  scope for this set of PRs and belongs with the first vendor module,
-  which is the first consumer that needs it.
+- **How the resolved permissions reach the browser is now chosen.** The
+  requirement above assumes the page can read the server's decision, and
+  v1 had no carrier for it. The binding constraint is that the JavaScript
+  bundle is composed at startup and served under a content hash, so one
+  body is shared across every visitor and cannot carry per-visitor
+  permission state, which means the signal has to be per request. The
+  permission-model PR (#1045) picks the injected-value carrier and
+  delivers it. The page receives `window.tsjs.permissions`, an object
+  `{"set": ["necessary.operations.storage", "..."]}` naming the Data Uses
+  set for the request, using the same keys as `permissions.yaml` and
+  `Permission::as_str()`. Under inline assembly it is injected as a
+  `<script>` at the open of `<head>`, before the tsjs bundle, on every
+  HTML document. Under shared-template (ESI) assembly the `<head>` is part
+  of the cached template shared across visitors and can carry nothing
+  request-scoped, so the value is spliced into the per-request `</body>`
+  seam script instead, and a permissions-only seam script is emitted even
+  when the ad stack did not run, so a consent-denied or bot-classified
+  visitor still receives the empty state. Because the arrival point moves,
+  a page module waits on `tsjs.whenPermissions()`, a promise that resolves
+  when the value arrives, and does nothing with identity and contacts no
+  vendor before it resolves. That promise is the point a vendor module
+  gates on. The server's resolved permission decision remains the
+  authority, and an in-page CMP read is only a withdrawal re-check layered
+  under it and never a substitute for it, because a page-side read can
+  narrow what the server resolved and must never widen it. Wiring the
+  existing integration page scripts to wait on the promise is follow-up
+  work once these PRs are on main.
 - The JS module ships through the standard integration bundle mechanism,
   loaded only when a client-cycle provider is the selected EC provider.
   The interaction between provider-keyed bundle content and content-hash /
