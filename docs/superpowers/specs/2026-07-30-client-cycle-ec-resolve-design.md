@@ -202,9 +202,14 @@ the bar for the vendor-scheme implementation:
   applies to the identifier itself. A switch then restarts the client
   cycle instead of stalling it.
 - **The page leg is permission-gated before vendor contact.** The demo
-  module contacts no vendor (it posts a constant), so the draft's
-  injection-time and live-CMP gating requirements bind the first vendor
-  module rather than v1. A vendor module must not derive identity or
+  module contacts no vendor (it posts a constant), but it follows the rule
+  a vendor module will follow: it declares the Data Use its server-side
+  provider requires (`necessary.operations.storage`, kept in step by a Rust
+  test), waits on `tsjs.whenPermissions()`, and posts only when that Data
+  Use is in the set. With no permission state on the page it does not
+  post. The draft's live-CMP re-check binds the first vendor module rather
+  than v1, because the demo has no vendor contact to re-check before. A
+  vendor module must not derive identity or
   contact the vendor for a visitor whose resolved permissions do not
   satisfy the provider's declaration, must re-check immediately before
   vendor contact (consent can change between document delivery and
@@ -223,15 +228,18 @@ the bar for the vendor-scheme implementation:
   set for the request, using the same keys as `permissions.yaml` and
   `Permission::as_str()`. Under inline assembly it is injected as a
   `<script>` at the open of `<head>`, before the tsjs bundle, on every
-  HTML document. Under shared-template (ESI) assembly the `<head>` is part
+  HTML document that has a `<head>`. Under shared-template (ESI) assembly
+  the `<head>` is part
   of the cached template shared across visitors and can carry nothing
   request-scoped, so the value is spliced into the per-request `</body>`
   seam script instead, and a permissions-only seam script is emitted even
-  when the ad stack did not run, so a consent-denied or bot-classified
-  visitor still receives the empty state. Because the arrival point moves,
-  a page module waits on `tsjs.whenPermissions()`, a promise that resolves
-  when the value arrives, and does nothing with identity and contacts no
-  vendor before it resolves. That promise is the point a vendor module
+  when the ad stack did not run, so a bot-classified visitor, or one for
+  whom the auction was gated off, still receives the state resolved for the
+  request rather than nothing. Because the arrival point moves, a page
+  module waits on `tsjs.whenPermissions()`, a promise that resolves when
+  the value arrives, or with the empty state at `DOMContentLoaded` if
+  nothing arrived, which a module reads as nothing set, and does nothing
+  with identity and contacts no vendor before it resolves. That promise is the point a vendor module
   gates on. The server's resolved permission decision remains the
   authority, and an in-page CMP read is only a withdrawal re-check layered
   under it and never a substitute for it, because a page-side read can

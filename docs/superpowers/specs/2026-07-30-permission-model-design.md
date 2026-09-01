@@ -657,8 +657,12 @@ Consumers of the resolved set in the implementation:
    **Device** is ungated by a separate, deliberate decision, because its
    security-classification role must run for traffic that has granted
    nothing, and operator selection is the recorded authorization (providers
-   spec §5). The built-in Edge Cookie providers declare
-   `necessary.operations.storage`.
+   spec §5) for the built-in and host providers, which declare nothing. A
+   device provider an integration module supplies may not declare a
+   permission at all: a nonempty declaration is refused at startup, naming
+   the module and the Data Uses, because no per-request device gate exists
+   to honor it (registry `resolve_device_provider`). The built-in Edge
+   Cookie providers declare `necessary.operations.storage`.
 
 2. **EC lifecycle.** Creation requires the provider's declared permissions
    through the gate above. Withdrawal follows §4.2. Recognition and

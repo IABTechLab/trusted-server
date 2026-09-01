@@ -213,8 +213,9 @@ resolved in the implementation:
   behavior beyond gating. The gate itself has already run before `generate`
   is called, so a provider cannot use the fields to authorize itself.
 - `required_permissions` on `DeviceProvider` and `PlatformGeo`: **present,
-  with an empty default, and refused rather than ignored when a module
-  declares one.** The draft removed the method from both traits because PR
+  with an empty default. A module device declaration is refused rather than
+  ignored, and a geo declaration is not consulted.** The draft removed the
+  method from both traits because PR
   #838's copies were decorative. The implementation keeps one uniform
   declaration seam across all three traits instead. The built-in device
   and geo providers declare empty sets, and core enforces the declaration
