@@ -146,8 +146,9 @@ ts audit generate https://publisher.example
 ```
 
 The audit command writes `js-assets.toml` plus a draft `trusted-server.toml`.
-Review the draft, replace placeholders with stable secret key names, then
-validate it.
+The draft includes disabled JS Asset Proxy candidates for detected third-party
+scripts. Review it, replace placeholders with stable secret key names, and enable
+only the asset proxy entries you want to serve or block. Then validate it.
 
 Edit `trusted-server.toml` to configure:
 

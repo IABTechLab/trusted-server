@@ -3901,6 +3901,7 @@ excluded_gam_ad_unit_path_suffixes = ["{suffix}"]
         let integration = PrebidIntegration::new(base_config());
         let ctx = IntegrationAttributeContext {
             attribute_name: "src",
+            element_name: "script",
             request_host: "pub.example",
             request_scheme: "https",
             origin_host: "origin.example",
@@ -3918,6 +3919,7 @@ excluded_gam_ad_unit_path_suffixes = ["{suffix}"]
         let integration = PrebidIntegration::new(base_config());
         let ctx = IntegrationAttributeContext {
             attribute_name: "href",
+            element_name: "a",
             request_host: "pub.example",
             request_scheme: "https",
             origin_host: "origin.example",

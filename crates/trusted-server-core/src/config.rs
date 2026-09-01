@@ -16,10 +16,20 @@ use validator::{Validate, ValidationError, ValidationErrors};
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    adserver_mock::AdServerMockConfig, aps::ApsConfig, datadome::DataDomeConfig,
-    didomi::DidomiIntegrationConfig, google_tag_manager::GoogleTagManagerConfig, gpt::GptConfig,
-    gpt_diagnostics::GptDiagnosticsConfig, lockr::LockrConfig, nextjs::NextJsIntegrationConfig,
-    osano::OsanoConfig, permutive::PermutiveConfig, prebid, sourcepoint::SourcepointConfig,
+    adserver_mock::AdServerMockConfig,
+    aps::ApsConfig,
+    datadome::DataDomeConfig,
+    didomi::DidomiIntegrationConfig,
+    google_tag_manager::GoogleTagManagerConfig,
+    gpt::GptConfig,
+    gpt_diagnostics::GptDiagnosticsConfig,
+    js_asset_proxy::{JS_ASSET_PROXY_INTEGRATION_ID, JsAssetProxyConfig},
+    lockr::LockrConfig,
+    nextjs::NextJsIntegrationConfig,
+    osano::OsanoConfig,
+    permutive::PermutiveConfig,
+    prebid,
+    sourcepoint::SourcepointConfig,
     testlight::TestlightConfig,
 };
 use crate::settings::{AssetOriginAuth, IntegrationConfig, Settings};
@@ -41,6 +51,7 @@ const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
     "datadome",
     "gpt",
     "gpt_diagnostics",
+    JS_ASSET_PROXY_INTEGRATION_ID,
 ];
 
 /// Typed app-config root used by the `ts` CLI.
@@ -233,6 +244,7 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     let mut structural_settings = settings.clone();
     structural_settings.prepare_runtime()?;
     structural_settings.validate_admin_coverage()?;
+    validate_js_asset_proxy_config(settings)?;
 
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, false)?;
@@ -251,10 +263,32 @@ pub fn validate_settings_for_runtime(
 ) -> Result<(), Report<TrustedServerError>> {
     settings.reject_placeholder_secrets()?;
     settings.validate_admin_handler_passwords()?;
+    validate_js_asset_proxy_config(settings)?;
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, true)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
     Ok(())
+}
+
+fn validate_js_asset_proxy_config(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    let Some(raw_config) = settings.integrations.get(JS_ASSET_PROXY_INTEGRATION_ID) else {
+        return Ok(());
+    };
+
+    let config: JsAssetProxyConfig = serde_json::from_value(raw_config.clone()).map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "integration startup failed for `{JS_ASSET_PROXY_INTEGRATION_ID}`: configuration could not be parsed: {error}"
+            ),
+        })
+    })?;
+    config.validate().map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "integration startup failed for `{JS_ASSET_PROXY_INTEGRATION_ID}`: {error}"
+            ),
+        })
+    })
 }
 
 fn validate_enabled_integrations(
@@ -1138,6 +1172,27 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
+    fn validate_rejects_invalid_enabled_js_asset_proxy_config() {
+        let mut settings = valid_settings();
+        settings.integrations.insert(
+            "js_asset_proxy".to_string(),
+            serde_json::json!({ "enabled": true }),
+        );
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject invalid JS asset proxy config");
+        let message = err.to_string();
+        assert!(
+            message.contains("js_asset_proxy"),
+            "error should mention JS asset proxy validation"
+        );
+        assert!(
+            message.contains("empty_assets") || message.contains("assets"),
+            "error should mention the missing assets"
+        );
+    }
+
+    #[test]
     fn deploy_validation_accepts_dormant_prebid_browser_bidder_overlap() {
         let mut settings = valid_settings();
         settings.auction.enabled = false;
@@ -1237,6 +1292,34 @@ password = "production-admin-password-32-bytes"
                 "error should mention the invalid bypass setting: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn validate_rejects_invalid_disabled_js_asset_proxy_assets() {
+        let mut settings = valid_settings();
+        settings.integrations.insert(
+            JS_ASSET_PROXY_INTEGRATION_ID.to_string(),
+            serde_json::json!({
+                "enabled": false,
+                "assets": [{
+                    "path": "bad path",
+                    "origin_url": "not-a-url",
+                    "proxy": "disabled"
+                }]
+            }),
+        );
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject invalid disabled asset inventory");
+        let message = err.to_string();
+        assert!(
+            message.contains(JS_ASSET_PROXY_INTEGRATION_ID),
+            "error should mention JS asset proxy validation"
+        );
+        assert!(
+            message.contains("path") || message.contains("origin_url"),
+            "error should mention the invalid asset fields"
+        );
     }
 
     #[test]
