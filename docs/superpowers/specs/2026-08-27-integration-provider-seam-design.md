@@ -261,12 +261,12 @@ One vendor per PR, after this change lands. Each moves its Rust, its
 TypeScript, its config type and its tests into
 `crates/integrations/<vendor>`, and the adapter that wants it depends on it.
 
-| Vendor                                                           | What it needs                                                                                                           |
-| ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| Didomi, Google Tag Manager, Lockr, Osano, Permutive, Sourcepoint | Move as they are. Coupled only through the builder table, deploy validation and the JS map.                             |
-| APS                                                              | Also needs the auction provider seam and the generalized renderer contract in §3.4, both of which this change delivers. |
-| GPT (the `gpt` proxy and `gpt_diagnostics`)                      | The proxy moves as it is. The diagnostics half needs the prepare and finalize hooks in §3.5.                            |
-| DataDome                                                         | Needs the neutral response-shaping hook in §3.5, and about forty test literals move with it.                            |
+| Vendor                                                           | What it needs                                                                                                                                                                                                           |
+| ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Didomi, Google Tag Manager, Lockr, Osano, Permutive, Sourcepoint | Move as they are. Coupled only through the builder table, deploy validation and the JS map.                                                                                                                             |
+| APS                                                              | Needs the auction provider seam and the generalized renderer contract in §3.4, both of which this change delivers, and browser-side work it does not deliver, because core TypeScript imports APS directly (§8 item 8). |
+| GPT (the `gpt` proxy and `gpt_diagnostics`)                      | The proxy moves as it is. The diagnostics half needs the prepare and finalize hooks in §3.5.                                                                                                                            |
+| DataDome                                                         | Needs the neutral response-shaping hook in §3.5, and about forty test literals move with it.                                                                                                                            |
 
 `[integrations.<vendor>]` configuration tables need no change, because
 `IntegrationSettings` is a flattened map that already accepts unknown vendor
@@ -349,7 +349,7 @@ that the project pays for today, most recently in PR #1054.
 ## 8. What implementing this found
 
 A probe integration built outside `trusted-server-core` and registered
-through an adapter exercised every seam end to end. Seven things surfaced
+through an adapter exercised every seam end to end. Eight things surfaced
 that reading the code did not, and they are recorded here rather than left
 for each vendor to rediscover.
 
@@ -425,6 +425,23 @@ for each vendor to rediscover.
    adapter. The other three adapters expose both entry points. Fastly is
    the primary deployment target, so this one decides whether the seam is
    usable in production or only in the dev server.
+8. **Core TypeScript imports APS directly, so generalizing the Rust
+   renderer alone does not move APS out.** On `main` at d516a9e94,
+   `crates/trusted-server-js/lib/src/core/auction.ts:5` imports
+   `parseApsRendererDescriptor` from `../integrations/aps/render` and calls
+   it at line 139, `crates/trusted-server-js/lib/src/core/request.ts:2`
+   imports `dispatchApsRendering` and `renderApsCreative` from the same
+   module and calls both at lines 56 to 59, and
+   `crates/trusted-server-js/lib/src/core/types.ts:69` fixes the shared
+   renderer type with `export type AuctionBidRenderer = ApsRendererV1`.
+   That coupling is pre-existing on `main` and is introduced by no PR in
+   this stack. §3.4 does not reach it either, because §3.4 generalizes the
+   Rust `BidRenderer` enum and the serialized descriptor, not the browser
+   code that consumes them. Moving APS therefore needs the browser side
+   generalized too, so that core TypeScript names no vendor. Designing
+   that, whether as a browser-side renderer registry or in some other
+   shape, is out of scope for this stack and belongs with the APS
+   migration in §4.
 
 Items 1, 6 and 7 are the ones a vendor meets on its first day, and item 7
 decides whether any of this is reachable on the platform most deployments
@@ -454,12 +471,13 @@ defines, and both should land before the first vendor is asked to use it.
 
 ## Revision record
 
-| Date       | Change                                                                                                                                                                                                                                                                                                                                     |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 2026-08-27 | First draft, written against `split/5-response-hook-docs`.                                                                                                                                                                                                                                                                                 |
-| 2026-08-27 | Brought the bid renderer contract into scope (§3.4), so that after this change no vendor move needs a core change (§8 row 6).                                                                                                                                                                                                              |
-| 2026-08-28 | Corrected line references to `main` at b7fcb5d4c and added what mapping `main` found: composition of the served script moves into core (§3.2), registration enumeration and the auction-only `adserver_mock` case (§3.3), the duplicate-id gap (§3.1), the source-file guard and the `ts audit` vendor table (§4), the renderer risk (§7). |
-| 2026-08-28 | Recorded what implementing the seam found (§8): the operator CLI skips a vendor's deploy rules, a carried module's hash literal is fragile, providers resolve more than once per request, and one core reader still reads an APS payload. Recorded the construction-time hash check in §3.2.                                               |
-| 2026-08-28 | Adopted the #1043 review's registration shape for identity and applied its rule to geo and device, with no provider built into core (§3.6, §6 item 2, §8 rows 7 to 9). Recorded the relationship to #986 and reordered the series so this spec and its implementation come first.                                                          |
-| 2026-08-30 | Moved the five series design specs and the provider-code registry into this PR from PRs #1043 to #1047, so every normative document is reviewed before the code that implements it. Document content is unchanged, and only this status line and this row are new.                                                                             |
+| Date       | Change                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2026-08-27 | First draft, written against `split/5-response-hook-docs`.                                                                                                                                                                                                                                                                                                                                                                                  |
+| 2026-08-27 | Brought the bid renderer contract into scope (§3.4), so that after this change no vendor move needs a core change (§8 row 6).                                                                                                                                                                                                                                                                                                               |
+| 2026-08-28 | Corrected line references to `main` at b7fcb5d4c and added what mapping `main` found: composition of the served script moves into core (§3.2), registration enumeration and the auction-only `adserver_mock` case (§3.3), the duplicate-id gap (§3.1), the source-file guard and the `ts audit` vendor table (§4), the renderer risk (§7).                                                                                                  |
+| 2026-08-28 | Recorded what implementing the seam found (§8): the operator CLI skips a vendor's deploy rules, a carried module's hash literal is fragile, providers resolve more than once per request, and one core reader still reads an APS payload. Recorded the construction-time hash check in §3.2.                                                                                                                                                |
+| 2026-08-28 | Adopted the #1043 review's registration shape for identity and applied its rule to geo and device, with no provider built into core (§3.6, §6 item 2, §8 rows 7 to 9). Recorded the relationship to #986 and reordered the series so this spec and its implementation come first.                                                                                                                                                           |
+| 2026-08-30 | Moved the five series design specs and the provider-code registry into this PR from PRs #1043 to #1047, so every normative document is reviewed before the code that implements it. Document content is unchanged, and only this status line and this row are new.                                                                                                                                                                          |
 | 2026-08-31 | Corrected the counts and line references the review found, against `main` at d516a9e94: the source-file guard counts (§4), the prepare and finalize call-site counts (§3.5), the real double geo resolution on `POST /auction` (§8 item 3), the per-adapter preparer coverage (§8 item 5), and the `settings.rs`, `auction/mod.rs` and `publisher.rs` line references. §6 now requires the round trip on Fastly rather than on any adapter. |
+| 2026-09-01 | Answered the review finding that generalizing the Rust `BidRenderer` does not move APS out. Recorded the pre-existing browser-side coupling in core TypeScript as §8 item 8, and corrected the APS migration row in §4 to name the browser-side work. Designing a browser-side renderer contract stays out of scope for this stack.                                                                                                         |

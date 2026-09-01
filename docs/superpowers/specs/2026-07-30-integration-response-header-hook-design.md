@@ -932,19 +932,52 @@ byte-to-string replacement is forbidden:
   parsing and is then bounded. Commas inside an individual value are not split
   and reserialized.
 - Every other admitted value-bearing source header in the exact mapping above
-  is singleton. Zero lines means omit the DataDome field. Exactly one valid
-  line is OWS-normalized and processed. Two or more lines, even identical,
-  are ambiguous and skip the vendor call through the metered fail-open path;
-  core never chooses first, last, or comma-joined. In particular this applies
-  to `origin`, `referer`, `user-agent`, `content-type`, `from`, every remaining
+  is presented as received. Zero lines means omit the DataDome field. Each
+  received line has its leading and trailing optional whitespace removed and
+  is then checked for valid field-value octets and valid UTF-8, exactly as
+  above. Two or more lines, identical or not, are preserved as separate lines
+  in received order and reach the integration that way. Core does not drop a
+  line, comma-join the lines, choose the first or the last, or skip the
+  vendor call because a field arrived more than once. This covers `origin`,
+  `referer`, `user-agent`, `content-type`, `from`, every remaining
   `sec-ch-*`/`sec-fetch-*` field, and `x-requested-with`.
-- `authorization` and `content-length` are security singletons for this view.
-  Repetition skips the vendor call before either length or `HeadersList` is
-  constructed. `AuthorizationLen` is the byte length of the one
-  OWS-normalized value. `PostParamLen` is always the byte length of the body
-  actually presented to core, not the numeric `content-length` value. A
-  malformed or body-inconsistent `content-length` is rejected by the shared
-  HTTP request boundary before integrations run.
+- **Why core does not decide this.** Header multiplicity is attacker
+  controlled, so a core rule that skipped the vendor call whenever an
+  admitted field arrived twice would let any client turn bot detection off
+  by sending one header twice. That is a bypass this document would have
+  created rather than described, because nothing in the shipped code behaves
+  that way. The protection path reads each mapped field through a single
+  `headers().get()` in `header_value`
+  (`crates/trusted-server-core/src/integrations/datadome/protection.rs`) and
+  calls the Protection API regardless of how many lines arrived. The
+  principle behind the rewrite is that core must not invent vendor-specific
+  header normalization and must not decide on a vendor's behalf to skip a
+  vendor call. How a repeated or otherwise ambiguous field is interpreted,
+  and how it is encoded into the vendor's payload, is the vendor's detection
+  logic, so it belongs to the vendor integration, which sees every received
+  line in received order through `HeadersList` and the presented field
+  lines.
+- **Where that logic belongs.** The DataDome integration is core code today,
+  in `crates/trusted-server-core/src/integrations/datadome.rs` and the
+  `crates/trusted-server-core/src/integrations/datadome/` directory. Vendor
+  detection logic of this kind belongs in the vendor's own module rather
+  than in core, and the integration provider seam
+  (`2026-08-27-integration-provider-seam-design.md`) is where that move is
+  designed. This is a direction for that migration rather than a complaint
+  about the code as it stands.
+- `content-length` stays a protocol-level singleton. A repeated, malformed,
+  or body-inconsistent `content-length` is rejected by the shared HTTP
+  request boundary before any integration runs, which is an HTTP
+  correctness rule and not a vendor decision, so it is unchanged.
+  `PostParamLen` is always the byte length of the body actually presented to
+  core, not the numeric `content-length` value.
+- `authorization` never reaches the vendor payload as a value.
+  `AuthorizationLen` is the byte length of the OWS-normalized value. When
+  more than one `authorization` line arrives, every line is presented in
+  received order and how they are counted is the integration's decision,
+  as it is for any other repeated field. Repetition no longer skips the
+  vendor call, for the same reason as above, because that let the client
+  decide whether the vendor is consulted at all.
 - Multiple `cookie` field lines are permitted. Core OWS-normalizes them and
   joins them in received order with the literal bytes `; ` for the shared RFC
   cookie parser. `CookiesLen` is the byte length of that canonical joined
@@ -969,9 +1002,12 @@ fields follow their explicit rules instead of this optional-field omission.
 Adapter qualification fixtures feed the same ordered repeated-field corpus to
 every host and assert byte-identical form fields, lengths, `HeadersList`, and
 reject/omit outcomes. The corpus includes repeated list fields, identical and
-different singleton duplicates, multiple cookies, duplicate `datadome`
-cookies, empty values, invalid octets, and headers whose individual values
-contain commas. Invalid UTF-8 is a skip, never replacement decoding.
+different duplicates of the pass-through fields, multiple cookies, duplicate
+`datadome` cookies, empty values, invalid octets, and headers whose individual
+values contain commas. For a duplicated pass-through field the asserted
+outcome is that every received line survives in received order and that the
+vendor call still happens, never a skip. Invalid UTF-8 is a skip, never
+replacement decoding.
 
 `true-client-ip`, `x-forwarded-for`, and `x-real-ip` are not admitted in v1.
 The trusted `IP` field already supplies connection provenance, and copying raw
@@ -1211,6 +1247,17 @@ first consumer, §7) merges:
   that must set response headers, for example `Accept-CH` client-hint
   requests or detection results such as §4a's security channel. The
   returning PR implements this spec, not PR #838's shape.
+- Corrected on 2026-09-01, from review of PR #1084. §4a.2 previously
+  required core to treat two or more lines of an admitted singleton
+  request header as ambiguous and to skip the vendor call. Header
+  multiplicity is attacker controlled, so that rule would have given any
+  client a way to turn bot detection off by repeating a header, and it
+  described no shipped behavior, because `header_value` in
+  `crates/trusted-server-core/src/integrations/datadome/protection.rs`
+  reads each mapped field with a single `headers().get()` and the
+  Protection API is called regardless. Core now passes repeated lines
+  through as received and leaves the interpretation to the vendor
+  integration.
 - Recorded for that future design, from review of the earlier draft. The
   `&mut HeaderMap` shape concern stands. Handing a mutator a mutable
   header map makes §3's collision policy unenforceable by construction,
