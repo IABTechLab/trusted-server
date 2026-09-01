@@ -4,14 +4,17 @@
 #1047, none of which is yet merged to main, and this document was revised
 against that series on 2026-08-25. The §8 sign-off rows remain the series'
 decision ledger, and rows the implementation now satisfies are marked with
-their PR so the task force can ratify rather than re-litigate.
+their PR so the task force can ratify rather than re-litigate. Updated on
+2026-09-01, where `[geo] default_country` is retired and the fallback baseline
+for a request with no resolvable country moves to the top node of the `rules:`
+tree in `permissions.yaml` (permission-model spec §3.2 and §12).
 **Author:** Engineering
 **Issue references:** #777-#781 (epic)
 **Related specs:** `2026-07-30-pluggable-providers-design.md`,
 `2026-07-30-permission-model-design.md`,
 `2026-07-30-integration-response-header-hook-design.md` (not implemented in
 the series, see its status)
-**Last updated:** 2026-08-25
+**Last updated:** 2026-09-01
 
 > **Context.** The provider/permission epic is a breaking change to a live
 > identity system. PR #838's review showed that the riskiest part of such a
@@ -71,8 +74,10 @@ integration provider seam spec on top of the series and changes no code:
    destroy an issued identifier. Sharing beyond the edge (bidstream
    `user.id`, the identify response, partner pull sync) requires storage
    plus personalised-ad selection, the same pair that gates bidstream
-   EIDs. `[geo] default_country` becomes required, a failed geo lookup
-   resolves at the requires-signal floor instead of the default, and a
+   EIDs. A fallback baseline for a request with no resolvable country
+   becomes required, shipped as `[geo] default_country` and carried by the
+   rules tree's top node since 2026-09-01, a failed geo lookup
+   resolves at the requires-signal floor instead of that baseline, and a
    no-geo deployment running an Edge Cookie provider must set
    `[geo] assume_single_jurisdiction = true`.
 4. **PR #1046, the hardened client-cycle resolve endpoint.**
@@ -132,7 +137,7 @@ for the follow-up work that will implement them.
 | 4   | UK request, no TCF record → no EC                                                                              | Same, unless the policy deliberately adopts a `granted` storage baseline for GB with citation and sign-off                                                                                                                              | **The shipped default adopts `granted` storage for GB (#1045), flagged.** The citation and sign-off the draft required do not exist yet. The task force owns this row                                                            |
 | 5   | No country resolvable (geo failure) → no EC (fail-closed)                                                      | Protective failure profile, where permissions resolve at the requires-signal floor and `default_country` is reserved for unmatched requests in acknowledged static-jurisdiction mode                                                    | Implemented (#1045), where a failed lookup resolves at the requires-signal floor, logged at error level, and never falls back to `default_country` (sign-off 18)                                                                 |
 | 6   | Non-regulated country, TCF record refusing Purpose 1 → EC still created, identity never tombstoned             | Refusal blocks new grants everywhere, and existing identity is never tombstoned where the baseline is `granted`                                                                                                                         | Implemented (#1045), where an authoritative refusal revokes its mapped uses everywhere and withdrawal is scoped to non-granted baselines                                                                                         |
-| 7   | Country resolved but in no regulation list → EC created, EIDs pass through                                     | Governed by the deployment's default rule. The implementation expresses this as the required `[geo] default_country`, naming the `permissions.yaml` rule for unmatched requests                                                         | Implemented (#1045) with a changed mechanism, since no `rules.default` entry exists and `default_country` is required and validated at startup                                                                                   |
+| 7   | Country resolved but in no regulation list → EC created, EIDs pass through                                     | Governed by the deployment's default rule. The implementation expresses this as the required `[geo] default_country`, naming the `permissions.yaml` rule for unmatched requests                                                         | Implemented (#1045) with a changed mechanism, since no `rules.default` entry exists and the fallback is required and validated at startup. Restructured on 2026-09-01, where the fallback is the top node of the `rules:` tree   |
 | 8   | Opt-out signal outside US states → ignored today                                                               | Mapped use restrictions are honored globally, and opt-outs never tombstone identity                                                                                                                                                     | Implemented (#1045), where the signal mapping is jurisdiction-free and suppresses even TCF-consented uses, without destruction (sign-off 1)                                                                                      |
 | 9   | Fastly bot gate requires JA4 plus platform class before KV-backed EC writes                                    | The draft deferred host signal processing and startup-failed `[device] provider = "fastly"`                                                                                                                                             | **Contradicted by the series, flagged.** The `fastly` device provider ships opt-in with `builtin` (UA-only) as the default (#1044). Whether the host-signal surface stays is sign-off 22, open                                   |
 | 10  | Fastly always resolves geo per request                                                                         | Only with `[geo] provider = "platform"`. The neutral default flips only together with the permission model's jurisdiction guard, never in an intermediate step                                                                          | Implemented as sequenced (#1044 kept the platform default, and #1045 flipped geo off by default together with `default_country` and the acknowledgment guard)                                                                    |
@@ -273,19 +278,20 @@ Requirements, each marked with its implementation state:
    server-side provider makes switching real.
 9. **The example config ships the migrated shape.** **Revised.** The
    example ships Edge Cookie identity off by default, with each selector
-   and its block documented together and commented together, and
-   `default_country = "FR"` uncommented. The draft wanted the happy path
+   and its block documented together and commented together, and the
+   fallback baseline stated in `permissions.yaml` rather than left to the
+   reader. The draft wanted the happy path
    uncommented. The series instead closes PR #838's silent-stateless trap
    by validation (requirement 6), so a half-uncommented configuration
    refuses to start rather than running stateless. Static-geo examples
-   pair `default_country` with the commented
+   pair the rules tree's top node with the commented
    `assume_single_jurisdiction` acknowledgment, which startup enforces
    whenever an EC provider runs with no geo provider (#1045).
 10. Every misconfiguration in the providers spec §6 table fails at
     **startup**. Implemented for configuration errors (#1043-#1045:
     selector/block mismatches, unknown keys, unknown selector values,
-    missing `default_country`, missing acknowledgment, demo provider in a
-    production build). The pre-series passphrase minimum and placeholder
+    a top node missing its `group` or `jurisdiction`, missing
+    acknowledgment, demo provider in a production build). The pre-series passphrase minimum and placeholder
     rejection carry over unchanged. One residual is declared. A
     selected vendor or host provider the running adapter does not inject
     fails per request, loudly, because adapter injection is a build fact
@@ -296,8 +302,8 @@ Requirements, each marked with its implementation state:
     (the CLI deserializes and validates the typed settings, with a
     regression test covering environment overlays) and again at startup,
     and startup additionally validates deployment facts only startup can
-    see (provider availability in the build, `default_country` against
-    the compiled `permissions.yaml`, the acknowledgment rule). The
+    see (provider availability in the build, the top node of the rules tree
+    in the compiled `permissions.yaml`, the acknowledgment rule). The
     machine-readable adapter capability profile for push-time deployment
     pre-checks is deferred with requirement 2.
 
@@ -323,8 +329,8 @@ default policy maps the EU-27 plus the EEA states to `gdpr-eu` (a signal
 required for every modeled use), GB to `gdpr-uk` (storage `granted`,
 flagged in row 4), and US and AU to `us-opt-out` (a `granted` baseline
 where all granted uses drop on any opt-out signal), leaves every unmodeled
-Data Use `denied`, and sends unmatched requests to the rule named by the
-required `[geo] default_country`.
+Data Use `denied`, and sends unmatched requests to the group named at the top
+of the required rules tree.
 
 The migrated operator configuration is:
 
@@ -337,9 +343,11 @@ The migrated operator configuration is:
   (Fastly and Cloudflare in production, the Axum dev server in
   development, while Spin resolves nothing either way). A selected
   provider's lookup failure resolves at the requires-signal floor and
-  never at `default_country`. A static deployment instead sets
-  `default_country` together with `assume_single_jurisdiction = true`;
-- `[geo] default_country` naming the fallback rule (required).
+  never at the fallback baseline. A static deployment instead states its
+  group at the top of the rules tree together with
+  `assume_single_jurisdiction = true`;
+- the `permissions.yaml` rules tree carrying a top node with a `group` and a
+  `jurisdiction` (required).
 
 The draft's committed per-adapter fixture files
 (`docs/guide/fixtures/migration-preserving-<adapter>.toml`, CI-validated
@@ -378,8 +386,9 @@ signals is unconditional in the shipped model.
    the deferred `legacy_providers` design (§4 requirement 8).
 5. Startup logs. Partially implemented. Startup logs the effective
    default baseline and the exact list of permissions granted without a
-   signal (`Permission baseline: [geo] default_country = ...; granted
-without a signal: [...]`), plus the passphrase deprecation warning.
+   signal, plus the passphrase deprecation warning. That line named
+   `[geo] default_country` when it was written, and it names the rules
+   tree's top node from 2026-09-01.
    The single greppable line naming the selected provider per concern and
    whether geo is live remains to add.
 6. **The batch-sync coverage dip.** **Deferred** with the provenance
@@ -427,8 +436,9 @@ model-transition command.
   the dedicated migration page with per-adapter fixtures and the
   CHANGELOG link do not exist yet.
 - `configuration.md` documents **every** valid `provider` value for all
-  three concerns. **Done** (#1047), including the required
-  `default_country`, the acknowledgment flag, and the requires-signal
+  three concerns. **Done** (#1047), including the required fallback
+  baseline (`default_country` at the time, the rules tree's top node since
+  2026-09-01), the acknowledgment flag, and the requires-signal
   floor on a failed lookup. The environment-variable overrides are now
   real in production, applied as typed EdgeZero app-config overlays when
   the operator publishes through `ts config push`, with a CLI regression
@@ -504,7 +514,7 @@ the code with the row open.
 | `[device] provider = "fastly"` startup-fails pending a separate host-signal design (§2 row 9, row 22) | The `fastly` device provider and host-signal EC provider ship opt-in, and device signals persist in graph rows. The identifier-collision defect the review found (host-signal identifiers shared the HMAC grammar and keyspace) is fixed by the mandatory provider-code envelope, so host-signal identifiers are `hs00~` namespaced. The policy question of row 22 is unchanged by the collision fix | Implementation choice, deliberately flagged as the open review question rather than presented as settled                                                     |
 | US recipe: `requires_signal` with an extended grant-signal class (§2 rows 3/3a)                       | Shipped default: `granted` US baseline, `revokes: all` on any opt-out, and no US signal grants anything                                                                                                                                                                                                                                                                                              | The shipped signal model is revoke-only, which is simpler and stricter on grants, and the baseline choice is deployer-editable yaml, flagged in rows 3 and 5 |
 | `[permissions]` TOML policy published at runtime                                                      | `permissions.yaml` compiled into the build, no `[permissions]` block                                                                                                                                                                                                                                                                                                                                 | Policy stays reviewable in version control and the partial-policy trap cannot be written                                                                     |
-| `rules.default` worldwide default entry (§2 row 7)                                                    | Required `[geo] default_country` naming the fallback rule, validated at startup                                                                                                                                                                                                                                                                                                                      | Same role, one mechanism, loud when missing                                                                                                                  |
+| `rules.default` worldwide default entry (§2 row 7)                                                    | Required fallback baseline naming the group for unmatched requests, validated at startup. Shipped as `[geo] default_country` and carried by the rules tree's top node since 2026-09-01                                                                                                                                                                                                               | Same role, one mechanism, loud when missing                                                                                                                  |
 | Graph store mandatory at startup for creating providers (§2 row 12, §4.4b)                            | No startup requirement, and with no graph no identifier is created, per request                                                                                                                                                                                                                                                                                                                      | The phantom-cookie rule holds without a breaking startup change, and graphless deployments run identity-less                                                 |
 | `legacy_providers` reader chain for provider switches (§4.8)                                          | Not implemented, so a switch restarts identity                                                                                                                                                                                                                                                                                                                                                       | Deferred until a second server-side provider makes switching real                                                                                            |
 | N+1/N+2 negative-record machinery, model epochs, `m00` mirror (§4.1, row 20)                          | Deferred with rows 11, 16, 19, 20. The shipped dual-read is one release of `[ec] passphrase` mapping with mixed forms rejected                                                                                                                                                                                                                                                                       | Nothing durable beyond pre-existing withdrawal tombstones ships, so binary rollback strands no new state                                                     |
