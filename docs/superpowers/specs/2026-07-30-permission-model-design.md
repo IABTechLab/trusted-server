@@ -597,8 +597,8 @@ case-insensitively. Implemented in
 Implemented, with the failure state carried explicitly:
 `GeoStatus { Located, NoLocation, Failed }` (in `ec/consent.rs`) separates
 "the provider resolved no location" from "the lookup errored". A **failed**
-lookup resolves every permission to the **requires-signal floor**, never
-the tree's top `group`. The failure is logged at error
+lookup resolves every permission to the **requires-signal floor** and its
+jurisdiction to `unknown`, never the tree's top node. The failure is logged at error
 level so it is visible. The storage-withdrawal baseline follows the same
 floor, so a failed lookup cannot widen destructive withdrawal either. The
 rule is proven through the seam by
@@ -697,19 +697,19 @@ requires a live user signal (§4.2), never a policy change.
 
 ## 6. Failure-mode matrix (normative, implemented)
 
-| Condition                                         | Resolution behavior                                                                                                                                                                                  |
-| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Geo lookup reports a failure                      | Requires-signal floor for every permission, never the top-node baseline, with the error logged. No provider shipped today can report one, so a host geo outage lands on the row above instead (§5.2) |
-| No geo provider configured                        | Top-node baseline, guarded by `assume_single_jurisdiction` (§5.3)                                                                                                                                    |
-| Country resolved, no matching node                | Top-node baseline (§5.4)                                                                                                                                                                             |
-| Region resolved, no region node                   | Country node's group, and the nearest ancestor's `jurisdiction`                                                                                                                                      |
-| Top node missing `group` or `jurisdiction`        | Startup failure (§3.3)                                                                                                                                                                               |
-| EC provider configured, no geo, no acknowledgment | Startup failure (§5.3)                                                                                                                                                                               |
-| Malformed `permissions.yaml`                      | Parse error at settings load, once per instance, because the embedded file is a build-time constant, never per-request                                                                               |
-| Undecodable record present (TCF, GPP, or USP)     | Revokes every Data Use (fail-closed acquisition), never withdraws, and still honors opt-outs                                                                                                         |
-| Expired TCF record                                | Distinct state, not malformed, and treated as absent, so the baseline applies                                                                                                                        |
-| Signals contradict (opt-out plus consent)         | Opt-out wins (§4)                                                                                                                                                                                    |
-| No EC provider selected                           | Identity fails closed, with nothing created and an incoming cookie value never used or egressed (§7)                                                                                                 |
+| Condition                                         | Resolution behavior                                                                                                                                                                                                                |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Geo lookup reports a failure                      | Requires-signal floor for every permission and an `unknown` jurisdiction, never the top-node baseline, with the error logged. No provider shipped today can report one, so a host geo outage lands on the row above instead (§5.2) |
+| No geo provider configured                        | Top-node baseline, guarded by `assume_single_jurisdiction` (§5.3)                                                                                                                                                                  |
+| Country resolved, no matching node                | Top-node baseline (§5.4)                                                                                                                                                                                                           |
+| Region resolved, no region node                   | Country node's group, and the nearest ancestor's `jurisdiction`                                                                                                                                                                    |
+| Top node missing `group` or `jurisdiction`        | Startup failure (§3.3)                                                                                                                                                                                                             |
+| EC provider configured, no geo, no acknowledgment | Startup failure (§5.3)                                                                                                                                                                                                             |
+| Malformed `permissions.yaml`                      | Parse error at settings load, once per instance, because the embedded file is a build-time constant, never per-request                                                                                                             |
+| Undecodable record present (TCF, GPP, or USP)     | Revokes every Data Use (fail-closed acquisition), never withdraws, and still honors opt-outs                                                                                                                                       |
+| Expired TCF record                                | Distinct state, not malformed, and treated as absent, so the baseline applies                                                                                                                                                      |
+| Signals contradict (opt-out plus consent)         | Opt-out wins (§4)                                                                                                                                                                                                                  |
+| No EC provider selected                           | Identity fails closed, with nothing created and an incoming cookie value never used or egressed (§7)                                                                                                                               |
 
 The posture is fail-closed. Every ambiguous state resolves to the
 configured baseline or more restrictive.
