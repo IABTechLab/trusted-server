@@ -698,9 +698,505 @@ docs/guide/onboarding.md docs/internal/onboarding.md` exited 0. The source
   }
   ```
 
-  This is authoritative raw local build evidence only. It is not a live
-  Pages, CNAME, deployment, or release receipt and does not complete any
-  release-pending row.
+  This earlier raw local result is superseded by the semantic-parser correction
+  below and is no longer authoritative. It was never a live Pages, CNAME,
+  deployment, or release receipt.
+
+- Semantic containment evidence correction timestamp:
+  2026-09-01T13:35:41Z. This correction supersedes both prior href
+  implementations: the shell-command-substitution scan from
+  `0a8e57f5e5aa03423dce29b61817dfb2b7194a1e` and the regex-over-document Node
+  scan from `75fd40671bf5ae6acafc7f5230a39e88b8e70fc6`. Neither prior href result is
+  authoritative because it did not apply HTML attribute semantics.
+- Semantic correction package start HEAD:
+  `75fd40671bf5ae6acafc7f5230a39e88b8e70fc6`. Before mutation, it equaled
+  `origin/spec-docs-refresh`; `origin/rc/202608` remained exactly
+  `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` and ancestral to HEAD; the
+  worktree was clean.
+- From `docs`, the fresh semantic correction build ran `npm ci`,
+  `npm run lint`, `npm run format`, and `npm run build` in that order. All
+  exited 0: `npm ci` added 346 packages in 4 seconds, lint completed after
+  `eslint .`, format reported `All matched files use Prettier code style!`,
+  and VitePress reported `build complete in 5.21s.` with only the known
+  non-failing `vcl`-to-`txt` fallback.
+- The following exact fail-closed command was run from `docs`. It retains the
+  four-path Git binding to
+  `5dcf84bd0bebf8e6297822d0435e737bb7b4e2ed`, recursive filesystem walk,
+  manifest/file checks, six excluded families, and Home/Guide/API markers.
+  Python standard-library `html.parser.HTMLParser` collects only literal
+  `href` attributes from start and start-end tags and decodes HTML character
+  references. Parser, filesystem, decoding, URL-normalization, Git-binding,
+  and synthetic-assertion exceptions propagate; none are suppressed.
+
+  ```sh
+  python3 <<'PY'
+  import json
+  import os
+  import platform
+  import posixpath
+  import re
+  import stat
+  import subprocess
+  from html.parser import HTMLParser
+  from pathlib import Path
+  from urllib.parse import unquote_to_bytes, urljoin, urlsplit
+
+  BOUND_CONTENT_SHA = '5dcf84bd0bebf8e6297822d0435e737bb7b4e2ed'
+  CONTAINMENT_PATHS = [
+      'docs/.vitepress/config.mts',
+      'docs/guide/index.md',
+      'docs/guide/onboarding.md',
+      'docs/internal/onboarding.md',
+  ]
+  LOCAL_ORIGIN = 'https://local.invalid'
+  LOCAL_ORIGIN_TUPLE = ('https', 'local.invalid', 443)
+  DOCS_ROOT = Path.cwd()
+  REPO_ROOT = DOCS_ROOT.parent
+  DIST_ROOT = DOCS_ROOT / '.vitepress' / 'dist'
+
+  binding = subprocess.run(
+      ['git', 'diff', '--quiet', BOUND_CONTENT_SHA, 'HEAD', '--', *CONTAINMENT_PATHS],
+      cwd=REPO_ROOT,
+      capture_output=True,
+      text=True,
+      check=False,
+  )
+  if binding.returncode != 0:
+      raise RuntimeError(
+          f'containment binding failed with status {binding.returncode}: {binding.stderr}'
+      )
+
+
+  def walk_files(root):
+      files = []
+      with os.scandir(root) as iterator:
+          entries = sorted(iterator, key=lambda entry: entry.name)
+      for entry in entries:
+          absolute = Path(entry.path)
+          if entry.is_dir(follow_symlinks=False):
+              files.extend(walk_files(absolute))
+          elif entry.is_file(follow_symlinks=False):
+              files.append(absolute)
+          else:
+              raise RuntimeError(f'unsupported filesystem entry: {absolute}')
+      return files
+
+
+  def count_markdown_files(root):
+      return sum(file.suffix == '.md' for file in walk_files(root))
+
+
+  def count_optional_file(file):
+      try:
+          mode = os.stat(file, follow_symlinks=False).st_mode
+      except FileNotFoundError:
+          return 0
+      if not stat.S_ISREG(mode):
+          raise RuntimeError(f'expected a regular file: {file}')
+      return 1
+
+
+  def require_file_count(file):
+      mode = os.stat(file, follow_symlinks=False).st_mode
+      if not stat.S_ISREG(mode):
+          raise RuntimeError(f'expected a regular file: {file}')
+      return 1
+
+
+  class HrefParser(HTMLParser):
+      def __init__(self):
+          super().__init__(convert_charrefs=True)
+          self.hrefs = []
+
+      def collect_hrefs(self, attrs):
+          for name, value in attrs:
+              if name.lower() == 'href':
+                  if value is None:
+                      raise ValueError('href attribute must have a literal value')
+                  self.hrefs.append(value)
+
+      def handle_starttag(self, tag, attrs):
+          self.collect_hrefs(attrs)
+
+      def handle_startendtag(self, tag, attrs):
+          self.collect_hrefs(attrs)
+
+
+  def parse_hrefs(source):
+      parser = HrefParser()
+      parser.feed(source)
+      parser.close()
+      return parser.hrefs
+
+
+  def origin_tuple(parts):
+      hostname = parts.hostname
+      if hostname is None:
+          return (parts.scheme.lower(), None, None)
+      port = parts.port
+      if port is None:
+          if parts.scheme.lower() == 'https':
+              port = 443
+          elif parts.scheme.lower() == 'http':
+              port = 80
+      return (parts.scheme.lower(), hostname.lower(), port)
+
+
+  def normalize_href(raw_href, html_file):
+      if raw_href is None:
+          raise ValueError(f'{html_file}: href value is missing')
+      if any(ord(character) < 0x20 or ord(character) == 0x7F for character in raw_href):
+          raise ValueError(f'{html_file}: href contains a control character: {raw_href!r}')
+      if '\\' in raw_href:
+          raise ValueError(f'{html_file}: href contains an ambiguous backslash: {raw_href!r}')
+      if re.search(r'%(?![0-9A-Fa-f]{2})', raw_href):
+          raise ValueError(f'{html_file}: href contains invalid percent encoding: {raw_href!r}')
+      base_url = f'{LOCAL_ORIGIN}/trusted-server/{html_file}'
+      try:
+          resolved = urlsplit(urljoin(base_url, raw_href))
+          resolved_origin = origin_tuple(resolved)
+      except ValueError as error:
+          raise ValueError(f'{html_file}: malformed href {raw_href!r}: {error}') from error
+      if resolved_origin != LOCAL_ORIGIN_TUPLE:
+          return None
+      try:
+          route = unquote_to_bytes(resolved.path).decode('utf-8', errors='strict')
+      except UnicodeDecodeError as error:
+          raise ValueError(f'{html_file}: href path is not valid UTF-8: {raw_href!r}') from error
+      route = posixpath.normpath(route)
+      if not route.startswith('/'):
+          raise ValueError(f'{html_file}: normalized local href is not absolute: {raw_href!r}')
+      if route == '/trusted-server':
+          route = '/'
+      elif route.startswith('/trusted-server/'):
+          route = route[len('/trusted-server'):]
+      route = re.sub(r'\.(?:html|md)$', '', route, flags=re.IGNORECASE)
+      if len(route) > 1:
+          route = route.rstrip('/')
+      return route.lower()
+
+
+  synthetic_results = {}
+
+
+  def require_synthetic(name, condition):
+      if not condition:
+          raise AssertionError(f'synthetic assertion failed: {name}')
+      synthetic_results[name] = True
+
+
+  text_hrefs = parse_hrefs(
+      '<pre>href="/trusted-server/internal/pre"</pre>'
+      '<code>&lt;a href="/trusted-server/internal/code"&gt;</code>'
+      '<p>href=/trusted-server/internal/plain</p>'
+  )
+  require_synthetic('hrefLookingTextIgnored', text_hrefs == [])
+  entity_hrefs = parse_hrefs('<a href="/trusted-server/int&#x65;rnal/x">entity</a>')
+  require_synthetic(
+      'entityEncodedLocalHrefDecodedAndNormalized',
+      entity_hrefs == ['/trusted-server/internal/x']
+      and normalize_href(entity_hrefs[0], 'index.html') == '/internal/x',
+  )
+  require_synthetic(
+      'absoluteOffsiteHrefIgnored',
+      normalize_href('https://offsite.example/internal/x', 'index.html') is None,
+  )
+  require_synthetic(
+      'protocolRelativeOffsiteHrefIgnored',
+      normalize_href('//offsite.example/internal/x', 'index.html') is None,
+  )
+  quoted_hrefs = parse_hrefs(
+      '<a href="/trusted-server/guide/double">double</a>'
+      "<a href='/trusted-server/guide/single'>single</a>"
+      '<a href=/trusted-server/guide/unquoted>unquoted</a>'
+  )
+  require_synthetic(
+      'doubleQuotedHrefCollected',
+      quoted_hrefs[0] == '/trusted-server/guide/double',
+  )
+  require_synthetic(
+      'singleQuotedHrefCollected',
+      quoted_hrefs[1] == '/trusted-server/guide/single',
+  )
+  require_synthetic(
+      'unquotedHrefCollected',
+      quoted_hrefs[2] == '/trusted-server/guide/unquoted',
+  )
+
+  families = [
+      {
+          'name': 'superpowers/**',
+          'source_count': lambda: count_markdown_files(DOCS_ROOT / 'superpowers'),
+          'file_match': lambda file: file.startswith('superpowers/')
+          or file.startswith('assets/superpowers_'),
+          'manifest_match': lambda key: key.startswith('superpowers_')
+          or key.startswith('superpowers/'),
+          'route_match': lambda route: route == '/superpowers'
+          or route.startswith('/superpowers/'),
+      },
+      {
+          'name': 'internal/**',
+          'source_count': lambda: count_markdown_files(DOCS_ROOT / 'internal'),
+          'file_match': lambda file: file.startswith('internal/')
+          or file.startswith('assets/internal_'),
+          'manifest_match': lambda key: key.startswith('internal_')
+          or key.startswith('internal/'),
+          'route_match': lambda route: route == '/internal'
+          or route.startswith('/internal/'),
+      },
+      {
+          'name': 'epics/**',
+          'source_count': lambda: count_markdown_files(DOCS_ROOT / 'epics'),
+          'file_match': lambda file: file.startswith('epics/')
+          or file.startswith('assets/epics_'),
+          'manifest_match': lambda key: key.startswith('epics_')
+          or key.startswith('epics/'),
+          'route_match': lambda route: route == '/epics'
+          or route.startswith('/epics/'),
+      },
+      {
+          'name': 'guide/onboarding.md',
+          'source_count': lambda: count_optional_file(DOCS_ROOT / 'guide' / 'onboarding.md'),
+          'file_match': lambda file: file == 'guide/onboarding.html'
+          or file.startswith('guide/onboarding/')
+          or file.startswith('assets/guide_onboarding.md.'),
+          'manifest_match': lambda key: key in ('guide_onboarding.md', 'guide/onboarding.md'),
+          'route_match': lambda route: route == '/guide/onboarding'
+          or route.startswith('/guide/onboarding/'),
+      },
+      {
+          'name': 'README.md',
+          'source_count': lambda: require_file_count(DOCS_ROOT / 'README.md'),
+          'file_match': lambda file: file == 'readme.html'
+          or file.startswith('readme/')
+          or file.startswith('assets/readme.md.'),
+          'manifest_match': lambda key: key.lower() == 'readme.md',
+          'route_match': lambda route: route == '/readme'
+          or route.startswith('/readme/'),
+      },
+      {
+          'name': 'business-use-cases.md',
+          'source_count': lambda: require_file_count(DOCS_ROOT / 'business-use-cases.md'),
+          'file_match': lambda file: file == 'business-use-cases.html'
+          or file.startswith('business-use-cases/')
+          or file.startswith('assets/business-use-cases.md.'),
+          'manifest_match': lambda key: key == 'business-use-cases.md',
+          'route_match': lambda route: route == '/business-use-cases'
+          or route.startswith('/business-use-cases/'),
+      },
+  ]
+
+  dist_files = walk_files(DIST_ROOT)
+  relative_dist_files = [file.relative_to(DIST_ROOT).as_posix() for file in dist_files]
+  html_files = [file for file in relative_dist_files if file.endswith('.html')]
+  hashmap = json.loads((DIST_ROOT / 'hashmap.json').read_text(encoding='utf-8'))
+  if not isinstance(hashmap, dict):
+      raise TypeError('hashmap.json must contain an object')
+  manifest_keys = sorted(hashmap)
+  for key in manifest_keys:
+      if not isinstance(hashmap[key], str):
+          raise TypeError(f'non-string hashmap entry: {key}')
+
+  href_records = []
+  for html_file in html_files:
+      html = (DIST_ROOT / html_file).read_text(encoding='utf-8')
+      for href in parse_hrefs(html):
+          href_records.append(
+              {
+                  'file': html_file,
+                  'href': href,
+                  'route': normalize_href(href, html_file),
+              }
+          )
+
+  violations = []
+  family_results = {}
+  for family in families:
+      route_assets = [
+          file
+          for file in relative_dist_files
+          if family['file_match'](file.lower())
+      ]
+      manifest = [key for key in manifest_keys if family['manifest_match'](key)]
+      hrefs = [
+          record
+          for record in href_records
+          if record['route'] is not None and family['route_match'](record['route'])
+      ]
+      family_results[family['name']] = {
+          'sourceCount': family['source_count'](),
+          'routeAssetCount': len(route_assets),
+          'manifestCount': len(manifest),
+          'hrefCount': len(hrefs),
+      }
+      violations.extend(f"{family['name']} file: {file}" for file in route_assets)
+      violations.extend(f"{family['name']} manifest: {key}" for key in manifest)
+      violations.extend(
+          f"{family['name']} href in {record['file']}: {record['href']}"
+          for record in hrefs
+      )
+
+  artifact_specifications = [
+      {
+          'name': 'Home',
+          'file': 'index.html',
+          'markers': [
+              '<title>Trusted Server</title>',
+              'The New Execution Layer for Publishers',
+          ],
+      },
+      {
+          'name': 'Guide',
+          'file': 'guide/index.html',
+          'markers': ['<title>Guide | Trusted Server</title>', '<h1 id="guide"'],
+      },
+      {
+          'name': 'API',
+          'file': 'guide/api-reference.html',
+          'markers': [
+              '<title>API Reference | Trusted Server</title>',
+              'Quick reference for all Trusted Server HTTP endpoints.',
+          ],
+      },
+  ]
+  required_artifacts = {}
+  for specification in artifact_specifications:
+      html = (DIST_ROOT / specification['file']).read_text(encoding='utf-8')
+      missing_markers = [
+          marker for marker in specification['markers'] if marker not in html
+      ]
+      required_artifacts[specification['name']] = {
+          'file': specification['file'],
+          'exists': True,
+          'markerCount': len(specification['markers']) - len(missing_markers),
+          'requiredMarkerCount': len(specification['markers']),
+      }
+      violations.extend(
+          f"{specification['name']} missing marker: {marker}"
+          for marker in missing_markers
+      )
+
+  if violations:
+      raise RuntimeError('containment verification failed:\n' + '\n'.join(sorted(violations)))
+
+  result = {
+      'parser': {
+          'name': 'html.parser.HTMLParser',
+          'pythonVersion': platform.python_version(),
+          'convertCharRefs': True,
+      },
+      'syntheticAssertions': {
+          'count': len(synthetic_results),
+          'results': synthetic_results,
+      },
+      'boundContentSha': BOUND_CONTENT_SHA,
+      'families': family_results,
+      'htmlFileCount': len(html_files),
+      'hrefCount': len(href_records),
+      'requiredArtifacts': required_artifacts,
+  }
+  print(json.dumps(result, indent=2, ensure_ascii=False))
+  PY
+  ```
+
+  It exited 0. The following fenced JSON is the authoritative verbatim stdout
+  from the semantic local command:
+
+  ```json
+  {
+    "parser": {
+      "name": "html.parser.HTMLParser",
+      "pythonVersion": "3.9.6",
+      "convertCharRefs": true
+    },
+    "syntheticAssertions": {
+      "count": 7,
+      "results": {
+        "hrefLookingTextIgnored": true,
+        "entityEncodedLocalHrefDecodedAndNormalized": true,
+        "absoluteOffsiteHrefIgnored": true,
+        "protocolRelativeOffsiteHrefIgnored": true,
+        "doubleQuotedHrefCollected": true,
+        "singleQuotedHrefCollected": true,
+        "unquotedHrefCollected": true
+      }
+    },
+    "boundContentSha": "5dcf84bd0bebf8e6297822d0435e737bb7b4e2ed",
+    "families": {
+      "superpowers/**": {
+        "sourceCount": 135,
+        "routeAssetCount": 0,
+        "manifestCount": 0,
+        "hrefCount": 0
+      },
+      "internal/**": {
+        "sourceCount": 4,
+        "routeAssetCount": 0,
+        "manifestCount": 0,
+        "hrefCount": 0
+      },
+      "epics/**": {
+        "sourceCount": 1,
+        "routeAssetCount": 0,
+        "manifestCount": 0,
+        "hrefCount": 0
+      },
+      "guide/onboarding.md": {
+        "sourceCount": 0,
+        "routeAssetCount": 0,
+        "manifestCount": 0,
+        "hrefCount": 0
+      },
+      "README.md": {
+        "sourceCount": 1,
+        "routeAssetCount": 0,
+        "manifestCount": 0,
+        "hrefCount": 0
+      },
+      "business-use-cases.md": {
+        "sourceCount": 1,
+        "routeAssetCount": 0,
+        "manifestCount": 0,
+        "hrefCount": 0
+      }
+    },
+    "htmlFileCount": 43,
+    "hrefCount": 4601,
+    "requiredArtifacts": {
+      "Home": {
+        "file": "index.html",
+        "exists": true,
+        "markerCount": 2,
+        "requiredMarkerCount": 2
+      },
+      "Guide": {
+        "file": "guide/index.html",
+        "exists": true,
+        "markerCount": 2,
+        "requiredMarkerCount": 2
+      },
+      "API": {
+        "file": "guide/api-reference.html",
+        "exists": true,
+        "markerCount": 2,
+        "requiredMarkerCount": 2
+      }
+    }
+  }
+  ```
+
+  This fenced JSON is the sole authoritative Task 2 containment and href
+  result. It is local build evidence only, not a live Pages, CNAME,
+  deployment, or release receipt, and it does not complete a release-pending
+  row.
+
+- After the final `npm run format`, `npm run lint`, and `npm run build` pass,
+  an independent verifier extracted and reran the exact fenced command and
+  compared stdout to the fenced JSON byte-for-byte. The command exited 0;
+  both values were 1,831 bytes with SHA-256
+  `7d2e9d27e69789149eafb99956a4608c391d5cce71aff71e19ad9942cbd0d44e`, and
+  `byteIdentical` was `true`. Only generated `.vitepress/.temp` was removed
+  afterward.
 
 - The exact onboarding-link assertion was:
 
