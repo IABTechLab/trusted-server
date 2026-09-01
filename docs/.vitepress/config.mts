@@ -79,6 +79,7 @@ export default withMermaid(
           items: [
             { text: 'Edge Cookies', link: '/guide/edge-cookies' },
             { text: 'EC Setup Guide', link: '/guide/ec-setup-guide' },
+            { text: 'Permission Model', link: '/guide/permission-model' },
             { text: 'GDPR Compliance', link: '/guide/gdpr-compliance' },
             { text: 'Ad Serving', link: '/guide/ad-serving' },
             {
