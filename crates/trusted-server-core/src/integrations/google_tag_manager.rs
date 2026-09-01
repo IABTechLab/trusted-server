@@ -103,16 +103,22 @@ static GTM_TAG_ID_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 /// The path list mirrors the one in
 /// [`GoogleTagManagerIntegration::is_rewritable_url`].
 ///
-/// A second group requires that whatever follows the path is not itself a path
-/// character, so a longer path that merely starts with a routed one
-/// (`/collectXYZ`) is left alone rather than rewritten to a first-party URL with
-/// no route. Naming the terminators instead would miss the ones nobody thought
-/// of, such as a template literal's backtick or interpolation.
+/// A second group requires that the path be followed by something that ends a
+/// URL in the surrounding source — a quote, a backtick, an interpolation, a
+/// bracket, whitespace, or end of input — so a longer path that merely starts
+/// with a routed one (`/collectXYZ`, `/collect%58YZ`, `/collect:extra`) is left
+/// alone rather than rewritten to a first-party URL with no route behind it.
+///
+/// The extent of a URL here is set by the language it is embedded in, not by
+/// the RFC path grammar: characters such as `'`, `;` and `,` are legal in a
+/// path yet end the URL in real source. Listing the terminators rather than the
+/// continuations also fails safe, since an unrecognised byte leaves the URL
+/// third-party instead of rewriting it to a route that does not exist.
 ///
 /// The replacement target is `/integrations/google_tag_manager` + both captures.
 static GTM_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?:https?:)?//(?:www\.(?:googletagmanager|google-analytics)\.com|analytics\.google\.com)(/gtm\.js|/gtag/js|/gtag\.js|/g/collect|/collect|")((?:[^A-Za-z0-9._~/-]|$))"#,
+        r#"(?:https?:)?//(?:www\.(?:googletagmanager|google-analytics)\.com|analytics\.google\.com)(/gtm\.js|/gtag/js|/gtag\.js|/g/collect|/collect|")((?:[?"'`\s;,)\]}&#<>\\$]|$))"#,
     )
     .expect("GTM URL regex should compile")
 });
@@ -1944,6 +1950,21 @@ mod tests {
                 result.contains("/integrations/google_tag_manager/collect"),
                 "should rewrite a routed path in a template literal: {result}"
             );
+        }
+    }
+
+    #[test]
+    fn rewriter_leaves_a_percent_encoded_path_continuation() {
+        // `%58` is a legal path continuation, so this is not the routed
+        // `/collect` and rewriting it would produce a first-party 404.
+        for source in [
+            "const url = \"https://www.google-analytics.com/collect%58YZ\";",
+            "const url = \"https://www.google-analytics.com/collect:extra\";",
+            "const url = \"https://www.google-analytics.com/collect@host\";",
+        ] {
+            let result = GoogleTagManagerIntegration::rewrite_gtm_urls(source);
+
+            assert_eq!(source, result, "should not rewrite a longer path: {source}");
         }
     }
 
