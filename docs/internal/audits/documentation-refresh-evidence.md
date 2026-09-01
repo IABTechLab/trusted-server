@@ -2443,8 +2443,9 @@ PY
   explicit YAML, shell, TOML, JavaScript, protobuf, and Dockerfile mappings;
   unknown formats fail update for review.
 - URL overlap suppression is limited to the parsed authority host bytes. URL
-  path, query, and fragment text is independently scanned for nested domains
-  and email addresses. Credential assignment capture is bounded to one line,
+  query and fragment candidates use the ordinary domain context and boundary
+  checks; path-like components are not promoted to findings. Credential
+  assignment capture is bounded to one line,
   respects quoted escapes and unquoted comment/whitespace terminators, and
   accepts punctuation without weakening occurrence-specific source lexing.
 - PNG chunks now require a valid signature, bounded lengths, CRCs, IHDR-first
@@ -2453,13 +2454,14 @@ PY
   so compressed sensitive metadata cannot pass silently. JSON lock span
   association now uses one forward lexical pass with an object stack rather
   than rescanning from byte zero for each field.
-- The final reviewed inventory contains 6,602 exact findings: 6,260 domain,
+- The final reviewed inventory contains 5,847 exact findings: 5,505 domain,
   286 lockfile field, 42 credential shape, 12 binary string, one email, and one
-  service ID. Classes are 6,533 vendor URL, 42 fake credential, 15 historical,
+  service ID. Classes are 5,778 vendor URL, 42 fake credential, 15 historical,
   11 project-owned, and one service ID. Relative to the preceding 5,832-record
-  checkpoint, the 770-record increase is 767 nested URL path/query/fragment
-  domains exposed by exact authority-only overlap and three punctuation-bearing
-  credentials. Exact selector/fingerprint and class-policy validation passed
+  checkpoint, the 15-record increase is 12 validated query/fragment domains
+  and three punctuation-bearing credentials. The earlier +767 URL-tail claim
+  is retracted: those raw path-substring findings were false positives. Exact
+  selector/fingerprint and class-policy validation passed
   for all records; the 42 fake records were also reviewed against their selected
   repository bytes and narrowed evidence predicate.
 

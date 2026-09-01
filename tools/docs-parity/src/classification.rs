@@ -610,6 +610,22 @@ fn unique_sources(
 }
 
 fn validate_source_shape(record: &SourceRecord) -> Result<(), Report<ClassificationError>> {
+    if github_operational_path(&record.path) {
+        let expected = operational_comment_grammar(&record.path).ok_or_else(|| {
+            Report::new(ClassificationError::InvalidManifest).attach(format!(
+                "unsupported GitHub operational format requires review: {}",
+                record.path
+            ))
+        })?;
+        if record.mode != SourceMode::Comments || record.grammar.as_deref() != Some(expected) {
+            return Err(
+                Report::new(ClassificationError::InvalidManifest).attach(format!(
+                    "GitHub operational source requires comment grammar {expected}: {}",
+                    record.path
+                )),
+            );
+        }
+    }
     match record.mode {
         SourceMode::Whole if record.grammar.is_some() => Err(Report::new(
             ClassificationError::InvalidManifest,

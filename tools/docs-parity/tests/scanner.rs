@@ -764,7 +764,7 @@ fn email_detector_ignores_url_userinfo_and_at_sign_filenames() {
 #[test]
 fn url_authority_overlap_does_not_hide_query_or_fragment_findings() {
     let value = format!(
-        "https://example.com/path/{0}#contact=person@{0}",
+        "https://example.com/path/{0}?host={0} https://example.com/#contact=person@{0}",
         "private-corp.internal"
     );
     let repository = TestRepository::new("notes.txt", value.as_bytes(), "text");
@@ -777,6 +777,20 @@ fn url_authority_overlap_does_not_hide_query_or_fragment_findings() {
     .expect("should read bootstrap manifest");
     assert_eq!(manifest.matches("detector = \"email\"").count(), 1);
     assert_eq!(manifest.matches("detector = \"domain\"").count(), 2);
+}
+
+#[test]
+fn url_path_components_use_normal_domain_context_rules() {
+    let value = "https://example.com/rust-lang/crates.io-index/CONTRIBUTING.md/function.prototype.name/gpt.rs/mod.rs/prebid.rs";
+    let repository = TestRepository::new("notes.txt", value.as_bytes(), "text");
+    assert_eq!(status_code(&repository.bootstrap()), SUCCESS);
+    let manifest = fs::read_to_string(
+        repository
+            .path()
+            .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+    )
+    .expect("should read bootstrap manifest");
+    assert_eq!(manifest.matches("detector = \"domain\"").count(), 0);
 }
 
 #[test]

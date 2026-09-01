@@ -373,29 +373,44 @@ fn scan_text(
                 base_offset + matched.start() + host_end,
             ));
         }
-        let tail = &value[host_end..];
-        for nested in domain_host_regex().find_iter(tail) {
+        let Some(component_start) = value.find(['?', '#']) else {
+            continue;
+        };
+        let component = &value[component_start..];
+        for nested in domain_host_regex().find_iter(component) {
             let raw_host = nested.as_str();
+            let start = matched.start() + component_start + nested.start();
+            let end = start + raw_host.len();
             if valid_public_host(&raw_host.to_ascii_lowercase())
                 && !fictional_or_local_url(raw_host)
+                && bare_domain_context_allowed(
+                    path,
+                    text,
+                    start,
+                    end,
+                    domain_context,
+                    lexical_context.as_ref(),
+                )
+                && bare_domain_has_terminator(text, end)
             {
                 result.push(finding(
                     path,
                     Detector::Domain,
                     raw_host,
-                    base_offset + matched.start() + host_end + nested.start(),
-                    base_offset + matched.start() + host_end + nested.start() + raw_host.len(),
+                    base_offset + start,
+                    base_offset + end,
                 ));
             }
         }
-        for nested in email_regex().find_iter(tail) {
+        for nested in email_regex().find_iter(component) {
             if !fictional_email(nested.as_str()) && !at_sign_filename(nested.as_str()) {
+                let start = matched.start() + component_start + nested.start();
                 result.push(finding(
                     path,
                     Detector::Email,
                     nested.as_str(),
-                    base_offset + matched.start() + host_end + nested.start(),
-                    base_offset + matched.start() + host_end + nested.end(),
+                    base_offset + start,
+                    base_offset + matched.start() + component_start + nested.end(),
                 ));
             }
         }
@@ -1201,15 +1216,14 @@ fn scan_json_lock_fields_counted(
     text: &str,
 ) -> Result<(Vec<Finding>, usize), Report<ScannerError>> {
     let bytes = text.as_bytes();
-    let mut seen = BTreeSet::new();
     let mut findings = Vec::new();
-    let mut objects = Vec::new();
+    let mut objects = Vec::<(usize, u8)>::new();
     let mut i = 0;
     let mut steps = 0;
     while i < bytes.len() {
         steps += 1;
         if bytes[i] == b'{' {
-            objects.push(i);
+            objects.push((i, 0));
             i += 1;
             continue;
         }
@@ -1225,29 +1239,34 @@ fn scan_json_lock_fields_counted(
             i += 1;
             continue;
         }
-        let Some(end) = quoted_end(bytes, i) else {
+        let Some(end) = quoted_end_counted(bytes, i, &mut steps) else {
             return Err(Report::new(ScannerError::Finding)
                 .attach(format!("unterminated JSON lockfile string: {path}")));
         };
         let raw = &text[i..=end];
+        steps += raw.len();
         let value: String = serde_json::from_str(raw).change_context(ScannerError::Finding)?;
         let mut cursor = end + 1;
         while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            steps += 1;
             cursor += 1;
         }
         if cursor < bytes.len() && bytes[cursor] == b':' && lock_field(Some(&value)) {
-            let object_start = objects.last().copied().ok_or_else(|| {
+            let (_object_start, seen) = objects.last_mut().ok_or_else(|| {
                 Report::new(ScannerError::Finding).attach(format!(
                     "structured lockfile field outside object: {path}:{value}"
                 ))
             })?;
-            if !seen.insert((object_start, value.clone())) {
+            let bit = lock_field_bit(&value).expect("known lock field should have a bit");
+            if *seen & bit != 0 {
                 return Err(Report::new(ScannerError::Finding).attach(format!(
                     "duplicate structured lockfile field: {path}:{value}"
                 )));
             }
+            *seen |= bit;
             cursor += 1;
             while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                steps += 1;
                 cursor += 1;
             }
             if cursor >= bytes.len() || bytes[cursor] != b'"' {
@@ -1255,11 +1274,12 @@ fn scan_json_lock_fields_counted(
                     "unsupported structured lockfile field shape: {path}:{value}"
                 )));
             }
-            let value_end = quoted_end(bytes, cursor).ok_or_else(|| {
+            let value_end = quoted_end_counted(bytes, cursor, &mut steps).ok_or_else(|| {
                 Report::new(ScannerError::Finding)
                     .attach(format!("unterminated JSON lockfile string: {path}"))
             })?;
             let raw = &text[cursor + 1..value_end];
+            steps += value_end + 1 - cursor;
             let decoded: String = serde_json::from_str(&text[cursor..=value_end])
                 .change_context(ScannerError::Finding)?;
             if sensitive_lock_value(&decoded) {
@@ -1283,9 +1303,10 @@ fn scan_json_lock_fields_counted(
     Ok((findings, steps))
 }
 
-fn quoted_end(bytes: &[u8], start: usize) -> Option<usize> {
+fn quoted_end_counted(bytes: &[u8], start: usize, steps: &mut usize) -> Option<usize> {
     let mut escaped = false;
     for (index, byte) in bytes.iter().enumerate().skip(start + 1) {
+        *steps += 1;
         if escaped {
             escaped = false;
             continue;
@@ -1303,6 +1324,16 @@ fn quoted_end(bytes: &[u8], start: usize) -> Option<usize> {
 
 fn lock_field(key: Option<&str>) -> bool {
     matches!(key, Some("resolved" | "registry" | "source" | "url"))
+}
+
+fn lock_field_bit(key: &str) -> Option<u8> {
+    match key {
+        "resolved" => Some(1),
+        "registry" => Some(2),
+        "source" => Some(4),
+        "url" => Some(8),
+        _ => None,
+    }
 }
 
 fn sensitive_lock_value(value: &str) -> bool {
@@ -2093,28 +2124,57 @@ fn png_metadata(contents: &[u8]) -> Result<Vec<(usize, String)>, Report<ScannerE
             return Err(Report::new(ScannerError::Finding).attach("PNG data follows IEND"));
         }
         if chunk_type == b"tEXt" {
-            if let Some(position) = data.iter().position(|byte| *byte == 0) {
-                metadata.push((
-                    offset + 8 + position + 1,
-                    String::from_utf8_lossy(&data[position + 1..]).into_owned(),
-                ));
-            }
+            let position = png_keyword_end(data)?;
+            let text = core::str::from_utf8(&data[position + 1..])
+                .change_context(ScannerError::Finding)
+                .attach("PNG tEXt metadata is not byte-mappable UTF-8")?;
+            metadata.push((offset + 8 + position + 1, text.to_owned()));
         } else if chunk_type == b"zTXt" {
+            let position = png_keyword_end(data)?;
+            if data.get(position + 1) != Some(&0) || data.len() <= position + 2 {
+                return Err(Report::new(ScannerError::Finding)
+                    .attach("invalid PNG zTXt compression fields"));
+            }
             return Err(Report::new(ScannerError::Finding)
                 .attach("compressed PNG zTXt metadata requires review"));
         } else if chunk_type == b"iTXt" {
-            let Some(keyword_end) = data.iter().position(|byte| *byte == 0) else {
-                return Err(Report::new(ScannerError::Finding).attach("invalid PNG iTXt metadata"));
-            };
-            if data.get(keyword_end + 1) == Some(&1) {
+            let keyword_end = png_keyword_end(data)?;
+            let flag = *data.get(keyword_end + 1).ok_or_else(|| {
+                Report::new(ScannerError::Finding).attach("missing PNG iTXt compression flag")
+            })?;
+            let method = *data.get(keyword_end + 2).ok_or_else(|| {
+                Report::new(ScannerError::Finding).attach("missing PNG iTXt compression method")
+            })?;
+            if flag > 1 || method != 0 {
+                return Err(Report::new(ScannerError::Finding)
+                    .attach("invalid PNG iTXt compression fields"));
+            }
+            let language_start = keyword_end + 3;
+            let language_end = data[language_start..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|position| language_start + position)
+                .ok_or_else(|| {
+                    Report::new(ScannerError::Finding).attach("missing PNG iTXt language separator")
+                })?;
+            let translated_start = language_end + 1;
+            let translated_end = data[translated_start..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|position| translated_start + position)
+                .ok_or_else(|| {
+                    Report::new(ScannerError::Finding)
+                        .attach("missing PNG iTXt translated-keyword separator")
+                })?;
+            if flag == 1 {
                 return Err(Report::new(ScannerError::Finding)
                     .attach("compressed PNG iTXt metadata requires review"));
             }
-            metadata.extend(
-                printable_strings(data)
-                    .into_iter()
-                    .map(|(position, text)| (offset + 8 + position, text)),
-            );
+            let text_start = translated_end + 1;
+            let text = core::str::from_utf8(&data[text_start..])
+                .change_context(ScannerError::Finding)
+                .attach("PNG iTXt text is not valid UTF-8")?;
+            metadata.push((offset + 8 + text_start, text.to_owned()));
         }
         if chunk_type == b"IEND" {
             if length != 0 {
@@ -2128,6 +2188,17 @@ fn png_metadata(contents: &[u8]) -> Result<Vec<(usize, String)>, Report<ScannerE
         return Err(Report::new(ScannerError::Finding).attach("PNG has no IEND"));
     }
     Ok(metadata)
+}
+
+fn png_keyword_end(data: &[u8]) -> Result<usize, Report<ScannerError>> {
+    let end = data.iter().position(|byte| *byte == 0).ok_or_else(|| {
+        Report::new(ScannerError::Finding).attach("PNG text keyword has no separator")
+    })?;
+    if !(1..=79).contains(&end) {
+        return Err(Report::new(ScannerError::Finding)
+            .attach("PNG text keyword length must be 1 through 79 bytes"));
+    }
+    Ok(end)
 }
 
 fn png_crc32(bytes: &[u8]) -> u32 {
@@ -2330,16 +2401,16 @@ mod tests {
         let mut entries = Vec::new();
         for index in 0..20_000 {
             entries.push(format!(
-                r#""description{index}":"decoy","name":"package-{index}""#
+                r#"{{"description":"decoy-{index}","resolved":"https://registry.npmjs.org/package-{index}/-/package.tgz"}}"#
             ));
         }
-        let text = format!("{{{}}}", entries.join(","));
+        let text = format!("[{}]", entries.join(","));
         let (findings, steps) =
             scan_json_lock_fields_counted("package-lock.json", &text).expect("valid JSON scan");
         assert!(findings.is_empty());
         assert!(
-            steps <= text.len(),
-            "lexical cursor must advance monotonically: {steps} > {}",
+            steps <= text.len() * 4,
+            "accounted lexical work must remain linear: {steps} > 4*{}",
             text.len()
         );
     }
