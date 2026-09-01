@@ -2431,6 +2431,38 @@ PY
   three-record increase from the preceding audit is two domain occurrences and
   one credential occurrence introduced by the new regression fixtures.
 
+#### Task 5 consolidated governance edge-hardening checkpoint
+
+- The preceding bypass checkpoint correctly records 65 scanner tests before
+  this quality pass. The final focused suites now contain 67 scanner and 35
+  classification tests.
+- Classification update validates existing manifest versions, size bounds,
+  paths, record shapes, uniqueness, comment selectors, fingerprints, and
+  source/comment relationships before constructing preservation maps. Invalid
+  reviewed input remains byte-unchanged. GitHub operational files use only the
+  explicit YAML, shell, TOML, JavaScript, protobuf, and Dockerfile mappings;
+  unknown formats fail update for review.
+- URL overlap suppression is limited to the parsed authority host bytes. URL
+  path, query, and fragment text is independently scanned for nested domains
+  and email addresses. Credential assignment capture is bounded to one line,
+  respects quoted escapes and unquoted comment/whitespace terminators, and
+  accepts punctuation without weakening occurrence-specific source lexing.
+- PNG chunks now require a valid signature, bounded lengths, CRCs, IHDR-first
+  and IEND termination. tEXt and uncompressed iTXt remain scanned; zTXt and
+  compressed iTXt fail closed deterministically pending bounded decompression,
+  so compressed sensitive metadata cannot pass silently. JSON lock span
+  association now uses one forward lexical pass with an object stack rather
+  than rescanning from byte zero for each field.
+- The final reviewed inventory contains 6,602 exact findings: 6,260 domain,
+  286 lockfile field, 42 credential shape, 12 binary string, one email, and one
+  service ID. Classes are 6,533 vendor URL, 42 fake credential, 15 historical,
+  11 project-owned, and one service ID. Relative to the preceding 5,832-record
+  checkpoint, the 770-record increase is 767 nested URL path/query/fragment
+  domains exposed by exact authority-only overlap and three punctuation-bearing
+  credentials. Exact selector/fingerprint and class-policy validation passed
+  for all records; the 42 fake records were also reviewed against their selected
+  repository bytes and narrowed evidence predicate.
+
 #### Task 6 — Implement generated regions, Markdown ownership, and link checks
 
 Pending. Record each atomic fixture cycle and generated second-run no-diff.

@@ -234,8 +234,7 @@ fn binary_and_media_service_ids_cannot_bypass_service_governance() {
     let mut binary = vec![0];
     binary.extend_from_slice(text.as_bytes());
     binary.push(0);
-    let mut media = png_text_chunk("Service", &text);
-    media.push(0);
+    let media = png_text_chunk("Service", &text);
     for (path, contents) in [("asset.bin", binary), ("asset.png", media)] {
         let repository = TestRepository::new(path, &contents, "binary");
         let mut record = exception_for_contents(
@@ -727,32 +726,57 @@ fn email_detector_has_positive_and_typed_allowlisted_fixtures() {
 
 #[test]
 fn email_detector_ignores_url_userinfo_and_at_sign_filenames() {
-    for value in [
-        format!("https://user:pass@portal.{}", "private-corp.internal"),
-        format!(
-            "https://cdn.{}/{}@{}",
-            "private-corp.internal", "banner", "2x.jpg"
-        ),
-    ] {
-        let repository = TestRepository::new("notes.txt", value.as_bytes(), "text");
-        repository.write_allowlist(&exception_for_contents(
-            "vendor_url",
-            "notes.txt",
-            "domain",
-            value.as_bytes(),
-            &value,
-            "2099-01-01T00:00:00Z",
-        ));
+    let value = format!("https://user:pass@portal.{}", "private-corp.internal");
+    let repository = TestRepository::new("notes.txt", value.as_bytes(), "text");
+    repository.write_allowlist(&exception_for_contents(
+        "vendor_url",
+        "notes.txt",
+        "domain",
+        value.as_bytes(),
+        &value,
+        "2099-01-01T00:00:00Z",
+    ));
 
-        let result = repository.scan();
+    let result = repository.scan();
 
-        assert_eq!(
-            status_code(&result),
-            SUCCESS,
-            "URL substrings are not email addresses: {}",
-            diagnostic(&result)
-        );
-    }
+    assert_eq!(
+        status_code(&result),
+        SUCCESS,
+        "URL substrings are not email addresses: {}",
+        diagnostic(&result)
+    );
+
+    let path_email = format!(
+        "https://cdn.{}/{}@{}",
+        "private-corp.internal", "banner", "2x.jpg"
+    );
+    let repository = TestRepository::new("notes.txt", path_email.as_bytes(), "text");
+    assert_eq!(status_code(&repository.bootstrap()), SUCCESS);
+    let manifest = fs::read_to_string(
+        repository
+            .path()
+            .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+    )
+    .expect("should read bootstrap manifest");
+    assert!(!manifest.contains("detector = \"email\""));
+}
+
+#[test]
+fn url_authority_overlap_does_not_hide_query_or_fragment_findings() {
+    let value = format!(
+        "https://example.com/path/{0}#contact=person@{0}",
+        "private-corp.internal"
+    );
+    let repository = TestRepository::new("notes.txt", value.as_bytes(), "text");
+    assert_eq!(status_code(&repository.bootstrap()), SUCCESS);
+    let manifest = fs::read_to_string(
+        repository
+            .path()
+            .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+    )
+    .expect("should read bootstrap manifest");
+    assert_eq!(manifest.matches("detector = \"email\"").count(), 1);
+    assert_eq!(manifest.matches("detector = \"domain\"").count(), 2);
 }
 
 #[test]
@@ -790,7 +814,13 @@ fn credential_shape_detects_quoted_and_unquoted_digitless_values() {
 
 #[test]
 fn credential_shape_keeps_config_punctuation_values() {
-    for value in ["abcdefghijkl::mn", "abcdefghijkl.mn", "abcdefghijkl-mn"] {
+    for value in [
+        "abcdefghijkl::mn",
+        "abcdefghijkl.mn",
+        "abcdefghijkl-mn",
+        "!abcdefghijklmnop",
+        "abc!def@ghi$jklmnop",
+    ] {
         let contents = format!("password={value}\n");
         for path in [".env", "notes.txt"] {
             let repository = TestRepository::new(path, contents.as_bytes(), "text");
@@ -1143,11 +1173,28 @@ fn media_metadata_detector_has_positive_and_typed_allowlisted_fixtures() {
 }
 
 #[test]
+fn compressed_png_metadata_fails_closed() {
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    append_png_chunk(&mut png, b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0]);
+    let mut metadata = b"Comment\0\0".to_vec();
+    metadata.extend_from_slice(&[0x78, 0x9c, 3, 0, 0, 0, 0, 1]);
+    append_png_chunk(&mut png, b"zTXt", &metadata);
+    append_png_chunk(&mut png, b"IEND", &[]);
+    let repository = TestRepository::new("asset.png", &png, "binary");
+    let result = repository.scan();
+    assert_eq!(status_code(&result), ERROR);
+    assert!(diagnostic(&result).contains("compressed PNG zTXt"));
+}
+
+#[test]
 fn identical_media_and_non_metadata_binary_values_remain_distinct_occurrences() {
     let value = format!("person@{}", "private-corp.internal");
     let mut contents = png_text_chunk("Author", &value);
-    contents.push(0);
-    contents.extend_from_slice(value.as_bytes());
+    contents.truncate(contents.len() - 12);
+    let mut ancillary = vec![0];
+    ancillary.extend_from_slice(value.as_bytes());
+    append_png_chunk(&mut contents, b"vpAg", &ancillary);
+    append_png_chunk(&mut contents, b"IEND", &[]);
     let repository = TestRepository::new("asset.png", &contents, "binary");
     let result = repository.bootstrap();
     assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
@@ -2126,9 +2173,22 @@ fn png_text_chunk(keyword: &str, value: &str) -> Vec<u8> {
     data.extend_from_slice(value.as_bytes());
 
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-    png.extend_from_slice(&(u32::try_from(data.len()).expect("chunk should fit")).to_be_bytes());
-    png.extend_from_slice(b"tEXt");
-    png.extend_from_slice(&data);
-    png.extend_from_slice(&[0, 0, 0, 0]);
+    append_png_chunk(&mut png, b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0]);
+    append_png_chunk(&mut png, b"tEXt", &data);
+    append_png_chunk(&mut png, b"IEND", &[]);
     png
+}
+
+fn append_png_chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    png.extend_from_slice(&(u32::try_from(data.len()).expect("chunk should fit")).to_be_bytes());
+    png.extend_from_slice(kind);
+    png.extend_from_slice(data);
+    let mut crc = u32::MAX;
+    for byte in kind.iter().chain(data) {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1));
+        }
+    }
+    png.extend_from_slice(&(!crc).to_be_bytes());
 }

@@ -178,6 +178,7 @@ pub(crate) fn update(repository: &Repository) -> Result<(), Report<Classificatio
     let previous_tracked = read_manifest_optional::<TrackedManifest>(repository, TRACKED_MANIFEST)?;
     let previous_maintained =
         read_manifest_optional::<MaintainedManifest>(repository, MAINTAINED_MANIFEST)?;
+    validate_previous_manifests(previous_tracked.as_ref(), previous_maintained.as_ref())?;
     let previous_kinds = previous_tracked
         .as_ref()
         .map(|manifest| {
@@ -303,7 +304,14 @@ pub(crate) fn update(repository: &Repository) -> Result<(), Report<Classificatio
 
         maintained_changed = true;
 
-        if let Some(grammar) = operational_comment_grammar(&record.path) {
+        let grammar = operational_comment_grammar(&record.path);
+        if github_operational_path(&record.path) && grammar.is_none() {
+            return Err(Report::new(ClassificationError::Update).attach(format!(
+                "unsupported GitHub operational format requires review: {}",
+                record.path
+            )));
+        }
+        if let Some(grammar) = grammar {
             sources.push(SourceRecord {
                 path: record.path.clone(),
                 mode: SourceMode::Comments,
@@ -378,6 +386,60 @@ pub(crate) fn update(repository: &Repository) -> Result<(), Report<Classificatio
 
     write_manifest(repository, TRACKED_MANIFEST, &tracked)?;
     write_manifest(repository, MAINTAINED_MANIFEST, &maintained)
+}
+
+fn validate_previous_manifests(
+    tracked: Option<&TrackedManifest>,
+    maintained: Option<&MaintainedManifest>,
+) -> Result<(), Report<ClassificationError>> {
+    if let Some(tracked) = tracked {
+        if tracked.version != MANIFEST_VERSION
+            || tracked.max_text_bytes == 0
+            || tracked.max_text_bytes > MAXIMUM_CONFIGURED_TEXT_BYTES
+        {
+            return Err(Report::new(ClassificationError::InvalidManifest)
+                .attach("existing tracked manifest has invalid version or size bound"));
+        }
+        unique_files(&tracked.files)?;
+    }
+    if let Some(maintained) = maintained {
+        if maintained.version != MANIFEST_VERSION {
+            return Err(Report::new(ClassificationError::InvalidManifest)
+                .attach("existing maintained manifest has invalid version"));
+        }
+        let sources = unique_sources(&maintained.sources)?;
+        let mut comments = BTreeSet::new();
+        for record in &maintained.comments {
+            validate_manifest_path(&record.path)?;
+            parse_selector(&record.selector)?;
+            validate_fingerprint(&record.fingerprint)?;
+            validate_disposition(
+                Some(record.disposition),
+                record.exclude_kind,
+                &format!("comment span: {}:{}", record.path, record.selector),
+            )?;
+            if !comments.insert((record.path.clone(), record.selector.clone())) {
+                return Err(
+                    Report::new(ClassificationError::InvalidManifest).attach(format!(
+                        "duplicate comment selector: {}:{}",
+                        record.path, record.selector
+                    )),
+                );
+            }
+            if sources
+                .get(&record.path)
+                .is_none_or(|source| source.mode != SourceMode::Comments)
+            {
+                return Err(
+                    Report::new(ClassificationError::InvalidManifest).attach(format!(
+                        "comment record conflicts with source: {}",
+                        record.path
+                    )),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate(
@@ -1266,10 +1328,18 @@ fn scan_markdown_comments(text: &str) -> Result<Vec<CommentSpan>, Report<Classif
 
 fn operational_comment_grammar(path: &str) -> Option<&'static str> {
     let file_name = Path::new(path).file_name()?.to_str()?;
-    if path.starts_with(".github/workflows/")
-        || path.starts_with(".github/actions/")
-        || path.starts_with(".github/ISSUE_TEMPLATE/")
-        || path == ".cargo/config.toml"
+    if github_operational_path(path) {
+        return match Path::new(path).extension().and_then(|value| value.to_str()) {
+            Some("yml" | "yaml") => Some("yaml"),
+            Some("sh") => Some("shell"),
+            Some("toml") => Some("toml"),
+            Some("js" | "mjs") => Some("javascript"),
+            Some("proto") => Some("protobuf"),
+            _ if file_name == "Dockerfile" => Some("dockerfile"),
+            _ => None,
+        };
+    }
+    if path == ".cargo/config.toml"
         || path.ends_with(".sh")
         || matches!(
             file_name,
@@ -1299,6 +1369,12 @@ fn operational_comment_grammar(path: &str) -> Option<&'static str> {
         return Some("protobuf");
     }
     None
+}
+
+fn github_operational_path(path: &str) -> bool {
+    path.starts_with(".github/workflows/")
+        || path.starts_with(".github/actions/")
+        || path.starts_with(".github/ISSUE_TEMPLATE/")
 }
 
 fn whole_file_disposition(path: &str) -> (Disposition, Option<ExcludeKind>) {

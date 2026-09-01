@@ -844,6 +844,84 @@ fn update_never_silently_approves_a_sniffed_binary_kind() {
 }
 
 #[test]
+fn update_rejects_malformed_reviewed_prior_manifests() {
+    let cases = [
+        (
+            "version = 1\nreviewed = true\nmax_text_bytes = 1024\n\n[[files]]\npath = \"notes.txt\"\nkind = \"text\"\n\n[[files]]\npath = \"notes.txt\"\nkind = \"binary\"\n".to_owned(),
+            whole_source("notes.txt"),
+        ),
+        (
+            text_manifest("notes.txt", 1024),
+            format!("{}\n[[sources]]\npath = \"notes.txt\"\nmode = \"whole\"\ndisposition = \"exclude\"\nexclude_kind = \"historical\"\n", whole_source("notes.txt")),
+        ),
+        (
+            text_manifest("notes.txt", 1024),
+            "version = 2\nreviewed = true\n".to_owned(),
+        ),
+    ];
+    for (tracked, maintained) in cases {
+        let repository = TestRepository::new();
+        repository.track("notes.txt", b"guidance\n");
+        repository.manifests(&tracked, &maintained);
+        let before_tracked = fs::read(
+            repository
+                .path()
+                .join("tools/docs-parity/manifests/tracked-files.toml"),
+        )
+        .expect("read tracked");
+        let before_maintained = fs::read(
+            repository
+                .path()
+                .join("tools/docs-parity/manifests/maintained-sources.toml"),
+        )
+        .expect("read maintained");
+        let result = repository.update_classification();
+        assert_eq!(status_code(&result), ERROR, "{}", diagnostic(&result));
+        assert_eq!(
+            fs::read(
+                repository
+                    .path()
+                    .join("tools/docs-parity/manifests/tracked-files.toml")
+            )
+            .expect("read tracked"),
+            before_tracked
+        );
+        assert_eq!(
+            fs::read(
+                repository
+                    .path()
+                    .join("tools/docs-parity/manifests/maintained-sources.toml")
+            )
+            .expect("read maintained"),
+            before_maintained
+        );
+    }
+}
+
+#[test]
+fn github_operational_unknown_formats_fail_update() {
+    for path in [
+        ".github/actions/run.unknown",
+        ".github/workflows/build.weird",
+    ] {
+        let repository = TestRepository::new();
+        repository.track(path, b"# guidance\n");
+        repository.manifests(
+            "version = 1\nreviewed = true\nmax_text_bytes = 1024\n",
+            "version = 1\nreviewed = true\n",
+        );
+        let result = repository.update_classification();
+        assert_eq!(
+            status_code(&result),
+            ERROR,
+            "{path}: {}",
+            diagnostic(&result)
+        );
+        assert!(diagnostic(&result).contains("unsupported GitHub operational format"));
+    }
+}
+
+#[test]
 fn real_maintained_manifest_preserves_reader_facing_sets_and_typed_excludes() {
     let manifest = fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("manifests/maintained-sources.toml"),

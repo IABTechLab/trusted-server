@@ -308,7 +308,7 @@ fn scan_repository(repository: &Repository) -> Result<ScanState, Report<ScannerE
                 }
             }
             FileKind::Binary => {
-                let media_findings = scan_media_metadata(&file.path, &contents, &domain_context);
+                let media_findings = scan_media_metadata(&file.path, &contents, &domain_context)?;
                 let media_matches = media_findings
                     .iter()
                     .map(|finding| (finding.selector.as_str(), finding.matched.as_str()))
@@ -349,6 +349,13 @@ fn scan_text(
 ) -> Vec<Finding> {
     let mut result = Vec::new();
     let lexical_context = SourceLexicalContext::for_path(path, text);
+    let url_authority_spans = url_regex()
+        .find_iter(text)
+        .filter_map(|matched| {
+            extracted_host_span(matched.as_str())
+                .map(|(_host, start, end)| (matched.start() + start, matched.start() + end))
+        })
+        .collect::<Vec<_>>();
     for matched in url_regex().find_iter(text) {
         let value = trim_url(matched.as_str());
         let Some((host, host_start, host_end)) = extracted_host_span(value) else {
@@ -366,12 +373,38 @@ fn scan_text(
                 base_offset + matched.start() + host_end,
             ));
         }
+        let tail = &value[host_end..];
+        for nested in domain_host_regex().find_iter(tail) {
+            let raw_host = nested.as_str();
+            if valid_public_host(&raw_host.to_ascii_lowercase())
+                && !fictional_or_local_url(raw_host)
+            {
+                result.push(finding(
+                    path,
+                    Detector::Domain,
+                    raw_host,
+                    base_offset + matched.start() + host_end + nested.start(),
+                    base_offset + matched.start() + host_end + nested.start() + raw_host.len(),
+                ));
+            }
+        }
+        for nested in email_regex().find_iter(tail) {
+            if !fictional_email(nested.as_str()) && !at_sign_filename(nested.as_str()) {
+                result.push(finding(
+                    path,
+                    Detector::Email,
+                    nested.as_str(),
+                    base_offset + matched.start() + host_end + nested.start(),
+                    base_offset + matched.start() + host_end + nested.end(),
+                ));
+            }
+        }
     }
     for matched in bare_domain_regex().find_iter(text) {
         if matched.start() > 0 && text.as_bytes()[matched.start() - 1] == b'@' {
             continue;
         }
-        if preceding_token_is_url(text, matched.start()) {
+        if overlaps_url_authority(&url_authority_spans, matched.start(), matched.end()) {
             continue;
         }
         if !bare_domain_context_allowed(
@@ -404,7 +437,10 @@ fn scan_text(
         }
     }
     for matched in email_regex().find_iter(text) {
-        if !preceding_token_is_url(text, matched.start()) && !fictional_email(matched.as_str()) {
+        if !overlaps_url_authority(&url_authority_spans, matched.start(), matched.end())
+            && !fictional_email(matched.as_str())
+            && !at_sign_filename(matched.as_str())
+        {
             result.push(finding(
                 path,
                 Detector::Email,
@@ -426,8 +462,12 @@ fn scan_text(
         }
     }
     for captures in credential_regex().captures_iter(text) {
-        if let Some(value) = captures.get(1).or_else(|| captures.get(2)) {
-            let is_quoted = captures.get(1).is_some();
+        if let Some(value) = captures
+            .get(1)
+            .or_else(|| captures.get(2))
+            .or_else(|| captures.get(3))
+        {
+            let is_quoted = captures.get(1).is_some() || captures.get(2).is_some();
             if lexical_context
                 .as_ref()
                 .is_some_and(|context| !context.allows(value.start()))
@@ -467,6 +507,21 @@ fn scan_text(
         }
     }
     result
+}
+
+fn at_sign_filename(value: &str) -> bool {
+    value.rsplit_once('@').is_some_and(|(_name, suffix)| {
+        let lower = suffix.to_ascii_lowercase();
+        [".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"]
+            .iter()
+            .any(|extension| {
+                lower.strip_suffix(extension).is_some_and(|scale| {
+                    scale.strip_suffix('x').is_some_and(|digits| {
+                        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+                    })
+                })
+            })
+    })
 }
 
 fn credential_source_expression(text: &str, match_start: usize, value: &str) -> bool {
@@ -950,14 +1005,10 @@ fn bare_domain_has_terminator(text: &str, end: usize) -> bool {
             .is_none_or(|after| after.is_whitespace() || ",;)]}>\"'`".contains(after))
 }
 
-fn preceding_token_is_url(text: &str, start: usize) -> bool {
-    text[..start]
-        .rsplit(|character: char| {
-            character.is_whitespace()
-                || matches!(character, '"' | '\'' | '`' | '<' | '>' | '(' | '[' | '{')
-        })
-        .next()
-        .is_some_and(|prefix| prefix.contains("://"))
+fn overlaps_url_authority(spans: &[(usize, usize)], start: usize, end: usize) -> bool {
+    spans
+        .iter()
+        .any(|(authority_start, authority_end)| start < *authority_end && end > *authority_start)
 }
 
 fn scan_binary(path: &str, contents: &[u8], domain_context: &DomainContext) -> Vec<Finding> {
@@ -978,15 +1029,15 @@ fn scan_media_metadata(
     path: &str,
     contents: &[u8],
     domain_context: &DomainContext,
-) -> Vec<Finding> {
+) -> Result<Vec<Finding>, Report<ScannerError>> {
     let metadata = if path.ends_with(".png") {
-        png_metadata(contents)
+        png_metadata(contents)?
     } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
         jpeg_metadata(contents)
     } else {
         Vec::new()
     };
-    metadata
+    Ok(metadata
         .into_iter()
         .flat_map(|(offset, text)| scan_text(path, &text, offset, domain_context))
         .map(|finding| match finding.detector {
@@ -996,7 +1047,7 @@ fn scan_media_metadata(
                 ..finding
             },
         })
-        .collect()
+        .collect())
 }
 
 fn scan_lockfile(path: &str, text: &str) -> Result<Vec<Finding>, Report<ScannerError>> {
@@ -1142,11 +1193,34 @@ fn toml_string_content_span(
 }
 
 fn scan_json_lock_fields(path: &str, text: &str) -> Result<Vec<Finding>, Report<ScannerError>> {
+    scan_json_lock_fields_counted(path, text).map(|(findings, _steps)| findings)
+}
+
+fn scan_json_lock_fields_counted(
+    path: &str,
+    text: &str,
+) -> Result<(Vec<Finding>, usize), Report<ScannerError>> {
     let bytes = text.as_bytes();
     let mut seen = BTreeSet::new();
     let mut findings = Vec::new();
+    let mut objects = Vec::new();
     let mut i = 0;
+    let mut steps = 0;
     while i < bytes.len() {
+        steps += 1;
+        if bytes[i] == b'{' {
+            objects.push(i);
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'}' {
+            objects.pop().ok_or_else(|| {
+                Report::new(ScannerError::Finding)
+                    .attach(format!("unbalanced JSON lockfile object: {path}"))
+            })?;
+            i += 1;
+            continue;
+        }
         if bytes[i] != b'"' {
             i += 1;
             continue;
@@ -1162,7 +1236,7 @@ fn scan_json_lock_fields(path: &str, text: &str) -> Result<Vec<Finding>, Report<
             cursor += 1;
         }
         if cursor < bytes.len() && bytes[cursor] == b':' && lock_field(Some(&value)) {
-            let object_start = json_object_start(bytes, i).ok_or_else(|| {
+            let object_start = objects.last().copied().ok_or_else(|| {
                 Report::new(ScannerError::Finding).attach(format!(
                     "structured lockfile field outside object: {path}:{value}"
                 ))
@@ -1202,27 +1276,11 @@ fn scan_json_lock_fields(path: &str, text: &str) -> Result<Vec<Finding>, Report<
             i = end + 1;
         }
     }
-    Ok(findings)
-}
-
-fn json_object_start(bytes: &[u8], end: usize) -> Option<usize> {
-    let mut stack = Vec::new();
-    let mut i = 0;
-    while i < end {
-        match bytes[i] {
-            b'"' => {
-                i = quoted_end(bytes, i)? + 1;
-                continue;
-            }
-            b'{' => stack.push(i),
-            b'}' => {
-                stack.pop()?;
-            }
-            _ => {}
-        }
-        i += 1;
+    if !objects.is_empty() {
+        return Err(Report::new(ScannerError::Finding)
+            .attach(format!("unbalanced JSON lockfile object: {path}")));
     }
-    stack.last().copied()
+    Ok((findings, steps))
 }
 
 fn quoted_end(bytes: &[u8], start: usize) -> Option<usize> {
@@ -1563,6 +1621,10 @@ fn fake_credential_evidence(path: &str, value: &str) -> bool {
             | "secure_handler_password"
             | "api_handler_password"
             | "secret_value"
+            | "<high-entropy-32-plus-character-value>"
+            | "<your-fastly-api-token>"
+            | "{}/{credential_scope}"
+            | "store.get(\"ts-2025-10-a\")?"
     );
     let published_example = lower == "akiaiosfodnn7example/20130524/us-east-1/s3/aws4_request";
     (!production_looking || exact_size_marker)
@@ -1986,13 +2048,18 @@ fn printable_strings(contents: &[u8]) -> Vec<(usize, String)> {
     strings
 }
 
-fn png_metadata(contents: &[u8]) -> Vec<(usize, String)> {
+fn png_metadata(contents: &[u8]) -> Result<Vec<(usize, String)>, Report<ScannerError>> {
     if !contents.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Vec::new();
+        return Err(Report::new(ScannerError::Finding).attach("invalid PNG signature"));
     }
     let mut offset = 8;
     let mut metadata = Vec::new();
-    while offset + 12 <= contents.len() {
+    let mut first = true;
+    let mut saw_end = false;
+    while offset < contents.len() {
+        if offset + 12 > contents.len() {
+            return Err(Report::new(ScannerError::Finding).attach("truncated PNG chunk"));
+        }
         let length = u32::from_be_bytes([
             contents[offset],
             contents[offset + 1],
@@ -2003,13 +2070,28 @@ fn png_metadata(contents: &[u8]) -> Vec<(usize, String)> {
             .checked_add(12)
             .and_then(|value| value.checked_add(length))
         else {
-            break;
+            return Err(Report::new(ScannerError::Finding).attach("PNG chunk length overflow"));
         };
         if end > contents.len() {
-            break;
+            return Err(Report::new(ScannerError::Finding).attach("truncated PNG chunk data"));
         }
         let chunk_type = &contents[offset + 4..offset + 8];
         let data = &contents[offset + 8..offset + 8 + length];
+        let expected_crc = u32::from_be_bytes(
+            contents[offset + 8 + length..end]
+                .try_into()
+                .expect("PNG CRC has four bytes"),
+        );
+        if png_crc32(&contents[offset + 4..offset + 8 + length]) != expected_crc {
+            return Err(Report::new(ScannerError::Finding).attach("invalid PNG chunk CRC"));
+        }
+        if first && chunk_type != b"IHDR" {
+            return Err(Report::new(ScannerError::Finding).attach("PNG must begin with IHDR"));
+        }
+        first = false;
+        if saw_end {
+            return Err(Report::new(ScannerError::Finding).attach("PNG data follows IEND"));
+        }
         if chunk_type == b"tEXt" {
             if let Some(position) = data.iter().position(|byte| *byte == 0) {
                 metadata.push((
@@ -2017,16 +2099,46 @@ fn png_metadata(contents: &[u8]) -> Vec<(usize, String)> {
                     String::from_utf8_lossy(&data[position + 1..]).into_owned(),
                 ));
             }
+        } else if chunk_type == b"zTXt" {
+            return Err(Report::new(ScannerError::Finding)
+                .attach("compressed PNG zTXt metadata requires review"));
         } else if chunk_type == b"iTXt" {
+            let Some(keyword_end) = data.iter().position(|byte| *byte == 0) else {
+                return Err(Report::new(ScannerError::Finding).attach("invalid PNG iTXt metadata"));
+            };
+            if data.get(keyword_end + 1) == Some(&1) {
+                return Err(Report::new(ScannerError::Finding)
+                    .attach("compressed PNG iTXt metadata requires review"));
+            }
             metadata.extend(
                 printable_strings(data)
                     .into_iter()
                     .map(|(position, text)| (offset + 8 + position, text)),
             );
         }
+        if chunk_type == b"IEND" {
+            if length != 0 {
+                return Err(Report::new(ScannerError::Finding).attach("invalid PNG IEND"));
+            }
+            saw_end = true;
+        }
         offset = end;
     }
-    metadata
+    if !saw_end {
+        return Err(Report::new(ScannerError::Finding).attach("PNG has no IEND"));
+    }
+    Ok(metadata)
+}
+
+fn png_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
 }
 
 fn jpeg_metadata(contents: &[u8]) -> Vec<(usize, String)> {
@@ -2160,6 +2272,16 @@ fn bare_domain_regex() -> &'static Regex {
     })
 }
 
+fn domain_host_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\b(?:[A-Z0-9](?:[A-Z0-9-]*[A-Z0-9])?\.)+(?:XN--[A-Z0-9-]{2,}|[A-Z]{2,63})\b"#,
+        )
+        .expect("domain-host detector should compile")
+    })
+}
+
 fn email_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
@@ -2180,7 +2302,7 @@ fn credential_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
         Regex::new(
-            r#"(?im)\b(?:api[_-]?secret|client[_-]?secret|password|secret|credential|access[_-]?token)[\"']?\s*[:=]\s*(?:[\"']([A-Za-z0-9_./+=:-]{12,})[\"']|([A-Za-z0-9_./+=:-]{12,}))"#,
+            r#"(?im)\b(?:api[_-]?secret|client[_-]?secret|password|secret|credential|access[_-]?token)[\"']?\s*[:=]\s*(?:\"((?:\\.|[^\"\\\r\n]){12,})\"|'((?:\\.|[^'\\\r\n]){12,})'|([^\s#;\"'`,]{12,}))"#,
         )
         .expect("credential detector should compile")
     })
@@ -2201,7 +2323,26 @@ fn non_whitespace_regex() -> &'static Regex {
 
 #[cfg(test)]
 mod tests {
-    use super::exception_is_active;
+    use super::{exception_is_active, scan_json_lock_fields_counted};
+
+    #[test]
+    fn dense_json_lock_span_association_is_single_pass() {
+        let mut entries = Vec::new();
+        for index in 0..20_000 {
+            entries.push(format!(
+                r#""description{index}":"decoy","name":"package-{index}""#
+            ));
+        }
+        let text = format!("{{{}}}", entries.join(","));
+        let (findings, steps) =
+            scan_json_lock_fields_counted("package-lock.json", &text).expect("valid JSON scan");
+        assert!(findings.is_empty());
+        assert!(
+            steps <= text.len(),
+            "lexical cursor must advance monotonically: {steps} > {}",
+            text.len()
+        );
+    }
 
     #[test]
     fn service_exception_fails_at_the_exact_approved_expiry_instant() {
