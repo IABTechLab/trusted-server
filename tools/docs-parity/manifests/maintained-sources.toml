@@ -6997,12 +6997,6 @@ disposition = "include"
 
 [[comments]]
 path = "scripts/profile.sh"
-selector = "bytes:3249-3263"
-fingerprint = "sha256:3bead6c36a02f67912971a74583f0cd4f0bf18b34eaa67b87032d81a3017f6f3"
-disposition = "include"
-
-[[comments]]
-path = "scripts/profile.sh"
 selector = "bytes:3663-3677"
 fingerprint = "sha256:871ae54456aaafaa275996370bc6a98bb88e7fc723e00190b41f4ac9e0942a7f"
 disposition = "include"

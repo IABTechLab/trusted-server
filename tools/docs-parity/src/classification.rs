@@ -661,8 +661,8 @@ fn extract_comments(
     grammar: &str,
 ) -> Result<Vec<CommentSpan>, Report<ClassificationError>> {
     match grammar {
-        "shell" => scan_hash_comments(text, true),
-        "python" | "dockerfile" => scan_hash_comments(text, false),
+        "shell" => scan_hash_comments(text, true, true),
+        "python" | "dockerfile" => scan_hash_comments(text, false, false),
         "toml" => scan_toml_comments(text),
         "yaml" => scan_yaml_comments(text),
         "rust" => scan_rust_comments(text),
@@ -677,6 +677,7 @@ fn extract_comments(
 fn scan_hash_comments(
     text: &str,
     preserve_quotes_across_lines: bool,
+    require_comment_boundary: bool,
 ) -> Result<Vec<CommentSpan>, Report<ClassificationError>> {
     let bytes = text.as_bytes();
     let mut spans = Vec::new();
@@ -713,7 +714,10 @@ fn scan_hash_comments(
             index += 1;
             continue;
         }
-        if byte == b'#' && quote.is_none() {
+        if byte == b'#'
+            && quote.is_none()
+            && (!require_comment_boundary || index == 0 || bytes[index - 1].is_ascii_whitespace())
+        {
             let end = bytes[index..]
                 .iter()
                 .position(|b| *b == b'\n')
@@ -758,14 +762,16 @@ fn scan_toml_comments(text: &str) -> Result<Vec<CommentSpan>, Report<Classificat
                 return Err(Report::new(ClassificationError::Incomplete)
                     .attach("unterminated single-line TOML string"));
             }
-            let closes = if multiline {
-                i + 2 < bytes.len() && bytes[i..i + 3] == [delimiter; 3]
-            } else {
-                bytes[i] == delimiter
-            };
-            if closes {
+            let quote_run = bytes[i..]
+                .iter()
+                .take_while(|byte| **byte == delimiter)
+                .count();
+            if multiline && quote_run >= 3 {
                 quote = None;
-                i += if multiline { 3 } else { 1 };
+                i += quote_run.min(5);
+            } else if !multiline && bytes[i] == delimiter {
+                quote = None;
+                i += 1;
             } else {
                 i += 1;
             }
@@ -854,7 +860,10 @@ fn scan_yaml_comments(text: &str) -> Result<Vec<CommentSpan>, Report<Classificat
         let plain = comment_start
             .map_or(body, |start| &body[..start])
             .trim_end();
-        if plain.ends_with('|') || plain.ends_with('>') {
+        if matches!(
+            plain.split_whitespace().last(),
+            Some("|" | ">" | "|-" | "|+" | ">-" | ">+")
+        ) {
             block_indent = Some(indent + 1);
         }
         offset += line.len();
@@ -1081,7 +1090,9 @@ fn scan_javascript_comments(text: &str) -> Result<Vec<CommentSpan>, Report<Class
                 } else if byte == b'`' {
                     mode = JavascriptCommentMode::Template;
                     index += 1;
-                } else if byte == b'/' && javascript_regex_can_start(previous_code_byte) {
+                } else if byte == b'/'
+                    && javascript_regex_can_start(text, index, previous_code_byte)
+                {
                     mode = JavascriptCommentMode::RegularExpression;
                     regex_character_class = false;
                     index += 1;
@@ -1201,8 +1212,33 @@ fn scan_javascript_comments(text: &str) -> Result<Vec<CommentSpan>, Report<Class
     }
 }
 
-fn javascript_regex_can_start(previous: Option<u8>) -> bool {
+fn javascript_regex_can_start(text: &str, slash: usize, previous: Option<u8>) -> bool {
     previous.is_none_or(|byte| b"=(:,![{;?+-*%&|^~<>".contains(&byte))
+        || javascript_preceding_keyword(text, slash).is_some_and(|keyword| {
+            matches!(
+                keyword,
+                "return"
+                    | "throw"
+                    | "case"
+                    | "delete"
+                    | "void"
+                    | "typeof"
+                    | "yield"
+                    | "await"
+                    | "new"
+                    | "in"
+                    | "of"
+                    | "instanceof"
+            )
+        })
+}
+
+fn javascript_preceding_keyword(text: &str, offset: usize) -> Option<&str> {
+    let prefix = text.get(..offset)?.trim_end();
+    let start = prefix
+        .rfind(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .map_or(0, |index| index + 1);
+    prefix.get(start..)
 }
 
 fn scan_markdown_comments(text: &str) -> Result<Vec<CommentSpan>, Report<ClassificationError>> {

@@ -562,6 +562,101 @@ fn javascript_comment_lexer_tracks_regex_and_nested_template_interpolation() {
 }
 
 #[test]
+fn javascript_keyword_led_regex_and_division_preserve_trailing_comment_boundaries() {
+    for contents in [
+        "function check(input) { return /[/*]/.test(input); } // guidance\n",
+        "const ratio = numerator / denominator; // guidance\n",
+    ] {
+        let comment = "// guidance";
+        let start = contents
+            .rfind(comment)
+            .expect("guidance comment should exist");
+        let selector = format!("bytes:{start}-{}", start + comment.len());
+        let repository = TestRepository::new();
+        repository.track("build.mjs", contents.as_bytes());
+        repository.manifests(
+            &text_manifest("build.mjs", 2048),
+            &comment_source("build.mjs", "javascript", &[(&selector, comment)]),
+        );
+
+        let result = repository.classify();
+
+        assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+    }
+}
+
+#[test]
+fn toml_multiline_strings_accept_four_and_five_quote_terminators() {
+    for contents in [
+        "value = \"\"\"foo\"\"\"\" # guidance\n",
+        "value = \"\"\"foo\"\"\"\"\" # guidance\n",
+    ] {
+        let comment = "# guidance";
+        let start = contents
+            .rfind(comment)
+            .expect("guidance comment should exist");
+        let selector = format!("bytes:{start}-{}", start + comment.len());
+        let repository = TestRepository::new();
+        repository.track("config.toml", contents.as_bytes());
+        repository.manifests(
+            &text_manifest("config.toml", 2048),
+            &comment_source("config.toml", "toml", &[(&selector, comment)]),
+        );
+
+        let result = repository.classify();
+
+        assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+    }
+}
+
+#[test]
+fn shell_hash_requires_a_comment_boundary() {
+    let contents = "echo foo#bar\necho foo # guidance\n";
+    let comment = "# guidance";
+    let start = contents
+        .rfind(comment)
+        .expect("guidance comment should exist");
+    let selector = format!("bytes:{start}-{}", start + comment.len());
+    let repository = TestRepository::new();
+    repository.track("script.sh", contents.as_bytes());
+    repository.manifests(
+        &text_manifest("script.sh", 2048),
+        &comment_source("script.sh", "shell", &[(&selector, comment)]),
+    );
+
+    let result = repository.classify();
+
+    assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+}
+
+#[test]
+fn yaml_chomping_block_scalars_keep_hash_lines_literal() {
+    for indicator in ["|-", "|+", ">-", ">+"] {
+        let contents = format!("value: {indicator}\n  # scalar text\nnext: ok # guidance\n");
+        let comment = "# guidance";
+        let start = contents
+            .rfind(comment)
+            .expect("guidance comment should exist");
+        let selector = format!("bytes:{start}-{}", start + comment.len());
+        let repository = TestRepository::new();
+        repository.track("config.yaml", contents.as_bytes());
+        repository.manifests(
+            &text_manifest("config.yaml", 2048),
+            &comment_source("config.yaml", "yaml", &[(&selector, comment)]),
+        );
+
+        let result = repository.classify();
+
+        assert_eq!(
+            status_code(&result),
+            SUCCESS,
+            "{indicator}: {}",
+            diagnostic(&result)
+        );
+    }
+}
+
+#[test]
 fn malformed_javascript_template_escape_fails_closed() {
     let contents = "const value = `${value\\``;\n";
     let repository = TestRepository::new();

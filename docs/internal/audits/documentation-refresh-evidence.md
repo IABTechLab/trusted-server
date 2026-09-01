@@ -2346,6 +2346,91 @@ PY
   all-target/all-feature Clippy with warnings denied are re-run after this
   evidence is scanned and restaged.
 
+#### Task 5 final independent-review correction
+
+- The independent RED pass added ten reproductions. Lockfiles lost domains in
+  non-structural fields; a source member in one file suppressed the same host
+  in unrelated prose and source literals; digitless unquoted credentials were
+  skipped; five common punctuation boundaries failed retired-token matching;
+  invalid binary bytes destroyed retired-token offsets; class checks accepted
+  detector-compatible semantic misuse; and valid JavaScript, TOML, shell, and
+  YAML grammar forms failed extraction. The focused GREEN suites contain 61
+  scanner and 33 classification cases; the additional cross-class matrix brings
+  the final scanner count to 62.
+- Lockfiles now receive the general text scan and structural traversal. A
+  general domain is suppressed only when its exact byte span is contained in
+  the exact structural value span that represents it. Non-structural JSON and
+  TOML values remain general domain findings, while structural values retain
+  one exact lockfile-field record.
+- Domain member suppression is occurrence-specific. Rust and JavaScript source
+  expressions are rejected only at code offsets outside literal/comment
+  regions; repository-wide matched-byte state no longer exists. The two-file
+  regression keeps the prose occurrence plus the source string and comment,
+  while rejecting only the source expression. In the real inventory, the
+  named nested settings token appears only at its two documentation
+  occurrences; the corresponding source expression and the named prediction,
+  document-body, and result-containment expressions remain absent. The named
+  README, build, configuration, contribution, and getting-started path tokens
+  remain absent through repository-path evidence.
+- Credential grammar no longer requires a digit. Quoted and unquoted
+  all-letter and digit-bearing values are detected. Source declarations,
+  member assignments, calls, and JSON-like identifier expressions are rejected
+  through lexical offset and key/value context rather than value composition.
+- Retired matching trims the complete reviewed prose/Markdown boundary set
+  while retaining punctuation as a separator between code fragments. Binary
+  scanning walks maximal valid UTF-8 regions with explicit original byte
+  bases; invalid bytes before and between identical tokens preserve two exact,
+  distinct selectors and fingerprints.
+- Exception classes are checked against the matched finding, not only its
+  detector. Vendor records require a public host or structural URL and cannot
+  claim project-owned or deleted-CNAME domains. Fake credentials require a
+  test/fixture/documentation/example category or an explicit synthetic marker.
+  Historical domains are limited to the two approved path, selector, and
+  fingerprint records; historical binary strings are limited to the approved
+  image artifact; the historical email remains the exact test fixture.
+  Project-owned domains require the exact owned host/subdomain boundary, and
+  service path, owner, expiry, detector, selector, and fingerprint controls are
+  unchanged.
+- The reviewed pre-evidence inventory is 5,829 exact findings: 5,491 domain,
+  286 structural lockfile field, 38 credential shape, 12 binary string, one
+  email, and one service ID. Classes are 5,764 vendor URL, 38 hash-pinned fake
+  credential fixture, 15 historical example, 11 project-owned public domain,
+  and one service ID. Relative to the prior reviewed inventory, the net change
+  is 2,009: 2,007 domains exposed by removing repository-global suppression
+  and two credentials. The exact-key transition is 2,067 new and 58 stale
+  records because scanner/test edits also move governed offsets. Independent
+  review found zero selector/fingerprint mismatches across all 5,829 records
+  and zero class-policy violations.
+- Comment classification remains 704 sources and changes from 569 to 568 exact
+  spans. The sole removal is the shell parameter-count expansion in the
+  profiling script, which was previously misclassified as a comment.
+
+#### Task 5 scanner bypass follow-up
+
+- Three additional RED fixtures closed context and boundary bypasses. Unquoted
+  credential values containing `::`, `.`, or `-` remain findings in `.env` and
+  prose; expression suppression now runs only for paths with an established
+  source lexer and at code occurrences. Existing Rust member and assignment
+  negatives remain absent.
+- Retired-token matching now trims `*`, `~`, and `|` in addition to the prior
+  punctuation matrix. Paired Markdown delimiters match the exact token bytes;
+  punctuation within a token still prevents a match.
+- Fake-credential semantics no longer accept every `docs/` path or substring
+  collisions such as `latest`, `contest`, or `exampled`. Evidence is limited to
+  fixture/test paths, example configuration paths, exact synthetic-marker
+  tokens, a small exact placeholder vocabulary, and the exact published AWS
+  signing example; explicit production/live tokens reject arbitrary values.
+  The complete regenerated set of 39 fake
+  records was checked against its selected repository bytes and the predicate.
+  The intentional `production-admin-password-32-bytes` test value remains
+  provable only through its exact size marker, not through `production`.
+- Before final evidence regeneration the inventory was 5,832 findings: 5,493
+  domain, 286 lockfile field, 39 credential shape, 12 binary string, one email,
+  and one service ID. Classes were 5,766 vendor URL, 39 fake credential, 15
+  historical example, 11 project-owned public domain, and one service ID. The
+  three-record increase from the preceding audit is two domain occurrences and
+  one credential occurrence introduced by the new regression fixtures.
+
 #### Task 6 — Implement generated regions, Markdown ownership, and link checks
 
 Pending. Record each atomic fixture cycle and generated second-run no-diff.

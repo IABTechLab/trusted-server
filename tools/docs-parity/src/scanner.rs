@@ -28,6 +28,9 @@ const SERVICE_OWNER: &str = "aram356";
 const SERVICE_EXPIRY: &str = "2026-09-30T00:00:00Z";
 const HISTORICAL_CNAME_FINGERPRINT: &str =
     "sha256:c5c88b1c0fd72489bc2352a680544204f898392cfe43655f761e8e21ae26bddf";
+const HISTORICAL_EMAIL_FINGERPRINT: &str =
+    "sha256:60a0c7d895777dbb3206205a932557134c63283c4f73dce19e5b1fc2e225bb2a";
+const HISTORICAL_BINARY_PATH: &str = "docs/public/images/hero-graphic.jpeg";
 
 /// Failure while scanning classified repository content.
 #[derive(Debug, derive_more::Display)]
@@ -174,7 +177,6 @@ struct SourceLexicalContext {
 
 struct DomainContext {
     tracked_paths: BTreeSet<String>,
-    source_members: BTreeSet<String>,
 }
 
 struct TomlLockScanner<'a> {
@@ -260,7 +262,7 @@ pub(crate) fn bootstrap(repository: &Repository) -> Result<(), Report<ScannerErr
 fn scan_repository(repository: &Repository) -> Result<ScanState, Report<ScannerError>> {
     let classified =
         classification::checked_files(repository).change_context(ScannerError::Classification)?;
-    let domain_context = DomainContext::build(repository, &classified)?;
+    let domain_context = DomainContext::build(&classified);
     for path in [TRACKED_MANIFEST, MAINTAINED_MANIFEST] {
         let text = read_manifest_text(repository, path)?;
         reject_toml_comments(path, &text)?;
@@ -285,12 +287,22 @@ fn scan_repository(repository: &Repository) -> Result<ScanState, Report<ScannerE
                 let text =
                     core::str::from_utf8(&contents).change_context(ScannerError::Classification)?;
                 if is_lockfile(&file.path) {
+                    let structured = scan_lockfile(&file.path, text)?;
                     result.extend(
                         scan_text(&file.path, text, 0, &domain_context)
                             .into_iter()
-                            .filter(|finding| finding.detector != Detector::Domain),
+                            .filter(|finding| {
+                                finding.detector != Detector::Domain
+                                    || !structured.iter().any(|structural| {
+                                        structural.detector == Detector::LockfileField
+                                            && selector_contains(
+                                                &structural.selector,
+                                                &finding.selector,
+                                            )
+                                    })
+                            }),
                     );
-                    result.extend(scan_lockfile(&file.path, text)?);
+                    result.extend(structured);
                 } else if !is_governance_manifest(&file.path) {
                     result.extend(scan_text(&file.path, text, 0, &domain_context));
                 }
@@ -416,7 +428,20 @@ fn scan_text(
     for captures in credential_regex().captures_iter(text) {
         if let Some(value) = captures.get(1).or_else(|| captures.get(2)) {
             let is_quoted = captures.get(1).is_some();
-            if !is_quoted && !value.as_str().bytes().any(|byte| byte.is_ascii_digit()) {
+            if lexical_context
+                .as_ref()
+                .is_some_and(|context| !context.allows(value.start()))
+                || lexical_context.is_some()
+                    && !is_quoted
+                    && credential_source_expression(
+                        text,
+                        captures
+                            .get(0)
+                            .expect("credential match should exist")
+                            .start(),
+                        value.as_str(),
+                    )
+            {
                 continue;
             }
             if !fictional_credential(value.as_str()) {
@@ -442,6 +467,23 @@ fn scan_text(
         }
     }
     result
+}
+
+fn credential_source_expression(text: &str, match_start: usize, value: &str) -> bool {
+    if value.contains('.') || value.contains("::") {
+        return true;
+    }
+    let line_start = text[..match_start].rfind('\n').map_or(0, |index| index + 1);
+    let prefix = &text[line_start..match_start];
+    let trimmed = prefix.trim_end();
+    trimmed.ends_with('.')
+        || trimmed.ends_with(']')
+        || trimmed.ends_with('"')
+        || trimmed.ends_with('\'')
+        || trimmed.ends_with('`')
+        || prefix
+            .split_whitespace()
+            .any(|token| matches!(token, "let" | "const" | "var" | "static" | "final"))
 }
 
 fn valid_public_host(host: &str) -> bool {
@@ -472,15 +514,7 @@ fn bare_domain_context_allowed(
     domain_context: &DomainContext,
     lexical_context: Option<&SourceLexicalContext>,
 ) -> bool {
-    let candidate = trim_url(&text[start..end]);
-    let host = candidate
-        .split('/')
-        .next()
-        .unwrap_or(candidate)
-        .to_ascii_lowercase();
-    if domain_context.source_members.contains(&host)
-        || repository_path_token(path, text, start, end, &domain_context.tracked_paths)
-    {
+    if repository_path_token(path, text, start, end, &domain_context.tracked_paths) {
         return false;
     }
     lexical_context.is_none_or(|context| context.allows(start))
@@ -596,53 +630,15 @@ impl DomainContext {
     fn empty() -> Self {
         Self {
             tracked_paths: BTreeSet::new(),
-            source_members: BTreeSet::new(),
         }
     }
 
-    fn build(
-        repository: &Repository,
-        classified: &[classification::ClassifiedFile],
-    ) -> Result<Self, Report<ScannerError>> {
+    fn build(classified: &[classification::ClassifiedFile]) -> Self {
         let tracked_paths = classified
             .iter()
             .map(|file| file.path.clone())
             .collect::<BTreeSet<_>>();
-        let mut source_members = BTreeSet::new();
-        for file in classified.iter().filter(|file| file.kind == FileKind::Text) {
-            let normalized = NormalizedRelativePath::new(Path::new(&file.path))
-                .change_context(ScannerError::Classification)?;
-            let contents = repository
-                .read_tracked(&normalized)
-                .change_context(ScannerError::Classification)?;
-            let text =
-                core::str::from_utf8(&contents).change_context(ScannerError::Classification)?;
-            let Some(lexical_context) = SourceLexicalContext::for_path(&file.path, text) else {
-                continue;
-            };
-            for matched in bare_domain_regex().find_iter(text) {
-                if lexical_context.allows(matched.start())
-                    || matched.start() > 0 && text.as_bytes()[matched.start() - 1] == b'@'
-                    || preceding_token_is_url(text, matched.start())
-                    || !bare_domain_has_terminator(text, matched.end())
-                {
-                    continue;
-                }
-                let candidate = trim_url(matched.as_str());
-                let host = candidate
-                    .split('/')
-                    .next()
-                    .unwrap_or(candidate)
-                    .to_ascii_lowercase();
-                if valid_public_host(&host) {
-                    source_members.insert(host);
-                }
-            }
-        }
-        Ok(Self {
-            tracked_paths,
-            source_members,
-        })
+        Self { tracked_paths }
     }
 }
 
@@ -804,7 +800,9 @@ fn javascript_literal_and_comment_bytes(text: &str) -> Vec<bool> {
                     mode = JavascriptLexicalMode::Template;
                     marked[index] = true;
                     index += 1;
-                } else if byte == b'/' && javascript_regex_can_start(previous_code_byte) {
+                } else if byte == b'/'
+                    && javascript_regex_can_start(text, index, previous_code_byte)
+                {
                     mode = JavascriptLexicalMode::RegularExpression;
                     marked[index] = true;
                     index += 1;
@@ -903,8 +901,33 @@ fn javascript_literal_and_comment_bytes(text: &str) -> Vec<bool> {
     marked
 }
 
-fn javascript_regex_can_start(previous: Option<u8>) -> bool {
+fn javascript_regex_can_start(text: &str, slash: usize, previous: Option<u8>) -> bool {
     previous.is_none_or(|byte| b"=(:,![{;?+-*%&|^~<>".contains(&byte))
+        || javascript_preceding_keyword(text, slash).is_some_and(|keyword| {
+            matches!(
+                keyword,
+                "return"
+                    | "throw"
+                    | "case"
+                    | "delete"
+                    | "void"
+                    | "typeof"
+                    | "yield"
+                    | "await"
+                    | "new"
+                    | "in"
+                    | "of"
+                    | "instanceof"
+            )
+        })
+}
+
+fn javascript_preceding_keyword(text: &str, offset: usize) -> Option<&str> {
+    let prefix = text.get(..offset)?.trim_end();
+    let start = prefix
+        .rfind(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .map_or(0, |index| index + 1);
+    prefix.get(start..)
 }
 
 fn bare_domain_has_terminator(text: &str, end: usize) -> bool {
@@ -1241,8 +1264,7 @@ fn scan_retired(
     contents: &[u8],
     identifiers: &[RetiredIdentifier],
 ) -> Result<Vec<Finding>, Report<ScannerError>> {
-    let text = String::from_utf8_lossy(contents);
-    let tokens = retired_tokens(&text);
+    let tokens = retired_tokens(contents);
     let mut result = Vec::new();
     for record in identifiers {
         for window in tokens.windows(record.word_count) {
@@ -1268,7 +1290,33 @@ fn scan_retired(
     Ok(result)
 }
 
-fn retired_tokens(text: &str) -> Vec<RetiredToken> {
+fn retired_tokens(contents: &[u8]) -> Vec<RetiredToken> {
+    let mut tokens = Vec::new();
+    let mut offset = 0;
+    while offset < contents.len() {
+        match core::str::from_utf8(&contents[offset..]) {
+            Ok(text) => {
+                tokens.extend(retired_tokens_in_text(text, offset));
+                break;
+            }
+            Err(error) => {
+                let valid_end = offset + error.valid_up_to();
+                if valid_end > offset {
+                    let text = core::str::from_utf8(&contents[offset..valid_end])
+                        .expect("validated UTF-8 prefix should decode");
+                    tokens.extend(retired_tokens_in_text(text, offset));
+                }
+                let Some(error_length) = error.error_len() else {
+                    break;
+                };
+                offset = valid_end + error_length;
+            }
+        }
+    }
+    tokens
+}
+
+fn retired_tokens_in_text(text: &str, base_offset: usize) -> Vec<RetiredToken> {
     non_whitespace_regex()
         .find_iter(text)
         .filter_map(|matched| {
@@ -1276,7 +1324,25 @@ fn retired_tokens(text: &str) -> Vec<RetiredToken> {
             let token = raw.trim_matches(|character: char| {
                 matches!(
                     character,
-                    '"' | '\'' | '`' | ',' | ';' | ':' | '!' | '?' | '(' | ')' | '{' | '}'
+                    '.' | ','
+                        | ';'
+                        | ':'
+                        | '!'
+                        | '?'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '<'
+                        | '>'
+                        | '"'
+                        | '\''
+                        | '`'
+                        | '*'
+                        | '~'
+                        | '|'
                 )
             });
             if token.is_empty() {
@@ -1287,8 +1353,8 @@ fn retired_tokens(text: &str) -> Vec<RetiredToken> {
                 .expect("trimmed token should be a substring");
             Some(RetiredToken {
                 text: token.to_owned(),
-                start: matched.start() + leading,
-                end: matched.start() + leading + token.len(),
+                start: base_offset + matched.start() + leading,
+                end: base_offset + matched.start() + leading + token.len(),
             })
         })
         .collect()
@@ -1310,7 +1376,7 @@ fn validate_findings(
     let mut exceptions = BTreeMap::new();
     for record in &allowlist.exceptions {
         let key = validate_exception(record, now_seconds)?;
-        if exceptions.insert(key, false).is_some() {
+        if exceptions.insert(key, (record, false)).is_some() {
             return Err(Report::new(ScannerError::InvalidGovernance).attach(format!(
                 "duplicate sensitive-data exception: {}",
                 record.path
@@ -1324,7 +1390,8 @@ fn validate_findings(
             selector: finding.selector.clone(),
             fingerprint: fingerprint(finding.matched.as_bytes()),
         };
-        if let Some(used) = exceptions.get_mut(&key) {
+        if let Some((record, used)) = exceptions.get_mut(&key) {
+            validate_class_semantics(record, finding)?;
             *used = true;
         } else {
             return Err(Report::new(ScannerError::Finding).attach(format!(
@@ -1335,7 +1402,7 @@ fn validate_findings(
             )));
         }
     }
-    if let Some((key, _used)) = exceptions.iter().find(|(_key, used)| !**used) {
+    if let Some((key, _record)) = exceptions.iter().find(|(_key, (_record, used))| !*used) {
         return Err(Report::new(ScannerError::InvalidGovernance).attach(format!(
             "stale sensitive-data exception: {} [{}] {}",
             key.path,
@@ -1397,13 +1464,15 @@ fn validate_exception(
 
 fn validate_class_pair(record: &ExceptionRecord) -> Result<(), Report<ScannerError>> {
     let valid = match record.class {
-        ExceptionClass::VendorUrl | ExceptionClass::ProjectOwnedPublicDomain => matches!(
-            record.detector,
-            Detector::Domain
-                | Detector::BinaryString
-                | Detector::LockfileField
-                | Detector::MediaMetadata
-        ),
+        ExceptionClass::VendorUrl => {
+            matches!(
+                record.detector,
+                Detector::Domain
+                    | Detector::LockfileField
+                    | Detector::BinaryString
+                    | Detector::MediaMetadata
+            )
+        }
         ExceptionClass::HashPinnedFakeCredentialFixture => matches!(
             record.detector,
             Detector::CredentialShape
@@ -1411,7 +1480,15 @@ fn validate_class_pair(record: &ExceptionRecord) -> Result<(), Report<ScannerErr
                 | Detector::BinaryString
                 | Detector::MediaMetadata
         ),
-        ExceptionClass::HistoricalExample => record.detector != Detector::ServiceId,
+        ExceptionClass::HistoricalExample => matches!(
+            record.detector,
+            Detector::Domain
+                | Detector::BinaryString
+                | Detector::Email
+                | Detector::MediaMetadata
+                | Detector::RetiredIdentifier
+        ),
+        ExceptionClass::ProjectOwnedPublicDomain => record.detector == Detector::Domain,
         ExceptionClass::ServiceId => record.detector == Detector::ServiceId,
     };
     if valid {
@@ -1422,6 +1499,116 @@ fn validate_class_pair(record: &ExceptionRecord) -> Result<(), Report<ScannerErr
             record.class,
             record.detector.label()
         )))
+    }
+}
+
+fn validate_class_semantics(
+    record: &ExceptionRecord,
+    finding: &Finding,
+) -> Result<(), Report<ScannerError>> {
+    let valid = match record.class {
+        ExceptionClass::VendorUrl => {
+            finding.detector == Detector::LockfileField
+                || matches!(
+                    finding.detector,
+                    Detector::Domain | Detector::BinaryString | Detector::MediaMetadata
+                ) && valid_public_host(&finding.matched.to_ascii_lowercase())
+                    && !project_owned_host(&finding.matched)
+                    && fingerprint(finding.matched.to_ascii_lowercase().as_bytes())
+                        != HISTORICAL_CNAME_FINGERPRINT
+        }
+        ExceptionClass::HashPinnedFakeCredentialFixture => {
+            fake_credential_evidence(&finding.path, &finding.matched)
+        }
+        ExceptionClass::HistoricalExample => historical_example_evidence(record, finding),
+        ExceptionClass::ProjectOwnedPublicDomain => project_owned_host(&finding.matched),
+        ExceptionClass::ServiceId => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(Report::new(ScannerError::InvalidGovernance).attach(format!(
+            "exception class lacks provable finding semantics: {:?}/{} in {}",
+            record.class,
+            finding.detector.label(),
+            finding.path
+        )))
+    }
+}
+
+fn fake_credential_evidence(path: &str, value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let tokens = lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let production_looking = tokens
+        .iter()
+        .any(|token| matches!(*token, "production" | "prod" | "live"));
+    let exact_size_marker = tokens
+        .windows(3)
+        .any(|triplet| triplet == ["password", "32", "bytes"]);
+    let exact_marker = tokens.iter().any(|token| {
+        matches!(
+            *token,
+            "fake" | "test" | "example" | "fixture" | "integration" | "unit" | "placeholder"
+        )
+    }) || tokens.windows(2).any(|pair| pair == ["change", "me"])
+        || exact_size_marker;
+    let exact_placeholder = matches!(
+        lower.as_str(),
+        "admin-password"
+            | "admin_password"
+            | "handler_password"
+            | "secure_handler_password"
+            | "api_handler_password"
+            | "secret_value"
+    );
+    let published_example = lower == "akiaiosfodnn7example/20130524/us-east-1/s3/aws4_request";
+    (!production_looking || exact_size_marker)
+        && (categorized_fixture_path(path)
+            || path.ends_with(".example.toml")
+            || exact_marker
+            || exact_placeholder
+            || published_example)
+}
+
+fn categorized_fixture_path(path: &str) -> bool {
+    path.starts_with("tests/")
+        || path.contains("/tests/")
+        || path.starts_with("fixtures/")
+        || path.contains("/fixtures/")
+}
+
+fn historical_example_evidence(record: &ExceptionRecord, finding: &Finding) -> bool {
+    match finding.detector {
+        Detector::Domain => {
+            record.fingerprint == HISTORICAL_CNAME_FINGERPRINT
+                && matches!(
+                    (record.path.as_str(), record.selector.as_str()),
+                    (
+                        "docs/internal/audits/documentation-refresh-decisions.md",
+                        "bytes:5027-5049"
+                    ) | (
+                        "docs/superpowers/specs/2026-08-19-documentation-refresh-design.md",
+                        "bytes:3892-3914"
+                    )
+                )
+        }
+        Detector::BinaryString => record.path == HISTORICAL_BINARY_PATH,
+        Detector::Email => {
+            categorized_fixture_path(&record.path)
+                && (record.path != "tools/docs-parity/tests/scanner.rs"
+                    || record.fingerprint == HISTORICAL_EMAIL_FINGERPRINT)
+        }
+        Detector::MediaMetadata => {
+            record.path == HISTORICAL_BINARY_PATH || categorized_fixture_path(&record.path)
+        }
+        Detector::RetiredIdentifier => true,
+        Detector::CredentialShape
+        | Detector::ServiceId
+        | Detector::EncodedToken
+        | Detector::LockfileField => false,
     }
 }
 
@@ -1593,11 +1780,19 @@ fn candidate_class(finding: &Finding) -> ExceptionClass {
     {
         return ExceptionClass::HistoricalExample;
     }
-    if project_owned_host(&finding.matched) {
+    if finding.detector == Detector::BinaryString && finding.path == HISTORICAL_BINARY_PATH {
+        return ExceptionClass::HistoricalExample;
+    }
+    if finding.detector == Detector::Domain && project_owned_host(&finding.matched) {
         return ExceptionClass::ProjectOwnedPublicDomain;
     }
     match finding.detector {
         Detector::Domain | Detector::LockfileField => ExceptionClass::VendorUrl,
+        Detector::BinaryString | Detector::MediaMetadata
+            if valid_public_host(&finding.matched.to_ascii_lowercase()) =>
+        {
+            ExceptionClass::VendorUrl
+        }
         Detector::CredentialShape | Detector::EncodedToken => {
             ExceptionClass::HashPinnedFakeCredentialFixture
         }
@@ -1631,6 +1826,21 @@ fn finding_key(finding: &Finding) -> ExceptionKey {
         selector: finding.selector.clone(),
         fingerprint: fingerprint(finding.matched.as_bytes()),
     }
+}
+
+fn selector_contains(container: &str, nested: &str) -> bool {
+    let Some((container_start, container_end)) = parse_selector_span(container) else {
+        return false;
+    };
+    let Some((nested_start, nested_end)) = parse_selector_span(nested) else {
+        return false;
+    };
+    container_start <= nested_start && nested_end <= container_end
+}
+
+fn parse_selector_span(selector: &str) -> Option<(usize, usize)> {
+    let (start, end) = selector.strip_prefix("bytes:")?.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?))
 }
 
 fn project_owned_host(value: &str) -> bool {

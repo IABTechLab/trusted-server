@@ -327,7 +327,7 @@ fn domain_detector_has_positive_and_typed_allowlisted_fixtures() {
     let value = format!("https://portal.{}", "private-corp.internal/path");
     assert_detected("notes.txt", value.as_bytes(), "text", "domain");
     assert_allowlisted(
-        "notes.txt",
+        "tests/email.txt",
         value.as_bytes(),
         "text",
         "domain",
@@ -635,7 +635,7 @@ fn source_domain_context_persists_across_lines_and_rejects_members() {
 }
 
 #[test]
-fn source_member_evidence_suppresses_documented_expressions_not_real_hosts() {
+fn source_member_evidence_does_not_suppress_documented_host_shaped_tokens() {
     let member_one = ["prediction", ".name"].concat();
     let member_two = ["state.settings.ec", ".partners"].concat();
     let host = ["service.example", ".rs"].concat();
@@ -657,10 +657,34 @@ fn source_member_evidence_suppresses_documented_expressions_not_real_hosts() {
     .expect("should read bootstrap manifest");
     assert_eq!(
         manifest.matches("detector = \"domain\"").count(),
-        1,
-        "only the real host must remain: {manifest}"
+        3,
+        "source expressions must not suppress separate README occurrences: {manifest}"
     );
     assert!(manifest.contains(&fingerprint(host.as_bytes())));
+}
+
+#[test]
+fn source_member_suppression_is_occurrence_specific() {
+    let host = ["service.example", ".rs"].concat();
+    let readme = format!("{host} in prose, `{host}` in code markup.\n");
+    let source = format!("let member = {host};\nlet string = \"{host}\";\n// {host}\n");
+    let repository = TestRepository::new("README.md", readme.as_bytes(), "text");
+    repository.add_text("src/main.rs", &source);
+
+    let result = repository.bootstrap();
+
+    assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+    let manifest = fs::read_to_string(
+        repository
+            .path()
+            .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+    )
+    .expect("should read bootstrap manifest");
+    assert_eq!(
+        manifest.matches("detector = \"domain\"").count(),
+        4,
+        "README prose/markup and source string/comment must remain findings; only the expression is suppressed: {manifest}"
+    );
 }
 
 #[test]
@@ -692,7 +716,7 @@ fn email_detector_has_positive_and_typed_allowlisted_fixtures() {
     let value = format!("person@{}", "private-corp.internal");
     assert_detected("notes.txt", value.as_bytes(), "text", "email");
     assert_allowlisted(
-        "notes.txt",
+        "tests/email.txt",
         value.as_bytes(),
         "text",
         "email",
@@ -742,13 +766,47 @@ fn credential_shape_detector_has_positive_and_typed_allowlisted_fixtures() {
         "credential_shape",
     );
     assert_allowlisted(
-        "fixture.toml",
+        "tests/fixture.toml",
         contents.as_bytes(),
         "text",
         "credential_shape",
         value,
         "hash_pinned_fake_credential_fixture",
     );
+}
+
+#[test]
+fn credential_shape_detects_quoted_and_unquoted_digitless_values() {
+    let key = ["pass", "word"].concat();
+    for contents in [
+        format!("{key}=abcdefghijklmnop\n"),
+        format!("{key}='abcdefghijklmnop'\n"),
+        format!("{key}=abcdefghijklmnop123\n"),
+        format!("{key}=\"abcdefghijklmnop123\"\n"),
+    ] {
+        assert_detected(".env", contents.as_bytes(), "text", "credential_shape");
+    }
+}
+
+#[test]
+fn credential_shape_keeps_config_punctuation_values() {
+    for value in ["abcdefghijkl::mn", "abcdefghijkl.mn", "abcdefghijkl-mn"] {
+        let contents = format!("password={value}\n");
+        for path in [".env", "notes.txt"] {
+            let repository = TestRepository::new(path, contents.as_bytes(), "text");
+            assert_eq!(status_code(&repository.bootstrap()), SUCCESS);
+            let manifest = fs::read_to_string(
+                repository
+                    .path()
+                    .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+            )
+            .expect("should read bootstrap manifest");
+            assert!(
+                manifest.contains("detector = \"credential_shape\""),
+                "punctuation-bearing credential must be retained in {path}: {manifest}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -803,7 +861,7 @@ fn encoded_token_detector_has_positive_and_typed_allowlisted_fixtures() {
     let contents = format!("encoded_token = \"{value}\"\n");
     assert_detected("fixture.toml", contents.as_bytes(), "text", "encoded_token");
     assert_allowlisted(
-        "fixture.toml",
+        "tests/fixture.toml",
         contents.as_bytes(),
         "text",
         "encoded_token",
@@ -875,6 +933,53 @@ fn lockfiles_scan_non_url_secrets_and_select_the_structured_value_occurrence() {
 }
 
 #[test]
+fn lockfiles_scan_domains_outside_structural_fields_without_duplicate_structural_hosts() {
+    let prose_host = ["service.example", ".rs"].concat();
+    let registry_host = ["registry.private-corp", ".internal"].concat();
+    for (path, contents) in [
+        (
+            "package-lock.json",
+            format!(
+                "{{\"description\":\"https://{prose_host}/private\",\"resolved\":\"https://{registry_host}/pkg\"}}"
+            ),
+        ),
+        (
+            "Cargo.lock",
+            format!(
+                "version = 3\ndescription = \"https://{prose_host}/private\"\nsource = \"https://{registry_host}/pkg\"\n"
+            ),
+        ),
+    ] {
+        let repository = TestRepository::new(path, contents.as_bytes(), "text");
+
+        let result = repository.bootstrap();
+
+        assert_eq!(
+            status_code(&result),
+            SUCCESS,
+            "{path}: {}",
+            diagnostic(&result)
+        );
+        let manifest = fs::read_to_string(
+            repository
+                .path()
+                .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+        )
+        .expect("should read bootstrap manifest");
+        assert_eq!(
+            manifest.matches("detector = \"domain\"").count(),
+            1,
+            "nonstructural fields must receive general domain scanning without duplicating the structured host: {manifest}"
+        );
+        assert_eq!(
+            manifest.matches("detector = \"lockfile_field\"").count(),
+            1,
+            "the structural field must retain its exact lockfile finding: {manifest}"
+        );
+    }
+}
+
+#[test]
 fn structured_lockfiles_fail_closed_on_non_string_and_duplicate_url_fields() {
     for contents in [
         "version = 3\n\"source\" = \"https://private-corp.internal/index\"\n",
@@ -927,14 +1032,22 @@ fn cargo_lock_ignores_field_decoys_in_comments_and_strings() {
     ] {
         let repository = TestRepository::new("Cargo.lock", contents.as_bytes(), "text");
 
-        let result = repository.scan();
+        let result = repository.bootstrap();
 
         assert_eq!(
             status_code(&result),
             SUCCESS,
-            "field-like TOML text must not be structural: {contents}: {}",
+            "field-like TOML text must remain general scan input: {contents}: {}",
             diagnostic(&result)
         );
+        let manifest = fs::read_to_string(
+            repository
+                .path()
+                .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+        )
+        .expect("should read bootstrap manifest");
+        assert_eq!(manifest.matches("detector = \"domain\"").count(), 1);
+        assert_eq!(manifest.matches("detector = \"lockfile_field\"").count(), 0);
     }
 }
 
@@ -1020,7 +1133,7 @@ fn media_metadata_detector_has_positive_and_typed_allowlisted_fixtures() {
     let contents = png_text_chunk("Author", &value);
     assert_detected("asset.png", &contents, "binary", "media_metadata");
     assert_allowlisted(
-        "asset.png",
+        "tests/asset.png",
         &contents,
         "binary",
         "media_metadata",
@@ -1161,6 +1274,96 @@ fn retired_phrase_matching_does_not_join_code_fragments_across_punctuation() {
     );
 }
 
+#[test]
+fn retired_identifier_matching_trims_common_prose_and_markdown_punctuation() {
+    let token = "OldSecretTerm";
+    let punctuation = [
+        '.', ',', ';', ':', '!', '?', '(', ')', '[', ']', '{', '}', '<', '>', '"', '\'', '`', '*',
+        '~', '|',
+    ];
+    let contents = punctuation
+        .iter()
+        .map(|boundary| format!("{boundary}{token}{boundary}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let repository = TestRepository::new("audit.md", contents.as_bytes(), "text");
+    repository.write_denylist(&retired_record("identifier", token));
+
+    let result = repository.bootstrap();
+
+    assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+    let manifest = fs::read_to_string(
+        repository
+            .path()
+            .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+    )
+    .expect("should read bootstrap manifest");
+    assert_eq!(
+        manifest
+            .matches("detector = \"retired_identifier\"")
+            .count(),
+        punctuation.len(),
+        "every punctuation-delimited occurrence must hash-match case-insensitively: {manifest}"
+    );
+}
+
+#[test]
+fn retired_identifier_matches_paired_markdown_delimiters_without_joining() {
+    let token = "OldSecretTerm";
+    let contents = format!("**{token}** ~~{token}~~ |{token}| Old*SecretTerm");
+    let repository = TestRepository::new("audit.md", contents.as_bytes(), "text");
+    repository.write_denylist(&retired_record("identifier", token));
+
+    let result = repository.bootstrap();
+
+    assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+    let manifest = fs::read_to_string(
+        repository
+            .path()
+            .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+    )
+    .expect("should read bootstrap manifest");
+    assert_eq!(
+        manifest
+            .matches("detector = \"retired_identifier\"")
+            .count(),
+        3,
+        "paired Markdown delimiters must match without joining across punctuation: {manifest}"
+    );
+}
+
+#[test]
+fn binary_retired_selectors_preserve_original_byte_offsets_across_invalid_utf8() {
+    let token = "OldSecretTerm";
+    let mut contents = vec![0xff];
+    contents.extend_from_slice(token.as_bytes());
+    contents.push(0xfe);
+    contents.extend_from_slice(token.as_bytes());
+    let repository = TestRepository::new("archive.bin", &contents, "binary");
+    repository.write_denylist(&retired_record("identifier", token));
+
+    let result = repository.bootstrap();
+
+    assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+    let manifest = fs::read_to_string(
+        repository
+            .path()
+            .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+    )
+    .expect("should read bootstrap manifest");
+    let second_start = 1 + token.len() + 1;
+    for start in [1, second_start] {
+        assert!(
+            manifest.contains(&format!(
+                "selector = \"bytes:{start}-{}\"\nfingerprint = \"{}\"",
+                start + token.len(),
+                fingerprint(token.as_bytes())
+            )),
+            "retired selector must use original binary offsets: {manifest}"
+        );
+    }
+}
+
 fn retired_record(kind: &str, value: &str) -> String {
     let normalized = value
         .split_whitespace()
@@ -1179,17 +1382,27 @@ fn retired_record(kind: &str, value: &str) -> String {
 #[test]
 fn all_five_exception_classes_are_supported_with_narrow_detector_pairings() {
     let fixtures = [
-        ("vendor_url", "domain"),
-        ("hash_pinned_fake_credential_fixture", "credential_shape"),
-        ("historical_example", "email"),
-        ("project_owned_public_domain", "domain"),
+        ("vendor_url", "domain", "notes.txt"),
+        (
+            "hash_pinned_fake_credential_fixture",
+            "credential_shape",
+            "tests/fixture.rs",
+        ),
+        ("historical_example", "email", "tests/archive.txt"),
+        ("project_owned_public_domain", "domain", "notes.txt"),
     ];
-    for (class, detector) in fixtures {
-        let value = match detector {
-            "domain" => format!("https://owned.{}", "private-corp.internal"),
-            "credential_shape" => "fake-credential-value-123".to_owned(),
-            "email" => format!("archived@{}", "private-corp.internal"),
-            "service_id" => "AbCdEf1234567890GhIj".to_owned(),
+    for (class, detector, path) in fixtures {
+        let value = match (class, detector) {
+            ("project_owned_public_domain", "domain") => {
+                format!(
+                    "https://{}/trusted-server/",
+                    ["iabtechlab.github", ".io"].concat()
+                )
+            }
+            (_, "domain") => format!("https://owned.{}", ["private-corp", ".internal"].concat()),
+            (_, "credential_shape") => "fake-credential-value-123".to_owned(),
+            (_, "email") => format!("archived@{}", ["private-corp", ".internal"].concat()),
+            (_, "service_id") => "AbCdEf1234567890GhIj".to_owned(),
             _ => unreachable!("fixture detector should be known"),
         };
         let contents = match detector {
@@ -1197,14 +1410,7 @@ fn all_five_exception_classes_are_supported_with_narrow_detector_pairings() {
             "service_id" => format!("service_id = \"{value}\""),
             _ => value.clone(),
         };
-        assert_allowlisted(
-            "notes.txt",
-            contents.as_bytes(),
-            "text",
-            detector,
-            &value,
-            class,
-        );
+        assert_allowlisted(path, contents.as_bytes(), "text", detector, &value, class);
     }
 }
 
@@ -1641,6 +1847,186 @@ fn project_owned_class_requires_an_exact_or_subdomain_host_boundary() {
         candidates.contains("class = \"vendor_url\"")
             && !candidates.contains("class = \"project_owned_public_domain\""),
         "lookalike host must not inherit project ownership: {candidates}"
+    );
+}
+
+#[test]
+fn exception_classes_require_provable_finding_semantics() {
+    let private = ["owned.private-corp", ".internal"].concat();
+    let private_url = format!("https://{private}/path");
+    for class in ["project_owned_public_domain", "historical_example"] {
+        let repository = TestRepository::new("notes.txt", private_url.as_bytes(), "text");
+        repository.write_allowlist(&exception_for_contents(
+            class,
+            "notes.txt",
+            "domain",
+            private_url.as_bytes(),
+            &private,
+            "2099-01-01T00:00:00Z",
+        ));
+        let result = repository.scan();
+        assert_eq!(
+            status_code(&result),
+            ERROR,
+            "{class} must reject a generic vendor host"
+        );
+    }
+
+    let owned = ["iabtechlab.github", ".io"].concat();
+    let owned_url = format!("https://{owned}/trusted-server/");
+    let repository = TestRepository::new("notes.txt", owned_url.as_bytes(), "text");
+    repository.write_allowlist(&exception_for_contents(
+        "vendor_url",
+        "notes.txt",
+        "domain",
+        owned_url.as_bytes(),
+        &owned,
+        "2099-01-01T00:00:00Z",
+    ));
+    assert_eq!(
+        status_code(&repository.scan()),
+        ERROR,
+        "project-owned hosts must not be mislabeled as vendors"
+    );
+
+    let credential = "abcdefghijklmnop";
+    let contents = format!("{}word={credential}\n", "pass");
+    let repository = TestRepository::new("notes.txt", contents.as_bytes(), "text");
+    repository.write_allowlist(&exception_for_contents(
+        "hash_pinned_fake_credential_fixture",
+        "notes.txt",
+        "credential_shape",
+        contents.as_bytes(),
+        credential,
+        "2099-01-01T00:00:00Z",
+    ));
+    assert_eq!(
+        status_code(&repository.scan()),
+        ERROR,
+        "fixture credentials require fixture-path evidence"
+    );
+
+    let binary_value = format!("historical@{}", ["private-corp", ".internal"].concat());
+    let mut binary = vec![0];
+    binary.extend_from_slice(binary_value.as_bytes());
+    binary.push(0);
+    let repository = TestRepository::new("archive.bin", &binary, "binary");
+    repository.write_allowlist(&exception_for_contents(
+        "historical_example",
+        "archive.bin",
+        "binary_string",
+        &binary,
+        &binary_value,
+        "2099-01-01T00:00:00Z",
+    ));
+    assert_eq!(
+        status_code(&repository.scan()),
+        ERROR,
+        "historical binary records require the approved artifact policy"
+    );
+}
+
+#[test]
+fn fake_credential_class_requires_exact_synthetic_evidence() {
+    for (path, value) in [
+        (".env", "latest-production-secret-123"),
+        ("docs/setup.md", "latest-production-secret-123"),
+        ("docs/setup.md", "contest-production-secret-123"),
+        ("docs/setup.md", "exampled-production-secret-123"),
+    ] {
+        let contents = format!("password={value}\n");
+        let repository = TestRepository::new(path, contents.as_bytes(), "text");
+        repository.write_allowlist(&exception_for_contents(
+            "hash_pinned_fake_credential_fixture",
+            path,
+            "credential_shape",
+            contents.as_bytes(),
+            value,
+            "2099-01-01T00:00:00Z",
+        ));
+        assert_eq!(
+            status_code(&repository.scan()),
+            ERROR,
+            "arbitrary production-looking credential must not qualify in {path}"
+        );
+    }
+
+    for (path, value) in [
+        ("tests/fixture.env", "abcdefghijklmnop123"),
+        ("fixtures/example.env", "abcdefghijklmnop456"),
+        ("config.example.toml", "abcdefghijklmnop789"),
+    ] {
+        let contents = format!("password={value}\n");
+        assert_allowlisted(
+            path,
+            contents.as_bytes(),
+            "text",
+            "credential_shape",
+            value,
+            "hash_pinned_fake_credential_fixture",
+        );
+    }
+}
+
+#[test]
+fn exception_class_detector_cross_misuse_is_rejected() {
+    let domain = format!("service.{}", ["private-corp", ".internal"].concat());
+    let domain_url = format!("https://{domain}/path");
+    for class in ["hash_pinned_fake_credential_fixture", "service_id"] {
+        let repository = TestRepository::new("notes.txt", domain_url.as_bytes(), "text");
+        repository.write_allowlist(&exception_for_contents(
+            class,
+            "notes.txt",
+            "domain",
+            domain_url.as_bytes(),
+            &domain,
+            "2099-01-01T00:00:00Z",
+        ));
+        assert_eq!(
+            status_code(&repository.scan()),
+            ERROR,
+            "{class}/domain must fail"
+        );
+    }
+
+    let credential = "fake-credential-value-123";
+    let credential_text = format!("secret=\"{credential}\"\n");
+    for class in ["vendor_url", "project_owned_public_domain"] {
+        let repository =
+            TestRepository::new("tests/fixture.txt", credential_text.as_bytes(), "text");
+        repository.write_allowlist(&exception_for_contents(
+            class,
+            "tests/fixture.txt",
+            "credential_shape",
+            credential_text.as_bytes(),
+            credential,
+            "2099-01-01T00:00:00Z",
+        ));
+        assert_eq!(
+            status_code(&repository.scan()),
+            ERROR,
+            "{class}/credential_shape must fail"
+        );
+    }
+
+    let lock_value = format!(
+        "https://{}/pkg",
+        ["registry.private-corp", ".internal"].concat()
+    );
+    let lockfile = format!("{{\"resolved\":\"{lock_value}\"}}");
+    let repository = TestRepository::new("package-lock.json", lockfile.as_bytes(), "text");
+    repository.write_allowlist(&exception_for_contents(
+        "historical_example",
+        "package-lock.json",
+        "lockfile_field",
+        lockfile.as_bytes(),
+        &lock_value,
+        "2099-01-01T00:00:00Z",
+    ));
+    assert_eq!(
+        status_code(&repository.scan()),
+        ERROR,
+        "historical lockfile fields must fail"
     );
 }
 
