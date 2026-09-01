@@ -266,6 +266,12 @@ timeout_ms = 2000
 # empty blocks all).
 allowed_context_keys = []
 
+[observability]
+# Keep this leaf present so the environment override can apply; the overlay
+# cannot create a missing configuration leaf. The Server-Timing header stays
+# off until enabled.
+server_timing_enabled = false
+
 # Server-side ad slot templates + creative-opportunity auction. Kept active.
 [creative_opportunities]
 # Set false to disable server-side ad templates while keeping slot definitions
@@ -356,9 +362,15 @@ auction_timeout_ms = 500
 # [tinybird]
 # enabled = true
 # api_host = "api.us-east.tinybird.example"   # required when enabled; host only
-# secret_store = "ts_secrets"                 # Secret Store holding the append token
-# auction_dataset = "auction_events"          # Events API datasource name
-# auction_token_secret = "tinybird_auction_append_token"  # Secret Store key for the token
+# secret_store = "ts_secrets"                 # Secret Store holding append tokens
+# auction_dataset = "auction_events_raw"      # auction Events API datasource
+# auction_token_secret = "tinybird_auction_append_token"
+# auction_enabled = true                       # emit auction telemetry
+# access_enabled = false                       # emit sampled access telemetry
+# access_dataset = "access_logs_raw"          # access Events API datasource
+# access_token_secret = "tinybird_access_append_token"
+# access_sample_rate = 0.0                     # fraction from 0.0 through 1.0
+# max_body_bytes = 1048576                     # maximum NDJSON request body
 
 # Debug endpoints (all default false — never enable in production).
 # [debug]

@@ -1,19 +1,39 @@
 DESCRIPTION >
-  Optional sampled Trusted Server access telemetry rows. Disabled by default in Fastly config.
+  Per-request phase-timing telemetry rows, sampled and emitted post-send by the edge service.
 
 SCHEMA >
-  `event_ts` DateTime64(3),
-  `method` LowCardinality(String),
-  `path` String,
-  `status` UInt16,
-  `time_elapsed_ms` UInt32,
-  `cache_state` LowCardinality(Nullable(String)),
-  `country` LowCardinality(String),
-  `sample_rate` Float64,
-  `event_date` Date DEFAULT toDate(event_ts)
+  `event_ts` DateTime64(3) `json:$.event_ts`,
+  `method` LowCardinality(String) `json:$.method`,
+  `status` UInt16 `json:$.status`,
+  `time_elapsed_ms` Nullable(UInt32) `json:$.time_elapsed_ms`,
+  `sample_rate` Float64 `json:$.sample_rate`,
+  `service_id` LowCardinality(String) `json:$.service_id`,
+  `publisher_domain` LowCardinality(String) `json:$.publisher_domain`,
+  `env` LowCardinality(String) `json:$.env`,
+  `route_class` LowCardinality(String) `json:$.route_class`,
+  `route_template` String `json:$.route_template`,
+  `body_mode` LowCardinality(String) `json:$.body_mode`,
+  `auction_wait_placement` LowCardinality(String) `json:$.auction_wait_placement`,
+  `appbuild_ms` Nullable(UInt32) `json:$.appbuild_ms`,
+  `filter_ms` Nullable(UInt32) `json:$.filter_ms`,
+  `geo_ms` Nullable(UInt32) `json:$.geo_ms`,
+  `kv_ms` Nullable(UInt32) `json:$.kv_ms`,
+  `origin_ms` Nullable(UInt32) `json:$.origin_ms`,
+  `template_cache_ms` Nullable(UInt32) `json:$.template_cache_ms`,
+  `auction_wait_ms` Nullable(UInt32) `json:$.auction_wait_ms`,
+  `stream_ms` Nullable(UInt32) `json:$.stream_ms`,
+  `request_elapsed_ms` Nullable(UInt32) `json:$.request_elapsed_ms`,
+  `resp_bytes` Nullable(UInt64) `json:$.resp_bytes`,
+  `template_cache_state` LowCardinality(String) `json:$.template_cache_state`,
+  `country` LowCardinality(String) `json:$.country`,
+  `ts_version` LowCardinality(String) `json:$.ts_version`,
+  `pop` LowCardinality(String) `json:$.pop`
 
 ENGINE "MergeTree"
-ENGINE_SORTING_KEY "event_date, path, status, method"
-TTL "event_date + INTERVAL 30 DAY"
+ENGINE_SORTING_KEY "toDate(event_ts), service_id, publisher_domain, env, route_class, pop, status"
+TTL "toDate(event_ts) + INTERVAL 30 DAY"
+
+FORWARD_QUERY >
+  SELECT event_ts, method, status, time_elapsed_ms, sample_rate, service_id, publisher_domain, env, route_class, route_template, body_mode, auction_wait_placement, appbuild_ms, filter_ms, geo_ms, kv_ms, origin_ms, template_cache_ms, auction_wait_ms, stream_ms, request_elapsed_ms, resp_bytes, template_cache_state, country, ts_version, pop
 
 TOKEN ts_access_ingest APPEND

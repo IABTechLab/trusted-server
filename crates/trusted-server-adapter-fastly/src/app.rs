@@ -98,6 +98,7 @@ use edgezero_core::http::{
 };
 use edgezero_core::router::RouterService;
 use error_stack::Report;
+use trusted_server_core::access_telemetry::{RouteClass, RouteMetadata, publisher_route_template};
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
@@ -114,12 +115,15 @@ use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::geo::GeoLookupState;
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
 };
-use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
+use trusted_server_core::platform::{
+    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, TimedKvStore,
+};
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
@@ -133,6 +137,7 @@ use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
 };
+use trusted_server_core::request_timing::{Phase, RequestTimings};
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::{
     default_config_key, default_config_store_name, get_settings_from_config_store,
@@ -220,13 +225,18 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
 pub(crate) fn runtime_services_for_consent_route(
     settings: &Settings,
     runtime_services: &RuntimeServices,
+    timings: &RequestTimings,
 ) -> Result<RuntimeServices, Report<TrustedServerError>> {
     let Some(store_name) = settings.consent.consent_store.as_deref() else {
         return Ok(runtime_services.clone());
     };
 
     open_kv_store(store_name)
-        .map(|store| runtime_services.clone().with_kv_store(store))
+        .map(|store| {
+            let timed_store =
+                Arc::new(TimedKvStore::new(store, timings.clone())) as Arc<dyn PlatformKvStore>;
+            runtime_services.clone().with_kv_store(timed_store)
+        })
         .map_err(|e| {
             Report::new(TrustedServerError::KvStore {
                 store_name: store_name.to_string(),
@@ -294,6 +304,12 @@ fn uses_dynamic_tsjs_fallback(method: &Method, path: &str) -> bool {
     *method == Method::GET && path.starts_with("/static/tsjs=")
 }
 
+/// Coarse route template for every `tsjs` bundle request, used as the
+/// `route_template` in the [`RouteMetadata`] attached by the tsjs branch of
+/// [`dispatch_fallback`]. Actual filenames vary by module/hash; the prefix
+/// alone is the route identity that matters for access telemetry.
+const TSJS_ROUTE_TEMPLATE: &str = "/static/tsjs=*";
+
 // ---------------------------------------------------------------------------
 // EC request state
 // ---------------------------------------------------------------------------
@@ -355,6 +371,17 @@ impl EcRequestState {
             services: self.services,
         }
     }
+
+    /// Derives the carried [`GeoLookupState`] from this request's geo lookup
+    /// outcome, so response-phase finalize can reuse it instead of repeating
+    /// the lookup. `build_ec_request_state` always attempts the lookup, so
+    /// `None` here means the lookup ran and failed, not that it was skipped.
+    fn geo_lookup_state(&self) -> GeoLookupState {
+        match &self.geo_info {
+            Some(info) => GeoLookupState::Resolved(info.clone()),
+            None => GeoLookupState::Attempted,
+        }
+    }
 }
 
 /// Derives device signals from the request's `User-Agent` header.
@@ -410,13 +437,21 @@ fn build_ec_request_state(
     let eids_cookie = crate::extract_cookie_value(req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(req, COOKIE_SHAREDID);
 
-    let geo_info = services
-        .geo()
-        .lookup(services.client_info().client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed during EC setup: {e}");
-            None
-        });
+    let timings = req
+        .extensions()
+        .get::<RequestTimings>()
+        .cloned()
+        .unwrap_or_default();
+    let geo_info = {
+        let _span = timings.span(Phase::Geo);
+        services
+            .geo()
+            .lookup(services.client_info().client_ip)
+            .unwrap_or_else(|e| {
+                log::warn!("geo lookup failed during EC setup: {e}");
+                None
+            })
+    };
 
     let (ec_context, setup_error) =
         match EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref()) {
@@ -430,7 +465,7 @@ fn build_ec_request_state(
     // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
     // consent withdrawals. Revocations keep the write path so tombstones stay
     // authoritative even for privacy-extension-heavy clients.
-    let kv_graph = crate::maybe_identity_graph(settings);
+    let kv_graph = crate::identity_graph_with_timing(settings, &timings);
     let finalize_kv_graph = if setup_error.is_none()
         && (is_real_browser || ec_consent_withdrawn(ec_context.consent()))
     {
@@ -482,6 +517,18 @@ async fn run_pre_route_filters(
     req: &mut Request,
     geo_info: Option<&GeoInfo>,
 ) -> PreRoute {
+    // Only recorded when a filter is actually registered, so unconfigured
+    // deployments omit ts-filter from the Server-Timing header entirely.
+    let timings = req
+        .extensions()
+        .get::<RequestTimings>()
+        .cloned()
+        .unwrap_or_default();
+    let _span = state
+        .registry
+        .has_request_filters()
+        .then(|| timings.span(Phase::Filter));
+
     match state
         .registry
         .filter_request(RequestFilterRegistryInput {
@@ -515,6 +562,7 @@ fn attach_dispatch_extensions(
     ec: EcRequestState,
     effects: RequestFilterEffects,
 ) -> Response {
+    response.extensions_mut().insert(ec.geo_lookup_state());
     response.extensions_mut().insert(ec.into_finalize_state());
     if !effects.response_headers.is_empty() {
         response.extensions_mut().insert(effects);
@@ -551,7 +599,12 @@ async fn execute_named(
                     // Deliberately do not use an EC request-state graph: that
                     // copy is bot-gated, while operators use curl for this
                     // authenticated diagnostic.
-                    let kv = crate::maybe_identity_graph(&state.settings);
+                    let timings = req
+                        .extensions()
+                        .get::<RequestTimings>()
+                        .cloned()
+                        .unwrap_or_default();
+                    let kv = crate::identity_graph_with_timing(&state.settings, &timings);
                     handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
                 }
                 NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
@@ -622,7 +675,12 @@ async fn run_named_route(
             if req.method() == Method::OPTIONS {
                 cors_preflight_identify(&state.settings, &req)
             } else {
-                let kv = crate::require_identity_graph(&state.settings)?;
+                let timings = req
+                    .extensions()
+                    .get::<RequestTimings>()
+                    .cloned()
+                    .unwrap_or_default();
+                let kv = crate::require_identity_graph_with_timing(&state.settings, &timings)?;
                 let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
                 handle_identify(
                     &state.settings,
@@ -639,7 +697,13 @@ async fn run_named_route(
             // The auction reads consent data, so the consent KV store must be
             // available — fail closed with 503 when it is configured but
             // cannot be opened, matching legacy behavior.
-            let consent_services = runtime_services_for_consent_route(&state.settings, services)?;
+            let timings = req
+                .extensions()
+                .get::<RequestTimings>()
+                .cloned()
+                .unwrap_or_default();
+            let consent_services =
+                runtime_services_for_consent_route(&state.settings, services, &timings)?;
             let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
             let registry_ref = if partner_registry.is_empty() {
                 None
@@ -667,7 +731,13 @@ async fn run_named_route(
             // Like the auction, page-bids reads consent data, so the consent KV
             // store must be available — fail closed with 503 when configured but
             // unopenable, matching legacy.
-            let consent_services = runtime_services_for_consent_route(&state.settings, services)?;
+            let timings = req
+                .extensions()
+                .get::<RequestTimings>()
+                .cloned()
+                .unwrap_or_default();
+            let consent_services =
+                runtime_services_for_consent_route(&state.settings, services, &timings)?;
             let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
             let registry_ref = if partner_registry.is_empty() {
                 None
@@ -712,12 +782,18 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
     let is_real_browser = device_signals.looks_like_browser();
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
+    let timings = req
+        .extensions()
+        .get::<RequestTimings>()
+        .cloned()
+        .unwrap_or_default();
 
-    let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
-        let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
-        let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-        handle_batch_sync(&kv, &partner_registry, &limiter, req)
-    });
+    let result =
+        crate::require_identity_graph_with_timing(&state.settings, &timings).and_then(|kv| {
+            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+            let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
+            handle_batch_sync(&kv, &partner_registry, &limiter, req)
+        });
 
     let mut response = result.unwrap_or_else(|e| http_error(&e));
     // Legacy parity: batch-sync responses still pass through
@@ -777,12 +853,28 @@ async fn dispatch_fallback(
         PreRoute::Continue { effects } => effects,
     };
 
+    // Assigned exactly once, per branch below, alongside the routing
+    // decision itself, so the access-telemetry route identity always
+    // reflects which branch actually dispatched the request — including
+    // when that branch's handler errors. The asset-route sub-branch is an
+    // early return handled separately by `dispatch_asset_fallback`, so it
+    // never reaches (or needs to assign) this binding.
+    let route_metadata: Option<RouteMetadata>;
+
     let result = if uses_dynamic_tsjs_fallback(&method, &path) {
+        route_metadata = Some(RouteMetadata {
+            route_class: RouteClass::Tsjs,
+            route_template: TSJS_ROUTE_TEMPLATE.to_owned(),
+        });
         handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SurrogateControl)
     } else if state.registry.has_route(&method, &path) {
         // Integration-proxy responses are not bounded by
         // publisher.max_buffered_body_bytes. Publisher fallback below uses the
         // publisher-specific streaming finalizer instead.
+        route_metadata = Some(RouteMetadata {
+            route_class: RouteClass::IntegrationProxy,
+            route_template: publisher_route_template(&path),
+        });
         state
             .registry
             .handle_proxy(ProxyDispatchInput {
@@ -810,8 +902,30 @@ async fn dispatch_fallback(
             .then(|| state.settings.asset_route_for_path(&path))
             .flatten();
         if let Some(asset_route) = matched_asset_route {
-            return dispatch_asset_fallback(state, services, req, asset_route, &effects).await;
+            // The template is the operator-configured route prefix, so it
+            // is bounded and content-free by construction (unlike request
+            // paths, which need `publisher_route_template`).
+            let asset_metadata = RouteMetadata {
+                route_class: RouteClass::Asset,
+                route_template: format!("{}/*", asset_route.prefix.trim_end_matches('/')),
+            };
+            let mut response = dispatch_asset_fallback(
+                state,
+                services,
+                req,
+                asset_route,
+                &effects,
+                ec.geo_lookup_state(),
+            )
+            .await;
+            response.extensions_mut().insert(asset_metadata);
+            return response;
         }
+
+        route_metadata = Some(RouteMetadata {
+            route_class: RouteClass::PublisherHtml,
+            route_template: publisher_route_template(&path),
+        });
 
         // Generate an EC ID if needed — mirrors the legacy catch-all arm.
         // Only for document navigations by recognised browsers; subresource
@@ -828,7 +942,12 @@ async fn dispatch_fallback(
         // Publisher pages read consent data, so the consent KV store must be
         // available — fail closed with 503 when it is configured but cannot
         // be opened, matching legacy behavior.
-        match runtime_services_for_consent_route(&state.settings, services) {
+        let timings = req
+            .extensions()
+            .get::<RequestTimings>()
+            .cloned()
+            .unwrap_or_default();
+        match runtime_services_for_consent_route(&state.settings, services, &timings) {
             Ok(publisher_services) => {
                 // Run the server-side auction with the configured creative-
                 // opportunity slots and collect dispatched bids from the lazy
@@ -876,7 +995,10 @@ async fn dispatch_fallback(
         }
     };
 
-    let response = result.unwrap_or_else(|e| http_error(&e));
+    let mut response = result.unwrap_or_else(|e| http_error(&e));
+    if let Some(metadata) = route_metadata {
+        response.extensions_mut().insert(metadata);
+    }
     attach_dispatch_extensions(response, ec, effects)
 }
 
@@ -900,7 +1022,10 @@ fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
 /// [`AssetProxyCachePolicy`] out via response extensions so `edgezero_main`
 /// can reapply protected cache directives after finalization. EC finalization
 /// is intentionally skipped: no [`EcFinalizeState`] is attached, matching the
-/// legacy `should_finalize_ec = false` behavior for asset responses.
+/// legacy `should_finalize_ec = false` behavior for asset responses. The
+/// caller's [`GeoLookupState`] is still attached, since `build_ec_request_state`
+/// already attempted the lookup before the asset route was matched — this is
+/// the one exit path that carries geo state without an `EcFinalizeState`.
 ///
 /// Like legacy `route_request`, asset bodies are streamed straight to the client
 /// with no cap: the origin stream is attached to the response and `edgezero_main`
@@ -915,6 +1040,7 @@ async fn dispatch_asset_fallback(
     req: Request,
     asset_route: &ProxyAssetRoute,
     effects: &RequestFilterEffects,
+    geo_state: GeoLookupState,
 ) -> Response {
     log::info!("No explicit route matched; proxying via configured asset route");
 
@@ -936,6 +1062,7 @@ async fn dispatch_asset_fallback(
             }
 
             response.extensions_mut().insert(cache_policy);
+            response.extensions_mut().insert(geo_state);
             attach_request_filter_effects(&mut response, effects);
             response
         }
@@ -944,6 +1071,7 @@ async fn dispatch_asset_fallback(
             response
                 .extensions_mut()
                 .insert(AssetProxyCachePolicy::NoStorePrivate);
+            response.extensions_mut().insert(geo_state);
             attach_request_filter_effects(&mut response, effects);
             response
         }
@@ -1066,6 +1194,10 @@ struct NamedRoute {
     path: &'static str,
     primary_methods: &'static [Method],
     handler: NamedRouteHandler,
+    /// Access-telemetry traffic category for this row. Attached verbatim
+    /// alongside `path` (the route-table pattern) to every response this
+    /// route produces — see [`named_route_handler`].
+    route_class: RouteClass,
 }
 
 const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
@@ -1083,21 +1215,25 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/.well-known/trusted-server.json",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::TrustedServerDiscovery,
+        route_class: RouteClass::Other,
     },
     NamedRoute {
         path: "/verify-signature",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::VerifySignature,
+        route_class: RouteClass::Ec,
     },
     NamedRoute {
         path: "/_ts/admin/keys/rotate",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::RotateKey,
+        route_class: RouteClass::Ec,
     },
     NamedRoute {
         path: "/_ts/admin/keys/deactivate",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::DeactivateKey,
+        route_class: RouteClass::Ec,
     },
     // Admin EC lookup: the bare route reads the EC ID from the caller's
     // `ts-ec` cookie; the parameterized route takes an explicit EC ID.
@@ -1105,11 +1241,13 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/admin/ec",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::AdminEcLookup,
+        route_class: RouteClass::Ec,
     },
     NamedRoute {
         path: "/_ts/admin/ec/{id}",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::AdminEcLookup,
+        route_class: RouteClass::Ec,
     },
     // Admin EIDs echo: decodes the request's ts-eids/sharedId cookies with
     // an ingestion preview. Pure request inspection — no KV access.
@@ -1117,6 +1255,7 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/admin/eids",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::AdminEidsLookup,
+        route_class: RouteClass::Ec,
     },
     // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with a
     // 404 instead of executing key operations: the production basic-auth handler
@@ -1128,36 +1267,43 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/admin/keys/rotate",
         primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::LegacyAdminDenied,
+        route_class: RouteClass::Other,
     },
     NamedRoute {
         path: "/admin/keys/deactivate",
         primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::LegacyAdminDenied,
+        route_class: RouteClass::Other,
     },
     NamedRoute {
         path: "/_ts/api/v1/batch-sync",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::BatchSync,
+        route_class: RouteClass::Ec,
     },
     NamedRoute {
         path: "/_ts/api/v1/identify",
         primary_methods: &[Method::GET, Method::OPTIONS],
         handler: NamedRouteHandler::Identify,
+        route_class: RouteClass::Ec,
     },
     NamedRoute {
         path: "/_ts/set-tester",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::SetTester,
+        route_class: RouteClass::Other,
     },
     NamedRoute {
         path: "/_ts/clear-tester",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::ClearTester,
+        route_class: RouteClass::Other,
     },
     NamedRoute {
         path: "/auction",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::Auction,
+        route_class: RouteClass::AuctionApi,
     },
     // GET runs the SPA re-auction; OPTIONS is denied in-handler as a CORS
     // preflight guard for this side-effecting endpoint.
@@ -1165,6 +1311,7 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: PAGE_BIDS_PATH,
         primary_methods: &[Method::GET, Method::OPTIONS],
         handler: NamedRouteHandler::PageBids,
+        route_class: RouteClass::AuctionApi,
     },
     // Deprecated double-underscore alias. tsjs bundles served before the
     // `/_ts/page-bids` rename keep requesting this path from already-loaded
@@ -1175,21 +1322,29 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: PAGE_BIDS_LEGACY_PATH,
         primary_methods: &[Method::GET, Method::OPTIONS],
         handler: NamedRouteHandler::PageBids,
+        route_class: RouteClass::AuctionApi,
     },
+    // Classified `Other` rather than `IntegrationProxy`: that class is
+    // reserved for `state.registry.handle_proxy` (the js-integration proxy
+    // dispatch in `dispatch_fallback`), which these first-party proxy routes
+    // do not go through.
     NamedRoute {
         path: "/first-party/proxy",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::FirstPartyProxy,
+        route_class: RouteClass::Other,
     },
     NamedRoute {
         path: "/first-party/click",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::FirstPartyClick,
+        route_class: RouteClass::Other,
     },
     NamedRoute {
         path: "/first-party/sign",
         primary_methods: &[Method::GET, Method::POST],
         handler: NamedRouteHandler::FirstPartySign,
+        route_class: RouteClass::Other,
     },
     NamedRoute {
         path: "/first-party/proxy-rebuild",
@@ -1198,16 +1353,35 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         // POST is blocked by CORS and the guard navigates here for a 302 instead.
         primary_methods: &[Method::GET, Method::POST],
         handler: NamedRouteHandler::FirstPartyProxyRebuild,
+        route_class: RouteClass::Other,
     },
 ];
 
+/// Wraps [`execute_named`], attaching a [`RouteMetadata`] extension carrying
+/// `route_class` and the route-table pattern (`route_template`, verbatim,
+/// with parameters left as placeholders) to every response the handler
+/// produces — including its early-return diagnostic and setup-error arms,
+/// since the attachment happens once around the whole future rather than in
+/// each branch.
 fn named_route_handler(
     state: Arc<AppState>,
     handler: NamedRouteHandler,
+    route_class: RouteClass,
+    route_template: &'static str,
 ) -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
     move |ctx: RequestContext| {
         let state = Arc::clone(&state);
-        Box::pin(execute_named(state, ctx, handler))
+        Box::pin(async move {
+            execute_named(state, ctx, handler)
+                .await
+                .map(|mut response| {
+                    response.extensions_mut().insert(RouteMetadata {
+                        route_class,
+                        route_template: route_template.to_owned(),
+                    });
+                    response
+                })
+        })
     }
 }
 
@@ -1266,7 +1440,12 @@ impl TrustedServerApp {
                 router = router.route(
                     route.path,
                     method.clone(),
-                    named_route_handler(Arc::clone(state), route.handler),
+                    named_route_handler(
+                        Arc::clone(state),
+                        route.handler,
+                        route.route_class,
+                        route.path,
+                    ),
                 );
             }
 
@@ -1307,15 +1486,18 @@ mod tests {
 
     use super::{
         AppState, AuctionDispatch, EcContext, EdgeCacheHeader, HandlerFuture, NAMED_ROUTES,
-        NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, TrustedServerApp,
-        build_per_request_services, build_state_from_settings, handle_publisher_request,
-        publisher_response_into_streaming_response, startup_error_router,
+        NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RouteClass, RouteMetadata,
+        TSJS_ROUTE_TEMPLATE, TrustedServerApp, build_per_request_services,
+        build_state_from_settings, handle_publisher_request,
+        publisher_response_into_streaming_response, publisher_route_template, startup_error_router,
     };
     use base64::Engine as _;
     use bytes::Bytes;
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
-    use edgezero_core::http::{Method, Response, StatusCode, header, request_builder};
+    use edgezero_core::http::{
+        Method, Response, StatusCode, header, request_builder, response_builder,
+    };
     use edgezero_core::key_value_store::NoopKvStore;
     use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
@@ -1324,20 +1506,23 @@ mod tests {
     use error_stack::Report;
     use futures::executor::block_on;
     use serde_json::json;
-    use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
+    use trusted_server_core::constants::{HEADER_X_GEO_COUNTRY, HEADER_X_GEO_INFO_AVAILABLE};
     use trusted_server_core::ec::device::DeviceSignals;
     use trusted_server_core::error::TrustedServerError;
+    use trusted_server_core::geo::GeoLookupState;
     use trusted_server_core::integrations::{
         HeaderMutation, IntegrationRegistry, IntegrationRequestFilter, RequestFilterDecision,
         RequestFilterEffects, RequestFilterInput,
     };
     use trusted_server_core::platform::{
-        ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, PlatformHttpClient,
-        PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
-        PlatformSelectResult, PlatformTemplateCache, PlatformTemplateCacheReservation,
-        RuntimeServices, TemplateCacheError, TemplateCacheKey, TemplateCacheLookup,
-        TemplateCacheMiss, TemplateCacheReservation, TemplateEntry, TemplateMetadata,
+        ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformError, PlatformGeo,
+        PlatformHttpClient, PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest,
+        PlatformResponse, PlatformSelectResult, PlatformTemplateCache,
+        PlatformTemplateCacheReservation, RuntimeServices, TemplateCacheError, TemplateCacheKey,
+        TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation, TemplateEntry,
+        TemplateMetadata,
     };
+    use trusted_server_core::request_timing::RequestTimings;
     use trusted_server_core::settings::Settings;
 
     fn settings_with_missing_consent_store() -> Settings {
@@ -1483,19 +1668,19 @@ mod tests {
         );
     }
 
-    /// Builds a router whose `AppState` uses a registry containing the given
-    /// request filters (and no routes), so dispatch-level request-filter
-    /// behavior can be exercised without a real integration.
-    fn router_with_request_filters(
+    /// Builds an `AppState` whose registry contains the given request
+    /// filters (and no routes), so dispatch-level request-filter behavior can
+    /// be exercised without a real integration.
+    fn state_with_request_filters(
         filters: Vec<Arc<dyn IntegrationRequestFilter>>,
-    ) -> RouterService {
+    ) -> Arc<AppState> {
         let settings = test_settings();
         let orchestrator = trusted_server_core::auction::build_orchestrator(&settings)
             .expect("should build orchestrator");
         let registry = IntegrationRegistry::from_request_filters(filters);
         let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
-        let state = Arc::new(super::AppState {
+        Arc::new(super::AppState {
             auction_telemetry_sink: Arc::new(
                 trusted_server_core::auction::NoopAuctionTelemetrySink,
             ),
@@ -1503,8 +1688,15 @@ mod tests {
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
             default_kv_store,
-        });
-        TrustedServerApp::routes_for_state(&state)
+        })
+    }
+
+    /// Builds a router on top of [`state_with_request_filters`] so
+    /// dispatch-level request-filter behavior can be exercised end-to-end.
+    fn router_with_request_filters(
+        filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    ) -> RouterService {
+        TrustedServerApp::routes_for_state(&state_with_request_filters(filters))
     }
 
     /// Continues routing while mutating the request and emitting a response
@@ -2128,6 +2320,111 @@ mod tests {
         );
     }
 
+    /// `Authorization: Basic` header value for `test_settings()`'s
+    /// `^/_ts/admin` handler (`admin` / `admin-pass`).
+    fn admin_basic_auth_header() -> edgezero_core::http::HeaderValue {
+        let credentials = base64::engine::general_purpose::STANDARD.encode("admin:admin-pass");
+        format!("Basic {credentials}")
+            .parse()
+            .expect("should parse basic-auth header value")
+    }
+
+    #[test]
+    fn named_route_attaches_the_table_pattern_verbatim_even_with_a_real_id_in_the_path() {
+        // A named-route response must carry the route-TABLE pattern
+        // (`{id}` left as a placeholder), never the caller's actual matched
+        // path segment — this is what keeps a real EC identifier out of
+        // access telemetry, independent of anything the row-serialization
+        // layer does.
+        let router = test_router();
+        let ec_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test01";
+        let mut req = empty_request(Method::GET, &format!("/_ts/admin/ec/{ec_id}"));
+        req.headers_mut()
+            .insert(header::AUTHORIZATION, admin_basic_auth_header());
+        let response = route(&router, req);
+
+        let metadata = response
+            .extensions()
+            .get::<RouteMetadata>()
+            .expect("named-route responses should carry RouteMetadata");
+        assert_eq!(metadata.route_class, RouteClass::Ec);
+        assert_eq!(metadata.route_template, "/_ts/admin/ec/{id}");
+        assert!(
+            !metadata.route_template.contains(ec_id),
+            "the attached template must never contain the matched id"
+        );
+    }
+
+    #[test]
+    fn named_route_attaches_metadata_even_on_a_read_only_diagnostic_early_return() {
+        // AdminEidsLookup is handled by an early-return arm inside
+        // execute_named, before the normal EC lifecycle runs (see the
+        // "read-only diagnostics" comment there). named_route_handler wraps
+        // the whole future, so the attachment must still happen here too.
+        let router = test_router();
+        let mut req = empty_request(Method::GET, "/_ts/admin/eids");
+        req.headers_mut()
+            .insert(header::AUTHORIZATION, admin_basic_auth_header());
+        let response = route(&router, req);
+
+        let metadata = response
+            .extensions()
+            .get::<RouteMetadata>()
+            .expect("even a read-only diagnostic early-return response should carry RouteMetadata");
+        assert_eq!(metadata.route_class, RouteClass::Ec);
+        assert_eq!(metadata.route_template, "/_ts/admin/eids");
+    }
+
+    #[test]
+    fn tsjs_fallback_attaches_tsjs_route_metadata() {
+        let router = test_router();
+        let response = route(
+            &router,
+            empty_request(Method::GET, "/static/tsjs=tsjs-unified.min.js"),
+        );
+
+        let metadata = response
+            .extensions()
+            .get::<RouteMetadata>()
+            .expect("tsjs fallback responses should carry RouteMetadata");
+        assert_eq!(metadata.route_class, RouteClass::Tsjs);
+        assert_eq!(metadata.route_template, TSJS_ROUTE_TEMPLATE);
+    }
+
+    #[test]
+    fn integration_proxy_fallback_attaches_integration_proxy_route_metadata() {
+        // test_settings() enables the prebid integration, which registers a
+        // proxy route at /integrations/prebid/bundle.js.
+        let router = test_router();
+        let response = route(
+            &router,
+            empty_request(Method::GET, "/integrations/prebid/bundle.js"),
+        );
+
+        let metadata = response
+            .extensions()
+            .get::<RouteMetadata>()
+            .expect("integration-proxy fallback responses should carry RouteMetadata");
+        assert_eq!(metadata.route_class, RouteClass::IntegrationProxy);
+        assert_eq!(
+            metadata.route_template,
+            publisher_route_template("/integrations/prebid/bundle.js")
+        );
+    }
+
+    #[test]
+    fn publisher_fallback_attaches_publisher_html_route_metadata() {
+        let router = test_router();
+        let response = route(&router, empty_request(Method::GET, "/news/some-article"));
+
+        let metadata = response
+            .extensions()
+            .get::<RouteMetadata>()
+            .expect("publisher fallback responses should carry RouteMetadata");
+        assert_eq!(metadata.route_class, RouteClass::PublisherHtml);
+        assert_eq!(metadata.route_template, "/news/*");
+    }
+
     #[test]
     fn browser_device_signals_from_extension_reach_ec_finalize_state() {
         // Regression guard for the EdgeZero JA4/H2 signal loss: `edgezero_main`
@@ -2548,6 +2845,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn asset_fallback_carries_geo_state_without_ec_finalize_state() {
+        // The asset-route fallback is the one exit path that skips
+        // EcFinalizeState but must still carry GeoLookupState, since
+        // build_ec_request_state (and its geo lookup) already ran before the
+        // asset route was matched. Without this, the finalize step would
+        // silently repeat the lookup for every asset request.
+        let settings = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.image/"
+            origin_url = "https://assets.example.com"
+            "#,
+        )
+        .expect("should parse asset-route settings");
+        let state = build_state_from_settings(settings).expect("should build state");
+        let router = TrustedServerApp::routes_for_state(&state);
+
+        let response = route(&router, empty_request(Method::GET, "/.image/banner.png"));
+
+        assert!(
+            response.extensions().get::<GeoLookupState>().is_some(),
+            "asset-route responses should still carry GeoLookupState even though \
+             EC finalization is skipped"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .is_none(),
+            "asset-route responses must skip EC finalization (no EcFinalizeState)"
+        );
+    }
+
     struct FixedBackend;
 
     impl PlatformBackend for FixedBackend {
@@ -2958,6 +3310,7 @@ mod tests {
             req,
             asset_route,
             &effects,
+            trusted_server_core::geo::GeoLookupState::NotAttempted,
         ));
 
         assert_eq!(
@@ -2998,6 +3351,259 @@ mod tests {
         assert!(
             !response.headers().contains_key(header::CONTENT_LENGTH),
             "processed streaming publisher responses must not carry a stale Content-Length"
+        );
+    }
+
+    /// A [`PlatformGeo`] stub that counts every `lookup` call and always
+    /// returns the same canned result, used to prove the request-phase geo
+    /// lookup is never repeated during finalize.
+    struct CountingGeo {
+        calls: Arc<AtomicUsize>,
+        result: Option<GeoInfo>,
+    }
+
+    impl PlatformGeo for CountingGeo {
+        fn lookup(&self, _: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.result.clone())
+        }
+    }
+
+    fn sample_geo_info() -> GeoInfo {
+        GeoInfo {
+            city: "Testville".to_string(),
+            country: "US".to_string(),
+            continent: "NorthAmerica".to_string(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: None,
+            asn: None,
+        }
+    }
+
+    fn runtime_services_with_geo(geo: Arc<dyn PlatformGeo>) -> RuntimeServices {
+        RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
+            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
+            .backend(Arc::new(FixedBackend))
+            .http_client(Arc::new(StreamingHttpClient))
+            .geo(geo)
+            .client_info(ClientInfo::default())
+            .build()
+    }
+
+    #[test]
+    fn finalize_reuses_request_phase_geo_without_second_lookup() {
+        // Dispatching a publisher route runs build_ec_request_state, which
+        // attempts the geo lookup once and carries the result via
+        // GeoLookupState. The finalize step (resolve_geo_for_response) must
+        // reuse that carried value instead of calling the geo backend again.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let geo = Arc::new(CountingGeo {
+            calls: Arc::clone(&calls),
+            result: Some(sample_geo_info()),
+        });
+        let state = app_state_for_settings(test_settings());
+        let services = runtime_services_with_geo(geo);
+        let req = empty_request(Method::GET, "/some-page");
+
+        let response = block_on(super::dispatch_fallback(&state, &services, req));
+
+        let carried = response
+            .extensions()
+            .get::<GeoLookupState>()
+            .cloned()
+            .expect("dispatch should attach GeoLookupState");
+        assert!(
+            matches!(carried, GeoLookupState::Resolved(_)),
+            "a successful lookup should carry Resolved"
+        );
+
+        let geo_info =
+            crate::middleware::resolve_geo_for_response(&response, &carried, None, |_| {
+                panic!("finalize must not repeat a resolved geo lookup");
+            });
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the request-phase lookup should have run"
+        );
+
+        let mut response = response;
+        geo_info
+            .expect("geo info should have resolved")
+            .set_response_headers(&mut response);
+        assert!(
+            response.headers().get(HEADER_X_GEO_COUNTRY).is_some(),
+            "x-geo-country should still be set on the response after reusing the carried geo"
+        );
+    }
+
+    #[test]
+    fn failed_lookup_is_not_retried() {
+        // When the request-phase lookup fails (returns None), dispatch must
+        // carry GeoLookupState::Attempted rather than NotAttempted, and
+        // finalize must not retry it.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let geo = Arc::new(CountingGeo {
+            calls: Arc::clone(&calls),
+            result: None,
+        });
+        let state = app_state_for_settings(test_settings());
+        let services = runtime_services_with_geo(geo);
+        let req = empty_request(Method::GET, "/some-page");
+
+        let response = block_on(super::dispatch_fallback(&state, &services, req));
+
+        let carried = response
+            .extensions()
+            .get::<GeoLookupState>()
+            .cloned()
+            .expect("dispatch should attach GeoLookupState even for a failed lookup");
+        assert!(
+            matches!(carried, GeoLookupState::Attempted),
+            "a failed lookup should carry Attempted, not Resolved or NotAttempted"
+        );
+
+        let geo_info =
+            crate::middleware::resolve_geo_for_response(&response, &carried, None, |_| {
+                panic!("finalize must not retry a failed geo lookup");
+            });
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the request-phase lookup should have run"
+        );
+        assert!(
+            geo_info.is_none(),
+            "no geo info should be available after a failed lookup"
+        );
+    }
+
+    #[test]
+    fn filter_span_recorded_when_request_filter_runs() {
+        // The Filter phase span should only be recorded when the registry
+        // actually has a request filter registered, so unconfigured
+        // deployments omit ts-filter from the Server-Timing header entirely.
+        let state = state_with_request_filters(vec![Arc::new(RecordingRequestFilter)]);
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
+            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
+            .backend(Arc::new(FixedBackend))
+            .http_client(Arc::new(StreamingHttpClient))
+            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .client_info(ClientInfo::default())
+            .build();
+        let mut req = empty_request(Method::GET, "/some-page");
+        let timings = RequestTimings::new();
+        req.extensions_mut().insert(timings.clone());
+
+        let _ = block_on(super::run_pre_route_filters(
+            &state, &services, &mut req, None,
+        ));
+
+        assert!(
+            timings.snapshot().filter_ms.is_some(),
+            "should record the Filter phase span when a request filter is registered and runs"
+        );
+    }
+
+    #[test]
+    fn filter_span_not_recorded_when_no_request_filters_registered() {
+        // Mirror test: an empty registry must never record the Filter span,
+        // even though run_pre_route_filters still runs (as a no-op loop).
+        let state = state_with_request_filters(Vec::new());
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
+            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
+            .backend(Arc::new(FixedBackend))
+            .http_client(Arc::new(StreamingHttpClient))
+            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .client_info(ClientInfo::default())
+            .build();
+        let mut req = empty_request(Method::GET, "/some-page");
+        let timings = RequestTimings::new();
+        req.extensions_mut().insert(timings.clone());
+
+        let _ = block_on(super::run_pre_route_filters(
+            &state, &services, &mut req, None,
+        ));
+
+        assert!(
+            timings.snapshot().filter_ms.is_none(),
+            "should omit the Filter phase span when no request filters are registered"
+        );
+    }
+
+    fn settings_with_consent_and_ec_store() -> Settings {
+        Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+            ec_store = "ec_identity_store"
+
+            [consent]
+            consent_store = "consent_store"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+            "#,
+        )
+        .expect("should parse settings with consent and EC KV stores configured")
+    }
+
+    #[test]
+    fn consent_store_reads_are_timed_and_pull_sync_is_not() {
+        // Consent-store access threaded through RuntimeServices uses the same
+        // TimedKvStore decorator as request-path KvIdentityGraph
+        // construction, so a read through it records Phase::EcKv.
+        let settings = settings_with_consent_and_ec_store();
+        let services = streaming_runtime_services();
+        let timings = RequestTimings::new();
+
+        let consent_services =
+            super::runtime_services_for_consent_route(&settings, &services, &timings)
+                .expect("should open the configured consent store");
+        let _ = block_on(consent_services.kv_store().get_bytes("consent-read-key"));
+
+        timings.mark_headers_ready();
+        assert!(
+            timings.snapshot().kv_ms.is_some(),
+            "a consent-store read through the decorated RuntimeServices store should record Phase::EcKv"
+        );
+
+        // Pull-sync's identity graph is built by `require_identity_graph`,
+        // which takes no `timings` parameter at all — the untimed store it
+        // constructs cannot record into any handle, including a fresh one.
+        let graph = crate::require_identity_graph(&settings)
+            .expect("should construct the pull-sync identity graph");
+        let ec_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test01";
+        let _ = graph.get(ec_id);
+
+        let pull_sync_timings = RequestTimings::new();
+        pull_sync_timings.mark_headers_ready();
+        assert!(
+            pull_sync_timings.snapshot().kv_ms.is_none(),
+            "pull-sync's untimed graph construction has no timings handle to record into"
         );
     }
 
@@ -3057,6 +3663,110 @@ mod tests {
                 .iter()
                 .any(|m| m.name == "x-challenge"),
             "the filter's response-header effect must be threaded out"
+        );
+    }
+
+    /// Joins every instance of a response header into one comma-separated
+    /// string (mirroring how a client sees repeated header fields), or
+    /// `None` if the header is absent.
+    fn response_header(response: &Response, name: &str) -> Option<String> {
+        let values: Vec<&str> = response
+            .headers()
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.join(", "))
+        }
+    }
+
+    #[test]
+    fn server_timing_emitted_on_private_response_when_enabled() {
+        let mut response = response_builder()
+            .header("cache-control", "private, no-store")
+            .body(Body::empty())
+            .expect("should build a private response fixture");
+        let timings = RequestTimings::new();
+
+        crate::apply_server_timing_header(&mut response, &timings, true);
+
+        let header = response_header(&response, "server-timing").expect("should emit header");
+        assert!(
+            header.contains("ts-total;dur="),
+            "should carry the stored total: {header}"
+        );
+        assert_eq!(
+            header.matches("ts-total").count(),
+            1,
+            "should emit exactly one TS-owned metric set"
+        );
+    }
+
+    #[test]
+    fn server_timing_absent_when_flag_off() {
+        let mut response = response_builder()
+            .header("cache-control", "private, no-store")
+            .body(Body::empty())
+            .expect("should build a private response fixture");
+        let timings = RequestTimings::new();
+
+        crate::apply_server_timing_header(&mut response, &timings, false);
+
+        assert!(
+            response_header(&response, "server-timing").is_none(),
+            "should not emit server-timing when the flag is off"
+        );
+    }
+
+    #[test]
+    fn server_timing_absent_on_cacheable_responses() {
+        // tsjs route policy: public, long max-age, immutable.
+        let mut tsjs_response = response_builder()
+            .header("cache-control", "public, max-age=31536000, immutable")
+            .body(Body::empty())
+            .expect("should build a tsjs-style response fixture");
+        // A bare shared-cacheable response with no private/no-store directive.
+        let mut public_response = response_builder()
+            .header("cache-control", "max-age=60")
+            .body(Body::empty())
+            .expect("should build a bare max-age response fixture");
+
+        crate::apply_server_timing_header(&mut tsjs_response, &RequestTimings::new(), true);
+        crate::apply_server_timing_header(&mut public_response, &RequestTimings::new(), true);
+
+        assert!(
+            response_header(&tsjs_response, "server-timing").is_none(),
+            "should not emit on the public immutable tsjs cache policy"
+        );
+        assert!(
+            response_header(&public_response, "server-timing").is_none(),
+            "should not emit on a bare shared-cacheable max-age response"
+        );
+    }
+
+    #[test]
+    fn preexisting_server_timing_values_survive() {
+        let mut response = response_builder()
+            .header("cache-control", "private, no-store")
+            .header("server-timing", "upstream;dur=1")
+            .body(Body::empty())
+            .expect("should build a private response fixture carrying an upstream Server-Timing");
+        let timings = RequestTimings::new();
+
+        crate::apply_server_timing_header(&mut response, &timings, true);
+
+        let header =
+            response_header(&response, "server-timing").expect("should still carry a header");
+        assert!(
+            header.contains("upstream;dur=1"),
+            "should preserve the pre-existing entry: {header}"
+        );
+        assert!(
+            header.contains("ts-total"),
+            "should append the TS-owned set: {header}"
         );
     }
 }

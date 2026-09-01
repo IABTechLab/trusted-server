@@ -811,6 +811,28 @@ mod tests {
     }
 
     #[test]
+    fn kv_span_accumulates_across_graph_operations() {
+        let timings = crate::request_timing::RequestTimings::new();
+        let graph = KvIdentityGraph::new(crate::platform::TimedKvStore::new(
+            crate::ec::kv_backend::test_support::InMemoryEcKv::new("test-store"),
+            timings.clone(),
+        ));
+
+        graph
+            .create("ec-1", &live_entry())
+            .expect("should create entry through the timed store");
+        graph
+            .get("ec-1")
+            .expect("should read the entry back through the timed store");
+
+        timings.mark_headers_ready();
+        assert!(
+            timings.snapshot().kv_ms.is_some(),
+            "should accumulate Phase::EcKv across both graph operations, not just the last write"
+        );
+    }
+
+    #[test]
     fn serialize_entry_produces_valid_json() {
         let entry = KvEntry::tombstone(1000);
         let (body, meta) =
