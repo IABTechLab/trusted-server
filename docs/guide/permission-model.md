@@ -295,6 +295,61 @@ The "Failed" branch is the rule for a geo provider that can report a failed
 lookup. None of the providers shipped today can, so a geo outage takes the
 "No or none resolved" branch instead. See the default-country note below.
 
+## How the resolved permissions reach downstream code
+
+The permission state is resolved once, at the start of the request cycle in
+`EcContext::read_from_request`, before any integration request filter or route
+handler runs. Everything downstream reads that one result rather than deriving
+its own, so there is a single decision per request.
+
+**Server side.** An integration request filter receives
+`permissions: Option<&PermissionState>` on its `RequestFilterInput`, alongside
+the geo result it already receives, so a filter can skip or narrow what it does
+when a permission it depends on is unset. None of the shipped filters changes
+its behavior on that input yet, so for now the state is carried and available
+rather than acted on.
+
+**Page side.** The same resolved state reaches the page as
+`window.tsjs.permissions`, an object listing the Data Use names that are set for
+this request. The names are the ones used everywhere else in this guide, being
+the `permissions.yaml` keys and `Permission::as_str()`.
+
+```json
+{
+  "set": [
+    "necessary.operations.storage",
+    "analytics.ad_reporting.market_research"
+  ]
+}
+```
+
+Delivery follows the pattern already used for `adSlots` and `bids`, and the
+timing depends on how the page is assembled. Under inline assembly the value is
+injected as a `<script>` at the open of `<head>`, before the tsjs bundle, on
+every HTML document, so it is there before any page module runs. Under
+shared-template (ESI) assembly the `<head>` is part of a template shared across
+visitors and must carry nothing request-scoped, so the value is spliced into the
+per-request script at the `</body>` seam instead. A permissions-only seam script
+is emitted even when the ad stack did not run, so a visitor whose consent was
+denied or who was classified as a bot still receives the state, empty in that
+case rather than missing.
+
+Because the arrival point moves, a page module must not read `tsjs.permissions`
+directly at load. TSJS core defaults the value to `{ set: [] }` and exposes
+`tsjs.whenPermissions()`, a promise that resolves when the real value arrives,
+immediately in the head-first case or at the body seam, with a
+`DOMContentLoaded` fallback. That promise is the waiting point for a vendor page
+module, which does nothing with identity and contacts no vendor until the
+promise resolves. Wiring the existing integrations' JavaScript to wait on it is
+follow-up work.
+
+The page cannot work this out for itself. Consent is only one of the ways a
+permission is set, and the country and region baselines and the deployer's
+configuration live on the server, so a CMP read in the page cannot reproduce the
+server's decision. The server decision is the authority, and an in-page CMP read
+is at most a withdrawal re-check under it, able to narrow what the server
+resolved and never to widen it.
+
 ## Configuration
 
 The geo provider, which resolves the country, and the default country for
