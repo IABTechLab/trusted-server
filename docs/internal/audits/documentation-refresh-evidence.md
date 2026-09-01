@@ -386,44 +386,321 @@ docs/guide/onboarding.md docs/internal/onboarding.md` exited 0. The source
   `All matched files use Prettier code style!`; and `npm run build` exited 0
   with `build complete in 4.86s.` VitePress emitted only the known non-failing
   `vcl`-to-`txt` syntax-highlighting fallback.
-- The exact built-file assertion, run from `docs`, was:
+- Containment evidence correction timestamp: 2026-09-01T11:08:07Z. This
+  correction supersedes the shell-command-substitution containment and href
+  assertions and the unrecorded supplemental assertion from evidence commit
+  `0a8e57f5e5aa03423dce29b61817dfb2b7194a1e`; those checks could discard a
+  scanner error and are not authoritative evidence.
+- Correction package start HEAD:
+  `0a8e57f5e5aa03423dce29b61817dfb2b7194a1e`. Before mutation, it equaled
+  `origin/spec-docs-refresh`; `origin/rc/202608` remained exactly
+  `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf` and was ancestral to HEAD; the
+  worktree was clean.
+- From `docs`, the fresh correction build ran `npm ci`, `npm run lint`,
+  `npm run format`, and `npm run build` in that order. They all exited 0:
+  `npm ci` added 346 packages in 3 seconds, lint completed after `eslint .`,
+  format reported `All matched files use Prettier code style!`, and VitePress
+  reported `build complete in 4.83s.` with only the known non-failing
+  `vcl`-to-`txt` fallback.
+- The following exact fail-closed command was run from `docs`. The initial
+  `git diff --quiet` binds the four containment paths at current HEAD to
+  `5dcf84bd0bebf8e6297822d0435e737bb7b4e2ed` before any artifact scan. Git
+  invocation errors or nonzero status, directory-walk or file-read errors,
+  invalid JSON, malformed URLs, unsupported filesystem entries, missing
+  required artifacts, missing identifying markers, or any excluded output
+  terminate nonzero. It recursively enumerates all dist files, parses
+  `hashmap.json`, reads every HTML file, and inspects double-quoted,
+  single-quoted, and unquoted `href` attributes.
 
   ```sh
-  test -z "$(find .vitepress/dist -type f | rg '/(superpowers|internal|epics)/|/guide/onboarding[.]html$|/README[.]html$|/business-use-cases[.]html$|/assets/(superpowers_|internal_|epics_|guide_onboarding[.]md[.]|README[.]md[.]|business-use-cases[.]md[.])')"
+  node <<'NODE'
+  const fs = require('node:fs')
+  const path = require('node:path')
+  const { spawnSync } = require('node:child_process')
+
+  const boundContentSha = '5dcf84bd0bebf8e6297822d0435e737bb7b4e2ed'
+  const containmentPaths = [
+    'docs/.vitepress/config.mts',
+    'docs/guide/index.md',
+    'docs/guide/onboarding.md',
+    'docs/internal/onboarding.md',
+  ]
+  const docsRoot = process.cwd()
+  const repoRoot = path.resolve(docsRoot, '..')
+  const distRoot = path.join(docsRoot, '.vitepress', 'dist')
+
+  const binding = spawnSync(
+    'git',
+    ['diff', '--quiet', boundContentSha, 'HEAD', '--', ...containmentPaths],
+    { cwd: repoRoot, encoding: 'utf8' },
+  )
+  if (binding.error) throw binding.error
+  if (binding.status !== 0) {
+    throw new Error(
+      `containment binding failed with status ${String(binding.status)}: ${binding.stderr}`,
+    )
+  }
+
+  function walkFiles(root) {
+    const files = []
+    for (const entry of fs.readdirSync(root, { withFileTypes: true }).sort((a, b) =>
+      a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+    )) {
+      const absolute = path.join(root, entry.name)
+      if (entry.isDirectory()) files.push(...walkFiles(absolute))
+      else if (entry.isFile()) files.push(absolute)
+      else throw new Error(`unsupported filesystem entry: ${absolute}`)
+    }
+    return files
+  }
+
+  function countMarkdownFiles(root) {
+    return walkFiles(root).filter((file) => file.endsWith('.md')).length
+  }
+
+  function countOptionalFile(file) {
+    try {
+      const stat = fs.statSync(file)
+      if (!stat.isFile()) throw new Error(`expected a file: ${file}`)
+      return 1
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return 0
+      throw error
+    }
+  }
+
+  function requireFileCount(file) {
+    const stat = fs.statSync(file)
+    if (!stat.isFile()) throw new Error(`expected a file: ${file}`)
+    return 1
+  }
+
+  const families = [
+    {
+      name: 'superpowers/**',
+      sourceCount: () => countMarkdownFiles(path.join(docsRoot, 'superpowers')),
+      fileMatch: (file) => file.startsWith('superpowers/') || file.startsWith('assets/superpowers_'),
+      manifestMatch: (key) => key.startsWith('superpowers_') || key.startsWith('superpowers/'),
+      routeMatch: (route) => route === '/superpowers' || route.startsWith('/superpowers/'),
+    },
+    {
+      name: 'internal/**',
+      sourceCount: () => countMarkdownFiles(path.join(docsRoot, 'internal')),
+      fileMatch: (file) => file.startsWith('internal/') || file.startsWith('assets/internal_'),
+      manifestMatch: (key) => key.startsWith('internal_') || key.startsWith('internal/'),
+      routeMatch: (route) => route === '/internal' || route.startsWith('/internal/'),
+    },
+    {
+      name: 'epics/**',
+      sourceCount: () => countMarkdownFiles(path.join(docsRoot, 'epics')),
+      fileMatch: (file) => file.startsWith('epics/') || file.startsWith('assets/epics_'),
+      manifestMatch: (key) => key.startsWith('epics_') || key.startsWith('epics/'),
+      routeMatch: (route) => route === '/epics' || route.startsWith('/epics/'),
+    },
+    {
+      name: 'guide/onboarding.md',
+      sourceCount: () => countOptionalFile(path.join(docsRoot, 'guide', 'onboarding.md')),
+      fileMatch: (file) => file === 'guide/onboarding.html' || file.startsWith('guide/onboarding/') || file.startsWith('assets/guide_onboarding.md.'),
+      manifestMatch: (key) => key === 'guide_onboarding.md' || key === 'guide/onboarding.md',
+      routeMatch: (route) => route === '/guide/onboarding' || route.startsWith('/guide/onboarding/'),
+    },
+    {
+      name: 'README.md',
+      sourceCount: () => requireFileCount(path.join(docsRoot, 'README.md')),
+      fileMatch: (file) => file === 'readme.html' || file.startsWith('readme/') || file.startsWith('assets/readme.md.'),
+      manifestMatch: (key) => key.toLowerCase() === 'readme.md',
+      routeMatch: (route) => route === '/readme' || route.startsWith('/readme/'),
+    },
+    {
+      name: 'business-use-cases.md',
+      sourceCount: () => requireFileCount(path.join(docsRoot, 'business-use-cases.md')),
+      fileMatch: (file) => file === 'business-use-cases.html' || file.startsWith('business-use-cases/') || file.startsWith('assets/business-use-cases.md.'),
+      manifestMatch: (key) => key === 'business-use-cases.md',
+      routeMatch: (route) => route === '/business-use-cases' || route.startsWith('/business-use-cases/'),
+    },
+  ]
+
+  const distFiles = walkFiles(distRoot)
+  const relativeDistFiles = distFiles.map((file) => path.relative(distRoot, file).split(path.sep).join('/'))
+  const htmlFiles = relativeDistFiles.filter((file) => file.endsWith('.html'))
+  const hashmap = JSON.parse(fs.readFileSync(path.join(distRoot, 'hashmap.json'), 'utf8'))
+  if (hashmap === null || Array.isArray(hashmap) || typeof hashmap !== 'object') {
+    throw new Error('hashmap.json must contain an object')
+  }
+  const manifestKeys = Object.keys(hashmap).sort()
+  for (const key of manifestKeys) {
+    if (typeof hashmap[key] !== 'string') throw new Error(`non-string hashmap entry: ${key}`)
+  }
+
+  function normalizeHref(rawHref, htmlFile) {
+    const value = rawHref.replaceAll('&amp;', '&')
+    if (value === '' || value.startsWith('#')) return null
+    if (/^(?:data|javascript|mailto|tel):/i.test(value)) return null
+    const base = new URL(`/trusted-server/${htmlFile}`, 'https://local.invalid')
+    const url = new URL(value, base)
+    let route = decodeURIComponent(url.pathname)
+    route = path.posix.normalize(route)
+    if (route === '/trusted-server') route = '/'
+    else if (route.startsWith('/trusted-server/')) route = route.slice('/trusted-server'.length)
+    route = route.replace(/\.(?:html|md)$/i, '')
+    if (route.length > 1) route = route.replace(/\/$/, '')
+    return route.toLowerCase()
+  }
+
+  const hrefPattern = /(?:^|[\s<])href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/gimu
+  const hrefRecords = []
+  for (const htmlFile of htmlFiles) {
+    const html = fs.readFileSync(path.join(distRoot, htmlFile), 'utf8')
+    for (const match of html.matchAll(hrefPattern)) {
+      const href = match[1] ?? match[2] ?? match[3]
+      hrefRecords.push({ file: htmlFile, href, route: normalizeHref(href, htmlFile) })
+    }
+  }
+
+  const violations = []
+  const familyResults = {}
+  for (const family of families) {
+    const routeAssets = relativeDistFiles.filter((file) => family.fileMatch(file.toLowerCase()))
+    const manifest = manifestKeys.filter((key) => family.manifestMatch(key))
+    const hrefs = hrefRecords.filter((record) => record.route !== null && family.routeMatch(record.route))
+    familyResults[family.name] = {
+      sourceCount: family.sourceCount(),
+      routeAssetCount: routeAssets.length,
+      manifestCount: manifest.length,
+      hrefCount: hrefs.length,
+    }
+    for (const file of routeAssets) violations.push(`${family.name} file: ${file}`)
+    for (const key of manifest) violations.push(`${family.name} manifest: ${key}`)
+    for (const record of hrefs) violations.push(`${family.name} href in ${record.file}: ${record.href}`)
+  }
+
+  const artifactSpecifications = [
+    {
+      name: 'Home',
+      file: 'index.html',
+      markers: ['<title>Trusted Server</title>', 'The New Execution Layer for Publishers'],
+    },
+    {
+      name: 'Guide',
+      file: 'guide/index.html',
+      markers: ['<title>Guide | Trusted Server</title>', '<h1 id="guide"'],
+    },
+    {
+      name: 'API',
+      file: 'guide/api-reference.html',
+      markers: [
+        '<title>API Reference | Trusted Server</title>',
+        'Quick reference for all Trusted Server HTTP endpoints.',
+      ],
+    },
+  ]
+  const requiredArtifacts = {}
+  for (const specification of artifactSpecifications) {
+    const html = fs.readFileSync(path.join(distRoot, specification.file), 'utf8')
+    const missingMarkers = specification.markers.filter((marker) => !html.includes(marker))
+    requiredArtifacts[specification.name] = {
+      file: specification.file,
+      exists: true,
+      markerCount: specification.markers.length - missingMarkers.length,
+      requiredMarkerCount: specification.markers.length,
+    }
+    for (const marker of missingMarkers) {
+      violations.push(`${specification.name} missing marker: ${marker}`)
+    }
+  }
+
+  if (violations.length > 0) {
+    throw new Error(`containment verification failed:\n${violations.sort().join('\n')}`)
+  }
+
+  console.log(
+    JSON.stringify(
+      {
+        boundContentSha,
+        families: familyResults,
+        htmlFileCount: htmlFiles.length,
+        hrefCount: hrefRecords.length,
+        requiredArtifacts,
+      },
+      null,
+      2,
+    ),
+  )
+  NODE
   ```
 
-  It exited 0 and printed nothing. The exact page-manifest assertion was:
+  It exited 0. The following fenced JSON is the authoritative verbatim stdout
+  from this local command:
 
-  ```sh
-  node -e 'const h=require("./.vitepress/dist/hashmap.json"); const x=Object.keys(h).filter((k)=>/^(superpowers_|internal_|epics_|guide_onboarding[.]md$|README[.]md$|business-use-cases[.]md$)/.test(k)); console.log("forbidden manifest entries="+x.length); if(x.length) process.exit(1)'
+  ```json
+  {
+    "boundContentSha": "5dcf84bd0bebf8e6297822d0435e737bb7b4e2ed",
+    "families": {
+      "superpowers/**": {
+        "sourceCount": 135,
+        "routeAssetCount": 0,
+        "manifestCount": 0,
+        "hrefCount": 0
+      },
+      "internal/**": {
+        "sourceCount": 4,
+        "routeAssetCount": 0,
+        "manifestCount": 0,
+        "hrefCount": 0
+      },
+      "epics/**": {
+        "sourceCount": 1,
+        "routeAssetCount": 0,
+        "manifestCount": 0,
+        "hrefCount": 0
+      },
+      "guide/onboarding.md": {
+        "sourceCount": 0,
+        "routeAssetCount": 0,
+        "manifestCount": 0,
+        "hrefCount": 0
+      },
+      "README.md": {
+        "sourceCount": 1,
+        "routeAssetCount": 0,
+        "manifestCount": 0,
+        "hrefCount": 0
+      },
+      "business-use-cases.md": {
+        "sourceCount": 1,
+        "routeAssetCount": 0,
+        "manifestCount": 0,
+        "hrefCount": 0
+      }
+    },
+    "htmlFileCount": 43,
+    "hrefCount": 4604,
+    "requiredArtifacts": {
+      "Home": {
+        "file": "index.html",
+        "exists": true,
+        "markerCount": 2,
+        "requiredMarkerCount": 2
+      },
+      "Guide": {
+        "file": "guide/index.html",
+        "exists": true,
+        "markerCount": 2,
+        "requiredMarkerCount": 2
+      },
+      "API": {
+        "file": "guide/api-reference.html",
+        "exists": true,
+        "markerCount": 2,
+        "requiredMarkerCount": 2
+      }
+    }
+  }
   ```
 
-  It exited 0 and printed `forbidden manifest entries=0`. The exact built-href
-  assertion was:
-
-  ```sh
-  test -z "$(rg -o --no-filename 'href=\"[^\"]+\"' .vitepress/dist --glob '*.html' | rg -i 'href=\"(?:/trusted-server)?/(?:superpowers|internal|epics)(?:[/.?#\"]|$)|href=\"(?:/trusted-server)?/(?:guide/onboarding|README|business-use-cases)(?:[/.?#\"]|$)')"
-  ```
-
-  It exited 0 and printed nothing. A supplemental per-family assertion
-  recursively enumerated `.vitepress/dist`, read `hashmap.json`, extracted
-  every HTML `href`, and failed on any excluded route, page-manifest entry, or
-  route/asset file. It exited 0 with these exact results:
-  `superpowers/**: sources=135, route/assets=0, manifest=0, hrefs=0`;
-  `internal/**: sources=4, route/assets=0, manifest=0, hrefs=0`;
-  `epics/**: sources=1, route/assets=0, manifest=0, hrefs=0`;
-  `guide/onboarding.md: sources=0, route/assets=0, manifest=0, hrefs=0`;
-  `README.md: sources=1, route/assets=0, manifest=0, hrefs=0`; and
-  `business-use-cases.md: sources=1, route/assets=0, manifest=0, hrefs=0`.
-
-- The exact required-artifact assertion was:
-
-  ```sh
-  test -f .vitepress/dist/index.html && rg -q '<title>Trusted Server</title>' .vitepress/dist/index.html && rg -q 'The New Execution Layer for Publishers' .vitepress/dist/index.html && test -f .vitepress/dist/guide/index.html && rg -q '<title>Guide | Trusted Server</title>' .vitepress/dist/guide/index.html && rg -q '<h1 id="guide"' .vitepress/dist/guide/index.html && test -f .vitepress/dist/guide/api-reference.html && rg -q '<title>API Reference | Trusted Server</title>' .vitepress/dist/guide/api-reference.html && rg -q 'Quick reference for all Trusted Server HTTP endpoints[.]' .vitepress/dist/guide/api-reference.html
-  ```
-
-  It exited 0 and printed nothing, proving the Home, Guide, and API artifacts
-  exist and contain both required identifying markers.
+  This is authoritative raw local build evidence only. It is not a live
+  Pages, CNAME, deployment, or release receipt and does not complete any
+  release-pending row.
 
 - The exact onboarding-link assertion was:
 
