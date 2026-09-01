@@ -196,18 +196,21 @@ groups:
     # ... the other mapped purposes granted, the rest denied
 
 rules:
-  group: gdpr-eu # when no country can be resolved
-  jurisdiction: gdpr # consent handling when no country can be resolved
+  group: gdpr-eu # baseline when no country can be resolved
+  jurisdiction: gdpr # inherited by every node that states none
   FR: gdpr-eu
   GB: gdpr-uk
   AU: us-opt-out
   US:
     group: us-opt-out
-    # A region node takes precedence over its country. A node written as a
-    # mapping may also apply explicit per-permission acquisitions on top of
-    # its group:
+    jurisdiction: non-regulated
+    # A region node takes precedence over its country, and a state with a
+    # comprehensive privacy law names itself with `jurisdiction: us-state`. A
+    # node written as a mapping may also apply explicit per-permission
+    # acquisitions on top of its group:
     # CA:
     #   group: us-opt-out
+    #   jurisdiction: us-state
     #   permissions:
     #     advertising_marketing.first_party.targeted: requires_signal
 
@@ -237,16 +240,20 @@ Format rules, as implemented:
   children. A node written as a mapping must contain `group:` and may contain
   child place codes beside it. Reserved keys cannot collide with place codes,
   because an ISO code is at most three characters.
-- The top node, meaning the `rules:` mapping itself, requires `group:` and
-  `jurisdiction:`, and `jurisdiction` appears only there. It names the consent
-  handling applied when no country can be resolved, and its accepted values are
-  the states of the `Jurisdiction` type in
-  `crates/trusted-server-core/src/consent/jurisdiction.rs`, read by
-  `Jurisdiction::from_policy_name`, being `gdpr`, `us-state/<CODE>` (a US state
-  with a comprehensive privacy law, for example `us-state/CA`),
-  `non-regulated`, and `unknown`. Any other value is a configuration error.
-- Matching is most specific wins with fallback to the parent's `group`, being
-  region, then country, then the top node.
+- Any node may carry `jurisdiction:` beside `group:`, naming the consent
+  handling for the places that node covers. A node that carries none inherits
+  the nearest ancestor that does. The top node, meaning the `rules:` mapping
+  itself, must carry both, so the inheritance always terminates and the
+  unresolved-country case is simply the top node.
+- The accepted `jurisdiction` values are the states of the `Jurisdiction` type
+  in `crates/trusted-server-core/src/consent/jurisdiction.rs`, being `gdpr`,
+  `us-state`, `non-regulated`, and `unknown`. Any other value is a
+  configuration error. `us-state` carries **no** state code, because the region
+  node it sits on already names the state, so the value is valid only on a
+  region node under `US` and is rejected at the top and on a country node.
+- Matching is most specific wins with fallback to the parent, being region,
+  then country, then the top node. `group` and `jurisdiction` fall back
+  independently, so the two answers need not come from the same node.
 - A mapping node may carry `permissions`, a map from a Data Use to an explicit
   acquisition (`granted`, `requires_signal`, or `denied`), overriding the group
   baseline for exactly that Data Use. This adopts the draft's requirement that
@@ -265,20 +272,26 @@ The canonical shape of the tree, as written for policy owners in
 
 ```yaml
 rules:
-  group: gdpr-eu # when no country can be resolved
-  jurisdiction: gdpr # consent handling when no country can be resolved
-  GB: gdpr-uk # United Kingdom
-  US: # United States
-    group: us-notice # any state not listed below
-    CA: us-opt-out # California
-    NY: us-notice # New York
+  group: gdpr-eu
+  # Inherited by every country not overriding it, and the answer when no
+  # country resolves.
+  jurisdiction: gdpr
+  GB: gdpr-uk # inherits gdpr
+  US:
+    group: us-notice
+    jurisdiction: non-regulated
+    CA:
+      group: us-opt-out
+      jurisdiction: us-state
+    NY: us-notice # inherits non-regulated
 ```
 
-A New York visitor gets `us-notice`, a Texas visitor gets `us-notice` through
-the US fallback, a Manchester visitor gets `gdpr-uk`, and a visitor with no
-resolvable country gets `gdpr-eu` with GDPR consent handling. The nesting shows
-a reader the precedence rather than hiding it in slash-joined keys, and the
-audience for the file is a policy owner rather than a developer.
+A Manchester visitor gets `gdpr-uk` under GDPR handling, a Californian visitor
+gets `us-opt-out` under that state's own opt-out handling, a Texas visitor gets
+`us-notice` under `non-regulated` handling through the US fallback, and a
+visitor with no resolvable country gets `gdpr-eu` under GDPR handling. The
+nesting shows a reader the precedence rather than hiding it in slash-joined
+keys, and the audience for the file is a policy owner rather than a developer.
 
 The draft's required per-group **`regime`** class (`gdpr`, `us-privacy`,
 `none`) is **not implemented**. Its intended consumer, server-side auction
@@ -312,17 +325,24 @@ parses. For the shipped table the EU and EEA coverage test (§3.5) closes the
 consequence the draft cared about, a member state silently dropping to the
 fallback.
 
-### 3.4 One source of jurisdiction truth (deferred)
+### 3.4 One source of jurisdiction truth (adopted 2026-09-01)
 
-Not implemented. `detect_jurisdiction`, driven by the runtime lists
-`consent.gdpr.applies_in` and `consent.us_states.privacy_states`, remains the
-jurisdiction source for the auction consent gate and for
-`ConsentContext.jurisdiction`, while the permission model resolves against
-`permissions.yaml` independently. The drift risk the draft named is real and
-stands recorded. Adding a country to one source has no effect on the other,
-and no CI test asserts consistency between the legacy lists and the policy
-table. Unifying the two, with the auction gate reading a policy regime class,
-travels with the dispatch migration (§7.4) as deferred follow-up.
+The runtime lists `consent.gdpr.applies_in` and
+`consent.us_states.privacy_states` retire into the `rules:` tree, so one
+document now carries the permission baselines and the regime applicability
+together. The shipped policy file states the same 31 GDPR countries, being the
+EU 27 plus Iceland, Liechtenstein, Norway and the United Kingdom, which inherit
+`gdpr` from the top node, and the same 20 US states with a comprehensive
+privacy law, written as region children of `US` carrying
+`jurisdiction: us-state`. A visitor resolves to one node, and that node answers
+both what is permitted and which regime applies, so the drift the draft named,
+where a country added to one source had no effect on the other, has nothing
+left to drift against and needs no consistency test between two lists.
+
+What remains open is the consumer side. Auction dispatch still reads the
+consent subsystem's gate rather than a policy regime class (§7.4), so unifying
+the last consumer travels with the dispatch migration. Documentation that
+pointed operators at the two `[consent]` lists points at the tree instead.
 
 ### 3.5 Shipped-table coverage
 
@@ -639,8 +659,11 @@ dispatch joins the model, the guard's trigger list grows with it.
 
 The top node of the `rules:` tree is **required in every mode** and is
 validated at startup, meaning it must carry a `group` naming a defined group
-and a `jurisdiction`. A no-geo single-state deployment states that state's
-group at the top and nests nothing beneath it. The top node covers two states
+and a `jurisdiction`. Every node below may carry its own `jurisdiction`, and a
+node that carries none inherits the nearest ancestor that does (§3.2). A no-geo
+single-state deployment states that state's group at the top and nests nothing
+beneath it, though `us-state` is not valid there, because the top node names no
+state. The top node covers two states
 the draft kept separate:
 
 - the geo provider resolved no location (or none is configured), and
@@ -679,7 +702,7 @@ requires a live user signal (§4.2), never a policy change.
 | Geo lookup reports a failure                      | Requires-signal floor for every permission, never the top-node baseline, with the error logged. No provider shipped today can report one, so a host geo outage lands on the row above instead (§5.2) |
 | No geo provider configured                        | Top-node baseline, guarded by `assume_single_jurisdiction` (§5.3)                                                                                                                                    |
 | Country resolved, no matching node                | Top-node baseline (§5.4)                                                                                                                                                                             |
-| Region resolved, no region node                   | Country node's group                                                                                                                                                                                 |
+| Region resolved, no region node                   | Country node's group, and the nearest ancestor's `jurisdiction`                                                                                                                                      |
 | Top node missing `group` or `jurisdiction`        | Startup failure (§3.3)                                                                                                                                                                               |
 | EC provider configured, no geo, no acknowledgment | Startup failure (§5.3)                                                                                                                                                                               |
 | Malformed `permissions.yaml`                      | Parse error at settings load, once per instance, because the embedded file is a build-time constant, never per-request                                                                               |
@@ -853,42 +876,48 @@ One row per divergence between the draft and the implementation this
 revision was verified against (branch `split/5-response-hook-docs`,
 PR #1045).
 
-| Draft position                                                                                                                                            | Implemented position                                                                                                                                                                                                                       | Why                                                                                                                                                                                           |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Vocabulary is two TCF-purpose identifiers, enforced permissions only (§2)                                                                                 | IAB Privacy Taxonomy Data Uses, with eleven named purposes all signal-resolved, plus 53 taxonomy Data Uses carried as declared but unenforced baseline flags                                                                               | The joint taxonomy adoption postdates the draft, and whole-taxonomy declaration serves completeness and demonstration, with `denied` defaults keeping unenforced flags inert                  |
-| Policy lives in `[permissions]` in `trusted-server.toml`, published via `ts config push` (§3.1)                                                           | Policy is `permissions.yaml`, compiled into the build with `include_str!`, parsed once and covered by tests                                                                                                                                | The runtime config push and activation apparatus does not exist, so publishing runtime policy without it would recreate the hazards the draft cataloged. Runtime policy is deferred follow-up |
-| Every group carries a required `regime` class read by auction dispatch (§3.2)                                                                             | No regime field exists                                                                                                                                                                                                                     | Its only consumer, regime-gated dispatch, was not migrated, and the field returns with that work                                                                                              |
-| Overrides name explicit acquisition rules, replacing the `+`/`-` sigils (§3.2)                                                                            | Adopted. A detailed rule's `permissions` map assigns `granted`, `requires_signal`, or `denied` per Data Use                                                                                                                                | The draft's requirement, expressed in the YAML schema. `requires_signal` is now expressible per rule                                                                                          |
-| Two fallbacks: policy `rules.default` for unmatched countries, `default_country` only for the static no-geo mode (§5.4)                                   | One required fallback covers unmatched and unresolved requests in every mode, startup-validated, and a failed lookup floors separately. It was `[geo] default_country` until 2026-09-01 and is now the top node of the `rules:` tree (§12) | One deployer knob is simpler, and the safety-critical separation kept is failure vs absence, carried by `GeoStatus`                                                                           |
-| Validation checks assigned ISO 3166-1 codes, assigned subdivisions, and a group identifier grammar (§3.3)                                                 | Validation covers unknown groups, permissions, acquisitions, revoke rules, incomplete groups, case-duplicate rule keys, and unknown fields on detailed rules                                                                               | Smaller surface shipped first, and the EU/EEA coverage test guards the shipped table against the typo class. ISO-assignment checks are future hardening                                       |
-| Three-class signal taxonomy with regime-scoped grant acceptance, where the US posture is `requires_signal` with GPP/USP non-opt-out values as grants (§4) | TCF is the only grant source, the US posture is a `granted` baseline that opt-outs revoke, and explicit non-opt-out values grant nothing                                                                                                   | A simpler two-signal model without regimes. The cost, no-signal US traffic is allowed by baseline rather than blocked pending a signal, is a deliberate policy choice in the shipped file     |
-| Malformed-present blocks grants per record family and mapped section (§4.4, §4.5)                                                                         | Any present-but-undecodable record revokes every Data Use for the request                                                                                                                                                                  | Strictly more restrictive simplification, and per-family scoping needs the full §4.5 decoder work                                                                                             |
-| Normalization runs expiry before conflict resolution, a declared change (§4.4)                                                                            | Conflict resolution still runs before the expiry check                                                                                                                                                                                     | The reordering was not implemented, though the expired state itself (distinct from malformed, absent for acquisition) was adopted                                                             |
-| Persisted-KV consent flows through the full normalization pipeline with an explicit TTL comparison (§4.4)                                                 | The loaded record substitutes directly when the request carries no signals, jurisdiction re-derived, and staleness is enforced by the store TTL (`max_consent_age_days`)                                                                   | The store-level TTL delivers the staleness bound without a second normalization pass                                                                                                          |
-| Proxy mode gains minimal opt-out extraction (§4.4)                                                                                                        | Proxy mode still skips decoding, so a present record blocks all grants via the malformed-present rule and the GPC header opt-out is honored without decoding                                                                               | The permission-layer outcome is equally or more restrictive with no new decode paths, and this is revisited with the §4.5 decoder work                                                        |
-| Withdrawal has four triggers including an explicit storage-withdrawal or authenticated deletion request (§4.2)                                            | The TCF Purpose 1 refusal under a non-granted baseline is the only trigger, and opt-outs, malformed records, absence, and policy changes never withdraw (adopted)                                                                          | No deletion endpoint exists to carry the extra trigger, so the narrowest destructive surface shipped first                                                                                    |
-| §4.3 durability protocol: family records first, suppression and authority-state records, outbox, breaker, strong reads                                    | Cookie expiry plus best-effort identity-graph tombstones per presented identifier, with failures logged                                                                                                                                    | The protocol requires storage primitives (linearizable CAS, independent durability domains) the adapters do not yet qualify, so it is deferred with the providers-spec storage work           |
-| §4.5 field mapping and §4.5.1 vendored registry snapshot (sharing/targeted opt-outs, embedded GPC, applicability, derived `gpp_sid`)                      | Opt-out sources are the GPC header, a GPP sale opt-out, and a USP sale opt-out. The revoke set is policy-declared, shipped as `all` (which also drops storage)                                                                             | The full decoder and registry vendoring are their own project, and the policy-declared revoke set gives deployers the scoping lever meanwhile                                                 |
-| §5.5 activation: JCS policy digests, ordinals, activation register, journal, drains, admission leases                                                     | None of it exists, and the built binary is the policy identity                                                                                                                                                                             | With no runtime policy there is nothing to activate, and the draft remains the reference design for the runtime-config follow-up                                                              |
-| §3.4 single jurisdiction truth, and §7 dispatch gated on the policy regime with a contextual projection                                                   | Auction dispatch keeps the consent-subsystem gate (effective TCF Purpose 1 for GDPR or unknown jurisdictions). `detect_jurisdiction` and its lists remain, with no contextual view                                                         | Dispatch migration is follow-up. The legacy-list drift risk the draft named still stands and is recorded rather than resolved                                                                 |
-| Every raw-EC egress path is pair-gated, with per-row tests and a denylist check (§7)                                                                      | Pair gating is centralized in `ec_sharing_allowed` (auction endpoint `user.id`, publisher navigation and page-bids `user.id`, identify, pull sync) and `gate_eids_by_permissions` (EIDs everywhere). Batch sync checks row state only      | Partial adoption. Aligning the remaining paths, the S2S stored-provenance authority, and the inventory tests is recorded follow-up                                                            |
-| Identity rows never store raw consent strings, only normalized provenance and a digest (§1)                                                               | The identity-graph entry stores the raw TCF and GPP strings with the row                                                                                                                                                                   | The normalized provenance schema belongs to the providers-spec storage work, and until then rows carry the raw strings                                                                        |
-| No signals block in policy, and the signal mapping is fixed in the spec                                                                                   | New. A `signals` section in `permissions.yaml` declares the TCF purpose map, opt-out sources, and revoke set, with `tcf.authoritative` governing only TCF's own effect                                                                     | Moves signal policy from code into deployer-editable data, and the flag can never let a TCF record override an opt-out, preserving §4 precedence                                              |
-| The §5.3 no-geo guard covers every jurisdiction consumer                                                                                                  | The guard fires when an Edge Cookie provider is configured with no geo provider                                                                                                                                                            | The EC provider is the only policy-gated consumer today, and the trigger list grows when dispatch and further egress paths join the model                                                     |
-| `default_country` is required only in the acknowledged static no-geo mode (§5.4)                                                                          | Required always and startup-validated. Since 2026-09-01 the requirement sits on the `rules:` tree's top node, which must carry a `group` and a `jurisdiction` (§12)                                                                        | It is the baseline for unmatched requests in every mode, so it must always exist                                                                                                              |
+| Draft position                                                                                                                                            | Implemented position                                                                                                                                                                                                                                                                  | Why                                                                                                                                                                                           |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Vocabulary is two TCF-purpose identifiers, enforced permissions only (§2)                                                                                 | IAB Privacy Taxonomy Data Uses, with eleven named purposes all signal-resolved, plus 53 taxonomy Data Uses carried as declared but unenforced baseline flags                                                                                                                          | The joint taxonomy adoption postdates the draft, and whole-taxonomy declaration serves completeness and demonstration, with `denied` defaults keeping unenforced flags inert                  |
+| Policy lives in `[permissions]` in `trusted-server.toml`, published via `ts config push` (§3.1)                                                           | Policy is `permissions.yaml`, compiled into the build with `include_str!`, parsed once and covered by tests                                                                                                                                                                           | The runtime config push and activation apparatus does not exist, so publishing runtime policy without it would recreate the hazards the draft cataloged. Runtime policy is deferred follow-up |
+| Every group carries a required `regime` class read by auction dispatch (§3.2)                                                                             | No regime field exists                                                                                                                                                                                                                                                                | Its only consumer, regime-gated dispatch, was not migrated, and the field returns with that work                                                                                              |
+| Overrides name explicit acquisition rules, replacing the `+`/`-` sigils (§3.2)                                                                            | Adopted. A detailed rule's `permissions` map assigns `granted`, `requires_signal`, or `denied` per Data Use                                                                                                                                                                           | The draft's requirement, expressed in the YAML schema. `requires_signal` is now expressible per rule                                                                                          |
+| Two fallbacks: policy `rules.default` for unmatched countries, `default_country` only for the static no-geo mode (§5.4)                                   | One required fallback covers unmatched and unresolved requests in every mode, startup-validated, and a failed lookup floors separately. It was `[geo] default_country` until 2026-09-01 and is now the top node of the `rules:` tree (§12)                                            | One deployer knob is simpler, and the safety-critical separation kept is failure vs absence, carried by `GeoStatus`                                                                           |
+| Validation checks assigned ISO 3166-1 codes, assigned subdivisions, and a group identifier grammar (§3.3)                                                 | Validation covers unknown groups, permissions, acquisitions, revoke rules, incomplete groups, case-duplicate rule keys, and unknown fields on detailed rules                                                                                                                          | Smaller surface shipped first, and the EU/EEA coverage test guards the shipped table against the typo class. ISO-assignment checks are future hardening                                       |
+| Three-class signal taxonomy with regime-scoped grant acceptance, where the US posture is `requires_signal` with GPP/USP non-opt-out values as grants (§4) | TCF is the only grant source, the US posture is a `granted` baseline that opt-outs revoke, and explicit non-opt-out values grant nothing                                                                                                                                              | A simpler two-signal model without regimes. The cost, no-signal US traffic is allowed by baseline rather than blocked pending a signal, is a deliberate policy choice in the shipped file     |
+| Malformed-present blocks grants per record family and mapped section (§4.4, §4.5)                                                                         | Any present-but-undecodable record revokes every Data Use for the request                                                                                                                                                                                                             | Strictly more restrictive simplification, and per-family scoping needs the full §4.5 decoder work                                                                                             |
+| Normalization runs expiry before conflict resolution, a declared change (§4.4)                                                                            | Conflict resolution still runs before the expiry check                                                                                                                                                                                                                                | The reordering was not implemented, though the expired state itself (distinct from malformed, absent for acquisition) was adopted                                                             |
+| Persisted-KV consent flows through the full normalization pipeline with an explicit TTL comparison (§4.4)                                                 | The loaded record substitutes directly when the request carries no signals, jurisdiction re-derived, and staleness is enforced by the store TTL (`max_consent_age_days`)                                                                                                              | The store-level TTL delivers the staleness bound without a second normalization pass                                                                                                          |
+| Proxy mode gains minimal opt-out extraction (§4.4)                                                                                                        | Proxy mode still skips decoding, so a present record blocks all grants via the malformed-present rule and the GPC header opt-out is honored without decoding                                                                                                                          | The permission-layer outcome is equally or more restrictive with no new decode paths, and this is revisited with the §4.5 decoder work                                                        |
+| Withdrawal has four triggers including an explicit storage-withdrawal or authenticated deletion request (§4.2)                                            | The TCF Purpose 1 refusal under a non-granted baseline is the only trigger, and opt-outs, malformed records, absence, and policy changes never withdraw (adopted)                                                                                                                     | No deletion endpoint exists to carry the extra trigger, so the narrowest destructive surface shipped first                                                                                    |
+| §4.3 durability protocol: family records first, suppression and authority-state records, outbox, breaker, strong reads                                    | Cookie expiry plus best-effort identity-graph tombstones per presented identifier, with failures logged                                                                                                                                                                               | The protocol requires storage primitives (linearizable CAS, independent durability domains) the adapters do not yet qualify, so it is deferred with the providers-spec storage work           |
+| §4.5 field mapping and §4.5.1 vendored registry snapshot (sharing/targeted opt-outs, embedded GPC, applicability, derived `gpp_sid`)                      | Opt-out sources are the GPC header, a GPP sale opt-out, and a USP sale opt-out. The revoke set is policy-declared, shipped as `all` (which also drops storage)                                                                                                                        | The full decoder and registry vendoring are their own project, and the policy-declared revoke set gives deployers the scoping lever meanwhile                                                 |
+| §5.5 activation: JCS policy digests, ordinals, activation register, journal, drains, admission leases                                                     | None of it exists, and the built binary is the policy identity                                                                                                                                                                                                                        | With no runtime policy there is nothing to activate, and the draft remains the reference design for the runtime-config follow-up                                                              |
+| §3.4 single jurisdiction truth, and §7 dispatch gated on the policy regime with a contextual projection                                                   | Half adopted. Since 2026-09-01 the `rules:` tree carries regime applicability and the two `[consent]` lists retire into it (§3.4), while auction dispatch still keeps the consent-subsystem gate (effective TCF Purpose 1 for GDPR or unknown jurisdictions), with no contextual view | Dispatch migration is follow-up. The legacy-list drift risk the draft named still stands and is recorded rather than resolved                                                                 |
+| Every raw-EC egress path is pair-gated, with per-row tests and a denylist check (§7)                                                                      | Pair gating is centralized in `ec_sharing_allowed` (auction endpoint `user.id`, publisher navigation and page-bids `user.id`, identify, pull sync) and `gate_eids_by_permissions` (EIDs everywhere). Batch sync checks row state only                                                 | Partial adoption. Aligning the remaining paths, the S2S stored-provenance authority, and the inventory tests is recorded follow-up                                                            |
+| Identity rows never store raw consent strings, only normalized provenance and a digest (§1)                                                               | The identity-graph entry stores the raw TCF and GPP strings with the row                                                                                                                                                                                                              | The normalized provenance schema belongs to the providers-spec storage work, and until then rows carry the raw strings                                                                        |
+| No signals block in policy, and the signal mapping is fixed in the spec                                                                                   | New. A `signals` section in `permissions.yaml` declares the TCF purpose map, opt-out sources, and revoke set, with `tcf.authoritative` governing only TCF's own effect                                                                                                                | Moves signal policy from code into deployer-editable data, and the flag can never let a TCF record override an opt-out, preserving §4 precedence                                              |
+| The §5.3 no-geo guard covers every jurisdiction consumer                                                                                                  | The guard fires when an Edge Cookie provider is configured with no geo provider                                                                                                                                                                                                       | The EC provider is the only policy-gated consumer today, and the trigger list grows when dispatch and further egress paths join the model                                                     |
+| `default_country` is required only in the acknowledged static no-geo mode (§5.4)                                                                          | Required always and startup-validated. Since 2026-09-01 the requirement sits on the `rules:` tree's top node, which must carry a `group` and a `jurisdiction` (§12)                                                                                                                   | It is the baseline for unmatched requests in every mode, so it must always exist                                                                                                              |
 
 ## 12. Revision record: the rules tree (2026-09-01)
 
 The flat rule keys and `[geo] default_country` are replaced by a single
-`rules:` tree, following review discussion on PR #1084. One row per change.
+`rules:` tree, following review discussion on PR #1084. The tree was extended
+the same day, where `jurisdiction` became a per-node inherited attribute and
+the two `[consent]` applicability lists retired into the tree. One row per
+change.
 
-| Before                                                                                 | After                                                                                                                                           | Why                                                                                                                                                     |
-| -------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Flat rule keys, a bare country (`FR`) or a slash-joined pair (`US/CA`)                 | One tree, with country codes at the first level and region codes nested beneath them, all matched case-insensitively                            | The nesting shows the reader the precedence instead of hiding it inside a joined key, and the file's audience is a policy owner rather than a developer |
-| A rule value is a group name, or a mapping of `{group, permissions}`                   | Every node has a `group` and optional children. A single string is shorthand for that group with no children, and a mapping must carry `group:` | One node shape reads the same at every depth, and the shorthand keeps a one-line country rule to one line                                               |
-| `[geo] default_country` in `trusted-server.toml` names the rule for unmatched requests | The tree's top node carries the `group` for a request whose country cannot be resolved                                                          | Treating an unknown visitor as being in a chosen country was a fiction, and the tree states the unknown case explicitly where a reader will look for it |
-| The consent handling for an unresolved request follows from the chosen default country | The top node also requires `jurisdiction:`, which appears nowhere else, with the values of the `Jurisdiction` type (§3.2)                       | The unknown case deserves its own stated answer rather than one inherited from a stand-in country                                                       |
-| Startup rejects a missing or unresolvable `default_country`                            | Startup rejects a top node missing `group` or `jurisdiction`, and reserved keys cannot collide with place codes because ISO codes are short     | The same loud failure, moved to where the policy now lives                                                                                              |
+| Before                                                                                                           | After                                                                                                                                                                                                   | Why                                                                                                                                                                                             |
+| ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Flat rule keys, a bare country (`FR`) or a slash-joined pair (`US/CA`)                                           | One tree, with country codes at the first level and region codes nested beneath them, all matched case-insensitively                                                                                    | The nesting shows the reader the precedence instead of hiding it inside a joined key, and the file's audience is a policy owner rather than a developer                                         |
+| A rule value is a group name, or a mapping of `{group, permissions}`                                             | Every node has a `group` and optional children. A single string is shorthand for that group with no children, and a mapping must carry `group:`                                                         | One node shape reads the same at every depth, and the shorthand keeps a one-line country rule to one line                                                                                       |
+| `[geo] default_country` in `trusted-server.toml` names the rule for unmatched requests                           | The tree's top node carries the `group` for a request whose country cannot be resolved                                                                                                                  | Treating an unknown visitor as being in a chosen country was a fiction, and the tree states the unknown case explicitly where a reader will look for it                                         |
+| The consent handling for an unresolved request follows from the chosen default country                           | The top node requires `jurisdiction:` beside `group:`, with the values of the `Jurisdiction` type (§3.2)                                                                                                | The unknown case deserves its own stated answer rather than one inherited from a stand-in country                                                                                               |
+| Startup rejects a missing or unresolvable `default_country`                                                      | Startup rejects a top node missing `group` or `jurisdiction`, and reserved keys cannot collide with place codes because ISO codes are short                                                             | The same loud failure, moved to where the policy now lives                                                                                                                                      |
+| `jurisdiction` is written at the top of the tree only                                                            | Any node may carry `jurisdiction:` beside `group:`, and a node carrying none inherits the nearest ancestor that does. The top node must carry both, so the inheritance always terminates                | A country or a state often needs its own regime, and inheritance states the common case once while leaving the exceptions visible where a reader meets them                                     |
+| The US-state value carries the state code, as `us-state/<CODE>`                                                  | The value is bare `us-state`, valid only on a region node under `US`, and rejected at the top and on a country node                                                                                     | The matched node already names the state, so repeating the code in the value invites the two disagreeing                                                                                        |
+| `consent.gdpr.applies_in` and `consent.us_states.privacy_states` in the operator TOML carry regime applicability | Both retire into the tree, where the shipped file holds the same 31 GDPR countries inheriting `gdpr` and the same 20 privacy-law states as region children of `US` with `jurisdiction: us-state` (§3.4) | One document carries the baselines and the applicability together, so a policy owner keeps one list rather than two in step, and the drift risk §3.4 recorded has nothing left to drift against |
 
 This revision leaves unchanged the group vocabulary and flags, the signal
 precedence of §4, and the requires-signal floor for a failed geo lookup, which

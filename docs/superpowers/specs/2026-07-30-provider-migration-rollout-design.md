@@ -7,7 +7,10 @@ decision ledger, and rows the implementation now satisfies are marked with
 their PR so the task force can ratify rather than re-litigate. Updated on
 2026-09-01, where `[geo] default_country` is retired and the fallback baseline
 for a request with no resolvable country moves to the top node of the `rules:`
-tree in `permissions.yaml` (permission-model spec §3.2 and §12).
+tree in `permissions.yaml`, where `jurisdiction` is a per-node inherited
+attribute and the `consent.gdpr.applies_in` and
+`consent.us_states.privacy_states` lists retire into the same tree
+(permission-model spec §3.2, §3.4 and §12).
 **Author:** Engineering
 **Issue references:** #777-#781 (epic)
 **Related specs:** `2026-07-30-pluggable-providers-design.md`,
@@ -347,7 +350,11 @@ The migrated operator configuration is:
   group at the top of the rules tree together with
   `assume_single_jurisdiction = true`;
 - the `permissions.yaml` rules tree carrying a top node with a `group` and a
-  `jurisdiction` (required).
+  `jurisdiction` (required), with each country or region below stating its own
+  `jurisdiction` only where it differs from the node above. The operator no
+  longer carries `consent.gdpr.applies_in` or `consent.us_states.privacy_states`,
+  because the shipped tree holds the same 31 GDPR countries and the same 20
+  privacy-law states.
 
 The draft's committed per-adapter fixture files
 (`docs/guide/fixtures/migration-preserving-<adapter>.toml`, CI-validated
