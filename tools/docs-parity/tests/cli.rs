@@ -385,6 +385,58 @@ fn symlink_escape_is_rejected_at_the_repository_boundary() {
 
 #[cfg(unix)]
 #[test]
+fn dangling_output_symlink_is_rejected_without_replacement() {
+    let repository = TestRepository::new(&["source.txt"]);
+    let update_record = repository.path().join("update-record.txt");
+    let check_record = repository.path().join("check-record.txt");
+    let missing_target = Path::new("missing-target.txt");
+    symlink(missing_target, &update_record).expect("should create update symlink");
+    symlink(missing_target, &check_record).expect("should create check symlink");
+
+    let updated = output(repository.command().args([
+        "update",
+        "--tracked-paths-record",
+        "update-record.txt",
+    ]));
+    let checked =
+        output(
+            repository
+                .command()
+                .args(["check", "--tracked-paths-record", "check-record.txt"]),
+        );
+
+    assert_eq!(
+        status_code(&updated),
+        ERROR,
+        "update should reject a dangling final symlink"
+    );
+    assert_eq!(
+        status_code(&checked),
+        ERROR,
+        "check should reject a dangling final symlink"
+    );
+    for record in [&update_record, &check_record] {
+        assert!(
+            fs::symlink_metadata(record)
+                .expect("should inspect final entry")
+                .file_type()
+                .is_symlink(),
+            "final entry should remain a symlink"
+        );
+        assert_eq!(
+            fs::read_link(record).expect("should read final symlink"),
+            missing_target,
+            "final symlink target should remain unchanged"
+        );
+    }
+    assert!(
+        !repository.path().join(missing_target).exists(),
+        "dangling target should not be created"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn tracked_symlink_to_an_internal_regular_file_is_allowed() {
     let repository = TestRepository::new(&["target.txt"]);
     symlink("target.txt", repository.path().join("link.txt"))

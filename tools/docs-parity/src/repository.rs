@@ -1,6 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write as _;
+use std::io::{ErrorKind, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
@@ -156,10 +156,7 @@ impl Repository {
         path: &NormalizedRelativePath,
     ) -> Result<Option<Vec<u8>>, Report<RepositoryError>> {
         let absolute = self.root.join(path.as_path());
-        if !absolute
-            .try_exists()
-            .change_context(RepositoryError::FileOperation)?
-        {
+        if final_entry_metadata(&absolute)?.is_none() {
             self.validate_parent_chain(path)?;
             return Ok(None);
         }
@@ -177,10 +174,7 @@ impl Repository {
         contents: &[u8],
     ) -> Result<(), Report<RepositoryError>> {
         let absolute = self.root.join(path.as_path());
-        if absolute
-            .try_exists()
-            .change_context(RepositoryError::FileOperation)?
-        {
+        if final_entry_metadata(&absolute)?.is_some() {
             self.validate_existing(path, false)?;
         }
         let parent = absolute.parent().ok_or_else(|| {
@@ -324,6 +318,16 @@ impl Repository {
             .change_context(RepositoryError::FileOperation)
             .attach_with(|| format!("create directory: {}", parent.display()))?;
         self.validate_parent_chain(path)
+    }
+}
+
+fn final_entry_metadata(path: &Path) -> Result<Option<fs::Metadata>, Report<RepositoryError>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Report::new(error)
+            .change_context(RepositoryError::FileOperation)
+            .attach(format!("inspect final entry: {}", path.display()))),
     }
 }
 

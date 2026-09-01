@@ -2075,6 +2075,12 @@ PY
   rejection and full existing-parent-chain validation were added. A tracked
   symlink to an internal regular file passed; an escaping symlink and unsafe
   tracked/output directory modes failed closed.
+- Review correction from `4f7fe471a4945d8d239091b30d07b9667e97239e`:
+  a dangling final output symlink initially made `update` exit 0 instead of 2
+  because `try_exists` followed its missing target. The focused regression then
+  passed after both check and update inspected the directory entry with
+  `symlink_metadata`: each exited 2, both symlink entries and link targets were
+  unchanged, and no dangling target was created.
 - Final focused commands:
 
   ```bash
@@ -2084,7 +2090,7 @@ PY
   cargo run --manifest-path tools/docs-parity/Cargo.toml -- check
   ```
 
-  Results: the integration command passed 14 tests, formatting and Clippy
+  Results: the integration command passed 15 tests, formatting and Clippy
   passed, and the real-worktree check passed without writing repository files.
 
 - Workspace isolation: the standalone tool owns
