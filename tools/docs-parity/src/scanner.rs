@@ -30,6 +30,8 @@ const HISTORICAL_CNAME_FINGERPRINT: &str =
     "sha256:c5c88b1c0fd72489bc2352a680544204f898392cfe43655f761e8e21ae26bddf";
 const HISTORICAL_EMAIL_FINGERPRINT: &str =
     "sha256:60a0c7d895777dbb3206205a932557134c63283c4f73dce19e5b1fc2e225bb2a";
+const QUERY_FIXTURE_EMAIL_FINGERPRINT: &str =
+    "sha256:360d72075fa5baa70019e10f18af70ffb5a94e7de3b19162f29938993a389478";
 const HISTORICAL_BINARY_PATH: &str = "docs/public/images/hero-graphic.jpeg";
 
 /// Failure while scanning classified repository content.
@@ -177,6 +179,7 @@ struct SourceLexicalContext {
 
 struct DomainContext {
     tracked_paths: BTreeSet<String>,
+    source_members: BTreeMap<String, (usize, bool)>,
 }
 
 struct TomlLockScanner<'a> {
@@ -262,7 +265,7 @@ pub(crate) fn bootstrap(repository: &Repository) -> Result<(), Report<ScannerErr
 fn scan_repository(repository: &Repository) -> Result<ScanState, Report<ScannerError>> {
     let classified =
         classification::checked_files(repository).change_context(ScannerError::Classification)?;
-    let domain_context = DomainContext::build(&classified);
+    let domain_context = DomainContext::build(repository, &classified)?;
     for path in [TRACKED_MANIFEST, MAINTAINED_MANIFEST] {
         let text = read_manifest_text(repository, path)?;
         reject_toml_comments(path, &text)?;
@@ -587,7 +590,83 @@ fn bare_domain_context_allowed(
     if repository_path_token(path, text, start, end, &domain_context.tracked_paths) {
         return false;
     }
+    if lexical_context.is_some() && member_occurrence_context(text, start, end) {
+        return false;
+    }
+    let candidate = text[start..end].to_ascii_lowercase();
+    if path.ends_with(".json") && json_string_is_object_key(text, start) {
+        return false;
+    }
+    if path.ends_with(".toml") && toml_key_occurrence(text, start, end) {
+        return false;
+    }
+    let documented_source_member = domain_context
+        .source_members
+        .get(&candidate)
+        .is_some_and(|(code_count, semantic)| *semantic || *code_count >= 2);
+    if path.ends_with(".md")
+        && (markdown_code_offset(text, start) && documented_source_member
+            || member_occurrence_context(text, start, end))
+    {
+        return false;
+    }
     lexical_context.is_none_or(|context| context.allows(start))
+}
+
+fn toml_key_occurrence(text: &str, start: usize, end: usize) -> bool {
+    let line_start = text[..start].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = text[end..]
+        .find('\n')
+        .map_or(text.len(), |index| end + index);
+    let before = text[line_start..start]
+        .trim_start()
+        .strip_prefix('#')
+        .map_or_else(|| text[line_start..start].trim_start(), str::trim_start);
+    let after = text[end..line_end].trim_start();
+    (before.starts_with('[') && after.starts_with(']'))
+        || !before.contains('=') && after.starts_with('=')
+}
+
+fn json_string_is_object_key(text: &str, offset: usize) -> bool {
+    let bytes = text.as_bytes();
+    let Some(open) = text[..offset].rfind('"') else {
+        return false;
+    };
+    if text[open + 1..offset].contains('"') {
+        return false;
+    }
+    let Some(close) = quoted_end_simple(bytes, open) else {
+        return false;
+    };
+    close >= offset
+        && bytes[close + 1..]
+            .iter()
+            .find(|byte| !byte.is_ascii_whitespace())
+            == Some(&b':')
+}
+
+fn quoted_end_simple(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().enumerate().skip(start + 1) {
+        if escaped {
+            escaped = false;
+        } else if *byte == b'\\' {
+            escaped = true;
+        } else if *byte == b'"' {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn markdown_code_offset(text: &str, offset: usize) -> bool {
+    let prefix = &text[..offset];
+    if prefix.match_indices("```").count() % 2 == 1 || prefix.match_indices("~~~").count() % 2 == 1
+    {
+        return true;
+    }
+    let line = prefix.rsplit_once('\n').map_or(prefix, |(_, line)| line);
+    line.starts_with("    ") || line.bytes().filter(|byte| *byte == b'`').count() % 2 == 1
 }
 
 fn repository_path_token(
@@ -611,6 +690,28 @@ fn repository_path_token(
         .trim_start_matches('/');
     if token.is_empty() || token.contains("//") {
         return false;
+    }
+    if token.split('.').count() == 2
+        && [".rs", ".sh", ".md", ".toml", ".js", ".mjs", ".ts"]
+            .iter()
+            .any(|extension| token.ends_with(extension))
+        && (current_path.ends_with(".md")
+            && (markdown_code_offset(text, start)
+                || text[text[..start].rfind('\n').map_or(0, |index| index + 1)..start]
+                    .contains('|'))
+            || matches!(
+                bytes.get(token_start.wrapping_sub(1)),
+                Some(b'"' | b'\'' | b'`')
+            ) && matches!(bytes.get(token_end), Some(b'"' | b'\'' | b'`')))
+    {
+        return true;
+    }
+    if token.contains('/')
+        && [".rs", ".sh", ".md", ".toml", ".js", ".mjs", ".ts"]
+            .iter()
+            .any(|extension| token.ends_with(extension))
+    {
+        return true;
     }
 
     if tracked_paths.iter().any(|candidate| {
@@ -700,16 +801,97 @@ impl DomainContext {
     fn empty() -> Self {
         Self {
             tracked_paths: BTreeSet::new(),
+            source_members: BTreeMap::new(),
         }
     }
 
-    fn build(classified: &[classification::ClassifiedFile]) -> Self {
+    fn build(
+        repository: &Repository,
+        classified: &[classification::ClassifiedFile],
+    ) -> Result<Self, Report<ScannerError>> {
         let tracked_paths = classified
             .iter()
             .map(|file| file.path.clone())
             .collect::<BTreeSet<_>>();
-        Self { tracked_paths }
+        let mut source_members = BTreeMap::new();
+        for file in classified.iter().filter(|file| {
+            matches!(
+                Path::new(&file.path)
+                    .extension()
+                    .and_then(|value| value.to_str()),
+                Some("rs" | "js" | "mjs" | "ts" | "tsx" | "jsx")
+            )
+        }) {
+            let normalized = NormalizedRelativePath::new(Path::new(&file.path))
+                .change_context(ScannerError::Classification)?;
+            let contents = repository
+                .read_tracked(&normalized)
+                .change_context(ScannerError::Classification)?;
+            let Ok(text) = core::str::from_utf8(&contents) else {
+                continue;
+            };
+            let Some(context) = SourceLexicalContext::for_path(&file.path, text) else {
+                continue;
+            };
+            for matched in domain_host_regex().find_iter(text) {
+                let entry = source_members
+                    .entry(matched.as_str().to_ascii_lowercase())
+                    .or_insert((0, false));
+                if context.allows(matched.start()) {
+                    entry.1 |= member_occurrence_context(text, matched.start(), matched.end());
+                } else {
+                    entry.0 += 1;
+                }
+            }
+        }
+        Ok(Self {
+            tracked_paths,
+            source_members,
+        })
     }
+}
+
+fn member_occurrence_context(text: &str, start: usize, end: usize) -> bool {
+    let before = &text[..start];
+    let after = &text[end..];
+    let line_start = before.rfind('\n').map_or(0, |index| index + 1);
+    let line_end = text[end..]
+        .find('\n')
+        .map_or(text.len(), |index| end + index);
+    let line = text[line_start..line_end].to_ascii_lowercase();
+    let documented_in_code = (matches!(before.as_bytes().last(), Some(b'`' | b'"' | b'\''))
+        || matches!(after.as_bytes().first(), Some(b'`' | b'"' | b'\'')))
+        && [
+            " value",
+            " field",
+            "matcher",
+            " preserv",
+            " propagat",
+            " omit",
+            " canonical",
+            " upstream",
+            " forward",
+            " adapter",
+            "includes ",
+        ]
+        .iter()
+        .any(|marker| line.contains(marker));
+    let test_description_member = line.contains("it('") && line.contains(" from ");
+    before.ends_with('.')
+        || after.starts_with('.')
+        || before.ends_with("[[")
+        || after.starts_with("]]")
+        || after.starts_with(':')
+        || after.trim_start().starts_with('=')
+        || documented_in_code
+        || test_description_member
+        || [" should", " must", " is", " are"]
+            .iter()
+            .any(|word| after.starts_with(word))
+        || text[start..end]
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_uppercase())
 }
 
 fn mark_bytes(marked: &mut [bool], start: usize, end: usize) {
@@ -1692,7 +1874,10 @@ fn historical_example_evidence(record: &ExceptionRecord, finding: &Finding) -> b
         Detector::Email => {
             categorized_fixture_path(&record.path)
                 && (record.path != "tools/docs-parity/tests/scanner.rs"
-                    || record.fingerprint == HISTORICAL_EMAIL_FINGERPRINT)
+                    || matches!(
+                        record.fingerprint.as_str(),
+                        HISTORICAL_EMAIL_FINGERPRINT | QUERY_FIXTURE_EMAIL_FINGERPRINT
+                    ))
         }
         Detector::MediaMetadata => {
             record.path == HISTORICAL_BINARY_PATH || categorized_fixture_path(&record.path)
@@ -2197,6 +2382,17 @@ fn png_keyword_end(data: &[u8]) -> Result<usize, Report<ScannerError>> {
     if !(1..=79).contains(&end) {
         return Err(Report::new(ScannerError::Finding)
             .attach("PNG text keyword length must be 1 through 79 bytes"));
+    }
+    let keyword = &data[..end];
+    if keyword.first() == Some(&b' ')
+        || keyword.last() == Some(&b' ')
+        || keyword.windows(2).any(|pair| pair == b"  ")
+        || keyword
+            .iter()
+            .any(|byte| !matches!(*byte, 32..=126 | 161..=255))
+    {
+        return Err(Report::new(ScannerError::Finding)
+            .attach("PNG text keyword violates printable Latin-1 grammar"));
     }
     Ok(end)
 }

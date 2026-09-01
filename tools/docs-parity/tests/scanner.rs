@@ -1201,6 +1201,53 @@ fn compressed_png_metadata_fails_closed() {
 }
 
 #[test]
+fn png_text_keywords_enforce_printable_latin1_spacing_grammar() {
+    for keyword in [
+        vec![1],
+        vec![0x7f],
+        vec![0x80],
+        vec![0x9f],
+        b" leading".to_vec(),
+        b"trailing ".to_vec(),
+        b"double  space".to_vec(),
+        Vec::new(),
+        vec![b'a'; 80],
+    ] {
+        let mut data = keyword;
+        data.push(0);
+        data.extend_from_slice(b"person@private-corp.internal");
+        let png = png_with_chunk(b"tEXt", &data);
+        assert_eq!(
+            status_code(&TestRepository::new("asset.png", &png, "binary").scan()),
+            ERROR
+        );
+    }
+    let mut missing_separator = b"Keyword".to_vec();
+    missing_separator.extend_from_slice(b"person@private-corp.internal");
+    let png = png_with_chunk(b"tEXt", &missing_separator);
+    assert_eq!(
+        status_code(&TestRepository::new("asset.png", &png, "binary").scan()),
+        ERROR
+    );
+
+    for keyword in [b"Single space".as_slice(), &[0xa1, b'K'][..]] {
+        let mut data = keyword.to_vec();
+        data.push(0);
+        data.extend_from_slice(b"person@private-corp.internal");
+        let png = png_with_chunk(b"tEXt", &data);
+        let repository = TestRepository::new("asset.png", &png, "binary");
+        assert_eq!(status_code(&repository.bootstrap()), SUCCESS);
+        let manifest = fs::read_to_string(
+            repository
+                .path()
+                .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+        )
+        .expect("should read bootstrap manifest");
+        assert!(manifest.contains("detector = \"media_metadata\""));
+    }
+}
+
+#[test]
 fn identical_media_and_non_metadata_binary_values_remain_distinct_occurrences() {
     let value = format!("person@{}", "private-corp.internal");
     let mut contents = png_text_chunk("Author", &value);
@@ -1286,6 +1333,56 @@ fn real_retired_manifest_contains_no_retired_plaintext() {
         assert!(
             manifest.contains(fingerprint),
             "real denylist must contain each reviewed fingerprint"
+        );
+    }
+}
+
+#[test]
+fn real_domain_manifest_excludes_repository_member_and_path_tokens() {
+    let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repository_root = crate_root
+        .parent()
+        .and_then(Path::parent)
+        .expect("tool should live below the repository root");
+    let manifest_text = fs::read_to_string(crate_root.join("manifests/sensitive-allowlist.toml"))
+        .expect("should read real sensitive manifest");
+    let manifest: toml::Value =
+        toml::from_str(&manifest_text).expect("real sensitive manifest should be TOML");
+    let forbidden = [
+        ["function.prototype", ".name"].concat(),
+        ["prebid", ".rs"].concat(),
+        ["ec", ".partners"].concat(),
+        ["when", ".zone"].concat(),
+        ["script", ".sh"].concat(),
+        ["slot", ".id"].concat(),
+        ["user", ".id"].concat(),
+        ["synthetic", ".rs"].concat(),
+        ["AuctionRequest", ".id"].concat(),
+        ["onboarding", ".md"].concat(),
+        ["site", ".page"].concat(),
+        ["seatbid", ".seat"].concat(),
+        ["mediaTypes.banner", ".name"].concat(),
+    ];
+    for exception in manifest["exceptions"]
+        .as_array()
+        .expect("manifest exceptions should be an array")
+    {
+        if exception["detector"].as_str() != Some("domain") {
+            continue;
+        }
+        let path = exception["path"].as_str().expect("exception path");
+        let selector = exception["selector"]
+            .as_str()
+            .expect("exception selector")
+            .strip_prefix("bytes:")
+            .expect("byte selector");
+        let (start, end) = selector.split_once('-').expect("selector range");
+        let bytes = fs::read(repository_root.join(path)).expect("selected path should exist");
+        let selected = &bytes[start.parse::<usize>().expect("start offset")
+            ..end.parse::<usize>().expect("end offset")];
+        assert!(
+            !forbidden.iter().any(|value| selected == value.as_bytes()),
+            "repository member/path token must not be a domain finding: {path}:{selector}"
         );
     }
 }
@@ -2189,6 +2286,14 @@ fn png_text_chunk(keyword: &str, value: &str) -> Vec<u8> {
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     append_png_chunk(&mut png, b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0]);
     append_png_chunk(&mut png, b"tEXt", &data);
+    append_png_chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+fn png_with_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    append_png_chunk(&mut png, b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0]);
+    append_png_chunk(&mut png, kind, data);
     append_png_chunk(&mut png, b"IEND", &[]);
     png
 }

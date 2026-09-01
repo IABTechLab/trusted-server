@@ -2465,6 +2465,33 @@ PY
   for all records; the 42 fake records were also reviewed against their selected
   repository bytes and narrowed evidence predicate.
 
+#### Task 5 final domain-context and PNG-keyword checkpoint
+
+- The prior consolidated checkpoint contained 68 scanner tests; the final
+  focused scanner suite contains 70 tests. CRC-valid PNG fixtures now prove
+  that tEXt, zTXt, and iTXt keywords accept only 1–79 printable Latin-1 bytes,
+  reject C0/C1 controls, and reject leading, trailing, or consecutive ASCII
+  spaces. Missing separators continue to fail closed.
+- The regenerated reviewed inventory contains 5,309 exact findings: 4,964
+  domain, 286 lockfile field, 42 credential shape, 12 binary string, four
+  email, and one service ID. Classes are 5,235 vendor URL, 42 fake credential,
+  18 historical example, 11 project-owned public domain, and one service ID.
+- Every domain selector was resolved to its exact repository bytes and the 332
+  unique values were aggregated by frequency and audited by URL, fixture,
+  internal-test, source-member, repository-path, and lockfile context. The most
+  frequent retained values were `registry.npmjs.org` (1,172), `github.com`
+  (916), `www.test-publisher.com` (867), `cms.theprospectagroup.net` (254), and
+  `js.datadome.co` (121). Mixed-case, source-extension, and low-frequency
+  buckets received a separate semantic pass; retained ambiguous-looking bytes
+  were public-host or deliberate scanner fixtures, not path/member findings.
+- The large reduction from 5,847 is the removal of repository basenames,
+  structured JSON/TOML keys, and documented source-member occurrences that had
+  been classified as vendor domains. Exact selector assertions now keep all
+  requested representative path/member values at zero, while focused fixtures
+  retain real hosts in prose, Markdown code, source strings/comments, and URL
+  query/fragment values. The real-manifest regression resolves selectors back
+  to bytes so representative false domains cannot silently return.
+
 #### Task 6 — Implement generated regions, Markdown ownership, and link checks
 
 Pending. Record each atomic fixture cycle and generated second-run no-diff.
