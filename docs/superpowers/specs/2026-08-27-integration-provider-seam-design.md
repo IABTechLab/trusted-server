@@ -196,9 +196,7 @@ the neutral form.
 
 ### 3.6 Identity, geo and device as registration capabilities
 
-The rule. Things the host supplies are platform services, being the KV
-store, the HTTP client, the host geo lookup, and the host TLS and HTTP/2
-signals. Things a vendor supplies are capabilities of that vendor's module.
+The rule. Things the host supplies are platform services, being the KV store, the HTTP client, and the host TLS and HTTP/2 signals. A host geo lookup is host data that a selected geo provider may consume; geo itself is a provider a deployer selects, never a platform service. Things a vendor supplies are capabilities of that vendor's module.
 An identity provider, a geo provider and a device provider are supplied by
 vendors, with or without any host involved, so all three are module
 capabilities, and the same registration carries them alongside the module's
@@ -257,7 +255,7 @@ and #1047 are unaffected beyond the rebase.
 
 ## 4. Migration of the nine existing integrations
 
-One vendor per PR, after this change lands. Each moves its Rust, its
+One vendor per PR, after this change lands. Each migration PR gives its vendor crate a visible maintainers declaration, the way Prebid.js requires of every adapter, and per-crate code ownership, so the boundary carries a named owner from its first day. Each moves its Rust, its
 TypeScript, its config type and its tests into
 `crates/integrations/<vendor>`, and the adapter that wants it depends on it.
 
