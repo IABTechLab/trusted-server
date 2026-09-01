@@ -17,8 +17,9 @@ and what they allow.
 
 The default deployment makes no host-specific call, creates no identifiers, and
 resolves no location until an operator enables a provider. It requires exactly
-one policy decision, the default jurisdiction baseline (`[geo] default_country`).
-Trusted Server does not assume a jurisdiction for you, so you declare one, and
+one policy decision, the baseline that applies when no country can be resolved,
+which is stated at the top of the `rules:` tree in `permissions.yaml`. Trusted
+Server does not assume a jurisdiction for you, so you declare one, and
 the examples use the most protective baseline (GDPR-EU). With no Edge Cookie
 provider selected there is nothing to gate, so no identifier is created and the
 request proceeds.
@@ -88,9 +89,10 @@ is one source among many, not the basis for every permission:
 
 - **Country and region.** The baseline position for a jurisdiction, from the geo
   provider, keyed by ISO 3166-1 with an optional region such as a US state. When
-  no country is identified, or the country/region has no rule, the deployer's
-  configured default country applies. A default is required, so there is always
-  one.
+  a region has no rule of its own the country's rule applies, and when no
+  country is identified, or the country has no rule either, the baseline at the
+  top of the rules tree applies. That top baseline is required, so there is
+  always one.
 - **Consent signals.** TCF, GPP, or GPC decoded from the request, mapped onto
   permissions as a grant or a revoke on top of the baseline.
 - **Interaction with the user.** A publisher may establish a preference because
@@ -175,15 +177,66 @@ The Edge Cookie `Set-Cookie` operation always requires `necessary.operations.sto
 The policy lives in a human-editable `permissions.yaml` at the repository root,
 compiled into the build, so policy owners read and change it in version control.
 It has two parts. **Groups** are named baselines, each a set of permission flags.
-**Rules** map a country, or a country and state, to a group. The keys are the
-codes a geo provider returns, matched case-insensitively. The country is an
-ISO 3166-1 alpha-2 code (`FR`), and a state adds the ISO 3166-2 subdivision code
-with no country prefix (`US/CA` is California). The Fastly geo provider emits
-these codes directly, and any other provider must do the same. A region rule
-takes precedence over its country. A request that matches no rule, or whose
-country the geo provider could not resolve, uses the deployer's configured
-default country
-(`[geo] default_country`). A default is required, so there is always one.
+**Rules** are a single tree that says which group applies where.
+
+### Reading and editing the rules tree
+
+Every node of the tree has a `group`, and children are optional. A child key is
+a place code, so the keys directly under `rules:` are ISO 3166-1 alpha-2 country
+codes (`FR`, `US`, `GB`), and the keys beneath a country are ISO 3166-2 region
+codes with no country prefix (`CA` is California). Codes are matched
+case-insensitively, so `us` and `US` name the same place. These are the codes a
+geo provider returns. The Fastly geo provider emits them directly, and any other
+provider must do the same.
+
+A node can be written two ways. The shorthand is a single string, which becomes
+that node's `group` and gives it no children, so `GB: gdpr-uk` is a complete
+rule. The longer form is a mapping, which must contain `group:` and may carry
+child place codes beside it. A reserved key can never be mistaken for a place,
+because an ISO code is at most three characters long.
+
+The top node, meaning the `rules:` mapping itself, is the only node that needs
+more than a `group`. It also requires `jurisdiction:`, which appears nowhere
+else in the tree. The top node's `group` is the baseline for a visitor whose
+country cannot be resolved, and its `jurisdiction` is the consent handling
+applied to that same visitor. The accepted values are the states of the
+`Jurisdiction` type in
+`crates/trusted-server-core/src/consent/jurisdiction.rs`, which the rest of the
+stack already uses:
+
+| Value           | Meaning                                                                             |
+| --------------- | ----------------------------------------------------------------------------------- |
+| `gdpr`          | GDPR handling, being `Jurisdiction::Gdpr`, which appears in logs as `GDPR`          |
+| `us-<state>`    | A US state with a comprehensive privacy law, for example `us-ca`, logged as `US-CA` |
+| `non-regulated` | The location is known and matches no regulation, being `Jurisdiction::NonRegulated` |
+| `unknown`       | The jurisdiction cannot be determined, being `Jurisdiction::Unknown`                |
+
+Matching is most specific wins, falling back to the parent's `group`. Trusted
+Server tries the region node, then the country node, then the top node, and uses
+the first `group` it finds. A geo lookup **failure** is a different state from
+having no location, and it keeps the requires-signal floor described below
+rather than reaching the tree at all.
+
+```yaml
+rules:
+  group: gdpr-eu # when no country can be resolved
+  jurisdiction: gdpr # consent handling when no country can be resolved
+  GB: gdpr-uk # United Kingdom
+  US: # United States
+    group: us-notice # any state not listed below
+    CA: us-opt-out # California
+    NY: us-notice # New York
+```
+
+Read that tree as follows. A New York visitor gets `us-notice` from the `NY`
+node. A Texas visitor gets `us-notice` too, through the `US` node, because no
+`TX` child exists. A Manchester visitor gets `gdpr-uk` from the `GB` node. A
+visitor whose country cannot be resolved gets `gdpr-eu` with GDPR consent
+handling, both stated at the top.
+
+Startup rejects a file whose top node has no `group` or no `jurisdiction`, in
+the same way a missing default country was rejected before, so the unknown case
+is always answered in the file rather than assumed by the code.
 
 The country and region rules set only the **baseline** position. They say what
 is permitted before any session signal, not what a deployer must ask the user
@@ -201,10 +254,10 @@ session signal can then change:
 
 A group lists every permission and its flag, so its meaning is explicit in the
 file. (A group may instead give a single `default` flag for any permission it
-omits, but the shipped groups spell every one out.) A rule may then make small
-per-permission tweaks on top of its group with a `permissions` map from Data
-Use to flag (`granted`, `requires_signal`, or `denied`), each entry overriding
-the group baseline for that Data Use.
+omits, but the shipped groups spell every one out.) A node written as a mapping
+may then make small per-permission tweaks on top of its group with a
+`permissions` map from Data Use to flag (`granted`, `requires_signal`, or
+`denied`), each entry overriding the group baseline for that Data Use.
 
 ### Why three states, not two
 
@@ -229,8 +282,8 @@ same consent against a `requires_signal` baseline would set it. Consent lifts
 
 The shipped `permissions.yaml` defines `gdpr-eu`, `gdpr-uk`, and `us-opt-out`
 groups, and maps the EU 27 and the EEA members (IS, LI, NO) to `gdpr-eu`, the
-UK to `gdpr-uk`, and the US (one country-level rule, with state rules
-available as overrides) and Australia to `us-opt-out`. For device storage (Purpose 1), that yields:
+UK to `gdpr-uk`, and the US (a country node, with region children available
+beneath it) and Australia to `us-opt-out`. For device storage (Purpose 1), that yields:
 
 | Country        | Device storage (Purpose 1)                                      |
 | -------------- | --------------------------------------------------------------- |
@@ -239,10 +292,11 @@ available as overrides) and Australia to `us-opt-out`. For device storage (Purpo
 | United States  | Granted (opt-out)                                               |
 | Australia      | Granted                                                         |
 
-These are defaults to modify or replace, not legal advice. The deployer must set
-the default country for unmatched requests in `trusted-server.toml`
-(`[geo] default_country`). It is required and validated at startup against these
-rules, so startup fails when it is unset or names no rule. A rule that names a
+These are defaults to modify or replace, not legal advice. The deployer states
+the baseline for an unresolved request at the top of the rules tree, through its
+`group` and its `jurisdiction`. Both are required and are validated at startup,
+so startup fails when either is missing or when the `group` names nothing
+defined in the file. A node that names a
 group not defined in the file, or a flag that is not `granted`,
 `requires_signal`, or `denied`, is rejected at build time, so a typo is caught
 rather than silently ignored.
@@ -269,9 +323,9 @@ record refuses storage in a jurisdiction whose baseline did not grant it.
 flowchart TD
     Start[Resolve country and region] --> Lookup{Geo lookup<br/>succeeded?}
     Lookup -- "Failed" --> Floor[Requires-signal floor]
-    Lookup -- "Yes" --> Rules{Region or country<br/>has a rule?}
+    Lookup -- "Yes" --> Rules{Region or country<br/>has a node?}
     Rules -- "Yes" --> CountryMap[Use that baseline]
-    Rules -- "No or none resolved" --> Default[Use the configured default country]
+    Rules -- "No or none resolved" --> Default[Use the top node's group]
     Floor --> PerPerm
     CountryMap --> PerPerm
     Default --> PerPerm
@@ -293,7 +347,7 @@ flowchart TD
 
 The "Failed" branch is the rule for a geo provider that can report a failed
 lookup. None of the providers shipped today can, so a geo outage takes the
-"No or none resolved" branch instead. See the default-country note below.
+"No or none resolved" branch instead. See the note on the top node below.
 
 ## How the resolved permissions reach downstream code
 
@@ -352,40 +406,40 @@ resolved and never to widen it.
 
 ## Configuration
 
-The geo provider, which resolves the country, and the default country for
-unmatched requests are selected in `trusted-server.toml`. The country and region
-rules live in the human-editable `permissions.yaml` at the repository root,
-compiled into the build (not loaded at runtime).
+The geo provider, which resolves the country, is selected in
+`trusted-server.toml`. The rules tree, including the baseline for a request with
+no resolvable country, lives in the human-editable `permissions.yaml` at the
+repository root, compiled into the build (not loaded at runtime).
 
 ```toml
-# trusted-server.toml selects the geo provider and the default country used when
-# a request matches no rule (or the geo provider resolves no country).
+# trusted-server.toml selects the geo provider. The baseline used when a request
+# matches no node, or the geo provider resolves no country, is stated at the top
+# of the rules tree in permissions.yaml.
 [geo]
 provider = "platform"
-default_country = "US"
-# With no geo provider, every request is treated as default_country. A
+# With no geo provider, every request resolves at the top of the rules tree. A
 # deployment that runs an Edge Cookie provider without a geo provider must
 # acknowledge that explicitly:
 # assume_single_jurisdiction = true
 ```
 
-The default country covers requests the geo provider leaves unmatched. A
+The top of the tree covers requests the geo provider leaves unmatched. A
 failed geo lookup is different, because it resolves every permission to the
-requires-signal floor instead of the default, and is logged at error level.
+requires-signal floor instead of the top baseline, and is logged at error level.
 
 Read that alongside which lookups can actually fail, because it decides how
-much the default country is doing for you. None of the geo providers shipped
+much the top baseline is doing for you. None of the geo providers shipped
 today can fail. Fastly's lookup returns "no data" rather than an error, the
 Cloudflare provider reads request headers, and the Axum and Spin providers
-resolve nothing at all. **A geo outage therefore reaches the default country,
+resolve nothing at all. **A geo outage therefore reaches the top baseline,
 not the floor**, because "no data" and "the deployer left this unmatched" are
-the same state. Choose the default country on that basis, meaning whatever it grants
-is what an outage grants. The floor applies to a geo provider that does its
-own lookup and can report a failure.
+the same state. Choose the top `group` and `jurisdiction` on that basis, meaning
+whatever they grant is what an outage grants. The floor applies to a geo
+provider that does its own lookup and can report a failure.
 
 ```yaml
 # permissions.yaml (excerpt). Each group lists every permission and its flag.
-# Rules map countries and states to a group.
+# The rules tree maps places to a group, countries first, then regions beneath.
 groups:
   gdpr-eu: # opt-in, every purpose requires a signal
     necessary.operations.storage: requires_signal
@@ -397,12 +451,15 @@ groups:
     # ... the remaining purposes, also granted
 
 rules:
+  group: gdpr-eu # when no country can be resolved
+  jurisdiction: gdpr # consent handling when no country can be resolved
   FR: gdpr-eu
-  US: us-opt-out
-  US/CA: # a state can override single flags on top of its group
+  US:
     group: us-opt-out
-    permissions:
-      advertising_marketing.first_party.targeted: denied
+    CA: # a region can override single flags on top of its group
+      group: us-opt-out
+      permissions:
+        advertising_marketing.first_party.targeted: denied
 ```
 
 ## Relationship to Edge Cookies
