@@ -253,16 +253,23 @@ mod tests {
     }
 
     #[test]
-    fn config_store_name_applies_the_physical_name_override() {
-        let env = EnvConfig::from_vars([(
-            "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME",
-            "publisher-config-store",
-        )]);
+    fn config_store_name_override_preserves_the_independently_selected_key() {
+        let env = EnvConfig::from_vars([
+            (
+                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME",
+                "publisher-config-store",
+            ),
+            (
+                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY",
+                "trusted_server_config_staging",
+            ),
+        ]);
 
         assert_eq!(
             config_store_name(&env),
             StoreName::from("publisher-config-store")
         );
+        assert_eq!(config_key(&env), "trusted_server_config_staging");
     }
 
     #[test]
