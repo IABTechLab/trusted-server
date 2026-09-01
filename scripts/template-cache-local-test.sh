@@ -198,7 +198,11 @@ s = re.sub(r'passphrase = "[^"]*"',
 # platform geo provider is selected here, so the auction runs under the US
 # state opt-out rules with no consent signal, which is what the retired
 # default_country lever used to arrange.
-s = s.replace('# provider = "platform"', 'provider = "platform"', 1)
+s = s.replace('
+# provider = "platform"
+', '
+provider = "platform"
+', 1)
 
 # A real auction, pointed at the stub's slow endpoint, so the timings mean something.
 s = s.replace('[integrations.prebid]\nenabled = false\nserver_url = "https://prebid.example.com/openrtb2/auction"',
