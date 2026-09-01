@@ -418,6 +418,69 @@ fn grammar_specific_comment_states_handle_templates_escapes_and_multiline_scalar
 }
 
 #[test]
+fn multiline_quotes_and_nested_templates_close_before_guidance_comments() {
+    for (path, grammar, contents, comment) in [
+        (
+            "script.sh",
+            "shell",
+            "value='literal\n# string content\n' # operator guidance\n",
+            "# operator guidance",
+        ),
+        (
+            "config.yaml",
+            "yaml",
+            "value: 'literal\n# string content\n' # operator guidance\n",
+            "# operator guidance",
+        ),
+        (
+            "build.mjs",
+            "javascript",
+            "const x = `${outer ? `${inner}` : value}`; // operator guidance\n",
+            "// operator guidance",
+        ),
+    ] {
+        let start = contents.find(comment).expect("comment");
+        let selector = format!("bytes:{start}-{}", start + comment.len());
+        let repository = TestRepository::new();
+        repository.track(path, contents.as_bytes());
+        repository.manifests(
+            &text_manifest(path, 2048),
+            &comment_source(path, grammar, &[(&selector, comment)]),
+        );
+        let result = repository.classify();
+        assert_eq!(
+            status_code(&result),
+            SUCCESS,
+            "{grammar}: {}",
+            diagnostic(&result)
+        );
+    }
+}
+
+#[test]
+fn unterminated_comment_grammar_states_fail_closed() {
+    for (path, grammar, contents) in [
+        ("script.sh", "shell", "value='open\n"),
+        ("config.yaml", "yaml", "value: 'open\n"),
+        ("build.mjs", "javascript", "const x = `open ${value;"),
+        ("build.js", "javascript", "/* open"),
+    ] {
+        let repository = TestRepository::new();
+        repository.track(path, contents.as_bytes());
+        repository.manifests(
+            &text_manifest(path, 2048),
+            &comment_source(path, grammar, &[]),
+        );
+        let result = repository.classify();
+        assert_eq!(
+            status_code(&result),
+            ERROR,
+            "{grammar} unterminated state must fail"
+        );
+    }
+}
+
+#[test]
 fn comment_records_cannot_reference_unknown_or_whole_file_sources() {
     for maintained in [
         format!(

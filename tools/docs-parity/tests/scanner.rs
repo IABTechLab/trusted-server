@@ -122,10 +122,11 @@ fn exception(
     matched_content: &str,
     expiry: &str,
 ) -> String {
+    let governed = governed_match(detector, matched_content);
     format!(
         "version = 1\nreviewed = true\n\n[[exceptions]]\nclass = \"{class}\"\npath = \"{path}\"\ndetector = \"{detector}\"\nscope = \"exact-occurrence\"\nselector = \"bytes:0-{}\"\nfingerprint = \"{}\"\nowner = \"docs-owner\"\nrationale = \"Reviewed fixture with an exact content boundary.\"\nexpires_at = \"{expiry}\"\n",
-        matched_content.len(),
-        fingerprint(matched_content.as_bytes())
+        governed.len(),
+        fingerprint(governed.as_bytes())
     )
 }
 
@@ -137,17 +138,36 @@ fn exception_for_contents(
     matched_content: &str,
     expiry: &str,
 ) -> String {
+    let governed = governed_match(detector, matched_content);
     let start = contents
-        .windows(matched_content.len())
-        .position(|window| window == matched_content.as_bytes())
+        .windows(governed.len())
+        .position(|window| window == governed.as_bytes())
         .expect("matched fixture content should exist");
-    exception(class, path, detector, matched_content, expiry).replace(
-        &format!("selector = \"bytes:0-{}\"", matched_content.len()),
-        &format!(
-            "selector = \"bytes:{start}-{}\"",
-            start + matched_content.len()
-        ),
+    exception(class, path, detector, &governed, expiry).replace(
+        &format!("selector = \"bytes:0-{}\"", governed.len()),
+        &format!("selector = \"bytes:{start}-{}\"", start + governed.len()),
     )
+}
+
+fn governed_match(detector: &str, value: &str) -> String {
+    if !matches!(detector, "domain" | "binary_string" | "media_metadata") || !value.contains("://")
+    {
+        return value.to_owned();
+    }
+    value
+        .split_once("://")
+        .expect("URL")
+        .1
+        .split(['/', '?', '#'])
+        .next()
+        .expect("host")
+        .rsplit('@')
+        .next()
+        .expect("host")
+        .split(':')
+        .next()
+        .expect("host")
+        .to_owned()
 }
 
 fn fingerprint(contents: &[u8]) -> String {
@@ -322,10 +342,13 @@ fn bare_domain_detector_does_not_match_source_member_prefixes() {
 #[test]
 fn domain_detector_rejects_template_path_and_code_member_false_positives() {
     for (path, contents) in [
-        ("main.rs", r#"format!("http://{}");"#),
-        ("build.rs", r#"let path = "build.rs";"#),
-        ("platform.rs", "let x = prediction.name;"),
-        ("app.rs", "let x = state.settings.ec.partners;"),
+        ("main.rs", ["format!(\"http", "://{}\");"].concat()),
+        ("build.rs", ["let path = \"build", ".rs\";"].concat()),
+        ("platform.rs", ["let x = prediction", ".name;"].concat()),
+        (
+            "app.rs",
+            ["let x = state.settings.ec", ".partners;"].concat(),
+        ),
     ] {
         let repository = TestRepository::new(path, contents.as_bytes(), "text");
         let result = repository.scan();
@@ -336,6 +359,52 @@ fn domain_detector_rejects_template_path_and_code_member_false_positives() {
             diagnostic(&result)
         );
     }
+}
+
+#[test]
+fn domain_detector_rejects_non_code_paths_and_markup_tokens_but_keeps_link_hosts() {
+    for (path, contents) in [
+        (
+            "README.md",
+            [
+                "See build",
+                ".rs, `prediction",
+                ".name`, and ```state.settings.ec",
+                ".partners```.",
+            ]
+            .concat(),
+        ),
+        (
+            "README.md",
+            [
+                "[guide](getting-started",
+                ".md) and ../docs/configuration",
+                ".md",
+            ]
+            .concat(),
+        ),
+        (".dockerignore", ["dist/cache", ".name\n"].concat()),
+        (
+            "config.txt",
+            ["relative\\path", ".name and /var/tmp/file", ".dev"].concat(),
+        ),
+        ("script.sh", ["# generated path build", ".rs\n"].concat()),
+    ] {
+        let repository = TestRepository::new(path, contents.as_bytes(), "text");
+        let result = repository.scan();
+        assert_eq!(
+            status_code(&result),
+            SUCCESS,
+            "{path}: {}",
+            diagnostic(&result)
+        );
+    }
+    assert_detected(
+        "README.md",
+        b"[purpose](https://getpurpose.ai/docs)",
+        "text",
+        "domain",
+    );
 }
 
 #[test]
@@ -542,6 +611,13 @@ fn lockfiles_scan_non_url_secrets_and_select_the_structured_value_occurrence() {
 
 #[test]
 fn structured_lockfiles_fail_closed_on_non_string_and_duplicate_url_fields() {
+    for contents in [
+        "version = 3\n\"source\" = \"https://private-corp.internal/index\"\n",
+        "version = 3\npackage = { source = \"https://private-corp.internal/index\" }\n",
+        "version = 3\npackage.source = \"https://private-corp.internal/index\"\n",
+    ] {
+        assert_detected("Cargo.lock", contents.as_bytes(), "text", "lockfile_field");
+    }
     for contents in [
         r#"{"resolved":null}"#,
         r#"{"resolved":{}}"#,
@@ -1217,7 +1293,16 @@ fn identical_findings_require_distinct_occurrences_and_moving_one_invalidates_sc
     let value = format!("https://duplicate.{}", "private-corp.internal/path");
     let contents = format!("{value}\n{value}\n");
     let repository = TestRepository::new("notes.txt", contents.as_bytes(), "text");
-    let first = occurrence_exception("vendor_url", "notes.txt", "domain", &value, 0, value.len());
+    let host = governed_match("domain", &value);
+    let host_offset = value.find(&host).expect("host");
+    let first = occurrence_exception(
+        "vendor_url",
+        "notes.txt",
+        "domain",
+        &host,
+        host_offset,
+        host_offset + host.len(),
+    );
     repository.write_allowlist(&first);
     let missing_second = repository.scan();
     assert_eq!(
@@ -1234,9 +1319,9 @@ fn identical_findings_require_distinct_occurrences_and_moving_one_invalidates_sc
             "vendor_url",
             "notes.txt",
             "domain",
-            &value,
-            second_start,
-            second_start + value.len(),
+            &host,
+            second_start + host_offset,
+            second_start + host_offset + host.len(),
         )
     );
     repository.write_allowlist(&two_records);

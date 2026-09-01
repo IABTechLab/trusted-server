@@ -661,10 +661,20 @@ fn extract_comments(
     grammar: &str,
 ) -> Result<Vec<CommentSpan>, Report<ClassificationError>> {
     match grammar {
-        "shell" | "python" | "dockerfile" => Ok(extract_hash_comments(text, true, false)),
+        "shell" => {
+            ensure_closed_hash_state(text, true)?;
+            Ok(extract_hash_comments(text, true, false))
+        }
+        "python" | "dockerfile" => Ok(extract_hash_comments(text, false, false)),
         "toml" => Ok(extract_toml_comments(text)),
-        "yaml" => Ok(extract_yaml_comments(text)),
-        "rust" | "javascript" | "protobuf" => Ok(extract_slash_comments(text)),
+        "yaml" => {
+            ensure_closed_yaml_state(text)?;
+            Ok(extract_yaml_comments(text))
+        }
+        "rust" | "javascript" | "protobuf" => {
+            ensure_closed_slash_state(text)?;
+            Ok(extract_slash_comments(text))
+        }
         "markdown" => Ok(extract_markdown_comments(text)),
         _ => Err(Report::new(ClassificationError::InvalidManifest)
             .attach(format!("unsupported comment grammar: {grammar}"))),
@@ -684,7 +694,9 @@ fn extract_hash_comments(
     while index < bytes.len() {
         let byte = bytes[index];
         if byte == b'\n' {
-            quote = None;
+            if !escaped_hash {
+                quote = None;
+            }
             escaped = false;
             index += 1;
             continue;
@@ -727,6 +739,104 @@ fn extract_hash_comments(
         index += 1;
     }
     spans
+}
+
+fn ensure_closed_hash_state(
+    text: &str,
+    preserve_newlines: bool,
+) -> Result<(), Report<ClassificationError>> {
+    let mut quote = None;
+    let mut escaped = false;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' && quote != Some(b'\'') {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if quote.is_none() && b == b'#' {
+            i = bytes[i..]
+                .iter()
+                .position(|v| *v == b'\n')
+                .map_or(bytes.len(), |n| i + n + 1);
+            continue;
+        }
+        if matches!(b, b'"' | b'\'') {
+            if quote == Some(b) {
+                quote = None
+            } else if quote.is_none() {
+                quote = Some(b)
+            }
+        }
+        if b == b'\n' && !preserve_newlines {
+            quote = None
+        }
+        i += 1;
+    }
+    if quote.is_some() {
+        Err(Report::new(ClassificationError::Incomplete)
+            .attach("unterminated comment-grammar quote state"))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_closed_slash_state(text: &str) -> Result<(), Report<ClassificationError>> {
+    let mut block = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if quote.is_some() && b[i] == b'\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if quote.is_none() && block == 0 && i + 1 < b.len() && &b[i..i + 2] == b"//" {
+            i = b[i..]
+                .iter()
+                .position(|v| *v == b'\n')
+                .map_or(b.len(), |n| i + n + 1);
+            continue;
+        }
+        if quote.is_none() && i + 1 < b.len() && &b[i..i + 2] == b"/*" {
+            block += 1;
+            i += 2;
+            continue;
+        }
+        if block > 0 && i + 1 < b.len() && &b[i..i + 2] == b"*/" {
+            block -= 1;
+            i += 2;
+            continue;
+        }
+        if block == 0 && matches!(b[i], b'"' | b'\'' | b'`') {
+            if quote == Some(b[i]) {
+                quote = None
+            } else if quote.is_none() {
+                quote = Some(b[i])
+            }
+        }
+        i += 1
+    }
+    if block > 0 || quote.is_some() {
+        Err(Report::new(ClassificationError::Incomplete)
+            .attach("unterminated comment grammar lexical state"))
+    } else {
+        Ok(())
+    }
 }
 
 fn extract_toml_comments(text: &str) -> Vec<CommentSpan> {
@@ -788,6 +898,8 @@ fn extract_yaml_comments(text: &str) -> Vec<CommentSpan> {
     let mut spans = Vec::new();
     let mut offset = 0;
     let mut block_indent = None;
+    let mut quote = None;
+    let mut escaped = false;
     for line in text.split_inclusive('\n') {
         let body = line.strip_suffix('\n').unwrap_or(line);
         let indent = body.len() - body.trim_start().len();
@@ -796,19 +908,101 @@ fn extract_yaml_comments(text: &str) -> Vec<CommentSpan> {
             continue;
         }
         block_indent = None;
-        let candidates = extract_hash_comments(body, false, true);
-        spans.extend(candidates.into_iter().map(|span| CommentSpan {
-            start: offset + span.start,
-            end: offset + span.end,
-            contents: span.contents,
-        }));
-        let plain = body.split('#').next().unwrap_or(body).trim_end();
+        let bytes = body.as_bytes();
+        let mut i = 0;
+        let mut comment_start = None;
+        while i < bytes.len() {
+            if escaped {
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            if quote == Some(b'"') && bytes[i] == b'\\' {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            if matches!(bytes[i], b'"' | b'\'') {
+                if quote == Some(bytes[i]) {
+                    quote = None
+                } else if quote.is_none() {
+                    quote = Some(bytes[i])
+                };
+                i += 1;
+                continue;
+            }
+            if bytes[i] == b'#' && quote.is_none() && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            {
+                comment_start = Some(i);
+                break;
+            }
+            i += 1
+        }
+        if let Some(start) = comment_start {
+            spans.push(CommentSpan {
+                start: offset + start,
+                end: offset + body.len(),
+                contents: body[start..].to_owned(),
+            });
+        }
+        let plain = comment_start
+            .map_or(body, |start| &body[..start])
+            .trim_end();
         if plain.ends_with('|') || plain.ends_with('>') {
             block_indent = Some(indent + 1);
         }
         offset += line.len();
     }
     spans
+}
+
+fn ensure_closed_yaml_state(text: &str) -> Result<(), Report<ClassificationError>> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut block_indent = None;
+    for line in text.lines() {
+        let indent = line.len() - line.trim_start().len();
+        if block_indent.is_some_and(|n| line.trim().is_empty() || indent >= n) {
+            continue;
+        }
+        block_indent = None;
+        let b = line.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if escaped {
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            if quote == Some(b'"') && b[i] == b'\\' {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            if matches!(b[i], b'"' | b'\'') {
+                if quote == Some(b[i]) {
+                    quote = None
+                } else if quote.is_none() {
+                    quote = Some(b[i])
+                };
+                i += 1;
+                continue;
+            }
+            if b[i] == b'#' && quote.is_none() && (i == 0 || b[i - 1].is_ascii_whitespace()) {
+                break;
+            }
+            i += 1
+        }
+        let plain = line.split('#').next().unwrap_or(line).trim_end();
+        if quote.is_none() && (plain.ends_with('|') || plain.ends_with('>')) {
+            block_indent = Some(indent + 1)
+        }
+    }
+    if quote.is_some() {
+        Err(Report::new(ClassificationError::Incomplete).attach("unterminated YAML quoted scalar"))
+    } else {
+        Ok(())
+    }
 }
 
 fn extract_slash_comments(text: &str) -> Vec<CommentSpan> {
@@ -818,6 +1012,7 @@ fn extract_slash_comments(text: &str) -> Vec<CommentSpan> {
     let mut quote = None;
     let mut escaped = false;
     let mut template_depth = 0usize;
+    let mut template_parents = Vec::new();
     while i < bytes.len() {
         let b = bytes[i];
         if escaped {
@@ -831,6 +1026,7 @@ fn extract_slash_comments(text: &str) -> Vec<CommentSpan> {
             continue;
         }
         if quote == Some(b'`') && i + 1 < bytes.len() && &bytes[i..i + 2] == b"${" {
+            template_parents.push(template_depth);
             quote = None;
             template_depth = 1;
             i += 2;
@@ -853,7 +1049,10 @@ fn extract_slash_comments(text: &str) -> Vec<CommentSpan> {
         }
         if matches!(b, b'\'' | b'"' | b'`') {
             if quote == Some(b) {
-                quote = None
+                quote = None;
+                if b == b'`' {
+                    template_depth = template_parents.pop().unwrap_or(0);
+                }
             } else if quote.is_none() {
                 quote = Some(b)
             };

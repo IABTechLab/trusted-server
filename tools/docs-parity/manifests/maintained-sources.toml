@@ -7201,12 +7201,6 @@ disposition = "include"
 
 [[comments]]
 path = "scripts/template-cache-local-test.sh"
-selector = "bytes:4244-4276"
-fingerprint = "sha256:3a21b73b1b7d3ea9864834759d764efd8051d4be848ac7a24b27ffe4ac8efd92"
-disposition = "include"
-
-[[comments]]
-path = "scripts/template-cache-local-test.sh"
 selector = "bytes:4811-4897"
 fingerprint = "sha256:2b92b09b5557afb5129e09fd19dd1274452ea64a776e35c5e2aeb445c5ce32c0"
 disposition = "include"

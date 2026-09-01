@@ -314,7 +314,7 @@ fn scan_text(path: &str, text: &str, base_offset: usize) -> Vec<Finding> {
     let mut result = Vec::new();
     for matched in url_regex().find_iter(text) {
         let value = trim_url(matched.as_str());
-        let Some(host) = extracted_host(value) else {
+        let Some((host, host_start, host_end)) = extracted_host_span(value) else {
             continue;
         };
         if !valid_public_host(&host) && !fictional_or_local_url(value) {
@@ -324,9 +324,9 @@ fn scan_text(path: &str, text: &str, base_offset: usize) -> Vec<Finding> {
             result.push(finding(
                 path,
                 Detector::Domain,
-                value,
-                base_offset + matched.start(),
-                base_offset + matched.start() + value.len(),
+                &host,
+                base_offset + matched.start() + host_start,
+                base_offset + matched.start() + host_end,
             ));
         }
     }
@@ -424,18 +424,64 @@ fn valid_public_host(host: &str) -> bool {
             && psl::domain_str(host).is_some()
 }
 
-fn extracted_host(value: &str) -> Option<String> {
-    let authority = value.split_once("://")?.1.split(['/', '?', '#']).next()?;
-    let host = authority
-        .rsplit('@')
-        .next()?
-        .split(':')
-        .next()?
-        .to_ascii_lowercase();
-    (!host.is_empty()).then_some(host)
+fn extracted_host_span(value: &str) -> Option<(String, usize, usize)> {
+    let scheme_end = value.find("://")? + 3;
+    let authority_end = value[scheme_end..]
+        .find(['/', '?', '#'])
+        .map_or(value.len(), |n| scheme_end + n);
+    let authority = &value[scheme_end..authority_end];
+    let user_end = authority.rfind('@').map_or(0, |n| n + 1);
+    let host_port = &authority[user_end..];
+    let host_len = host_port.find(':').unwrap_or(host_port.len());
+    let start = scheme_end + user_end;
+    let end = start + host_len;
+    (start < end).then(|| (value[start..end].to_ascii_lowercase(), start, end))
 }
 
 fn bare_domain_context_allowed(path: &str, text: &str, start: usize, end: usize) -> bool {
+    let candidate = &text[start..end];
+    if matches!(
+        candidate.rsplit('.').next(),
+        Some(
+            "rs" | "js"
+                | "jsx"
+                | "ts"
+                | "tsx"
+                | "mjs"
+                | "mts"
+                | "toml"
+                | "json"
+                | "md"
+                | "sh"
+                | "yaml"
+                | "yml"
+                | "html"
+                | "css"
+        )
+    ) {
+        return false;
+    }
+    if path.ends_with(".dockerignore") || path.ends_with(".gitignore") {
+        return false;
+    }
+    if start > 0 && matches!(text.as_bytes()[start - 1], b'/' | b'\\') {
+        return false;
+    }
+    if matches!(
+        Path::new(path).extension().and_then(|v| v.to_str()),
+        Some("md" | "mdx")
+    ) {
+        let before = &text[..start];
+        if before.matches("```").count() % 2 == 1
+            || before[before.rfind('\n').map_or(0, |i| i + 1)..]
+                .matches('`')
+                .count()
+                % 2
+                == 1
+        {
+            return false;
+        }
+    }
     let code = matches!(
         Path::new(path).extension().and_then(|v| v.to_str()),
         Some("rs" | "js" | "jsx" | "ts" | "tsx" | "mjs" | "mts" | "c")
@@ -457,7 +503,6 @@ fn bare_domain_context_allowed(path: &str, text: &str, start: usize, end: usize)
     if !quoted {
         return false;
     }
-    let candidate = &text[start..end];
     !matches!(
         candidate.rsplit('.').next(),
         Some("rs" | "js" | "jsx" | "ts" | "tsx" | "mjs" | "mts" | "toml" | "json" | "md" | "sh")
@@ -546,45 +591,78 @@ fn scan_lockfile(path: &str, text: &str) -> Result<Vec<Finding>, Report<ScannerE
 }
 
 fn scan_toml_lock_fields(path: &str, text: &str) -> Result<Vec<Finding>, Report<ScannerError>> {
+    let bytes = text.as_bytes();
     let mut findings = Vec::new();
-    let mut offset = 0;
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        if let Some((key, rest)) = trimmed.split_once('=')
-            && lock_field(Some(key.trim()))
-        {
-            let value_text = rest.trim_start();
-            if !value_text.starts_with('"') {
-                return Err(Report::new(ScannerError::Finding).attach(format!(
-                    "unsupported structured lockfile field shape: {path}"
-                )));
-            }
-            let Some(end_quote) = quoted_end(value_text.as_bytes(), 0) else {
-                return Err(Report::new(ScannerError::Finding)
-                    .attach(format!("unterminated structured lockfile field: {path}")));
-            };
-            let raw = &value_text[..=end_quote];
-            let value: String = toml::from_str(&format!("value = {raw}"))
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() || b"{}[],.".contains(&bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let (key, end) = if bytes[i] == b'"' {
+            let end = quoted_end(bytes, i).ok_or_else(|| {
+                Report::new(ScannerError::Finding).attach(format!("unterminated TOML key: {path}"))
+            })?;
+            let key: String = toml::from_str(&format!("value = {}", &text[i..=end]))
                 .ok()
                 .and_then(|v: toml::Value| v.get("value")?.as_str().map(str::to_owned))
                 .ok_or_else(|| {
-                    Report::new(ScannerError::Finding).attach("invalid TOML lockfile string")
+                    Report::new(ScannerError::Finding).attach("invalid quoted TOML key")
                 })?;
-            if sensitive_lock_value(&value) {
-                let start = offset + line.len() - trimmed.len() + trimmed.len() - rest.len()
-                    + rest.len()
-                    - value_text.len()
-                    + 1;
-                findings.push(finding(
-                    path,
-                    Detector::LockfileField,
-                    &raw[1..raw.len() - 1],
-                    start,
-                    start + raw.len() - 2,
-                ));
+            (key, end + 1)
+        } else {
+            let end = bytes[i..]
+                .iter()
+                .position(|b| !b.is_ascii_alphanumeric() && *b != b'_' && *b != b'-')
+                .map_or(bytes.len(), |n| i + n);
+            if end == i {
+                i += 1;
+                continue;
             }
+            (text[i..end].to_owned(), end)
+        };
+        let mut cursor = end;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
         }
-        offset += line.len();
+        if cursor >= bytes.len() || bytes[cursor] != b'=' {
+            i = end;
+            continue;
+        }
+        if !lock_field(Some(&key)) {
+            i = end;
+            continue;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b'"' {
+            return Err(Report::new(ScannerError::Finding).attach(format!(
+                "unsupported structured lockfile field shape: {path}:{key}"
+            )));
+        }
+        let value_end = quoted_end(bytes, cursor).ok_or_else(|| {
+            Report::new(ScannerError::Finding)
+                .attach(format!("unterminated structured lockfile field: {path}"))
+        })?;
+        let raw = &text[cursor + 1..value_end];
+        let decoded: String = toml::from_str(&format!("value = {}", &text[cursor..=value_end]))
+            .ok()
+            .and_then(|v: toml::Value| v.get("value")?.as_str().map(str::to_owned))
+            .ok_or_else(|| {
+                Report::new(ScannerError::Finding).attach("invalid TOML lockfile string")
+            })?;
+        if sensitive_lock_value(&decoded) {
+            findings.push(finding(
+                path,
+                Detector::LockfileField,
+                raw,
+                cursor + 1,
+                value_end,
+            ));
+        }
+        i = value_end + 1;
     }
     Ok(findings)
 }

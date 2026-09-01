@@ -276,6 +276,7 @@ git commit -m "Add documentation parity tool foundation"
 - Create: `tools/docs-parity/manifests/retired-identifiers.toml`
 - Create/Test: `tools/docs-parity/tests/classification.rs`
 - Create/Test: `tools/docs-parity/tests/scanner.rs`
+- Modify: `tools/docs-parity/README.md`
 
 - [ ] **Step 1: Write exhaustive-classification failures**
 
@@ -306,6 +307,8 @@ workspace lockfile is unchanged.
 ```bash
 cargo test --manifest-path tools/docs-parity/Cargo.toml --test classification
 cargo test --manifest-path tools/docs-parity/Cargo.toml --test scanner
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test cli
+cargo test --manifest-path tools/docs-parity/Cargo.toml
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- classify --check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- scan --check
 ```
@@ -315,7 +318,7 @@ Expected: synthesized violations fail for the intended diagnostic; the repositor
 - [ ] **Step 7: Commit the closed universe**
 
 ```bash
-git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-parity/src/classification.rs tools/docs-parity/src/scanner.rs tools/docs-parity/src/main.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/model.rs tools/docs-parity/src/repository.rs tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/retired-identifiers.toml tools/docs-parity/tests/classification.rs tools/docs-parity/tests/scanner.rs docs/internal/audits/documentation-refresh-evidence.md
+git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-parity/README.md tools/docs-parity/src/classification.rs tools/docs-parity/src/scanner.rs tools/docs-parity/src/main.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/model.rs tools/docs-parity/src/repository.rs tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/retired-identifiers.toml tools/docs-parity/tests/classification.rs tools/docs-parity/tests/scanner.rs docs/internal/audits/documentation-refresh-evidence.md
 git commit -m "Enforce documentation source classification"
 ```
 

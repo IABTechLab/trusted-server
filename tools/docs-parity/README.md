@@ -102,6 +102,9 @@ compile time; there is no non-atomic or mode-blind fallback.
 
 ```bash
 cargo test --manifest-path tools/docs-parity/Cargo.toml --test cli
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test classification
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test scanner
+cargo test --manifest-path tools/docs-parity/Cargo.toml
 cargo fmt --manifest-path tools/docs-parity/Cargo.toml -- --check
 cargo clippy --manifest-path tools/docs-parity/Cargo.toml --all-targets -- -D warnings
 ```

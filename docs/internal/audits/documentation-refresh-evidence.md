@@ -2267,6 +2267,31 @@ PY
   complete public-suffix bare domains and syntactically valid URL hosts remain
   exact reviewed occurrences.
 
+#### Task 5 domain and grammar re-review correction
+
+- The preceding 4,856/4,520 totals are retracted: they included path,
+  source-member, Markdown code, and invalid URL-template false positives. RED
+  samples included repository filenames, relative guide links, dotted Rust
+  members, and a format placeholder mistaken for a URL host.
+- URL findings now select and fingerprint only exact host bytes. Bare-domain
+  recognition combines the compiled public-suffix authority with global
+  repository-path, relative-path, Markdown code-span/fence, ignore-file, and
+  source lexical context. A representative review covered root/internal/public
+  Markdown, shell and ignore files, Rust/TypeScript, configuration examples,
+  HTML fixtures, lockfiles, and the three previously missed modern-domain
+  occurrences.
+- The corrected reviewed inventory contains 3,265 exact findings: 2,929
+  domain, 286 structured lockfile field, 36 credential-shape, 12 binary string,
+  one email, and one service ID. Classes are 3,205 vendor URL, 36 hash-pinned
+  fake credential fixture, 13 historical example, 10 project-owned public
+  domain, and one service ID. Maintained classification has 704 sources and
+  569 exact comment spans after removing one quote-state false extraction.
+- Span-aware TOML tests cover quoted and dotted keys and inline tables; JSON
+  and TOML reject unsupported or ambiguous value shapes. Multiline shell/YAML
+  quote state, nested JavaScript templates, and unterminated lexical states are
+  fail-closed. The plan and README now list the exact targets, full standalone
+  suite, review flows, and authorized README staging scope.
+
 #### Task 6 — Implement generated regions, Markdown ownership, and link checks
 
 Pending. Record each atomic fixture cycle and generated second-run no-diff.
