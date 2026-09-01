@@ -284,12 +284,12 @@ no-diff proof is incomplete.
 Every exception requires an owner, narrow rationale, and review or expiry date.
 Expired or ownerless entries fail the checkpoint.
 
-| Type / path                                 | Value classification   | Owner                 | Rationale                                                                                                              | Review or expiry           | State    |
-| ------------------------------------------- | ---------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------- | -------------------------- | -------- |
-| `fastly.toml` `service_id`                  | Service ID             | `aram356`             | Preserve the existing service binding during this refresh; check mode fails at or after expiry; removal is independent | `2026-09-30T00:00:00Z`     | Approved |
-| Design record's deleted placeholder literal | Historical example     | `aram356`             | Preserve the approved audit's exact record of the deleted placeholder CNAME                                            | `2027-08-31T00:00:00Z`     | Approved |
-| Task 13 temporary public-page ownership     | Page/orphan transition | Pending Task 13 owner | Page registered before Task 14 final ownership                                                                         | Expires at Task 14         | Pending  |
-| Spin manual smoke, only if CI cannot run it | Manual evidence        | Pending               | Runner capability gap                                                                                                  | Time-bounded date required | Pending  |
+| Type / path                                          | Value classification   | Owner                 | Rationale                                                                                                              | Review or expiry           | State    |
+| ---------------------------------------------------- | ---------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------- | -------------------------- | -------- |
+| `fastly.toml` `service_id`                           | Service ID             | `aram356`             | Preserve the existing service binding during this refresh; check mode fails at or after expiry; removal is independent | `2026-09-30T00:00:00Z`     | Approved |
+| Deleted placeholder literal in design and Decision 9 | Historical example     | `aram356`             | Preserve the approved audit's exact record; scope is the design path and Decision 9 path                               | `2027-08-31T00:00:00Z`     | Approved |
+| Task 13 temporary public-page ownership              | Page/orphan transition | Pending Task 13 owner | Page registered before Task 14 final ownership                                                                         | Expires at Task 14         | Pending  |
+| Spin manual smoke, only if CI cannot run it          | Manual evidence        | Pending               | Runner capability gap                                                                                                  | Time-bounded date required | Pending  |
 
 ### Follow-up issues
 
@@ -1330,6 +1330,664 @@ internal/audits/documentation-refresh-evidence.md` exited 0 and reported
 - Enclosing policy commit message: `Clean documentation publishing policy`.
   Its SHA and push result are reported in the execution handoff because a
   commit cannot contain its own identifier.
+
+##### Authoritative Task 3 evidence correction
+
+- Correction timestamp: 2026-09-01T15:05:38Z.
+- Correction: the earlier Task 3 policy, privacy, and artifact aggregates are
+  non-authoritative because their executable predicates and raw output were not
+  retained, and the artifact aggregate omitted 28 relative local references.
+  This correction supersedes those aggregates without changing their historical
+  record. The command and JSON below are the sole authoritative Task 3 gate
+  evidence.
+- Binding: the command fails unless all Task 3 policy and documentation source
+  paths, excluding this append-only evidence ledger, remain byte-equivalent to
+  `b4a99c583f62d9d053ffb1c7073b6dd8e96c36c1` in HEAD, index, and working tree.
+- Semantics: actual entity-decoded `href` and `src` attributes are resolved
+  against each emitted page at a synthetic local origin. Every local reference
+  is checked for project-path containment, excluded-family absence, and an
+  existing target artifact. Only genuine off-origin HTTP(S) references are
+  ignored; non-web schemes fail. Focused synthetics require entity-decoded
+  relative exclusion detection, project-path escape detection, and genuine
+  offsite ignoring while code text remains inert.
+- Exact executable command:
+
+```sh
+python3 - <<'PY'
+from __future__ import annotations
+
+import json
+import posixpath
+import re
+import subprocess
+from datetime import datetime, timezone
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import unquote, urljoin, urlsplit
+
+
+BOUND_SHA = "b4a99c583f62d9d053ffb1c7073b6dd8e96c36c1"
+LOCAL_ORIGIN = "https://docs.local.invalid"
+PROJECT_PREFIX = "/trusted-server/"
+REPOSITORY_ROOT = Path.cwd()
+DIST_ROOT = REPOSITORY_ROOT / "docs/.vitepress/dist"
+EVIDENCE_PATH = "docs/internal/audits/documentation-refresh-evidence.md"
+
+
+def run_git(arguments: list[str]) -> bytes:
+    return subprocess.run(
+        ["git", *arguments],
+        check=True,
+        cwd=REPOSITORY_ROOT,
+        stdout=subprocess.PIPE,
+    ).stdout
+
+
+bound_pathspecs = [
+    ".claude/commands/check-ci.md",
+    ".claude/commands/review-changes.md",
+    ".claude/commands/test-all.md",
+    ".claude/commands/test-crate.md",
+    ".claude/commands/verify.md",
+    ".github/pull_request_template.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "fastly.toml",
+    "docs",
+    f":(exclude){EVIDENCE_PATH}",
+]
+run_git(["cat-file", "-e", f"{BOUND_SHA}^{{commit}}"])
+run_git(["diff", "--quiet", BOUND_SHA, "HEAD", "--", *bound_pathspecs])
+run_git(["diff", "--quiet", "--", *bound_pathspecs])
+run_git(["diff", "--cached", "--quiet", "--", *bound_pathspecs])
+
+
+def read_text(path: str) -> str:
+    return (REPOSITORY_ROOT / path).read_text(encoding="utf-8")
+
+
+business = read_text("docs/business-use-cases.md")
+package = json.loads(read_text("docs/package.json"))
+package_lock = json.loads(read_text("docs/package-lock.json"))
+fastly = read_text("fastly.toml")
+claude = read_text("CLAUDE.md")
+agents = read_text("AGENTS.md")
+template = read_text(".github/pull_request_template.md")
+decisions = read_text("docs/internal/audits/documentation-refresh-decisions.md")
+gate_link = "[canonical CI gate list](/CLAUDE.md#ci-gates)"
+canonical = claude.split("## CI Gates\n\n", 1)[1].split("\n\n---", 1)[0].strip()
+generated_begin = "<!-- BEGIN GENERATED CI GATES: source CLAUDE.md#ci-gates -->"
+generated_end = "<!-- END GENERATED CI GATES -->"
+generated = agents.split(generated_begin, 1)[1].split(generated_end, 1)[0].strip()
+policy_region = claude.split("## Other guidelines", 1)[1].split(
+    "## Git Commit Conventions", 1
+)[0]
+
+policy_predicates = {
+    "business warning": "**Unverified planning material.**" in business,
+    "package private": package.get("private") is True,
+    "package license": package.get("license") == "Apache-2.0",
+    "lock license": package_lock["packages"][""]["license"] == "Apache-2.0",
+    "empty authors": re.search(r"^authors = \[\]$", fastly, re.MULTILINE)
+    is not None,
+    "counter KV comment": "# Local test fixture for the counter KV store."
+    in fastly,
+    "creative KV comment": "# Local test fixture for the creative KV store."
+    in fastly,
+    "EC identity KV comment": "# Local test fixture for the EC identity KV store."
+    in fastly,
+    "consent KV comment": "# Local test fixture for the consent KV store."
+    in fastly,
+    "obsolete script absent from fastly": "test-prebid-eids.sh" not in fastly,
+    "service owner": "owner `aram356`" in fastly,
+    "service expiry": "2026-09-30T00:00:00Z" in fastly,
+    "template gate link": gate_link in template,
+    "template log terminology": "Uses `log` macros" in template
+    and "Uses `tracing` macros" not in template,
+    ".claude/commands/check-ci.md gate link": gate_link
+    in read_text(".claude/commands/check-ci.md"),
+    ".claude/commands/review-changes.md gate link": gate_link
+    in read_text(".claude/commands/review-changes.md"),
+    ".claude/commands/test-all.md gate link": gate_link
+    in read_text(".claude/commands/test-all.md"),
+    ".claude/commands/test-crate.md gate link": gate_link
+    in read_text(".claude/commands/test-crate.md"),
+    ".claude/commands/verify.md gate link": gate_link
+    in read_text(".claude/commands/verify.md"),
+    "generated markers": generated_begin in agents and generated_end in agents,
+    "generated equality": generated == canonical,
+    "type vendor URL": "vendor URL" in policy_region,
+    "type hash-pinned fake-credential fixture": "hash-pinned fake-credential fixture"
+    in policy_region,
+    "type historical example": "historical example" in policy_region,
+    "type service ID": "service ID" in policy_region,
+    "type project-owned public domain": "project-owned public domain"
+    in policy_region,
+    "exception fields": all(
+        field in policy_region.lower()
+        for field in ("owner", "rationale", "expiry timestamp")
+    ),
+    "historical decision": "These are the only two active WP1 sensitive-data exceptions."
+    in decisions
+    and "2027-08-31T00:00:00Z" in decisions,
+    "source CNAME absent": not (REPOSITORY_ROOT / "docs/public/CNAME").exists(),
+    "project base": "base: '/trusted-server'"
+    in read_text("docs/.vitepress/config.mts"),
+}
+if len(policy_predicates) != 30:
+    raise RuntimeError(
+        f"policy predicate count changed: expected 30, got {len(policy_predicates)}"
+    )
+failed_policy = sorted(name for name, passed in policy_predicates.items() if not passed)
+if failed_policy:
+    raise RuntimeError(f"policy predicates failed: {failed_policy}")
+
+
+tracked_paths = run_git(["ls-files", "-z"]).split(b"\0")
+tracked_paths = [path.decode("utf-8") for path in tracked_paths if path]
+tracked_bytes = {
+    path: (REPOSITORY_ROOT / path).read_bytes() for path in tracked_paths
+}
+
+
+def occurrences(value: str) -> list[str]:
+    needle = value.encode("utf-8")
+    found: list[str] = []
+    for path, content in tracked_bytes.items():
+        found.extend([path] * content.count(needle))
+    return sorted(found)
+
+
+removed_terms = {
+    "personal email": "jason" + "@stackpop.com",
+    "project-lead handle": "@jev" + "ansnyc",
+    "developer handle": "@Christian" + "Pavilonis",
+    "internal channel": "#trusted-server-" + "internal",
+    "manager or buddy access direction": "Ask your manager or onboarding "
+    + "buddy",
+    "GitHub access direction": "Get GitHub " + "access to",
+    "project-board access direction": "Get access to the [Trusted Server "
+    + "project board]",
+    "Slack access direction": "Join the Slack " + "workspace",
+    "calendar access direction": "Get calendar invites for Task " + "Force",
+    "internal standup reference": "Development Team " + "Standup",
+}
+privacy_term_results = {
+    name: len(occurrences(value)) for name, value in removed_terms.items()
+}
+privacy_violations = [
+    f"{name}: expected zero occurrences, got {count}"
+    for name, count in privacy_term_results.items()
+    if count != 0
+]
+
+historical_value = "your" + "-custom-domain.com"
+historical_scope = sorted(
+    [
+        "docs/internal/audits/documentation-refresh-decisions.md",
+        "docs/superpowers/specs/2026-08-19-documentation-refresh-design.md",
+    ]
+)
+historical_occurrences = occurrences(historical_value)
+if historical_occurrences != historical_scope:
+    privacy_violations.append(
+        "historical example scope: "
+        f"expected {historical_scope}, got {historical_occurrences}"
+    )
+
+service_value = "dysUw6h73Vze" + "omD61eal85"
+service_scope = ["fastly.toml"]
+service_occurrences = occurrences(service_value)
+if service_occurrences != service_scope:
+    privacy_violations.append(
+        f"service ID scope: expected {service_scope}, got {service_occurrences}"
+    )
+
+now = datetime.now(timezone.utc)
+for exception_type, expiry in (
+    ("service ID", "2026-09-30T00:00:00Z"),
+    ("historical example", "2027-08-31T00:00:00Z"),
+):
+    expiry_time = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+    if expiry not in decisions or now >= expiry_time:
+        privacy_violations.append(f"{exception_type}: missing or expired {expiry}")
+if "Owner: `aram356`." not in decisions:
+    privacy_violations.append("historical example: missing owner")
+if "Rationale: preserve the approved audit" not in decisions:
+    privacy_violations.append("historical example: missing rationale")
+if "These are the only two active WP1 sensitive-data exceptions." not in decisions:
+    privacy_violations.append("active WP1 exception set is not exact")
+if re.search(r"allowed types[^\n]*\ball\b", decisions, re.IGNORECASE) or re.search(
+    r"(?:domain|credential)[^\n]*\*", decisions, re.IGNORECASE
+):
+    privacy_violations.append("broad exception shape detected")
+if privacy_violations:
+    raise RuntimeError(f"privacy predicates failed: {sorted(privacy_violations)}")
+
+
+EXCLUDED_PREFIXES = ("superpowers/", "internal/", "epics/")
+EXCLUDED_EXACT = {
+    "guide/onboarding",
+    "guide/onboarding.html",
+    "readme",
+    "readme.html",
+    "business-use-cases",
+    "business-use-cases.html",
+}
+EXCLUDED_ASSET_MARKERS = (
+    "superpowers_",
+    "internal_",
+    "epics_",
+    "guide_onboarding.md",
+    "readme.md",
+    "business-use-cases.md",
+)
+REQUIRED_HTML = {
+    "index.html": "<title>Trusted Server</title>",
+    "guide/index.html": '<h1 id="guide"',
+    "guide/api-reference.html": '<h1 id="api-reference"',
+}
+REQUIRED_ASSETS = {
+    "index.md.": 2,
+    "guide_index.md.": 2,
+    "guide_api-reference.md.": 2,
+}
+
+
+def normalize_local_path(path: str) -> str:
+    decoded = unquote(path)
+    if "\\" in decoded or "\x00" in decoded:
+        raise ValueError(f"unsafe local URL path: {path!r}")
+    normalized = posixpath.normpath(decoded)
+    if decoded.endswith("/") and not normalized.endswith("/"):
+        normalized += "/"
+    return normalized
+
+
+def excluded_route(route: str) -> bool:
+    folded = route.casefold()
+    return folded in EXCLUDED_EXACT or any(
+        folded.startswith(prefix) for prefix in EXCLUDED_PREFIXES
+    )
+
+
+def artifact_candidates(local_path: str) -> list[Path]:
+    route = local_path.removeprefix(PROJECT_PREFIX)
+    if not route or route.endswith("/"):
+        return [DIST_ROOT / route / "index.html"]
+    direct = DIST_ROOT / route
+    candidates = [direct]
+    if direct.suffix == "":
+        candidates.extend([direct.with_suffix(".html"), direct / "index.html"])
+    return candidates
+
+
+class AttributeParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.references: list[tuple[str, str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        for name, value in attrs:
+            if name in {"href", "src"} and value is not None:
+                self.references.append((tag, name, value))
+
+
+def inspect_references(
+    page_relative: str,
+    html: str,
+    *,
+    require_targets: bool,
+) -> dict[str, object]:
+    parser = AttributeParser()
+    parser.feed(html)
+    parser.close()
+    page_url = f"{LOCAL_ORIGIN}{PROJECT_PREFIX}{page_relative}"
+    counts = {
+        "projectAbsolute": 0,
+        "relativeArtifact": 0,
+        "sameDocument": 0,
+        "absoluteSameOrigin": 0,
+        "offOrigin": 0,
+        "nonWebScheme": 0,
+    }
+    violations: list[str] = []
+    for tag, name, raw_value in parser.references:
+        value = raw_value.strip()
+        raw_parts = urlsplit(value)
+        resolved = urlsplit(urljoin(page_url, value))
+        if resolved.scheme not in {"http", "https"}:
+            counts["nonWebScheme"] += 1
+            violations.append(
+                f"{page_relative}: {tag}[{name}] uses non-web scheme: {value!r}"
+            )
+            continue
+        if (resolved.scheme, resolved.netloc) != ("https", "docs.local.invalid"):
+            counts["offOrigin"] += 1
+            continue
+        try:
+            local_path = normalize_local_path(resolved.path)
+        except ValueError as error:
+            violations.append(f"{page_relative}: {tag}[{name}] {error}")
+            continue
+        if not local_path.startswith(PROJECT_PREFIX):
+            violations.append(
+                f"{page_relative}: {tag}[{name}] escapes project path: {value!r}"
+            )
+            continue
+        route = local_path.removeprefix(PROJECT_PREFIX)
+        if excluded_route(route):
+            violations.append(
+                f"{page_relative}: {tag}[{name}] resolves to excluded route: {route!r}"
+            )
+        same_document = value == "" or value.startswith(("#", "?"))
+        if same_document:
+            counts["sameDocument"] += 1
+        elif value.startswith("/"):
+            counts["projectAbsolute"] += 1
+        elif raw_parts.scheme:
+            counts["absoluteSameOrigin"] += 1
+        else:
+            counts["relativeArtifact"] += 1
+        if require_targets and not any(
+            candidate.is_file() for candidate in artifact_candidates(local_path)
+        ):
+            violations.append(
+                f"{page_relative}: {tag}[{name}] target artifact missing: {value!r}"
+            )
+    return {"counts": counts, "violations": sorted(set(violations))}
+
+
+synthetic_cases = {
+    "relative excluded decoded": (
+        '<a href="../Int&#x65;rnal/private.html">x</a>',
+        "excluded route",
+    ),
+    "relative project escape": (
+        '<img src="../../../escape.png">',
+        "escapes project path",
+    ),
+}
+synthetic_results: dict[str, bool] = {}
+for name, (html, expected_diagnostic) in synthetic_cases.items():
+    result = inspect_references(
+        "guide/example.html", html, require_targets=False
+    )
+    synthetic_results[name] = any(
+        expected_diagnostic in violation for violation in result["violations"]
+    )
+offsite_result = inspect_references(
+    "guide/example.html",
+    '<code>&lt;a href="../internal/private.html"&gt;</code>'
+    '<a href="https://offsite.example/internal/private.html">offsite</a>',
+    require_targets=False,
+)
+synthetic_results["offsite ignored"] = (
+    offsite_result["counts"]["offOrigin"] == 1
+    and offsite_result["violations"] == []
+)
+if not all(synthetic_results.values()):
+    raise RuntimeError(f"artifact synthetics failed: {synthetic_results}")
+
+artifact_violations: list[str] = []
+artifact_files = sorted(path for path in DIST_ROOT.rglob("*") if path.is_file())
+artifact_relatives = [path.relative_to(DIST_ROOT).as_posix() for path in artifact_files]
+for relative in artifact_relatives:
+    folded_relative = relative.casefold()
+    if (
+        folded_relative == "cname"
+        or any(folded_relative.startswith(prefix) for prefix in EXCLUDED_PREFIXES)
+        or folded_relative in EXCLUDED_EXACT
+    ):
+        artifact_violations.append(f"excluded artifact: {relative}")
+    if relative.startswith("assets/") and any(
+        marker in folded_relative for marker in EXCLUDED_ASSET_MARKERS
+    ):
+        artifact_violations.append(f"excluded page asset: {relative}")
+
+required_asset_counts: dict[str, int] = {}
+for relative, marker in REQUIRED_HTML.items():
+    path = DIST_ROOT / relative
+    if not path.is_file() or marker not in path.read_text(encoding="utf-8"):
+        artifact_violations.append(f"missing required marker: {relative}: {marker}")
+for marker, expected in REQUIRED_ASSETS.items():
+    count = sum(
+        relative.startswith(f"assets/{marker}") and relative.endswith(".js")
+        for relative in artifact_relatives
+    )
+    required_asset_counts[marker] = count
+    if count != expected:
+        artifact_violations.append(
+            f"required asset count {marker!r}: expected {expected}, got {count}"
+        )
+
+aggregate_counts = {
+    "projectAbsolute": 0,
+    "relativeArtifact": 0,
+    "sameDocument": 0,
+    "absoluteSameOrigin": 0,
+    "offOrigin": 0,
+    "nonWebScheme": 0,
+}
+html_count = 0
+for path in artifact_files:
+    if path.suffix != ".html":
+        continue
+    html_count += 1
+    relative = path.relative_to(DIST_ROOT).as_posix()
+    result = inspect_references(
+        relative, path.read_text(encoding="utf-8"), require_targets=True
+    )
+    for name, count in result["counts"].items():
+        aggregate_counts[name] += count
+    artifact_violations.extend(result["violations"])
+
+local_artifact_references = (
+    aggregate_counts["projectAbsolute"]
+    + aggregate_counts["relativeArtifact"]
+    + aggregate_counts["absoluteSameOrigin"]
+)
+expected_counts = {
+    "projectAbsolute": 3425,
+    "relativeArtifact": 28,
+    "absoluteSameOrigin": 0,
+    "localArtifactReferences": 3453,
+}
+actual_counts = {
+    "projectAbsolute": aggregate_counts["projectAbsolute"],
+    "relativeArtifact": aggregate_counts["relativeArtifact"],
+    "absoluteSameOrigin": aggregate_counts["absoluteSameOrigin"],
+    "localArtifactReferences": local_artifact_references,
+}
+if actual_counts != expected_counts:
+    artifact_violations.append(
+        f"bound artifact counts changed: expected {expected_counts}, got {actual_counts}"
+    )
+if (REPOSITORY_ROOT / "docs/public/CNAME").exists():
+    artifact_violations.append("source CNAME exists")
+if artifact_violations:
+    raise RuntimeError(
+        "artifact predicates failed:\n" + "\n".join(sorted(set(artifact_violations)))
+    )
+
+output = {
+    "boundSourceSha": BOUND_SHA,
+    "policy": {
+        "predicateCount": len(policy_predicates),
+        "predicates": policy_predicates,
+        "violations": failed_policy,
+    },
+    "privacy": {
+        "trackedFilesScanned": len(tracked_paths),
+        "searchedTermClasses": privacy_term_results,
+        "activeExceptions": [
+            {
+                "type": "service ID",
+                "paths": service_scope,
+                "occurrences": len(service_occurrences),
+                "owner": "aram356",
+                "expiry": "2026-09-30T00:00:00Z",
+            },
+            {
+                "type": "historical example",
+                "paths": historical_scope,
+                "occurrences": len(historical_occurrences),
+                "owner": "aram356",
+                "expiry": "2027-08-31T00:00:00Z",
+            },
+        ],
+        "violations": sorted(privacy_violations),
+    },
+    "artifacts": {
+        "htmlFiles": html_count,
+        "requiredHtml": sorted(REQUIRED_HTML),
+        "requiredAssetCounts": required_asset_counts,
+        "excludedFamilies": [
+            "superpowers/**",
+            "internal/**",
+            "epics/**",
+            "guide/onboarding.md",
+            "README.md",
+            "business-use-cases.md",
+        ],
+        "referenceCounts": {
+            **aggregate_counts,
+            "localArtifactReferences": local_artifact_references,
+        },
+        "synthetics": synthetic_results,
+        "violations": sorted(set(artifact_violations)),
+    },
+}
+print(json.dumps(output, indent=2, sort_keys=True))
+PY
+```
+
+- Verbatim stdout:
+
+```text
+{
+  "artifacts": {
+    "excludedFamilies": [
+      "superpowers/**",
+      "internal/**",
+      "epics/**",
+      "guide/onboarding.md",
+      "README.md",
+      "business-use-cases.md"
+    ],
+    "htmlFiles": 43,
+    "referenceCounts": {
+      "absoluteSameOrigin": 0,
+      "localArtifactReferences": 3453,
+      "nonWebScheme": 0,
+      "offOrigin": 115,
+      "projectAbsolute": 3425,
+      "relativeArtifact": 28,
+      "sameDocument": 1077
+    },
+    "requiredAssetCounts": {
+      "guide_api-reference.md.": 2,
+      "guide_index.md.": 2,
+      "index.md.": 2
+    },
+    "requiredHtml": [
+      "guide/api-reference.html",
+      "guide/index.html",
+      "index.html"
+    ],
+    "synthetics": {
+      "offsite ignored": true,
+      "relative excluded decoded": true,
+      "relative project escape": true
+    },
+    "violations": []
+  },
+  "boundSourceSha": "b4a99c583f62d9d053ffb1c7073b6dd8e96c36c1",
+  "policy": {
+    "predicateCount": 30,
+    "predicates": {
+      ".claude/commands/check-ci.md gate link": true,
+      ".claude/commands/review-changes.md gate link": true,
+      ".claude/commands/test-all.md gate link": true,
+      ".claude/commands/test-crate.md gate link": true,
+      ".claude/commands/verify.md gate link": true,
+      "EC identity KV comment": true,
+      "business warning": true,
+      "consent KV comment": true,
+      "counter KV comment": true,
+      "creative KV comment": true,
+      "empty authors": true,
+      "exception fields": true,
+      "generated equality": true,
+      "generated markers": true,
+      "historical decision": true,
+      "lock license": true,
+      "obsolete script absent from fastly": true,
+      "package license": true,
+      "package private": true,
+      "project base": true,
+      "service expiry": true,
+      "service owner": true,
+      "source CNAME absent": true,
+      "template gate link": true,
+      "template log terminology": true,
+      "type hash-pinned fake-credential fixture": true,
+      "type historical example": true,
+      "type project-owned public domain": true,
+      "type service ID": true,
+      "type vendor URL": true
+    },
+    "violations": []
+  },
+  "privacy": {
+    "activeExceptions": [
+      {
+        "expiry": "2026-09-30T00:00:00Z",
+        "occurrences": 1,
+        "owner": "aram356",
+        "paths": [
+          "fastly.toml"
+        ],
+        "type": "service ID"
+      },
+      {
+        "expiry": "2027-08-31T00:00:00Z",
+        "occurrences": 2,
+        "owner": "aram356",
+        "paths": [
+          "docs/internal/audits/documentation-refresh-decisions.md",
+          "docs/superpowers/specs/2026-08-19-documentation-refresh-design.md"
+        ],
+        "type": "historical example"
+      }
+    ],
+    "searchedTermClasses": {
+      "GitHub access direction": 0,
+      "Slack access direction": 0,
+      "calendar access direction": 0,
+      "developer handle": 0,
+      "internal channel": 0,
+      "internal standup reference": 0,
+      "manager or buddy access direction": 0,
+      "personal email": 0,
+      "project-board access direction": 0,
+      "project-lead handle": 0
+    },
+    "trackedFilesScanned": 689,
+    "violations": []
+  }
+}
+```
+
+- Result: 30 of 30 named policy predicates passed. The byte scan covered all
+  689 tracked files, all ten named removed-value classes had zero occurrences,
+  and the two active exceptions matched their exact one-path and two-path
+  scopes. The semantic artifact scan resolved 3,425 project-absolute and 28
+  relative artifact references, for 3,453 local artifact references; it also
+  resolved 1,077 same-document references. All required and excluded artifact,
+  target-existence, project-path, CNAME, and synthetic predicates passed with
+  zero violations. Live Pages and observed CNAME behavior remain
+  `release-pending`.
 
 #### Task 4 — Scaffold the standalone `docs-parity` crate
 
