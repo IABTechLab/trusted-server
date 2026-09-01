@@ -770,7 +770,11 @@ fn bid_row(
     row.slot_w = Some(u16::try_from(bid.width).unwrap_or(u16::MAX));
     row.slot_h = Some(u16::try_from(bid.height).unwrap_or(u16::MAX));
     row.media_type = media_type_for_slot(request, &bid.slot_id).map(str::to_owned);
-    row.seat = Some(bid.bidder.clone());
+    row.seat = Some(
+        bid.returned_seat
+            .clone()
+            .unwrap_or_else(|| bid.bidder.clone()),
+    );
     row.price_cpm = price;
     row.currency = Some(bid.currency.clone());
     row.is_win = Some(is_win);
@@ -974,6 +978,7 @@ mod tests {
             creative: None,
             adomain: Some(vec!["advertiser.example".to_owned()]),
             bidder: bidder.to_owned(),
+            returned_seat: None,
             width: 300,
             height: 250,
             nurl: None,
@@ -1098,6 +1103,112 @@ mod tests {
             Some("parse_error"),
             "should map provider parse failures"
         );
+    }
+
+    #[test]
+    fn bid_rows_prefer_returned_seat_over_delivery_bidder() {
+        let request = test_request("ts-ec-derived-id");
+        let mut aps_bid = bid("slot-1", "aps", Some("ad-1"), Some(1.25));
+        aps_bid.returned_seat = Some("upstream-seat".to_string());
+        let provider = AuctionResponse::success("aps-primary", vec![aps_bid.clone()], 12);
+        let result = OrchestrationResult {
+            provider_responses: vec![provider],
+            mediator_response: None,
+            winning_bids: HashMap::from([("slot-1".to_owned(), aps_bid.clone())]),
+            total_time_ms: 12,
+            metadata: HashMap::new(),
+        };
+        let batch = build_auction_events(
+            AuctionObservationContext::for_test(AuctionSource::AuctionApi, "/auction", 1),
+            AuctionTerminalOutcome::Completed {
+                request: &request,
+                result: &result,
+                delivered_winner_slots: None,
+            },
+        );
+
+        let provider_row = batch
+            .rows()
+            .iter()
+            .find(|row| row.event_kind == "provider_call")
+            .expect("should emit provider row");
+        assert_eq!(provider_row.provider.as_deref(), Some("aps-primary"));
+        let bid_row = batch
+            .rows()
+            .iter()
+            .find(|row| row.event_kind == "bid")
+            .expect("should emit bid row");
+        assert_eq!(bid_row.provider.as_deref(), Some("aps-primary"));
+        assert_eq!(bid_row.seat.as_deref(), Some("upstream-seat"));
+
+        let mut fallback_bid = aps_bid;
+        fallback_bid.returned_seat = None;
+        let fallback = OrchestrationResult {
+            provider_responses: vec![AuctionResponse::success(
+                "aps-primary",
+                vec![fallback_bid.clone()],
+                12,
+            )],
+            mediator_response: None,
+            winning_bids: HashMap::from([("slot-1".to_owned(), fallback_bid)]),
+            total_time_ms: 12,
+            metadata: HashMap::new(),
+        };
+        let fallback_batch = build_auction_events(
+            AuctionObservationContext::for_test(AuctionSource::AuctionApi, "/auction", 1),
+            AuctionTerminalOutcome::Completed {
+                request: &request,
+                result: &fallback,
+                delivered_winner_slots: None,
+            },
+        );
+        assert_eq!(
+            fallback_batch
+                .rows()
+                .iter()
+                .find(|row| row.event_kind == "bid")
+                .and_then(|row| row.seat.as_deref()),
+            Some("aps")
+        );
+    }
+
+    #[test]
+    fn mediated_aps_telemetry_retains_provider_upstream_seat_and_delivery_identity() {
+        let request = test_request("ts-ec-derived-id");
+        let mut aps_bid = bid("slot-1", "aps", Some("ad-1"), Some(1.25));
+        aps_bid.returned_seat = Some("upstream-seat".to_string());
+        let provider = AuctionResponse::success("aps-primary", vec![aps_bid.clone()], 12);
+        let mediator = AuctionResponse::success("adserver_mock", vec![aps_bid.clone()], 3);
+        let result = OrchestrationResult {
+            provider_responses: vec![provider],
+            mediator_response: Some(mediator),
+            winning_bids: HashMap::from([("slot-1".to_owned(), aps_bid.clone())]),
+            total_time_ms: 15,
+            metadata: HashMap::new(),
+        };
+        let batch = build_auction_events(
+            AuctionObservationContext::for_test(AuctionSource::AuctionApi, "/auction", 1),
+            AuctionTerminalOutcome::Completed {
+                request: &request,
+                result: &result,
+                delivered_winner_slots: None,
+            },
+        );
+
+        let provider_row = batch
+            .rows()
+            .iter()
+            .find(|row| row.event_kind == "provider_call")
+            .expect("should emit provider call");
+        assert_eq!(provider_row.provider.as_deref(), Some("aps-primary"));
+        let bid_row = batch
+            .rows()
+            .iter()
+            .find(|row| row.event_kind == "bid")
+            .expect("should emit provider bid");
+        assert_eq!(bid_row.provider.as_deref(), Some("aps-primary"));
+        assert_eq!(bid_row.seat.as_deref(), Some("upstream-seat"));
+        assert_eq!(aps_bid.bidder, "aps", "delivery identity remains distinct");
     }
 
     #[test]
