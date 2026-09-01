@@ -238,10 +238,12 @@ pull_sync_concurrency = 3
 # edge_ttl_seconds = 31536000
 # immutable = true
 
-# Server-side auction. Provider/mediator names must match enabled integrations.
-# Kept active with the creative-processing leaves present so the EdgeZero
-# environment override can apply to them.
+# Server-side auction. Providers are declared below; mediator names must match
+# enabled integrations. Kept active with the creative-processing leaves present
+# so the EdgeZero environment override can apply to them.
 [auction]
+# Keep disabled until provider endpoints, routes, and profile values below are
+# replaced with deployment-specific settings.
 enabled = false
 # Rewrite winning-bid creative HTML to first-party endpoints (default true). Set
 # false to skip proxy/click-URL conversion and creative TSJS injection.
@@ -259,12 +261,47 @@ rewrite_creatives = true
 # server's iframe), since it removes script-based creatives entirely and would
 # blank slots on a script-heavy demand stack.
 sanitize_creatives = false
-providers = []
 timeout_ms = 2000
 # mediator = "adserver_mock"       # optional mediator integration
 # Context keys the JS client may forward into auction requests (allowlist;
 # empty blocks all).
 allowed_context_keys = []
+
+# Example server-side provider declarations. Remove or customize before enabling auctions.
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+# `prebid-server` defaults to 1000 ms when omitted.
+routing = "explicit"
+
+[auction.providers.pbs-main.profile_config]
+debug = false
+test_mode = false
+consent_forwarding = "both"
+
+[auction.providers.pbs-main.notifications]
+suppress_all = false
+suppress_seats = []
+
+[auction.bidders.example-bidder]
+provider = "pbs-main"
+
+# APS server behavior is also provider/profile-owned. Use routing = "all_eligible"
+# when every banner-compatible slot should be eligible. The APS profile timeout
+# defaults to 800 ms; debug and script creatives default to false.
+# [auction.providers.aps-main]
+# protocol = "openrtb-2.6"
+# profile = "aps"
+# endpoint = "https://aps.example.com/e/pb/bid"
+# routing = "all_eligible"
+#
+# [auction.providers.aps-main.profile_config]
+# account_id = "example-aps-account-id"
+# debug = false
+# allow_script_creatives = false
+# inventory_domain = "publisher.example"
+# inventory_page_origin = "https://www.publisher.example"
 
 # Server-side ad slot templates + creative-opportunity auction. Kept active.
 [creative_opportunities]
@@ -399,14 +436,13 @@ auction_timeout_ms = 500
 # their section is commented out. Required fields are noted per block.
 # =============================================================================
 
-# Prebid Server-side auction + first-party Prebid.js bundle.
-# When enabled: `server_url` is required, and `external_bundle_url` is required
-# (its host must be listed in [proxy].allowed_domains). Kept active but disabled.
+# Browser-side Prebid.js integration. Server-side bidder routing belongs under
+# [auction.providers] and [auction.bidders]. When enabled,
+# `external_bundle_url` is required and its host must be listed in
+# [proxy].allowed_domains. Kept active but disabled.
 [integrations.prebid]
 enabled = false
-server_url = "https://prebid.example.com/openrtb2/auction"
 timeout_ms = 1000
-bidders = []
 debug = false
 client_side_bidders = []          # bidders running via native Prebid.js adapters
 # Keep selected GAM inventory out of Trusted Server's Prebid refresh auctions.
@@ -416,12 +452,6 @@ client_side_bidders = []          # bidders running via native Prebid.js adapter
 # external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-<sha256>.js"
 # external_bundle_sha256 = "<manifest sha256>"
 # external_bundle_sri = "<manifest sri>"
-# Per-bidder / per-zone param overrides (canonical rule form):
-# [[integrations.prebid.bid_param_override_rules]]
-# when.bidder = "examplebidder"
-# when.zone = "header"
-# set = { placementId = "_abc" }
-#
 # Bundle build inputs consumed by the `ts prebid bundle` CLI (not the runtime):
 # [integrations.prebid.bundle]
 # adapters = ["rubicon"]
@@ -527,24 +557,13 @@ gam_attribution_enabled = false
 # [integrations.gpt_diagnostics]
 # enabled = true
 
-# Amazon Publisher Services (APS/TAM) OpenRTB. `account_id` required when
-# enabled (`pub_id` is accepted as a deserialization alias only).
+# APS browser renderer ownership. Server-side APS behavior belongs under an
+# [auction.providers] entry with profile = "aps".
 # [integrations.aps]
 # enabled = true
-# account_id = "example-aps-account-id"      # required (non-empty); your APS account
-# endpoint = "https://aps.example.com/e/pb/bid"
-# timeout_ms = 1000
-# Include raw APS request/response data in /auction metadata on test sites only.
-# debug = false
-# Script creatives require separate security validation before opt-in.
-# allow_script_creatives = false
-# Winning-bid renderer. Default `trusted_server` uses TS's opaque static renderer
-# route; set `publisher_native` only for the controlled publisher-origin
-# friendly-frame experiment.
+# Default `trusted_server` uses TS's opaque static renderer route. Set
+# `publisher_native` only for a controlled publisher-origin friendly-frame cohort.
 # rendering_mode = "trusted_server"
-# Set both when the deployment hostname differs from APS-authorized inventory.
-# inventory_domain = "publisher.example"
-# inventory_page_origin = "https://www.publisher.example"
 
 # Google Tag Manager first-party proxy. Kept active but disabled so `ts audit`
 # can fill container_id and flip `enabled` when GTM is detected. `container_id`

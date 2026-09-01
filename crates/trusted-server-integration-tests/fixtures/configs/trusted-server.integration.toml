@@ -33,9 +33,7 @@ secret_store_id = "secrets"
 
 [integrations.prebid]
 enabled = false
-server_url = "https://prebid.example.com/openrtb2/auction"
 timeout_ms = 1000
-bidders = []
 debug = false
 client_side_bidders = []
 
@@ -99,16 +97,37 @@ certificate_check = false
 
 [auction]
 enabled = false
-providers = []
 timeout_ms = 2000
 allowed_context_keys = []
 
-[integrations.aps]
-enabled = true
-account_id = "example-aps-account-id"
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+routing = "explicit"
+
+[auction.providers.pbs-main.profile_config]
+debug = false
+test_mode = false
+consent_forwarding = "both"
+
+[auction.providers.pbs-main.notifications]
+suppress_all = false
+suppress_seats = []
+
+[auction.providers.aps-main]
+protocol = "openrtb-2.6"
+profile = "aps"
 endpoint = "https://aps.example.com/e/pb/bid"
-timeout_ms = 1000
+routing = "all_eligible"
+
+[auction.providers.aps-main.profile_config]
+account_id = "example-aps-account-id"
+debug = false
 allow_script_creatives = false
+
+[auction.bidders.example-bidder]
+provider = "pbs-main"
 
 [integrations.google_tag_manager]
 enabled = false

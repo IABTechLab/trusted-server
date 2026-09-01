@@ -18,8 +18,8 @@ const LEGACY_ADMIN_DENY_METHODS: &[&str] =
 /// The settings baked into the binary contain placeholder secrets that
 /// `get_settings()` rejects by design, which would turn every route into a
 /// startup error page (and its route table into the fallback-only set).
-fn test_router() -> edgezero_core::router::RouterService {
-    let settings = trusted_server_core::settings::Settings::from_toml(
+fn test_settings() -> trusted_server_core::settings::Settings {
+    trusted_server_core::settings::Settings::from_toml(
         r#"
             [[handlers]]
             path = "^/_ts/admin"
@@ -36,9 +36,11 @@ fn test_router() -> edgezero_core::router::RouterService {
             passphrase = "test-secret-key-32-bytes-minimum"
         "#,
     )
-    .expect("should parse route test settings");
+    .expect("should parse route test settings")
+}
 
-    TrustedServerApp::routes_with_settings(settings)
+fn test_router() -> edgezero_core::router::RouterService {
+    TrustedServerApp::routes_with_settings(test_settings())
         .expect("should build router from test settings")
 }
 
@@ -60,6 +62,42 @@ fn assert_route_registered(method: &str, path: &str) {
         routes.iter().any(|(m, p)| m == method && p == path),
         "{method} {path} must be explicitly registered; registered routes: {routes:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aps_profile_serves_renderer_through_adapter_fallback() {
+    let mut settings = test_settings();
+    settings.auction.providers.insert(
+        "aps-main".parse().expect("should parse APS provider ID"),
+        trusted_server_core::auction::ProviderConfig {
+            protocol: "openrtb-2.6".to_string(),
+            profile: "aps".to_string(),
+            endpoint: "https://aps.example/e/pb/bid".to_string(),
+            timeout_ms: None,
+            routing: trusted_server_core::auction::RoutingMode::AllEligible,
+            notifications: trusted_server_core::auction::NotificationConfig::default(),
+            profile_config: "{\"account_id\":\"example-account\"}"
+                .parse()
+                .expect("should parse APS profile config"),
+        },
+    );
+    let router = TrustedServerApp::routes_with_settings(settings)
+        .expect("should build router with APS profile");
+    let mut service = EdgeZeroAxumService::new(router);
+    let request = Request::builder()
+        .method("GET")
+        .uri("/integrations/aps/renderer")
+        .body(AxumBody::empty())
+        .expect("should build APS renderer request");
+
+    let response = service
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(request)
+        .await
+        .expect("should serve APS renderer");
+    assert_eq!(response.status().as_u16(), 200);
 }
 
 /// Verify that every expected explicit route is registered in the route table.

@@ -297,6 +297,10 @@ mod tests {
     }
 
     impl PlatformBackend for RecordingBackend {
+        fn naming_policy(&self) -> trusted_server_core::platform::BackendNamingPolicy {
+            trusted_server_core::platform::BackendNamingPolicy::Fastly
+        }
+
         fn predict_name(
             &self,
             _spec: &PlatformBackendSpec,

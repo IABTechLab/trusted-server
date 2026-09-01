@@ -104,7 +104,11 @@ impl Default for Publisher {
 
 impl Publisher {
     /// Known placeholder values that must not be used in production.
-    pub const PROXY_SECRET_PLACEHOLDERS: &[&str] = &["change-me-proxy-secret", "proxy-secret"];
+    pub const PROXY_SECRET_PLACEHOLDERS: &[&str] = &[
+        "change-me-proxy-secret",
+        "proxy-secret",
+        "replace-with-random-proxy-secret",
+    ];
 
     /// Returns the EC cookie domain, computed as `.{domain}`.
     ///
@@ -219,6 +223,23 @@ pub struct IntegrationSettings {
 
 pub trait IntegrationConfig: DeserializeOwned + Validate {
     fn is_enabled(&self) -> bool;
+
+    /// Validate the public field schema for an explicitly disabled config.
+    ///
+    /// The default deserializes the integration's normal schema, except it
+    /// permits omitted enabled-only required fields. Override this only when a
+    /// disabled integration has a distinct public schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns a deserialization error when the disabled public field schema is invalid.
+    fn validate_disabled_schema(raw: &JsonValue) -> Result<(), serde_json::Error> {
+        match serde_json::from_value::<Self>(raw.clone()) {
+            Ok(_) => Ok(()),
+            Err(error) if error.to_string().starts_with("missing field ") => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 impl IntegrationSettings {
@@ -269,6 +290,11 @@ impl IntegrationSettings {
         };
 
         if Self::is_explicitly_disabled(raw) {
+            T::validate_disabled_schema(raw).change_context(TrustedServerError::Configuration {
+                message: format!(
+                    "Integration '{integration_id}' configuration could not be parsed"
+                ),
+            })?;
             return Ok(None);
         }
 
@@ -515,6 +541,7 @@ impl Ec {
         "secret_key",
         "trusted-server",
         "trusted-server-placeholder-secret",
+        "replace-with-random-ec-passphrase",
     ];
 
     /// Default maximum concurrent pull-sync requests.
@@ -2856,6 +2883,17 @@ impl Settings {
     ///
     /// - [`TrustedServerError::Configuration`] if the JSON value is invalid or missing required fields
     pub fn from_json_value(value: JsonValue) -> Result<Self, Report<TrustedServerError>> {
+        if value
+            .get("auction")
+            .and_then(JsonValue::as_object)
+            .and_then(|auction| auction.get("providers"))
+            .is_some_and(JsonValue::is_array)
+        {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "Configuration field `auction.providers` uses the removed list schema; migrate to `[auction.providers.<id>]` map entries as described in the CHANGELOG.md breaking migration".to_string(),
+            }));
+        }
+
         let settings: Self =
             serde_json::from_value(value).change_context(TrustedServerError::Configuration {
                 message: "Failed to deserialize JSON configuration".to_string(),
@@ -3436,9 +3474,10 @@ where
 }
 
 // Helper: allow Vec fields to deserialize from either a JSON array or a map of numeric indices.
-// This lets env vars like TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS__0=smartadserver work, which the config env source
-// represents as an object {"0": "value"} rather than a sequence. Also supports string inputs that are
-// JSON arrays or comma-separated values.
+// This lets env vars such as
+// TRUSTED_SERVER__INTEGRATIONS__PREBID__CLIENT_SIDE_BIDDERS__0=example-browser work;
+// the config env source represents the value as an object rather than a sequence.
+// String inputs may also be JSON arrays or comma-separated values.
 /// Deserializes a `HashMap<String, String>` from either:
 /// - A TOML table / JSON object (standard deserialization)
 /// - A JSON string (e.g. from env var: `'{"Key": "value"}'`)
@@ -3574,6 +3613,7 @@ mod tests {
     use regex::Regex;
     use serde_json::json;
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     use crate::auction::build_orchestrator;
     use crate::integrations::{
@@ -4097,6 +4137,27 @@ mod tests {
     }
 
     #[test]
+    fn json_settings_rejects_legacy_auction_provider_list_with_migration_guidance() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should load the test settings fixture");
+        let mut value = serde_json::to_value(settings)
+            .expect("should serialize the test settings fixture to JSON");
+        value["auction"]["providers"] = json!(["prebid"]);
+
+        let error = Settings::from_json_value(value)
+            .expect_err("should reject the removed auction provider list schema");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("auction.providers"),
+            "error should identify the removed field, got {rendered}"
+        );
+        assert!(
+            rendered.contains("CHANGELOG.md"),
+            "error should direct operators to the migration guidance, got {rendered}"
+        );
+    }
+
+    #[test]
     fn auction_debug_comment_options_default_matches_serde_defaults() {
         let opts = AuctionDebugCommentOptions::default();
         assert!(opts.include_provider_responses, "should default to true");
@@ -4333,10 +4394,7 @@ mod tests {
             .integration_config::<PrebidIntegrationConfig>("prebid")
             .expect("Prebid config query should succeed")
             .expect("Prebid config should load from test settings");
-        assert_eq!(
-            prebid_cfg.server_url,
-            "https://test-prebid.com/openrtb2/auction"
-        );
+        assert_eq!(prebid_cfg.timeout_ms, 1000);
         assert!(
             settings
                 .integration_config::<NextJsIntegrationConfig>("nextjs")
@@ -5292,101 +5350,6 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
-    fn test_prebid_bidders_override_with_json_env() {
-        let toml_str = crate_test_settings_str();
-        let env_key = format!(
-            "{}{}INTEGRATIONS{}PREBID{}BIDDERS",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        // Ensure no external override interferes
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        temp_env::with_var(
-            origin_key,
-            Some("https://origin.test-publisher.com"),
-            || {
-                temp_env::with_var(env_key, Some("[\"smartadserver\",\"rubicon\"]"), || {
-                    let res = Settings::from_toml_and_env(&toml_str);
-                    if res.is_err() {
-                        eprintln!("JSON override error: {:?}", res.as_ref().err());
-                    }
-                    let settings = res.expect("Settings should parse with JSON env override");
-                    let cfg = settings
-                        .integration_config::<PrebidIntegrationConfig>("prebid")
-                        .expect("Prebid config query should succeed")
-                        .expect("Prebid config should exist with env override");
-                    assert_eq!(
-                        cfg.bidders,
-                        vec!["smartadserver".to_string(), "rubicon".to_string()]
-                    );
-                });
-            },
-        );
-    }
-
-    #[test]
-    fn test_prebid_bidders_override_with_indexed_env() {
-        let toml_str = crate_test_settings_str();
-
-        let env_key0 = format!(
-            "{}{}INTEGRATIONS{}PREBID{}BIDDERS{}0",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let env_key1 = format!(
-            "{}{}INTEGRATIONS{}PREBID{}BIDDERS{}1",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        // Also ensure origin_url env is a plain string (avoid any external env interference)
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        temp_env::with_var(
-            origin_key,
-            Some("https://origin.test-publisher.com"),
-            || {
-                temp_env::with_var(env_key0, Some("smartadserver"), || {
-                    temp_env::with_var(env_key1, Some("openx"), || {
-                        let res = Settings::from_toml_and_env(&toml_str);
-                        if res.is_err() {
-                            eprintln!("Indexed override error: {:?}", res.as_ref().err());
-                        }
-                        let settings =
-                            res.expect("Settings should parse with indexed env override");
-                        let cfg = settings
-                            .integration_config::<PrebidIntegrationConfig>("prebid")
-                            .expect("Prebid config query should succeed")
-                            .expect("Prebid config should exist with indexed env override");
-                        assert_eq!(
-                            cfg.bidders,
-                            vec!["smartadserver".to_string(), "openx".to_string()]
-                        );
-                    });
-                });
-            },
-        );
-    }
-
-    #[test]
     fn test_handlers_override_with_env() {
         let toml_str = crate_test_settings_str();
 
@@ -5935,7 +5898,7 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
-    fn disabled_invalid_integration_skips_validation() {
+    fn disabled_integration_can_omit_enabled_required_fields_and_skip_semantic_validation() {
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -5943,21 +5906,26 @@ origin_host_header_overide = "www.example.com""#,
                 "gpt",
                 &json!({
                     "enabled": false,
-                    "script_url": "not a url",
                 }),
             )
             .expect("should insert GPT config");
 
         let config = settings
             .integration_config::<GptConfig>("gpt")
-            .expect("disabled GPT config should be ignored");
+            .expect("minimal disabled GPT config should be ignored");
         assert!(config.is_none(), "disabled GPT config should be skipped");
-        IntegrationRegistry::new(&settings)
-            .expect("disabled invalid integration config should not fail registry startup");
+        IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("disabled invalid integration config should not fail registry startup");
     }
 
     #[test]
-    fn disabled_invalid_default_enabled_prebid_skips_validation() {
+    fn minimal_disabled_prebid_deserializes_without_enabled_only_validation() {
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -5965,7 +5933,6 @@ origin_host_header_overide = "www.example.com""#,
                 "prebid",
                 &json!({
                     "enabled": false,
-                    "server_url": "not a url",
                 }),
             )
             .expect("should insert prebid config");
@@ -5974,10 +5941,47 @@ origin_host_header_overide = "www.example.com""#,
             .integration_config::<PrebidIntegrationConfig>("prebid")
             .expect("disabled prebid config should be ignored");
         assert!(config.is_none(), "disabled prebid config should be skipped");
-        IntegrationRegistry::new(&settings)
-            .expect("disabled default-enabled prebid config should not fail registry startup");
+        IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("disabled default-enabled prebid config should not fail registry startup");
         build_orchestrator(&settings)
-            .expect("disabled default-enabled prebid config should not fail orchestrator startup");
+            .expect("minimal disabled prebid config should not fail orchestrator startup");
+    }
+
+    #[test]
+    fn disabled_removed_prebid_and_aps_fields_are_rejected() {
+        for (integration_id, removed_field) in [("prebid", "server_url"), ("aps", "account_id")] {
+            let mut settings = create_test_settings();
+            settings
+                .integrations
+                .insert_config(
+                    integration_id,
+                    &json!({
+                        "enabled": false,
+                        (removed_field): "removed-value",
+                    }),
+                )
+                .expect("should insert removed integration config field");
+
+            let error = match integration_id {
+                "prebid" => settings
+                    .integration_config::<PrebidIntegrationConfig>(integration_id)
+                    .expect_err("should reject removed disabled Prebid field"),
+                "aps" => settings
+                    .integration_config::<crate::integrations::aps::ApsConfig>(integration_id)
+                    .expect_err("should reject removed disabled APS field"),
+                _ => unreachable!("test integration ID should be known"),
+            };
+            assert!(
+                format!("{error:?}").contains(removed_field),
+                "should identify removed field `{removed_field}`: {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -5994,79 +5998,19 @@ origin_host_header_overide = "www.example.com""#,
             )
             .expect("should insert GPT config");
 
-        let err = match IntegrationRegistry::new(&settings) {
+        let err = match IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        ) {
             Ok(_) => panic!("enabled invalid integration should fail registry startup"),
             Err(err) => err,
         };
         assert!(
             err.to_string().contains("Integration 'gpt'"),
             "should identify the invalid integration config"
-        );
-    }
-
-    #[test]
-    fn disabled_invalid_provider_config_does_not_fail_orchestrator_startup() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "adserver_mock",
-                &json!({
-                    "enabled": false,
-                    "endpoint": "not a url",
-                }),
-            )
-            .expect("should insert adserver mock config");
-
-        build_orchestrator(&settings).expect("disabled invalid provider config should be ignored");
-    }
-
-    #[test]
-    fn enabled_invalid_provider_config_fails_orchestrator_startup() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "adserver_mock",
-                &json!({
-                    "enabled": true,
-                    "endpoint": "not a url",
-                }),
-            )
-            .expect("should insert adserver mock config");
-
-        let err = match build_orchestrator(&settings) {
-            Ok(_) => panic!("enabled invalid provider config should fail startup"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string().contains("Integration 'adserver_mock'"),
-            "should identify the invalid provider config"
-        );
-    }
-
-    #[test]
-    fn empty_prebid_server_url_fails_orchestrator_startup() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "prebid",
-                &json!({
-                    "enabled": true,
-                    "server_url": "",
-                }),
-            )
-            .expect("should insert prebid config");
-
-        let err = match build_orchestrator(&settings) {
-            Ok(_) => panic!("empty prebid server_url should fail startup"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string()
-                .contains("Integration 'prebid' configuration failed validation"),
-            "should surface a validation error for prebid.server_url"
         );
     }
 
@@ -6126,7 +6070,6 @@ origin_host_header_overide = "www.example.com""#,
             + r#"
             [auction]
             enabled = true
-            providers = []
             "#;
 
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
@@ -6147,7 +6090,6 @@ origin_host_header_overide = "www.example.com""#,
             + r#"
             [auction]
             enabled = true
-            providers = []
             rewrite_creatives = false
             "#;
 
@@ -6174,7 +6116,6 @@ origin_host_header_overide = "www.example.com""#,
             + r#"
             [auction]
             enabled = true
-            providers = []
             allowed_context_keys = ["permutive_segments", "lockr_ids"]
             "#;
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
@@ -6190,7 +6131,6 @@ origin_host_header_overide = "www.example.com""#,
             + r#"
             [auction]
             enabled = true
-            providers = []
             allowed_context_keys = []
             "#;
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
