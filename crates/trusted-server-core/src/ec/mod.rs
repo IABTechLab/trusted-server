@@ -1181,44 +1181,6 @@ mod tests {
         );
     }
 
-    /// A provider that needs no client IP, recording the value it was given so
-    /// a test can prove a host that cannot determine one passes the documented
-    /// unavailable value rather than failing the request.
-    #[derive(Debug, Default)]
-    struct NoClientIpProvider {
-        seen_client_ip: std::sync::Mutex<Option<String>>,
-    }
-
-    impl EdgeCookieProvider for NoClientIpProvider {
-        fn id(&self) -> &'static str {
-            "no-client-ip"
-        }
-
-        fn code(&self) -> ProviderCode {
-            crate::provider_code!("t0ni")
-        }
-
-        fn generate(
-            &self,
-            request_info: &dyn RequestInfo,
-            _input: &IdentityInput<'_>,
-        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
-            *self
-                .seen_client_ip
-                .lock()
-                .expect("should lock the seen client IP") =
-                Some(request_info.client_ip().to_owned());
-            Ok(GeneratedEdgeCookie {
-                id: Some("no-ip-ec".to_owned()),
-                response_headers: Vec::new(),
-            })
-        }
-
-        fn accepts_id(&self, value: &str) -> bool {
-            !value.is_empty()
-        }
-    }
-
     #[test]
     fn a_provider_that_reads_no_client_ip_mints_when_the_host_has_none() {
         use crate::platform::test_support::noop_services_with_ec_provider_without_client_ip;
