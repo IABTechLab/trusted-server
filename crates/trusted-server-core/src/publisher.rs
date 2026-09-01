@@ -14275,6 +14275,7 @@ mod tests {
                 services: &services,
                 req: &mut req,
                 geo_info: None,
+                permissions: None,
             })
             .await
             .expect("should run DataDome filter");

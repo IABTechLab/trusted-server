@@ -329,6 +329,11 @@ pub struct RequestFilterInput<'a> {
     pub services: &'a RuntimeServices,
     pub request: &'a mut Request<EdgeBody>,
     pub geo_info: Option<&'a GeoInfo>,
+    /// The permission state resolved for this request at the start of the
+    /// request cycle, so a filter reads the same permissions the rest of the
+    /// request uses rather than resolving its own. `None` only on paths that
+    /// build no EC context, such as batch sync and admin diagnostics.
+    pub permissions: Option<&'a crate::permissions::PermissionState>,
     /// Whether the request matches a registered integration proxy route.
     pub is_integration_route: bool,
 }
@@ -409,6 +414,10 @@ pub struct RequestFilterRegistryInput<'a> {
     pub services: &'a RuntimeServices,
     pub req: &'a mut Request<EdgeBody>,
     pub geo_info: Option<&'a GeoInfo>,
+    /// The permission state resolved for this request at the start of the
+    /// request cycle, passed on to every filter. `None` only on paths that
+    /// build no EC context, such as batch sync and admin diagnostics.
+    pub permissions: Option<&'a crate::permissions::PermissionState>,
 }
 
 /// Outcome returned by [`IntegrationRegistry::filter_request`].
@@ -911,6 +920,7 @@ impl IntegrationRegistry {
             services,
             req,
             geo_info,
+            permissions,
         } = input;
         let mut accumulated = RequestFilterEffects::default();
         let is_integration_route = self.has_route(req.method(), req.uri().path());
@@ -922,6 +932,7 @@ impl IntegrationRegistry {
                     services,
                     request: req,
                     geo_info,
+                    permissions,
                     is_integration_route,
                 })
                 .await?;
@@ -1347,6 +1358,7 @@ impl IntegrationRegistry {
 mod tests {
     use super::*;
     use crate::constants::COOKIE_TS_EC;
+    use crate::permissions::{Permission, PermissionSet, PermissionState};
     use crate::platform::test_support::noop_services;
     use http::{HeaderValue, StatusCode, header};
 
@@ -1465,6 +1477,45 @@ mod tests {
                 request_headers: vec![HeaderMutation::set("x-datadome-isbot", "1")],
                 response_headers: vec![HeaderMutation::set("x-dd-b", "allowed")],
             }))
+        }
+    }
+
+    /// Records the permission state each filter invocation received, so a test
+    /// can assert what the registry handed to the filter.
+    #[derive(Default)]
+    struct RecordingPermissionsFilter {
+        seen: std::sync::Mutex<Option<Option<crate::permissions::PermissionState>>>,
+    }
+
+    impl RecordingPermissionsFilter {
+        /// The permission state observed by the last invocation, or `None` when
+        /// the filter has not run.
+        fn seen(&self) -> Option<Option<crate::permissions::PermissionState>> {
+            *self
+                .seen
+                .lock()
+                .expect("should lock the recorded permission state")
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl IntegrationRequestFilter for RecordingPermissionsFilter {
+        fn integration_id(&self) -> &'static str {
+            "recording-permissions"
+        }
+
+        async fn filter_request(
+            &self,
+            input: RequestFilterInput<'_>,
+        ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+            *self
+                .seen
+                .lock()
+                .expect("should lock the recorded permission state") =
+                Some(input.permissions.copied());
+            Ok(RequestFilterDecision::Continue(
+                RequestFilterEffects::default(),
+            ))
         }
     }
 
@@ -1613,6 +1664,7 @@ mod tests {
                 services: &services,
                 req: &mut req,
                 geo_info: None,
+                permissions: None,
             }))
             .expect("should run request filter");
 
@@ -1637,6 +1689,55 @@ mod tests {
             }
             RequestFilterRegistryOutcome::Respond { .. } => panic!("should continue routing"),
         }
+    }
+
+    #[test]
+    fn filter_request_passes_the_resolved_permission_state_to_each_filter() {
+        let filter = Arc::new(RecordingPermissionsFilter::default());
+        let registry = IntegrationRegistry::from_request_filters(vec![
+            filter.clone() as Arc<dyn IntegrationRequestFilter>
+        ]);
+        let settings = crate::test_support::tests::create_test_settings();
+        let services = crate::platform::test_support::noop_services();
+        let permissions =
+            PermissionState::new(PermissionSet::none().with(Permission::StoreOnDevice));
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/page")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        futures::executor::block_on(registry.filter_request(RequestFilterRegistryInput {
+            settings: &settings,
+            services: &services,
+            req: &mut req,
+            geo_info: None,
+            permissions: Some(&permissions),
+        }))
+        .expect("should run request filter");
+
+        assert_eq!(
+            filter.seen(),
+            Some(Some(permissions)),
+            "the filter should observe exactly the permission state resolved for the request"
+        );
+
+        // A path that builds no EC context passes no permissions, and the
+        // filter must see that absence rather than an empty state.
+        futures::executor::block_on(registry.filter_request(RequestFilterRegistryInput {
+            settings: &settings,
+            services: &services,
+            req: &mut req,
+            geo_info: None,
+            permissions: None,
+        }))
+        .expect("should run request filter");
+
+        assert_eq!(
+            filter.seen(),
+            Some(None),
+            "an absent permission state should reach the filter as `None`"
+        );
     }
 
     #[test]

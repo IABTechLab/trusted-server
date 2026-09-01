@@ -121,6 +121,7 @@ use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
 };
+use trusted_server_core::permissions::PermissionState;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, build_geo_provider,
 };
@@ -546,11 +547,15 @@ enum PreRoute {
 /// mutations are applied to `req` so the routed handler observes them; response
 /// effects are returned for the entry point to apply after EC finalization. A
 /// filter that responds (e.g. a `DataDome` challenge) short-circuits routing.
+///
+/// `permissions` carries the state resolved when the EC context was built, so
+/// every filter reads the same permissions as the rest of the request.
 async fn run_pre_route_filters(
     state: &AppState,
     services: &RuntimeServices,
     req: &mut Request,
     geo_info: Option<&GeoInfo>,
+    permissions: Option<&PermissionState>,
 ) -> PreRoute {
     match state
         .registry
@@ -559,6 +564,7 @@ async fn run_pre_route_filters(
             services,
             req,
             geo_info,
+            permissions,
         })
         .await
     {
@@ -655,13 +661,20 @@ async fn execute_named(
         ));
     }
 
-    let effects =
-        match run_pre_route_filters(&state, &services, &mut req, ec.geo_info.as_ref()).await {
-            PreRoute::ShortCircuit { response, effects } => {
-                return Ok(attach_dispatch_extensions(response, ec, effects));
-            }
-            PreRoute::Continue { effects } => effects,
-        };
+    let effects = match run_pre_route_filters(
+        &state,
+        &services,
+        &mut req,
+        ec.geo_info.as_ref(),
+        Some(ec.ec_context.permissions()),
+    )
+    .await
+    {
+        PreRoute::ShortCircuit { response, effects } => {
+            return Ok(attach_dispatch_extensions(response, ec, effects));
+        }
+        PreRoute::Continue { effects } => effects,
+    };
 
     let response = run_named_route(&state, &services, req, handler, &mut ec)
         .await
@@ -848,7 +861,14 @@ async fn dispatch_fallback(
 
     // Pre-route integration request filters (DataDome protection, etc.) run
     // before the route-type decision, matching legacy `route_request` ordering.
-    let effects = match run_pre_route_filters(state, services, &mut req, ec.geo_info.as_ref()).await
+    let effects = match run_pre_route_filters(
+        state,
+        services,
+        &mut req,
+        ec.geo_info.as_ref(),
+        Some(ec.ec_context.permissions()),
+    )
+    .await
     {
         PreRoute::ShortCircuit { response, effects } => {
             return attach_dispatch_extensions(response, ec, effects);
