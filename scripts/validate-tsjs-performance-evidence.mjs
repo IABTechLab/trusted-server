@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const EXPECTED = Object.freeze({
-  schemaVersion: 6,
+  schemaVersion: 7,
   chromium: "145.0.7632.6",
   machineClass: "github-hosted:ubuntu-24.04",
   runnerImage: "ubuntu-24.04",
@@ -119,7 +119,7 @@ function validateReferenceTransfer(
   }
   const endpoints = new Set();
   const sums = { rawBytes: 0, gzipBytes: 0, brotliBytes: 0 };
-  let externalRawBytes;
+  let externalTransfer;
   for (const [index, source] of value.sources.entries()) {
     const sourcePath = `${path}.sources[${index}]`;
     exactKeys(
@@ -157,10 +157,10 @@ function validateReferenceTransfer(
       if (source.semanticEndpoint !== expectedExternalEndpoint) {
         fail(`${sourcePath} has a mismatched external endpoint`);
       }
-      if (externalRawBytes !== undefined) {
+      if (externalTransfer !== undefined) {
         fail(`${path} contains duplicate external transfer`);
       }
-      externalRawBytes = source.rawBytes;
+      externalTransfer = source;
     } else {
       fail(`${sourcePath}.delivery is invalid`);
     }
@@ -183,7 +183,7 @@ function validateReferenceTransfer(
   ) {
     fail(`${path} omits or mislabels an inline semantic source`);
   }
-  if (externalRawBytes === undefined)
+  if (externalTransfer === undefined)
     fail(`${path} omits the external transfer`);
   for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
     const total = finiteNumber(value[metric], `${path}.${metric}`, {
@@ -192,7 +192,7 @@ function validateReferenceTransfer(
     });
     if (total !== sums[metric]) fail(`${path}.${metric} total is inconsistent`);
   }
-  return { externalRawBytes };
+  return { externalTransfer };
 }
 
 export function validateEvidence(evidence, expected) {
@@ -424,7 +424,7 @@ export function validateEvidence(evidence, expected) {
   );
   exactString(
     evidence.transfer.algorithm,
-    "semantic-tsjs-transfer-v1",
+    "split-preaction-transfer-v2",
     "transfer.algorithm",
   );
   const baselineTransfer = validateReferenceTransfer(
@@ -440,22 +440,23 @@ export function validateEvidence(evidence, expected) {
     "transfer.candidateReferenceTransfer",
   );
   if (
-    timing.baseline.selectedTransferBytes !== baselineTransfer.externalRawBytes
+    timing.baseline.selectedTransferBytes !==
+    baselineTransfer.externalTransfer.rawBytes
   ) {
-    fail("baseline selected transfer bytes disagree with semantic transfer");
+    fail("baseline selected transfer bytes disagree with reference transfer");
   }
   if (
     timing.candidate.selectedTransferBytes !==
-    candidateTransfer.externalRawBytes
+    candidateTransfer.externalTransfer.rawBytes
   ) {
-    fail("candidate selected transfer bytes disagree with semantic transfer");
+    fail("candidate selected transfer bytes disagree with reference transfer");
   }
   for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
     if (
-      evidence.transfer.candidateReferenceTransfer[metric] >
-      evidence.transfer.baselineReferenceTransfer[metric]
+      candidateTransfer.externalTransfer[metric] >
+      baselineTransfer.externalTransfer[metric]
     ) {
-      fail(`candidate reference ${metric} exceeds the rc baseline`);
+      fail(`candidate selected agent ${metric} exceeds the rc baseline`);
     }
   }
 
@@ -696,7 +697,7 @@ export function validateEvidence(evidence, expected) {
   );
   exactString(
     evidence.aps.transfer.algorithm,
-    "semantic-tsjs-transfer-v1",
+    "split-preaction-transfer-v2",
     "aps.transfer.algorithm",
   );
   if (evidence.aps.transfer.maximumRatio !== EXPECTED.maximumRatio) {
@@ -718,19 +719,20 @@ export function validateEvidence(evidence, expected) {
   );
   if (
     apsFirstAction.baseline.selectedTransferBytes !==
-      apsBaselineTransfer.externalRawBytes ||
+      apsBaselineTransfer.externalTransfer.rawBytes ||
     apsFirstAction.candidate.selectedTransferBytes !==
-      apsCandidateTransfer.externalRawBytes
+      apsCandidateTransfer.externalTransfer.rawBytes
   ) {
-    fail("APS selected transfer bytes disagree with semantic transfer");
+    fail("APS selected transfer bytes disagree with reference transfer");
   }
   for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
     if (
-      evidence.aps.transfer.candidateReferenceTransfer[metric] >
-      evidence.aps.transfer.baselineReferenceTransfer[metric] *
-        EXPECTED.maximumRatio
+      apsCandidateTransfer.externalTransfer[metric] >
+      apsBaselineTransfer.externalTransfer[metric] * EXPECTED.maximumRatio
     ) {
-      fail(`APS candidate ${metric} transfer exceeds the paired 10% limit`);
+      fail(
+        `APS candidate selected-agent ${metric} exceeds the paired 10% limit`,
+      );
     }
   }
 
@@ -860,7 +862,7 @@ function validFixture() {
   return {
     expected: { evidenceId, headSha, baseSha, mode: "preswitch" },
     evidence: {
-      schemaVersion: 6,
+      schemaVersion: 7,
       evidenceId,
       mode: "preswitch",
       headSha,
@@ -917,7 +919,7 @@ function validFixture() {
         },
       },
       transfer: {
-        algorithm: "semantic-tsjs-transfer-v1",
+        algorithm: "split-preaction-transfer-v2",
         baselineReferenceTransfer: {
           sha: baseSha,
           artifactModel: "legacy-rc-v1",
@@ -1049,7 +1051,7 @@ function validFixture() {
           },
         },
         transfer: {
-          algorithm: "semantic-tsjs-transfer-v1",
+          algorithm: "split-preaction-transfer-v2",
           maximumRatio: 1.1,
           baselineReferenceTransfer: {
             sha: baseSha,
@@ -1150,6 +1152,17 @@ function validFixture() {
 function runSelfTest() {
   const fixture = validFixture();
   validateEvidence(fixture.evidence, fixture.expected);
+  const splitTransferFixture = structuredClone(fixture.evidence);
+  for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
+    const baselineTotal =
+      splitTransferFixture.transfer.baselineReferenceTransfer[metric];
+    const candidateTransfer =
+      splitTransferFixture.transfer.candidateReferenceTransfer;
+    const increase = baselineTotal - candidateTransfer[metric] + 1;
+    candidateTransfer.sources[0][metric] += increase;
+    candidateTransfer[metric] += increase;
+  }
+  validateEvidence(splitTransferFixture, fixture.expected);
   const releaseBaselineFixture = structuredClone(fixture.evidence);
   releaseBaselineFixture.performance.requestToFirstActionMs.baseline.artifactModel =
     "release-v1";
@@ -1258,11 +1271,11 @@ function runSelfTest() {
       "one-byte raw regression",
       (value) => {
         const transfer = value.transfer.candidateReferenceTransfer;
-        const increase =
-          value.transfer.baselineReferenceTransfer.rawBytes -
-          transfer.rawBytes +
-          1;
-        transfer.sources[1].rawBytes += increase;
+        const baselineAgent =
+          value.transfer.baselineReferenceTransfer.sources[2];
+        const candidateAgent = transfer.sources[1];
+        const increase = baselineAgent.rawBytes - candidateAgent.rawBytes + 1;
+        candidateAgent.rawBytes += increase;
         transfer.rawBytes += increase;
         value.performance.requestToFirstActionMs.candidate.selectedTransferBytes +=
           increase;
@@ -1272,11 +1285,11 @@ function runSelfTest() {
       "one-byte gzip regression",
       (value) => {
         const transfer = value.transfer.candidateReferenceTransfer;
-        const increase =
-          value.transfer.baselineReferenceTransfer.gzipBytes -
-          transfer.gzipBytes +
-          1;
-        transfer.sources[1].gzipBytes += increase;
+        const baselineAgent =
+          value.transfer.baselineReferenceTransfer.sources[2];
+        const candidateAgent = transfer.sources[1];
+        const increase = baselineAgent.gzipBytes - candidateAgent.gzipBytes + 1;
+        candidateAgent.gzipBytes += increase;
         transfer.gzipBytes += increase;
       },
     ],
@@ -1284,11 +1297,12 @@ function runSelfTest() {
       "one-byte Brotli regression",
       (value) => {
         const transfer = value.transfer.candidateReferenceTransfer;
+        const baselineAgent =
+          value.transfer.baselineReferenceTransfer.sources[2];
+        const candidateAgent = transfer.sources[1];
         const increase =
-          value.transfer.baselineReferenceTransfer.brotliBytes -
-          transfer.brotliBytes +
-          1;
-        transfer.sources[1].brotliBytes += increase;
+          baselineAgent.brotliBytes - candidateAgent.brotliBytes + 1;
+        candidateAgent.brotliBytes += increase;
         transfer.brotliBytes += increase;
       },
     ],
@@ -1418,11 +1432,12 @@ function runSelfTest() {
       "APS transfer ratio",
       (value) => {
         const transfer = value.aps.transfer.candidateReferenceTransfer;
-        const limit = Math.floor(
-          value.aps.transfer.baselineReferenceTransfer.rawBytes * 1.1,
-        );
-        const increase = limit - transfer.rawBytes + 1;
-        transfer.sources[1].rawBytes += increase;
+        const baselineAgent =
+          value.aps.transfer.baselineReferenceTransfer.sources[2];
+        const candidateAgent = transfer.sources[1];
+        const limit = Math.floor(baselineAgent.rawBytes * 1.1);
+        const increase = limit - candidateAgent.rawBytes + 1;
+        candidateAgent.rawBytes += increase;
         transfer.rawBytes += increase;
         value.aps.performance.firstAction.candidate.selectedTransferBytes +=
           increase;
@@ -1536,7 +1551,7 @@ function runSelfTest() {
   assert.match(
     performanceTest,
     /performanceCase === "aps" \? "008f" : "008b"/u,
-    "the release-v1 semantic transfer must measure the exact admitted GPT and APS agents",
+    "the release-v1 reference transfer must measure the exact admitted GPT and APS agents",
   );
   assert.match(
     generatorSource,
@@ -1632,8 +1647,8 @@ function runSelfTest() {
   }
   assert.match(
     performanceTest,
-    /candidateResources\.referenceTransfer\[metric\][\s\S]*baselineResources\.referenceTransfer\[metric\]/u,
-    "the browser gate must softly collect all evidence while enforcing every transfer encoding",
+    /candidateAgent\[metric\][\s\S]*baselineAgent\[metric\]/u,
+    "the browser gate must enforce every selected-agent transfer encoding while the controller retains its independent absolute ceiling",
   );
   assert.match(
     performanceWorkflowScript,

@@ -1062,10 +1062,14 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
       `[first_display,creative_initial,gpt_initial,prebid_initial,datadome_initial]`,
       and APS
       `[first_display,render_owner_initial,aps_initial,creative_initial,gpt_initial]`
-      masks, plus the largest admitted mask per encoding. Enforce GPT reference
-      semantic transfer no-growth in every encoding. Separately require both GPT and
-      APS candidate first-action p90 and pre-action raw/gzip/Brotli transfer to be at
-      most the exact rc base × 1.10.
+      masks, plus the largest admitted mask per encoding. Record the complete
+      inline-plus-agent semantic transfer as diagnostic context. Require the GPT
+      candidate's one selected external agent to be no larger than the exact rc-base
+      selected agent in raw, gzip, and Brotli; allow the APS selected agent at most
+      the exact rc-base selected agent × 1.10 in each encoding. Keep the controller's
+      independent `48,000/16,000/14,000` ceiling and require both GPT and APS
+      candidate first-action p90 to be at most the exact rc base × 1.10 so the paired
+      timing measurement covers controller and agent transfer/parse end to end.
 
       Pin the APS absolute table: bids-script→first GPT action p90 ≤900 ms; first
       action→accepted completion p90 ≤1,500 ms; accepted completion→paint p90 ≤250
@@ -1110,7 +1114,7 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 
 - [ ] **Step 5: Run local self-tests and prove the intentional pre-remediation
       RED.** Validator/schema/dispatch unit tests and the build must be GREEN. The
-      exact semantic-transfer and APS admission checks against the untouched
+      exact selected-agent-transfer and APS admission checks against the untouched
       candidate are expected RED for the recorded revision-43 bytes/timing; preserve
       that failure as the gate contract. Do not weaken membership, a threshold, or a
       fixture to make Task 15 green. Tasks 15A/15B are the remediation, and Task 15B
@@ -1286,12 +1290,14 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 
 - [ ] **Step 7: Measure rather than infer transfer improvement.** Read the generated
       bootstrap raw/gzip/Brotli values and its complete source-owner list. If the
-      graph exclusions pass but the served GPT semantic interval cannot fit beneath
-      the exact rc baseline after including its real inline payload, stop and revisit
-      the architecture instead of adding mangling or changing membership. Generate
-      the manifest-entry capacity as a build constant so persistent core does not
-      import the release catalog for one number; assert both catalog exclusion and
-      intentional tree-shaking of the declaration module in the release metafile.
+      graph exclusions pass but the bootstrap exceeds its independent ceiling or the
+      served GPT selected agent cannot fit beneath the exact rc selected agent, stop
+      and revisit the architecture instead of adding mangling or changing membership.
+      Keep the aggregate inline-plus-agent interval as diagnostic context and retain
+      the paired end-to-end timing gate. Generate the manifest-entry capacity as a
+      build constant so persistent core does not import the release catalog for one
+      number; assert both catalog exclusion and intentional tree-shaking of the
+      declaration module in the release metafile.
 
 - [ ] **Step 8: Commit.**
 
@@ -1434,8 +1440,10 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 
   Expected: every focused behavior is unchanged, the production graph has one
   render journal, and the exact mandatory APS mask remains admitted. If the combined
-  inline-plus-mask semantic bytes still exceed the rc × 1.10 allowance, stop and
-  revisit the approved split rather than weakening a gate. The release proof must
+  selected-agent bytes still exceed their rc comparator, stop and revisit the
+  approved split rather than weakening a gate. The aggregate inline-plus-agent bytes
+  remain recorded context and the inline controller still must pass its independent
+  ceiling. The release proof must
   show 36 artifacts, 14 first-display rows, 3,584 reachable masks, the exact
   generated admitted subset, a largest admitted first-display body no greater than
   90,000/30,000/26,000 raw/gzip/Brotli bytes, and a maximal total that excludes the

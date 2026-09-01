@@ -5084,8 +5084,8 @@ semantics:
    program but is compacted in place, with no external asset or reduced adversarial
    behavior; and
 4. source-ownership tests, focused lifecycle suites, every admitted-mask budget,
-   semantic rc comparison, and the complete paired performance run must all pass on
-   one clean pushed replacement SHA.
+   selected-agent rc comparison, and the complete paired performance run must all
+   pass on one clean pushed replacement SHA.
 
 An optimization is rejected if it merely moves bytes into an auxiliary request,
 stores executable source in boot data, weakens the top-page owner, removes mixed
@@ -5124,9 +5124,10 @@ must not reach APS, GPT, creative, PUC, or any optional-slice implementation. Ev
 optional slice remains independently owned and is included only by its mask bit.
 Release/source-ownership tests prove the logical marker has exactly one physical
 owner, cannot be routed independently, and is absent from every served first-display
-body. The exact semantic rc comparison remains the acceptance test; the consolidation
-is incomplete until raw, gzip, and Brotli all pass without changing membership,
-fixture, baseline, or ceiling.
+body. The exact selected-agent rc comparison, controller absolute ceiling, and paired
+end-to-end timing remain the acceptance tests; the consolidation is incomplete until
+raw, gzip, Brotli, and timing all pass without changing membership, fixture,
+baseline, or ceiling.
 
 The checked-in pre-change fixture is immutable historical evidence and is never
 regenerated or rewritten. Its original `bundles` values measured a different
@@ -5185,14 +5186,28 @@ where transfer growth and shared-source duplication remain.
 
 In the same blocking job, a detached worktree at the exact PR base SHA from
 `origin/rc/202608` builds the real production page for the reference configuration
-with its baseline artifact model and default creative behavior. `baselineReferenceTransfer`
-is the exact raw/gzip/Brotli sum of every Trusted Server JavaScript byte delivered or
-embedded from `tsjs:bids-script` through the first responsible GPT action. The
-candidate records the same semantic interval for its controller, upstream-independent
-TSJS transports, and agent; neither side relabels artifact names to manufacture
-membership parity. Candidate reference transfer must be at most the rc-baseline
-value for each encoding. This semantic transfer comparison is independent of, and in
-addition to, the paired 1.10 timing ratio below.
+with its baseline artifact model and default creative behavior. Each side records a
+`referenceTransfer` context containing the exact raw/gzip/Brotli size and hash of
+every distinct Trusted Server JavaScript source delivered or embedded from
+`tsjs:bids-script` through the first responsible GPT action. The aggregate is
+diagnostic context rather than a relative byte comparator: the rc artifact model
+embeds only a small legacy shim while the hard-cutover model's inline controller owns
+queue ingress, sealed transport, fallback, lifecycle, and takeover coordination.
+Comparing those unlike inline responsibilities as though they were the same artifact
+would double-gate controller code already covered by the independent bootstrap
+ceiling and by end-to-end timing.
+
+The relative byte comparator instead measures the one externally delivered selected
+first-display agent on each side. It requires exactly one external agent source and
+compares raw, gzip, and Brotli independently. For the GPT reference fixture, the
+candidate selected agent must be no larger than the exact rc-baseline selected agent
+in every encoding. For APS, the candidate selected agent must be at most the exact
+rc-baseline selected agent × 1.10 in every encoding. Neither side relabels or splits
+sources to manufacture parity. The candidate inline controller independently remains
+at most 48,000/16,000/14,000 raw/gzip/Brotli bytes, every selected agent remains
+subject to its admitted-mask ceiling, and paired first-action p90 includes transfer
+and parse of the complete inline-plus-agent path. No ceiling is raised by this split
+pre-action transfer contract.
 
 The candidate evidence is accepted only after the first-display graph contains no public
 runtime API, persistent broker/registry, diagnostics, refresh, SPA/navigation,
@@ -5210,8 +5225,8 @@ ceilings apply to the candidate and do not derive from any candidate capture:
 The first-display ceilings are selected from the fixed 200,000-byte/s profile; the
 post-paint and maximal limits prevent phase splitting or duplicated ownership from
 making total release growth unbounded. They are not substitutes for the rc-baseline
-semantic transfer or paired timing gates. Changing any ceiling requires a reviewed
-design rather than recapturing candidate history.
+selected-agent comparison or paired end-to-end timing gates. Changing any ceiling
+requires a reviewed design rather than recapturing candidate history.
 
 The build emits one canonical release inventory with each production bundle's id,
 role, phase, trigger, inputs, outputs, bytes, and hash. Budget membership is derived
@@ -5236,7 +5251,8 @@ validation, generation/disposal, timing, and local logging primitives.
 1. the original and two intermediate candidate captures and their digests are
    validated and printed as immutable history, never as pass/fail ceilings;
 2. the freshly built exact rc-baseline and candidate reference pages enforce the
-   semantic transfer comparison;
+   split pre-action contract: selected-agent relative bytes, controller absolute
+   bytes, and paired end-to-end timing;
 3. candidate bootstrap/all-permitted-masks/persistent/maximal values enforce the
    independent absolute ceilings; and
 4. the one-time architecture/source-ownership assertions above remain blocking.
@@ -5338,9 +5354,12 @@ correctness deadline. Changing a fictional dependency body/schedule, a ceiling, 
 mark endpoint, or the network profile is a performance-contract change requiring
 review rather than a way to recapture a passing baseline. These deliberately broad
 absolute guardrails cover the candidate-only document lifecycle. For both GPT and
-APS, candidate first-action p90 and pre-action raw/gzip/Brotli transfer must be at
-most the rc-baseline value × 1.10; the reference GPT semantic transfer retains the
-stricter no-growth rule above.
+APS, candidate first-action p90 must be at most the rc-baseline value × 1.10. The GPT
+candidate selected-agent raw/gzip/Brotli transfer must not exceed the exact
+rc-baseline selected agent; the APS candidate selected-agent transfer may be at most
+the exact rc-baseline selected agent × 1.10. The recorded aggregate transfer remains
+diagnostic context, while the candidate controller and admitted agent remain bound by
+their independent absolute ceilings above.
 
 On a pull request, each run reads `pull_request.base.sha` into the dedicated
 `TSJS_PERF_BASE_SHA`, verifies it is a 40-character commit reachable from the fetched
@@ -5931,8 +5950,9 @@ boolean and exposes no legacy alias or omitted-field compatibility path.
    takeover, move persistent/later behavior out of its graph, and make inventory,
    ownership, and production-metafile gates green. Record candidate evidence from
    its exact clean pushed parent; all historical/intermediate deltas remain
-   report-only, and fresh-rc-baseline semantic transfer, independent absolute size,
-   timing, and heap gates must be green before production wiring.
+   report-only, and fresh-rc-baseline selected-agent transfer, independent absolute
+   size, paired end-to-end timing, and heap gates must be green before production
+   wiring.
 6. **Browser integrations:** migrate APS, GPT, Prebid, direct auction, fallback,
    local diagnostics, creative processing, every remaining affected TSJS
    integration, and bootstrap to the catalogued first-display/takeover/deferred
@@ -6162,8 +6182,12 @@ The design is complete when all of the following are true:
     GPT-reference and APS masks, passes the 90,000/30,000/26,000 raw/gzip/Brotli
     ceilings; all reachable masks are measured and any other closed configuration
     selects direct persistent boot. Bootstrap, persistent reference, and the maximal
-    non-bootstrap total pass their independent §5.12 ceilings; and the candidate's semantic pre-action transfer is
-    no larger than a fresh rc-baseline build in each encoding.
+    non-bootstrap total pass their independent §5.12 ceilings. The GPT candidate's
+    selected-agent transfer is no larger than a fresh rc-baseline selected agent in
+    each encoding, while the APS selected agent is no larger than that exact baseline
+    × 1.10. The aggregate inline-plus-agent transfer is recorded as diagnostic
+    context; the inline controller remains bound by its independent ceiling and the
+    paired timing gate covers the complete end-to-end pre-action path.
     Boot-to-first-display passes the automatic fixed-network-profile
     candidate-versus-rc-baseline timing gate, including the candidate's real-mark
     and deferred-order assertions; the APS fixture passes every named

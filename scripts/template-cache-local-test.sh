@@ -518,135 +518,21 @@ else
     "$(assembly_state "$WORK/r2.html.headers")" "byte-seam"
   check "no unresolved seam marker reaches the browser" \
     "$(grep -cF "$SEAM_MARKER" "$SERVED" || true)" "0"
-  check "a bids script is present" \
-    "$(grep -c 'window.tsjs' "$SERVED" || true)" "1"
-  # `window.tsjs` alone passes while initial ads are dead: shared modes suppress the head
-  # slot script, so if the seam does not carry slots, `adSlots` stays `[]` and `adInit`
-  # defines nothing. This harness passed green through exactly that bug.
-  # The slots ride the scheduler call (`s(b,a)`) rather than a bare assignment, so the
-  # navigation-generation guard covers them; `var a=JSON.parse(...)` is where they land.
-  check "the seam carries slot definitions, not just bids" \
-    "$(grep -c 'var a=JSON.parse' "$SERVED" || true)" "1"
-  check "the slot definitions reach the guarded scheduler" \
-    "$(grep -cF 's(b,a)' "$SERVED" || true)" "1"
-  check "the slot definitions are populated, not an empty array" \
-    "$(grep -c 'var a=JSON.parse("\[\]")' "$SERVED" || true)" "0"
-  # The assertion the harness was missing entirely. `window.tsjs` and populated slots
-  # both pass on a page whose bids are `{}` — which is what shared modes served, on
-  # every request, for as long as this file has existed.
-  check "the seam carries a real bid, not an empty map" \
-    "$(grep -cF 'var b=JSON.parse("{}")' "$SERVED" || true)" "0"
+  check "the hard-cutover controller is present" \
+    "$(grep -c '__TSJS_SERVER_BOOT_TRANSPORT_V1__' "$SERVED" || true)" "1"
+  check "the controller records the real bids-script mark" \
+    "$(grep -cF 'performance.mark("tsjs:bids-script")' "$SERVED" || true)" "1"
+  check "the selected hard-cutover runtime is present" \
+    "$(grep -c 'src="/static/tsjs=tsjs-unified.min.js?v=[0-9a-f]\{64\}" id="trustedserver-js"' "$SERVED" || true)" "1"
   check "the winning bid's bucketed price reaches the reader" \
     "$(grep -cF "$WINNING_BID" "$SERVED" || true)" "1"
-
-  GPT_BUNDLE=""
-  while IFS= read -r -d '' candidate; do
-    if [ -z "$GPT_BUNDLE" ] || [ "$candidate" -nt "$GPT_BUNDLE" ]; then
-      GPT_BUNDLE="$candidate"
-    fi
-  done < <(find "$REPO_ROOT/target/wasm32-wasip1/debug/build" \
-    -path '*/out/tsjs-gpt.js' -type f -print0)
-  if [ -z "$GPT_BUNDLE" ] || [ ! -s "$GPT_BUNDLE" ]; then
-    bad "the generated GPT module cannot be found"
-  else
-    cat > "$WORK/verify-seam.mjs" <<'NODEEOF'
-import fs from "node:fs";
-import vm from "node:vm";
-
-const [documentPath, gptPath] = process.argv.slice(2);
-const html = fs.readFileSync(documentPath, "utf8");
-const gpt = fs.readFileSync(gptPath, "utf8");
-const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/gi)].map((match) => match[1]);
-const seam = scripts.find((script) => script.includes('var b=JSON.parse("'));
-if (!seam) throw new Error("served document has no executable seam payload");
-
-const element = {
-  id: "ts-slot-header",
-  parentElement: null,
-  checkVisibility: () => true,
-  getBoundingClientRect: () => ({ width: 728, height: 90 }),
-  querySelectorAll: () => [],
-};
-const defined = [];
-const gptSlots = [];
-const pubads = {
-  addEventListener() {},
-  disableInitialLoad() {},
-  enableSingleRequest() {},
-  getSlots: () => gptSlots,
-  refresh() {},
-};
-const googletag = {
-  cmd: { push(...callbacks) { callbacks.forEach((callback) => callback()); return callbacks.length; } },
-  defineSlot(unit, formats, divId) {
-    defined.push({ unit, formats, divId });
-    const slot = {
-      addService() { return slot; },
-      clearTargeting() {},
-      getSlotElementId: () => divId,
-      setTargeting() { return slot; },
-    };
-    gptSlots.push(slot);
-    return slot;
-  },
-  destroySlots: () => true,
-  display() {},
-  enableServices() {},
-  pubads: () => pubads,
-};
-const listeners = new Map();
-const windowObject = {
-  addEventListener(type, callback) { listeners.set(type, callback); },
-  getComputedStyle: () => ({ display: "block", visibility: "visible" }),
-  googletag,
-  history: { pushState() {}, replaceState() {} },
-  location: {
-    host: "ts.example.com",
-    href: "https://ts.example.com/article",
-    origin: "https://ts.example.com",
-    pathname: "/article",
-    protocol: "https:",
-  },
-  requestAnimationFrame(callback) { callback(); return 1; },
-  tsjs: { navGeneration: 0 },
-};
-const documentObject = {
-  documentElement: {},
-  getElementById: (id) => id === element.id ? element : null,
-  querySelectorAll: () => [],
-  readyState: "complete",
-  visibilityState: "visible",
-};
-globalThis.window = windowObject;
-globalThis.document = documentObject;
-globalThis.history = windowObject.history;
-globalThis.location = windowObject.location;
-globalThis.requestAnimationFrame = windowObject.requestAnimationFrame;
-
-vm.runInThisContext(gpt, { filename: gptPath });
-vm.runInThisContext(seam, { filename: documentPath });
-
-const slots = windowObject.tsjs.adSlots ?? [];
-const bids = windowObject.tsjs.bids ?? {};
-if (slots.length !== 1 || slots[0].id !== "ts-slot-header") {
-  throw new Error(`scheduler received invalid slots: ${JSON.stringify(slots)}`);
-}
-if (!bids["ts-slot-header"] || bids["ts-slot-header"].hb_pb !== "4.25") {
-  throw new Error(`scheduler received no winning bid: ${JSON.stringify(bids)}`);
-}
-if (defined.length !== 1 || defined[0].divId !== "ts-slot-header") {
-  throw new Error(`GPT defineSlot contract failed: ${JSON.stringify(defined)}`);
-}
-console.log(`slots=${slots.length} bids=${Object.keys(bids).length} defined=${defined.length}`);
-NODEEOF
-    GPT_RESULT=$(node "$WORK/verify-seam.mjs" "$SERVED" "$GPT_BUNDLE" 2>&1) || {
-      bad "the served seam failed the real GPT module contract: $GPT_RESULT"
-      GPT_RESULT=""
-    }
-    [ -z "$GPT_RESULT" ] || check \
-      "the real scheduler defines the populated GPT slot" "$GPT_RESULT" \
-      "slots=1 bids=1 defined=1"
-  fi
+  CUTOVER_RESULT=$(node "$REPO_ROOT/scripts/template-cache-verify-hard-cutover.mjs" "$SERVED" 2>&1) || {
+    bad "the served seam failed the hard-cutover transport contract: $CUTOVER_RESULT"
+    CUTOVER_RESULT=""
+  }
+  [ -z "$CUTOVER_RESULT" ] || check \
+    "the sealed controller binds the populated slot and bid to its selected runtime" \
+    "$CUTOVER_RESULT" "slots=1 bids=1 selected=1 mode=direct"
 
   check_hit_is_private
   check_post_reaches_origin
@@ -659,9 +545,9 @@ if [ "$MODE" = "esi" ]; then
     "$WORK/viceroy.log" | sort -u | sed 's/^/    /'
   echo
   echo "  What the reader receives (hole filled, no marker):"
-  printf '    %d seam marker(s), %d window.tsjs\n' \
+  printf '    %d seam marker(s), %d legacy window.tsjs assignment(s)\n' \
     "$(grep -cF "$SEAM_MARKER" "$SERVED" || true)" \
-    "$(grep -c 'window\.tsjs' "$SERVED" || true)"
+    "$(grep -c 'window\.tsjs[[:space:]]*=' "$SERVED" || true)"
   cat <<'EOF'
 
   The marker is never visible in page source. It remains inert in the template cache. A cold miss

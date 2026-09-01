@@ -270,6 +270,12 @@ jobs:
           name: integration-test-artifacts
           path: ${{ env.ARTIFACTS_DIR }}
 
+      - name: Generate browser Viceroy configs with APS enabled
+        run: ./scripts/generate-integration-viceroy-configs.sh
+        env:
+          INTEGRATION_ENABLE_AUCTION: "true"
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+
       - name: Load integration test Docker images
         run: docker load --input "$DOCKER_ARTIFACT_PATH"
 

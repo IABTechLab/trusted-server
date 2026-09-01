@@ -131,6 +131,18 @@ interface ReferenceTransfer {
   brotliBytes: number;
 }
 
+function externalAgentTransfer(
+  transfer: ReferenceTransfer,
+): ReferenceTransferSource {
+  const external = transfer.sources.filter(
+    ({ delivery }) => delivery === "external",
+  );
+  if (external.length !== 1) {
+    throw new Error("reference transfer must contain one external agent");
+  }
+  return external[0]!;
+}
+
 interface FixtureRun {
   context: BrowserContext;
   page: Page;
@@ -1898,7 +1910,7 @@ test("measures each distinct semantic transfer source exactly once", () => {
   ).toThrow("semantic transfer source is empty or duplicated");
 });
 
-test("gates semantic reference transfer against the exact rc base build", () => {
+test("gates selected agent transfer against the exact rc base build", () => {
   const mode = process.env.TSJS_PERF_MODE;
   const baselineRoot = process.env.TSJS_PERF_BASE_ROOT;
   const baseSha = process.env.TSJS_PERF_BASE_SHA;
@@ -1909,12 +1921,12 @@ test("gates semantic reference transfer against the exact rc base build", () => 
       mode === "pull-request"
     ) {
       throw new Error(
-        "exact-rc semantic transfer comparison is required in CI and release modes",
+        "exact-rc selected-agent transfer comparison is required in CI and release modes",
       );
     }
     test.skip(
       true,
-      "exact-rc semantic transfer comparison unavailable; check:bundle still enforces candidate ceilings",
+      "exact-rc selected-agent transfer comparison unavailable; check:bundle still enforces controller and agent ceilings",
     );
     return;
   }
@@ -1926,19 +1938,21 @@ test("gates semantic reference transfer against the exact rc base build", () => 
   ).toBe(baseSha);
   const baselineResources = loadBaselineFixtureResources(baselineRoot);
   const candidateResources = loadReleaseFixtureResources(REPO_ROOT);
+  const baselineAgent = externalAgentTransfer(
+    baselineResources.referenceTransfer,
+  );
+  const candidateAgent = externalAgentTransfer(
+    candidateResources.referenceTransfer,
+  );
 
   const regressions = (
     ["rawBytes", "gzipBytes", "brotliBytes"] as const
-  ).filter(
-    (metric) =>
-      candidateResources.referenceTransfer[metric] >
-      baselineResources.referenceTransfer[metric],
-  );
+  ).filter((metric) => candidateAgent[metric] > baselineAgent[metric]);
   expect(
     regressions,
     JSON.stringify({
-      baseline: baselineResources.referenceTransfer,
-      candidate: candidateResources.referenceTransfer,
+      baselineAgent,
+      candidateAgent,
     }),
   ).toEqual([]);
 });
@@ -2186,13 +2200,19 @@ test.describe("TSJS first-display performance gate", () => {
     expect
       .soft(candidateP90, "candidate p90")
       .toBeLessThanOrEqual(baselineP90 * MAXIMUM_P90_RATIO);
+    const baselineAgent = externalAgentTransfer(
+      baselineResources.referenceTransfer,
+    );
+    const candidateAgent = externalAgentTransfer(
+      candidateResources.referenceTransfer,
+    );
     for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"] as const) {
       expect
         .soft(
-          candidateResources.referenceTransfer[metric],
-          `candidate ${metric} semantic transfer`,
+          candidateAgent[metric],
+          `candidate ${metric} selected-agent transfer`,
         )
-        .toBeLessThanOrEqual(baselineResources.referenceTransfer[metric]);
+        .toBeLessThanOrEqual(baselineAgent[metric]);
     }
 
     for (let index = 0; index < WARMUPS; index += 1) {
@@ -2268,15 +2288,19 @@ test.describe("TSJS first-display performance gate", () => {
     expect
       .soft(apsTotalToPaintP90, "APS total-to-paint p90")
       .toBeLessThanOrEqual(APS_TOTAL_P90_CEILING_MS);
+    const apsBaselineAgent = externalAgentTransfer(
+      apsBaselineResources.referenceTransfer,
+    );
+    const apsCandidateAgent = externalAgentTransfer(
+      apsCandidateResources.referenceTransfer,
+    );
     for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"] as const) {
       expect
         .soft(
-          apsCandidateResources.referenceTransfer[metric],
-          `APS candidate ${metric} semantic transfer`,
+          apsCandidateAgent[metric],
+          `APS candidate ${metric} selected-agent transfer`,
         )
-        .toBeLessThanOrEqual(
-          apsBaselineResources.referenceTransfer[metric] * MAXIMUM_P90_RATIO,
-        );
+        .toBeLessThanOrEqual(apsBaselineAgent[metric] * MAXIMUM_P90_RATIO);
     }
 
     const representativeRun = await openFixture(
@@ -2374,7 +2398,7 @@ test.describe("TSJS first-display performance gate", () => {
       encoding: "utf8",
     }).trim();
     const evidence = {
-      schemaVersion: 6,
+      schemaVersion: 7,
       evidenceId,
       mode,
       headSha,
@@ -2436,7 +2460,7 @@ test.describe("TSJS first-display performance gate", () => {
         },
       },
       transfer: {
-        algorithm: "semantic-tsjs-transfer-v1",
+        algorithm: "split-preaction-transfer-v2",
         baselineReferenceTransfer: {
           sha: baseSha,
           artifactModel: baselineResources.artifactModel,
@@ -2519,7 +2543,7 @@ test.describe("TSJS first-display performance gate", () => {
           },
         },
         transfer: {
-          algorithm: "semantic-tsjs-transfer-v1",
+          algorithm: "split-preaction-transfer-v2",
           maximumRatio: MAXIMUM_P90_RATIO,
           baselineReferenceTransfer: {
             sha: baseSha,

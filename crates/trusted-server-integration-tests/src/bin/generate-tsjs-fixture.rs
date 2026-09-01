@@ -170,21 +170,23 @@ mod tests {
 
         assert!(html.contains(r#"id="perf-slot""#));
         assert!(html.contains(
-            r#""creative":{"version":1,"enabled":true,"clickGuard":true,"renderGuard":false}"#
+            r#"\"creative\":{\"version\":1,\"enabled\":true,\"clickGuard\":true,\"renderGuard\":false}"#
         ));
-        assert!(html.contains(r#""renderTraceOverlay":true"#));
+        assert!(html.contains(r#"\"renderTraceOverlay\":true"#));
         assert!(html.contains(
-            r#"{"id":"gpt","config":{"gamAttributionEnabled":false,"pageBidsEnabled":true}}"#
+            r#"{\"id\":\"gpt\",\"config\":{\"gamAttributionEnabled\":false,\"pageBidsEnabled\":true}}"#
         ));
-        assert!(html.contains(r#""id":"diagnostics_presentation","phase":"deferred""#));
-        assert!(html.contains(r#""id":"gpt_later","phase":"deferred""#));
+        assert!(html.contains(r#"\"id\":\"diagnostics_presentation\",\"phase\":\"deferred\""#));
+        assert!(html.contains(r#"\"id\":\"gpt_later\",\"phase\":\"deferred\""#));
         assert!(html.contains(
-            r#""firstDisplay":{"src":"/static/tsjs=tsjs-first-display.min.js?m=0045\u0026v="#
+            r#"\"firstDisplay\":{\"src\":\"/static/tsjs=tsjs-first-display.min.js?m=008b\u0026v="#
         ));
-        assert!(html.contains(r#""slices":["first_display","creative_initial","gpt_initial"]"#));
-        assert!(html.contains(r#""runtimeSrc":"/static/tsjs=tsjs-unified.min.js?v="#));
+        assert!(html.contains(
+            r#"\"slices\":[\"first_display\",\"render_owner_initial\",\"creative_initial\",\"gpt_initial\"]"#
+        ));
+        assert!(html.contains(r#"\"runtimeSrc\":\"/static/tsjs=tsjs-unified.min.js?v="#));
         assert_eq!(html.matches("<script").count(), 2);
-        assert!(html.contains(r#"<script src="/static/tsjs=tsjs-first-display.min.js?m=0045&v="#));
+        assert!(html.contains(r#"<script src="/static/tsjs=tsjs-first-display.min.js?m=008b&v="#));
         assert!(!html.contains(r#"<script src="/static/tsjs=tsjs-unified.min.js"#));
         assert!(!html.contains(r#"<script src="/static/tsjs=tsjs-gpt_later"#));
     }
