@@ -953,6 +953,24 @@ fn resolve_device_provider(
         Some(module_id) => Some(module_device_provider(module_id, inner)?),
     };
 
+    // A module-supplied device provider may declare the permissions its data
+    // use requires, but nothing enforces that declaration yet. Device
+    // classification runs before the permission set for the request is
+    // assembled, so there is no per-request gate to check it against. Selecting
+    // a provider is an operator decision and not a per-request permission
+    // decision, so honoring the declaration by silently ignoring it would let a
+    // vendor state a requirement that never binds. Refuse the selection instead,
+    // loudly and at startup, until a real per-request device gate exists.
+    if let Some(provider) = resolved.as_ref()
+        && provider.required_permissions() != crate::permissions::PermissionSet::none()
+    {
+        let message = format!(
+            "integration module `{}` declares a device provider with required permissions, and              Trusted Server has no per-request gate that can enforce them yet, so the selection              is refused rather than silently ignored",
+            selector.unwrap_or_default(),
+        );
+        return Err(Report::new(TrustedServerError::Configuration { message }));
+    }
+
     for (id, _) in &inner.device_providers {
         if selector != Some(*id) {
             log::warn!(
@@ -3685,6 +3703,77 @@ mod tests {
                 .with_geo_provider(Arc::new(FixedCountryGeo))
                 .build(),
         ))
+    }
+
+    /// A device provider that declares it needs a permission, which nothing can
+    /// enforce per request yet.
+    #[derive(Debug)]
+    struct PermissionDemandingDevice;
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::ec::device::DeviceProvider for PermissionDemandingDevice {
+        fn id(&self) -> &'static str {
+            "device-probe"
+        }
+
+        async fn detect(
+            &self,
+            _request_info: &dyn crate::evidence::RequestInfo,
+            _services: &crate::platform::RuntimeServices,
+        ) -> crate::ec::device::DeviceSignals {
+            crate::ec::device::DeviceSignals {
+                is_mobile: 2,
+                ja4_class: None,
+                platform_class: None,
+                h2_fp_hash: None,
+                known_browser: None,
+                looks_like_browser: false,
+            }
+        }
+
+        fn required_permissions(&self) -> crate::permissions::PermissionSet {
+            crate::permissions::PermissionSet::none()
+                .with(crate::permissions::Permission::StoreOnDevice)
+        }
+    }
+
+    fn device_probe_registration(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder("device-probe")
+                .with_device_provider(Arc::new(PermissionDemandingDevice))
+                .build(),
+        ))
+    }
+
+    fn device_probe_builders() -> [crate::integrations::IntegrationBuilder; 1] {
+        [crate::integrations::IntegrationBuilder::new(
+            "device-probe",
+            "seam-probe",
+            device_probe_registration,
+            validate_nothing,
+        )]
+    }
+
+    #[test]
+    fn a_module_device_provider_declaring_permissions_is_refused_at_startup() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.device.provider = Some("device-probe".to_owned());
+
+        let error = IntegrationRegistry::with_registrations(&settings, &device_probe_builders())
+            .err()
+            .expect("should refuse a device provider whose permissions nothing can enforce");
+
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("device-probe"),
+            "the failure should name the module, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("required permissions"),
+            "the failure should say why it was refused, got: {rendered}"
+        );
     }
 
     fn geo_probe_builders() -> [crate::integrations::IntegrationBuilder; 1] {
