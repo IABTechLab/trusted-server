@@ -103,14 +103,16 @@ static GTM_TAG_ID_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 /// The path list mirrors the one in
 /// [`GoogleTagManagerIntegration::is_rewritable_url`].
 ///
-/// A second group requires a delimiter or end of input immediately after the
-/// path, so a longer path that merely starts with a routed one (`/collectXYZ`)
-/// is left alone rather than rewritten to a first-party URL with no route.
+/// A second group requires that whatever follows the path is not itself a path
+/// character, so a longer path that merely starts with a routed one
+/// (`/collectXYZ`) is left alone rather than rewritten to a first-party URL with
+/// no route. Naming the terminators instead would miss the ones nobody thought
+/// of, such as a template literal's backtick or interpolation.
 ///
 /// The replacement target is `/integrations/google_tag_manager` + both captures.
 static GTM_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?:https?:)?//(?:www\.(?:googletagmanager|google-analytics)\.com|analytics\.google\.com)(/gtm\.js|/gtag/js|/gtag\.js|/g/collect|/collect|")((?:[?"'\s;,)\]&#]|$))"#,
+        r#"(?:https?:)?//(?:www\.(?:googletagmanager|google-analytics)\.com|analytics\.google\.com)(/gtm\.js|/gtag/js|/gtag\.js|/g/collect|/collect|")((?:[^A-Za-z0-9._~/-]|$))"#,
     )
     .expect("GTM URL regex should compile")
 });
@@ -186,10 +188,18 @@ fn validate_https_upstream(value: &str) -> Result<(), ValidationError> {
     // means "any subdomain". A wildcard would widen the allowlist rather than
     // pin it, and a URL with no host would leave the upstream unpinned, so
     // both are refused here instead of at request time.
-    match url::Url::parse(value)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
+    let parsed = url::Url::parse(value).ok();
+    // The upstream is handed to the browser in the redirect for an unconfigured
+    // tag, so credentials embedded in it would be disclosed to the client.
+    if parsed
+        .as_ref()
+        .is_some_and(|url| !url.username().is_empty() || url.password().is_some())
     {
+        let mut err = ValidationError::new("upstream_with_credentials");
+        err.message = Some("upstream_url must not embed a username or password".into());
+        return Err(err);
+    }
+    match parsed.and_then(|url| url.host_str().map(str::to_owned)) {
         Some(host) if !host.contains('*') => Ok(()),
         Some(host) => {
             let mut err = ValidationError::new("wildcard_upstream_host");
@@ -1898,6 +1908,43 @@ mod tests {
             r#"var beacon = "/integrations/google_tag_manager/g/collect";"#,
             "should route the beacon back through this origin"
         );
+    }
+
+    #[test]
+    fn config_rejects_an_upstream_url_carrying_credentials() {
+        // The upstream is echoed to the browser in the redirect for an
+        // unconfigured tag, so anything embedded in it becomes visible.
+        for upstream in [
+            "https://user:password@tags.example.com",
+            "https://user@tags.example.com",
+        ] {
+            let config = GoogleTagManagerConfig {
+                upstream_url: upstream.to_string(),
+                ..tag_config("GTM-CONFIGURED", &[])
+            };
+
+            assert!(
+                config.validate().is_err(),
+                "should reject an upstream carrying credentials: {upstream}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewriter_rewrites_a_routed_path_inside_a_template_literal() {
+        // A backtick and an interpolation both terminate the URL just as a
+        // quote does; the previous host-only pattern rewrote these.
+        for source in [
+            "const url = `https://www.google-analytics.com/collect`;",
+            "const url = `https://www.google-analytics.com/collect${query}`;",
+        ] {
+            let result = GoogleTagManagerIntegration::rewrite_gtm_urls(source);
+
+            assert!(
+                result.contains("/integrations/google_tag_manager/collect"),
+                "should rewrite a routed path in a template literal: {result}"
+            );
+        }
     }
 
     #[test]
