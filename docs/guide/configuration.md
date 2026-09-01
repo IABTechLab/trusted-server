@@ -623,11 +623,10 @@ Selects how a client IP is resolved into geolocation (country, region, coordinat
 
 ### `[geo]`
 
-| Field                        | Type           | Required        | Description                                                                                                                                                                                                                                                                                                                    |
-| ---------------------------- | -------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `provider`                   | String or null | No              | Key of the geo provider. Omit, or set `none`, to resolve no location and make no host geo call. Set `platform` to use the host's own geo lookup.                                                                                                                                                                               |
-| `default_country`            | String         | Yes             | Country (`US`) or country/region (`US/CA`) whose `permissions.yaml` rule applies when geo returns no country, or a country/region with no rule. Required, so there is always a default permission set and startup fails when unset. Validated at startup.                                                                      |
-| `assume_single_jurisdiction` | Boolean        | See description | With no geo provider, every request is treated as `default_country`. A deployment that runs an Edge Cookie provider without a geo provider must set this to `true`, acknowledging single-jurisdiction operation; startup fails otherwise. Not needed when a geo provider is selected or no Edge Cookie provider is configured. |
+| Field                        | Type           | Required        | Description                                                                                                                                                                                                      |
+| ---------------------------- | -------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `provider`                   | String or null | No              | Key of the geo provider. Omit, or set `none`, to resolve no location and make no host geo call. Set `platform` to use the host's own geo lookup.                                                                 |
+| `assume_single_jurisdiction` | Boolean        | See description | With no geo provider, every request resolves at the top of the `permissions.yaml` rules tree. A deployment that runs an Edge Cookie provider without a geo provider acknowledges that by setting this to `true`. |
 
 No provider is the default, so a default deployment is not tied to any host geo service. Selecting an unknown provider key fails at startup. A failed geo lookup at request time does not fall back to `default_country`; it resolves every permission to the requires-signal floor and is logged at error level, so an outage is handled protectively.
 
@@ -636,7 +635,6 @@ No provider is the default, so a default deployment is not tied to any host geo 
 ```toml
 [geo]
 provider = "platform"
-default_country = "US"
 ```
 
 **Environment Override**:
