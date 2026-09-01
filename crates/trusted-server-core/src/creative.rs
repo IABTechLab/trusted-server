@@ -80,12 +80,37 @@ pub(super) fn to_abs(settings: &Settings, u: &str) -> Option<String> {
 /// as a bad-string, so neither can close it. Returning `None` leaves the caller on its
 /// plain scan for the next `)`, which keeps a malformed value unrewritten rather than
 /// guessing at its extent.
+/// Whether a `url()` value can be mapped to the URL the browser will request.
+///
+/// CSS escapes are not resolved here, so a value carrying a backslash cannot be
+/// resolved to the resource the page actually asks for, and proxying the raw
+/// bytes would point somewhere else. A raw newline — which preprocessing also
+/// produces from a carriage return or a form feed — makes the value a bad
+/// string the browser discards, so rewriting it would proxy a URL that is never
+/// requested. Both are left untouched.
+fn css_value_is_resolvable(value: &str) -> bool {
+    !value
+        .bytes()
+        .any(|byte| matches!(byte, b'\\' | b'\n' | b'\r' | b'\x0c'))
+}
+
 fn css_string_end(bytes: &[u8], from: usize, quote: u8) -> Option<usize> {
     let mut i = from;
     while i < bytes.len() {
         match bytes[i] {
-            b'\\' => i += 2,
-            b'\n' | b'\r' => return None,
+            b'\\' => {
+                // A backslash escapes what follows. CSS preprocessing folds a
+                // CRLF pair into one newline, so an escaped CRLF is a single
+                // escaped newline and both bytes belong to the escape.
+                if bytes.get(i + 1) == Some(&b'\r') && bytes.get(i + 2) == Some(&b'\n') {
+                    i += 3;
+                } else {
+                    i += 2;
+                }
+            }
+            // Preprocessing turns a carriage return and a form feed into a
+            // newline, and a raw newline ends a string as a bad string.
+            b'\n' | b'\r' | b'\x0c' => return None,
             byte if byte == quote => return Some(i),
             _ => i += 1,
         }
@@ -153,7 +178,9 @@ pub(super) fn rewrite_style_urls(settings: &Settings, style: &str, base_origin: 
             (s, e)
         };
         let url_val = &style[qs..qe];
-        let new_val = if let Some(abs) = to_abs(settings, url_val) {
+        let new_val = if !css_value_is_resolvable(url_val) {
+            url_val.to_owned()
+        } else if let Some(abs) = to_abs(settings, url_val) {
             build_proxy_url(settings, &abs, base_origin)
         } else {
             url_val.to_owned()
@@ -1403,9 +1430,9 @@ mod tests {
             !out.contains(&truncated),
             "an escaped quote should not end the string early: {out}"
         );
-        assert!(
-            out.contains("/first-party/proxy?tsurl="),
-            "the value should still be proxied: {out}"
+        assert_eq!(
+            out, css,
+            "an escape cannot be resolved here, so the value is left alone"
         );
     }
 
@@ -1432,6 +1459,48 @@ mod tests {
         assert_eq!(
             out, css,
             "a string a newline has already ended should be left alone"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_leaves_a_value_carrying_an_escape_unrewritten() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // The rewriter does not resolve CSS escapes, so it cannot know which URL
+        // the browser will actually request. Emitting a proxy token for the raw
+        // bytes would point at a different resource than the page asked for.
+        for css in [
+            "background:url(\"https://cdn.example/a\\2e png\")",
+            "background:url(\"https://cdn.example/a\\\r\nb.png\")",
+            "background:url(\"https://cdn.example/a\\\r\nb)c.png\")",
+        ] {
+            let out = rewrite_style_urls(&settings, css, "");
+            assert_eq!(out, css, "should leave an escaped value alone: {css}");
+        }
+    }
+
+    #[test]
+    fn rewrite_style_urls_treats_a_form_feed_as_ending_the_string() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // CSS preprocessing turns a form feed into a newline, which makes this a
+        // bad string the browser discards. Proxying it would rewrite a URL that
+        // is never requested.
+        let css = "background:url(\"https://cdn.example/a\u{c}b.png\")";
+
+        let out = rewrite_style_urls(&settings, css, "");
+
+        assert_eq!(out, css, "should not proxy a value the browser discards");
+    }
+
+    #[test]
+    fn rewrite_style_urls_still_proxies_a_plain_quoted_value() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let css = "background:url(\"https://cdn.example/plain.png\")";
+
+        let out = rewrite_style_urls(&settings, css, "");
+
+        assert!(
+            out.contains("/first-party/proxy?tsurl="),
+            "an ordinary value must still be proxied: {out}"
         );
     }
 
