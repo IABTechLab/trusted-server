@@ -517,6 +517,17 @@ pub struct Ec {
     /// one block may be present, and it must be the one the selector names, so
     /// [`validate_provider_selection`](Self::validate_provider_selection)
     /// rejects an unselected block.
+    /// Extra exact origins allowed to POST the client resolve endpoint.
+    ///
+    /// The endpoint always accepts `https://{publisher.domain}` and nothing
+    /// else by default. A publisher whose pages are served from another origin,
+    /// `www` being the common case, lists those origins here. Each entry is
+    /// compared as a whole serialized origin, so the scheme, the host and any
+    /// non-default port all have to match. A suffix or subdomain match is never
+    /// performed, because control of a DNS namespace does not make every host
+    /// under it a trusted identity-setting origin.
+    #[serde(default)]
+    pub resolve_allowed_origins: Vec<String>,
     #[serde(default)]
     #[validate(nested)]
     pub providers: EcProviders,

@@ -12,7 +12,7 @@ use crate::constants::EC_RESPONSE_HEADERS;
 use crate::settings::Settings;
 
 use super::EcContext;
-use super::cookies::{expire_ec_cookie, set_ec_cookie};
+use super::cookies::{expire_ec_cookie, expire_ec_resolved_marker, set_ec_cookie};
 use super::kv::KvIdentityGraph;
 use super::log_id;
 use super::prebid_eids::ingest_eid_cookies;
@@ -91,6 +91,19 @@ pub fn ec_finalize_response(
         }
 
         return;
+    }
+
+    // The request carried a `ts-ec` the selected provider does not own, which
+    // is what a switch between client-cycle providers looks like on the first
+    // request after the switch. The resolved marker is not namespaced by the
+    // provider code, so it would otherwise survive and tell the new provider's
+    // page script that a resolve had already happened, leaving the visitor with
+    // no identity instead of a restarted one. Expire the marker so the cycle
+    // starts again. The cookie itself is left alone, because the value is
+    // already ignored for read-back and a returning visitor may still be
+    // carrying an identifier another selected provider would own.
+    if ec_context.cookie_was_present() && !ec_context.ec_was_present() {
+        expire_ec_resolved_marker(settings, response);
     }
 
     // Returning user: EC is permitted and came from the request.
@@ -1173,6 +1186,78 @@ mod tests {
                 .iter()
                 .any(|cookie| cookie.starts_with("ts-ec=") && cookie.contains("Max-Age=0")),
             "withdrawal should still expire the browser cookie after a switch, got {cookies:?}"
+        );
+    }
+    #[test]
+    fn marker_is_expired_when_the_selected_provider_does_not_own_the_cookie() {
+        // A switch between client-cycle providers looks like this on the first
+        // request after the switch. The raw cookie is still presented, but the
+        // selected provider does not recognize it, so no EC is in play.
+        let settings = create_test_settings();
+        let ec_context = make_context(
+            None,
+            Some("other~an-ec"),
+            false,
+            false,
+            Jurisdiction::Unknown,
+            true,
+        );
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            None,
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let expired = response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| v.starts_with("ts-ecr=") && v.contains("Max-Age=0"));
+        assert!(
+            expired,
+            "the resolved marker should be expired so the new provider's page script resolves again"
+        );
+    }
+
+    #[test]
+    fn marker_is_left_alone_when_the_provider_owns_the_cookie() {
+        let settings = create_test_settings();
+        let ec_context = make_context(
+            Some("an-ec"),
+            Some("an-ec"),
+            true,
+            false,
+            Jurisdiction::Unknown,
+            true,
+        );
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            None,
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let expired = response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| v.starts_with("ts-ecr=") && v.contains("Max-Age=0"));
+        assert!(
+            !expired,
+            "a recognized identifier should leave the resolved marker in place"
         );
     }
 }

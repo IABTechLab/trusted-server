@@ -240,8 +240,19 @@ pub fn handle_ec_resolve(
     Ok(response)
 }
 
-/// Whether the request's `Origin` names the publisher's domain (exactly, or a
-/// subdomain of it).
+/// Whether the request's `Origin` is one this deployment authorizes to set
+/// identity.
+///
+/// The comparison is on the whole serialized origin, being the scheme, the
+/// lowercased host and the effective port. `https://{publisher.domain}` is
+/// always accepted and `[ec] resolve_allowed_origins` adds further exact
+/// origins. A subdomain of the publisher is not accepted unless it is listed,
+/// because the Edge Cookie is scoped to the parent domain, so a delegated or
+/// compromised sibling host would otherwise be able to fix an identity that
+/// lands on the apex and every sibling with it.
+///
+/// This is defense in depth rather than the primary control. The primary
+/// control is the provider's own verification of the value it is handed.
 fn origin_is_publisher(req: &Request<EdgeBody>, settings: &Settings) -> bool {
     let Some(origin) = req
         .headers()
@@ -250,18 +261,37 @@ fn origin_is_publisher(req: &Request<EdgeBody>, settings: &Settings) -> bool {
     else {
         return false;
     };
-    let Some(host) = origin
-        .strip_prefix("https://")
-        .or_else(|| origin.strip_prefix("http://"))
-    else {
-        return false;
+    let origin = origin.trim();
+
+    let default_origin = format!("https://{}", settings.publisher.domain);
+    if origins_match(origin, &default_origin) {
+        return true;
+    }
+    settings
+        .ec
+        .resolve_allowed_origins
+        .iter()
+        .any(|allowed| origins_match(origin, allowed))
+}
+
+/// Whether two serialized origins are the same origin.
+///
+/// The scheme and host are compared case-insensitively because both are
+/// case-insensitive in a URL, and everything else has to match byte for byte.
+/// A port is part of the origin, so `https://example.com:8443` and
+/// `https://example.com` are different origins and neither is normalized away.
+fn origins_match(candidate: &str, allowed: &str) -> bool {
+    let split = |origin: &str| -> Option<(String, String)> {
+        let (scheme, rest) = origin.split_once("://")?;
+        if rest.is_empty() || rest.contains('/') {
+            return None;
+        }
+        Some((scheme.to_ascii_lowercase(), rest.to_ascii_lowercase()))
     };
-    let host = host.split(':').next().unwrap_or(host);
-    let publisher = settings.publisher.domain.as_str();
-    host.eq_ignore_ascii_case(publisher)
-        || host
-            .to_ascii_lowercase()
-            .ends_with(&format!(".{}", publisher.to_ascii_lowercase()))
+    match (split(candidate), split(allowed)) {
+        (Some(candidate), Some(allowed)) => candidate == allowed,
+        _ => false,
+    }
 }
 
 /// Whether the request's `Content-Type` is one a resolve payload may use.
@@ -798,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_accepts_a_publisher_subdomain_origin() {
+    fn resolve_rejects_a_publisher_subdomain_origin() {
         let settings = settings_with_client_fixed();
         let graph = in_memory_graph();
         let request = post_with(
@@ -810,8 +840,66 @@ mod tests {
             .expect("should handle resolve");
         assert_eq!(
             response.status(),
+            StatusCode::FORBIDDEN,
+            "a sibling subdomain should not be able to set identity that lands on the apex"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_a_plain_http_origin() {
+        let settings = settings_with_client_fixed();
+        let graph = in_memory_graph();
+        let request = post_with(
+            Some("http://test-publisher.com"),
+            Some("text/plain"),
+            FIXED_WORD,
+        );
+        let response = handle_ec_resolve(&settings, request, &gated(true), Some(&graph))
+            .expect("should handle resolve");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "the scheme is part of the origin, so http should not match the https default"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_a_non_default_port_origin() {
+        let settings = settings_with_client_fixed();
+        let graph = in_memory_graph();
+        let request = post_with(
+            Some("https://test-publisher.com:8443"),
+            Some("text/plain"),
+            FIXED_WORD,
+        );
+        let response = handle_ec_resolve(&settings, request, &gated(true), Some(&graph))
+            .expect("should handle resolve");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a port is part of the origin, so it should not be discarded before comparing"
+        );
+    }
+
+    #[test]
+    fn resolve_accepts_a_configured_extra_origin() {
+        let mut settings = settings_with_client_fixed();
+        settings
+            .ec
+            .resolve_allowed_origins
+            .push("https://www.test-publisher.com".to_owned());
+        let graph = in_memory_graph();
+        let request = post_with(
+            Some("https://www.test-publisher.com"),
+            Some("text/plain"),
+            FIXED_WORD,
+        );
+        let response = handle_ec_resolve(&settings, request, &gated(true), Some(&graph))
+            .expect("should handle resolve");
+        assert_eq!(
+            response.status(),
             StatusCode::OK,
-            "a subdomain of the publisher should be accepted"
+            "an operator should be able to authorize the origin their pages are served from"
         );
     }
 

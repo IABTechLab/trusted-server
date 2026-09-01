@@ -90,6 +90,13 @@ proxy_secret = "change-me-proxy-secret"
 # bound per adapter (e.g. `ec_identity_store` in fastly.toml); edgezero.toml's
 # logical KV id is `trusted_server_kv`.
 ec_store = "ec_identity_store"
+# Extra origins allowed to POST the client resolve endpoint. The endpoint
+# always accepts https://<publisher.domain> and nothing else by default. List
+# further origins here if the pages that resolve identity are served from
+# another origin, www being the common case. Each entry is compared as a whole
+# serialized origin, so the scheme, host and any non-default port all have to
+# match, and a subdomain is never accepted just for being a subdomain.
+# resolve_allowed_origins = ["https://www.example.com"]
 # Max concurrent partner pull-sync requests.
 pull_sync_concurrency = 3
 # Optional cluster-heuristic tuning (defaults shown):
