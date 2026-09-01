@@ -241,9 +241,10 @@ Format rules, as implemented:
   `jurisdiction:`, and `jurisdiction` appears only there. It names the consent
   handling applied when no country can be resolved, and its accepted values are
   the states of the `Jurisdiction` type in
-  `crates/trusted-server-core/src/consent/jurisdiction.rs`, being `gdpr`,
-  `us-<state>` (a US state with a comprehensive privacy law, for example
-  `us-ca`), `non-regulated`, and `unknown`.
+  `crates/trusted-server-core/src/consent/jurisdiction.rs`, read by
+  `Jurisdiction::from_policy_name`, being `gdpr`, `us-state/<CODE>` (a US state
+  with a comprehensive privacy law, for example `us-state/CA`),
+  `non-regulated`, and `unknown`. Any other value is a configuration error.
 - Matching is most specific wins with fallback to the parent's `group`, being
   region, then country, then the top node.
 - A mapping node may carry `permissions`, a map from a Data Use to an explicit
