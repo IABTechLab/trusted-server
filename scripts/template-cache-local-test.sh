@@ -192,11 +192,13 @@ s = s.replace('proxy_secret = "change-me-proxy-secret"',
 s = re.sub(r'passphrase = "[^"]*"',
            'passphrase = "local-harness-ec-passphrase-not-a-real-one"', s, count=1)
 
-# The default jurisdiction is no longer a config value: it is the top of the
-# rules tree in permissions.yaml, which is compiled into the binary. That top
-# node is gdpr-eu, where the server-side auction needs TCF consent, so a
-# harness run that wants the auction to proceed with no consent signals must
-# edit permissions.yaml before building.
+# The permission baseline and consent handling come from the permissions.yaml
+# rules tree compiled into the binary. The Viceroy geolocation block appended
+# to the harness fastly.toml below maps the loopback client to US/CA, and the
+# platform geo provider is selected here, so the auction runs under the US
+# state opt-out rules with no consent signal, which is what the retired
+# default_country lever used to arrange.
+s = s.replace('# provider = "platform"', 'provider = "platform"', 1)
 
 # A real auction, pointed at the stub's slow endpoint, so the timings mean something.
 s = s.replace('[integrations.prebid]\nenabled = false\nserver_url = "https://prebid.example.com/openrtb2/auction"',
@@ -239,6 +241,33 @@ info "Seeding an isolated config store (tracked fastly.toml remains untouched)"
 # pointed at this checkout without copying the workspace.
 cp "$REPO_ROOT/edgezero.toml" "$WORK/edgezero.toml"
 cp "$REPO_ROOT/fastly.toml" "$WORK/fastly.toml"
+# Give Viceroy a geolocation answer for the loopback client, so the platform
+# geo provider selected in the app config resolves US/CA.
+cat >> "$WORK/fastly.toml" <<'GEOEOF'
+
+[local_server.geolocation]
+format = "inline-toml"
+
+[local_server.geolocation.addresses."127.0.0.1"]
+as_name = "Local Harness"
+as_number = 64496
+area_code = 0
+city = "Test City"
+conn_speed = "broadband"
+conn_type = "wired"
+continent = "NA"
+country_code = "US"
+country_code3 = "USA"
+country_name = "United States"
+latitude = 0.0
+longitude = 0.0
+metro_code = 0
+postal_code = "00000"
+proxy_description = "?"
+proxy_type = "?"
+region = "CA"
+utc_offset = -800
+GEOEOF
 ln -s "$REPO_ROOT/crates" "$WORK/crates"
 (cd "$WORK" && "$TS" config push --adapter fastly --local \
   --manifest "$WORK/edgezero.toml" --app-config "$WORK/app.toml" \
