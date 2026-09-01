@@ -68,9 +68,10 @@ sites it stops the tag loading altogether:
   exists to provide.
 - A `<link rel="preload">` for it pays an extra round trip.
 - **A strict `script-src` blocks it.** A redirect does not make the upstream
-  origin satisfy `'self'`, so unless your policy lists
-  `https://www.googletagmanager.com` explicitly, the redirected script is
-  refused and the tag does not run at all.
+  origin satisfy `'self'`, so unless your policy lists that origin explicitly,
+  the redirected script is refused and the tag does not run at all. The origin
+  to allow is whatever `upstream_url` points at — `https://www.googletagmanager.com`
+  by default, or your own tagging domain if you have overridden it.
 
 Standard `gtag.js` installations use a product tag ID that is usually not the
 `GTM-` container ID, so most deployments that load `gtag/js` will have at least
@@ -174,8 +175,9 @@ Only `container_id` and any `allowed_tag_ids` are served from your origin, and
 they are matched exactly — a tag id spelled with different capitalization is
 treated as unconfigured. A
 request naming a different tag id is answered with a redirect to the upstream,
-so the tag still loads for the visitor while your origin serves only containers
-you configured. Upstream answers `200` for tag ids that do not exist, so it
+so your origin serves only containers you configured. The visitor then loads
+that tag from the upstream directly, which a `script-src` that does not list
+the upstream origin will block. Upstream answers `200` for tag ids that do not exist, so it
 cannot be relied on to reject an unknown tag.
 
 ### `GET/POST .../collect` - Analytics Beacon

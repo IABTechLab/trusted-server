@@ -557,8 +557,9 @@ container_id = "GTM-REPLACE-ME"
 # upstream_url = "https://tags.example.com"
 # Tag ids the `gtag/js` path may serve from your own origin, in addition to
 # `container_id`. A request naming any other tag id is redirected to the
-# upstream instead, so the tag still loads but this origin never serves a
-# container you did not choose.
+# upstream instead, so this origin never serves a container you did not
+# choose. The visitor loads that tag from the upstream directly, which a
+# `script-src` that does not list the upstream origin will block.
 #
 # Set this if your pages load gtag with a measurement id separate from the
 # container above (a GA4 `G-` or Ads `AW-` id). A tag that is missing here is

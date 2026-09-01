@@ -85,7 +85,7 @@ const GTM_URL_PATHS: &str = r"(?P<path>/gtm\.js|/gtag/js|/gtag\.js|/g/collect|/c
 /// must be the URL.
 static GTM_WHOLE_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"^{GTM_URL_HOSTS}{GTM_URL_PATHS}(?P<query>\?.*)?$"
+        r"^{GTM_URL_HOSTS}{GTM_URL_PATHS}(?P<suffix>[?#].*)?$"
     ))
     .expect("GTM whole-URL regex should compile")
 });
@@ -106,20 +106,20 @@ static GTM_QUOTED_URL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     [
         (
             r#"(?P<open>")"#,
-            r#"(?P<query>\?[^"]*)?"#,
+            r#"(?P<suffix>[?#][^"]*)?"#,
             r#"(?P<close>")"#,
         ),
-        (r"(?P<open>')", r"(?P<query>\?[^']*)?", r"(?P<close>')"),
+        (r"(?P<open>')", r"(?P<suffix>[?#][^']*)?", r"(?P<close>')"),
         (
             r"(?P<open>`)",
-            r"(?P<query>\?[^`$]*)?",
+            r"(?P<suffix>[?#][^`$]*)?",
             r"(?P<close>`|\$\{)",
         ),
     ]
     .iter()
-    .map(|(open, query, close)| {
+    .map(|(open, suffix, close)| {
         Regex::new(&format!(
-            "{open}{GTM_URL_HOSTS}{GTM_URL_PATHS}{query}{close}"
+            "{open}{GTM_URL_HOSTS}{GTM_URL_PATHS}{suffix}{close}"
         ))
         .expect("GTM quoted-URL regex should compile")
     })
@@ -151,10 +151,11 @@ pub struct GoogleTagManagerConfig {
     /// `gtag/js` path, in addition to [`Self::container_id`].
     ///
     /// A request naming any other tag ID is redirected to the upstream rather
-    /// than proxied, so the tag still loads for the visitor but this origin
-    /// never serves a container the publisher did not choose. Leaving this
-    /// empty is the safe default: only the configured container is served
-    /// first-party.
+    /// than proxied, so this origin never serves a container the publisher did
+    /// not choose. The visitor then loads that tag from the upstream directly,
+    /// which a `script-src` that does not list the upstream origin will block.
+    /// Leaving this empty is the safe default: only the configured container is
+    /// served first-party.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[validate(custom(function = validate_allowed_tag_ids))]
     pub allowed_tag_ids: Vec<String>,
@@ -308,8 +309,9 @@ enum GtmTarget {
     Proxy(String),
     /// Point the browser at the upstream instead of serving it first-party.
     ///
-    /// Used when a request names a tag the publisher has not configured: the
-    /// tag still loads, but this origin never re-serves it.
+    /// Used when a request names a tag the publisher has not configured, so
+    /// this origin never re-serves it. Whether the visitor still gets the tag
+    /// is then up to the page's own `script-src`.
     Redirect(String),
 }
 
@@ -374,16 +376,18 @@ impl GoogleTagManagerIntegration {
 
     /// Rewrite GTM and Google Analytics URLs to first-party proxy paths.
     ///
-    /// Uses [`GTM_URL_PATTERN`] to handle all URL variants (https, protocol-relative)
-    /// for `googletagmanager.com` and `google-analytics.com`.
+    /// Uses [`GTM_WHOLE_URL_PATTERN`] for a value that is the whole URL, such as an
+    /// attribute, and [`GTM_QUOTED_URL_PATTERNS`] for URLs embedded in source, across
+    /// all variants (https, protocol-relative) of `googletagmanager.com`,
+    /// `google-analytics.com` and `analytics.google.com`.
     fn rewrite_gtm_urls(content: &str) -> String {
         let first_party = format!("/integrations/{GTM_INTEGRATION_ID}");
 
         // An attribute value is the whole URL on its own.
         if let Some(captures) = GTM_WHOLE_URL_PATTERN.captures(content) {
             let path = &captures["path"];
-            let query = captures.name("query").map_or("", |m| m.as_str());
-            return format!("{first_party}{path}{query}");
+            let suffix = captures.name("suffix").map_or("", |m| m.as_str());
+            return format!("{first_party}{path}{suffix}");
         }
 
         let mut rewritten = content.to_owned();
@@ -392,9 +396,9 @@ impl GoogleTagManagerIntegration {
                 .replace_all(&rewritten, |captures: &regex::Captures<'_>| {
                     let open = &captures["open"];
                     let path = &captures["path"];
-                    let query = captures.name("query").map_or("", |m| m.as_str());
+                    let suffix = captures.name("suffix").map_or("", |m| m.as_str());
                     let close = &captures["close"];
-                    format!("{open}{first_party}{path}{query}{close}")
+                    format!("{open}{first_party}{path}{suffix}{close}")
                 })
                 .into_owned();
         }
@@ -2026,6 +2030,39 @@ mod tests {
 
             assert_eq!(source, result, "should not rewrite `/collect{tail}`");
         }
+    }
+
+    #[test]
+    fn rewriter_preserves_a_fragment_suffix() {
+        // `is_rewritable_url` accepts a fragment, so the script-body patterns
+        // must too, and it has to survive verbatim.
+        for (source, expected) in [
+            (
+                "var a = \"https://www.google-analytics.com/collect#transport\";",
+                "var a = \"/integrations/google_tag_manager/collect#transport\";",
+            ),
+            (
+                "var a = 'https://www.googletagmanager.com/gtm.js#bootstrap';",
+                "var a = '/integrations/google_tag_manager/gtm.js#bootstrap';",
+            ),
+            (
+                "var a = \"https://www.googletagmanager.com/gtm.js?id=X#frag\";",
+                "var a = \"/integrations/google_tag_manager/gtm.js?id=X#frag\";",
+            ),
+        ] {
+            let result = GoogleTagManagerIntegration::rewrite_gtm_urls(source);
+
+            assert_eq!(result, expected, "should keep the suffix on `{source}`");
+        }
+    }
+
+    #[test]
+    fn rewriter_preserves_a_fragment_on_a_bare_url() {
+        let result = GoogleTagManagerIntegration::rewrite_gtm_urls(
+            "https://www.googletagmanager.com/gtm.js#bootstrap",
+        );
+
+        assert_eq!(result, "/integrations/google_tag_manager/gtm.js#bootstrap");
     }
 
     #[test]
