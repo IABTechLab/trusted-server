@@ -663,6 +663,46 @@ fn source_member_evidence_does_not_suppress_documented_host_shaped_tokens() {
 }
 
 #[test]
+fn markdown_prose_grammar_never_substitutes_for_harvested_member_evidence() {
+    let project = ["getpurpose", ".ai"].concat();
+    let vendor = ["vendor.example", ".co.uk"].concat();
+    let internal = ["Portal.Private-Corp", ".Internal"].concat();
+    let assignment = ["endpoint.example", ".co.uk"].concat();
+    let member = ["model", ".name"].concat();
+    let readme = format!(
+        "{project} is the project host.\n{vendor}:443\n{internal} is reachable.\n\
+         {assignment} = documented endpoint\n\
+         `{member}`\n```js\n{member}\n```\n{member} is a reachable host.\n"
+    );
+    let repository = TestRepository::new("README.md", readme.as_bytes(), "text");
+    repository.add_text(
+        "src/main.js",
+        &format!("const first = {member};\nconst second = {member};\n"),
+    );
+
+    let result = repository.bootstrap();
+
+    assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+    let manifest = fs::read_to_string(
+        repository
+            .path()
+            .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+    )
+    .expect("should read bootstrap manifest");
+    assert_eq!(
+        manifest.matches("detector = \"domain\"").count(),
+        5,
+        "four prose hosts and the identical member-shaped prose host must remain; harvested inline/fenced expressions must be suppressed: {manifest}"
+    );
+    for host in [&project, &vendor, &internal, &assignment, &member] {
+        assert!(
+            manifest.contains(&fingerprint(host.as_bytes())),
+            "missing prose host {host}"
+        );
+    }
+}
+
+#[test]
 fn source_member_suppression_is_occurrence_specific() {
     let host = ["service.example", ".rs"].concat();
     let readme = format!("{host} in prose, `{host}` in code markup.\n");

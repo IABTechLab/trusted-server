@@ -2468,11 +2468,11 @@ PY
 #### Task 5 final domain-context and PNG-keyword checkpoint
 
 - The prior consolidated checkpoint contained 68 scanner tests; the final
-  focused scanner suite contains 70 tests. CRC-valid PNG fixtures now prove
+  focused scanner suite contains 71 tests. CRC-valid PNG fixtures now prove
   that tEXt, zTXt, and iTXt keywords accept only 1–79 printable Latin-1 bytes,
   reject C0/C1 controls, and reject leading, trailing, or consecutive ASCII
   spaces. Missing separators continue to fail closed.
-- The regenerated reviewed inventory contains 5,309 exact findings: 4,964
+- The regenerated reviewed inventory contains 5,315 exact findings: 4,970
   domain, 286 lockfile field, 42 credential shape, 12 binary string, four
   email, and one service ID. Classes are 5,235 vendor URL, 42 fake credential,
   18 historical example, 11 project-owned public domain, and one service ID.
@@ -2491,6 +2491,14 @@ PY
   retain real hosts in prose, Markdown code, source strings/comments, and URL
   query/fragment values. The real-manifest regression resolves selectors back
   to bytes so representative false domains cannot silently return.
+- Markdown prose punctuation, English predicates, assignment punctuation, and
+  capitalization never independently suppress hosts. Documented member
+  suppression now requires both established harvested evidence and explicit
+  code/member syntax at the occurrence. Positive prose/port/assignment
+  fixtures remain findings; repeated harvested inline and fenced member
+  expressions remain absent. The final regeneration retained all requested
+  host positives and kept every audited representative path/member selector at
+  zero.
 
 #### Task 6 — Implement generated regions, Markdown ownership, and link checks
 

@@ -179,7 +179,7 @@ struct SourceLexicalContext {
 
 struct DomainContext {
     tracked_paths: BTreeSet<String>,
-    source_members: BTreeMap<String, (usize, bool)>,
+    source_members: BTreeMap<String, (usize, bool, usize, bool)>,
 }
 
 struct TomlLockScanner<'a> {
@@ -600,13 +600,14 @@ fn bare_domain_context_allowed(
     if path.ends_with(".toml") && toml_key_occurrence(text, start, end) {
         return false;
     }
-    let documented_source_member = domain_context
-        .source_members
-        .get(&candidate)
-        .is_some_and(|(code_count, semantic)| *semantic || *code_count >= 2);
+    let documented_source_member = domain_context.source_members.get(&candidate).is_some_and(
+        |(code_count, semantic, markdown_count, markdown_semantic)| {
+            *semantic || *code_count >= 2 || *markdown_count >= 2 && *markdown_semantic
+        },
+    );
     if path.ends_with(".md")
-        && (markdown_code_offset(text, start) && documented_source_member
-            || member_occurrence_context(text, start, end))
+        && documented_source_member
+        && (markdown_code_offset(text, start) || explicit_member_syntax(text, start, end))
     {
         return false;
     }
@@ -836,12 +837,29 @@ impl DomainContext {
             for matched in domain_host_regex().find_iter(text) {
                 let entry = source_members
                     .entry(matched.as_str().to_ascii_lowercase())
-                    .or_insert((0, false));
+                    .or_insert((0, false, 0, false));
                 if context.allows(matched.start()) {
                     entry.1 |= member_occurrence_context(text, matched.start(), matched.end());
                 } else {
                     entry.0 += 1;
                 }
+            }
+        }
+        for file in classified.iter().filter(|file| file.path.ends_with(".md")) {
+            let normalized = NormalizedRelativePath::new(Path::new(&file.path))
+                .change_context(ScannerError::Classification)?;
+            let contents = repository
+                .read_tracked(&normalized)
+                .change_context(ScannerError::Classification)?;
+            let Ok(text) = core::str::from_utf8(&contents) else {
+                continue;
+            };
+            for matched in domain_host_regex().find_iter(text) {
+                let entry = source_members
+                    .entry(matched.as_str().to_ascii_lowercase())
+                    .or_insert((0, false, 0, false));
+                entry.2 += 1;
+                entry.3 |= explicit_member_syntax(text, matched.start(), matched.end());
             }
         }
         Ok(Self {
@@ -888,6 +906,20 @@ fn member_occurrence_context(text: &str, start: usize, end: usize) -> bool {
         || [" should", " must", " is", " are"]
             .iter()
             .any(|word| after.starts_with(word))
+        || text[start..end]
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_uppercase())
+}
+
+fn explicit_member_syntax(text: &str, start: usize, end: usize) -> bool {
+    let before = &text[..start];
+    let after = &text[end..];
+    before.ends_with('.')
+        || after.starts_with('.')
+        || before.ends_with("[[")
+        || after.starts_with("]]")
+        || after.trim_start().starts_with('=')
         || text[start..end]
             .bytes()
             .next()
