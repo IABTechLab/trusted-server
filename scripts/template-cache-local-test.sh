@@ -289,8 +289,8 @@ s = replace_once(
 )
 s = replace_once(
     s,
-    'auction_timeout_ms = 500  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS',
-    'auction_timeout_ms = 10000  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS',
+    'auction_timeout_ms = 500',
+    'auction_timeout_ms = 10000',
     "creative opportunity auction timeout",
 )
 

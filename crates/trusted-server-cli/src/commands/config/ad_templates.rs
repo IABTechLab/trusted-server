@@ -192,7 +192,7 @@ fn run_lint(args: &AdTemplatesLintArgs, out: &mut dyn Write) -> Result<(), Strin
                 .auction
                 .providers
                 .keys()
-                .map(|provider| provider.as_str())
+                .map(trusted_server_core::auction::ProviderId::as_str)
                 .collect::<Vec<_>>()
                 .join(", ");
             escape_terminal_text(&providers).into_owned()
