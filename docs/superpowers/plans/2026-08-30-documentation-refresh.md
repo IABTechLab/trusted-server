@@ -2,339 +2,174 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Refresh every maintained documentation surface, make reader-facing inventories derive from checked records, and activate enforcement without exposing write credentials to pull-request-controlled code.
+**Goal:** Refresh every maintained documentation surface, derive reader-facing inventories from checked records, and commit all implementation work to PR #1049 without exposing write credentials to pull-request-controlled code.
 
-**Architecture:** One rc implementation PR supplies eight package checkpoints and the canonical `docs-parity` tooling. Four small `main` PRs contain the public site, install a base-controlled validation controller, resolve CNAME, and activate scheduled automation after the rc merge; a separately owned release handoff closes the temporary branch lifecycle. Checked manifests connect code inventories, generated Markdown, source classification, examples, and CI so each fact has one source of truth.
+**Architecture:** The existing `spec-docs-refresh` branch and PR #1049 are the only implementation branch and PR. Reviewable package commits build one standalone `docs-parity` tool and final-state documentation automation; Pages, schedules, dependency submission, and optional `main` protection effects that cannot run from rc are recorded as release-pending rather than represented by auxiliary PRs.
 
 **Tech Stack:** Rust 1.95 (`syn`, Serde, `error-stack`, Cargo), VitePress/Node 24, ESLint/JSDoc, GitHub Actions and REST APIs, shell smoke scripts, Fastly Viceroy, Wrangler, Spin, Axum
 
-**Revised:** 2026-08-31 after full spec/plan review (round 21)
+**Revised:** 2026-08-31 for the approved single-PR delivery model
 
 ---
 
 ## Execution gate
 
-**Gate status:** Satisfied by `aram356` on 2026-08-31. The approval covers the
-five-PR-through-activation delivery shape, temporary `main`
-`docs/automation-delta` required-status and strict/up-to-date protection
-change, merge queues disabled on `main` through PR (e), and the external
-dependency-snapshot retirement call under the specified runbook and controls.
-Task 2 may begin only after Task 1 commits this approval.
-
-The narrower owner gates are also resolved:
-
-- `aram356` owns the temporary `fastly.toml` `service_id` allowlist exception;
-  it expires at `2026-09-30T00:00:00Z`, and check mode fails at or after that
-  instant. Renewal requires a reviewed, committed replacement before expiry.
-  This is not the ops migration deadline.
-- Task 3 deletes `docs/public/CNAME` and retains the project-path base. PR (d)
-  must merge before Task 4 imports the live publishing deltas into rc.
-- Task 12 archives `FAQ_POC.md` at
-  `docs/superpowers/archive/FAQ_POC.md`.
-- Task 17 uses the factual-governance fallback; no governance owner was named.
-- Questions 5 and 8 remain explicitly non-blocking; question 4 remains closed.
+- Work only in `/Users/ag/projects/iab/trusted-server/.claude/worktrees/spec-docs-refresh` on branch `spec-docs-refresh`.
+- Push implementation commits only to PR #1049. Do not create containment, CNAME, controller, activation, or release-handoff implementation PRs.
+- PR #1104 is closed. Its source branch remains only long enough to transfer reviewed commits `34b0613dc603ba6529396dad4dd4b7e68b1e11a9` and `e6554f24f58f6122fb806ce25432f66033765c65`.
+- Before every package, fetch `origin/rc/202608` and require it to equal `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`; require the implementation branch to contain that commit. Any target advance stops execution for a full delta audit and spec/plan re-review.
+- Owner decisions are fixed: delete CNAME, archive `FAQ_POC.md`, use the factual-governance fallback, and expire the Fastly service-ID exception at `2026-09-30T00:00:00Z`.
+- Live Pages, real scheduled runs, dependency submission, graph visibility, and optional `main` protection changes are release-pending. Never substitute local output for those receipts or create another PR to obtain them.
 
 ## File map
 
-### Program records and release controls
+### Program records
 
-| File                                                                | Responsibility                                                                               |
-| ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `docs/superpowers/specs/2026-08-19-documentation-refresh-design.md` | Approved design, immutable baseline contract, owner decisions, and epoch definitions.        |
-| `docs/superpowers/plans/2026-08-30-documentation-refresh.md`        | This execution plan and package checkpoints.                                                 |
-| `docs/internal/audits/documentation-refresh-decisions.md`           | Owners, dates, selected open-question branches, audited tips, ruleset snapshot, and PR URLs. |
-| `docs/internal/audits/documentation-refresh-inventory.toml`         | Per-file or per-region WP2 dispositions and source anchors.                                  |
-| `docs/internal/audits/documentation-refresh-evidence.md`            | Epoch 1 commands/proofs/smokes plus schemas and issue links for post-merge evidence.         |
-| `docs/internal/runbooks/documentation-automation-release.md`        | Normal and abandonment release sequencing, snapshot retirement, and branch deletion gate.    |
-| `docs/internal/runbooks/documentation-automation-rollback.md`       | Controller, c2, Pages, and CNAME rollback procedures.                                        |
-| `docs/internal/runbooks/patches/docs-links-c2.patch`                | Reviewed activation delta from validation-only controller to the rc-final workflow.          |
-| `docs/internal/runbooks/patches/docs-links-rollback-c2.patch`       | Exact inverse of c2 without overwriting unrelated base changes.                              |
-| `docs/internal/runbooks/patches/docs-links-release-retarget.patch`  | Normal release retarget/removal template.                                                    |
-| `docs/internal/runbooks/patches/docs-links-release-disable.patch`   | Abandonment removal template.                                                                |
+| File                                                                | Responsibility                                                                    |
+| ------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `docs/superpowers/specs/2026-08-19-documentation-refresh-design.md` | Approved single-PR design and immutable baseline.                                 |
+| `docs/superpowers/plans/2026-08-30-documentation-refresh.md`        | This package-by-package execution plan.                                           |
+| `docs/internal/audits/documentation-refresh-decisions.md`           | Owner decisions, exact #1049 identity, closed #1104 transfer, and release bounds. |
+| `docs/internal/audits/documentation-refresh-inventory.toml`         | Per-file or per-region WP2 dispositions and source anchors.                       |
+| `docs/internal/audits/documentation-refresh-evidence.md`            | Package evidence, hosted runs, smokes, issues, and release-pending schema.        |
+| `docs/internal/runbooks/documentation-automation-release.md`        | Post-main Pages, schedule, snapshot, graph, and optional protection verification. |
 
 ### `docs-parity` crate and checked records
 
 `tools/docs-parity` is a standalone Cargo workspace with its own committed lockfile; it is not added to the repository workspace members.
 
-| File                                           | Responsibility                                                                                                   |
-| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `tools/docs-parity/Cargo.toml`                 | Standalone binary/library metadata, `[workspace]`, dependencies, and lint policy.                                |
-| `tools/docs-parity/Cargo.lock`                 | Reproducible host-tool dependency graph.                                                                         |
-| `tools/docs-parity/README.md`                  | Subcommands, manifest ownership, update/check flow, and failure semantics.                                       |
-| `tools/docs-parity/src/main.rs`                | Thin CLI parsing and exit-code mapping.                                                                          |
-| `tools/docs-parity/src/lib.rs`                 | Subcommand dispatch and shared `Report<DocsParityError>` API.                                                    |
-| `tools/docs-parity/src/model.rs`               | Checked record schemas, ownership/expiry types, and generated-region markers.                                    |
-| `tools/docs-parity/src/repository.rs`          | Repository-root discovery, tracked-file enumeration, safe paths, exact Git object reads, and atomic writes.      |
-| `tools/docs-parity/src/classification.rs`      | Text/binary classification and exhaustive candidate/span closure.                                                |
-| `tools/docs-parity/src/scanner.rs`             | Domain, email, credential, identifier, encoded-token, lockfile, binary-string, and media-metadata scanners.      |
-| `tools/docs-parity/src/markdown.rs`            | Link/anchor parsing, fence inventory, ownership markers, orphan/tombstone checks, and generated regions.         |
-| `tools/docs-parity/src/settings.rs`            | Serde-aware settings extractor, companion semantics, compiled probes, and template harness.                      |
-| `tools/docs-parity/src/integrations.rs`        | Integration/provider inventory and capability-record checks.                                                     |
-| `tools/docs-parity/src/routes.rs`              | Route record checks, Cloudflare fail-closed parser, and adapter-support rendering.                               |
-| `tools/docs-parity/src/cli_help.rs`            | Linux/macOS help capture, annotated union, overrides, and golden comparison.                                     |
-| `tools/docs-parity/src/snippets.rs`            | Fence manifest, diagnostic matching, isolated execution, and waiver expiry.                                      |
-| `tools/docs-parity/src/gates.rs`               | Canonical gate manifest and link-only/generated consumer checks.                                                 |
-| `tools/docs-parity/src/workflow.rs`            | YAML AST policy, dispatch/diff authentication fixtures, and PR-status state machine.                             |
-| `tools/docs-parity/src/dependency_snapshot.rs` | Schema-validated Cargo dependency snapshot generation only; submission stays in the no-checkout workflow writer. |
+| File                                           | Responsibility                                                                                        |
+| ---------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `tools/docs-parity/Cargo.toml`                 | Standalone binary/library metadata, `[workspace]`, dependencies, and lint policy.                     |
+| `tools/docs-parity/Cargo.lock`                 | Reproducible host-tool dependency graph.                                                              |
+| `tools/docs-parity/README.md`                  | Subcommands, manifest ownership, update/check flow, and failure semantics.                            |
+| `tools/docs-parity/src/main.rs`                | Thin CLI parsing and exit-code mapping.                                                               |
+| `tools/docs-parity/src/lib.rs`                 | Subcommand dispatch and shared `Report<DocsParityError>` API.                                         |
+| `tools/docs-parity/src/model.rs`               | Checked schemas, ownership/expiry types, and generated markers.                                       |
+| `tools/docs-parity/src/repository.rs`          | Root discovery, tracked files, safe paths, Git object reads, and atomic writes.                       |
+| `tools/docs-parity/src/classification.rs`      | Text/binary classification and exhaustive candidate/span closure.                                     |
+| `tools/docs-parity/src/scanner.rs`             | Domain, email, credential, identifier, encoded-token, lockfile, binary-string, and metadata scanning. |
+| `tools/docs-parity/src/markdown.rs`            | Links, anchors, fences, ownership markers, orphan/tombstone checks, and generated regions.            |
+| `tools/docs-parity/src/settings.rs`            | Serde-aware settings extraction, companions, compiled probes, and template harness.                   |
+| `tools/docs-parity/src/integrations.rs`        | Integration/provider inventory and behavioral capability checks.                                      |
+| `tools/docs-parity/src/routes.rs`              | Route records, Cloudflare fail-closed parser, and adapter-support rendering.                          |
+| `tools/docs-parity/src/cli_help.rs`            | Native Linux/macOS capture, annotated union, overrides, and goldens.                                  |
+| `tools/docs-parity/src/snippets.rs`            | Fence modes, diagnostics, isolated execution, and waiver expiry.                                      |
+| `tools/docs-parity/src/gates.rs`               | Canonical gate manifest and generated/link-only consumers.                                            |
+| `tools/docs-parity/src/workflow.rs`            | YAML policy for read-only PR checks and final default-branch readers/writers.                         |
+| `tools/docs-parity/src/dependency_snapshot.rs` | Bounded dependency snapshot schema and deterministic generation.                                      |
 
-Checked records live under `tools/docs-parity/manifests/`: `tracked-files.toml`, `maintained-sources.toml`, `sensitive-allowlist.toml`, `retired-identifiers.toml`, `snippets.toml`, `settings-companions.toml`, `routes.toml`, `integrations.toml`, `adapter-support.toml`, `cli-overrides.toml`, `gates.toml`, `pages.toml`, `diagrams.toml`, and `orphans.toml`. CLI goldens live at `tools/docs-parity/goldens/cli-linux.txt` and `tools/docs-parity/goldens/cli-macos.txt`. Synthetic fixtures live under `tools/docs-parity/tests/fixtures/`; never add a live secret, internal contact, or real customer value as a fixture.
+Checked records live under `tools/docs-parity/manifests/`: `tracked-files.toml`, `maintained-sources.toml`, `sensitive-allowlist.toml`, `retired-identifiers.toml`, `snippets.toml`, `settings-companions.toml`, `routes.toml`, `integrations.toml`, `adapter-support.toml`, `cli-overrides.toml`, `gates.toml`, `pages.toml`, `diagrams.toml`, and `orphans.toml`. CLI goldens live at `tools/docs-parity/goldens/cli-linux.txt` and `tools/docs-parity/goldens/cli-macos.txt`. Synthetic fixtures live under `tools/docs-parity/tests/fixtures/`; never add a live secret, internal contact, or real customer value.
 
-### Existing surfaces with known edits
+### Existing product/documentation surfaces
 
-- Publishing/policy: `docs/.vitepress/config.mts`, `docs/guide/index.md`, `docs/guide/onboarding.md`, `docs/internal/onboarding.md`, `docs/business-use-cases.md`, `docs/public/CNAME`, `docs/package.json`, `docs/package-lock.json`, `fastly.toml`, `CLAUDE.md`, `AGENTS.md`, `.github/pull_request_template.md`, and `.claude/commands/{check-ci,review-changes,test-all,test-crate,verify}.md`.
-- Truth pass: the active sets defined by the spec, with named repairs in `docs/guide/{ad-serving,architecture,configuration,creative-processing,error-reference,integration-guide,roadmap}.md`, `docs/guide/integrations/{gam,kargo}.md`, `crates/trusted-server-core/src/auction/README.md`, `TESTING.md`, `FAQ_POC.md`, `CHANGELOG.md`, `.env.example`, `.env.dev`, `.claude/agents/{code-architect,issue-creator}.md`, `crates/trusted-server-openrtb/generate.sh`, and the human-facing workflow/script comments recorded in the inventory.
-- Configuration/API: `trusted-server.example.toml`, `docs/guide/configuration.md`, `docs/guide/api-reference.md`, and generated/check seams in `crates/trusted-server-core/src/{config,settings,auction_config_types}.rs`, `crates/trusted-server-core/src/auction/{plan,profile}.rs`, `crates/trusted-server-core/src/integrations/*.rs`, the four adapter `src/app.rs` files, and their route tests.
-- New coverage: `docs/guide/{auction-testing,axum-dev,cloudflare,edgezero,fastly,spin,telemetry,tsjs}.md`, `docs/guide/integrations/{adserver_mock,gpt,testlight}.md`, `tinybird/README.md`, `scripts/smoke-{axum,fastly,cloudflare,spin}.sh`, and `.github/workflows/integration-tests.yml`.
-- README/rustdoc/JSDoc: the seven missing crate READMEs named in Task 17, their Cargo manifests, `scripts/README.md`, the WP7 Rust worklist, `crates/trusted-server-js/lib/eslint.config.js`, and the scoped TypeScript/MJS files named in the spec.
+- Publishing/policy: `docs/.vitepress/config.mts`, `docs/guide/index.md`, `docs/internal/onboarding.md`, `docs/business-use-cases.md`, `docs/public/CNAME`, `docs/package.json`, `docs/package-lock.json`, `fastly.toml`, `CLAUDE.md`, `AGENTS.md`, `.github/pull_request_template.md`, and `.claude/commands/{check-ci,review-changes,test-all,test-crate,verify}.md`.
+- Truth/config/API/product: the exact WP2-WP5 paths enumerated in Tasks 10-14.
+- README/rustdoc/JSDoc: the WP6/WP7 paths enumerated in Tasks 15-16.
 - Automation: `.github/workflows/{codeql,deploy-docs,docs-links,format,integration-tests,test}.yml`, `.github/dependabot.yml`, `.tool-versions`, and `crates/trusted-server-openrtb-codegen/Cargo.toml`.
 
 ## Package checkpoint rule
 
-After each rc package task:
-
-1. Before editing, record `package_start_head="$(git rev-parse HEAD)"`. Make the
-   package edits, generate candidate outputs, and create the package's evidence
-   section.
-2. Fully stage every intended add/modify/delete with the task's exact
-   pathspecs before classification or parity checks. Never use `git add -N`:
-   intent-to-add has no candidate blob. Review
-   `git diff --cached --name-status "$package_start_head"` and reject every
-   changed path outside the task's file list. Require
-   `git ls-files --others --exclude-standard` to print nothing, and require
-   `git diff --quiet` to exit 0 so no unstaged tracked byte anywhere can affect
-   a repository-wide check. Ignored dependency/build output remains unstaged.
-3. Run the focused tests and package acceptance commands against that fully
-   staged universe. Regenerate checked outputs, restage only their exact paths,
-   run `docs-parity check`, and require a clean generated diff.
-   Bootstrap exception: Tasks 1, 4, and 5 run every staged-universe check above
-   but cannot regenerate `tracked-files.toml` or `maintained-sources.toml`
-   because Task 6 creates them. Task 6's initial bootstrap must classify the
-   complete then-current repository, including every path those tasks added,
-   moved, or deleted. From the Task 6 commit onward, every package that creates,
-   moves, or deletes a tracked path must regenerate and stage both manifests;
-   public-page changes must also regenerate the applicable page/orphan records.
-4. Record commands/results in
-   `docs/internal/audits/documentation-refresh-evidence.md` and stage that
-   exact file. Because that mutation changes the candidate universe, repeat any
-   classification/scanner check that consumes the ledger, restage any generated
-   output, and again require global `git diff --quiet` so every tracked
-   working-tree byte equals the index/HEAD candidate. Run
-   `git diff --cached --check` and review the cached
-   name/status and content diff from `package_start_head` against only this
-   package.
-5. Commit with the exact imperative message listed in the task. If recording
-   final commit/run identifiers requires a follow-up, make one immediately
-   adjacent evidence-only commit before starting the next package. Never let a
-   later directory-wide `git add` absorb earlier evidence, and do not squash
-   package or evidence commits.
-6. Require `git status --porcelain` to be empty except for explicitly named,
-   reviewed state before advancing to the next package.
+1. Fetch and reassert the immutable rc tip. Record `package_start_head="$(git rev-parse HEAD)"` before editing.
+2. Execute one test-first leaf at a time: add one named failing fixture/assertion, run the focused red command and record its diagnostic, implement the minimum change, then rerun the focused command and immediate regressions.
+3. Fully stage only the package allowlist. Never use `git add -N` or directory-wide staging. Review `git diff --cached --name-status "$package_start_head"`. Require `git ls-files --others --exclude-standard` to print nothing and `git diff --quiet` to exit 0.
+4. From Task 5 onward, regenerate and stage `tracked-files.toml` and `maintained-sources.toml` whenever a tracked path is created, moved, or deleted. Public-page changes also regenerate page/orphan records. Tasks 1-4 are bootstrap exceptions because Task 5 creates the classification records.
+5. Run focused tests, regenerate checked outputs, restage exact output paths, run `docs-parity check` where available, and prove a second generation is byte-stable.
+6. Append commands/results to `documentation-refresh-evidence.md`. Restage that exact file, rerun any scanner/classifier consuming it, and reassert no unstaged bytes.
+7. Run `git diff --cached --check` and inspect the cached content. Commit with the exact task message. If final identifiers require a receipt, create one immediately adjacent evidence-only commit; do not create recursive self-SHA receipts.
+8. Push the clean package commits to `origin/spec-docs-refresh` so PR #1049 is the only hosted review surface. Require clean status before advancing.
 
 ### Atomic execution rule
 
-This is the master program plan. Composite implementation checkpoints in
-Tasks 5-10, 15, and 19 are not single coding actions. Before changing a
-component, copy its next fixture from the task's enumerated negative matrix
-into the evidence checklist and execute one leaf cycle at a time:
+Composite parser, scanner, workflow, settings, route, and smoke tasks are packages, not single coding actions. Copy each named negative fixture into the evidence checklist and complete its red/green cycle before the next leaf. Never batch multiple parser or trust classes into one unreviewed implementation change.
 
-1. add one named failing fixture/test;
-2. run its exact focused command and record the expected diagnostic;
-3. implement the smallest production/tool change for that fixture;
-4. rerun the focused command and its immediately affected regression set;
-5. mark that leaf complete, then continue to the next named fixture.
-
-Do not batch multiple parser classes, workflow rejection classes, scanners, or
-adapter seams into one unreviewed edit. The package checkpoint commit happens
-only after every enumerated leaf is green; the evidence ledger is the resumable
-leaf-task list.
-
-### Task 1: Record decisions and revalidate immutable tips
+### Task 1: Align program records to the single PR
 
 **Files:**
 
 - Modify: `docs/superpowers/specs/2026-08-19-documentation-refresh-design.md`
-- Modify: `docs/superpowers/plans/2026-08-30-documentation-refresh.md`
-- Create: `docs/internal/audits/documentation-refresh-decisions.md`
-- Create: `docs/internal/audits/documentation-refresh-evidence.md`
+- Modify: `docs/internal/audits/documentation-refresh-decisions.md`
+- Modify: `docs/internal/audits/documentation-refresh-evidence.md`
 
-- [x] **Step 1: Fetch and verify the rc baseline**
+- [ ] **Step 1: Revalidate PR #1049 and the immutable target**
 
 Run:
 
 ```bash
-git fetch origin rc/202608 main
-git rev-parse origin/rc/202608
+git fetch origin rc/202608 spec-docs-refresh
+test "$(git rev-parse origin/rc/202608)" = 07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf
 git merge-base --is-ancestor 07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf HEAD
+gh pr view 1049 --json url,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid
 ```
 
-Expected: the first command succeeds, `origin/rc/202608` prints exactly `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`, and the ancestry command exits 0. Stop and re-audit every new rc commit if either assertion changes.
+Expected: exact target SHA, ancestry success, and PR #1049 open from `spec-docs-refresh` to `rc/202608`. Record the current remote head as a timestamped capture, not as a permanent final SHA.
 
-- [x] **Step 2: Record the current default-branch tip**
+- [ ] **Step 2: Replace obsolete delivery records**
 
-Run `git rev-parse origin/main` and record the full SHA as the starting `audited_main_tip`; do not reuse it for a later `main` PR after `main` advances.
+Make #1049 the only implementation row. Record PR #1104 as closed/superseded with its two reviewed source commits and no live merge/deploy receipt. Remove executable fields for PRs (b), (c), (d), (c2), and (e), all Epoch terminology, temporary protection/status changes, snapshot retirement, and cross-worktree import blocks.
 
-- [x] **Step 3: Resolve the owner gates**
+- [ ] **Step 3: Define release-pending evidence**
 
-Record owner/date/answer for questions 1, 2, 3, and 7. Record whether question 6 has an owner or will take the deterministic fallback. Leave questions 5 and 8 explicitly non-blocking and preserve question 4 as closed.
+Keep the durable hashed-body schema, but use it only for real external captures. Add explicit `release-pending` rows for Pages/CNAME, first schedule, dependency submission/graph, and optional `main` protection. State that local/fixture output cannot complete those rows.
 
-- [x] **Step 4: Make the spec state executable**
+- [ ] **Step 4: Mark the reviewed spec executable**
 
-Change the spec status only after question 7 is explicit. Replace resolved open-question prose with the selected branch plus owner/date; do not erase the rejected alternatives or rollback requirements.
+Change the spec status to approved for implementation and record the written-spec approval date and owner. Do not change WP scope.
 
-- [x] **Step 5: Establish evidence templates**
+- [ ] **Step 5: Verify and commit**
 
-Add the complete Epoch 1/package evidence sections, PR/issue URLs for (a)-(e),
-ruleset snapshots, first-success smokes, generated-diff proof, follow-up
-issues, and exceptions with owner/expiry. For Epochs 2 and 3, record the
-required evidence schema and canonical c2/release-handoff issue URLs. The
-schema must require append-only timestamped captures of actor/operation, exact
-commit/ref and PR head/base/tool SHAs, run IDs/attempts/jobs, redacted request
-method/endpoint/body, response status/body, snapshot identity, and applicable
-graph/ruleset/protection/branch API JSON. Hash every body with SHA-256; split
-captures over 60 KiB into ordered hashed chunks; make links navigational rather
-than authoritative; append corrections that name the superseded comment.
-Actual post-merge receipts are captured under that schema in those issues
-rather than committed later.
+Run `cd docs && npm run format && npm run lint && npm run build`, remove only generated VitePress temp output, then run `git diff --check`.
 
-Also define the cross-worktree handoff template for PRs (b), (c), and (d):
-their branch-specific tips, checks, live receipts, and ruleset snapshots stay in
-the PR description or named tracking issue while the tightly scoped `main`
-branch is open. The next named rc checkpoint imports those captures by URL and
-value into the rc evidence/decision records; the records never ride in a
-scope-limited `main` PR.
-
-- [x] **Step 6: Verify and commit the approved handoff**
-
-Run `cd docs && npm run format`, then `git diff --check`.
-
-Expected: both commands pass and only the spec, plan, and new audit records are in this checkpoint.
+Stage exactly the three files and commit:
 
 ```bash
-git add docs/superpowers/specs/2026-08-19-documentation-refresh-design.md docs/superpowers/plans/2026-08-30-documentation-refresh.md docs/internal/audits/documentation-refresh-decisions.md docs/internal/audits/documentation-refresh-evidence.md
-git commit -m "Approve documentation refresh delivery plan"
+git add docs/superpowers/specs/2026-08-19-documentation-refresh-design.md docs/internal/audits/documentation-refresh-decisions.md docs/internal/audits/documentation-refresh-evidence.md
+git commit -m "Align documentation refresh records to one PR"
 ```
 
-### Task 2: Ship the public-site containment PR (b)
+### Task 2: Transfer the reviewed containment commits
 
 **Files:**
 
 - Modify: `docs/.vitepress/config.mts`
 - Modify: `docs/guide/index.md`
-- Move/Modify: `docs/guide/onboarding.md` → `docs/internal/onboarding.md`
+- Delete: `docs/guide/onboarding.md`
+- Create: `docs/internal/onboarding.md`
+- Modify: `docs/internal/audits/documentation-refresh-evidence.md`
 
-- [ ] **Step 1: Create an isolated branch from the fresh `origin/main` tip**
+- [ ] **Step 1: Authenticate the closed source PR and commits**
 
-Use `@superpowers:using-git-worktrees`. Record that PR's new
-`audited_main_tip` in its PR-description handoff block; the containment branch
-must contain exactly the four containment concerns below. Do not add the rc-only
-decision/evidence records to this branch.
+Require PR #1104 closed, base `d516a9e94249e10cbc36e41beb4269f9255cf407`, and source commits `34b0613dc603ba6529396dad4dd4b7e68b1e11a9` and `e6554f24f58f6122fb806ce25432f66033765c65`. Verify their combined base-to-head path set is exactly the four paths above.
 
-- [ ] **Step 2: Prove the current build leaks excluded pages**
+- [ ] **Step 2: Transfer the two commits**
 
-Run `cd docs && npm ci && npm run build`, then assert that at least one `superpowers/**`, `internal/**`, `epics/**`, `guide/onboarding.html`, `README.html`, or `business-use-cases.html` artifact exists.
-
-Expected: the assertion demonstrates the pre-change leak. Save the exact artifact path as failing evidence.
-
-- [ ] **Step 3: Add the minimal containment configuration**
-
-Set `srcExclude` to `superpowers/**`, `internal/**`, `epics/**`, `guide/onboarding.md`, `README.md`, and `business-use-cases.md`. Fill `docs/guide/index.md`, point the Guide nav item at `/guide/`, remove Business Value navigation, move/scrub onboarding, and remove every built-page link to an excluded source. Do not include CNAME, package metadata, marketing-copy edits, or unrelated navigation work.
-
-- [ ] **Step 4: Rebuild and prove the boundary**
-
-Run `cd docs && npm run lint && npm run format && npm run build`.
-
-Expected: all commands pass; the six excluded path families produce no output; `/index.html`, `/guide/index.html`, and `/guide/api-reference.html` exist and contain their expected headings.
-
-- [ ] **Step 5: Review and commit the XS diff**
+Cherry-pick the commits in order. Any conflict outside the four authorized paths stops execution. Resolve an authorized-path conflict only by preserving the reviewed containment behavior on the rc version; record the conflict and resulting blob comparison.
 
 ```bash
-git add docs/.vitepress/config.mts docs/guide/index.md docs/guide/onboarding.md docs/internal/onboarding.md
-git diff --cached --check
-git diff --cached --name-status "$AUDITED_MAIN_TIP"
-git diff --cached "$AUDITED_MAIN_TIP" -- docs/.vitepress/config.mts docs/guide/index.md docs/guide/onboarding.md docs/internal/onboarding.md
-git commit -m "Contain internal documentation pages"
+git cherry-pick 34b0613dc603ba6529396dad4dd4b7e68b1e11a9
+git cherry-pick e6554f24f58f6122fb806ce25432f66033765c65
 ```
 
-Reject any cached path beyond those four. Require `git diff --quiet` before the
-commit so the reviewed index is the complete candidate.
+Expected commit subjects: `Contain internal documentation pages` and `Fix internal onboarding links`.
 
-- [ ] **Step 6: Merge and smoke the live Pages deployment**
+- [ ] **Step 3: Reprove containment on rc**
 
-Immediately before merge, refetch `main` and require the PR base to equal its
-`audited_main_tip`; otherwise rebase, re-review, and record the new tip. After
-merge, set a task-specific `DOCS_BASE_URL` from the selected project URL and
-assert excluded URLs return 404 while site root, Guide, and API reference return
-200 with expected text. Put response headers, deployment SHA, URLs, merge SHA,
-and authenticated PR base in the external handoff block for Task 4 to import.
+Run `cd docs && npm ci && npm run lint && npm run format && npm run build`. Assert no output for the six excluded families, required Home/Guide/API artifacts with expected content, no excluded hrefs, and every repository-relative onboarding target exists.
 
-### Task 3: Resolve CNAME in independent PR (d)
+- [ ] **Step 4: Record the transfer**
+
+Append source PR URL/state, source base/head, original and resulting commit SHAs, exact path set, commands, and local-only status. Commit only the evidence ledger:
+
+```bash
+git add docs/internal/audits/documentation-refresh-evidence.md
+git commit -m "Record documentation containment transfer"
+```
+
+### Task 3: Complete WP1 CNAME and policy hygiene
 
 **Files:**
 
-- Delete or Modify: `docs/public/CNAME`
-- Modify only on custom-domain path: `docs/.vitepress/config.mts`, `README.md`, and every hard-coded Pages URL found by the checked inventory
-
-- [ ] **Step 1: Cut a new isolated branch from the then-current `origin/main`**
-
-Record a fresh `audited_main_tip` in the PR-description handoff block; never
-stack this on containment or automation PRs and do not add rc-only audit records.
-
-- [ ] **Step 2: Execute exactly the selected branch**
-
-The selected branch is **delete**. The custom-domain instructions remain
-rejected/reference-only unless Task 1's CNAME decision is formally reopened
-and this plan is amended and re-approved.
-
-Delete path: remove `docs/public/CNAME` and keep the project-path `base`.
-Custom-domain path: first run
-`git grep -l -F 'https://iabtechlab.github.io/trusted-server'`; at the audited
-baseline the exact URL-bearing path list is `README.md`. Record that list in the
-external handoff block. If it differs, stop and amend this task's exact allowlist
-and staging command before editing. Replace the placeholder with the approved
-project-owned public domain, set `base: '/'`, update that exact URL set, and
-attach owner/DNS/TLS evidence.
-
-- [ ] **Step 3: Build and test locally**
-
-Run `cd docs && npm ci && npm run lint && npm run format && npm run build`.
-
-Expected: the build is green and assets resolve under the selected base.
-
-- [ ] **Step 4: Commit, merge, and run branch-specific smokes**
-
-```bash
-# Delete path:
-git add -A -- docs/public/CNAME
-
-# Custom-domain path instead:
-git add -A -- docs/public/CNAME docs/.vitepress/config.mts README.md
-
-git diff --cached --check
-git diff --cached --name-status "$AUDITED_MAIN_TIP"
-git commit -m "Resolve documentation site domain"
-```
-
-Run the selected delete staging branch. The delete path's cached set is exactly
-CNAME; the rejected custom path's reference set is exactly CNAME, config, and
-the recorded URL path. Review
-the full cached content and require `git diff --quiet` before committing.
-
-Immediately before merge, assert the exact recorded base. After deploy, the
-delete path re-smokes project URLs; the custom path records DNS, TLS, canonical
-page, asset, and former hard-coded URL results. Put the merge SHA, base, and all
-receipts in the external handoff block for Task 4. Never restore the placeholder
-during rollback.
-
-### Task 4: Complete WP1 hygiene on rc
-
-**Files:**
-
-- Import exactly from PR (b): `docs/.vitepress/config.mts`,
-  `docs/guide/index.md`, `docs/guide/onboarding.md` →
-  `docs/internal/onboarding.md`
-- Import exactly from selected PR (d): `docs/public/CNAME` plus, only on the
-  custom-domain path, `docs/.vitepress/config.mts`, `README.md`, and each
-  checked URL path in that PR
+- Delete: `docs/public/CNAME`
 - Modify: `docs/business-use-cases.md`
 - Modify: `fastly.toml`
 - Modify: `docs/package.json`
@@ -350,99 +185,38 @@ during rollback.
 - Modify: `docs/internal/audits/documentation-refresh-evidence.md`
 - Modify: `docs/internal/audits/documentation-refresh-decisions.md`
 
-- [ ] **Step 1: Import the live publishing deltas into rc**
+- [ ] **Step 1: Add failing policy assertions**
 
-Fetch `main`, authenticate the recorded merge commits for (b) and (d), and
-authenticate each PR's recorded base SHA. Do not merge a moving `main`
-wholesale. First require each authenticated base-to-merge name/status to match
-its PR allowlist. Then import the final modes/blobs for only those paths directly
-from the merge tree and commit the two path sets separately. This intentionally
-handles an rc path whose unrelated bytes diverged from `main`; later named rc
-packages, not the import, reapply any intended content. Stop on any tree or
-allowlist mismatch:
+Prove the banner, package privacy/license, empty authors, fixture labels, KV comments, canonical gate link, generated AGENTS region, exception taxonomy, and CNAME deletion are absent or stale.
+
+- [ ] **Step 2: Delete the selected CNAME**
+
+Remove `docs/public/CNAME` and retain `base: '/trusted-server'`. Assert no tracked placeholder remains and build assets use the project path. Commit the exact deletion:
 
 ```bash
-b_import_start="$(git rev-parse HEAD)"
-git diff --name-status "$B_BASE_SHA" "$B_MERGE_SHA" -- docs/.vitepress/config.mts docs/guide/index.md docs/guide/onboarding.md docs/internal/onboarding.md
-git restore --source="$B_MERGE_SHA" --staged --worktree -- docs/.vitepress/config.mts docs/guide/index.md docs/guide/onboarding.md docs/internal/onboarding.md
-git diff --cached --name-status "$b_import_start"
+git add -A -- docs/public/CNAME
 git diff --cached --check
-git diff --quiet
-git diff --quiet "$B_MERGE_SHA" -- docs/.vitepress/config.mts docs/guide/index.md docs/guide/onboarding.md docs/internal/onboarding.md
-git commit -m "Import public documentation containment"
-
+git commit -m "Resolve documentation site domain"
 ```
 
-Then run exactly one d block. Delete path:
+- [ ] **Step 3: Apply policy and hygiene edits**
 
-```bash
-d_import_start="$(git rev-parse HEAD)"
-git diff --name-status "$D_BASE_SHA" "$D_MERGE_SHA" -- docs/public/CNAME
-git restore --source="$D_MERGE_SHA" --staged --worktree -- docs/public/CNAME
-git diff --cached --name-status "$d_import_start"
-git diff --cached --check
-git diff --quiet
-git diff --quiet "$D_MERGE_SHA" -- docs/public/CNAME
-git commit -m "Import documentation site domain"
-git status --porcelain
-```
+Add the unverified marketing banner; scrub `fastly.toml` while preserving only the expiring service-ID record; set docs package private/Apache-2.0 and refresh lock metadata; add the typed exception taxonomy to CLAUDE; make command files and PR template link-only; generate the AGENTS fallback region.
 
-Custom-domain path (the authenticated scan must still have exactly this path
-set; otherwise update the plan before applying):
+- [ ] **Step 4: Prove privacy and policy state**
 
-```bash
-d_import_start="$(git rev-parse HEAD)"
-git diff --name-status "$D_BASE_SHA" "$D_MERGE_SHA" -- docs/public/CNAME docs/.vitepress/config.mts README.md
-git restore --source="$D_MERGE_SHA" --staged --worktree -- docs/public/CNAME docs/.vitepress/config.mts README.md
-git diff --cached --name-status "$d_import_start"
-git diff --cached --check
-git diff --quiet
-git diff --quiet "$D_MERGE_SHA" -- docs/public/CNAME docs/.vitepress/config.mts README.md
-git commit -m "Import documentation site domain"
-git status --porcelain
-```
+Search all tracked files for removed contacts, handles, channels, access phrases, placeholder CNAME, and prohibited exception shapes. Expected: no match outside a typed, unexpired decision entry.
 
-Expected: each cached name/status is exactly its authenticated PR delta; every
-imported existing path has the merge commit's mode/blob and every imported
-deletion is absent; final status is empty. On the custom path, this direct
-README import replaces any divergent rc bytes; Task 17 performs the later WP6
-README rewrite from that imported state. Record
-both source base/merge pairs and resulting rc commit SHAs. Only after these two
-clean import commits set the Task 4 `package_start_head` and begin hygiene edits.
+- [ ] **Step 5: Verify and commit**
 
-- [ ] **Step 2: Add assertions for the policy state**
-
-Use temporary `rg` assertions to show the banner, package privacy/license, empty authors, fixture labels, KV comments, canonical gate link, generated AGENTS gate region, and exception taxonomy are absent or stale before editing.
-
-- [ ] **Step 3: Apply the policy and hygiene edits**
-
-Add the unverified marketing banner; scrub `fastly.toml` as specified while preserving the time-bounded service-ID entry; set the docs package private/Apache-2.0 and refresh its lockfile metadata; add the exception taxonomy to `CLAUDE.md`; make command files and the PR template link-only gate consumers; generate the AGENTS fallback region.
-
-- [ ] **Step 4: Prove contacts/access guidance are absent**
-
-Search all tracked files for every removed onboarding contact, handle, channel, and access phrase. Expected: no matches outside an explicit typed exception in the decision record.
-
-- [ ] **Step 5: Verify and checkpoint WP1**
-
-Run:
-
-```bash
-cd docs && npm ci && npm run lint && npm run format && npm run build
-git diff --check
-```
-
-Expected: all commands pass and the containment/CNAME live evidence is linked from the rc evidence record.
-
-Import the complete external handoff blocks for (b) and (d), including their
-audited bases, merge SHAs, live receipts, and URLs, into the rc evidence and
-decision records before staging this checkpoint.
+Run `cd docs && npm ci && npm run lint && npm run format && npm run build`, exact included/excluded artifact assertions, `git diff --check`, and the package checkpoint checks. Record live Pages/CNAME as release-pending.
 
 ```bash
 git add docs/business-use-cases.md fastly.toml docs/package.json docs/package-lock.json CLAUDE.md AGENTS.md .github/pull_request_template.md .claude/commands/check-ci.md .claude/commands/review-changes.md .claude/commands/test-all.md .claude/commands/test-crate.md .claude/commands/verify.md docs/internal/audits/documentation-refresh-evidence.md docs/internal/audits/documentation-refresh-decisions.md
 git commit -m "Clean documentation publishing policy"
 ```
 
-### Task 5: Scaffold the standalone `docs-parity` crate
+### Task 4: Scaffold the standalone `docs-parity` crate
 
 **Files:**
 
@@ -484,7 +258,7 @@ git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-par
 git commit -m "Add documentation parity tool foundation"
 ```
 
-### Task 6: Close tracked-file classification and sensitive-data scanning
+### Task 5: Close tracked-file classification and sensitive-data scanning
 
 **Files:**
 
@@ -545,7 +319,7 @@ git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-par
 git commit -m "Enforce documentation source classification"
 ```
 
-### Task 7: Implement generated regions, Markdown ownership, and link checks
+### Task 6: Implement generated regions, Markdown ownership, and link checks
 
 **Files:**
 
@@ -613,7 +387,7 @@ git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-par
 git commit -m "Add checked documentation regions and links"
 ```
 
-### Task 8: Extract settings semantics and execute the example harness
+### Task 7: Extract settings semantics and execute the example harness
 
 **Files:**
 
@@ -676,7 +450,7 @@ git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-par
 git commit -m "Check configuration documentation semantics"
 ```
 
-### Task 9: Check integration capabilities and adapter routes
+### Task 8: Check integration capabilities and adapter routes
 
 **Files:**
 
@@ -761,249 +535,83 @@ git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-par
 git commit -m "Check integration and adapter inventories"
 ```
 
-### Task 10: Check CLI help, snippets, gates, workflows, and snapshots
+### Task 9: Check CLI help, snippets, gates, and final workflow foundations
 
 **Files:**
 
-- Modify as dependencies are introduced: `tools/docs-parity/Cargo.toml`
-- Modify as dependencies are introduced: `tools/docs-parity/Cargo.lock`
+- Modify: `tools/docs-parity/Cargo.toml`
+- Modify: `tools/docs-parity/Cargo.lock`
 - Create: `tools/docs-parity/src/cli_help.rs`
 - Create: `tools/docs-parity/src/snippets.rs`
 - Create: `tools/docs-parity/src/gates.rs`
 - Create: `tools/docs-parity/src/workflow.rs`
 - Create: `tools/docs-parity/src/dependency_snapshot.rs`
-- Modify: `tools/docs-parity/src/main.rs`
-- Modify: `tools/docs-parity/src/lib.rs`
-- Modify: `tools/docs-parity/src/model.rs`
-- Modify: `tools/docs-parity/src/repository.rs`
+- Modify: `tools/docs-parity/src/{main,lib,model,repository}.rs`
 - Create: `tools/docs-parity/manifests/{cli-overrides,snippets,gates}.toml`
-- Modify: `tools/docs-parity/manifests/tracked-files.toml`
-- Modify: `tools/docs-parity/manifests/maintained-sources.toml`
+- Modify: `tools/docs-parity/manifests/{tracked-files,maintained-sources}.toml`
 - Create: `tools/docs-parity/goldens/{cli-linux,cli-macos}.txt`
 - Create/Test: `tools/docs-parity/tests/{cli_help,snippets,gates,workflow,dependency_snapshot}.rs`
-- Create: `docs/internal/runbooks/documentation-automation-rollback.md`
-- Create: `docs/internal/runbooks/patches/docs-links-c2.patch`
-- Create: `docs/internal/runbooks/patches/docs-links-rollback-c2.patch`
+- Modify: `.github/workflows/test.yml`
 - Create: `.github/workflows/docs-links.yml`
+- Modify: `docs/internal/audits/documentation-refresh-evidence.md`
 
-- [ ] **Step 1: Capture and union CLI help**
+- [ ] **Step 1: Write CLI capture and snippet failures**
 
-Add test seams if required so recursive Clap help can be captured without
-process termination. Implement a capture command that detects the compiled
-host OS and has no caller-supplied platform override. After the capture-ready
-source commit in Step 8, check out that exact 40-character SHA on one native
-Linux runner and one native macOS runner and run the same recursive capture
-command. For each raw result record runner identity, `uname -a`, `rustc -vV`,
-Node version, source SHA, and SHA-256. A Linux VM/container is acceptable only
-when it executes the Linux-target binary; the macOS capture must execute on
-macOS. Never copy or infer one platform's output from the other. Import the two
-hashed raw captures through the deterministic tool command, generate
-`cli-linux.txt` and `cli-macos.txt`, annotate platform-only commands, and require
-every prose override to carry owner/rationale/expiry plus an exact source-text
-staleness fingerprint.
+Cover recursive help, host-OS detection with no caller platform override, missing native capture provenance, stale overrides, every snippet mode, wrong failure phase/diagnostic, missing classification, expired waiver, and formerly invalid examples becoming valid.
 
-- [ ] **Step 2: Write snippet-mode tests**
+- [ ] **Step 2: Add native capture CI**
 
-Cover every language and mode: executable, compile/validation expected failure with phase and stable diagnostic, illustrative fragment with expiring owner waiver, missing classification, wrong diagnostic despite nonzero exit, and a formerly invalid example becoming valid.
+Add a permanent Linux/macOS PR matrix job that checks out the exact PR head, runs the same capture command, records runner/`uname`/Rust/Node/source SHA metadata, and uploads bounded raw artifacts. Commit capture-ready code before generating goldens and push that commit to #1049.
 
-- [ ] **Step 3: Implement the canonical gate manifest**
+- [ ] **Step 3: Import authenticated goldens**
 
-Define each command once with its runner/target/mode and generate or check every consumer region. Link-only consumers must contain no copied command bodies; AGENTS and canonical test docs use generated regions.
+Download both artifacts from the same hosted run and exact source SHA. Verify hashes and provenance, import through the deterministic tool command, never hand-edit the goldens, and prove a second import is unchanged.
 
-- [ ] **Step 4: Write workflow security fixtures first**
+- [ ] **Step 4: Implement snippets and canonical gates**
 
-Add positive fixtures for an ordinary net-empty PR, a
-divergent-history/net-identical rc release PR, c2, normal e, abandonment e,
-rollback-c2, same-lifecycle repair/sync, and post-handoff maintenance. Add one
-negative fixture per spec class, including a repair that changes lifecycle
-state, pre-handoff maintenance, caller-selected maintenance tool, maintenance
-AST weakening, an unexpected `merge_group` trigger, non-`main`
-dispatch, stale `main` controller, stale base/head, fork executable SHA, extra
-path, PR-files truncation attempt, unsafe mode/symlink, mixed inputs, open #1049
-SHA used by `validate_main_pr`, pending candidate, failed validation attestation,
-checkout/cache/service-container/secret escalation, stale snapshot, malformed
-or oversized artifact, and caller-supplied refresh SHA.
+Define every command once with runner/target/mode; generate checked regions or enforce link-only consumers. Execute fences in isolated working directories and require stable phase/diagnostic matches.
 
-- [ ] **Step 5: Implement exact-diff and workflow AST policy**
+- [ ] **Step 5: Write final-workflow security fixtures first**
 
-Use a separate bare object store, fetch the authenticated base/head objects,
-and never check out or execute the files object. Classify the merge result with
-a NUL-delimited two-tree `git diff --name-status <base> <head>`, never a
-merge-base/three-dot diff, and compare mode/blob IDs for both protected paths.
-Ordinary and rc release PRs pass only when those paths are net-identical even if
-history diverged. c2/e/rollback-c2/same-lifecycle repair-sync/post-handoff
-maintenance use the full two-tree candidate diff, change at most the two named protected files, and
-change no other path; each resulting blob is at most 384 KiB and the protected
-blobs at most 512 KiB total. Require exact lifecycle patch shapes; require
-repair/sync to equal the authenticated rc protected blobs without changing the
-validation-only or active-rc state; require
-maintenance to use the authenticated current-main tool and preserve every trust
-and AST invariant; require action SHA pins, least privilege, safe events, and
-byte equality between c2 result and the authenticated rc workflow.
-Expose the same policy through a local-index subcommand so a trusted tool
-worktree can validate another worktree's fully staged candidate as inert Git
-objects before its first commit; this local form never executes candidate
-files. Its `candidate-kind` argument is an assertion checked against the
-inferred shape, never a selector that relaxes checks, and the hosted workflow
-accepts no caller-supplied candidate kind.
+Positive fixtures: ordinary read-only PR validation, scheduled clean/finding link paths, issue dedup/auto-close, dependency generation/submission, and closed manual refresh. Negative fixtures: `pull_request_target`, `merge_group`, status write, caller tool/SHA input, privileged PR checkout, unpinned action, expanded permissions, unsafe cache/service/local action, stale source, extra path/member, traversal, unsafe mode/symlink, mixed inputs, malformed/oversized artifacts, unknown schema fields, and write job executing repository code.
 
-- [ ] **Step 6: Implement the controller state machine**
+- [ ] **Step 6: Implement workflow and snapshot policy**
 
-The validation-only workflow has `validate_rc`, `validate_main_pr`,
-`validate_main_maintenance`, and base-controlled `pull_request_target`; it
-asserts the current `main` controller SHA before inputs. Maintenance accepts no
-`tool_sha`, executes only the authenticated current-main tool, and fails until
-the base has tooling, main-targeted automation, and no temporary rc snapshot
-jobs/refresh. Validation has `contents: read`/`pull-requests: read`;
-attestation has only `statuses: write`, no checkout, fixed
-`docs/automation-delta`, authenticated 40-hex head, and fixed result enum.
-`validate_rc` cannot reach attestation or any writer. Materialize the complete
-link reader/issue writer jobs in their final dormant form now: final
-permissions/conditions, 30/5-minute timeouts, fixed schedule/refresh
-concurrency with no cancellation, bounded artifact schema, dedup/auto-close
-logic, and pinned action references. They remain unreachable solely because
-the validation-only workflow has no `schedule:` trigger.
+Parse YAML as data. Require read-only PR jobs, full action SHA pins, default-deny permissions, separated no-checkout writers, fixed concurrency/timeouts, exact archive member names, schema closure, and authenticated source SHA. Link bounds: 2 MiB archive, 1 MiB JSON, 500 findings, 2,048-byte strings. Snapshot bounds: 4 MiB archive, 2 MiB JSON, 5,000 records, 2,048-byte strings.
 
-Enforce the exact artifact bounds before any writer starts. Each archive has
-exactly one regular member, respectively `link-results.json` or
-`dependency-snapshot.json`, and rejects links, traversal, and extra members.
-Link results use a 2 MiB maximum archive, 1 MiB decoded JSON, 500 findings, and
-2,048-byte strings; dependency snapshots use a 4 MiB archive, 2 MiB decoded
-JSON, 5,000 records, and 2,048-byte strings. Both schemas reject unknown fields
-and every overflow.
+- [ ] **Step 7: Materialize the final workflow foundation**
 
-- [ ] **Step 7: Implement snapshot generation and templates**
+Create `docs-links.yml` directly in final-state shape: ordinary read-only PR validation; default-branch schedule; split link reader/issue writer; split snapshot reader/writer; and no-input manual refresh. It contains no temporary rc target, controller attestation, protected-file lifecycle, or caller-selected executable.
 
-Generate the schema-versioned snapshot from the exact authenticated rc tip with fixed detector/correlator/ref. The future writer template has only `contents: write`, no checkout or repository code, revalidates schema and current rc SHA, and submits only after validation. Produce and test c2 plus inverse rollback patch templates; keep schedule/snapshot jobs unreachable in the rc workflow's validation-only copy used by PR (c).
+- [ ] **Step 8: Verify and commit in two adjacent checkpoints**
 
-- [ ] **Step 8: Verify the whole WP8a tool**
-
-Add each CLI/workflow/snapshot dependency only in the standalone manifest,
-regenerate its lockfile, and require `git diff --quiet -- Cargo.lock` before the
-commands below. First stage the complete capture-ready Task 10 source except the
-two not-yet-generated golden files, review it under the package checkpoint rule,
-and commit the authenticated source used by both native runners:
+First commit capture-ready sources and workflow foundation:
 
 ```bash
-git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-parity/src/cli_help.rs tools/docs-parity/src/snippets.rs tools/docs-parity/src/gates.rs tools/docs-parity/src/workflow.rs tools/docs-parity/src/dependency_snapshot.rs tools/docs-parity/src/main.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/model.rs tools/docs-parity/src/repository.rs tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/cli-overrides.toml tools/docs-parity/manifests/snippets.toml tools/docs-parity/manifests/gates.toml tools/docs-parity/tests/cli_help.rs tools/docs-parity/tests/snippets.rs tools/docs-parity/tests/gates.rs tools/docs-parity/tests/workflow.rs tools/docs-parity/tests/dependency_snapshot.rs .github/workflows/docs-links.yml docs/internal/runbooks/documentation-automation-rollback.md docs/internal/runbooks/patches/docs-links-c2.patch docs/internal/runbooks/patches/docs-links-rollback-c2.patch docs/internal/audits/documentation-refresh-evidence.md
-git diff --cached --check
-git commit -m "Add documentation enforcement scaffolding"
-```
-
-Run the two native captures at that exact commit, import them without hand
-editing, regenerate `tracked-files.toml`/`maintained-sources.toml`, and append
-the complete provenance and raw/output hashes to the evidence ledger. Fully
-stage those five exact paths, require `git diff --quiet`, and then run:
-
-```bash
-./scripts/test-cli.sh
-cargo test --manifest-path tools/docs-parity/Cargo.toml
+cargo test --manifest-path tools/docs-parity/Cargo.toml cli_help
+cargo test --manifest-path tools/docs-parity/Cargo.toml snippets
+cargo test --manifest-path tools/docs-parity/Cargo.toml gates
+cargo test --manifest-path tools/docs-parity/Cargo.toml workflow
+cargo test --manifest-path tools/docs-parity/Cargo.toml dependency_snapshot
 cargo fmt --manifest-path tools/docs-parity/Cargo.toml -- --check
 cargo clippy --manifest-path tools/docs-parity/Cargo.toml --all-targets -- -D warnings
-cargo run --manifest-path tools/docs-parity/Cargo.toml -- check --all
+git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-parity/src/cli_help.rs tools/docs-parity/src/snippets.rs tools/docs-parity/src/gates.rs tools/docs-parity/src/workflow.rs tools/docs-parity/src/dependency_snapshot.rs tools/docs-parity/src/main.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/model.rs tools/docs-parity/src/repository.rs tools/docs-parity/manifests/cli-overrides.toml tools/docs-parity/manifests/snippets.toml tools/docs-parity/manifests/gates.toml tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/tests/cli_help.rs tools/docs-parity/tests/snippets.rs tools/docs-parity/tests/gates.rs tools/docs-parity/tests/workflow.rs tools/docs-parity/tests/dependency_snapshot.rs .github/workflows/test.yml .github/workflows/docs-links.yml docs/internal/audits/documentation-refresh-evidence.md
+git diff --cached --check
+git commit -m "Add documentation enforcement foundations"
+git push origin spec-docs-refresh
 ```
 
-Expected: all positive and negative fixtures pass for their intended reasons; update mode followed by check mode yields no diff.
-
-- [ ] **Step 9: Commit WP8a**
+After the native artifacts return, stage only the goldens, regenerated tracked/source manifests, and evidence:
 
 ```bash
 git add tools/docs-parity/goldens/cli-linux.txt tools/docs-parity/goldens/cli-macos.txt tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml docs/internal/audits/documentation-refresh-evidence.md
 git diff --cached --check
+cargo test --manifest-path tools/docs-parity/Cargo.toml
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- check --all
 git commit -m "Record cross-platform CLI help goldens"
 ```
 
-Expected: Task 10 is the adjacent two-commit series above; both capture
-provenance records name the first commit, all final checks run with the second
-commit's candidate bytes, and neither commit is squashed.
-
-### Task 11: Install the validation-only `main` controller in PR (c)
-
-**Files on the isolated `main` branch:**
-
-- Create: `.github/workflows/docs-links.yml`
-
-- [ ] **Step 1: Cut from a fresh `origin/main` and record the PR-specific tip**
-
-Use `@superpowers:using-git-worktrees`; record the full `audited_main_tip` and
-the rc PR #1049 head used as the reviewed source in PR (c)'s external handoff
-block. Attach the complete pre-change `main` ruleset/branch-protection JSON
-there. Do not add the rc-only audit records to this isolated branch.
-
-- [ ] **Step 2: Materialize only the validation form**
-
-Copy the complete reviewed validation-only workflow: the base-controlled PR
-gate, manual `validate_rc`/`validate_main_pr`/`validate_main_maintenance`, status
-attestation, and the schedule-only link reader/issue writer definitions, which
-remain unreachable because there is no `schedule:` trigger. The maintenance
-operation is also present but fail-closed until the normal post-(e) steady-state
-predicate is true. Omit `schedule:`,
-`refresh_dependency_snapshot`, snapshot jobs, and rc-targeted Dependabot
-entries. Record the full workflow blob hash; the controller, attestation, and
-unreachable link/issue definitions are frozen through c2.
-
-- [ ] **Step 3: Validate the exact candidate statically**
-
-Run the rc PR tool against the candidate workflow as data. Expected:
-controller-current-main assertions, event guards, exact permissions, no
-untrusted checkout/execution, action pins, dispatch input closure,
-base-vs-head net-equality handling, c2/e/rollback templates, and the
-same-lifecycle repair/sync plus pre-/post-handoff maintenance predicates all
-pass.
-
-- [ ] **Step 4: Commit and open PR (c)**
-
-```bash
-git add .github/workflows/docs-links.yml
-git diff --cached --check
-git diff --cached --name-status "$AUDITED_MAIN_TIP"
-git commit -m "Install documentation automation controller"
-```
-
-Before merge, refetch and require the PR's current base to equal its recorded
-tip. Put review and a successful manual `validate_rc` dispatch using `tool_sha`
-equal to the current #1049 head and `ref: main` in the external handoff block.
-
-- [ ] **Step 5: Seed all existing `main` PRs before requiring the context**
-
-Inventory every open `main` PR and authenticate its current head/base. Retrigger
-the automatic net-empty-protected-delta path or use the authenticated bootstrap
-path; record a `docs/automation-delta` result for every head. Do not enable the
-required context while any existing PR is missing it.
-
-- [ ] **Step 6: Enable and prove branch protection**
-
-Require `docs/automation-delta` from the GitHub Actions app for every `main` PR
-and enable strict/up-to-date enforcement. Demonstrate an unauthorized
-protected-file delta is blocked and an unrelated PR receives success without a
-privileged checkout. Record that merge queues are disabled for `main`; if they
-are active, stop until the approved question-7 branch disables them or a
-separate reviewed design updates the spec, plan, controller, and fixtures.
-Record queue adoption as blocked through PR (e).
-
-- [ ] **Step 7: Exercise controller rollback on paper**
-
-Review the exact procedure: remove only the new required context and restore prior strictness before disabling/reverting the controller; repair and re-prove block/pass before re-enabling. Attach the ruleset IDs and owner.
-
-- [ ] **Step 8: Import controller rollout evidence into rc**
-
-After PR (c), status seeding, and protection proofs complete, return to the rc
-worktree. Append the external handoff block, authenticated merge/base/rc-source
-SHAs, full before/after ruleset captures, seeded PR results, block/pass proof,
-queue state, and rollback owner to the rc records. Commit this adjacent evidence
-checkpoint before Task 12:
-
-```bash
-git add docs/internal/audits/documentation-refresh-evidence.md docs/internal/audits/documentation-refresh-decisions.md
-git diff --cached --check
-git diff --cached --name-status HEAD
-git commit -m "Record documentation controller rollout"
-git status --porcelain
-```
-
-Expected: only the two rc audit records are committed and final status is empty.
-
-### Task 12: Complete WP2 truth pass and dispositions
+### Task 10: Complete WP2 truth pass and dispositions
 
 **Files:**
 
@@ -1017,14 +625,12 @@ Expected: only the two rc audit records are committed and final status is empty.
 - Modify: `docs/guide/roadmap.md`
 - Modify: `docs/guide/integrations/gam.md`
 - Modify: `docs/guide/integrations/kargo.md`
+- Modify: `docs/.vitepress/config.mts`
 - Create: `docs/guide/auction-testing.md`
 - Modify: `crates/trusted-server-core/src/auction/README.md`
 - Modify: `TESTING.md`
 - Retire/Move/Modify: `FAQ_POC.md`
 - Create only on FAQ archive path: `docs/superpowers/archive/FAQ_POC.md`
-- Create only on FAQ rewrite path: `docs/guide/faq.md`
-- Modify only on FAQ rewrite path: `docs/guide/index.md`
-- Modify only on FAQ rewrite path: `docs/.vitepress/config.mts`
 - Modify: `CHANGELOG.md`
 - Modify: `.env.example`
 - Modify: `.env.dev`
@@ -1060,19 +666,15 @@ Replace `RequestWrapper` with real platform traits; remove Equativ, `.with_asset
 The selected FAQ branch is **archive**: move `FAQ_POC.md` to
 `docs/superpowers/archive/FAQ_POC.md`. The retire and rewrite instructions
 remain rejected/reference-only unless Task 1's FAQ decision is formally
-reopened and this plan is amended and re-approved. For reference, retire
-deletes `FAQ_POC.md`; rewrite moves it to
-`docs/guide/faq.md`, verifies every answer against code, links it from the
-Guide landing page and Reference navigation, registers `/guide/faq` in
-`pages.toml`, and adds a built-page smoke for `guide/faq.html`. Every branch
-removes the root path from the active-repo inventory; only rewrite adds an
-active public page. Independently replace GAM/Kargo with route-preserving
+reopened and this plan is amended and re-approved. The rejected retire and rewrite alternatives are not executable plan branches. Remove the root path from the active-repo inventory and add no active FAQ page or route. Independently replace GAM/Kargo with route-preserving
 tombstones, remove sidebar reachability, and add old-route/tombstone smokes to
 `pages.toml`.
 
 - [ ] **Step 5: Rewrite testing and operator records**
 
 Make root `TESTING.md` the test-matrix index, move the verified auction runbook into `docs/guide/auction-testing.md`, normalize the deterministic no-release CHANGELOG form, distinguish runtime env from CLI overlay, fix roadmap status, and repair the three known workflow/script comments.
+
+Record whether operator-visible CHANGELOG entries are complete for the audited range; if an entry is intentionally omitted, record the exact exclusion and source anchor. Formatting alone does not satisfy this check.
 
 - [ ] **Step 6: Reverify rc-delta content instead of blindly changing it**
 
@@ -1089,10 +691,7 @@ cargo run --manifest-path tools/docs-parity/Cargo.toml -- pages --check
 cd docs && npm run lint && npm run format && npm run build
 ```
 
-On the FAQ rewrite branch, additionally assert
-`docs/.vitepress/dist/guide/faq.html` exists and contains the expected FAQ
-heading and that `/guide/faq` is present in generated navigation. On retire and
-archive, assert that artifact and route are absent.
+Assert that `docs/.vitepress/dist/guide/faq.html` and `/guide/faq` navigation are absent on the selected archive path.
 
 Expected: set equality passes; retired terms are absent from active sets with only the spec-defined historical exceptions; every executable fence has a valid manifest entry and diagnostic.
 
@@ -1106,26 +705,18 @@ Stage the common WP2 paths first, then the selected archive branch and only the
 conditional fixture paths that actually changed:
 
 ```bash
-git add docs/internal/audits/documentation-refresh-inventory.toml docs/internal/audits/documentation-refresh-evidence.md docs/guide/ad-serving.md docs/guide/architecture.md docs/guide/configuration.md docs/guide/creative-processing.md docs/guide/error-reference.md docs/guide/integration-guide.md docs/guide/roadmap.md docs/guide/integrations/gam.md docs/guide/integrations/kargo.md docs/guide/auction-testing.md TESTING.md CHANGELOG.md .env.example .env.dev .claude/agents/code-architect.md .claude/agents/issue-creator.md .github/workflows/test.yml scripts/test-cli.sh crates/trusted-server-core/src/auction/README.md crates/trusted-server-openrtb/generate.sh tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/retired-identifiers.toml tools/docs-parity/manifests/snippets.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/orphans.toml
-# Retire branch:
-git add -A -- FAQ_POC.md
-# Archive branch instead:
+git add docs/internal/audits/documentation-refresh-inventory.toml docs/internal/audits/documentation-refresh-evidence.md docs/guide/ad-serving.md docs/guide/architecture.md docs/guide/configuration.md docs/guide/creative-processing.md docs/guide/error-reference.md docs/guide/integration-guide.md docs/guide/roadmap.md docs/guide/integrations/gam.md docs/guide/integrations/kargo.md docs/guide/auction-testing.md docs/.vitepress/config.mts TESTING.md CHANGELOG.md .env.example .env.dev .claude/agents/code-architect.md .claude/agents/issue-creator.md .github/workflows/test.yml scripts/test-cli.sh crates/trusted-server-core/src/auction/README.md crates/trusted-server-openrtb/generate.sh tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/retired-identifiers.toml tools/docs-parity/manifests/snippets.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/orphans.toml
 git add -A -- FAQ_POC.md docs/superpowers/archive/FAQ_POC.md
-# Rewrite branch instead:
-git add -A -- FAQ_POC.md docs/guide/faq.md docs/guide/index.md docs/.vitepress/config.mts
 # Only when the scanner required this fixture edit:
 git add crates/trusted-server-core/src/html_processor.test.html
 git commit -m "Correct maintained documentation truth"
 ```
 
-The comments preserve mutually exclusive reference branches; execute the
-archive command only unless the decision is formally reopened and this plan is
-amended and re-approved.
 If the mechanical inventory selects another human-facing comment path, add
 that one exact path to the reviewed list before running the checkpoint—never
 replace this list with `git add docs`, `git add .github`, or another directory.
 
-### Task 13: Complete WP3 configuration reference and template
+### Task 11: Complete WP3 configuration reference and template
 
 **Files:**
 
@@ -1133,6 +724,8 @@ replace this list with `git add docs`, `git add .github`, or another directory.
 - Modify: `docs/guide/cli.md`
 - Modify: `trusted-server.example.toml`
 - Modify: `tools/docs-parity/manifests/settings-companions.toml`
+- Modify: `tools/docs-parity/manifests/snippets.toml`
+- Modify: PR #1049 description through GitHub API/CLI
 
 - [ ] **Step 1: Make parity fail on the baseline gaps**
 
@@ -1155,6 +748,7 @@ Classify the 11 store-resolved paths, inline trusted-client-IP secret, and disca
 ```bash
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- settings --check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- examples --check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- snippets --check
 cargo test-fastly config
 cd docs && npm run lint && npm run format && npm run build
 ```
@@ -1164,18 +758,25 @@ Expected: every active canonical field appears in reference/template, noncanonic
 - [ ] **Step 6: Commit WP3**
 
 ```bash
-git add docs/guide/configuration.md docs/guide/cli.md trusted-server.example.toml tools/docs-parity/manifests/settings-companions.toml docs/internal/audits/documentation-refresh-evidence.md
+git add docs/guide/configuration.md docs/guide/cli.md trusted-server.example.toml tools/docs-parity/manifests/settings-companions.toml tools/docs-parity/manifests/snippets.toml docs/internal/audits/documentation-refresh-evidence.md
 git commit -m "Complete configuration documentation"
 ```
 
-### Task 14: Complete WP4 generated API contracts
+- [ ] **Step 7: Push and publish the Appendix B parity checklist to #1049**
+
+Push the clean WP3 commit to `origin/spec-docs-refresh`, then update only the bounded `<!-- docs-refresh:settings-parity:start -->` / `<!-- docs-refresh:settings-parity:end -->` region of PR #1049's description. Render the checklist from the checked settings record and include all 17 roots, all 14 deploy IDs, all three provider profile schemas, the directional-disposition axes, the secret classifications, and the exact WP3 check results. Read the description back through the GitHub API/CLI and require the rendered rows to equal the checked record; preserve every unrelated PR-description section.
+
+Append the readback timestamp, PR body hash, and equality result to `documentation-refresh-evidence.md`; commit it immediately as `Record configuration checklist publication` and push it. Do not include the receipt commit's own SHA in its body.
+
+### Task 12: Complete WP4 generated API contracts
 
 **Files:**
 
 - Modify: `docs/guide/api-reference.md`
 - Modify: `tools/docs-parity/manifests/routes.toml`
 - Modify: `tools/docs-parity/manifests/adapter-support.toml`
-- Modify/Test only for test seams: the four adapter `src/app.rs` files and route tests from Task 9
+- Modify: `tools/docs-parity/manifests/snippets.toml`
+- Modify/Test only for test seams: the four adapter `src/app.rs` files and route tests from Task 8
 
 - [ ] **Step 1: Make route generation fail on reader drift**
 
@@ -1194,6 +795,7 @@ For every endpoint, cover auth, schemas, status codes, cache/CORS, config gates,
 ```bash
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- routes --check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- generate --check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- snippets --check
 cargo test-fastly
 cargo test-axum
 cargo test-cloudflare
@@ -1206,11 +808,11 @@ Expected: no adapter can add/remove/change a route without a record and generate
 - [ ] **Step 5: Commit WP4**
 
 ```bash
-git add docs/guide/api-reference.md tools/docs-parity/manifests/routes.toml tools/docs-parity/manifests/adapter-support.toml crates/trusted-server-adapter-fastly/src/app.rs crates/trusted-server-adapter-axum/src/app.rs crates/trusted-server-adapter-axum/tests/routes.rs crates/trusted-server-adapter-cloudflare/src/app.rs crates/trusted-server-adapter-cloudflare/tests/routes.rs crates/trusted-server-adapter-spin/src/app.rs crates/trusted-server-adapter-spin/tests/routes.rs docs/internal/audits/documentation-refresh-evidence.md
+git add docs/guide/api-reference.md tools/docs-parity/manifests/routes.toml tools/docs-parity/manifests/adapter-support.toml tools/docs-parity/manifests/snippets.toml crates/trusted-server-adapter-fastly/src/app.rs crates/trusted-server-adapter-axum/src/app.rs crates/trusted-server-adapter-axum/tests/routes.rs crates/trusted-server-adapter-cloudflare/src/app.rs crates/trusted-server-adapter-cloudflare/tests/routes.rs crates/trusted-server-adapter-spin/src/app.rs crates/trusted-server-adapter-spin/tests/routes.rs docs/internal/audits/documentation-refresh-evidence.md
 git commit -m "Generate adapter API documentation"
 ```
 
-### Task 15: Add deployment guides and recurring first-success smokes
+### Task 13: Add deployment guides and recurring first-success smokes
 
 **Files:**
 
@@ -1230,6 +832,8 @@ git commit -m "Generate adapter API documentation"
 - Modify: `tools/docs-parity/manifests/maintained-sources.toml`
 - Modify: `tools/docs-parity/manifests/pages.toml`
 - Modify: `tools/docs-parity/manifests/orphans.toml`
+- Modify: `tools/docs-parity/manifests/snippets.toml`
+- Modify: PR #1049 description through GitHub API/CLI
 
 - [ ] **Step 1: Write smoke failures before guides**
 
@@ -1255,16 +859,16 @@ Set the required store mapping to `default`, local-push into `.spin/`, encode/ex
 
 Every guide command must be copyable and remain in the same order as the recurring script. State maturity, fan-out, health/startup, and unwired-store limitations from `adapter-support.toml`; a successful push is not described as a configured runtime where the bridge is still required.
 
-Register the four new public pages immediately. Until Task 16 adds their final
+Register the four new public pages immediately. Until Task 14 adds their final
 navigation, give any genuinely unreachable page a typed temporary orphan entry
-owned by WP5 and expiring at Task 16; Task 16 must remove that entry.
+owned by WP5 and expiring at Task 14; Task 14 must remove that entry.
 
 - [ ] **Step 6: Wire runnable scripts into integration CI**
 
 Run `chmod +x scripts/smoke-axum.sh scripts/smoke-fastly.sh
 scripts/smoke-cloudflare.sh scripts/smoke-spin.sh`. Run Axum, Fastly, and
 Cloudflare smokes in the existing integration workflow after their artifacts
-are prepared. Consume Wrangler from the Task 15 `.tool-versions` pin, not an
+are prepared. Consume Wrangler from the Task 13 `.tool-versions` pin, not an
 unpinned global latest. Preserve existing integration suites.
 
 - [ ] **Step 7: Verify focused journeys**
@@ -1278,15 +882,27 @@ bash -n scripts/smoke-axum.sh scripts/smoke-fastly.sh scripts/smoke-cloudflare.s
 
 Run Spin or attach its time-bounded evidence. Then run the integration-test parity target and docs build.
 
+```bash
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- snippets --check
+cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity
+cd docs && npm run lint && npm run format && npm run build
+```
+
 - [ ] **Step 8: Commit the deployment half of WP5**
 
 ```bash
-git add docs/guide/fastly.md docs/guide/cloudflare.md docs/guide/spin.md docs/guide/axum-dev.md scripts/smoke-fastly.sh scripts/smoke-cloudflare.sh scripts/smoke-spin.sh scripts/smoke-axum.sh .tool-versions .github/workflows/integration-tests.yml crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml crates/trusted-server-adapter-cloudflare/wrangler.ci.toml tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/orphans.toml docs/internal/audits/documentation-refresh-evidence.md
+git add docs/guide/fastly.md docs/guide/cloudflare.md docs/guide/spin.md docs/guide/axum-dev.md scripts/smoke-fastly.sh scripts/smoke-cloudflare.sh scripts/smoke-spin.sh scripts/smoke-axum.sh .tool-versions .github/workflows/integration-tests.yml crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml crates/trusted-server-adapter-cloudflare/wrangler.ci.toml tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/orphans.toml tools/docs-parity/manifests/snippets.toml docs/internal/audits/documentation-refresh-evidence.md
 git ls-files --stage scripts/smoke-axum.sh scripts/smoke-fastly.sh scripts/smoke-cloudflare.sh scripts/smoke-spin.sh | awk '$1 != "100755" { bad=1 } END { exit bad }'
 git commit -m "Document adapter deployment journeys"
 ```
 
-### Task 16: Complete WP5 product coverage and navigation
+- [ ] **Step 9: Push and publish exact smoke journeys to #1049**
+
+Push the clean deployment-guide commit to `origin/spec-docs-refresh` and wait for its hosted smoke jobs. Then update only the bounded `<!-- docs-refresh:adapter-smokes:start -->` / `<!-- docs-refresh:adapter-smokes:end -->` region of PR #1049's description. For Axum, Fastly, Cloudflare, and Spin, include the exact command sequence invoked by the recurring script, its generated-state and process cleanup procedure, the strong success oracle, the two independent negative cases, and the immutable run URL or time-bounded Spin receipt. Read the description back and require each script's command and cleanup sequence to match its checked snippet records; preserve every unrelated PR-description section.
+
+Append the readback timestamp, PR body hash, run URLs or Spin receipt, and equality result to `documentation-refresh-evidence.md`; commit it immediately as `Record adapter smoke publication` and push it. Do not include the receipt commit's own SHA in its body.
+
+### Task 14: Complete WP5 product coverage and navigation
 
 **Files:**
 
@@ -1303,7 +919,7 @@ git commit -m "Document adapter deployment journeys"
 - Modify: `docs/.vitepress/config.mts`
 - Modify: `docs/package.json`
 - Modify: `.github/workflows/deploy-docs.yml`
-- Read/verify: `.tool-versions` (Wrangler pin established in Task 15)
+- Read/verify: `.tool-versions` (Wrangler pin established in Task 13)
 - Create/Test: `crates/trusted-server-integration-tests/tests/documentation_snippets.rs`
 - Modify: `tools/docs-parity/manifests/tracked-files.toml`
 - Modify: `tools/docs-parity/manifests/maintained-sources.toml`
@@ -1355,7 +971,7 @@ git add docs/guide/edgezero.md docs/guide/telemetry.md docs/guide/tsjs.md docs/g
 git commit -m "Add full documentation product coverage"
 ```
 
-### Task 17: Complete WP6 root and crate documentation
+### Task 15: Complete WP6 root and crate documentation
 
 **Files:**
 
@@ -1372,14 +988,17 @@ git commit -m "Add full documentation product coverage"
 - Create: `crates/trusted-server-cli/README.md`
 - Create: `crates/trusted-server-js/README.md`
 - Create: `crates/trusted-server-openrtb-codegen/README.md`
+- Read/verify: `crates/trusted-server-openrtb/README.md`
 - Create: `scripts/README.md`
 - Modify: each corresponding crate `Cargo.toml`
+- Modify: `crates/trusted-server-openrtb/Cargo.toml`
 - Modify: `tools/docs-parity/manifests/tracked-files.toml`
 - Modify: `tools/docs-parity/manifests/maintained-sources.toml`
+- Modify: `tools/docs-parity/manifests/snippets.toml`
 
 - [ ] **Step 1: Add the failing README equality test**
 
-Use `cargo metadata --no-deps` to enumerate every package. Expected before edits: seven missing README files and/or missing `readme =` metadata. Include an extra/unlisted README negative fixture.
+Use `cargo metadata --no-deps` to enumerate every package. Expected before edits: seven missing README files and ten package manifests missing `readme =` metadata. Include an extra/unlisted README negative fixture.
 
 - [ ] **Step 2: Correct canonical contributor/operator prose**
 
@@ -1397,6 +1016,7 @@ Add exact `readme = "README.md"` entries to the seven new crate manifests and an
 
 ```bash
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- readmes --check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- snippets --check
 cargo metadata --no-deps --format-version 1
 cargo fmt --all -- --check
 cd docs && npm run lint && npm run format && npm run build
@@ -1407,11 +1027,11 @@ Expected: every package maps to an existing README and all active root/crate/ski
 - [ ] **Step 6: Commit WP6**
 
 ```bash
-git add README.md CONTRIBUTING.md CLAUDE.md ProjectGovernance.md crates/trusted-server-core/README.md crates/trusted-server-core/Cargo.toml crates/trusted-server-integration-tests/README.md crates/trusted-server-integration-tests/Cargo.toml crates/trusted-server-adapter-axum/README.md crates/trusted-server-adapter-cloudflare/README.md crates/trusted-server-adapter-fastly/README.md crates/trusted-server-adapter-spin/README.md crates/trusted-server-cli/README.md crates/trusted-server-js/README.md crates/trusted-server-openrtb-codegen/README.md crates/trusted-server-adapter-axum/Cargo.toml crates/trusted-server-adapter-cloudflare/Cargo.toml crates/trusted-server-adapter-fastly/Cargo.toml crates/trusted-server-adapter-spin/Cargo.toml crates/trusted-server-cli/Cargo.toml crates/trusted-server-js/Cargo.toml crates/trusted-server-openrtb-codegen/Cargo.toml scripts/README.md tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml docs/internal/audits/documentation-refresh-evidence.md
+git add README.md CONTRIBUTING.md CLAUDE.md ProjectGovernance.md crates/trusted-server-core/README.md crates/trusted-server-core/Cargo.toml crates/trusted-server-integration-tests/README.md crates/trusted-server-integration-tests/Cargo.toml crates/trusted-server-adapter-axum/README.md crates/trusted-server-adapter-cloudflare/README.md crates/trusted-server-adapter-fastly/README.md crates/trusted-server-adapter-spin/README.md crates/trusted-server-cli/README.md crates/trusted-server-js/README.md crates/trusted-server-openrtb-codegen/README.md crates/trusted-server-openrtb/Cargo.toml crates/trusted-server-adapter-axum/Cargo.toml crates/trusted-server-adapter-cloudflare/Cargo.toml crates/trusted-server-adapter-fastly/Cargo.toml crates/trusted-server-adapter-spin/Cargo.toml crates/trusted-server-cli/Cargo.toml crates/trusted-server-js/Cargo.toml crates/trusted-server-openrtb-codegen/Cargo.toml scripts/README.md tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/snippets.toml docs/internal/audits/documentation-refresh-evidence.md
 git commit -m "Refresh contributor and crate documentation"
 ```
 
-### Task 18: Complete WP7 rustdoc and JSDoc
+### Task 16: Complete WP7 rustdoc and JSDoc
 
 **Files:**
 
@@ -1520,7 +1140,7 @@ git add crates/trusted-server-core/src/lib.rs crates/trusted-server-core/src/pla
 git commit -m "Complete in-code documentation"
 ```
 
-### Task 19: Activate WP8b CI gates and release controls
+### Task 17: Activate final CI and release-pending controls
 
 **Files:**
 
@@ -1538,114 +1158,72 @@ git commit -m "Complete in-code documentation"
 - Modify: `TESTING.md`
 - Modify: `docs/guide/testing.md`
 - Create: `docs/internal/runbooks/documentation-automation-release.md`
-- Create: `docs/internal/runbooks/patches/docs-links-release-retarget.patch`
-- Create: `docs/internal/runbooks/patches/docs-links-release-disable.patch`
-- Modify: `tools/docs-parity/src/gates.rs`
-- Modify: `tools/docs-parity/src/workflow.rs`
-- Modify: `tools/docs-parity/src/dependency_snapshot.rs`
-- Modify/Test: `tools/docs-parity/tests/gates.rs`
-- Modify/Test: `tools/docs-parity/tests/workflow.rs`
-- Modify/Test: `tools/docs-parity/tests/dependency_snapshot.rs`
-- Modify: `tools/docs-parity/manifests/tracked-files.toml`
-- Modify: `tools/docs-parity/manifests/maintained-sources.toml`
-- Modify: `tools/docs-parity/manifests/gates.toml`
+- Modify: `tools/docs-parity/src/{gates,workflow,dependency_snapshot}.rs`
+- Modify/Test: `tools/docs-parity/tests/{gates,workflow,dependency_snapshot}.rs`
+- Modify: `tools/docs-parity/manifests/{tracked-files,maintained-sources,gates,snippets}.toml`
+- Modify: `docs/internal/audits/documentation-refresh-evidence.md`
 
-- [ ] **Step 1: Make static workflow fixtures fail for current gaps**
+- [ ] **Step 1: Write failing automation fixtures**
 
-Assert missing rc CodeQL triggers, rustdoc/doctest/docs-parity jobs, nested lockfile cache keys, setup-node lockfile paths, Dependabot roots, Wrangler pin, gate-region equality, schedule trust split, release patches, and openrtb-codegen workspace lints.
+Assert missing rc CodeQL triggers, docs-parity jobs, rustdoc/doctest jobs, nested lockfile cache inputs, Node pins, Dependabot roots, Wrangler pin, generated gate equality, action SHA pins, final `main` targets, reader/writer separation, closed manual refresh, and release-pending runbook fields.
 
 - [ ] **Step 2: Wire blocking deterministic checks**
 
-Add host docs-parity fmt/clippy/test/check, generated clean-diff, settings/examples/inventory/snippets/scanner/local links/readmes/jsdoc/workflow fixtures, rustdoc matrix, and native doctests. Pin Node wherever the JS build script runs. Keep external network links scheduled, not a flaky PR dependency.
+Add host docs-parity fmt/clippy/test/check, generated no-diff, settings/examples/inventory/snippets/scanner/local links/readmes/JSDoc/workflow fixtures, rustdoc matrix, native doctests, docs build, and existing target regression jobs. External network links remain scheduled, not a PR dependency.
 
 - [ ] **Step 3: Normalize existing automation**
 
-Add CodeQL `rc/*` PR triggers, `.tool-versions` deploy paths, lockfile-based
-setup-node cache keys, pinned Wrangler, GitHub
-Actions/browser/Next.js/docs-parity Dependabot roots, and
-`[lints] workspace = true`. Choose current stable action versions at
-implementation time and pin every new `uses` reference by full SHA with its
-source version recorded. The `docs-links.yml` action pins were selected and
-frozen in Tasks 10-11; verify them here but do not repin or otherwise change a
-non-activation byte. A required repin takes the controller-repair path.
+Add CodeQL `rc/*` PR triggers, `.tool-versions` deploy paths, exact setup-node lockfile paths, pinned Wrangler, all approved Dependabot roots targeting `main`, and `[lints] workspace = true`. Choose current stable action/tool versions at implementation time, cite their primary release sources, and pin every new `uses` by full SHA.
 
-- [ ] **Step 4: Finalize the rc workflow's activated form**
+- [ ] **Step 4: Finalize `docs-links.yml`**
 
-Starting from the exact workflow hash recorded in Task 11, add only the
-reviewed c2 activation regions: weekly `17 9 * * 1`, the fixed stateful
-schedule/refresh path already configured on the dormant link jobs, and the
-split snapshot generator/writer plus closed refresh operation with their
-20/5-minute timeouts. Preserve every
-non-activation byte, including per-PR serialization, controller,
-attestation, current-`main` assertion, fail-closed future maintenance mode, and
-unreachable link/issue definitions.
-The issue writer schema-validates bounded results, deduplicates the single
-owned report issue, and auto-closes it after a clean scheduled run. Generate a
-fresh c2 patch and its inverse covering both protected files. Record the final
-rc mode/blob IDs for `.github/workflows/docs-links.yml` and
-`.github/dependabot.yml`; prove the c2 base workflow hashes to the Task 11 blob,
-and prove applying c2 produces mode/blob identity with rc for both protected
-paths. The inverse must restore both base blobs without overwriting unrelated
-base changes. If a non-activation byte must change, stop and ship a separately
-reviewed controller-repair PR before continuing; do not hide it in c2.
+Preserve ordinary read-only PR validation. Finalize weekly `17 9 * * 1` schedule, fixed non-canceling concurrency, 30/20/5-minute timeouts, bounded artifacts, issue dedup/auto-close, fixed snapshot identity, authenticated default-branch SHA, and no-input manual refresh. Require no `pull_request_target`, `merge_group`, status writer, temporary rc target, retirement path, or caller-selected tool.
 
-- [ ] **Step 5: Finalize release and rollback runbooks**
+- [ ] **Step 5: Write the release-pending runbook**
 
-Provide normal and abandonment patch templates, freeze semantics, queued-run
-enumeration, optional separately scoped `actions: write` cancellation token,
-empty same-identity retirement request, 201 receipt fields,
-automatic-main-graph verification, branch deletion gate, CNAME fallback, and
-branch-protection restoration ordering. The normal runbook requires
-base-vs-rc-head mode/blob identity for both protected paths before the broad
-release merge and a separately reviewed sync/repair PR if they differ; it also
-proves post-(e) maintenance before closure. Add an rc dependency-change
-checklist with a named owner: every merge changing
-`tools/docs-parity/Cargo.toml` or `tools/docs-parity/Cargo.lock` remains
-incomplete until a post-merge `refresh_dependency_snapshot` receipt is
-attached; missed/failed refreshes are security-coverage incidents and the
-weekly run is only a reconciliation backstop.
+Document exact post-main Pages/CNAME smoke, first scheduled link run, first dependency submission and 201/graph proof, Dependabot/action-pin inspection, alert owner/SLA, and optional branch-protection activation only after contexts report from expected apps. Mark every receipt release-pending; do not create another PR or claim execution from rc.
 
 - [ ] **Step 6: Generate all gate consumers**
 
-Regenerate CLAUDE/AGENTS/TESTING/guide testing regions from `gates.toml`; prove command files and CONTRIBUTING remain link-only. A second generation must produce no diff.
+Regenerate CLAUDE/AGENTS/TESTING/guide testing from `gates.toml`. Prove command files, CONTRIBUTING, and PR template remain link-only. A second generation produces no diff.
 
-- [ ] **Step 7: Run WP8b focused acceptance**
+- [ ] **Step 7: Deduplicate all code follow-ups**
+
+Search the tracker for every item in the spec. File or record an exact existing-issue disposition for all twelve, with URL, owner, and labels. Do not collapse distinct adapter-store, config-bridge, health, reserved-field, placeholder, inline-secret, deploy-ID, CLI-help, telemetry, env-store, or staging-blob findings.
+
+- [ ] **Step 8: Run WP8 acceptance and commit**
 
 ```bash
 cargo test --manifest-path tools/docs-parity/Cargo.toml
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- check --all
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- generate --check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- snippets --check
 cargo fmt --manifest-path tools/docs-parity/Cargo.toml -- --check
 cargo clippy --manifest-path tools/docs-parity/Cargo.toml --all-targets -- -D warnings
 cargo fmt --all -- --check
 cd docs && npm run lint && npm run format && npm run build
 ```
 
-Expected: all static/runtime negative fixtures fail for their intended diagnostic, then the real repository passes; generation is idempotent.
-
-- [ ] **Step 8: Deduplicate and file every code follow-up**
-
-Search the tracker for each item in the spec's “Follow-up issues to file” section. File or record an existing-issue disposition for all twelve items, with URL, owner, and labels in the evidence record; do not collapse the adapter-store, config-bridge, health-contract, reserved-field, placeholder, inline-secret, deploy-ID, CLI-help, telemetry, env-store, or staging-blob issues into vague umbrella tickets.
-
-- [ ] **Step 9: Commit WP8b**
+Stage exactly the enumerated files and commit:
 
 ```bash
-git add .github/workflows/format.yml .github/workflows/test.yml .github/workflows/integration-tests.yml .github/workflows/codeql.yml .github/workflows/deploy-docs.yml .github/workflows/docs-links.yml .github/dependabot.yml .tool-versions crates/trusted-server-openrtb-codegen/Cargo.toml CLAUDE.md AGENTS.md TESTING.md docs/guide/testing.md docs/internal/runbooks/documentation-automation-release.md docs/internal/runbooks/patches/docs-links-release-retarget.patch docs/internal/runbooks/patches/docs-links-release-disable.patch tools/docs-parity/src/gates.rs tools/docs-parity/src/workflow.rs tools/docs-parity/src/dependency_snapshot.rs tools/docs-parity/tests/gates.rs tools/docs-parity/tests/workflow.rs tools/docs-parity/tests/dependency_snapshot.rs tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/gates.toml docs/internal/audits/documentation-refresh-evidence.md
+git add .github/workflows/format.yml .github/workflows/test.yml .github/workflows/integration-tests.yml .github/workflows/codeql.yml .github/workflows/deploy-docs.yml .github/workflows/docs-links.yml .github/dependabot.yml .tool-versions crates/trusted-server-openrtb-codegen/Cargo.toml CLAUDE.md AGENTS.md TESTING.md docs/guide/testing.md docs/internal/runbooks/documentation-automation-release.md tools/docs-parity/src/gates.rs tools/docs-parity/src/workflow.rs tools/docs-parity/src/dependency_snapshot.rs tools/docs-parity/tests/gates.rs tools/docs-parity/tests/workflow.rs tools/docs-parity/tests/dependency_snapshot.rs tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/gates.toml tools/docs-parity/manifests/snippets.toml docs/internal/audits/documentation-refresh-evidence.md
 git commit -m "Activate documentation enforcement gates"
 ```
 
-### Task 20: Close Epoch 1 and make PR (a) implementation-ready
+### Task 18: Close PR #1049 implementation
 
 **Files:**
 
 - Modify: `docs/internal/audits/documentation-refresh-evidence.md`
 - Modify: `docs/internal/audits/documentation-refresh-decisions.md`
+- Modify: PR #1049 description through GitHub API/CLI
 
-- [ ] **Step 1: Reassert the exact rc baseline at final PR head**
+- [ ] **Step 1: Reassert immutable state**
 
-Fetch and require `origin/rc/202608` still equals `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`; require the implementation branch contains it. Any advance triggers a focused delta audit, spec update, regenerated records, and re-review before continuing.
+Fetch and require `origin/rc/202608` still equals `07dfc1c6dddf69345ded17bd2d40a3d01bb39bcf`, the branch contains it, PR #1049 targets rc from `spec-docs-refresh`, and the worktree has no unrelated bytes.
 
-- [ ] **Step 2: Run the complete local CI gate list**
+- [ ] **Step 2: Run the complete local matrix**
 
 ```bash
 cargo fmt --all -- --check
@@ -1662,6 +1240,7 @@ cargo test-axum
 cargo test-cloudflare
 cargo test-spin
 cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity
+cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test documentation_snippets
 ./scripts/test-cli.sh
 cargo test --package trusted-server-openrtb-codegen --target "$(rustc -vV | sed -n 's/host: //p')"
 cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
@@ -1670,49 +1249,18 @@ cargo fmt --manifest-path tools/docs-parity/Cargo.toml -- --check
 cargo clippy --manifest-path tools/docs-parity/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path tools/docs-parity/Cargo.toml
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- check --all
-cd crates/trusted-server-js/lib
-npm ci
-npm run lint
-npx vitest run
-npm run format
-npm run build
+cd crates/trusted-server-js/lib && npm ci && npm run lint && npx vitest run && npm run format && npm run build
 cd ../../..
-cd docs
-npm ci
-npm run lint
-npm run format
-npm run build
-cd ..
+cd docs && npm ci && npm run lint && npm run format && npm run build
 ```
 
-Also run Task 18's rustdoc matrix, all four Task 15 smokes/evidence paths, and the integration workflow's runnable smoke targets.
+Also run Task 16 rustdoc commands and all four Task 13 smoke/evidence paths. Record exact commands, tool versions, durations, and results.
 
-- [ ] **Step 3: Confirm the hosted check topology provisionally**
+- [ ] **Step 3: Prove every acceptance surface**
 
-Confirm CodeQL with rc triggers, all format jobs, all seven `test.yml` jobs,
-all four `integration-tests.yml` jobs, release builds, JS build/test, docs build,
-and the new WP8 jobs report with the expected names and GitHub App identities.
-Record provisional run URLs and the current head, but do not call this the final
-hosted proof because Step 8 may create one last evidence commit. Local
-substitutes do not replace hosted evidence.
+Record generated no-diff; classification/disposition equality; retired/privacy scans; route/settings/integration equality; snippet diagnostics; README/JSDoc/rustdoc gates; local Pages/CNAME artifact proof; first-success smokes; all follow-up issue URLs/dispositions; package commit/path review; and release-pending fields without fabricated receipts. Read PR #1049's description back through the GitHub API/CLI and require the bounded settings-parity region to equal the Appendix B checklist and the bounded adapter-smokes region to contain each of the four exact script command/cleanup sequences plus its immutable run evidence.
 
-- [ ] **Step 4: Prove every acceptance surface**
-
-Record: generated no-diff; source/disposition equality; all retired/privacy scans; dead-link negatives; route/settings/integration equality; snippet diagnostics; README/JSDoc/rustdoc gates; Pages containment/CNAME smokes; all follow-up issue URLs/dispositions; PR (b), (c), and (d) URLs; c2 issue/owner; e issue plus reviewed runbooks.
-
-- [ ] **Step 5: Activate required checks on rc**
-
-Require the full WP8 suite on `rc/202608`, record context names/source apps/bypass policy, and demonstrate one planted failure actually prevents an rc merge. Remove the planted failure and show success.
-
-- [ ] **Step 6: Reprove the active `main` controller**
-
-Record strict/up-to-date protection, every pre-existing PR seed result, unauthorized protected-file block, unrelated-PR success, and full-suite `main` deferral. Do not claim the full suite is required on `main` yet.
-
-- [ ] **Step 7: Review commit/package shape**
-
-Require one reviewable commit or small series per package, generated-output commits separated where review needs it, no unrelated runtime changes, and no squash-on-merge. Run `git diff --check` and review `git diff origin/rc/202608...HEAD` path by path.
-
-- [ ] **Step 8: Commit the final Epoch 1 records and prove a clean tree**
+- [ ] **Step 4: Commit final records**
 
 ```bash
 git add docs/internal/audits/documentation-refresh-evidence.md docs/internal/audits/documentation-refresh-decisions.md
@@ -1721,188 +1269,30 @@ git commit -m "Record documentation refresh acceptance"
 git status --porcelain
 ```
 
-Expected: the status command prints nothing. If the final records do not
-change, omit the empty commit but still require the clean status.
+If records do not change, omit the empty commit but still require clean status.
 
-- [ ] **Step 9: Re-run hosted checks on the exact final head and mark implementation-ready**
+- [ ] **Step 5: Push and verify hosted checks on the exact head**
 
-After Step 8, record the new exact PR head in the PR description and require
-every hosted check named in Step 3 to report green on that SHA. Record the
-final run URLs and app identities in the PR description, which can be updated
-without advancing the commit. Reassert the rc baseline and clean-tree proof.
-Only then may the owner mark PR (a) #1049 implementation-ready. All approvals
-must be current and the PR ready to merge. Record that activation still
-requires the rc merge plus Task 21.
+Push to `origin/spec-docs-refresh`. Update only the bounded `<!-- docs-refresh:final-acceptance:start -->` / `<!-- docs-refresh:final-acceptance:end -->` region of PR #1049's description with the exact final head/base, run URLs, job/app identities, local evidence, and release-pending operations. Preserve every unrelated region. Read the final PR description back and revalidate the settings-parity and adapter-smokes regions after the final-acceptance update. Require every expected hosted job green on that SHA; a prior head does not count.
 
-### Task 21: Execute Epoch 2 activation PR (c2)
+- [ ] **Step 6: Mark implementation complete**
 
-**Files on the isolated `main` branch:**
-
-- Modify: `.github/workflows/docs-links.yml`
-- Modify: `.github/dependabot.yml`
-
-**External system of record:** the named c2 tracking issue and c2 PR timeline.
-The Epoch 1 repository evidence ledger already contains the issue URL and
-evidence schema. Do not create an evidence-only branch or advance rc merely to
-store receipts that exist only after c2 merges. Use append-only issue comments
-under the Task 1 schema: paste the redacted request/response and graph/ruleset
-captures with body hashes and exact SHAs; links alone are not evidence.
-
-- [ ] **Step 1: Record and authenticate the rc merge**
-
-After #1049 merges, record its exact merge result as `merged_rc_tip` and initial `validated_rc_tip`. Require the latter equals current `origin/rc/202608`; if rc advanced, audit the full delta and record a new exact `validated_rc_tip`.
-
-- [ ] **Step 2: Dispatch read-only post-merge validation**
-
-Dispatch `.github/workflows/docs-links.yml` at `ref: main` with `validate_rc` and exact `tool_sha`. Assert the run's `github.sha` was the authenticated current `main` tip and no writer/attestation job ran.
-
-- [ ] **Step 3: Cut c2 from a fresh `main` tip**
-
-Record c2's own `audited_main_tip`. Apply only the reviewed c2 patch: weekly
-schedule, rc-targeted Dependabot version roots, snapshot reader/writer, and
-`refresh_dependency_snapshot`. Require both resulting protected paths,
-including modes and blob IDs, to equal their counterparts at exact
-`validated_rc_tip`; workflow-only equality is not sufficient.
-
-- [ ] **Step 4: Stage, statically validate, and commit the exact c2 candidate**
-
-Use a detached trusted-tool worktree at exact `validated_rc_tip`. In the c2
-worktree run:
-
-```bash
-git add .github/workflows/docs-links.yml .github/dependabot.yml
-git diff --cached --check
-git diff --cached --name-status "$AUDITED_MAIN_TIP"
-git diff --quiet
-git ls-files --stage .github/workflows/docs-links.yml .github/dependabot.yml
-git ls-tree "$VALIDATED_RC_TIP" .github/workflows/docs-links.yml .github/dependabot.yml
-test "$(git -C "$TRUSTED_RC_WORKTREE" rev-parse HEAD)" = "$VALIDATED_RC_TIP"
-cargo run --manifest-path "$TRUSTED_RC_WORKTREE/tools/docs-parity/Cargo.toml" -- workflow validate-local-index --repository "$C2_WORKTREE" --base "$AUDITED_MAIN_TIP" --candidate-kind c2
-git commit -m "Activate documentation automation"
-```
-
-Expected: cached name/status is exactly the two protected files, byte/count
-budgets pass, the two `ls-*` outputs have identical modes/blob IDs by path, and
-the trusted validator accepts the reviewed c2 shape without executing candidate
-content. Record the commit SHA before opening the PR.
-
-- [ ] **Step 5: Let the automatic gate publish pending**
-
-Open c2 and record that the base controller authenticates the candidate set but publishes `docs/automation-delta: pending`, never success.
-
-- [ ] **Step 6: Run exact dual-ref validation**
-
-Dispatch `validate_main_pr` at `ref: main` with exact `validated_rc_tip`, c2 head, PR number, and base SHA. Require the local uncapped diff and AST policy pass; verify the manual run replaces pending with success on exactly that head/base.
-
-- [ ] **Step 7: Reassert head/base and merge**
-
-Immediately before merge, require current PR head/base equal the validated pair and the base equals recorded `audited_main_tip`. Merge without extra paths.
-
-- [ ] **Step 8: Submit and verify the first dependency snapshot**
-
-Dispatch `refresh_dependency_snapshot` with no SHA/PR inputs. Record in the c2
-tracking issue the authenticated rc SHA/ref, fixed detector/correlator,
-external snapshot ID, 201 receipt, dependency-graph visibility, and
-alert-triage owner/runbook/two-business-day SLA. Paste and hash the redacted
-request, 201 response, and graph API capture; link the exact workflow run for
-navigation.
-
-- [ ] **Step 9: Observe a real scheduled run**
-
-Require a genuine cron run (not manual emulation) to complete the link reader,
-schedule-only issue writer, snapshot reader/writer, and same-identity
-reconciliation. Record timeouts/concurrency behavior and resulting
-issue/snapshot state in the c2 tracking issue and link the run; no repository
-evidence commit follows.
-
-- [ ] **Step 10: Prove rollback readiness**
-
-Validate the reverse-c2 patch for both protected files against the current base,
-including restored mode/blob IDs. If activation is unhealthy, merge only that
-inverse, stop resubmission, drain/cancel prior snapshot runs, submit an empty
-same-identity snapshot, and reopen the activated milestone until a repaired c2
-passes again.
-
-- [ ] **Step 11: Mark this refresh activated**
-
-Activation closes this refresh. Do not claim lifecycle closure; Task 22 remains release-owned.
-
-### Task 22: Hand off the Epoch 3 release lifecycle
-
-**Files:**
-
-- Use: `docs/internal/runbooks/documentation-automation-release.md`
-- Use: `docs/internal/runbooks/patches/docs-links-release-retarget.patch`
-- Use: `docs/internal/runbooks/patches/docs-links-release-disable.patch`
-- Modify later in PR (e): `.github/workflows/docs-links.yml`
-- Modify later in PR (e): `.github/dependabot.yml`
-
-**External system of record:** the named release-handoff issue and PR (e)
-timeline. Post-merge retirement, ruleset, graph, and deletion receipts are
-captured there under the Task 1 append-only schema, with exact SHAs, redacted
-bodies, statuses, and SHA-256 hashes; URLs are navigation only. No follow-on
-repository evidence PR is part of this lifecycle.
-
-- [ ] **Step 1: Verify the tracked issue, owner, and both reviewed paths exist before activation closes**
-
-The normal path retargets to `main` and removes temporary snapshot jobs/refresh. The abandonment path removes the workflow, schedule, Dependabot entries, snapshot jobs, and refresh; it never points automation at missing tooling.
-
-- [ ] **Step 2: At release, freeze and authenticate rc**
-
-Pause queue/direct writes, record bypass policy and exact tip, audit any delta into `validated_rc_tip`, and recheck the freeze immediately before validation, retirement, and deletion.
-
-- [ ] **Step 3: Prove the normal release merge is net-empty on protected paths**
-
-On the normal path, authenticate the current-main base and frozen rc head and
-compare modes/blob IDs for `.github/workflows/docs-links.yml` and
-`.github/dependabot.yml`; require both identical. Demonstrate that the
-base-vs-head protected delta is empty while the three-dot history may contain
-the earlier independent copies, then merge the rc release PR with
-`docs/automation-delta` green. If either path differs, stop and use a separately
-reviewed sync/repair PR before retrying. On abandonment, record this step as
-inapplicable and do not merge rc.
-
-- [ ] **Step 4: Open the concrete PR (e) from the matching template**
-
-Record a fresh `audited_main_tip`; use the active base controller's automatic pending state and exact dual-ref manual validation. Reassert head/base before merge.
-
-- [ ] **Step 5: Drain and retire the temporary snapshot**
-
-After (e) stops resubmission, enumerate every queued/in-progress same-identity run, wait or cancel with a separate `actions: write` token, and submit an empty snapshot at the exact (e) merge SHA/ref `refs/heads/main`. Record the 201 receipt and prove it is the final submission.
-
-Attach the run enumeration, cancellation/drain result, request body hash, 201
-response, and final-submission proof to the release-handoff issue.
-
-- [ ] **Step 6: Close branch and protection state in order**
-
-Normal: verify automatic `main` dependency parsing, activate the deferred full
-WP8 suite on `main`, and run both a permitted action-repin maintenance fixture
-and an AST-weakening rejection through `validate_main_maintenance` using the
-authenticated current-main tool. Keep `docs/automation-delta` required,
-re-smoke Pages/CNAME, then delete rc. Abandonment: remove the nonreporting
-automation-delta required context immediately after (e), prove the next `main`
-PR is not stranded, then delete rc. Never delete rc first.
-
-Attach the final graph, ruleset, live-site, and branch-deletion receipts to the
-release-handoff issue and close it only after the selected path is complete.
+Review `git diff origin/rc/202608...HEAD` path by path, require no unrelated runtime change, keep package commits unsquashed, and mark PR #1049 ready for review without opening or requesting approval on any other PR. Completion means repository implementation is finished; merge and release-pending operations remain outside this plan.
 
 ## Final plan-to-spec traceability
 
-| Spec surface                            | Plan tasks |
-| --------------------------------------- | ---------- |
-| Owner questions and immutable tips      | 1          |
-| WP1 containment/CNAME/hygiene           | 2–4        |
-| WP8a tool, manifests, controller design | 5–10       |
-| `main` validation controller PR (c)     | 11         |
-| WP2 truth pass                          | 12         |
-| WP3 configuration                       | 13         |
-| WP4 API/routes                          | 14         |
-| WP5 deployment and coverage             | 15–16      |
-| WP6 root/crate docs                     | 17         |
-| WP7 in-code docs                        | 18         |
-| WP8b blocking enforcement               | 19         |
-| Epoch 1 / PR (a)                        | 20         |
-| Epoch 2 / activation PR (c2)            | 21         |
-| Epoch 3 / release PR (e)                | 22         |
+| Spec surface                               | Plan tasks |
+| ------------------------------------------ | ---------- |
+| Single-PR decisions and evidence           | 1-3        |
+| WP1 containment, CNAME, policy             | 2-3        |
+| WP8a tool, manifests, workflow foundations | 4-9        |
+| WP2 truth pass                             | 10         |
+| WP3 configuration                          | 11         |
+| WP4 API/routes                             | 12         |
+| WP5 deployment and product coverage        | 13-14      |
+| WP6 root/crate docs                        | 15         |
+| WP7 in-code docs                           | 16         |
+| WP8b final CI/release-pending controls     | 17         |
+| Final PR #1049 acceptance                  | 18         |
 
-The implementation is complete only at Task 21's **activated** milestone. Task 22 is deliberately specified and owned but is not part of this refresh's implementation completion claim.
+The implementation is complete only when Task 18 verifies the exact final #1049 head. No individual implementation PR or default-branch receipt is part of this plan.
