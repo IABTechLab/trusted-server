@@ -73,6 +73,26 @@ pub(super) fn to_abs(settings: &Settings, u: &str) -> Option<String> {
     Some(absolute)
 }
 
+/// Returns the index of the quote that closes a CSS string opened with `quote` and
+/// starting at `from`, or `None` when the string is unterminated.
+///
+/// A backslash escapes the byte that follows it, and a raw newline ends a CSS string
+/// as a bad-string, so neither can close it. Returning `None` leaves the caller on its
+/// plain scan for the next `)`, which keeps a malformed value unrewritten rather than
+/// guessing at its extent.
+fn css_string_end(bytes: &[u8], from: usize, quote: u8) -> Option<usize> {
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'\n' | b'\r' => return None,
+            byte if byte == quote => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 // Helper: rewrite url(...) occurrences inside a CSS style string to first-party proxy.
 // `base_origin` is prefixed onto the proxy path — empty for root-relative output,
 // `https://<domain>` for absolute output (see [`build_proxy_url`]).
@@ -87,15 +107,28 @@ pub(super) fn rewrite_style_urls(settings: &Settings, style: &str, base_origin: 
         let open = start + 4; // after 'url('
         // write prefix including 'url('
         out.push_str(&style[write_pos..open]);
+        let bytes = style.as_bytes();
+        // A quoted CSS string may legally contain `)`, so when the value opens with a
+        // quote the closing paren is searched for after the matching closing quote.
+        // Scanning from `open` would end the value at a `)` the browser keeps as part
+        // of the URL, leaving it unrewritten.
+        let mut value_start = open;
+        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
+            value_start += 1;
+        }
+        let search_from = bytes
+            .get(value_start)
+            .filter(|byte| **byte == b'"' || **byte == b'\'')
+            .and_then(|quote| css_string_end(bytes, value_start + 1, *quote))
+            .map_or(open, |string_end| string_end + 1);
         // find closing ')'
-        let close = if let Some(c) = lower[open..].find(')') {
-            open + c
+        let close = if let Some(c) = lower[search_from..].find(')') {
+            search_from + c
         } else {
             out.push_str(&style[open..]);
             return out;
         };
         // trim spaces and quotes
-        let bytes = style.as_bytes();
         let mut s = open;
         while s < close && bytes[s].is_ascii_whitespace() {
             s += 1;
@@ -104,10 +137,18 @@ pub(super) fn rewrite_style_urls(settings: &Settings, style: &str, base_origin: 
         while e > s && bytes[e - 1].is_ascii_whitespace() {
             e -= 1;
         }
+        // Only treat the value as quoted when a matching closing quote is actually
+        // present. Stepping back from `e` on the assumption that one is there can
+        // land inside a multi-byte character, and it silently rewrites the closing
+        // delimiter when the quotes do not match.
         let mut quoted = false;
-        let (qs, qe) = if s < e && (bytes[s] == b'"' || bytes[s] == b'\'') {
+        let (qs, qe) = if s < e
+            && (bytes[s] == b'"' || bytes[s] == b'\'')
+            && e > s + 1
+            && bytes[e - 1] == bytes[s]
+        {
             quoted = true;
-            (s + 1, if e > s + 1 { e - 1 } else { e })
+            (s + 1, e - 1)
         } else {
             (s, e)
         };
@@ -118,7 +159,7 @@ pub(super) fn rewrite_style_urls(settings: &Settings, style: &str, base_origin: 
             url_val.to_owned()
         };
         if quoted {
-            let q = style.as_bytes()[s] as char;
+            let q = bytes[s] as char;
             out.push(q);
             out.push_str(&new_val);
             out.push(q);
@@ -227,26 +268,35 @@ pub(super) fn proxy_if_abs(settings: &Settings, val: &str, base_origin: &str) ->
 /// - Splits on commas that separate candidates; whitespace after the comma is optional
 /// - Avoids splitting on the mediatype/data comma of a leading `data:` URL
 ///   (e.g., `data:image/png;base64,AAAA 1x, ...`).
-///   Note: this implementation only protects the first mediatype/data comma; it does not
-///   attempt to handle additional commas inside a `data:` payload (rare in ad creatives).
+///   Note: commas are treated as part of the `data:` URL until whitespace appears in the
+///   candidate, so a payload containing several commas stays in one candidate. A `data:`
+///   payload with whitespace before a comma is split there.
 pub(super) fn split_srcset_candidates(s: &str) -> Vec<&str> {
     let bytes = s.as_bytes();
     let mut items = Vec::new();
     let mut start = 0_usize;
     let mut i = 0_usize;
+    // Whether the candidate beginning at `start` uses the `data:` scheme, and whether
+    // any whitespace has followed its first non-whitespace byte. Both are properties of
+    // the candidate rather than of each comma, so they are tracked as the scan advances
+    // instead of being re-derived from the whole prefix at every comma.
+    let mut candidate_is_data_scheme = starts_with_data_scheme(&s[start..]);
+    let mut seen_non_whitespace = false;
+    let mut seen_whitespace_after_content = false;
     while i < bytes.len() {
-        if bytes[i] == b',' {
-            // Determine if this comma is the mediatype/data separator in a data: URL.
-            // Look at the current candidate prefix from `start` to `i` and see if it begins with
-            // `data:` (ignoring leading whitespace) and has no whitespace before this comma.
-            let prefix = &s[start..i];
-            let trimmed = prefix.trim_start();
-            let lower = trimmed.to_ascii_lowercase();
-            let is_data_scheme = lower.starts_with("data:");
-            let has_ws_before_comma = trimmed.chars().any(|c| c.is_ascii_whitespace());
-            let comma_is_data_delim = is_data_scheme && !has_ws_before_comma;
-            if comma_is_data_delim {
-                // Skip splitting at this comma; it's within the data: URL itself
+        let byte = bytes[i];
+        if byte.is_ascii_whitespace() {
+            if seen_non_whitespace {
+                seen_whitespace_after_content = true;
+            }
+            i += 1;
+            continue;
+        }
+        if byte == b',' {
+            // A comma inside a `data:` URL that carries no whitespace yet is the
+            // mediatype/data separator, not a candidate separator.
+            if candidate_is_data_scheme && !seen_whitespace_after_content {
+                seen_non_whitespace = true;
                 i += 1;
                 continue;
             }
@@ -259,14 +309,28 @@ pub(super) fn split_srcset_candidates(s: &str) -> Vec<&str> {
                 i += 1;
             }
             start = i;
+            candidate_is_data_scheme = starts_with_data_scheme(&s[start..]);
+            seen_non_whitespace = false;
+            seen_whitespace_after_content = false;
             continue;
         }
+        seen_non_whitespace = true;
         i += 1;
     }
     if start < bytes.len() {
         items.push(&s[start..]);
     }
     items
+}
+
+/// Returns `true` when `candidate` begins with the `data:` scheme, ignoring leading
+/// whitespace and ASCII case.
+fn starts_with_data_scheme(candidate: &str) -> bool {
+    candidate
+        .trim_start()
+        .as_bytes()
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"data:"))
 }
 
 /// Helper: rewrite a `srcset`/`imagesrcset` attribute value.
@@ -1307,6 +1371,79 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_style_urls_handles_unterminated_quote_before_multibyte() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let css = "background:url(\"café)";
+        let out = rewrite_style_urls(&settings, css, "");
+        assert_eq!(
+            out, css,
+            "should leave an unterminated quoted url unchanged"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_keeps_paren_inside_quoted_url() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let css = "background:url(\"https://cdn.example/a)b.png\")";
+        let out = rewrite_style_urls(&settings, css, "");
+        let expected = super::build_proxy_url(&settings, "https://cdn.example/a)b.png", "");
+        assert!(
+            out.contains(&expected),
+            "the whole quoted value, parens included, should be proxied: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_honors_escaped_quote_inside_quoted_url() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let css = r#"background:url("https://cdn.example/a\")b.png")"#;
+        let out = rewrite_style_urls(&settings, css, "");
+        let truncated = super::build_proxy_url(&settings, r#"https://cdn.example/a\"#, "");
+        assert!(
+            !out.contains(&truncated),
+            "an escaped quote should not end the string early: {out}"
+        );
+        assert!(
+            out.contains("/first-party/proxy?tsurl="),
+            "the value should still be proxied: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_ends_unquoted_url_at_first_paren() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let css = "background:url(https://cdn.example/a)b.png)";
+        let out = rewrite_style_urls(&settings, css, "");
+        assert!(
+            out.contains("/first-party/proxy?tsurl="),
+            "an unquoted url still ends at the first paren: {out}"
+        );
+        assert!(
+            out.ends_with("b.png)"),
+            "the trailing text is preserved: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_leaves_string_broken_by_newline_unchanged() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let css = "background:url(\"https://cdn.example/a\nb)";
+        let out = rewrite_style_urls(&settings, css, "");
+        assert_eq!(
+            out, css,
+            "a string a newline has already ended should be left alone"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_handles_mismatched_quotes() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let css = "background:url('/local/a.png\")";
+        let out = rewrite_style_urls(&settings, css, "");
+        assert_eq!(out, css, "should leave a mismatched quoted url unchanged");
+    }
+
+    #[test]
     fn rewrites_style_1x1_px() {
         use crate::http_util::encode_url;
         let settings = crate::test_support::tests::create_test_settings();
@@ -1587,6 +1724,25 @@ mod tests {
         assert_eq!(items.len(), 2, "{items:?}");
         assert_eq!(items[0].trim(), "data:image/png;base64,AAAA 1x");
         assert!(items[1].trim().starts_with("//cdn.example/b.png 2x"));
+    }
+
+    #[test]
+    fn split_srcset_keeps_consecutive_data_url_commas_in_one_candidate() {
+        let s = "data:text/plain;charset=utf-8,a,b,c 1x, /local/b.png 2x";
+        let items = super::split_srcset_candidates(s);
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0], "data:text/plain;charset=utf-8,a,b,c 1x");
+    }
+
+    #[test]
+    fn split_srcset_handles_long_data_url_comma_run() {
+        let mut s = String::from("data:image/png;base64,");
+        s.push_str(&",".repeat(100_000));
+        s.push_str(" 1x, https://cdn.example/b.png 2x");
+        let items = super::split_srcset_candidates(&s);
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert!(items[0].starts_with("data:image/png;base64,"));
+        assert!(items[1].trim().starts_with("https://cdn.example/b.png"));
     }
 
     #[test]
