@@ -195,52 +195,73 @@ rule. The longer form is a mapping, which must contain `group:` and may carry
 child place codes beside it. A reserved key can never be mistaken for a place,
 because an ISO code is at most three characters long.
 
-The top node, meaning the `rules:` mapping itself, is the only node that needs
-more than a `group`. It also requires `jurisdiction:`, which appears nowhere
-else in the tree. The top node's `group` is the baseline for a visitor whose
-country cannot be resolved, and its `jurisdiction` is the consent handling
-applied to that same visitor. The accepted values are the states of the
-`Jurisdiction` type in
+Any node may also carry `jurisdiction:` beside its `group:`, naming the consent
+handling for the places that node covers. A node that carries none inherits the
+nearest ancestor that does. The top node, meaning the `rules:` mapping itself,
+is the one node that must carry both, so the inheritance always ends somewhere
+and every place in the tree has an answer. The top node is also the answer for a
+visitor whose country cannot be resolved, whose baseline is the top `group` and
+whose consent handling is the top `jurisdiction`.
+
+The accepted values are the states of the `Jurisdiction` type in
 `crates/trusted-server-core/src/consent/jurisdiction.rs`, which the rest of the
 stack already uses:
 
-| Value             | Meaning                                                                                               |
-| ----------------- | ----------------------------------------------------------------------------------------------------- |
-| `gdpr`            | GDPR handling, being `Jurisdiction::Gdpr`, which appears in logs as `GDPR`                            |
-| `us-state/<CODE>` | A US state with a comprehensive privacy law, for example `us-state/CA`, being `Jurisdiction::UsState` |
-| `non-regulated`   | The location is known and matches no regulation, being `Jurisdiction::NonRegulated`                   |
-| `unknown`         | The jurisdiction cannot be determined, being `Jurisdiction::Unknown`                                  |
+| Value           | Meaning                                                                                                                     | Where it may be written       |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
+| `gdpr`          | GDPR handling, being `Jurisdiction::Gdpr`, which appears in logs as `GDPR`                                                  | Any node                      |
+| `us-state`      | A US state with a comprehensive privacy law, being `Jurisdiction::UsState`. The node names the state, so the value does not | A region node under `US` only |
+| `non-regulated` | The place is known and matches no regulation, being `Jurisdiction::NonRegulated`                                            | Any node                      |
+| `unknown`       | The jurisdiction cannot be determined, being `Jurisdiction::Unknown`                                                        | Any node                      |
 
-`Jurisdiction::from_policy_name` reads these, so anything else is a
-configuration error rather than a silent default. Write the value in lower
-case, and the state code after `us-state/` may be either case.
+Anything else is a configuration error rather than a silent default. Write the
+value in lower case. `us-state` carries no state code, because the node it sits
+on already names the state, which is why it is rejected at the top of the tree
+and on a country node, neither of which names one.
 
-Matching is most specific wins, falling back to the parent's `group`. Trusted
-Server tries the region node, then the country node, then the top node, and uses
-the first `group` it finds. A geo lookup **failure** is a different state from
-having no location, and it keeps the requires-signal floor described below
-rather than reaching the tree at all.
+Matching is most specific wins, and `group` and `jurisdiction` fall back the
+same way. Trusted Server tries the region node, then the country node, then the
+top node, taking the first `group` it finds and the first `jurisdiction` it
+finds, which need not come from the same node. A geo lookup **failure** is a
+different state from having no location, and it keeps the requires-signal floor
+described below rather than reaching the tree at all.
 
 ```yaml
 rules:
-  group: gdpr-eu # when no country can be resolved
-  jurisdiction: gdpr # consent handling when no country can be resolved
-  GB: gdpr-uk # United Kingdom
-  US: # United States
-    group: us-notice # any state not listed below
-    CA: us-opt-out # California
-    NY: us-notice # New York
+  group: gdpr-eu
+  # Inherited by every country not overriding it, and the answer when no
+  # country resolves.
+  jurisdiction: gdpr
+  GB: gdpr-uk # inherits gdpr
+  US:
+    group: us-notice
+    jurisdiction: non-regulated
+    CA:
+      group: us-opt-out
+      jurisdiction: us-state
+    NY: us-notice # inherits non-regulated
 ```
 
-Read that tree as follows. A New York visitor gets `us-notice` from the `NY`
-node. A Texas visitor gets `us-notice` too, through the `US` node, because no
-`TX` child exists. A Manchester visitor gets `gdpr-uk` from the `GB` node. A
-visitor whose country cannot be resolved gets `gdpr-eu` with GDPR consent
+Read that tree as follows. A Manchester visitor gets `gdpr-uk` under GDPR
+handling, inherited from the top. A Californian visitor gets `us-opt-out` under
+that state's own opt-out handling. A Texas visitor gets `us-notice` under
+`non-regulated` handling, both through the `US` node, because no `TX` child
+exists. A visitor whose country cannot be resolved gets `gdpr-eu` under GDPR
 handling, both stated at the top.
 
 Startup rejects a file whose top node has no `group` or no `jurisdiction`, in
 the same way a missing default country was rejected before, so the unknown case
 is always answered in the file rather than assumed by the code.
+
+Because the tree now says which regime applies where, the older consent
+settings `[consent.gdpr] applies_in` and `[consent.us_states] privacy_states`
+retire into it. The shipped `permissions.yaml` carries the same 31 GDPR
+countries, being the EU 27 plus Iceland, Liechtenstein, Norway and the United
+Kingdom, each inheriting `gdpr` from the top node, and the same 20 US states
+with a comprehensive privacy law, written as region children of `US` carrying
+`jurisdiction: us-state`. One file therefore holds the baselines and the regime
+applicability together, so a policy owner reads and changes both in one place
+instead of keeping two lists in step.
 
 The country and region rules set only the **baseline** position. They say what
 is permitted before any session signal, not what a deployer must ask the user
@@ -286,8 +307,9 @@ same consent against a `requires_signal` baseline would set it. Consent lifts
 
 The shipped `permissions.yaml` defines `gdpr-eu`, `gdpr-uk`, and `us-opt-out`
 groups, and maps the EU 27 and the EEA members (IS, LI, NO) to `gdpr-eu`, the
-UK to `gdpr-uk`, and the US (a country node, with region children available
-beneath it) and Australia to `us-opt-out`. For device storage (Purpose 1), that yields:
+UK to `gdpr-uk`, and the US (a country node whose region children are the 20
+states with a comprehensive privacy law, each carrying `jurisdiction: us-state`)
+and Australia to `us-opt-out`. For device storage (Purpose 1), that yields:
 
 | Country        | Device storage (Purpose 1)                                      |
 | -------------- | --------------------------------------------------------------- |
@@ -443,7 +465,8 @@ provider that does its own lookup and can report a failure.
 
 ```yaml
 # permissions.yaml (excerpt). Each group lists every permission and its flag.
-# The rules tree maps places to a group, countries first, then regions beneath.
+# The rules tree maps places to a group and a jurisdiction, countries first,
+# then regions beneath, with each node inheriting what it does not state.
 groups:
   gdpr-eu: # opt-in, every purpose requires a signal
     necessary.operations.storage: requires_signal
@@ -456,12 +479,14 @@ groups:
 
 rules:
   group: gdpr-eu # when no country can be resolved
-  jurisdiction: gdpr # consent handling when no country can be resolved
+  jurisdiction: gdpr # inherited by every node that states none
   FR: gdpr-eu
   US:
     group: us-opt-out
+    jurisdiction: non-regulated
     CA: # a region can override single flags on top of its group
       group: us-opt-out
+      jurisdiction: us-state
       permissions:
         advertising_marketing.first_party.targeted: denied
 ```
