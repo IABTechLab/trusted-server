@@ -367,6 +367,9 @@ mod tests {
 
     use super::*;
 
+    const TEST_USER_AGENT: &str =
+        "FictionalBrowser/123.4 (FictionalOS 10.2; FictionalDevice) ExampleRenderer/567.8";
+
     struct NoopConfigStore;
 
     impl PlatformConfigStore for NoopConfigStore {
@@ -564,6 +567,7 @@ mod tests {
             region: None,
             is_mobile: 0,
             is_known_browser: 1,
+            user_agent: Some(TEST_USER_AGENT.to_owned()),
             gdpr_applies: 0,
             consent_present: 0,
             terminal_status: Some("completed".to_owned()),
@@ -719,11 +723,11 @@ mod tests {
             header_value(&requests[0].headers, header::AUTHORIZATION.as_str()),
             Some("Bearer append-token")
         );
+        let body = std::str::from_utf8(&requests[0].body).expect("should record utf8 ndjson body");
+        assert!(body.ends_with('\n'), "should send newline-delimited JSON");
         assert!(
-            std::str::from_utf8(&requests[0].body)
-                .expect("should record utf8 ndjson body")
-                .ends_with('\n'),
-            "should send newline-delimited JSON"
+            body.contains(TEST_USER_AGENT),
+            "should send the complete user agent to Tinybird"
         );
         assert_eq!(
             *http_client
