@@ -134,12 +134,10 @@ ts config push --adapter fastly --staging
 ts config diff --adapter fastly --staging
 ```
 
-> **Known limitation:** Trusted Server's Fastly entry point does not yet read
-> the version-linked `edgezero_runtime_env` selectors, so a staged version
-> currently loads the **production** config blob rather than the staged one —
-> a staging healthcheck exercises the new binary against production config.
-> Selector resolution for custom entry points is tracked upstream in EdgeZero;
-> until it lands, do not rely on `--staging` to validate a config change.
+The staged version resolves its app-config key through the version-linked
+`edgezero_runtime_env` store. After `ts config push --staging`, the staged
+binary reads `<logical-store-id>_staging` while the active production version
+continues to read the production key.
 
 `--staging` on `config push` / `config diff` writes and compares the
 `<logical-store-id>_staging` key in the same store. It is mutually exclusive
@@ -165,6 +163,11 @@ ts healthcheck --adapter fastly --service-id <service-id> \
 ts rollback --adapter fastly --service-id <service-id> \
   --version <bad-version> --rollback-to <previous-version>
 ```
+
+Capture the rollback target before mutating production with
+`ts active-version`, or use an orchestration layer that captures the same
+previous-version value before deployment. `ts deploy` cannot reconstruct that
+value after the active version changes.
 
 `healthcheck` probes `/` by default (`--path` overrides) and makes 3 total
 attempts — not 3 retries after a first try — with a 5 second delay between
