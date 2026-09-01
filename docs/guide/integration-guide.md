@@ -276,13 +276,13 @@ Every step above puts the module inside `trusted-server-core`. A module can inst
 
 The crate hands out an `IntegrationBuilder`, which names the module and points at the functions that do the work.
 
-| Part              | Type                          | Purpose                                                                                                                                        |
-| ----------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| Id                | `&'static str`                | Names the module. The same string is the key of its `[integrations.<id>]` configuration block and the value `[geo] provider` uses to select it |
-| Source            | `&'static str`                | The crate or package name, reported when two builders claim the same id so an operator can tell which crates collided                          |
-| Build function    | `IntegrationBuilderFn`        | Reads `Settings` and returns a registration when the module is enabled, or nothing when it is not                                              |
+| Part              | Type                          | Purpose                                                                                                                                                                                                                          |
+| ----------------- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Id                | `&'static str`                | Names the module. The same string is the key of its `[integrations.<id>]` configuration block and the value `[geo] provider` uses to select it                                                                                   |
+| Source            | `&'static str`                | The crate or package name, reported when two builders claim the same id so an operator can tell which crates collided                                                                                                            |
+| Build function    | `IntegrationBuilderFn`        | Reads `Settings` and returns a registration when the module is enabled, or nothing when it is not                                                                                                                                |
 | Validate function | `IntegrationValidateFn`       | The module's own deploy-time rules. They run when deploy validation is invoked with this builder, for every builder passed, enabled or not. The registry does not call them and the CLI does not carry them, see the traps below |
-| Request preparer  | `IntegrationPrepareRequestFn` | Optional. Added with `.with_request_preparer()`, it runs once per request before routing, whether or not the module is enabled                 |
+| Request preparer  | `IntegrationPrepareRequestFn` | Optional. Added with `.with_request_preparer()`, it runs once per request before routing, whether or not the module is enabled                                                                                                   |
 
 ```rust
 pub fn builder() -> IntegrationBuilder {
@@ -310,8 +310,8 @@ The build function returns an `IntegrationRegistration`, built with the same bui
 | `.with_standalone_js()`                               | Serves the script only on its own path, never in the bundle and never as a deferred tag, for a module that injects its own tag       |
 | `.without_js()`                                       | Ships no browser script at all                                                                                                       |
 | `.with_geo_provider(...)`                             | Offers a geo provider that `[geo] provider` may select, described in the [configuration guide](./configuration.md#geo-configuration) |
-| `.with_ec_provider(...)`                              | Offers an Edge Cookie identity provider that `[ec] provider` may select                                                             |
-| `.with_device_provider(...)`                          | Offers a device provider that `[device] provider` may select                                                                        |
+| `.with_ec_provider(...)`                              | Offers an Edge Cookie identity provider that `[ec] provider` may select                                                              |
+| `.with_device_provider(...)`                          | Offers a device provider that `[device] provider` may select                                                                         |
 
 The three delivery choices are exclusive and the last call wins, so a builder chain naming two of them keeps the one written last.
 

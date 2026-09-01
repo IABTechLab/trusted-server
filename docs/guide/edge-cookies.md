@@ -138,7 +138,7 @@ The two types differ only in route and in the methods they use:
 | Feature              | Server-side               | Client-side                                    |
 | -------------------- | ------------------------- | ---------------------------------------------- |
 | Example              | HMAC (`hmac`)             | `client-fixed` (demo)                          |
-| Created in            | `generate()`, at the edge | `resolve_from_client()`, from the posted value |
+| Created in           | `generate()`, at the edge | `resolve_from_client()`, from the posted value |
 | `generate()` returns | the identifier            | no identifier (defers)                         |
 | Client JavaScript    | none                      | the provider JS (black box), which posts back  |
 | Endpoint             | none                      | `POST /_ts/api/v1/ec/resolve`                  |

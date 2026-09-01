@@ -965,7 +965,9 @@ fn resolve_device_provider(
         && provider.required_permissions() != crate::permissions::PermissionSet::none()
     {
         let message = format!(
-            "integration module `{}` declares a device provider with required permissions, and              Trusted Server has no per-request gate that can enforce them yet, so the selection              is refused rather than silently ignored",
+            "integration module `{}` declares a device provider with required permissions, \
+             and Trusted Server has no per-request gate that can enforce them yet, so the \
+             selection is refused rather than silently ignored",
             selector.unwrap_or_default(),
         );
         return Err(Report::new(TrustedServerError::Configuration { message }));
