@@ -562,10 +562,9 @@ container_id = "GTM-REPLACE-ME"
 # `script-src` that does not list the upstream origin will block.
 #
 # Set this if your pages load gtag with a measurement id separate from the
-# container above (a GA4 `G-` or Ads `AW-` id). A tag that is missing here is
-# served third-party, losing ad-blocker resilience, and a strict `script-src`
-# that does not list googletagmanager.com will block it outright. Find the ids
-# by grepping your rendered HTML for `gtag/js?id=`.
+# container above (a GA4 `G-` or Ads `AW-` id). A tag that is missing here also
+# loses the ad-blocker resilience this integration provides. Find the ids by
+# grepping your rendered HTML for `gtag/js?id=`.
 # allowed_tag_ids = ["G-EXAMPLE1", "AW-000000"]
 
 # Mock ad server used for auction mediation in dev/testing.
