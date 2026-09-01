@@ -284,12 +284,12 @@ no-diff proof is incomplete.
 Every exception requires an owner, narrow rationale, and review or expiry date.
 Expired or ownerless entries fail the checkpoint.
 
-| Type / path                                          | Value classification   | Owner                 | Rationale                                                                                                              | Review or expiry           | State    |
-| ---------------------------------------------------- | ---------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------- | -------------------------- | -------- |
-| `fastly.toml` `service_id`                           | Service ID             | `aram356`             | Preserve the existing service binding during this refresh; check mode fails at or after expiry; removal is independent | `2026-09-30T00:00:00Z`     | Approved |
-| Deleted placeholder literal in design and Decision 9 | Historical example     | `aram356`             | Preserve the approved audit's exact record; scope is the design path and Decision 9 path                               | `2027-08-31T00:00:00Z`     | Approved |
-| Task 13 temporary public-page ownership              | Page/orphan transition | Pending Task 13 owner | Page registered before Task 14 final ownership                                                                         | Expires at Task 14         | Pending  |
-| Spin manual smoke, only if CI cannot run it          | Manual evidence        | Pending               | Runner capability gap                                                                                                  | Time-bounded date required | Pending  |
+| Type / path                                          | Value classification   | Owner                 | Rationale                                                                                                                                                                              | Review or expiry           | State    |
+| ---------------------------------------------------- | ---------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- | -------- |
+| `fastly.toml` `service_id`                           | Service ID             | `aram356`             | Preserve the existing service binding during this refresh; check mode fails at or after expiry; removal is independent                                                                 | `2026-09-30T00:00:00Z`     | Approved |
+| Deleted placeholder literal in design and Decision 9 | Historical example     | `aram356`             | Preserve the approved audit's exact record; scope is `docs/superpowers/specs/2026-08-19-documentation-refresh-design.md` and `docs/internal/audits/documentation-refresh-decisions.md` | `2027-08-31T00:00:00Z`     | Approved |
+| Task 13 temporary public-page ownership              | Page/orphan transition | Pending Task 13 owner | Page registered before Task 14 final ownership                                                                                                                                         | Expires at Task 14         | Pending  |
+| Spin manual smoke, only if CI cannot run it          | Manual evidence        | Pending               | Runner capability gap                                                                                                                                                                  | Time-bounded date required | Pending  |
 
 ### Follow-up issues
 
@@ -1346,10 +1346,13 @@ internal/audits/documentation-refresh-evidence.md` exited 0 and reported
 - Semantics: actual entity-decoded `href` and `src` attributes are resolved
   against each emitted page at a synthetic local origin. Every local reference
   is checked for project-path containment, excluded-family absence, and an
-  existing target artifact. Only genuine off-origin HTTP(S) references are
-  ignored; non-web schemes fail. Focused synthetics require entity-decoded
-  relative exclusion detection, project-path escape detection, and genuine
-  offsite ignoring while code text remains inert.
+  existing target artifact. Normalized URL origins use lower-case schemes and
+  hostnames plus effective default ports; user information is origin-irrelevant,
+  while malformed hosts or ports fail closed. Genuine off-origin HTTP(S) and
+  non-web-scheme references are ignored and counted; focused synthetics require
+  entity-decoded relative and normalized same-origin exclusion detection,
+  project-path escape detection, default-port and user-information handling,
+  non-default-port offsite handling, and inert offsite, non-web, and code text.
 - Exact executable command:
 
 ```sh
@@ -1633,6 +1636,21 @@ class AttributeParser(HTMLParser):
                 self.references.append((tag, name, value))
 
 
+def normalized_origin(parts) -> tuple[str, str, int]:
+    scheme = parts.scheme.lower()
+    hostname = parts.hostname
+    if hostname is None:
+        raise ValueError("web URL has no hostname")
+    hostname = hostname.lower()
+    port = parts.port
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return (scheme, hostname, port)
+
+
+LOCAL_ORIGIN_TUPLE = normalized_origin(urlsplit(LOCAL_ORIGIN))
+
+
 def inspect_references(
     page_relative: str,
     html: str,
@@ -1654,15 +1672,21 @@ def inspect_references(
     violations: list[str] = []
     for tag, name, raw_value in parser.references:
         value = raw_value.strip()
-        raw_parts = urlsplit(value)
-        resolved = urlsplit(urljoin(page_url, value))
+        try:
+            raw_parts = urlsplit(value)
+            resolved = urlsplit(urljoin(page_url, value))
+        except ValueError as error:
+            violations.append(f"{page_relative}: {tag}[{name}] malformed URL: {error}")
+            continue
         if resolved.scheme not in {"http", "https"}:
             counts["nonWebScheme"] += 1
-            violations.append(
-                f"{page_relative}: {tag}[{name}] uses non-web scheme: {value!r}"
-            )
             continue
-        if (resolved.scheme, resolved.netloc) != ("https", "docs.local.invalid"):
+        try:
+            resolved_origin = normalized_origin(resolved)
+        except ValueError as error:
+            violations.append(f"{page_relative}: {tag}[{name}] malformed origin: {error}")
+            continue
+        if resolved_origin != LOCAL_ORIGIN_TUPLE:
             counts["offOrigin"] += 1
             continue
         try:
@@ -1707,6 +1731,14 @@ synthetic_cases = {
         '<img src="../../../escape.png">',
         "escapes project path",
     ),
+    "default port same-origin excluded decoded": (
+        '<a href="HTTPS://DOCS.LOCAL.INVALID:443/trusted-server/int&#x65;rnal/private.html">x</a>',
+        "excluded route",
+    ),
+    "userinfo same-origin excluded": (
+        '<a href="https://user:secret@docs.local.invalid/trusted-server/internal/private.html">x</a>',
+        "excluded route",
+    ),
 }
 synthetic_results: dict[str, bool] = {}
 for name, (html, expected_diagnostic) in synthetic_cases.items():
@@ -1725,6 +1757,25 @@ offsite_result = inspect_references(
 synthetic_results["offsite ignored"] = (
     offsite_result["counts"]["offOrigin"] == 1
     and offsite_result["violations"] == []
+)
+nondefault_result = inspect_references(
+    "guide/example.html",
+    '<a href="https://docs.local.invalid:444/trusted-server/internal/private.html">x</a>',
+    require_targets=False,
+)
+synthetic_results["non-default port offsite ignored"] = (
+    nondefault_result["counts"]["offOrigin"] == 1
+    and nondefault_result["violations"] == []
+)
+nonweb_result = inspect_references(
+    "guide/example.html",
+    '<code>&lt;a href="../internal/private.html"&gt;</code>'
+    '<a href="mailto:reviewer@example.test">mail</a>',
+    require_targets=False,
+)
+synthetic_results["non-web scheme ignored and inert"] = (
+    nonweb_result["counts"]["nonWebScheme"] == 1
+    and nonweb_result["violations"] == []
 )
 if not all(synthetic_results.values()):
     raise RuntimeError(f"artifact synthetics failed: {synthetic_results}")
@@ -1896,9 +1947,13 @@ PY
       "index.html"
     ],
     "synthetics": {
+      "default port same-origin excluded decoded": true,
+      "non-default port offsite ignored": true,
+      "non-web scheme ignored and inert": true,
       "offsite ignored": true,
       "relative excluded decoded": true,
-      "relative project escape": true
+      "relative project escape": true,
+      "userinfo same-origin excluded": true
     },
     "violations": []
   },
