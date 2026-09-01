@@ -176,21 +176,14 @@ sleep 1
 
 info "Generating stub config (mode: $MODE)"
 python3 - "$REPO_ROOT/trusted-server.example.toml" "$WORK/app.toml" "$MODE" "$ORIGIN_PORT" <<'PYEOF'
-import sys, re
+import sys
 src, out, mode, port = sys.argv[1:5]
 s = open(src).read()
 
 s = s.replace('origin_url = "https://origin.example.com"', f'origin_url = "http://127.0.0.1:{port}"', 1)
-# The example config ships placeholders that validation rejects outright,
-# including the reserved publisher domain/cookie_domain.
+# The example publisher domains are reserved placeholders that validation rejects.
 s = s.replace('domain = "example.com"', 'domain = "local-harness.example"', 1)
 s = s.replace('cookie_domain = ".example.com"', 'cookie_domain = ".local-harness.example"', 1)
-s = s.replace('password = "replace-with-admin-password-32-bytes"',
-              'password = "local-harness-admin-password-not-a-real-one"', 1)
-s = s.replace('proxy_secret = "change-me-proxy-secret"',
-              'proxy_secret = "local-harness-proxy-secret-not-a-real-one"', 1)
-s = re.sub(r'passphrase = "[^"]*"',
-           'passphrase = "local-harness-ec-passphrase-not-a-real-one"', s, count=1)
 
 # A real auction, pointed at the stub's slow endpoint, so the timings mean something.
 s = s.replace('[integrations.prebid]\nenabled = false\nserver_url = "https://prebid.example.com/openrtb2/auction"',
@@ -230,6 +223,24 @@ info "Seeding an isolated config store (tracked fastly.toml remains untouched)"
 # pointed at this checkout without copying the workspace.
 cp "$REPO_ROOT/edgezero.toml" "$WORK/edgezero.toml"
 cp "$REPO_ROOT/fastly.toml" "$WORK/fastly.toml"
+python3 - "$WORK/fastly.toml" <<'PYEOF'
+import sys
+
+with open(sys.argv[1], "a") as manifest:
+    manifest.write('''
+[[local_server.secret_stores.ts_secrets]]
+key = "publisher_proxy_secret"
+data = "fictional-local-publisher-proxy-secret-value"
+
+[[local_server.secret_stores.ts_secrets]]
+key = "ec_passphrase"
+data = "fictional-local-ec-passphrase-secret-value"
+
+[[local_server.secret_stores.ts_secrets]]
+key = "handler_password"
+data = "fictional-local-handler-password-secret-value"
+''')
+PYEOF
 ln -s "$REPO_ROOT/crates" "$WORK/crates"
 (cd "$WORK" && "$TS" config push --adapter fastly --local \
   --manifest "$WORK/edgezero.toml" --app-config "$WORK/app.toml" \

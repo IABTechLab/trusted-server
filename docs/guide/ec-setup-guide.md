@@ -23,19 +23,26 @@ Set EC configuration in `trusted-server.toml`:
 
 ```toml
 [ec]
-passphrase = "replace-with-32-plus-byte-random-secret"
+passphrase = "ec_passphrase"
 ec_store = "ec_identity_store"
 
 [[ec.partners]]
 name = "Mocktioneer SSP"
 source_domain = "formally-vital-lion.edgecompute.app"
-api_token = "test-batch-sync-key-2026"
+api_token = "partner_api_token"
 bidstream_enabled = true
 ```
 
+The `passphrase` and `api_token` fields contain keys in the Trusted Server
+secret store, not the credential values. This workflow calls the inbound
+identify and batch-sync APIs, so its partner needs `api_token`. Partners that
+do not call either API may omit it. Provision high-entropy values under
+`ec_passphrase` and `partner_api_token`; see
+[Configuration](/guide/configuration#secret-store-migration).
+
 Required behavior assumptions:
 
-- `passphrase` is long-lived HMAC-SHA256 keying material for EC ID derivation; use a high-entropy random value of at least 32 characters
+- The value stored under `ec_passphrase` is long-lived HMAC-SHA256 keying material for EC ID derivation; use a high-entropy random value of at least 32 characters
 - `ec_store` is linked to the active Fastly service version
 - `ec_store` is the only KV-backed EC lifecycle store; it contains identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones
 - Live consent is interpreted from request cookies, headers, geolocation, and policy defaults rather than a separate consent KV store
@@ -51,7 +58,8 @@ MOCK_SSP_URL="https://formally-vital-lion.edgecompute.app"
 
 PARTNER_SOURCE_DOMAIN="formally-vital-lion.edgecompute.app"
 PARTNER_NAME="Mocktioneer SSP"
-PARTNER_API_KEY="test-batch-sync-key-2026"
+# Use the value provisioned under the partner_api_token secret-store key.
+PARTNER_API_KEY="<resolved-partner-api-token>"
 
 # Optional: use a real browser EC if already present
 EC_ID="<64hex.6chars>"
@@ -68,11 +76,13 @@ Partners are configured in `trusted-server.toml` and loaded at startup:
 [[ec.partners]]
 name = "Mocktioneer SSP"
 source_domain = "formally-vital-lion.edgecompute.app"
-api_token = "test-batch-sync-key-2026"
+api_token = "partner_api_token"
 bidstream_enabled = true
 ```
 
-Deploy/restart after changing partner configuration.
+Provision the bearer token value under `partner_api_token`, then deploy or
+restart after changing partner configuration. The token is required for this
+demo because it exercises the inbound partner APIs.
 
 ## 4) Acquire or Reuse EC Cookie
 

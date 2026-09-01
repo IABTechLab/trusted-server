@@ -57,11 +57,18 @@ build = """
             key = "tinybird_auction_append_token"
             data = "test-tinybird-auction-append-token"
 
+        # App-config references use logical `trusted_server_secrets`; the
+        # edgezero_runtime_env mapping below resolves it to physical `ts_secrets`.
         [[local_server.secret_stores.ts_secrets]]
-            key = "tinybird_access_append_token"
-            data = "test-tinybird-access-append-token"
+            key = "placeholder"
+            data = "placeholder"
 
     [local_server.config_stores]
+        [local_server.config_stores.edgezero_runtime_env]
+            format = "inline-toml"
+        [local_server.config_stores.edgezero_runtime_env.contents]
+            EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME = "ts_secrets"
+
         [local_server.config_stores.trusted_server_config]
             format = "inline-toml"
         [local_server.config_stores.trusted_server_config.contents]

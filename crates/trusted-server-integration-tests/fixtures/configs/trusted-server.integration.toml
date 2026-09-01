@@ -1,16 +1,16 @@
 [[handlers]]
 path = "^/_ts/admin"
 username = "admin"
-password = "integration-admin-password-32-bytes-ok"
+password = "integration_admin_password"
 
 [publisher]
 domain = "localhost"
 cookie_domain = "localhost"
 origin_url = "http://127.0.0.1:8888"
-proxy_secret = "integration-test-proxy-secret"
+proxy_secret = "integration_proxy_secret"
 
 [ec]
-passphrase = "integration-test-ec-secret-padded-32"
+passphrase = "integration_ec_passphrase"
 ec_store = "ec_identity_store"
 pull_sync_concurrency = 3
 
@@ -18,13 +18,13 @@ pull_sync_concurrency = 3
 name = "Integration Test Partner"
 source_domain = "inttest.example.com"
 bidstream_enabled = true
-api_token = "integration-test-token-alpha-32-bytes-ok"
+api_token = "integration_partner_token_alpha"
 
 [[ec.partners]]
 name = "Integration Test Partner 2"
 source_domain = "inttest2.example.com"
 bidstream_enabled = true
-api_token = "integration-test-token-bravo-32-bytes-ok"
+api_token = "integration_partner_token_bravo"
 
 [request_signing]
 enabled = false
