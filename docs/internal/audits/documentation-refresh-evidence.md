@@ -2474,9 +2474,9 @@ PY
   spaces. Missing separators continue to fail closed.
 - The regenerated reviewed inventory contains 5,315 exact findings: 4,970
   domain, 286 lockfile field, 42 credential shape, 12 binary string, four
-  email, and one service ID. Classes are 5,235 vendor URL, 42 fake credential,
+  email, and one service ID. Classes are 5,243 vendor URL, 42 fake credential,
   18 historical example, 11 project-owned public domain, and one service ID.
-- Every domain selector was resolved to its exact repository bytes and the 332
+- Every domain selector was resolved to its exact repository bytes and the 338
   unique values were aggregated by frequency and audited by URL, fixture,
   internal-test, source-member, repository-path, and lockfile context. The most
   frequent retained values were `registry.npmjs.org` (1,172), `github.com`
