@@ -115,6 +115,7 @@ impl Detector {
 #[serde(deny_unknown_fields)]
 struct RetiredManifest {
     version: u32,
+    reviewed: bool,
     #[serde(default)]
     identifiers: Vec<RetiredIdentifier>,
 }
@@ -313,6 +314,12 @@ fn scan_text(path: &str, text: &str, base_offset: usize) -> Vec<Finding> {
     let mut result = Vec::new();
     for matched in url_regex().find_iter(text) {
         let value = trim_url(matched.as_str());
+        let Some(host) = extracted_host(value) else {
+            continue;
+        };
+        if !valid_public_host(&host) && !fictional_or_local_url(value) {
+            continue;
+        }
         if !fictional_or_local_url(value) {
             result.push(finding(
                 path,
@@ -327,13 +334,27 @@ fn scan_text(path: &str, text: &str, base_offset: usize) -> Vec<Finding> {
         if matched.start() > 0 && text.as_bytes()[matched.start() - 1] == b'@' {
             continue;
         }
+        if matched.start() > 0 && text.as_bytes()[matched.start() - 1] == b'/' {
+            continue;
+        }
         if preceding_token_is_url(text, matched.start()) {
+            continue;
+        }
+        if !bare_domain_context_allowed(path, text, matched.start(), matched.end()) {
             continue;
         }
         if !bare_domain_has_terminator(text, matched.end()) {
             continue;
         }
         let value = trim_url(matched.as_str());
+        let host = value
+            .split('/')
+            .next()
+            .unwrap_or(value)
+            .to_ascii_lowercase();
+        if !valid_public_host(&host) {
+            continue;
+        }
         if !fictional_or_local_url(value) {
             result.push(finding(
                 path,
@@ -397,6 +418,52 @@ fn scan_text(path: &str, text: &str, base_offset: usize) -> Vec<Finding> {
     result
 }
 
+fn valid_public_host(host: &str) -> bool {
+    host.ends_with(".internal")
+        || psl::suffix(host.as_bytes()).is_some_and(|suffix| suffix.typ().is_some())
+            && psl::domain_str(host).is_some()
+}
+
+fn extracted_host(value: &str) -> Option<String> {
+    let authority = value.split_once("://")?.1.split(['/', '?', '#']).next()?;
+    let host = authority
+        .rsplit('@')
+        .next()?
+        .split(':')
+        .next()?
+        .to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+fn bare_domain_context_allowed(path: &str, text: &str, start: usize, end: usize) -> bool {
+    let code = matches!(
+        Path::new(path).extension().and_then(|v| v.to_str()),
+        Some("rs" | "js" | "jsx" | "ts" | "tsx" | "mjs" | "mts" | "c")
+    );
+    if !code {
+        return true;
+    }
+    let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+    let prefix = &text[line_start..start];
+    if prefix.contains("//") || prefix.contains("/*") {
+        return true;
+    }
+    let quoted = prefix
+        .bytes()
+        .filter(|b| matches!(b, b'"' | b'\'' | b'`'))
+        .count()
+        % 2
+        == 1;
+    if !quoted {
+        return false;
+    }
+    let candidate = &text[start..end];
+    !matches!(
+        candidate.rsplit('.').next(),
+        Some("rs" | "js" | "jsx" | "ts" | "tsx" | "mjs" | "mts" | "toml" | "json" | "md" | "sh")
+    )
+}
+
 fn bare_domain_has_terminator(text: &str, end: usize) -> bool {
     let remainder = &text[end..];
     let Some(next) = remainder.chars().next() else {
@@ -431,9 +498,12 @@ fn scan_binary(path: &str, contents: &[u8]) -> Vec<Finding> {
     printable_strings(contents)
         .into_iter()
         .flat_map(|(offset, text)| scan_text(path, &text, offset))
-        .map(|finding| Finding {
-            detector: Detector::BinaryString,
-            ..finding
+        .map(|finding| match finding.detector {
+            Detector::ServiceId => finding,
+            _ => Finding {
+                detector: Detector::BinaryString,
+                ..finding
+            },
         })
         .collect()
 }
@@ -449,9 +519,12 @@ fn scan_media_metadata(path: &str, contents: &[u8]) -> Vec<Finding> {
     metadata
         .into_iter()
         .flat_map(|(offset, text)| scan_text(path, &text, offset))
-        .map(|finding| Finding {
-            detector: Detector::MediaMetadata,
-            ..finding
+        .map(|finding| match finding.detector {
+            Detector::ServiceId => finding,
+            _ => Finding {
+                detector: Detector::MediaMetadata,
+                ..finding
+            },
         })
         .collect()
 }
@@ -505,7 +578,7 @@ fn scan_toml_lock_fields(path: &str, text: &str) -> Result<Vec<Finding>, Report<
                 findings.push(finding(
                     path,
                     Detector::LockfileField,
-                    &value,
+                    &raw[1..raw.len() - 1],
                     start,
                     start + raw.len() - 2,
                 ));
@@ -518,7 +591,8 @@ fn scan_toml_lock_fields(path: &str, text: &str) -> Result<Vec<Finding>, Report<
 
 fn scan_json_lock_fields(path: &str, text: &str) -> Result<Vec<Finding>, Report<ScannerError>> {
     let bytes = text.as_bytes();
-    let mut strings = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut findings = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] != b'"' {
@@ -531,32 +605,72 @@ fn scan_json_lock_fields(path: &str, text: &str) -> Result<Vec<Finding>, Report<
         };
         let raw = &text[i..=end];
         let value: String = serde_json::from_str(raw).change_context(ScannerError::Finding)?;
-        strings.push((i, end + 1, value));
-        i = end + 1;
-    }
-    let mut findings = Vec::new();
-    for pair in strings.windows(2) {
-        let (ks, ke, key) = &pair[0];
-        let (vs, ve, value) = &pair[1];
-        let between = &text[*ke..*vs];
-        if lock_field(Some(key)) && between.trim_start().starts_with(':') {
-            if sensitive_lock_value(value) {
+        let mut cursor = end + 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor < bytes.len() && bytes[cursor] == b':' && lock_field(Some(&value)) {
+            let object_start = json_object_start(bytes, i).ok_or_else(|| {
+                Report::new(ScannerError::Finding).attach(format!(
+                    "structured lockfile field outside object: {path}:{value}"
+                ))
+            })?;
+            if !seen.insert((object_start, value.clone())) {
+                return Err(Report::new(ScannerError::Finding).attach(format!(
+                    "duplicate structured lockfile field: {path}:{value}"
+                )));
+            }
+            cursor += 1;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor >= bytes.len() || bytes[cursor] != b'"' {
+                return Err(Report::new(ScannerError::Finding).attach(format!(
+                    "unsupported structured lockfile field shape: {path}:{value}"
+                )));
+            }
+            let value_end = quoted_end(bytes, cursor).ok_or_else(|| {
+                Report::new(ScannerError::Finding)
+                    .attach(format!("unterminated JSON lockfile string: {path}"))
+            })?;
+            let raw = &text[cursor + 1..value_end];
+            let decoded: String = serde_json::from_str(&text[cursor..=value_end])
+                .change_context(ScannerError::Finding)?;
+            if sensitive_lock_value(&decoded) {
                 findings.push(finding(
                     path,
                     Detector::LockfileField,
-                    value,
-                    vs + 1,
-                    ve - 1,
+                    raw,
+                    cursor + 1,
+                    value_end,
                 ));
             }
-        } else if lock_field(Some(key)) {
-            let _ = ks;
-            return Err(Report::new(ScannerError::Finding).attach(format!(
-                "unsupported structured lockfile field shape: {path}"
-            )));
+            i = value_end + 1;
+        } else {
+            i = end + 1;
         }
     }
     Ok(findings)
+}
+
+fn json_object_start(bytes: &[u8], end: usize) -> Option<usize> {
+    let mut stack = Vec::new();
+    let mut i = 0;
+    while i < end {
+        match bytes[i] {
+            b'"' => {
+                i = quoted_end(bytes, i)? + 1;
+                continue;
+            }
+            b'{' => stack.push(i),
+            b'}' => {
+                stack.pop()?;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    stack.last().copied()
 }
 
 fn quoted_end(bytes: &[u8], start: usize) -> Option<usize> {
@@ -786,6 +900,10 @@ fn validate_retired_manifest(manifest: &RetiredManifest) -> Result<(), Report<Sc
     if manifest.version != MANIFEST_VERSION {
         return Err(Report::new(ScannerError::InvalidGovernance)
             .attach("retired-identifiers manifest version must be 1"));
+    }
+    if !manifest.reviewed {
+        return Err(Report::new(ScannerError::InvalidGovernance)
+            .attach("retired-identifier candidates require review"));
     }
     let mut values = BTreeSet::new();
     for record in &manifest.identifiers {
@@ -1297,7 +1415,7 @@ fn bare_domain_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
         Regex::new(
-            r#"(?i)\b(?:[A-Z0-9](?:[A-Z0-9-]*[A-Z0-9])?\.)+(?:com|org|net|io|dev|test|invalid|internal|cloud|app|co|gov|edu)\b(?:/[A-Z0-9._~!$&()*+,;=:@%/?#-]*)?"#,
+            r#"(?i)\b(?:[A-Z0-9](?:[A-Z0-9-]*[A-Z0-9])?\.)+(?:XN--[A-Z0-9-]{2,}|[A-Z]{2,63})(?:/[A-Z0-9._~!$&()*+,;=:@%/?#-]*)?"#,
         )
         .expect("bare-domain detector should compile")
     })

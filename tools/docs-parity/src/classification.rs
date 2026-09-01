@@ -431,6 +431,24 @@ fn validate(
                 .attach(format!("maintained source is not expected text: {path}")));
         }
     }
+    for comment in &maintained_manifest.comments {
+        let Some(source) = sources.get(&comment.path) else {
+            return Err(
+                Report::new(ClassificationError::InvalidManifest).attach(format!(
+                    "comment record references an unknown text source: {}",
+                    comment.path
+                )),
+            );
+        };
+        if source.mode != SourceMode::Comments {
+            return Err(
+                Report::new(ClassificationError::InvalidManifest).attach(format!(
+                    "comment record references a non-comment source: {}",
+                    comment.path
+                )),
+            );
+        }
+    }
 
     for path in tracked_paths {
         let path_text = path
@@ -643,7 +661,9 @@ fn extract_comments(
     grammar: &str,
 ) -> Result<Vec<CommentSpan>, Report<ClassificationError>> {
     match grammar {
-        "shell" | "toml" | "yaml" | "python" | "dockerfile" => Ok(extract_hash_comments(text)),
+        "shell" | "python" | "dockerfile" => Ok(extract_hash_comments(text, true, false)),
+        "toml" => Ok(extract_toml_comments(text)),
+        "yaml" => Ok(extract_yaml_comments(text)),
         "rust" | "javascript" | "protobuf" => Ok(extract_slash_comments(text)),
         "markdown" => Ok(extract_markdown_comments(text)),
         _ => Err(Report::new(ClassificationError::InvalidManifest)
@@ -651,7 +671,11 @@ fn extract_comments(
     }
 }
 
-fn extract_hash_comments(text: &str) -> Vec<CommentSpan> {
+fn extract_hash_comments(
+    text: &str,
+    escaped_hash: bool,
+    whitespace_hash: bool,
+) -> Vec<CommentSpan> {
     let bytes = text.as_bytes();
     let mut spans = Vec::new();
     let mut quote = None;
@@ -670,7 +694,7 @@ fn extract_hash_comments(text: &str) -> Vec<CommentSpan> {
             index += 1;
             continue;
         }
-        if quote == Some(b'"') && byte == b'\\' {
+        if byte == b'\\' && (quote == Some(b'"') || quote.is_none() && escaped_hash) {
             escaped = true;
             index += 1;
             continue;
@@ -684,7 +708,10 @@ fn extract_hash_comments(text: &str) -> Vec<CommentSpan> {
             index += 1;
             continue;
         }
-        if byte == b'#' && quote.is_none() {
+        if byte == b'#'
+            && quote.is_none()
+            && (!whitespace_hash || index == 0 || bytes[index - 1].is_ascii_whitespace())
+        {
             let end = bytes[index..]
                 .iter()
                 .position(|b| *b == b'\n')
@@ -702,12 +729,95 @@ fn extract_hash_comments(text: &str) -> Vec<CommentSpan> {
     spans
 }
 
+fn extract_toml_comments(text: &str) -> Vec<CommentSpan> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    let mut quote: Option<(u8, bool)> = None;
+    let mut escaped = false;
+    while i < bytes.len() {
+        if let Some((delimiter, multiline)) = quote {
+            if escaped {
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            if delimiter == b'"' && bytes[i] == b'\\' {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            let closes = if multiline {
+                i + 2 < bytes.len() && bytes[i..i + 3] == [delimiter; 3]
+            } else {
+                bytes[i] == delimiter
+            };
+            if closes {
+                quote = None;
+                i += if multiline { 3 } else { 1 };
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if matches!(bytes[i], b'"' | b'\'') {
+            let multiline = i + 2 < bytes.len() && bytes[i..i + 3] == [bytes[i]; 3];
+            quote = Some((bytes[i], multiline));
+            i += if multiline { 3 } else { 1 };
+            continue;
+        }
+        if bytes[i] == b'#' {
+            let end = bytes[i..]
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(bytes.len(), |n| i + n);
+            spans.push(CommentSpan {
+                start: i,
+                end,
+                contents: text[i..end].to_owned(),
+            });
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    spans
+}
+
+fn extract_yaml_comments(text: &str) -> Vec<CommentSpan> {
+    let mut spans = Vec::new();
+    let mut offset = 0;
+    let mut block_indent = None;
+    for line in text.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let indent = body.len() - body.trim_start().len();
+        if block_indent.is_some_and(|required| body.trim().is_empty() || indent >= required) {
+            offset += line.len();
+            continue;
+        }
+        block_indent = None;
+        let candidates = extract_hash_comments(body, false, true);
+        spans.extend(candidates.into_iter().map(|span| CommentSpan {
+            start: offset + span.start,
+            end: offset + span.end,
+            contents: span.contents,
+        }));
+        let plain = body.split('#').next().unwrap_or(body).trim_end();
+        if plain.ends_with('|') || plain.ends_with('>') {
+            block_indent = Some(indent + 1);
+        }
+        offset += line.len();
+    }
+    spans
+}
+
 fn extract_slash_comments(text: &str) -> Vec<CommentSpan> {
     let bytes = text.as_bytes();
     let mut spans = Vec::new();
     let mut i = 0;
     let mut quote = None;
     let mut escaped = false;
+    let mut template_depth = 0usize;
     while i < bytes.len() {
         let b = bytes[i];
         if escaped {
@@ -719,6 +829,27 @@ fn extract_slash_comments(text: &str) -> Vec<CommentSpan> {
             escaped = true;
             i += 1;
             continue;
+        }
+        if quote == Some(b'`') && i + 1 < bytes.len() && &bytes[i..i + 2] == b"${" {
+            quote = None;
+            template_depth = 1;
+            i += 2;
+            continue;
+        }
+        if quote.is_none() && template_depth > 0 {
+            if b == b'{' {
+                template_depth += 1;
+                i += 1;
+                continue;
+            }
+            if b == b'}' {
+                template_depth -= 1;
+                i += 1;
+                if template_depth == 0 {
+                    quote = Some(b'`');
+                }
+                continue;
+            }
         }
         if matches!(b, b'\'' | b'"' | b'`') {
             if quote == Some(b) {

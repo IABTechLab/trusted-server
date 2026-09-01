@@ -13,6 +13,10 @@ development commands from that root:
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- update \
   --tracked-paths-record path/to/record.txt
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- classify --check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- classify --update
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- scan --check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- scan --bootstrap
 ```
 
 The tool may also be launched from any nested worktree directory. Derive and
@@ -39,6 +43,38 @@ The exit-code contract is stable:
 - `0`: the check is clean or the update completed;
 - `1`: check mode found a missing or stale generated record;
 - `2`: command syntax, repository safety, Git, or file I/O failed.
+
+## Classification and privacy review
+
+`classify --check` validates every `git ls-files -z` path against
+`manifests/tracked-files.toml` and every expected-text path against
+`manifests/maintained-sources.toml`. Text/binary classification is manifest
+authority: invalid UTF-8 or oversized declared text fails rather than being
+reclassified. Whole-file sources carry an include or typed exclude. Operational
+sources carry a grammar and every extracted comment has an exact byte-range
+selector, SHA-256 content fingerprint, and disposition.
+
+`classify --update` is a candidate-generation workflow. It preserves only exact
+reviewed records, adds new or moved paths/comments as unreviewed candidates,
+and drops stale records. Review all differences before changing both manifests'
+explicit `reviewed` field to true. Missing or false attestation fails closed.
+
+`scan --check` scans every tracked text file, printable binary strings,
+supported image metadata, and structured lockfile URL fields. Domains use the
+compiled public-suffix dataset shipped by the standalone dependency, so checks
+remain offline and reproducible. It also enforces the hashed retired identifier
+and access-phrase records in `manifests/retired-identifiers.toml`. That manifest
+also requires explicit review.
+
+Every permitted finding has one occurrence record in
+`manifests/sensitive-allowlist.toml`: a narrow exception class, exact path and
+byte selector, content fingerprint, owner, rationale, and expiry. Check mode
+fails at the expiry instant, on stale/moved records, on unsupported structured
+data, or on findings without an exact exception. `scan --bootstrap` regenerates
+candidates, preserves only exact reviewed matches, and reopens the complete set
+for review when findings change. It never approves candidates. The five allowed
+exception classes do not assert that mechanical detection is complete for
+human semantic sensitivity.
 
 ## Repository boundary
 

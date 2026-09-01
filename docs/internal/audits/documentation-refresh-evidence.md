@@ -2238,6 +2238,35 @@ PY
   Two post-review scanner bootstraps preserved allowlist SHA-256
   `0ba6ab33c455b0ef6d96eb4feb3de0552a5e8a3ce56196d8474c835faae1fa92`.
 
+#### Task 5 strict re-review correction
+
+- RED evidence: the generalized-domain boundary run passed 39 of 40 scanner
+  tests and exposed a false positive in the source-member/boundary fixture.
+  Before correction, binary and media service identifiers were surfaced only
+  as storage detectors, non-string structured URL fields passed silently,
+  retired governance lacked mandatory attestation, and stale comment records
+  outside comment-mode sources were not closed over the manifest set.
+- GREEN uses the standalone `psl` crate's compiled public-suffix data for
+  deterministic offline modern, long, country-code, and punycode suffix
+  recognition. Binary/media findings retain the semantic service detector.
+  JSON and TOML lock fields reject unsupported shapes and duplicate keys and
+  fingerprint the exact selected raw bytes. Grammar-specific fixtures cover
+  JavaScript template interpolation, shell escapes, TOML multiline strings,
+  and YAML scalar states. The operational contract and review workflow are
+  documented in the tool README.
+- The reviewed real manifests contain 704 text sources and 570 exact comment
+  spans. The scanner manifest contains 4,856 exact findings: 4,520 domain,
+  286 structured lockfile field, 36 credential-shape, 12 binary string, one
+  email, and one service ID. Exception classes are 4,793 vendor URL, 36
+  hash-pinned fake credential fixture, 15 historical example, 11
+  project-owned public domain, and one service ID.
+- False-positive review sampled Rust and TypeScript member expressions, Rust
+  build-path strings, format-template URL fragments, HTML test fixtures,
+  integration script literals, maintained guides, historical plans/specs, and
+  generated lockfiles. Code-member/path/template candidates were removed;
+  complete public-suffix bare domains and syntactically valid URL hosts remain
+  exact reviewed occurrences.
+
 #### Task 6 — Implement generated regions, Markdown ownership, and link checks
 
 Pending. Record each atomic fixture cycle and generated second-run no-diff.

@@ -372,6 +372,74 @@ fn multiple_block_comments_on_one_line_have_distinct_byte_selectors() {
 }
 
 #[test]
+fn grammar_specific_comment_states_handle_templates_escapes_and_multiline_scalars() {
+    for (path, grammar, contents, comment) in [
+        (
+            "build.mjs",
+            "javascript",
+            "const x = `raw /* no */ ${input /* operator */}`;\n",
+            "/* operator */",
+        ),
+        (
+            "script.sh",
+            "shell",
+            "echo value \\# literal # operator\n",
+            "# operator",
+        ),
+        (
+            "config.toml",
+            "toml",
+            "value = \"\"\"# literal\ntext\"\"\" # operator\n",
+            "# operator",
+        ),
+        (
+            "config.yaml",
+            "yaml",
+            "value: |\n  # scalar text\nnext: ok # operator\n",
+            "# operator",
+        ),
+    ] {
+        let start = contents.find(comment).expect("comment should exist");
+        let selector = format!("bytes:{start}-{}", start + comment.len());
+        let repository = TestRepository::new();
+        repository.track(path, contents.as_bytes());
+        repository.manifests(
+            &text_manifest(path, 2048),
+            &comment_source(path, grammar, &[(&selector, comment)]),
+        );
+        let result = repository.classify();
+        assert_eq!(
+            status_code(&result),
+            SUCCESS,
+            "{grammar}: {}",
+            diagnostic(&result)
+        );
+    }
+}
+
+#[test]
+fn comment_records_cannot_reference_unknown_or_whole_file_sources() {
+    for maintained in [
+        format!(
+            "{}\n[[comments]]\npath = \"deleted.sh\"\nselector = \"bytes:0-3\"\nfingerprint = \"{}\"\ndisposition = \"include\"\n",
+            whole_source("notes.txt"),
+            fingerprint(b"# x")
+        ),
+        format!(
+            "{}\n[[comments]]\npath = \"notes.txt\"\nselector = \"bytes:0-3\"\nfingerprint = \"{}\"\ndisposition = \"include\"\n",
+            whole_source("notes.txt"),
+            fingerprint(b"# x")
+        ),
+    ] {
+        let repository = TestRepository::new();
+        repository.track("notes.txt", b"text\n");
+        repository.manifests(&text_manifest("notes.txt", 1024), &maintained);
+        let result = repository.classify();
+        assert_eq!(status_code(&result), ERROR);
+    }
+}
+
+#[test]
 fn a_stale_comment_fingerprint_fails_closed() {
     let repository = TestRepository::new();
     repository.track("script.sh", b"# changedx\necho ok\n");

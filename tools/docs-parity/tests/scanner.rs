@@ -49,7 +49,7 @@ impl TestRepository {
         .expect("should write allowlist");
         fs::write(
             manifests.join("retired-identifiers.toml"),
-            "version = 1\nidentifiers = []\n",
+            "version = 1\nreviewed = true\nidentifiers = []\n",
         )
         .expect("should write denylist");
         Self { directory }
@@ -181,6 +181,60 @@ fn service_id_cannot_use_historical_example_class() {
     assert!(diagnostic(&result).contains("incompatible"));
 }
 
+#[test]
+fn binary_and_media_service_ids_cannot_bypass_service_governance() {
+    let value = "AbCdEf1234567890GhIj";
+    let text = format!("service_id = \"{value}\"");
+    let mut binary = vec![0];
+    binary.extend_from_slice(text.as_bytes());
+    binary.push(0);
+    let mut media = png_text_chunk("Service", &text);
+    media.push(0);
+    for (path, contents) in [("asset.bin", binary), ("asset.png", media)] {
+        let repository = TestRepository::new(path, &contents, "binary");
+        let mut record = exception_for_contents(
+            "historical_example",
+            path,
+            "service_id",
+            &contents,
+            value,
+            "2099-01-01T00:00:00Z",
+        );
+        record = record.replace("owner = \"docs-owner\"", "owner = \"wrong-owner\"");
+        repository.write_allowlist(&record);
+        let result = repository.scan();
+        assert_eq!(status_code(&result), ERROR, "{path} must fail");
+        assert!(diagnostic(&result).contains("incompatible"));
+    }
+}
+
+#[test]
+fn modern_long_and_punycode_domains_are_detected() {
+    let modern = ["getpurpose", ".ai"].concat();
+    for value in [
+        modern.as_str(),
+        "service.technology",
+        "host.xn--p1ai",
+        "service.co.uk",
+    ] {
+        assert_detected("notes.txt", value.as_bytes(), "text", "domain");
+    }
+}
+
+#[test]
+fn retired_manifest_requires_explicit_true_attestation() {
+    for contents in [
+        "version = 1\nidentifiers = []\n",
+        "version = 1\nreviewed = false\nidentifiers = []\n",
+    ] {
+        let repository = TestRepository::new("notes.txt", b"safe text", "text");
+        repository.write_denylist(contents);
+        let result = repository.scan();
+        assert_eq!(status_code(&result), ERROR);
+        assert!(diagnostic(&result).contains("review"));
+    }
+}
+
 fn assert_detected(path: &str, contents: &[u8], kind: &str, detector: &str) {
     let repository = TestRepository::new(path, contents, kind);
 
@@ -252,7 +306,7 @@ fn bare_domain_detector_has_positive_and_typed_allowlisted_fixtures() {
 
 #[test]
 fn bare_domain_detector_does_not_match_source_member_prefixes() {
-    let contents = b"result.contains(value); output.status.code(); document.body.append(node);\nexample.com.evil service.co.uk\n";
+    let contents = b"result.contains(value); output.status.code(); document.body.append(node);\nexample.com.evil\n";
     let repository = TestRepository::new("fixture.rs", contents, "text");
 
     let result = repository.scan();
@@ -263,6 +317,25 @@ fn bare_domain_detector_does_not_match_source_member_prefixes() {
         "source member names are not bare domains: {}",
         diagnostic(&result)
     );
+}
+
+#[test]
+fn domain_detector_rejects_template_path_and_code_member_false_positives() {
+    for (path, contents) in [
+        ("main.rs", r#"format!("http://{}");"#),
+        ("build.rs", r#"let path = "build.rs";"#),
+        ("platform.rs", "let x = prediction.name;"),
+        ("app.rs", "let x = state.settings.ec.partners;"),
+    ] {
+        let repository = TestRepository::new(path, contents.as_bytes(), "text");
+        let result = repository.scan();
+        assert_eq!(
+            status_code(&result),
+            SUCCESS,
+            "{path}: {}",
+            diagnostic(&result)
+        );
+    }
 }
 
 #[test]
@@ -468,6 +541,48 @@ fn lockfiles_scan_non_url_secrets_and_select_the_structured_value_occurrence() {
 }
 
 #[test]
+fn structured_lockfiles_fail_closed_on_non_string_and_duplicate_url_fields() {
+    for contents in [
+        r#"{"resolved":null}"#,
+        r#"{"resolved":{}}"#,
+        r#"{"resolved":[]}"#,
+        r#"{"resolved":42}"#,
+        r#"{"resolved":"https://one.private-corp.internal","resolved":"https://two.private-corp.internal"}"#,
+    ] {
+        let repository = TestRepository::new("package-lock.json", contents.as_bytes(), "text");
+        let result = repository.scan();
+        assert_eq!(status_code(&result), ERROR, "{contents}");
+    }
+    for contents in [
+        "version = 3\nsource = []\n",
+        "version = 3\nsource = \"https://one.private-corp.internal\"\nsource = \"https://two.private-corp.internal\"\n",
+    ] {
+        let repository = TestRepository::new("Cargo.lock", contents.as_bytes(), "text");
+        let result = repository.scan();
+        assert_eq!(status_code(&result), ERROR, "{contents}");
+    }
+}
+
+#[test]
+fn escaped_json_lockfield_fingerprints_the_exact_selected_bytes() {
+    let raw = r#"https:\/\/user:secret@private-corp.internal\/pkg"#;
+    let contents = format!(r#"{{"resolved":"{raw}"}}"#);
+    let repository = TestRepository::new("package-lock.json", contents.as_bytes(), "text");
+    let result = repository.bootstrap();
+    assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+    let manifest = fs::read_to_string(
+        repository
+            .path()
+            .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+    )
+    .expect("manifest");
+    assert!(
+        manifest.contains(&fingerprint(raw.as_bytes())),
+        "raw selected bytes must be fingerprinted: {manifest}"
+    );
+}
+
+#[test]
 fn media_metadata_detector_has_positive_and_typed_allowlisted_fixtures() {
     let value = format!("person@{}", "private-corp.internal");
     let contents = png_text_chunk("Author", &value);
@@ -621,7 +736,7 @@ fn retired_record(kind: &str, value: &str) -> String {
         .join(" ")
         .to_ascii_lowercase();
     format!(
-        "version = 1\n\n[[identifiers]]\nkind = \"{kind}\"\nfingerprint = \"{}\"\nnormalized_length = {}\nword_count = {}\ncase_insensitive = true\nwhitespace_tolerant = {}\n",
+        "version = 1\nreviewed = true\n\n[[identifiers]]\nkind = \"{kind}\"\nfingerprint = \"{}\"\nnormalized_length = {}\nword_count = {}\ncase_insensitive = true\nwhitespace_tolerant = {}\n",
         fingerprint(normalized.as_bytes()),
         normalized.len(),
         normalized.split_whitespace().count(),
@@ -1073,7 +1188,7 @@ fn bootstrap_assigns_historical_and_project_owned_domain_classes() {
 
 #[test]
 fn project_owned_class_requires_an_exact_or_subdomain_host_boundary() {
-    let deceptive = "https://notiabtechlab.com.evil/path";
+    let deceptive = "https://notiabtechlab.com.io/path";
     let repository = TestRepository::new("notes.txt", deceptive.as_bytes(), "text");
 
     let result = repository.bootstrap();
