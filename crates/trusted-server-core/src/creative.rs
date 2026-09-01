@@ -73,13 +73,6 @@ pub(super) fn to_abs(settings: &Settings, u: &str) -> Option<String> {
     Some(absolute)
 }
 
-/// Returns the index of the quote that closes a CSS string opened with `quote` and
-/// starting at `from`, or `None` when the string is unterminated.
-///
-/// A backslash escapes the byte that follows it, and a raw newline ends a CSS string
-/// as a bad-string, so neither can close it. Returning `None` leaves the caller on its
-/// plain scan for the next `)`, which keeps a malformed value unrewritten rather than
-/// guessing at its extent.
 /// Whether a `url()` value can be mapped to the URL the browser will request.
 ///
 /// CSS escapes are not resolved here, so a value carrying a backslash cannot be
@@ -94,6 +87,13 @@ fn css_value_is_resolvable(value: &str) -> bool {
         .any(|byte| matches!(byte, b'\\' | b'\n' | b'\r' | b'\x0c'))
 }
 
+/// Returns the index of the quote that closes a CSS string opened with `quote` and
+/// starting at `from`, or `None` when the string is unterminated.
+///
+/// A backslash escapes what follows, and a raw newline ends a CSS string as a
+/// bad-string, so neither can close it. Returning `None` leaves the caller on its
+/// plain scan for the next `)`, which keeps a malformed value unrewritten rather than
+/// guessing at its extent.
 fn css_string_end(bytes: &[u8], from: usize, quote: u8) -> Option<usize> {
     let mut i = from;
     while i < bytes.len() {
