@@ -290,6 +290,16 @@ pub trait PlatformHttpClient: Send + Sync {
         true
     }
 
+    /// Whether the adapter enforces a hard total deadline for each request.
+    ///
+    /// First-byte and between-byte timers do not qualify: connection setup or a
+    /// byte-trickling response can still overrun the logical auction budget. The
+    /// auction collector uses this explicit capability to decide whether an
+    /// already-completed late response remains eligible.
+    fn has_enforceable_total_request_deadline(&self) -> bool {
+        false
+    }
+
     /// Whether [`send`](Self::send) can preserve upstream response bodies as
     /// [`Body::Stream`](edgezero_core::body::Body::Stream) when requested via
     /// [`PlatformHttpRequest::with_stream_response`].
