@@ -68,6 +68,7 @@ Ordered chunk index / total:
 Ordered chunk redacted content / bytes / SHA-256:
 Aggregate bytes / SHA-256:
 Navigation URLs:
+Authoritative capture/comment URL:
 Supersedes capture/comment:
 Result:
 ```
@@ -135,10 +136,9 @@ updated approved baseline before work continues.
 - `git diff --check` and `git diff --cached --check`: passed after formatting.
 - Cached path review: exactly the four approved paths above; no unintended
   untracked file or unstaged tracked byte remained.
-- Commit: the enclosing commit uses
-  `Approve documentation refresh delivery plan`; its SHA and post-commit clean
-  status are recorded in the execution handoff because a commit cannot contain
-  its own SHA.
+- Commit: `8588391b9e9d6f02d886c519836eedb84a37abd8` uses
+  `Approve documentation refresh delivery plan`; the review-fix and later
+  evidence-only receipt commits are identified below.
 
 #### Prior approval package completion receipt
 
@@ -161,9 +161,9 @@ updated approved baseline before work continues.
 - Clean-status observation immediately before this evidence-only mutation:
   `git status --porcelain` printed nothing.
 
-This immediately adjacent evidence-only commit cannot contain its own SHA.
-Its full SHA is reported in the execution handoff and independently verified
-by the controller and review; no recursive receipt commit follows.
+The immediately adjacent evidence-only receipt commit is
+`931e53e2cbd94d8a7f9fad9ec9d337d37a0f21ca`. That commit did not record its
+own SHA; this later ledger update supplies the exact identifier.
 
 ### Task 1: align program records to the single PR
 
@@ -243,12 +243,17 @@ the durable capture contract, including the actual redacted bodies, byte
 lengths, and SHA-256 hashes. Local builds, CI simulations, fixtures, and mocked
 API output cannot complete a row.
 
-| Surface                     | Required real external capture                                                                                                             | State                       |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------- |
-| Pages and CNAME             | Deployed `main` SHA; live URL/content/header matrix; project-path asset behavior; observed CNAME and canonical-URL behavior                | `release-pending`           |
-| First scheduled link run    | Default-branch run ID, attempt, jobs, URLs, app identities, bounded artifact, concurrency/timeout result, and issue-reconciliation outcome | `release-pending`           |
-| Dependency submission/graph | Authenticated `main` SHA; submission request and response; 201 result; detector/correlator; graph API body; triage owner and SLA           | `release-pending`           |
-| Optional `main` protection  | Only if maintainers opt in: exact contexts/apps, strictness, bypass policy, API bodies, and planted-failure block                          | `release-pending`, optional |
+| Surface                     | Required real external capture                                                                                                             | Capture owner                 | Canonical capture destination | State                       |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------- | ----------------------------- | --------------------------- |
+| Pages and CNAME             | Deployed `main` SHA; live URL/content/header matrix; project-path asset behavior; observed CNAME and canonical-URL behavior                | Pending — Task 17             | Pending — Task 17             | `release-pending`           |
+| First scheduled link run    | Default-branch run ID, attempt, jobs, URLs, app identities, bounded artifact, concurrency/timeout result, and issue-reconciliation outcome | Pending — Task 17             | Pending — Task 17             | `release-pending`           |
+| Dependency submission/graph | Authenticated `main` SHA; submission request and response; 201 result; detector/correlator; graph API body; triage owner and SLA           | Pending — Task 17             | Pending — Task 17             | `release-pending`           |
+| Optional `main` protection  | Only if maintainers opt in: exact contexts/apps, strictness, bypass policy, API bodies, and planted-failure block                          | Pending if selected — Task 17 | Pending if selected — Task 17 | `release-pending`, optional |
+
+Before Task 17 commits, it must replace every applicable pending owner with a
+named owner and every applicable pending destination with the authoritative
+external capture or comment location. If optional protection is not selected,
+Task 17 records that disposition instead of fabricating an owner or URL.
 
 ### First-success adapter smokes
 
