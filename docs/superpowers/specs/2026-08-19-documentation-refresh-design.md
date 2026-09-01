@@ -1038,7 +1038,7 @@ owner follows the committed runbook and records:
 These are release operations, not additional implementation PRs and not
 conditions for claiming the repository work in #1049 complete. Any failed
 release-pending check opens a focused repair through the normal repository
-process; it does not retroactively authorize fabricated Epoch evidence.
+process; it does not retroactively authorize fabricated release evidence.
 
 ## Owner decisions and remaining non-blocking questions
 
