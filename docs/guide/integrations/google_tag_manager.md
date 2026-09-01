@@ -61,10 +61,20 @@ own origin. If your pages load `gtag/js` with a measurement id different from
 your container — a GA4 `G-` id or an Ads `AW-` id, for example — add those ids
 here.
 
-Nothing breaks if you miss one: the tag is answered with a redirect to Google
-and still loads for the visitor. But it is then served third-party, so it loses
-the ad-blocker resilience this integration exists to provide, and a
-`<link rel="preload">` for it pays an extra round trip.
+Missing one does not break the page, but it does degrade the tag, and on some
+sites it stops the tag loading altogether:
+
+- It is served third-party, losing the ad-blocker resilience this integration
+  exists to provide.
+- A `<link rel="preload">` for it pays an extra round trip.
+- **A strict `script-src` blocks it.** A redirect does not make the upstream
+  origin satisfy `'self'`, so unless your policy lists
+  `https://www.googletagmanager.com` explicitly, the redirected script is
+  refused and the tag does not run at all.
+
+Standard `gtag.js` installations use a product tag ID that is usually not the
+`GTM-` container ID, so most deployments that load `gtag/js` will have at least
+one ID to add here.
 
 To find the ids your pages use, look for `gtag/js?id=` in your rendered HTML:
 
