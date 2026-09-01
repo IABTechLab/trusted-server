@@ -394,6 +394,12 @@ fn portable_ambiguous_paths_are_rejected() {
         "record ".to_owned(),
         ".GiT/config".to_owned(),
         "nested/.GIT/record.txt".to_owned(),
+        "COM¹.txt".to_owned(),
+        "com²".to_owned(),
+        "CoM³.log".to_owned(),
+        "LPT¹".to_owned(),
+        "lpt².txt".to_owned(),
+        "lpt³.log".to_owned(),
     ];
     for device in [
         "CON", "PRN", "AUX", "NUL", "CLOCK$", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6",
@@ -432,10 +438,16 @@ fn portable_ambiguous_paths_are_rejected() {
 }
 
 #[test]
-fn git_prefixed_regular_files_are_allowed() {
+fn portable_regular_lookalikes_are_allowed() {
     let repository = TestRepository::new(&["source.txt"]);
 
-    for record in [".gitignore", ".gitmodules"] {
+    for record in [
+        ".gitignore",
+        ".gitmodules",
+        "COM10.txt",
+        "COM¹extra.txt",
+        "lpt³more.log",
+    ] {
         let result =
             output(
                 repository
@@ -446,7 +458,7 @@ fn git_prefixed_regular_files_are_allowed() {
         assert_eq!(
             status_code(&result),
             SUCCESS,
-            "non-administrative Git-prefixed file should be allowed: {record}"
+            "non-reserved portable file should be allowed: {record}"
         );
     }
 }

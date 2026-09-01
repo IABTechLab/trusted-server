@@ -2095,6 +2095,12 @@ PY
   standalone Cargo check targeting `wasm32-wasip1` failed with the intended
   `docs-parity supports only Linux and macOS hosts` compile-time diagnostic,
   proving there is no unsupported-host fallback.
+- Final device-name correction from
+  `91bfa7f71ff554e8e6e71df781c471667a2390e9`: `COM¹.txt` initially exited 0
+  instead of 2. The focused portable-name test passed after exact superscript
+  `¹`, `²`, and `³` suffixes were recognized for case-insensitive `COM` and
+  `LPT` stems, with and without extensions. Longer lookalikes such as
+  `COM¹extra.txt` and `lpt³more.log` remained valid.
 - Final focused commands:
 
   ```bash

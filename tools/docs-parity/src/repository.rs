@@ -92,11 +92,17 @@ fn is_windows_device_name(value: &str) -> bool {
         return true;
     }
 
-    let bytes = stem.as_bytes();
-    bytes.len() == 4
-        && bytes[3].is_ascii_digit()
-        && (b'1'..=b'9').contains(&bytes[3])
-        && (bytes[..3].eq_ignore_ascii_case(b"COM") || bytes[..3].eq_ignore_ascii_case(b"LPT"))
+    let Some(prefix) = stem.get(..3) else {
+        return false;
+    };
+    let Some(suffix) = stem.get(3..) else {
+        return false;
+    };
+    (prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT"))
+        && matches!(
+            suffix,
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
 }
 
 pub(crate) struct Repository {
