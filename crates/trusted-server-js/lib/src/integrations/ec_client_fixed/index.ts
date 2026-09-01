@@ -27,6 +27,29 @@ const MARKER_COOKIE_NAME = 'ts-ecr';
 // stay in sync.
 const FIXED_WORD = 'an-ec';
 
+// The permission this provider requires, the same declaration the server-side
+// provider makes in `required_permissions` (crates/trusted-server-core/src/ec/
+// provider.rs). A page module is treated like any other provider: it declares
+// what it requires and checks that against the resolved state the server
+// hands the page before it does anything. The server enforces the same gate on
+// the resolve endpoint, so this check is the page's half of one decision, not
+// a substitute for the server's. A Rust test asserts the two stay in sync.
+const REQUIRED_PERMISSION = 'necessary.operations.storage';
+
+// Waits for the resolved permission state the edge injects into the page
+// (`window.tsjs.permissions`, via `tsjs.whenPermissions()`) and returns
+// whether the permission this module requires is set. With no permission state
+// on the page there is nothing to check against, so the answer is no.
+export async function requiredPermissionIsSet(): Promise<boolean> {
+  const whenPermissions = window.tsjs?.whenPermissions;
+  if (typeof whenPermissions !== 'function') {
+    log.warn('ec client-fixed: no permission state on the page, not posting');
+    return false;
+  }
+  const snapshot = await whenPermissions();
+  return Array.isArray(snapshot?.set) && snapshot.set.includes(REQUIRED_PERMISSION);
+}
+
 // Returns true when the resolved marker is present in `cookieString`. The Edge
 // Cookie itself is HttpOnly and never appears in `document.cookie`, so the
 // marker is the only signal the page has.
@@ -35,14 +58,19 @@ export function hasResolvedMarker(cookieString: string): boolean {
 }
 
 // Posts the fixed known word to the resolve endpoint when no resolved marker is
-// present. Returns the word posted, or null when nothing was sent or the post
-// failed (a resolve already succeeded, the environment lacks
-// `document`/`fetch`, or the request threw).
+// present and the required permission is set. Returns the word posted, or null
+// when nothing was sent or the post failed (a resolve already succeeded, the
+// required permission is not set, the environment lacks `document`/`fetch`, or
+// the request threw).
 export async function resolveEdgeCookie(): Promise<string | null> {
   if (typeof document === 'undefined' || typeof fetch !== 'function') {
     return null;
   }
   if (hasResolvedMarker(document.cookie)) {
+    return null;
+  }
+  if (!(await requiredPermissionIsSet())) {
+    log.info('ec client-fixed: required permission not set, not posting');
     return null;
   }
 

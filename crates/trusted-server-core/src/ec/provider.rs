@@ -2169,6 +2169,16 @@ mod tests {
             )),
             "the page script's marker cookie name should match COOKIE_TS_EC_RESOLVED"
         );
+        // The page module declares the same permission the server-side
+        // provider requires, and checks it against the state the page is
+        // handed, so the two declarations must name the same Data Use.
+        assert!(
+            script.contains(&format!(
+                "const REQUIRED_PERMISSION = '{}'",
+                Permission::StoreOnDevice.as_str()
+            )),
+            "the page script's REQUIRED_PERMISSION should match the provider's declaration"
+        );
     }
 
     #[test]
