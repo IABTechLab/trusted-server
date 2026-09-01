@@ -372,7 +372,6 @@ fn evaluate_known_browser(ja4_class: Option<&str>, h2_fp_hash: Option<&str>) -> 
 mod tests {
     use super::*;
     use crate::evidence::OwnedRequestInfo;
-    use http::HeaderMap;
 
     // Chrome Mac UA
     const CHROME_MAC_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
