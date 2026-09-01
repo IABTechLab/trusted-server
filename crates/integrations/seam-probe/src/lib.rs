@@ -652,7 +652,6 @@ mod tests {
                 passphrase = "test-secret-key-32-bytes-minimum"
 
                 [geo]
-                default_country = "US"
                 assume_single_jurisdiction = true
 
                 [integrations.seam_probe]
@@ -726,7 +725,6 @@ mod tests {
                 passphrase = "test-secret-key-32-bytes-minimum"
 
                 [geo]
-                default_country = "US"
                 assume_single_jurisdiction = true
             "#,
         )

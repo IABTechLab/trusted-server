@@ -4193,9 +4193,10 @@ mod tests {
         // set must not appear in the blob. A `deny_unknown_fields` binary that
         // predates the selector rejects the key during rollout or rollback.
         //
-        // The `[geo]` table itself is always written now that `default_country`
-        // is required, so the assertion is about the selector key rather than
-        // the table, which is what the blob's compatibility actually turns on.
+        // The shared fixture writes a `[geo]` table (it acknowledges running
+        // with no geo provider), so the assertion is about the selector key
+        // rather than the table, which is what the blob's compatibility
+        // actually turns on.
         let settings = Settings::from_toml(&crate_test_settings_str())
             .expect("should parse settings without a geo selector");
 
@@ -4203,7 +4204,7 @@ mod tests {
 
         let geo = value
             .get("geo")
-            .expect("the geo table is written because default_country is required");
+            .expect("the geo table is written because the fixture acknowledges no geo provider");
         assert!(
             geo.get("provider").is_none(),
             "an unset geo selector should not be serialized, got {geo}"
@@ -4218,10 +4219,9 @@ mod tests {
 
     #[test]
     fn a_selected_geo_provider_stays_in_the_serialized_config() {
-        // The shared test settings already carry a `[geo]` table, because
-        // `default_country` is required, so the selector is set inside that
-        // table rather than in a second one, which TOML rejects as a duplicate
-        // key.
+        // The shared test settings already carry a `[geo]` table, so the
+        // selector is set inside that table rather than in a second one, which
+        // TOML rejects as a duplicate key.
         let settings = Settings::from_toml(&crate_test_settings_str().replace(
             "[geo]",
             "[geo]

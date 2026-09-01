@@ -11,7 +11,7 @@ use super::{GeoInfo, PlatformError, PlatformGeo, RuntimeServices};
 /// sent to any host geo service, so a default deployment is not tied to any host
 /// geo capability. Every geo consumer already treats [`GeoInfo`] as optional, so
 /// a `None` result degrades gracefully: the permission baseline falls back to
-/// the configured `[geo] default_country`, the auction omits geo, and so on.
+/// the top of the `permissions.yaml` rules tree, the auction omits geo, and so on.
 ///
 /// Adapter crates should use this type rather than defining their own stub so
 /// the behavior is the same on every platform.

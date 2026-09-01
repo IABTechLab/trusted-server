@@ -629,7 +629,7 @@ Selects how a client IP is resolved into geolocation (country, region, coordinat
 | `provider`                   | String or null | No              | Key of the geo provider. Omit, or set `none`, to resolve no location and make no host geo call. Set `platform` to use the host's own geo lookup.                                                                 |
 | `assume_single_jurisdiction` | Boolean        | See description | With no geo provider, every request resolves at the top of the `permissions.yaml` rules tree. A deployment that runs an Edge Cookie provider without a geo provider acknowledges that by setting this to `true`. |
 
-No provider is the default, so a default deployment is not tied to any host geo service. Selecting an unknown provider key fails at startup. A failed geo lookup at request time does not fall back to `default_country`; it resolves every permission to the requires-signal floor and is logged at error level, so an outage is handled protectively.
+No provider is the default, so a default deployment is not tied to any host geo service. Selecting an unknown provider key fails at startup. A failed geo lookup at request time does not fall back to the rules tree. It resolves every permission to the requires-signal floor and is logged at error level, so an outage is handled protectively.
 
 **Example**:
 
@@ -650,7 +650,7 @@ A provider advertises the technical permissions its data use requires, and Trust
 
 ### Country and region rules (`permissions.yaml`)
 
-The country and region permission rules are defined in a human-editable permissions YAML document, compiled into the build (not loaded at runtime). The repository sample is `config/permissions/vanilla.yaml`. Edit or replace the compiled-in file and rebuild to change the policy. There is no `[permissions]` block in `trusted-server.toml`. It defines named **groups** (baselines such as `gdpr-eu`, `gdpr-uk`, `us-opt-out`) and **rules** that map a country or country/state to a group, with an optional `permissions` map that overrides single Data Uses (`granted`, `requires_signal`, or `denied`). A request that matches no rule resolves at the top of the rules tree. See the [Permission Model](/guide/permission-model) for the schema and the repository sample.
+The country and region permission rules are defined in a human-editable permissions YAML document, compiled into the build (not loaded at runtime). The repository sample is `config/permissions/vanilla.yaml`. Edit or replace the compiled-in file and rebuild to change the policy. There is no `[permissions]` block in `trusted-server.toml`. It defines named **groups** (baselines such as `gdpr-eu`, `gdpr-uk`, `us-opt-out`) and a **rules** tree whose nodes map a country, and regions beneath it, to a group, with an optional `permissions` map that overrides single Data Uses (`granted`, `requires_signal`, or `denied`). A request that matches no node resolves at the top of the tree, which also names the `jurisdiction` for consent handling. See the [Permission Model](/guide/permission-model) for the schema and the repository sample.
 
 ## Geo Configuration
 
