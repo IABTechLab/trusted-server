@@ -89,7 +89,13 @@ pub struct GoogleTagManagerConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     /// GTM Container ID (e.g., "GTM-XXXXXX").
-    #[validate(length(min = 1, max = 50), custom(function = "validate_container_id"))]
+    #[validate(
+        length(min = 1, max = 50),
+        regex(
+            path = *GTM_CONTAINER_ID_PATTERN,
+            message = "container_id must match format GTM-XXXXXX where X is alphanumeric"
+        )
+    )]
     pub container_id: String,
     /// Upstream URL for GTM (defaults to <https://www.googletagmanager.com>).
     #[serde(default = "default_upstream")]
@@ -126,16 +132,6 @@ fn default_cache_max_age() -> u32 {
 
 fn default_max_beacon_body_size() -> usize {
     65536 // 64KB - prevents memory pressure from oversized payloads
-}
-
-fn validate_container_id(container_id: &str) -> Result<(), validator::ValidationError> {
-    if GTM_CONTAINER_ID_PATTERN.is_match(container_id) {
-        Ok(())
-    } else {
-        Err(validator::ValidationError::new(
-            "container_id must match format GTM-XXXXXX where X is alphanumeric",
-        ))
-    }
 }
 
 /// GTM domain markers the script rewriter looks for. Kept in one place so the
@@ -673,6 +669,39 @@ mod tests {
     };
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+
+    #[test]
+    fn container_id_validation_matches_gtm_pattern() {
+        use validator::Validate as _;
+
+        let config = |id: &str| -> GoogleTagManagerConfig {
+            serde_json::from_value(serde_json::json!({ "container_id": id }))
+                .expect("should deserialize GTM config")
+        };
+
+        // Well-formed container ids pass.
+        for good in ["GTM-ABCD", "GTM-ABCD1234", "GTM-A1B2C3D4E5"] {
+            config(good)
+                .validate()
+                .unwrap_or_else(|err| panic!("valid container id {good:?} should pass: {err:?}"));
+        }
+
+        // Malformed ids are rejected: wrong prefix, too short, lowercase, bad
+        // chars, empty.
+        for bad in [
+            "ABCD1234",
+            "GTM-abc",
+            "gtm-ABCD",
+            "GTM-AB",
+            "GTM_ABCD",
+            "GTM-ABCD!",
+            "",
+        ] {
+            config(bad)
+                .validate()
+                .expect_err(&format!("invalid container id {bad:?} should be rejected"));
+        }
+    }
 
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;

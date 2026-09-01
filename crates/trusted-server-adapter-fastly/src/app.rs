@@ -1304,11 +1304,16 @@ impl Hooks for TrustedServerApp {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::{
-        AppState, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
-        TrustedServerApp, build_per_request_services, build_state_from_settings,
+        AppState, AuctionDispatch, EcContext, EdgeCacheHeader, HandlerFuture, NAMED_ROUTES,
+        NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, TrustedServerApp,
+        build_orchestrator_with_plan, build_per_request_services, build_state_from_settings,
+        compile_auction_plan, handle_publisher_request, publisher_response_into_streaming_response,
         startup_error_router,
     };
     use base64::Engine as _;
@@ -1320,7 +1325,6 @@ mod tests {
     use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::Mutex;
 
     use error_stack::Report;
     use futures::executor::block_on;
@@ -1335,7 +1339,9 @@ mod tests {
     use trusted_server_core::platform::{
         ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, PlatformHttpClient,
         PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
-        PlatformSelectResult, RuntimeServices,
+        PlatformSelectResult, PlatformTemplateCache, PlatformTemplateCacheReservation,
+        RuntimeServices, TemplateCacheError, TemplateCacheKey, TemplateCacheLookup,
+        TemplateCacheMiss, TemplateCacheReservation, TemplateEntry, TemplateMetadata,
     };
     use trusted_server_core::settings::Settings;
 
@@ -2236,13 +2242,27 @@ mod tests {
             server_region: Some("US-East".to_string()),
         });
 
-        let _ = route(&router, req);
+        let response = route(&router, req);
 
         let observed = captured
             .lock()
             .expect("should lock captured client info")
             .clone()
             .expect("request filter should have observed the entry-point ClientInfo");
+        assert_eq!(
+            observed.client_ip,
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
+            "request-scoped services should preserve the resolved client IP used by EC"
+        );
+        let finalize = response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("fallback response should carry EC finalization state");
+        assert_eq!(
+            finalize.ec_context.client_ip(),
+            Some("203.0.113.7"),
+            "EC should capture the resolved client IP from request-scoped services"
+        );
         assert_eq!(
             observed.tls_protocol.as_deref(),
             Some("TLSv1.3"),
@@ -2640,6 +2660,298 @@ mod tests {
             .geo(Arc::new(crate::platform::FastlyPlatformGeo))
             .client_info(ClientInfo::default())
             .build()
+    }
+
+    #[derive(Default)]
+    struct DispatchTemplateCache {
+        entries: Arc<Mutex<HashMap<String, TemplateEntry>>>,
+    }
+
+    struct DispatchTemplateReservation {
+        entries: Arc<Mutex<HashMap<String, TemplateEntry>>>,
+        key: TemplateCacheKey,
+    }
+
+    impl PlatformTemplateCacheReservation for DispatchTemplateReservation {
+        fn insert(
+            self: Box<Self>,
+            metadata: &TemplateMetadata,
+            body: Vec<u8>,
+            _max_age: Duration,
+        ) -> Result<(), TemplateCacheError> {
+            self.entries.lock().expect("should lock entries").insert(
+                self.key.to_cache_key(),
+                TemplateEntry {
+                    metadata: metadata.clone(),
+                    body,
+                },
+            );
+            Ok(())
+        }
+
+        fn cancel(self: Box<Self>) -> Result<(), TemplateCacheError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformTemplateCache for DispatchTemplateCache {
+        async fn lookup_or_reserve(
+            &self,
+            key: &TemplateCacheKey,
+        ) -> Result<TemplateCacheLookup, TemplateCacheError> {
+            if let Some(entry) = self
+                .entries
+                .lock()
+                .expect("should lock entries")
+                .get(&key.to_cache_key())
+                .cloned()
+            {
+                return Ok(TemplateCacheLookup::Hit(entry));
+            }
+            Ok(TemplateCacheLookup::Reserved(
+                TemplateCacheReservation::new(Box::new(DispatchTemplateReservation {
+                    entries: Arc::clone(&self.entries),
+                    key: key.clone(),
+                })),
+            ))
+        }
+
+        async fn get(&self, key: &TemplateCacheKey) -> Result<TemplateEntry, TemplateCacheMiss> {
+            self.entries
+                .lock()
+                .expect("should lock entries")
+                .get(&key.to_cache_key())
+                .cloned()
+                .ok_or(TemplateCacheMiss::NotFound)
+        }
+
+        async fn put(
+            &self,
+            key: &TemplateCacheKey,
+            metadata: &TemplateMetadata,
+            body: Vec<u8>,
+            _max_age: Duration,
+        ) -> Result<(), TemplateCacheError> {
+            self.entries.lock().expect("should lock entries").insert(
+                key.to_cache_key(),
+                TemplateEntry {
+                    metadata: metadata.clone(),
+                    body,
+                },
+            );
+            Ok(())
+        }
+
+        async fn purge_url(&self, key: &TemplateCacheKey) -> Result<(), TemplateCacheError> {
+            self.entries
+                .lock()
+                .expect("should lock entries")
+                .remove(&key.to_cache_key());
+            Ok(())
+        }
+
+        async fn purge_all(&self) -> Result<(), TemplateCacheError> {
+            self.entries.lock().expect("should lock entries").clear();
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct DispatchOriginClient {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformHttpClient for DispatchOriginClient {
+        async fn send(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let response = edgezero_core::http::response_builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .header(header::CACHE_CONTROL, "public, max-age=300")
+                .body(Body::from(
+                    b"<html><head></head><body>origin</body></html>".as_ref(),
+                ))
+                .map_err(|_| Report::new(PlatformError::HttpClient))?;
+            Ok(PlatformResponse::new(response))
+        }
+
+        async fn send_async(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        async fn select(
+            &self,
+            _pending_requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    #[test]
+    fn dispatch_edge_authenticated_esi_request_stores_then_hits_template() {
+        let settings = Arc::new(
+            Settings::from_toml(
+                r#"
+                    [[handlers]]
+                    path = "^/secure"
+                    username = "user"
+                    password = "pass"
+
+                    [[handlers]]
+                    path = "^/_ts/admin"
+                    username = "admin"
+                    password = "admin-pass"
+
+                    [publisher]
+                    domain = "test-publisher.com"
+                    cookie_domain = ".test-publisher.com"
+                    origin_url = "https://origin.test-publisher.com"
+                    proxy_secret = "unit-test-proxy-secret"
+
+                    [ec]
+                    passphrase = "test-secret-key-32-bytes-minimum"
+
+                    [auction]
+                    enabled = true
+                    providers = {}
+
+                    [creative_opportunities]
+                    gam_network_id = "99999"
+                    assembly_mode = "esi"
+
+                    [[creative_opportunities.slot]]
+                    id = "test-slot"
+                    page_patterns = ["/secure/article"]
+                    formats = [{ width = 728, height = 90 }]
+                "#,
+            )
+            .expect("should parse dispatch cache settings"),
+        );
+        let cache = Arc::new(DispatchTemplateCache::default());
+        let origin = Arc::new(DispatchOriginClient::default());
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
+            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
+            .template_cache(Arc::clone(&cache) as Arc<dyn PlatformTemplateCache>)
+            .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
+            .backend(Arc::new(FixedBackend))
+            .http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>)
+            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .client_info(ClientInfo::default())
+            .build();
+        let plan = Arc::new(compile_auction_plan(&settings).expect("should compile auction plan"));
+        let registry = Arc::new(
+            IntegrationRegistry::with_plan(&settings, Arc::clone(&plan))
+                .expect("should build integration registry"),
+        );
+        let orchestrator = Arc::new(
+            build_orchestrator_with_plan(plan, &settings)
+                .expect("should build auction orchestrator"),
+        );
+
+        let handler = {
+            let settings = Arc::clone(&settings);
+            let services = services.clone();
+            let registry = Arc::clone(&registry);
+            let orchestrator = Arc::clone(&orchestrator);
+            move |ctx: RequestContext| {
+                let settings = Arc::clone(&settings);
+                let services = services.clone();
+                let registry = Arc::clone(&registry);
+                let orchestrator = Arc::clone(&orchestrator);
+                Box::pin(async move {
+                    let request = ctx.into_request();
+                    let method = request.method().clone();
+                    let mut ec_context =
+                        match EcContext::read_from_request(&settings, &request, &services) {
+                            Ok(context) => context,
+                            Err(report) => return Ok(super::http_error(&report)),
+                        };
+                    let response = match handle_publisher_request(
+                        &settings,
+                        &services,
+                        None,
+                        &mut ec_context,
+                        AuctionDispatch {
+                            orchestrator: &orchestrator,
+                            slots: settings.creative_opportunity_slots(),
+                            registry: None,
+                        },
+                        request,
+                        EdgeCacheHeader::SurrogateControl,
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(report) => return Ok(super::http_error(&report)),
+                    };
+                    match publisher_response_into_streaming_response(
+                        response,
+                        &method,
+                        Arc::clone(&settings),
+                        &registry,
+                        orchestrator,
+                        services,
+                    )
+                    .await
+                    {
+                        Ok(response) => Ok(response),
+                        Err(report) => Ok(super::http_error(&report)),
+                    }
+                }) as HandlerFuture
+            }
+        };
+        let router = RouterService::builder()
+            .middleware(crate::middleware::AuthMiddleware::new(Arc::clone(
+                &settings,
+            )))
+            .route("/secure/article", Method::GET, handler)
+            .build();
+        let authorized_request = || {
+            request_builder()
+                .method(Method::GET)
+                .uri("https://test-publisher.com/secure/article")
+                .header(header::HOST, "test-publisher.com")
+                .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+                .header("sec-fetch-dest", "document")
+                .header("sec-fetch-mode", "navigate")
+                .body(Body::empty())
+                .expect("should build authorized navigation")
+        };
+
+        let cold = route(&router, authorized_request());
+        assert_eq!(
+            cold.headers()
+                .get("x-ts-template-cache")
+                .and_then(|value| value.to_str().ok()),
+            Some("miss-stored")
+        );
+        block_on(cold.into_body().into_bytes_bounded(1024 * 1024))
+            .expect("should drain cold response");
+
+        let warm = route(&router, authorized_request());
+        assert_eq!(
+            warm.headers()
+                .get("x-ts-template-cache")
+                .and_then(|value| value.to_str().ok()),
+            Some("hit")
+        );
+        block_on(warm.into_body().into_bytes_bounded(1024 * 1024))
+            .expect("should drain warm response");
+        assert_eq!(
+            origin.calls.load(Ordering::Relaxed),
+            1,
+            "the warm dispatch must not fetch the publisher origin"
+        );
     }
 
     #[test]

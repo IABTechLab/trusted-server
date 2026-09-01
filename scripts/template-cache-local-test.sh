@@ -227,7 +227,6 @@ import sys
 src, out, mode, origin_port, bid_port = sys.argv[1:6]
 s = open(src).read()
 
-
 def replace_once(content, old, new, description):
     if content.count(old) != 1:
         raise SystemExit(f"expected one {description} replacement target")
@@ -239,6 +238,18 @@ s = replace_once(
     'origin_url = "https://origin.example.com"',
     f'origin_url = "http://127.0.0.1:{origin_port}"',
     "publisher origin",
+)
+s = replace_once(
+    s,
+    'domain = "example.com"',
+    'domain = "local-harness.example"',
+    "publisher domain",
+)
+s = replace_once(
+    s,
+    'cookie_domain = ".example.com"',
+    'cookie_domain = ".local-harness.example"',
+    "publisher cookie domain",
 )
 # The example config ships placeholders that validation rejects outright.
 s = replace_once(
@@ -298,8 +309,8 @@ s = replace_once(
 )
 s = replace_once(
     s,
-    'auction_timeout_ms = 500  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS',
-    'auction_timeout_ms = 10000  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS',
+    'auction_timeout_ms = 500',
+    'auction_timeout_ms = 10000',
     "creative opportunity auction timeout",
 )
 
