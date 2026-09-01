@@ -39,7 +39,6 @@ impl core::error::Error for ClassificationError {}
 struct TrackedManifest {
     version: u32,
     max_text_bytes: usize,
-    #[serde(default = "reviewed_by_default")]
     reviewed: bool,
     #[serde(default)]
     files: Vec<TrackedFile>,
@@ -63,7 +62,6 @@ pub(crate) enum FileKind {
 #[serde(deny_unknown_fields)]
 struct MaintainedManifest {
     version: u32,
-    #[serde(default = "reviewed_by_default")]
     reviewed: bool,
     #[serde(default)]
     sources: Vec<SourceRecord>,
@@ -124,8 +122,15 @@ struct CommentRecord {
 
 #[derive(Clone, Debug)]
 struct CommentSpan {
-    line: usize,
+    start: usize,
+    end: usize,
     contents: String,
+}
+
+impl CommentSpan {
+    fn selector(&self) -> String {
+        format!("bytes:{}-{}", self.start, self.end)
+    }
 }
 
 pub(crate) struct ClassifiedFile {
@@ -265,19 +270,19 @@ pub(crate) fn update(repository: &Repository) -> Result<(), Report<Classificatio
                         .expect("tracked text contents should exist"),
                 )
                 .change_context(ClassificationError::Update)?;
-                let previous_by_line = previous_comments
+                let previous_by_selector = previous_comments
                     .iter()
                     .filter(|comment| comment.path == record.path)
                     .filter_map(|comment| {
                         parse_selector(&comment.selector)
                             .ok()
-                            .map(|line| (line, comment))
+                            .map(|selector| (selector, comment))
                     })
                     .collect::<BTreeMap<_, _>>();
                 for span in extract_comments(contents, grammar)? {
                     let expected_fingerprint = fingerprint(span.contents.as_bytes());
-                    if let Some(existing) = previous_by_line
-                        .get(&span.line)
+                    if let Some(existing) = previous_by_selector
+                        .get(&(span.start, span.end))
                         .filter(|record| record.fingerprint == expected_fingerprint)
                     {
                         comments.push((*existing).clone());
@@ -285,7 +290,7 @@ pub(crate) fn update(repository: &Repository) -> Result<(), Report<Classificatio
                         maintained_changed = true;
                         comments.push(CommentRecord {
                             path: record.path.clone(),
-                            selector: format!("line:{}", span.line),
+                            selector: span.selector(),
                             fingerprint: expected_fingerprint,
                             disposition: Disposition::Include,
                             exclude_kind: None,
@@ -317,7 +322,7 @@ pub(crate) fn update(repository: &Repository) -> Result<(), Report<Classificatio
             {
                 comments.push(CommentRecord {
                     path: record.path.clone(),
-                    selector: format!("line:{}", span.line),
+                    selector: span.selector(),
                     fingerprint: fingerprint(span.contents.as_bytes()),
                     disposition: Disposition::Include,
                     exclude_kind: None,
@@ -505,10 +510,6 @@ fn unique_files(
     Ok(result)
 }
 
-const fn reviewed_by_default() -> bool {
-    true
-}
-
 fn unique_sources(
     records: &[SourceRecord],
 ) -> Result<BTreeMap<String, SourceRecord>, Report<ClassificationError>> {
@@ -595,34 +596,42 @@ fn validate_source(
     let mut records = BTreeMap::new();
     for record in comment_records.iter().filter(|record| record.path == path) {
         validate_manifest_path(&record.path)?;
-        let line = parse_selector(&record.selector)?;
+        let selector = parse_selector(&record.selector)?;
         validate_fingerprint(&record.fingerprint)?;
         validate_disposition(
             Some(record.disposition),
             record.exclude_kind,
-            &format!("comment span: {path}:{line}"),
+            &format!("comment span: {path}:{}", record.selector),
         )?;
-        if records.insert(line, record).is_some() {
-            return Err(Report::new(ClassificationError::InvalidManifest)
-                .attach(format!("duplicate comment selector: {path}:{line}")));
+        if records.insert(selector, record).is_some() {
+            return Err(
+                Report::new(ClassificationError::InvalidManifest).attach(format!(
+                    "duplicate comment selector: {path}:{}",
+                    record.selector
+                )),
+            );
         }
     }
     for span in spans {
-        let Some(record) = records.remove(&span.line) else {
-            return Err(Report::new(ClassificationError::Incomplete)
-                .attach(format!("unclassified comment span: {path}:{}", span.line)));
+        let selector = (span.start, span.end);
+        let Some(record) = records.remove(&selector) else {
+            return Err(Report::new(ClassificationError::Incomplete).attach(format!(
+                "unclassified comment span: {path}:{}",
+                span.selector()
+            )));
         };
         if record.fingerprint != fingerprint(span.contents.as_bytes()) {
             return Err(Report::new(ClassificationError::Incomplete).attach(format!(
                 "comment fingerprint mismatch: {path}:{}",
-                span.line
+                span.selector()
             )));
         }
     }
-    if let Some((line, _record)) = records.first_key_value() {
+    if let Some((selector, _record)) = records.first_key_value() {
         return Err(
             Report::new(ClassificationError::InvalidManifest).attach(format!(
-                "comment selector has no extracted span: {path}:{line}"
+                "comment selector has no extracted span: {path}:bytes:{}-{}",
+                selector.0, selector.1
             )),
         );
     }
@@ -634,9 +643,7 @@ fn extract_comments(
     grammar: &str,
 ) -> Result<Vec<CommentSpan>, Report<ClassificationError>> {
     match grammar {
-        "shell" | "toml" | "yaml" | "python" | "dockerfile" => {
-            Ok(extract_prefixed_lines(text, "#"))
-        }
+        "shell" | "toml" | "yaml" | "python" | "dockerfile" => Ok(extract_hash_comments(text)),
         "rust" | "javascript" | "protobuf" => Ok(extract_slash_comments(text)),
         "markdown" => Ok(extract_markdown_comments(text)),
         _ => Err(Report::new(ClassificationError::InvalidManifest)
@@ -644,59 +651,110 @@ fn extract_comments(
     }
 }
 
-fn extract_prefixed_lines(text: &str, prefix: &str) -> Vec<CommentSpan> {
-    text.lines()
-        .enumerate()
-        .filter(|(_index, line)| line.trim_start().starts_with(prefix))
-        .map(|(index, line)| CommentSpan {
-            line: index + 1,
-            contents: line.trim().to_owned(),
-        })
-        .collect()
+fn extract_hash_comments(text: &str) -> Vec<CommentSpan> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\n' {
+            quote = None;
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if quote == Some(b'"') && byte == b'\\' {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'\'' || byte == b'"' {
+            if quote == Some(byte) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(byte);
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'#' && quote.is_none() {
+            let end = bytes[index..]
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(bytes.len(), |n| index + n);
+            spans.push(CommentSpan {
+                start: index,
+                end,
+                contents: text[index..end].to_owned(),
+            });
+            index = end;
+            continue;
+        }
+        index += 1;
+    }
+    spans
 }
 
 fn extract_slash_comments(text: &str) -> Vec<CommentSpan> {
+    let bytes = text.as_bytes();
     let mut spans = Vec::new();
-    let mut block_start = None;
-    let mut block = String::new();
-    for (index, line) in text.lines().enumerate() {
-        let line_number = index + 1;
-        let trimmed = line.trim();
-        if let Some(start) = block_start {
-            if !block.is_empty() {
-                block.push('\n');
-            }
-            block.push_str(trimmed);
-            if trimmed.contains("*/") {
-                spans.push(CommentSpan {
-                    line: start,
-                    contents: block.clone(),
-                });
-                block_start = None;
-                block.clear();
-            }
-        } else if trimmed.starts_with("//") {
-            spans.push(CommentSpan {
-                line: line_number,
-                contents: trimmed.to_owned(),
-            });
-        } else if trimmed.starts_with("/*") {
-            if trimmed.contains("*/") {
-                spans.push(CommentSpan {
-                    line: line_number,
-                    contents: trimmed.to_owned(),
-                });
-            } else {
-                block_start = Some(line_number);
-                block.push_str(trimmed);
-            }
+    let mut i = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
         }
-    }
-    if let Some(start) = block_start {
-        spans.push(CommentSpan {
-            line: start,
-            contents: block,
-        });
+        if quote.is_some() && b == b'\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if matches!(b, b'\'' | b'"' | b'`') {
+            if quote == Some(b) {
+                quote = None
+            } else if quote.is_none() {
+                quote = Some(b)
+            };
+            i += 1;
+            continue;
+        }
+        if quote.is_none() && i + 1 < bytes.len() && &bytes[i..i + 2] == b"//" {
+            let end = bytes[i..]
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(bytes.len(), |n| i + n);
+            spans.push(CommentSpan {
+                start: i,
+                end,
+                contents: text[i..end].to_owned(),
+            });
+            i = end;
+            continue;
+        }
+        if quote.is_none() && i + 1 < bytes.len() && &bytes[i..i + 2] == b"/*" {
+            let end = text[i + 2..]
+                .find("*/")
+                .map_or(bytes.len(), |n| i + 2 + n + 2);
+            spans.push(CommentSpan {
+                start: i,
+                end,
+                contents: text[i..end].to_owned(),
+            });
+            i = end;
+            continue;
+        }
+        i += 1;
     }
     spans
 }
@@ -704,26 +762,25 @@ fn extract_slash_comments(text: &str) -> Vec<CommentSpan> {
 fn extract_markdown_comments(text: &str) -> Vec<CommentSpan> {
     let mut spans = Vec::new();
     let mut remaining = text;
-    let mut line = 1;
+    let mut consumed = 0;
     while let Some(start) = remaining.find("<!--") {
-        line += remaining[..start]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count();
+        let absolute_start = consumed + start;
         let after_start = &remaining[start..];
         let Some(end) = after_start.find("-->") else {
             spans.push(CommentSpan {
-                line,
-                contents: after_start.trim().to_owned(),
+                start: absolute_start,
+                end: text.len(),
+                contents: after_start.to_owned(),
             });
             break;
         };
         let contents = &after_start[..end + 3];
         spans.push(CommentSpan {
-            line,
-            contents: contents.trim().to_owned(),
+            start: absolute_start,
+            end: absolute_start + contents.len(),
+            contents: contents.to_owned(),
         });
-        line += contents.bytes().filter(|byte| *byte == b'\n').count();
+        consumed = absolute_start + contents.len();
         remaining = &after_start[end + 3..];
     }
     spans
@@ -836,11 +893,12 @@ fn source_code(path: &str) -> bool {
     )
 }
 
-fn parse_selector(selector: &str) -> Result<usize, Report<ClassificationError>> {
+fn parse_selector(selector: &str) -> Result<(usize, usize), Report<ClassificationError>> {
     selector
-        .strip_prefix("line:")
-        .and_then(|line| line.parse::<usize>().ok())
-        .filter(|line| *line > 0)
+        .strip_prefix("bytes:")
+        .and_then(|value| value.split_once('-'))
+        .and_then(|(start, end)| Some((start.parse().ok()?, end.parse().ok()?)))
+        .filter(|(start, end)| start < end)
         .ok_or_else(|| {
             Report::new(ClassificationError::InvalidManifest)
                 .attach(format!("invalid comment selector: {selector}"))
@@ -848,10 +906,7 @@ fn parse_selector(selector: &str) -> Result<usize, Report<ClassificationError>> 
 }
 
 fn selector_line(selector: &str) -> usize {
-    selector
-        .strip_prefix("line:")
-        .and_then(|line| line.parse().ok())
-        .unwrap_or(usize::MAX)
+    parse_selector(selector).map_or(usize::MAX, |value| value.0)
 }
 
 fn validate_manifest_path(path: &str) -> Result<(), Report<ClassificationError>> {

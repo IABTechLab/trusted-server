@@ -52,7 +52,6 @@ impl core::error::Error for ScannerError {}
 #[serde(deny_unknown_fields)]
 struct AllowlistManifest {
     version: u32,
-    #[serde(default = "reviewed_by_default")]
     reviewed: bool,
     #[serde(default)]
     exceptions: Vec<ExceptionRecord>,
@@ -266,6 +265,11 @@ fn scan_repository(repository: &Repository) -> Result<ScanState, Report<ScannerE
                 let text =
                     core::str::from_utf8(&contents).change_context(ScannerError::Classification)?;
                 if is_lockfile(&file.path) {
+                    result.extend(
+                        scan_text(&file.path, text, 0)
+                            .into_iter()
+                            .filter(|finding| finding.detector != Detector::Domain),
+                    );
                     result.extend(scan_lockfile(&file.path, text)?);
                 } else if !is_governance_manifest(&file.path) {
                     result.extend(scan_text(&file.path, text, 0));
@@ -275,12 +279,15 @@ fn scan_repository(repository: &Repository) -> Result<ScanState, Report<ScannerE
                 let media_findings = scan_media_metadata(&file.path, &contents);
                 let media_matches = media_findings
                     .iter()
-                    .map(|finding| finding.matched.as_str())
+                    .map(|finding| (finding.selector.as_str(), finding.matched.as_str()))
                     .collect::<BTreeSet<_>>();
                 result.extend(
                     scan_binary(&file.path, &contents)
                         .into_iter()
-                        .filter(|finding| !media_matches.contains(finding.matched.as_str())),
+                        .filter(|finding| {
+                            !media_matches
+                                .contains(&(finding.selector.as_str(), finding.matched.as_str()))
+                        }),
                 );
                 result.extend(media_findings);
             }
@@ -450,74 +457,124 @@ fn scan_media_metadata(path: &str, contents: &[u8]) -> Vec<Finding> {
 }
 
 fn scan_lockfile(path: &str, text: &str) -> Result<Vec<Finding>, Report<ScannerError>> {
-    let mut values = Vec::new();
     if path.ends_with("Cargo.lock") {
-        let value: toml::Value = toml::from_str(text)
+        let _value: toml::Value = toml::from_str(text)
             .change_context(ScannerError::Finding)
             .attach(format!("cannot parse structured lockfile: {path}"))?;
-        collect_toml_lock_fields(&value, None, &mut values);
+        scan_toml_lock_fields(path, text)
     } else if path.ends_with("package-lock.json") {
-        let value: JsonValue = serde_json::from_str(text)
+        let _value: JsonValue = serde_json::from_str(text)
             .change_context(ScannerError::Finding)
             .attach(format!("cannot parse structured lockfile: {path}"))?;
-        collect_json_lock_fields(&value, None, &mut values);
+        scan_json_lock_fields(path, text)
+    } else {
+        Ok(Vec::new())
     }
-    let mut seen = BTreeMap::<String, usize>::new();
+}
+
+fn scan_toml_lock_fields(path: &str, text: &str) -> Result<Vec<Finding>, Report<ScannerError>> {
     let mut findings = Vec::new();
-    for value in values
-        .into_iter()
-        .filter(|value| sensitive_lock_value(value))
-    {
-        let occurrence = seen.entry(value.clone()).or_default();
-        let Some((start, _matched)) = text.match_indices(&value).nth(*occurrence) else {
-            return Err(Report::new(ScannerError::Finding).attach(format!(
-                "cannot locate structured lockfile field bytes: {path}"
-            )));
-        };
-        *occurrence += 1;
-        findings.push(finding(
-            path,
-            Detector::LockfileField,
-            &value,
-            start,
-            start + value.len(),
-        ));
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if let Some((key, rest)) = trimmed.split_once('=')
+            && lock_field(Some(key.trim()))
+        {
+            let value_text = rest.trim_start();
+            if !value_text.starts_with('"') {
+                return Err(Report::new(ScannerError::Finding).attach(format!(
+                    "unsupported structured lockfile field shape: {path}"
+                )));
+            }
+            let Some(end_quote) = quoted_end(value_text.as_bytes(), 0) else {
+                return Err(Report::new(ScannerError::Finding)
+                    .attach(format!("unterminated structured lockfile field: {path}")));
+            };
+            let raw = &value_text[..=end_quote];
+            let value: String = toml::from_str(&format!("value = {raw}"))
+                .ok()
+                .and_then(|v: toml::Value| v.get("value")?.as_str().map(str::to_owned))
+                .ok_or_else(|| {
+                    Report::new(ScannerError::Finding).attach("invalid TOML lockfile string")
+                })?;
+            if sensitive_lock_value(&value) {
+                let start = offset + line.len() - trimmed.len() + trimmed.len() - rest.len()
+                    + rest.len()
+                    - value_text.len()
+                    + 1;
+                findings.push(finding(
+                    path,
+                    Detector::LockfileField,
+                    &value,
+                    start,
+                    start + raw.len() - 2,
+                ));
+            }
+        }
+        offset += line.len();
     }
     Ok(findings)
 }
 
-fn collect_toml_lock_fields(value: &toml::Value, key: Option<&str>, output: &mut Vec<String>) {
-    match value {
-        toml::Value::String(value) if lock_field(key) => output.push(value.clone()),
-        toml::Value::Array(values) => {
-            for value in values {
-                collect_toml_lock_fields(value, key, output);
-            }
+fn scan_json_lock_fields(path: &str, text: &str) -> Result<Vec<Finding>, Report<ScannerError>> {
+    let bytes = text.as_bytes();
+    let mut strings = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
         }
-        toml::Value::Table(values) => {
-            for (key, value) in values {
-                collect_toml_lock_fields(value, Some(key), output);
-            }
-        }
-        _ => {}
+        let Some(end) = quoted_end(bytes, i) else {
+            return Err(Report::new(ScannerError::Finding)
+                .attach(format!("unterminated JSON lockfile string: {path}")));
+        };
+        let raw = &text[i..=end];
+        let value: String = serde_json::from_str(raw).change_context(ScannerError::Finding)?;
+        strings.push((i, end + 1, value));
+        i = end + 1;
     }
+    let mut findings = Vec::new();
+    for pair in strings.windows(2) {
+        let (ks, ke, key) = &pair[0];
+        let (vs, ve, value) = &pair[1];
+        let between = &text[*ke..*vs];
+        if lock_field(Some(key)) && between.trim_start().starts_with(':') {
+            if sensitive_lock_value(value) {
+                findings.push(finding(
+                    path,
+                    Detector::LockfileField,
+                    value,
+                    vs + 1,
+                    ve - 1,
+                ));
+            }
+        } else if lock_field(Some(key)) {
+            let _ = ks;
+            return Err(Report::new(ScannerError::Finding).attach(format!(
+                "unsupported structured lockfile field shape: {path}"
+            )));
+        }
+    }
+    Ok(findings)
 }
 
-fn collect_json_lock_fields(value: &JsonValue, key: Option<&str>, output: &mut Vec<String>) {
-    match value {
-        JsonValue::String(value) if lock_field(key) => output.push(value.clone()),
-        JsonValue::Array(values) => {
-            for value in values {
-                collect_json_lock_fields(value, key, output);
-            }
+fn quoted_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().enumerate().skip(start + 1) {
+        if escaped {
+            escaped = false;
+            continue;
         }
-        JsonValue::Object(values) => {
-            for (key, value) in values {
-                collect_json_lock_fields(value, Some(key), output);
-            }
+        if *byte == b'\\' {
+            escaped = true;
+            continue;
         }
-        _ => {}
+        if *byte == b'"' {
+            return Some(index);
+        }
     }
+    None
 }
 
 fn lock_field(key: Option<&str>) -> bool {
@@ -711,7 +768,7 @@ fn validate_class_pair(record: &ExceptionRecord) -> Result<(), Report<ScannerErr
                 | Detector::BinaryString
                 | Detector::MediaMetadata
         ),
-        ExceptionClass::HistoricalExample => true,
+        ExceptionClass::HistoricalExample => record.detector != Detector::ServiceId,
         ExceptionClass::ServiceId => record.detector == Detector::ServiceId,
     };
     if valid {
@@ -1283,10 +1340,6 @@ fn encoded_token_regex() -> &'static Regex {
 fn non_whitespace_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| Regex::new(r"\S+").expect("token detector should compile"))
-}
-
-const fn reviewed_by_default() -> bool {
-    true
 }
 
 #[cfg(test)]

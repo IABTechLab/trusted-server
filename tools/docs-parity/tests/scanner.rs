@@ -154,6 +154,33 @@ fn fingerprint(contents: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(contents))
 }
 
+#[test]
+fn allowlist_requires_explicit_review_attestation() {
+    let repository = TestRepository::new("notes.txt", b"safe text\n", "text");
+    repository.write_allowlist("version = 1\nexceptions = []\n");
+    let result = repository.scan();
+    assert_eq!(status_code(&result), ERROR);
+    assert!(diagnostic(&result).contains("reviewed"));
+}
+
+#[test]
+fn service_id_cannot_use_historical_example_class() {
+    let value = "AbCdEf1234567890GhIj";
+    let contents = format!("service_id = \"{value}\"\n");
+    let repository = TestRepository::new("fastly.toml", contents.as_bytes(), "text");
+    repository.write_allowlist(&exception_for_contents(
+        "historical_example",
+        "fastly.toml",
+        "service_id",
+        contents.as_bytes(),
+        value,
+        "2099-01-01T00:00:00Z",
+    ));
+    let result = repository.scan();
+    assert_eq!(status_code(&result), ERROR);
+    assert!(diagnostic(&result).contains("incompatible"));
+}
+
 fn assert_detected(path: &str, contents: &[u8], kind: &str, detector: &str) {
     let repository = TestRepository::new(path, contents, kind);
 
@@ -418,6 +445,29 @@ fn structured_lockfile_detector_has_positive_and_typed_allowlisted_fixtures() {
 }
 
 #[test]
+fn lockfiles_scan_non_url_secrets_and_select_the_structured_value_occurrence() {
+    let secret = "fake-credential-value-123";
+    let cargo = format!("version = 3\npassword = \"{secret}\"\n");
+    assert_detected("Cargo.lock", cargo.as_bytes(), "text", "credential_shape");
+
+    let value = format!("https://user:secret@{}/pkg.tgz", "private-corp.internal");
+    let contents = format!("{{\"description\":\"{value}\",\"resolved\":\"{value}\"}}");
+    let repository = TestRepository::new("package-lock.json", contents.as_bytes(), "text");
+    let result = repository.bootstrap();
+    assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+    let manifest = fs::read_to_string(
+        repository
+            .path()
+            .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+    )
+    .expect("should read bootstrap manifest");
+    let second = contents
+        .rfind(&value)
+        .expect("resolved occurrence should exist");
+    assert!(manifest.contains(&format!("detector = \"lockfile_field\"\nscope = \"exact-occurrence\"\nselector = \"bytes:{second}-{}\"", second + value.len())), "structured selector must identify the resolved value: {manifest}");
+}
+
+#[test]
 fn media_metadata_detector_has_positive_and_typed_allowlisted_fixtures() {
     let value = format!("person@{}", "private-corp.internal");
     let contents = png_text_chunk("Author", &value);
@@ -430,6 +480,25 @@ fn media_metadata_detector_has_positive_and_typed_allowlisted_fixtures() {
         &value,
         "historical_example",
     );
+}
+
+#[test]
+fn identical_media_and_non_metadata_binary_values_remain_distinct_occurrences() {
+    let value = format!("person@{}", "private-corp.internal");
+    let mut contents = png_text_chunk("Author", &value);
+    contents.push(0);
+    contents.extend_from_slice(value.as_bytes());
+    let repository = TestRepository::new("asset.png", &contents, "binary");
+    let result = repository.bootstrap();
+    assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+    let manifest = fs::read_to_string(
+        repository
+            .path()
+            .join("tools/docs-parity/manifests/sensitive-allowlist.toml"),
+    )
+    .expect("should read bootstrap manifest");
+    assert!(manifest.contains("detector = \"media_metadata\""));
+    assert!(manifest.contains("detector = \"binary_string\""));
 }
 
 #[test]

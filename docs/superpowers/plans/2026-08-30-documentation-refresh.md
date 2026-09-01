@@ -304,8 +304,8 @@ regenerate its lockfile. Require `git diff --quiet -- Cargo.lock` so the root
 workspace lockfile is unchanged.
 
 ```bash
-cargo test --manifest-path tools/docs-parity/Cargo.toml classification
-cargo test --manifest-path tools/docs-parity/Cargo.toml scanner
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test classification
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test scanner
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- classify --check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- scan --check
 ```

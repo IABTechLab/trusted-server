@@ -2211,6 +2211,33 @@ PY
   Its SHA and push/PR receipt are reported in the execution handoff because a
   commit cannot contain its own identifier.
 
+#### Task 5 review correction
+
+- Review RED: two omitted classification-attestation tests failed with exit 0
+  rather than 2; the omitted allowlist-attestation and service-ID-as-historical
+  tests likewise failed with exit 0 rather than 2. The corrected target-form
+  commands are recorded in the plan; the earlier filter-form wording is
+  superseded.
+- Review GREEN: the classification target passes 21 tests and the scanner
+  target passes 37 tests. Comment records now use exact byte spans and content
+  fingerprints; quote-aware fixtures cover trailing shell, TOML, YAML,
+  JavaScript, and protobuf comments, string literals, and two block comments on
+  one line. Lockfiles receive all non-domain detectors plus span-aware
+  structured URL-field checks. A structured value after an identical
+  description value selects the actual field bytes. Equal media-metadata and
+  non-metadata binary values remain separate occurrences.
+- The reviewed real manifests contain 704 text sources and 570 extracted
+  comment spans. The reviewed scanner manifest contains 3,682 exact findings:
+  3,348 domain, 286 structured lockfile field, 36 credential-shape, 11 binary
+  string, and one service ID. Classes are 3,621 vendor URL, 36 hash-pinned fake
+  credential fixture, 13 historical example, 11 project-owned public domain,
+  and one service ID. Human semantic sensitivity remains a reviewed-disposition
+  obligation, not a detector-completeness claim.
+- Two post-review classification updates preserved maintained-manifest SHA-256
+  `76b9912045566a3cf72b02bcdb14bce36fa062e02e8521710d686c8850597fd8`.
+  Two post-review scanner bootstraps preserved allowlist SHA-256
+  `0ba6ab33c455b0ef6d96eb4feb3de0552a5e8a3ce56196d8474c835faae1fa92`.
+
 #### Task 6 — Implement generated regions, Markdown ownership, and link checks
 
 Pending. Record each atomic fixture cycle and generated second-run no-diff.

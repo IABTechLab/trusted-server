@@ -84,25 +84,25 @@ fn diagnostic(output: &Output) -> String {
 
 fn text_manifest(path: &str, maximum: usize) -> String {
     format!(
-        "version = 1\nmax_text_bytes = {maximum}\n\n[[files]]\npath = \"{path}\"\nkind = \"text\"\n"
+        "version = 1\nreviewed = true\nmax_text_bytes = {maximum}\n\n[[files]]\npath = \"{path}\"\nkind = \"text\"\n"
     )
 }
 
 fn binary_manifest(path: &str) -> String {
     format!(
-        "version = 1\nmax_text_bytes = 1024\n\n[[files]]\npath = \"{path}\"\nkind = \"binary\"\n"
+        "version = 1\nreviewed = true\nmax_text_bytes = 1024\n\n[[files]]\npath = \"{path}\"\nkind = \"binary\"\n"
     )
 }
 
 fn whole_source(path: &str) -> String {
     format!(
-        "version = 1\n\n[[sources]]\npath = \"{path}\"\nmode = \"whole\"\ndisposition = \"include\"\n"
+        "version = 1\nreviewed = true\n\n[[sources]]\npath = \"{path}\"\nmode = \"whole\"\ndisposition = \"include\"\n"
     )
 }
 
 fn comment_source(path: &str, grammar: &str, comments: &[(&str, &str)]) -> String {
     let mut manifest = format!(
-        "version = 1\n\n[[sources]]\npath = \"{path}\"\nmode = \"comments\"\ngrammar = \"{grammar}\"\n"
+        "version = 1\nreviewed = true\n\n[[sources]]\npath = \"{path}\"\nmode = \"comments\"\ngrammar = \"{grammar}\"\n"
     );
     for (selector, contents) in comments {
         manifest.push_str(&format!(
@@ -118,12 +118,38 @@ fn fingerprint(contents: &[u8]) -> String {
 }
 
 #[test]
+fn tracked_manifest_requires_explicit_review_attestation() {
+    let repository = TestRepository::new();
+    repository.track("notes.txt", b"reviewed text\n");
+    repository.manifests(
+        "version = 1\nmax_text_bytes = 1024\n\n[[files]]\npath = \"notes.txt\"\nkind = \"text\"\n",
+        &whole_source("notes.txt"),
+    );
+    let result = repository.classify();
+    assert_eq!(status_code(&result), ERROR);
+    assert!(diagnostic(&result).contains("reviewed"));
+}
+
+#[test]
+fn maintained_manifest_requires_explicit_review_attestation() {
+    let repository = TestRepository::new();
+    repository.track("notes.txt", b"reviewed text\n");
+    repository.manifests(
+        &text_manifest("notes.txt", 1024),
+        "version = 1\n\n[[sources]]\npath = \"notes.txt\"\nmode = \"whole\"\ndisposition = \"include\"\n",
+    );
+    let result = repository.classify();
+    assert_eq!(status_code(&result), ERROR);
+    assert!(diagnostic(&result).contains("reviewed"));
+}
+
+#[test]
 fn complete_text_and_binary_classification_passes() {
     let repository = TestRepository::new();
     repository.track("notes.txt", b"reviewed text\n");
     repository.track("image.bin", &[0, 1, 2, 255]);
     repository.manifests(
-        "version = 1\nmax_text_bytes = 1024\n\n[[files]]\npath = \"image.bin\"\nkind = \"binary\"\n\n[[files]]\npath = \"notes.txt\"\nkind = \"text\"\n",
+        "version = 1\nreviewed = true\nmax_text_bytes = 1024\n\n[[files]]\npath = \"image.bin\"\nkind = \"binary\"\n\n[[files]]\npath = \"notes.txt\"\nkind = \"text\"\n",
         &whole_source("notes.txt"),
     );
 
@@ -222,14 +248,14 @@ fn human_facing_comment_outside_selector_fails_closed() {
     repository.track("script.sh", b"# reviewed\necho ok\n# newly added\n");
     repository.manifests(
         &text_manifest("script.sh", 1024),
-        &comment_source("script.sh", "shell", &[("line:1", "# reviewed")]),
+        &comment_source("script.sh", "shell", &[("bytes:0-10", "# reviewed")]),
     );
 
     let result = repository.classify();
 
     assert_eq!(status_code(&result), ERROR, "new comment should fail");
     assert!(
-        diagnostic(&result).contains("unclassified comment span: script.sh:3"),
+        diagnostic(&result).contains("unclassified comment span: script.sh:bytes:19-32"),
         "diagnostic should identify the new span: {}",
         diagnostic(&result)
     );
@@ -267,26 +293,98 @@ fn an_unclassified_extracted_comment_span_fails_closed() {
 
     assert_eq!(status_code(&result), ERROR, "unclassified span should fail");
     assert!(
-        diagnostic(&result).contains("unclassified comment span: config.toml:1"),
+        diagnostic(&result).contains("unclassified comment span: config.toml:bytes:0-19"),
         "diagnostic should identify the span: {}",
         diagnostic(&result)
     );
 }
 
 #[test]
+fn trailing_comments_are_extracted_without_treating_string_markers_as_comments() {
+    for (path, grammar, contents, comment) in [
+        (
+            "script.sh",
+            "shell",
+            "value=\"# literal\" # shell note\n",
+            "# shell note",
+        ),
+        (
+            "config.toml",
+            "toml",
+            "value = \"# literal\" # toml note\n",
+            "# toml note",
+        ),
+        (
+            "config.yaml",
+            "yaml",
+            "value: \"# literal\" # yaml note\n",
+            "# yaml note",
+        ),
+        (
+            "script.js",
+            "javascript",
+            "const x = \"// literal\"; // js note\n",
+            "// js note",
+        ),
+        (
+            "schema.proto",
+            "protobuf",
+            "string x = 1; // proto note\n",
+            "// proto note",
+        ),
+    ] {
+        let start = contents.find(comment).expect("comment should exist");
+        let selector = format!("bytes:{start}-{}", start + comment.len());
+        let repository = TestRepository::new();
+        repository.track(path, contents.as_bytes());
+        repository.manifests(
+            &text_manifest(path, 1024),
+            &comment_source(path, grammar, &[(&selector, comment)]),
+        );
+        let result = repository.classify();
+        assert_eq!(
+            status_code(&result),
+            SUCCESS,
+            "{grammar}: {}",
+            diagnostic(&result)
+        );
+    }
+}
+
+#[test]
+fn multiple_block_comments_on_one_line_have_distinct_byte_selectors() {
+    let contents = "let x = /* first */ 1 + /* second */ 2;\n";
+    let repository = TestRepository::new();
+    repository.track("script.js", contents.as_bytes());
+    repository.manifests(
+        &text_manifest("script.js", 1024),
+        &comment_source(
+            "script.js",
+            "javascript",
+            &[
+                ("bytes:8-19", "/* first */"),
+                ("bytes:24-36", "/* second */"),
+            ],
+        ),
+    );
+    let result = repository.classify();
+    assert_eq!(status_code(&result), SUCCESS, "{}", diagnostic(&result));
+}
+
+#[test]
 fn a_stale_comment_fingerprint_fails_closed() {
     let repository = TestRepository::new();
-    repository.track("script.sh", b"# changed\necho ok\n");
+    repository.track("script.sh", b"# changedx\necho ok\n");
     repository.manifests(
         &text_manifest("script.sh", 1024),
-        &comment_source("script.sh", "shell", &[("line:1", "# reviewed")]),
+        &comment_source("script.sh", "shell", &[("bytes:0-10", "# reviewed")]),
     );
 
     let result = repository.classify();
 
     assert_eq!(status_code(&result), ERROR, "stale selector should fail");
     assert!(
-        diagnostic(&result).contains("comment fingerprint mismatch: script.sh:1"),
+        diagnostic(&result).contains("comment fingerprint mismatch: script.sh:bytes:0-10"),
         "diagnostic should identify stale content: {}",
         diagnostic(&result)
     );
@@ -324,7 +422,10 @@ fn tracked_symlink_escape_fails_closed() {
 fn binary_entries_do_not_use_utf8_sniffing_as_authority() {
     let repository = TestRepository::new();
     repository.track("plain-looking.bin", b"valid UTF-8 is still binary\n");
-    repository.manifests(&binary_manifest("plain-looking.bin"), "version = 1\n");
+    repository.manifests(
+        &binary_manifest("plain-looking.bin"),
+        "version = 1\nreviewed = true\n",
+    );
 
     let result = repository.classify();
 
@@ -342,7 +443,7 @@ fn update_marks_new_and_moved_comment_spans_for_review() {
     repository.track("script.sh", b"\n# reviewed\necho ok\n# new\n");
     repository.manifests(
         &text_manifest("script.sh", 1024),
-        &comment_source("script.sh", "shell", &[("line:1", "# reviewed")]),
+        &comment_source("script.sh", "shell", &[("bytes:0-10", "# reviewed")]),
     );
 
     let updated = repository.update_classification();
@@ -361,8 +462,8 @@ fn update_marks_new_and_moved_comment_spans_for_review() {
         diagnostic(&updated)
     );
     assert!(
-        maintained.contains("selector = \"line:2\"")
-            && maintained.contains("selector = \"line:4\"")
+        maintained.contains("selector = \"bytes:1-11\"")
+            && maintained.contains("selector = \"bytes:20-25\"")
             && maintained.contains("reviewed = false")
             && maintained.matches("disposition = \"include\"").count() == 2,
         "moved and new spans should require review: {maintained}"
@@ -378,7 +479,10 @@ fn update_marks_new_and_moved_comment_spans_for_review() {
 fn update_never_silently_approves_a_sniffed_binary_kind() {
     let repository = TestRepository::new();
     repository.track("unknown.payload", &[0xff, 0xfe, 0xfd]);
-    repository.manifests("version = 1\nmax_text_bytes = 1024\n", "version = 1\n");
+    repository.manifests(
+        "version = 1\nreviewed = true\nmax_text_bytes = 1024\n",
+        "version = 1\nreviewed = true\n",
+    );
 
     let updated = repository.update_classification();
     let tracked = fs::read_to_string(
