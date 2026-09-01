@@ -1847,9 +1847,16 @@ impl Proxy {
 /// Direct Tinybird Events API telemetry configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TinybirdSettings {
-    /// Master enablement for auction telemetry ingestion.
+    /// Master enablement for Tinybird telemetry. Required by both auction and
+    /// access-log emission; each is independently toggled below.
     #[serde(default)]
     pub enabled: bool,
+    /// Emit auction telemetry when `enabled`. Defaults to `true` so existing
+    /// configs preserve their current auction-emission behavior after
+    /// upgrading; set `false` to silence auction events while keeping
+    /// `enabled` on for other Tinybird telemetry (e.g. `access_enabled`).
+    #[serde(default = "default_true")]
+    pub auction_enabled: bool,
     /// Regional Tinybird API host, without scheme or path.
     #[serde(default)]
     pub api_host: String,
@@ -1862,19 +1869,26 @@ pub struct TinybirdSettings {
     /// Secret reference containing the auction datasource APPEND token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auction_token_secret: Option<Redacted<String>>,
-    /// Reserved for future access-log telemetry.
+    /// Emit access-log telemetry when `enabled`, independent of
+    /// `auction_enabled`.
     ///
-    /// `true` is rejected until an access-log emitter is wired, so operators
-    /// cannot enable a setting that silently emits nothing.
+    /// `true` requires `enabled`, non-empty `api_host`/`secret_store`/
+    /// `access_dataset`/`access_token_secret`, `max_body_bytes > 0`, and
+    /// `access_sample_rate > 0.0`. This prevents an armed-but-silent sampler
+    /// that enables the flag but emits nothing.
     #[serde(default)]
     pub access_enabled: bool,
-    /// Future access-log Events API datasource name.
+    /// Access-log Events API datasource name. Required non-empty when
+    /// `access_enabled`.
     #[serde(default = "default_tinybird_access_dataset")]
     pub access_dataset: String,
-    /// Deprecated placeholder for the unwired access-log APPEND token.
-    #[serde(default, skip_serializing)]
+    /// Secret reference containing the access-log datasource APPEND token.
+    /// Required when `access_enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_token_secret: Option<Redacted<String>>,
-    /// Future fraction of requests to emit for optional access telemetry.
+    /// Fraction of requests to emit for access telemetry. Must be greater
+    /// than `0.0` when `access_enabled`, so an operator cannot enable access
+    /// telemetry while sampling it away entirely.
     #[serde(default)]
     pub access_sample_rate: f64,
     /// Defensive maximum NDJSON body size for one Events API request.
@@ -1898,6 +1912,7 @@ impl Default for TinybirdSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            auction_enabled: default_true(),
             api_host: String::new(),
             secret_store: None,
             auction_dataset: default_tinybird_auction_dataset(),
@@ -1925,9 +1940,18 @@ impl TinybirdSettings {
             (!value.is_empty()).then(|| Redacted::new(value))
         });
         self.access_dataset = self.access_dataset.trim().to_owned();
-        self.access_token_secret = None;
+        self.access_token_secret = self.access_token_secret.take().and_then(|value| {
+            let value = value.expose().trim().to_owned();
+            (!value.is_empty()).then(|| Redacted::new(value))
+        });
     }
 
+    /// Validate this settings block, including the access-telemetry matrix:
+    /// `access_enabled` requires `enabled`, a non-empty `api_host`,
+    /// `access_dataset`, and `access_token_secret`, a `max_body_bytes` above
+    /// the defensive floor enforced below, and an
+    /// `access_sample_rate` greater than `0.0`. Auction emission is
+    /// independently gated by `auction_enabled` and validated the same way.
     fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.normalize();
         if !(0.0..=1.0).contains(&self.access_sample_rate) {
@@ -1940,24 +1964,39 @@ impl TinybirdSettings {
                 message: "tinybird.max_body_bytes must be at least 1024".to_owned(),
             }));
         }
-        if self.access_enabled {
+        if self.access_enabled && !self.enabled {
             return Err(Report::new(TrustedServerError::Configuration {
-                message: "tinybird.access_enabled is reserved for future access-log telemetry; no emitter is currently wired".to_owned(),
+                message: "tinybird.access_enabled requires tinybird.enabled".to_owned(),
             }));
         }
         if !self.enabled {
             return Ok(());
         }
         validate_tinybird_api_host(&self.api_host)?;
-        validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
-        let token = self.auction_token_secret.as_ref().ok_or_else(|| {
-            Report::new(TrustedServerError::Configuration {
-                message:
-                    "tinybird.auction_token_secret is required when Tinybird telemetry is enabled"
-                        .to_owned(),
-            })
-        })?;
-        validate_tinybird_secret(token.expose(), "tinybird.auction_token_secret")
+        if self.auction_enabled {
+            validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
+            let token = self.auction_token_secret.as_ref().ok_or_else(|| {
+                Report::new(TrustedServerError::Configuration {
+                    message: "tinybird.auction_token_secret is required when tinybird.auction_enabled is true".to_owned(),
+                })
+            })?;
+            validate_tinybird_secret(token.expose(), "tinybird.auction_token_secret")?;
+        }
+        if self.access_enabled {
+            validate_tinybird_dataset(&self.access_dataset, "tinybird.access_dataset")?;
+            let token = self.access_token_secret.as_ref().ok_or_else(|| {
+                Report::new(TrustedServerError::Configuration {
+                    message: "tinybird.access_token_secret is required when tinybird.access_enabled is true".to_owned(),
+                })
+            })?;
+            validate_tinybird_secret(token.expose(), "tinybird.access_token_secret")?;
+            if self.access_sample_rate <= 0.0 {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: "tinybird.access_sample_rate must be > 0 when tinybird.access_enabled is true".to_owned(),
+                }));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2723,6 +2762,29 @@ pub enum AuctionDebugCommentFormat {
     Pretty,
 }
 
+/// Request-observability toggles exposed to operators.
+///
+/// The default table must stay omitted from serialized config blobs: this
+/// struct denies unknown fields, so an older binary loading a config blob
+/// carrying an `[observability]` table it does not know would reject it,
+/// breaking rollback. See [`Settings::observability`].
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilitySettings {
+    /// Emit the `Server-Timing` response header with per-phase request
+    /// timing. Defaults to `false` (off).
+    #[serde(default)]
+    pub server_timing_enabled: bool,
+}
+
+impl ObservabilitySettings {
+    /// True when every field is at its default, i.e. observability is fully
+    /// disabled and the table can be omitted from serialized output.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Tester-cookie endpoint configuration.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct TesterCookieConfig {
@@ -2882,6 +2944,12 @@ pub struct Settings {
     pub tinybird: TinybirdSettings,
     #[serde(default)]
     pub debug: DebugConfig,
+    /// Request-observability toggles. The default table is omitted from
+    /// serialized config blobs so a config round-tripped without change
+    /// still parses under a prior binary's schema; see
+    /// [`ObservabilitySettings`].
+    #[serde(default, skip_serializing_if = "ObservabilitySettings::is_default")]
+    pub observability: ObservabilitySettings,
 }
 
 impl Settings {
@@ -3704,6 +3772,14 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
 
+    /// Parses `extra` appended to the shared test fixture TOML, mirroring the
+    /// `format!("{}\n...", crate_test_settings_str())` pattern used throughout
+    /// this module's other tests.
+    fn settings_from_toml_with(extra: &str) -> Result<Settings, Report<TrustedServerError>> {
+        let toml = format!("{}\n{extra}", crate_test_settings_str());
+        Settings::from_toml(&toml)
+    }
+
     fn trusted_client_ip_toml(ip_header: &str, auth_header: &str, shared_secret: &str) -> String {
         format!(
             "{}\n[trusted_client_ip]\nip_header = \"{ip_header}\"\nauth_header = \"{auth_header}\"\nshared_secret = \"{shared_secret}\"\n",
@@ -4446,17 +4522,83 @@ mod tests {
     }
 
     #[test]
-    fn tinybird_access_enabled_is_rejected_until_emitter_is_wired() {
-        let toml = format!(
-            "{}\n[tinybird]\naccess_enabled = true\n",
-            crate_test_settings_str()
+    fn tinybird_access_enabled_with_full_config_is_accepted() {
+        let settings = settings_from_toml_with(
+            "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_enabled = false\naccess_enabled = true\naccess_token_secret = \"test-access-token\"\naccess_sample_rate = 1.0\n",
+        )
+        .expect("should accept a fully-specified access telemetry config");
+        assert!(
+            settings.tinybird.access_enabled,
+            "should enable access emission"
         );
+    }
 
-        let err = Settings::from_toml(&toml)
-            .expect_err("should reject access telemetry before emitter exists");
+    #[test]
+    fn access_enabled_requires_tinybird_enabled() {
+        // access_enabled = true with tinybird.enabled omitted (defaults
+        // false) must be rejected: access telemetry cannot run without the
+        // master toggle on.
+        let err = settings_from_toml_with(
+            "[tinybird]\napi_host = \"api.example.com\"\naccess_enabled = true\naccess_sample_rate = 1.0\n",
+        )
+        .expect_err("should reject access telemetry without tinybird.enabled");
         assert!(
             format!("{err:?}").contains("tinybird.access_enabled"),
-            "should report unsupported tinybird.access_enabled setting: {err:?}"
+            "should name the field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn access_enabled_requires_positive_sample_rate() {
+        // access_enabled = true with access_sample_rate = 0 is armed-but-silent: an error.
+        let err = settings_from_toml_with(
+            "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_enabled = false\naccess_enabled = true\naccess_token_secret = \"test-access-token\"\naccess_sample_rate = 0.0\n",
+        )
+        .expect_err("should reject armed-but-silent access telemetry");
+        assert!(
+            format!("{err:?}").contains("access_sample_rate"),
+            "should name the field"
+        );
+    }
+
+    #[test]
+    fn access_and_auction_emission_are_independent() {
+        let settings = settings_from_toml_with(
+            "[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_enabled = false\naccess_enabled = true\naccess_token_secret = \"test-access-token\"\naccess_sample_rate = 1.0\n",
+        )
+        .expect("should accept access without auction");
+        assert!(
+            !settings.tinybird.auction_enabled,
+            "should disable auction emission"
+        );
+        assert!(
+            settings.tinybird.access_enabled,
+            "should enable access emission"
+        );
+    }
+
+    #[test]
+    fn auction_enabled_defaults_true_for_existing_configs() {
+        let settings =
+            settings_from_toml_with("[tinybird]\nenabled = true\napi_host = \"api.example.com\"\nauction_token_secret = \"test-auction-token\"\n")
+                .expect("should parse a pre-decoupling config");
+        assert!(
+            settings.tinybird.auction_enabled,
+            "should preserve current behavior"
+        );
+    }
+
+    #[test]
+    fn observability_defaults_off_and_serializes_away() {
+        let settings = create_test_settings();
+        assert!(
+            !settings.observability.server_timing_enabled,
+            "should default off"
+        );
+        let toml = toml::to_string(&settings).expect("should serialize settings");
+        assert!(
+            !toml.contains("[observability]"),
+            "should omit the default table so a prior binary can parse the config"
         );
     }
 
