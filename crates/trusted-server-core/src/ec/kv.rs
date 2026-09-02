@@ -287,7 +287,7 @@ impl KvIdentityGraph {
         match self.write_entry(ec_id, &body, &meta_str, ENTRY_TTL, EcKvWriteMode::Add)? {
             EcKvWriteOutcome::Written => Ok(()),
             EcKvWriteOutcome::PreconditionFailed => {
-                Err(self.kv_error(format!("Key '{ec_id}' already exists")))
+                Err(self.kv_error(format!("Key '{}' already exists", log_id(ec_id))))
             }
         }
     }
@@ -398,7 +398,8 @@ impl KvIdentityGraph {
         }
 
         Err(self.kv_error(format!(
-            "CAS conflict after {MAX_CAS_RETRIES} retries reviving tombstone for '{ec_id}'"
+            "CAS conflict after {MAX_CAS_RETRIES} retries reviving tombstone for '{}'",
+            log_id(ec_id),
         )))
     }
 
@@ -432,8 +433,9 @@ impl KvIdentityGraph {
                         updates.len(),
                     );
                     return Err(self.kv_error(format!(
-                        "Cannot upsert {} partner IDs for missing key '{ec_id}'",
+                        "Cannot upsert {} partner IDs for missing key '{}'",
                         updates.len(),
+                        log_id(ec_id),
                     )));
                 }
             };
@@ -447,8 +449,9 @@ impl KvIdentityGraph {
                     updates.len(),
                 );
                 return Err(self.kv_error(format!(
-                    "Cannot upsert {} partner IDs for withdrawn key '{ec_id}'",
+                    "Cannot upsert {} partner IDs for withdrawn key '{}'",
                     updates.len(),
+                    log_id(ec_id),
                 )));
             }
 
@@ -478,8 +481,9 @@ impl KvIdentityGraph {
         }
 
         Err(self.kv_error(format!(
-            "CAS conflict after {MAX_CAS_RETRIES} retries upserting {} partner IDs for '{ec_id}'",
+            "CAS conflict after {MAX_CAS_RETRIES} retries upserting {} partner IDs for '{}'",
             updates.len(),
+            log_id(ec_id),
         )))
     }
 
@@ -510,7 +514,8 @@ impl KvIdentityGraph {
                         log_id(ec_id)
                     );
                     return Err(self.kv_error(format!(
-                        "Cannot upsert partner '{partner_id}' for missing key '{ec_id}'"
+                        "Cannot upsert partner '{partner_id}' for missing key '{}'",
+                        log_id(ec_id),
                     )));
                 }
             };
@@ -523,7 +528,8 @@ impl KvIdentityGraph {
                     log_id(ec_id),
                 );
                 return Err(self.kv_error(format!(
-                    "Cannot upsert partner '{partner_id}' for withdrawn key '{ec_id}'"
+                    "Cannot upsert partner '{partner_id}' for withdrawn key '{}'",
+                    log_id(ec_id),
                 )));
             }
 
@@ -566,7 +572,8 @@ impl KvIdentityGraph {
         }
 
         Err(self.kv_error(format!(
-            "CAS conflict after {MAX_CAS_RETRIES} retries upserting partner '{partner_id}' for '{ec_id}'"
+            "CAS conflict after {MAX_CAS_RETRIES} retries upserting partner '{partner_id}' for '{}'",
+            log_id(ec_id),
         )))
     }
 
@@ -636,7 +643,8 @@ impl KvIdentityGraph {
         }
 
         Err(self.kv_error(format!(
-            "CAS conflict after {MAX_CAS_RETRIES} retries upserting partner '{partner_id}' for '{ec_id}'"
+            "CAS conflict after {MAX_CAS_RETRIES} retries upserting partner '{partner_id}' for '{}'",
+            log_id(ec_id),
         )))
     }
 
@@ -1383,6 +1391,42 @@ mod tests {
             !rendered.contains(&ec_id),
             "a store error must not disclose the identifier: {rendered}"
         );
+    }
+
+    #[test]
+    fn a_locally_built_error_never_carries_the_whole_identifier() {
+        // The injected-failure case above covers errors the backend produces.
+        // These are built in this module from the identifier itself, on paths
+        // a request can reach: a duplicate create, and an upsert naming a key
+        // the store does not hold.
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        kv.create(&ec_id, &live_entry()).expect("should create");
+
+        let duplicate = kv
+            .create(&ec_id, &live_entry())
+            .expect_err("a second create should be refused");
+        let missing = kv
+            .upsert_partner_id(&format!("{}.ZZZ999", "b".repeat(64)), "partner", "uid")
+            .expect_err("an upsert on a missing key should be refused");
+        let withdrawn = {
+            kv.write_withdrawal_tombstone(&ec_id)
+                .expect("should tombstone");
+            kv.upsert_partner_id(&ec_id, "partner", "uid")
+                .expect_err("an upsert on a withdrawn key should be refused")
+        };
+
+        for (label, report) in [
+            ("duplicate create", duplicate),
+            ("missing key", missing),
+            ("withdrawn key", withdrawn),
+        ] {
+            let rendered = format!("{report:?}");
+            assert!(
+                !rendered.contains(&ec_id) && !rendered.contains(&"b".repeat(64)),
+                "the {label} error must not disclose the identifier: {rendered}"
+            );
+        }
     }
 
     #[test]
