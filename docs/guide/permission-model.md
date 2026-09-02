@@ -449,8 +449,9 @@ resolved and never to widen it.
 
 The geo provider, which resolves the country, is selected in
 `trusted-server.toml`. The rules tree, including the baseline for a request with
-no resolvable country, lives in the human-editable `permissions.yaml` at the
-repository root, compiled into the build (not loaded at runtime).
+no resolvable country, lives in a human-editable permissions YAML document
+compiled into the build (not loaded at runtime). The repository sample is
+`config/permissions/vanilla.yaml`.
 
 ```toml
 # trusted-server.toml selects the geo provider. The baseline used when a request
