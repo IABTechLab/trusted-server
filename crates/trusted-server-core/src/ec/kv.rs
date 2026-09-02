@@ -691,9 +691,11 @@ impl KvIdentityGraph {
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::KvStore`] on store error. Callers on
-    /// the browser path should log at `error` level and continue — cookie
-    /// deletion is the primary enforcement mechanism.
+    /// Returns [`TrustedServerError::KvStore`] when the tombstone write itself
+    /// fails. A failure to determine whether the identity exists is reported as
+    /// [`TombstoneOutcome::Unconfirmed`] rather than an error, since nothing was
+    /// written. Callers on the browser path should log at `error` level and
+    /// continue — cookie deletion is the primary enforcement mechanism.
     pub fn write_withdrawal_tombstone(
         &self,
         ec_id: &str,
@@ -709,14 +711,35 @@ impl KvIdentityGraph {
                 // fabricated identifier can produce one. Writing blind here
                 // would instead hand a caller the original unbounded write back
                 // whenever the store can be pushed into failing.
-                match self.get(ec_id) {
+                // The raw form is used deliberately: a row whose body no longer
+                // deserializes is still a row, and presence is all that matters
+                // here, so a corrupt entry must not read as absent.
+                match self.lookup_raw(ec_id) {
                     Ok(Some(_)) => {
                         log::warn!(
                             "Confirmed EC ID '{}' by lookup after a list failure: {list_error:?}",
                             log_id(ec_id),
                         );
                     }
-                    Ok(None) | Err(_) => return Ok(TombstoneOutcome::Unconfirmed),
+                    Ok(None) => {
+                        log::error!(
+                            "Cannot confirm EC ID '{}', so a withdrawal may go unrecorded \
+                             for the batch-sync window: the list failed and a lookup found \
+                             nothing. List error: {list_error:?}",
+                            log_id(ec_id),
+                        );
+                        return Ok(TombstoneOutcome::Unconfirmed);
+                    }
+                    Err(lookup_error) => {
+                        log::error!(
+                            "Cannot confirm EC ID '{}', so a withdrawal may go unrecorded \
+                             for the batch-sync window: neither the list nor a lookup could \
+                             be read. List error: {list_error:?}. Lookup error: \
+                             {lookup_error:?}",
+                            log_id(ec_id),
+                        );
+                        return Ok(TombstoneOutcome::Unconfirmed);
+                    }
                 }
             }
         }
@@ -1530,6 +1553,40 @@ mod tests {
             kv.get(&ec_id).expect("should read back").is_none(),
             "should not create a row while the store is degraded"
         );
+    }
+
+    /// Tripwire for [`KvIdentityGraph::key_exists_confirmed`].
+    ///
+    /// That check is a prefix query, and it is only exact because every value
+    /// [`is_valid_ec_id`] accepts is the same width — no accepted identifier can
+    /// be a proper prefix of another. Nothing in the type system enforces that,
+    /// so this test states the dependency: if the accepted grammar is ever
+    /// widened to variable-length identifiers, such as a provider envelope like
+    /// `{code}~value`, this fails and whoever widened it has to revisit the
+    /// prefix query rather than discovering a false positive in production.
+    #[test]
+    fn the_prefix_check_depends_on_ec_ids_being_fixed_width() {
+        let accepted = format!("{}.ABC123", "a".repeat(64));
+        assert!(is_valid_ec_id(&accepted), "the built-in shape is accepted");
+        assert_eq!(
+            accepted.len(),
+            71,
+            "an accepted identifier is a fixed 71 bytes"
+        );
+
+        // Anything longer or shorter, including a provider envelope, must be
+        // refused while the existence check relies on prefix semantics.
+        for widened in [
+            format!("hmac~{accepted}"),
+            format!("51dd~{}", "opaque-value-of-some-other-length"),
+            format!("{accepted}trailing"),
+            "a".repeat(64),
+        ] {
+            assert!(
+                !is_valid_ec_id(&widened),
+                "a variable-length identifier would break the prefix query: {widened}"
+            );
+        }
     }
 
     #[test]
