@@ -1427,19 +1427,15 @@ mod tests {
     }
 
     #[test]
-    fn key_exists_confirmed_refuses_a_value_that_is_not_an_ec_id() {
+    fn key_exists_confirmed_refuses_a_value_no_key_could_be() {
         let kv = KvIdentityGraph::in_memory("test_store");
         kv.create(&format!("{}.ABC123", "e".repeat(64)), &live_entry())
             .expect("should create");
 
-        // A prefix query would match every key for an empty value and unrelated
-        // keys for a truncated one, so neither may reach the store.
-        for value in [
-            "",
-            "e".repeat(64).as_str(),
-            "not-an-ec-id",
-            "E".repeat(64).as_str(),
-        ] {
+        // The check is exact, so a malformed value is simply absent. Only an
+        // empty or over-long value is refused ahead of the store, and that is
+        // to bound the work a cookie can ask for, not for correctness.
+        for value in ["", &"z".repeat(257), "not-an-ec-id", &"E".repeat(64)] {
             assert!(
                 !kv.key_exists_confirmed(value)
                     .expect("should resolve the check"),
@@ -1548,7 +1544,8 @@ mod tests {
     fn a_failing_list_is_not_a_way_to_write_for_an_identity_that_was_never_issued() {
         // The caller controls the identifier and can drive load, so a store
         // failure must not become a route to the write this gate exists to
-        // prevent. A lookup cannot report a row that does not exist.
+        // prevent. A lagging lookup may return a row already deleted, but it
+        // cannot return one for an identifier this deployment never issued.
         let kv = KvIdentityGraph::new(ListFailingEcKv::new());
         let ec_id = format!("{}.ABC123", "8".repeat(64));
 

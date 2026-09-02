@@ -42,12 +42,6 @@ impl FastlyEcKvStore {
     }
 }
 
-/// Keys to request when checking for one exact key.
-///
-/// Only an exact match matters, but a page of one could be filled by a longer
-/// key sharing the prefix, so a small page is requested and scanned.
-const EXACT_MATCH_LIST_LIMIT: u32 = 10;
-
 impl EcKvStore for FastlyEcKvStore {
     fn store_name(&self) -> &str {
         &self.store_name
@@ -140,17 +134,21 @@ impl EcKvStore for FastlyEcKvStore {
         // prefix — so the returned keys are compared for equality rather than
         // counted. A longer key carrying this one as a prefix is a different
         // identity and must not answer for it.
-        let page = store
-            .build_list()
-            .prefix(key)
-            .limit(EXACT_MATCH_LIST_LIMIT)
-            .execute()
-            .change_context(TrustedServerError::KvStore {
+        //
+        // Every page is followed. Nothing guarantees the exact key lands in the
+        // first one when other keys share its prefix, and stopping early would
+        // report a held identity as missing and discard its withdrawal.
+        for page in store.build_list().prefix(key).iter() {
+            let page = page.change_context(TrustedServerError::KvStore {
                 store_name: self.store_name.clone(),
-                message: format!("Failed to check key '{}'", key.get(..8).unwrap_or(key),),
+                message: format!("Failed to check key '{}'", key.get(..8).unwrap_or(key)),
             })?;
+            if page.keys().iter().any(|listed| listed == key) {
+                return Ok(true);
+            }
+        }
 
-        Ok(page.keys().iter().any(|listed| listed == key))
+        Ok(false)
     }
 
     fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
