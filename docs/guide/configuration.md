@@ -649,7 +649,7 @@ A provider advertises the technical permissions its data use requires, and Trust
 
 ### Country and region rules (`permissions.yaml`)
 
-The country and region permission rules are defined in a human-editable `permissions.yaml` at the repository root, compiled into the build (not loaded at runtime). Edit that file and rebuild to change the policy. There is no `[permissions]` block in `trusted-server.toml`. It defines named **groups** (baselines such as `gdpr-eu`, `gdpr-uk`, `us-opt-out`) and **rules** that map a country or country/state to a group, with an optional `permissions` map that overrides single Data Uses (`granted`, `requires_signal`, or `denied`). A request that matches no rule uses the required `[geo] default_country` set in `trusted-server.toml`. See the [Permission Model](/guide/permission-model) for the schema and the shipped defaults.
+The country and region permission rules are defined in a human-editable permissions YAML document, compiled into the build (not loaded at runtime). The repository sample is `config/permissions/vanilla.yaml`. Edit or replace the compiled-in file and rebuild to change the policy. There is no `[permissions]` block in `trusted-server.toml`. It defines named **groups** (baselines such as `gdpr-eu`, `gdpr-uk`, `us-opt-out`) and **rules** that map a country or country/state to a group, with an optional `permissions` map that overrides single Data Uses (`granted`, `requires_signal`, or `denied`). A request that matches no rule resolves at the top of the rules tree. See the [Permission Model](/guide/permission-model) for the schema and the repository sample.
 
 ## Response Headers
 
