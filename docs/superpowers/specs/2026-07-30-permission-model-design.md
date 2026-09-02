@@ -125,7 +125,8 @@ spelling.)
 
 ### 3.1 Location: `permissions.yaml`, compiled into the build
 
-Policy lives in a human-editable `permissions.yaml` at the repository root,
+Policy lives in a human-editable permissions YAML document (the repository
+sample is `config/permissions/vanilla.yaml`),
 compiled into the binary with `include_str!` and parsed once per instance
 (cached behind a `OnceLock` in `PermissionMaps::standard`). A deployer edits
 or replaces the file and rebuilds to change policy. The file is not read at
