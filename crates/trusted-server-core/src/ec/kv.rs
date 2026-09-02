@@ -1042,6 +1042,23 @@ mod tests {
                 )
                 .expect("should seed tombstone");
         }
+
+        fn seed_live(&self, ec_id: &str) {
+            let (body, meta) =
+                KvIdentityGraph::serialize_entry(&live_entry(), self.inner.store_name())
+                    .expect("should serialize live entry");
+            self.inner
+                .insert(
+                    ec_id,
+                    EcKvWrite {
+                        body: &body,
+                        metadata: &meta,
+                        ttl: TOMBSTONE_TTL,
+                        mode: EcKvWriteMode::Add,
+                    },
+                )
+                .expect("should seed live entry");
+        }
     }
 
     impl EcKvStore for ConflictInjectingEcKv {
@@ -1396,9 +1413,10 @@ mod tests {
     #[test]
     fn a_locally_built_error_never_carries_the_whole_identifier() {
         // The injected-failure case above covers errors the backend produces.
-        // These are built in this module from the identifier itself, on paths
-        // a request can reach: a duplicate create, and an upsert naming a key
-        // the store does not hold.
+        // These are built in this module from the identifier itself, on every
+        // path a request can reach: a duplicate create, single and batched
+        // upserts naming a key the store does not hold or has withdrawn, and
+        // the CAS-exhaustion terminal errors.
         let kv = KvIdentityGraph::in_memory("test_store");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         kv.create(&ec_id, &live_entry()).expect("should create");
@@ -1409,17 +1427,55 @@ mod tests {
         let missing = kv
             .upsert_partner_id(&format!("{}.ZZZ999", "b".repeat(64)), "partner", "uid")
             .expect_err("an upsert on a missing key should be refused");
+        let batched_missing = kv
+            .upsert_partner_ids(
+                &format!("{}.ZZZ999", "b".repeat(64)),
+                &[PartnerIdUpdate::new("partner", "uid")],
+            )
+            .expect_err("a batched upsert on a missing key should be refused");
         let withdrawn = {
             kv.write_withdrawal_tombstone(&ec_id)
                 .expect("should tombstone");
             kv.upsert_partner_id(&ec_id, "partner", "uid")
                 .expect_err("an upsert on a withdrawn key should be refused")
         };
+        let batched_withdrawn = kv
+            .upsert_partner_ids(&ec_id, &[PartnerIdUpdate::new("partner", "uid")])
+            .expect_err("a batched upsert on a withdrawn key should be refused");
+
+        // The CAS-exhaustion paths build their message the same way, and a
+        // store that never lets a write land is the only way to reach them.
+        let cas_revive = {
+            let store = ConflictInjectingEcKv::new(MAX_CAS_RETRIES + 1, false);
+            store.seed_tombstone(&ec_id);
+            KvIdentityGraph::new(store)
+                .create_or_revive(&ec_id, &live_entry())
+                .expect_err("should exhaust CAS retries")
+        };
+        let cas_upsert = {
+            let store = ConflictInjectingEcKv::new(MAX_CAS_RETRIES + 1, false);
+            store.seed_live(&ec_id);
+            KvIdentityGraph::new(store)
+                .upsert_partner_id(&ec_id, "partner", "uid")
+                .expect_err("should exhaust CAS retries")
+        };
+        let cas_batched = {
+            let store = ConflictInjectingEcKv::new(MAX_CAS_RETRIES + 1, false);
+            store.seed_live(&ec_id);
+            KvIdentityGraph::new(store)
+                .upsert_partner_ids(&ec_id, &[PartnerIdUpdate::new("partner", "uid")])
+                .expect_err("should exhaust CAS retries")
+        };
 
         for (label, report) in [
             ("duplicate create", duplicate),
             ("missing key", missing),
+            ("batched missing key", batched_missing),
             ("withdrawn key", withdrawn),
+            ("batched withdrawn key", batched_withdrawn),
+            ("CAS exhaustion reviving", cas_revive),
+            ("CAS exhaustion upserting", cas_upsert),
+            ("CAS exhaustion batch upserting", cas_batched),
         ] {
             let rendered = format!("{report:?}");
             assert!(
