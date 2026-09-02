@@ -189,12 +189,14 @@ fn log_tombstone_outcome(
                 log_id(ec_id),
             );
         }
-        Ok(TombstoneOutcome::Unconfirmed) => {
+        Ok(TombstoneOutcome::Unconfirmed { reason }) => {
             // Unlike an unknown identity, this is a fault worth surfacing: the
             // store could not be read, so a real identity may have gone
-            // untombstoned for the batch-sync window.
+            // untombstoned for the batch-sync window. Reported once, here,
+            // with the detail the store layer handed back.
             log::error!(
-                "Could not confirm EC ID '{}' to tombstone it; the browser cookie is still expired",
+                "Could not confirm EC ID '{}' to tombstone it, so a withdrawal may go \
+                 unrecorded; the browser cookie is still expired. {reason}",
                 log_id(ec_id),
             );
         }
@@ -524,6 +526,47 @@ mod tests {
         assert!(
             !entry.consent.ok,
             "a genuine withdrawal must still tombstone the identity"
+        );
+    }
+
+    #[test]
+    fn withdrawal_still_expires_the_cookie_when_the_store_is_unavailable() {
+        // Cookie expiry is the primary enforcement, so it has to survive a
+        // store that cannot answer at all — the case where the identity-graph
+        // marker is exactly what goes missing.
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("dead01");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let ec_context =
+            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent);
+        let kv = KvIdentityGraph::failing("test-store");
+        let mut response = empty_response();
+        set_header(&mut response, "x-ts-ec", "stale");
+        let registry = PartnerRegistry::from_config(&[]).expect("should build registry");
+
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            Some(&kv),
+            &registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        let set_cookie = get_header_str(&response, "set-cookie").unwrap_or_default();
+        assert!(
+            set_cookie.contains("Max-Age=0"),
+            "should expire the EC cookie even when the store is unavailable: {set_cookie}"
+        );
+        assert!(
+            get_header(&response, "x-ts-ec").is_none(),
+            "should still strip EC response headers"
         );
     }
 

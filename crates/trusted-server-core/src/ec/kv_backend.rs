@@ -107,6 +107,17 @@ pub trait EcKvStore {
         limit: u32,
     ) -> Result<u32, Report<TrustedServerError>>;
 
+    /// Whether the store holds exactly `key`.
+    ///
+    /// Must be an exact match and strongly consistent. A prefix scan is not a
+    /// substitute: another key may carry this one as a prefix, and a read that
+    /// may lag would report a freshly written key as absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] on store open or list failure.
+    fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>>;
+
     /// Hard-deletes a key.
     ///
     /// # Errors
@@ -205,6 +216,11 @@ pub(crate) mod test_support {
             Ok(count as u32)
         }
 
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            let entries = self.entries.lock().expect("should lock in-memory store");
+            Ok(entries.contains_key(key))
+        }
+
         fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
             let mut entries = self.entries.lock().expect("should lock in-memory store");
             entries.remove(key);
@@ -254,6 +270,10 @@ pub(crate) mod test_support {
             _limit: u32,
         ) -> Result<u32, Report<TrustedServerError>> {
             Err(self.error("list"))
+        }
+
+        fn key_exists(&self, _key: &str) -> Result<bool, Report<TrustedServerError>> {
+            Err(self.error("key_exists"))
         }
 
         fn delete(&self, _key: &str) -> Result<(), Report<TrustedServerError>> {

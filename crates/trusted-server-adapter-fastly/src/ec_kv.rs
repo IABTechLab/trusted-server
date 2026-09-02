@@ -42,6 +42,12 @@ impl FastlyEcKvStore {
     }
 }
 
+/// Keys to request when checking for one exact key.
+///
+/// Only an exact match matters, but a page of one could be filled by a longer
+/// key sharing the prefix, so a small page is requested and scanned.
+const EXACT_MATCH_LIST_LIMIT: u32 = 10;
+
 impl EcKvStore for FastlyEcKvStore {
     fn store_name(&self) -> &str {
         &self.store_name
@@ -56,7 +62,7 @@ impl EcKvStore for FastlyEcKvStore {
                 return Err(
                     Report::new(err).change_context(TrustedServerError::KvStore {
                         store_name: self.store_name.clone(),
-                        message: format!("Failed to read key '{key}'"),
+                        message: format!("Failed to read key '{}'", key.get(..8).unwrap_or(key),),
                     }),
                 );
             }
@@ -126,6 +132,25 @@ impl EcKvStore for FastlyEcKvStore {
         #[allow(clippy::cast_possible_truncation)]
         let count = page.keys().len() as u32;
         Ok(count)
+    }
+
+    fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+        let store = self.open_store()?;
+        // The list is strongly consistent, unlike a lookup, but it matches by
+        // prefix — so the returned keys are compared for equality rather than
+        // counted. A longer key carrying this one as a prefix is a different
+        // identity and must not answer for it.
+        let page = store
+            .build_list()
+            .prefix(key)
+            .limit(EXACT_MATCH_LIST_LIMIT)
+            .execute()
+            .change_context(TrustedServerError::KvStore {
+                store_name: self.store_name.clone(),
+                message: format!("Failed to check key '{}'", key.get(..8).unwrap_or(key),),
+            })?;
+
+        Ok(page.keys().iter().any(|listed| listed == key))
     }
 
     fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
