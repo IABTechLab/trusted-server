@@ -73,132 +73,315 @@ pub(super) fn to_abs(settings: &Settings, u: &str) -> Option<String> {
     Some(absolute)
 }
 
-/// Whether a `url()` value can be mapped to the URL the browser will request.
+/// Maximum number of nested parser scopes [`rewrite_style_urls`] will enter.
 ///
-/// CSS escapes are not resolved here, so a value carrying a backslash cannot be
-/// resolved to the resource the page actually asks for, and proxying the raw
-/// bytes would point somewhere else. A raw newline — which preprocessing also
-/// produces from a carriage return or a form feed — makes the value a bad
-/// string the browser discards, so rewriting it would proxy a URL that is never
-/// requested. Both are left untouched.
-fn css_value_is_resolvable(value: &str) -> bool {
-    !value
-        .bytes()
-        .any(|byte| matches!(byte, b'\\' | b'\n' | b'\r' | b'\x0c'))
-}
-
-/// Returns the index of the quote that closes a CSS string opened with `quote` and
-/// starting at `from`, or `None` when the string is unterminated.
+/// The walk recurses into blocks, functions and `@import` preludes, and the CSS
+/// it reads is supplied by the upstream creative, so an input of nothing but
+/// `{` would otherwise decide how deep the stack goes — and an overflow aborts
+/// the guest, turning a 2 KB style attribute into a failed response. Measured on
+/// `wasm32-wasip1`, the walk survives 1,000 nested blocks and overflows by
+/// 1,100, so this leaves room for a stack an order of magnitude smaller than
+/// the one measured. It is still far above any real stylesheet, where nesting
+/// is a declaration list inside a handful of blocks. Entering this many
+/// scopes costs one more stack frame than the bound, since the outermost walk
+/// has entered none.
 ///
-/// A backslash escapes what follows, and a raw newline ends a CSS string as a
-/// bad-string, so neither can close it. Returning `None` leaves the caller on its
-/// plain scan for the next `)`, which keeps a malformed value unrewritten rather than
-/// guessing at its extent.
-fn css_string_end(bytes: &[u8], from: usize, quote: u8) -> Option<usize> {
-    let mut i = from;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => {
-                // A backslash escapes what follows. CSS preprocessing folds a
-                // CRLF pair into one newline, so an escaped CRLF is a single
-                // escaped newline and both bytes belong to the escape.
-                if bytes.get(i + 1) == Some(&b'\r') && bytes.get(i + 2) == Some(&b'\n') {
-                    i += 3;
-                } else {
-                    i += 2;
-                }
-            }
-            // Preprocessing turns a carriage return and a form feed into a
-            // newline, and a raw newline ends a string as a bad string.
-            b'\n' | b'\r' | b'\x0c' => return None,
-            byte if byte == quote => return Some(i),
-            _ => i += 1,
-        }
-    }
-    None
-}
+/// An iterative walk would need no bound, but the tokenizer only exposes a
+/// block through a closure, so each nested slice would be re-read from its
+/// start — quadratic in the input, which [`MAX_REWRITABLE_BODY_SIZE`] allows
+/// to be 10 MB. Recursing stays linear and bounds the stack instead.
+const MAX_CSS_NESTING_DEPTH: usize = 64;
 
-// Helper: rewrite url(...) occurrences inside a CSS style string to first-party proxy.
-// `base_origin` is prefixed onto the proxy path — empty for root-relative output,
-// `https://<domain>` for absolute output (see [`build_proxy_url`]).
+/// Rewrites URL references inside a CSS string to the first-party proxy.
+///
+/// Covers every form the browser fetches: `url()` and `src()`, a bare string
+/// candidate in `image-set()`, and an `@import` prelude string.
+///
+/// `base_origin` is prefixed onto the proxy path — empty for root-relative
+/// output, `https://<domain>` for absolute output (see [`build_proxy_url`]).
+///
+/// Values are read with a CSS tokenizer rather than by scanning for quotes, so
+/// the extent of a value comes from the grammar and escapes are already
+/// resolved. That matters in both directions: a value whose escapes hide an
+/// absolute URL (`url("https://t.example/\70 ixel.gif")`) is still proxied, and
+/// a malformed value — which the tokenizer reports as a bad URL or bad string,
+/// exactly what a browser discards — is left untouched rather than guessed at.
+///
+/// A rewritten reference is re-emitted as `url("…")` whichever form it came
+/// in as, so the output is normalized rather than byte-preserved — `url()`
+/// is accepted everywhere the other forms are. Anything not rewritten keeps
+/// its original bytes.
+///
+/// CSS nested past [`MAX_CSS_NESTING_DEPTH`] is rejected outright (empty string
+/// returned), matching [`MAX_CREATIVE_SIZE`]. The alternative — keeping the
+/// rewrite of everything above the cap and passing the deeper bytes through —
+/// turns the bound into a way around the rewrite: a `url()` placed below the
+/// cap is never inspected and reaches the browser untouched, which is the leak
+/// this exists to close. Rejecting costs the styling of CSS no real page
+/// produces; passing through would cost the guarantee.
 pub(super) fn rewrite_style_urls(settings: &Settings, style: &str, base_origin: &str) -> String {
-    // naive url(...) rewrite for absolute/protocol-relative URLs
-    let lower = style.to_ascii_lowercase();
-    let mut out = String::with_capacity(style.len() + 16);
-    let mut write_pos = 0_usize;
-    let mut scan = 0_usize;
-    while let Some(off) = lower[scan..].find("url(") {
-        let start = scan + off;
-        let open = start + 4; // after 'url('
-        // write prefix including 'url('
-        out.push_str(&style[write_pos..open]);
-        let bytes = style.as_bytes();
-        // A quoted CSS string may legally contain `)`, so when the value opens with a
-        // quote the closing paren is searched for after the matching closing quote.
-        // Scanning from `open` would end the value at a `)` the browser keeps as part
-        // of the URL, leaving it unrewritten.
-        let mut value_start = open;
-        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
-            value_start += 1;
-        }
-        let search_from = bytes
-            .get(value_start)
-            .filter(|byte| **byte == b'"' || **byte == b'\'')
-            .and_then(|quote| css_string_end(bytes, value_start + 1, *quote))
-            .map_or(open, |string_end| string_end + 1);
-        // find closing ')'
-        let close = if let Some(c) = lower[search_from..].find(')') {
-            search_from + c
-        } else {
-            out.push_str(&style[open..]);
-            return out;
-        };
-        // trim spaces and quotes
-        let mut s = open;
-        while s < close && bytes[s].is_ascii_whitespace() {
-            s += 1;
-        }
-        let mut e = close;
-        while e > s && bytes[e - 1].is_ascii_whitespace() {
-            e -= 1;
-        }
-        // Only treat the value as quoted when a matching closing quote is actually
-        // present. Stepping back from `e` on the assumption that one is there can
-        // land inside a multi-byte character, and it silently rewrites the closing
-        // delimiter when the quotes do not match.
-        let mut quoted = false;
-        let (qs, qe) = if s < e
-            && (bytes[s] == b'"' || bytes[s] == b'\'')
-            && e > s + 1
-            && bytes[e - 1] == bytes[s]
-        {
-            quoted = true;
-            (s + 1, e - 1)
-        } else {
-            (s, e)
-        };
-        let url_val = &style[qs..qe];
-        let new_val = if !css_value_is_resolvable(url_val) {
-            url_val.to_owned()
-        } else if let Some(abs) = to_abs(settings, url_val) {
-            build_proxy_url(settings, &abs, base_origin)
-        } else {
-            url_val.to_owned()
-        };
-        if quoted {
-            let q = bytes[s] as char;
-            out.push(q);
-            out.push_str(&new_val);
-            out.push(q);
-        } else {
-            out.push_str(&new_val);
-        }
-        out.push(')');
-        write_pos = close + 1;
-        scan = write_pos;
+    rewrite_style_urls_in_context(settings, style, base_origin, true)
+}
+
+/// Rewrites a style attribute, where `@import` is ordinary declaration data.
+fn rewrite_style_attribute_urls(settings: &Settings, style: &str, base_origin: &str) -> String {
+    rewrite_style_urls_in_context(settings, style, base_origin, false)
+}
+
+fn rewrite_style_urls_in_context(
+    settings: &Settings,
+    style: &str,
+    base_origin: &str,
+    allows_import_rules: bool,
+) -> String {
+    let mut rewriter = CssUrlRewriter {
+        settings,
+        style,
+        base_origin,
+        allows_import_rules,
+        out: String::with_capacity(style.len() + 16),
+        write_pos: 0,
+        depth_exceeded: false,
+    };
+    let mut input = cssparser::ParserInput::new(style);
+    let mut parser = cssparser::Parser::new(&mut input);
+    rewriter.walk(&mut parser, 0, BareStringUrls::Never);
+    if rewriter.depth_exceeded {
+        log::warn!("Rejecting a stylesheet nested past the supported depth");
+        return String::new();
     }
-    out.push_str(&style[write_pos..]);
-    out
+    rewriter.out.push_str(&style[rewriter.write_pos..]);
+    rewriter.out
+}
+
+/// Splices rewritten `url()` values into a copy of the original CSS.
+struct CssUrlRewriter<'a> {
+    settings: &'a Settings,
+    style: &'a str,
+    base_origin: &'a str,
+    /// Whether the outermost scope is a stylesheet that may contain `@import`.
+    allows_import_rules: bool,
+    out: String,
+    write_pos: usize,
+    /// Set when the walk refused to descend further, which invalidates the
+    /// output because a `url()` below the cap was never inspected.
+    depth_exceeded: bool,
+}
+
+impl CssUrlRewriter<'_> {
+    /// Visits every token at this nesting level, descending into blocks and
+    /// functions because a `url()` may appear at any depth.
+    ///
+    /// `depth` is the number of parser scopes already entered; descending past
+    /// [`MAX_CSS_NESTING_DEPTH`] sets `depth_exceeded` instead of recursing.
+    ///
+    /// `strings_are_urls` marks a context where a bare quoted string is itself
+    /// a URL the browser fetches: an `image-set()` argument list, or an
+    /// `@import` prelude. It is false almost everywhere else — a `font-family`
+    /// or `content` string must not be touched. The mode is local to this
+    /// parser scope, so no malformed at-rule can carry it into a sibling.
+    fn walk(
+        &mut self,
+        parser: &mut cssparser::Parser<'_, '_>,
+        depth: usize,
+        strings_are_urls: BareStringUrls,
+    ) {
+        // Scope-local, so it cannot carry into a sibling or later scope.
+        let mut bare_strings = strings_are_urls;
+        // Only the start of a top-level stylesheet rule can introduce an
+        // `@import`; the same token is ordinary data in declarations and in
+        // another at-rule's prelude.
+        let is_stylesheet_root = depth == 0 && self.allows_import_rules;
+        let mut rule_may_start = is_stylesheet_root;
+        loop {
+            let token_start = parser.position().byte_index();
+            // Owned so the token stops borrowing the parser before the body of
+            // a block or function is read.
+            let found = match parser.next_including_whitespace_and_comments() {
+                Ok(cssparser::Token::UnquotedUrl(value)) => {
+                    CssToken::Url(value.as_ref().to_owned())
+                }
+                Ok(cssparser::Token::QuotedString(value))
+                    if bare_strings != BareStringUrls::Never =>
+                {
+                    CssToken::Url(value.as_ref().to_owned())
+                }
+                Ok(cssparser::Token::Function(name)) if is_url_function(name.as_ref()) => {
+                    CssToken::UrlFunction
+                }
+                Ok(cssparser::Token::Function(name)) => CssToken::Block(
+                    if takes_bare_string_urls(name.as_ref()) {
+                        BareStringUrls::Every
+                    } else {
+                        BareStringUrls::Never
+                    },
+                    false,
+                ),
+                Ok(cssparser::Token::ParenthesisBlock | cssparser::Token::SquareBracketBlock) => {
+                    CssToken::Block(BareStringUrls::Never, false)
+                }
+                Ok(cssparser::Token::CurlyBracketBlock) => {
+                    CssToken::Block(BareStringUrls::Never, is_stylesheet_root)
+                }
+                // `@import "…";` names a stylesheet the browser loads, so its
+                // prelude reads a bare string as a URL.
+                Ok(cssparser::Token::AtKeyword(name))
+                    if rule_may_start && name.eq_ignore_ascii_case("import") =>
+                {
+                    CssToken::ImportPrelude
+                }
+                Ok(cssparser::Token::Semicolon) => CssToken::RuleBoundary,
+                Ok(cssparser::Token::CDO | cssparser::Token::CDC) if is_stylesheet_root => {
+                    CssToken::Skippable
+                }
+                Ok(cssparser::Token::WhiteSpace(_) | cssparser::Token::Comment(_)) => {
+                    CssToken::Skippable
+                }
+                Ok(_) => CssToken::Other,
+                Err(_) => break,
+            };
+            let carries_a_value = !matches!(found, CssToken::Skippable);
+            let ends_rule = matches!(found, CssToken::RuleBoundary | CssToken::Block(_, true));
+
+            match found {
+                CssToken::Url(value) => self.rewrite(&value, token_start, parser),
+                CssToken::UrlFunction => {
+                    if depth >= MAX_CSS_NESTING_DEPTH {
+                        self.depth_exceeded = true;
+                        return;
+                    }
+                    if let Some(value) = quoted_url_argument(parser) {
+                        self.rewrite(&value, token_start, parser);
+                    }
+                }
+                CssToken::ImportPrelude => {
+                    if depth >= MAX_CSS_NESTING_DEPTH {
+                        self.depth_exceeded = true;
+                        return;
+                    }
+                    // Ends at the `;` or `{` that ends the at-rule, and the
+                    // delimiter itself is left for this loop to read, so the
+                    // prelude cannot reach a later declaration.
+                    let _ = parser.parse_until_before(
+                        cssparser::Delimiter::Semicolon | cssparser::Delimiter::CurlyBracketBlock,
+                        |prelude| -> Result<(), cssparser::ParseError<'_, ()>> {
+                            self.walk(prelude, depth + 1, BareStringUrls::FirstValue);
+                            Ok(())
+                        },
+                    );
+                }
+                CssToken::Block(nested_strings_are_urls, _) => {
+                    if depth >= MAX_CSS_NESTING_DEPTH {
+                        self.depth_exceeded = true;
+                        return;
+                    }
+                    // `parse_nested_block` must be called to consume the body;
+                    // skipping it would leave the block unvisited.
+                    let _ = parser.parse_nested_block(
+                        |inner| -> Result<(), cssparser::ParseError<'_, ()>> {
+                            self.walk(inner, depth + 1, nested_strings_are_urls);
+                            Ok(())
+                        },
+                    );
+                }
+                CssToken::RuleBoundary | CssToken::Skippable | CssToken::Other => {}
+            }
+
+            // The prelude's URL is its first value, so once a value has been
+            // read no later string in this scope is one.
+            if carries_a_value && bare_strings == BareStringUrls::FirstValue {
+                bare_strings = BareStringUrls::Never;
+            }
+            if ends_rule {
+                rule_may_start = is_stylesheet_root;
+            } else if carries_a_value {
+                rule_may_start = false;
+            }
+        }
+    }
+
+    /// Replaces the span just consumed with a proxied `url()`, or leaves it.
+    fn rewrite(&mut self, value: &str, token_start: usize, parser: &cssparser::Parser<'_, '_>) {
+        let Some(absolute) = to_abs(self.settings, value) else {
+            return;
+        };
+        let token_end = parser.position().byte_index();
+        self.out.push_str(&self.style[self.write_pos..token_start]);
+        self.out.push_str("url(");
+        cssparser::serialize_string(
+            &build_proxy_url(self.settings, &absolute, self.base_origin),
+            &mut self.out,
+        )
+        .expect("should write a serialized URL into a String");
+        self.out.push(')');
+        self.write_pos = token_end;
+    }
+}
+
+/// What a token turned out to be while scanning for `url()` references.
+enum CssToken {
+    /// An unquoted `url(...)`, carrying its resolved value.
+    Url(String),
+    /// The opening of a `url(` function, whose argument has yet to be read.
+    UrlFunction,
+    /// A block or other function, whose body may contain a `url()`. Carries
+    /// whether a bare string inside it is itself a URL and whether its closing
+    /// returns the outer parser to a top-level rule boundary.
+    Block(BareStringUrls, bool),
+    /// The start of an `@import`, whose prelude names a stylesheet.
+    ImportPrelude,
+    /// Whitespace or a comment, which carries no value.
+    Skippable,
+    /// A semicolon that ends the current top-level rule.
+    RuleBoundary,
+    /// Anything else.
+    Other,
+}
+
+/// Where a bare quoted string in a scope is itself a URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BareStringUrls {
+    /// A string is never a URL — a `content` or `font-family` value.
+    Never,
+    /// Every candidate is a URL, as in an `image-set()` argument list.
+    Every,
+    /// Only the first value is, as in an `@import` prelude: the grammar takes
+    /// one stylesheet URL, and anything after it is a layer, a supports
+    /// condition or a media query.
+    FirstValue,
+}
+
+/// Whether a function's argument is a URL, as `url()` and `src()` both are.
+fn is_url_function(name: &str) -> bool {
+    name.eq_ignore_ascii_case("url") || name.eq_ignore_ascii_case("src")
+}
+
+/// Whether a function accepts a bare string as a URL, rather than only `url()`.
+///
+/// `image-set()` takes each candidate as either a `url()` or a plain string,
+/// and the browser fetches the string form just the same.
+fn takes_bare_string_urls(name: &str) -> bool {
+    name.eq_ignore_ascii_case("image-set") || name.eq_ignore_ascii_case("-webkit-image-set")
+}
+
+/// Reads the argument of a `url(` or `src(` function when it is a single string.
+///
+/// Returns `None` for any other shape — a bad string, or a string carrying
+/// anything after it — leaving the original bytes in place rather than
+/// guessing at the intended value. The trailing case covers both a malformed
+/// value and the `<url-modifier>` grammar, which no engine acts on today; if
+/// one does, such a value would need proxying rather than skipping.
+fn quoted_url_argument(parser: &mut cssparser::Parser<'_, '_>) -> Option<String> {
+    parser
+        .parse_nested_block(
+            |inner| -> Result<Option<String>, cssparser::ParseError<'_, ()>> {
+                Ok(match inner.next() {
+                    Ok(cssparser::Token::QuotedString(value)) => Some(value.as_ref().to_owned()),
+                    _ => None,
+                })
+            },
+        )
+        .unwrap_or(None)
 }
 
 #[inline]
@@ -918,7 +1101,7 @@ fn rewrite_creative_html_impl(
                 // Inline style url(...)
                 element!("[style]", |el| {
                     if let Some(st) = el.get_attribute("style") {
-                        let rewritten = rewrite_style_urls(settings, &st, base_origin);
+                        let rewritten = rewrite_style_attribute_urls(settings, &st, base_origin);
                         if rewritten != st {
                             let _ = el.set_attribute("style", &rewritten);
                         }
@@ -1423,16 +1606,19 @@ mod tests {
     #[test]
     fn rewrite_style_urls_honors_escaped_quote_inside_quoted_url() {
         let settings = crate::test_support::tests::create_test_settings();
+        // An escaped quote does not end the string, so the whole value is the
+        // URL and it resolves with a literal quote in the path.
         let css = r#"background:url("https://cdn.example/a\")b.png")"#;
+
         let out = rewrite_style_urls(&settings, css, "");
-        let truncated = super::build_proxy_url(&settings, r#"https://cdn.example/a\"#, "");
+
         assert!(
-            !out.contains(&truncated),
-            "an escaped quote should not end the string early: {out}"
-        );
-        assert_eq!(
-            out, css,
-            "an escape cannot be resolved here, so the value is left alone"
+            out.contains(&super::build_proxy_url(
+                &settings,
+                "https://cdn.example/a\")b.png",
+                ""
+            )),
+            "should proxy the resolved value: {out}"
         );
     }
 
@@ -1463,19 +1649,44 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_style_urls_leaves_a_value_carrying_an_escape_unrewritten() {
+    fn rewrite_style_urls_resolves_an_escape_before_deciding() {
         let settings = crate::test_support::tests::create_test_settings();
-        // The rewriter does not resolve CSS escapes, so it cannot know which URL
-        // the browser will actually request. Emitting a proxy token for the raw
-        // bytes would point at a different resource than the page asked for.
+        // The browser resolves `\\2e ` to `.` and requests the result, so an
+        // escape must not hide an absolute URL from the rewriter — leaving it
+        // alone would send the request to the third party with the visitor's
+        // address and cookies.
         for css in [
             "background:url(\"https://cdn.example/a\\2e png\")",
             "background:url(\"https://cdn.example/a\\\r\nb.png\")",
             "background:url(\"https://cdn.example/a\\\r\nb)c.png\")",
         ] {
             let out = rewrite_style_urls(&settings, css, "");
-            assert_eq!(out, css, "should leave an escaped value alone: {css}");
+            assert!(
+                out.contains("/first-party/proxy?tsurl="),
+                "an escaped absolute URL must still be proxied: {css} -> {out}"
+            );
         }
+    }
+
+    #[test]
+    fn rewrite_style_urls_proxies_the_url_the_browser_will_request() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // `\\70 ` is `p`, so the browser asks for `pixel.gif`. The proxied
+        // token must name that, not the raw bytes.
+        let out = rewrite_style_urls(
+            &settings,
+            "background:url(\"https://tracker.example/\\70 ixel.gif\")",
+            "",
+        );
+
+        assert!(
+            out.contains(&super::build_proxy_url(
+                &settings,
+                "https://tracker.example/pixel.gif",
+                ""
+            )),
+            "should proxy the resolved URL: {out}"
+        );
     }
 
     #[test]
@@ -1501,6 +1712,464 @@ mod tests {
         assert!(
             out.contains("/first-party/proxy?tsurl="),
             "an ordinary value must still be proxied: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_leaves_a_bad_string_byte_for_byte() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // An unterminated string puts the tokenizer into the same recovery a
+        // browser performs, so the declaration is discarded rather than
+        // interpreted. Previously the scan fused the span with a quote from a
+        // later declaration and emitted a proxy token for the joined text.
+        let css = "a{background:url(\"https://cdn.example/a.png);\
+b{background:url(\"https://cdn.example/c.png\")}";
+
+        let out = rewrite_style_urls(&settings, css, "");
+
+        assert_eq!(out, css, "should not invent a value out of a bad string");
+        assert!(
+            !out.contains("%29%3B"),
+            "should not emit a token built from a fused span: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_proxies_a_url_token_unterminated_at_end_of_input() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // A url token that runs to the end of input is still a url token, and
+        // the browser fetches it, so the old bail-out was a standing bypass.
+        let out = rewrite_style_urls(
+            &settings,
+            "a{background:url('https://tracker.example/pixel.gif'",
+            "",
+        );
+
+        assert!(
+            out.contains("/first-party/proxy?tsurl="),
+            "should proxy a url token that reaches end of input: {out}"
+        );
+    }
+
+    /// Splices a large number of adversarial inputs to prove the rewrite never
+    /// slices a multi-byte character.
+    ///
+    /// The rewrite copies the original bytes around each token it replaces, so
+    /// every offset it uses has to fall on a character boundary. Slicing
+    /// between the bytes of one character panics, and the guest aborts on
+    /// panic, so such an input would answer a request with a failure. The
+    /// generator is a fixed-seed xorshift rather than a random source, so a
+    /// failure reproduces exactly.
+    #[test]
+    fn rewrite_style_urls_never_slices_a_character_in_half() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // Mixes CSS structure with multi-byte characters, including a combining
+        // mark and a zero-width mark, so a boundary lands mid-character often.
+        let alphabet = [
+            "url(",
+            ")",
+            "\"",
+            "'",
+            "{",
+            "}",
+            "/*",
+            "*/",
+            "\\",
+            ";",
+            ":",
+            ",",
+            " ",
+            "\n",
+            "\r",
+            "\t",
+            "\u{0c}",
+            "https://cdn.example/",
+            "//cdn.example/",
+            "a",
+            "-",
+            "@import",
+            "image-set(",
+            "var(--x)",
+            "data:image/png;base64,",
+            "\u{e9}",
+            "\u{4e2d}\u{6587}",
+            "\u{1f600}",
+            "\u{301}",
+            "\u{feff}",
+        ];
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for case in 0..20_000u32 {
+            let segments = (next() % 24) as usize + 1;
+            let mut css = String::new();
+            for _ in 0..segments {
+                css.push_str(alphabet[(next() as usize) % alphabet.len()]);
+            }
+
+            let out = rewrite_style_urls(&settings, &css, "");
+
+            // Output either keeps the original bytes, is rejected outright,
+            // or carries the proxy token it was rewritten for. Anything else
+            // means bytes were dropped or duplicated by the splice.
+            assert!(
+                out == css || out.is_empty() || out.contains("/first-party/proxy?tsurl="),
+                "case {case} changed {css:?} into {out:?} without a proxy token"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_style_urls_proxies_a_bare_string_candidate_in_image_set() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // `image-set()` takes each candidate as a `url()` or a plain string,
+        // and the browser fetches the string form identically.
+        for css in [
+            "background:image-set(\"https://tracker.example/a.png\" 1x)",
+            "background:-webkit-image-set(\"https://tracker.example/a.png\" 1x)",
+        ] {
+            let out = rewrite_style_urls(&settings, css, "");
+
+            assert!(
+                out.contains(&super::build_proxy_url(
+                    &settings,
+                    "https://tracker.example/a.png",
+                    ""
+                )),
+                "should proxy a bare image-set candidate: {css} -> {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_style_urls_proxies_every_image_set_candidate() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let out = rewrite_style_urls(
+            &settings,
+            "background:image-set(\"https://tracker.example/a.png\" 1x,\"https://tracker.example/b.png\" 2x)",
+            "",
+        );
+
+        for name in ["a.png", "b.png"] {
+            assert!(
+                out.contains(&super::build_proxy_url(
+                    &settings,
+                    &format!("https://tracker.example/{name}"),
+                    ""
+                )),
+                "should proxy {name}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_style_urls_proxies_a_src_function() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let out = rewrite_style_urls(
+            &settings,
+            "@font-face{src:src(\"https://tracker.example/a.woff2\")}",
+            "",
+        );
+
+        assert!(
+            out.contains(&super::build_proxy_url(
+                &settings,
+                "https://tracker.example/a.woff2",
+                ""
+            )),
+            "should proxy a src() argument: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_proxies_a_bare_import_prelude() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // `@import "…";` loads a whole third-party stylesheet.
+        let out = rewrite_style_urls(&settings, "@import \"https://tracker.example/s.css\";", "");
+
+        assert!(
+            out.contains(&super::build_proxy_url(
+                &settings,
+                "https://tracker.example/s.css",
+                ""
+            )),
+            "should proxy an @import prelude string: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_leaves_strings_that_are_not_urls_alone() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // A string is only a URL in the few contexts that fetch it. Rewriting
+        // one anywhere else would corrupt the declaration.
+        for css in [
+            "font-family:\"https://tracker.example/a.png\"",
+            "content:\"https://tracker.example/a.png\"",
+            "background:linear-gradient(\"https://tracker.example/a.png\")",
+            "@media \"https://tracker.example/a.png\"{a{color:red}}",
+            "@import \"https://tracker.example/s.css\";content:\"https://tracker.example/a.png\"",
+        ] {
+            let out = rewrite_style_urls(&settings, css, "");
+
+            assert!(
+                !out.contains("content:\"/first-party")
+                    && !out.contains("font-family:\"/first-party")
+                    && !out.contains("linear-gradient(\"/first-party")
+                    && !out.contains("@media \"/first-party"),
+                "should not treat a non-URL string as a URL: {css} -> {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_style_attribute_urls_leaves_a_leading_import_rule_alone() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // A style attribute is a declaration list, so an at-rule is not valid
+        // there and the browser never loads it. The same bytes in a stylesheet
+        // are a real `@import`, which is why the two entry points differ.
+        let css = "@import \"https://tracker.example/x.css\"";
+
+        let attribute = super::rewrite_style_attribute_urls(&settings, css, "");
+        let stylesheet = rewrite_style_urls(&settings, css, "");
+
+        assert_eq!(
+            attribute, css,
+            "should not read an at-rule in a style attribute: {attribute}"
+        );
+        assert!(
+            stylesheet.contains(&super::build_proxy_url(
+                &settings,
+                "https://tracker.example/x.css",
+                ""
+            )),
+            "should still read the same bytes as a rule in a stylesheet: {stylesheet}"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_confines_an_import_prelude_to_its_first_value() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // `@import` takes one stylesheet URL; a layer, supports condition or
+        // media query may follow, and none of those is a URL.
+        let out = rewrite_style_urls(
+            &settings,
+            "@import \"https://cdn.example/x.css\" \"https://tracker.example/z.css\";",
+            "",
+        );
+
+        assert!(
+            out.contains(&super::build_proxy_url(
+                &settings,
+                "https://cdn.example/x.css",
+                ""
+            )),
+            "should proxy the prelude's URL: {out}"
+        );
+        assert!(
+            out.contains("\"https://tracker.example/z.css\""),
+            "should leave a later prelude string alone: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_keeps_an_unterminated_import_out_of_later_declarations() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // An `@import` with no semicolon runs to the end of its block, so a
+        // following string sits inside the at-rule. It is still not a URL, and
+        // rewriting it would rewrite a `content` value.
+        let css = "@import \"https://cdn.example/x.css\" content:\"https://legit.example/y.png\"";
+        let out = rewrite_style_urls(&settings, css, "");
+
+        assert!(
+            !out.contains("content:url("),
+            "should not turn a content value into a URL: {css} -> {out}"
+        );
+        assert_eq!(
+            out.matches("/first-party/proxy?tsurl=").count(),
+            1,
+            "should proxy only the stylesheet URL: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_leaves_an_import_token_in_a_custom_property_alone() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let css = ".a{--metadata:@import \"https://tracker.example/text\";}";
+
+        let out = rewrite_style_urls(&settings, css, "");
+
+        assert_eq!(
+            out, css,
+            "should not treat @import inside a declaration as a stylesheet rule"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_leaves_an_import_token_in_another_at_rule_prelude_alone() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let css = "@unknown @import \"https://tracker.example/text\";";
+
+        let out = rewrite_style_urls(&settings, css, "");
+
+        assert_eq!(
+            out, css,
+            "should recognize @import only where a top-level rule may start"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_reads_an_import_value_past_whitespace_and_comments() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let out = rewrite_style_urls(
+            &settings,
+            "@import  /*c*/ \"https://cdn.example/x.css\";",
+            "",
+        );
+
+        assert!(
+            out.contains(&super::build_proxy_url(
+                &settings,
+                "https://cdn.example/x.css",
+                ""
+            )),
+            "should not spend the prelude's value on whitespace: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_reads_an_import_past_legacy_stylesheet_wrappers() {
+        let settings = crate::test_support::tests::create_test_settings();
+
+        for css in [
+            "<!-- @import \"https://cdn.example/x.css\";",
+            "--> @import \"https://cdn.example/x.css\";",
+        ] {
+            let out = rewrite_style_urls(&settings, css, "");
+
+            assert!(
+                out.contains(&super::build_proxy_url(
+                    &settings,
+                    "https://cdn.example/x.css",
+                    ""
+                )),
+                "should ignore a top-level CDO/CDC token before @import: {css} -> {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_style_urls_does_not_count_an_import_as_the_parent_of_later_css() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let css = format!(
+            "@import \"https://cdn.example/x.css\";{}background:url(https://tracker.example/y.png){}",
+            "a{".repeat(super::MAX_CSS_NESTING_DEPTH),
+            "}".repeat(super::MAX_CSS_NESTING_DEPTH)
+        );
+        let out = rewrite_style_urls(&settings, &css, "");
+
+        for url in ["https://cdn.example/x.css", "https://tracker.example/y.png"] {
+            assert!(
+                out.contains(&super::build_proxy_url(&settings, url, "")),
+                "should proxy {url} without treating later CSS as part of the import: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_style_urls_rejects_a_quoted_url_past_the_supported_depth() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let css = format!(
+            "{}background:url(\"https://cdn.example/a.png\"){}",
+            "a{".repeat(super::MAX_CSS_NESTING_DEPTH),
+            "}".repeat(super::MAX_CSS_NESTING_DEPTH)
+        );
+
+        let out = rewrite_style_urls(&settings, &css, "");
+
+        assert!(
+            out.is_empty(),
+            "should count the quoted url() parser frame against the depth bound"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_still_proxies_image_set_after_an_unexpected_token() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // Every candidate in an `image-set()` is a URL, so an unexpected token
+        // in the list must not switch that off for the ones after it.
+        let out = rewrite_style_urls(
+            &settings,
+            "background:image-set(@x \"https://tracker.example/a.png\" 1x)",
+            "",
+        );
+
+        assert!(
+            out.contains(&super::build_proxy_url(
+                &settings,
+                "https://tracker.example/a.png",
+                ""
+            )),
+            "should proxy a candidate following an unexpected token: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_rejects_css_nested_past_the_supported_depth() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // Well past the cap and well past what the guest stack survives, so an
+        // unbounded walk would abort the request rather than answer it.
+        let css = "{".repeat(super::MAX_CSS_NESTING_DEPTH * 40);
+
+        let out = rewrite_style_urls(&settings, &css, "");
+
+        assert!(
+            out.is_empty(),
+            "should reject rather than return partly inspected CSS"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_rewrites_at_the_deepest_supported_nesting() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // One url() at exactly the cap, to pin that the bound admits the depth
+        // it advertises rather than stopping one level short.
+        let css = format!(
+            "{}background:url(https://cdn.example/a.png){}",
+            "a{".repeat(super::MAX_CSS_NESTING_DEPTH),
+            "}".repeat(super::MAX_CSS_NESTING_DEPTH)
+        );
+
+        let out = rewrite_style_urls(&settings, &css, "");
+
+        assert!(
+            out.contains(&super::build_proxy_url(
+                &settings,
+                "https://cdn.example/a.png",
+                ""
+            )),
+            "should still rewrite at the deepest supported level: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_rewrites_inside_ordinary_nesting() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let css = "@media screen{.a{background:url(https://cdn.example/a.png)}}";
+
+        let out = rewrite_style_urls(&settings, css, "");
+
+        assert!(
+            out.contains(&super::build_proxy_url(
+                &settings,
+                "https://cdn.example/a.png",
+                ""
+            )),
+            "should rewrite a url() inside a media query: {out}"
         );
     }
 
@@ -1734,6 +2403,23 @@ mod tests {
             "style url() not rewritten: {out}"
         );
         assert!(!out.contains("https://cdn.example/bg.png"));
+    }
+
+    #[test]
+    fn leaves_an_import_token_and_string_in_an_inline_custom_property_alone() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let html = r#"<div style='--metadata:@import "https://tracker.example/text";'>ad</div>"#;
+
+        let out = rewrite_creative_html(&settings, html);
+
+        assert!(
+            !out.contains("/first-party/proxy?tsurl="),
+            "should not treat @import inside an inline declaration as an at-rule: {out}"
+        );
+        assert!(
+            out.contains("https://tracker.example/text"),
+            "should preserve the custom-property string: {out}"
+        );
     }
 
     #[test]
