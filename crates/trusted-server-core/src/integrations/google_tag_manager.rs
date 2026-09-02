@@ -77,7 +77,14 @@ const GTM_URL_HOSTS: &str =
     r"(?:https?:)?//(?:www\.(?:googletagmanager|google-analytics)\.com|analytics\.google\.com)";
 /// The paths this integration actually routes, mirroring
 /// [`GoogleTagManagerIntegration::is_rewritable_url`].
-const GTM_URL_PATHS: &str = r"(?P<path>/gtm\.js|/gtag/js|/gtag\.js|/g/collect|/collect)";
+/// The paths this integration routes, plus the empty path.
+///
+/// A script may hold an origin and build the path later
+/// (`var t = "https://www.google-analytics.com"; … t + "/g/collect"`). Leaving
+/// the origin alone sends that beacon straight to Google, which is the
+/// blockable request this integration exists to avoid, so an origin followed
+/// directly by its closing delimiter is rewritten too.
+const GTM_URL_PATHS: &str = r"(?P<path>/gtm\.js|/gtag/js|/gtag\.js|/g/collect|/collect|)";
 
 /// Matches a URL that is the entire input, as an attribute value is.
 ///
@@ -208,6 +215,20 @@ fn validate_https_upstream(value: &str) -> Result<(), ValidationError> {
         let mut err = ValidationError::new("upstream_with_credentials");
         err.message = Some("upstream_url must not embed a username or password".into());
         return Err(err);
+    }
+    // Targets are built by appending a path to this value, so anything beyond
+    // an origin corrupts them. `https://host#f` would append to the fragment
+    // and fetch the upstream homepage, which is then re-served from the
+    // publisher's origin as script — the outcome this validation exists to
+    // prevent. A query does the same, and a trailing slash yields a double one.
+    if let Some(url) = parsed.as_ref() {
+        let path_is_bare = url.path().is_empty() || url.path() == "/";
+        if !path_is_bare || url.query().is_some() || url.fragment().is_some() {
+            let mut err = ValidationError::new("upstream_not_an_origin");
+            err.message =
+                Some("upstream_url must be a bare origin, with no path, query or fragment".into());
+            return Err(err);
+        }
     }
     match parsed.and_then(|url| url.host_str().map(str::to_owned)) {
         Some(host) if !host.contains('*') => Ok(()),
@@ -351,7 +372,15 @@ impl GoogleTagManagerIntegration {
     /// fetch closed rather than falling back to permitting every host. Config
     /// validation rejects such a URL before this runs.
     fn proxy_allowed_domains(config: &GoogleTagManagerConfig) -> Vec<String> {
-        let mut domains = vec![GA_COLLECT_HOST.to_string()];
+        // Every host the rewriter will point at must be fetchable, or a
+        // redirect to it is refused by the allowlist and the beacon fails.
+        // GA4 answers from regional endpoints, so the collect host is allowed
+        // with its subdomains.
+        let mut domains = vec![
+            GA_COLLECT_HOST.to_string(),
+            format!("*.{GA_COLLECT_HOST}"),
+            ANALYTICS_HOST.to_string(),
+        ];
         if let Some(host) = url::Url::parse(&config.upstream_url)
             .ok()
             .and_then(|upstream| upstream.host_str().map(str::to_owned))
@@ -371,7 +400,10 @@ impl GoogleTagManagerIntegration {
     }
 
     fn upstream_url(&self) -> &str {
-        &self.config.upstream_url
+        // Validation accepts a bare origin, which may be written with a
+        // trailing slash. Targets append a rooted path, so trim it here rather
+        // than producing a doubled separator.
+        self.config.upstream_url.trim_end_matches('/')
     }
 
     /// Rewrite GTM and Google Analytics URLs to first-party proxy paths.
@@ -536,40 +568,44 @@ impl GoogleTagManagerIntegration {
     /// `gtag/js` is checked against the allowlist and redirected when it does
     /// not match, and the beacon paths are pinned to [`GA_COLLECT_HOST`].
     /// Returns `None` for a path this integration does not route.
+    /// Resolves a script request to a target, refusing to serve a tag the
+    /// publisher has not configured.
+    ///
+    /// A page may legitimately load more than one container, so a request that
+    /// names a configured tag is served with that tag rather than substituted
+    /// for `container_id` — substituting would make the second container's tags
+    /// silently never fire. A request naming anything else is redirected to the
+    /// upstream so this origin never serves it, and a request naming no tag at
+    /// all is redirected too: upstream answers `200` for anything, so nothing
+    /// downstream would reject it.
+    fn script_target(&self, base: &str, query: Option<&str>) -> GtmTarget {
+        match Self::requested_tag_id(query) {
+            Some(tag_id) if self.tag_id_is_allowed(&tag_id) => GtmTarget::Proxy(Self::with_query(
+                base.to_owned(),
+                &Self::canonical_query(query, Some(&tag_id)),
+            )),
+            Some(_) => {
+                log::warn!("Redirecting an unconfigured tag ID to the upstream");
+                GtmTarget::Redirect(Self::with_query(base.to_owned(), query.unwrap_or_default()))
+            }
+            None => GtmTarget::Proxy(Self::with_query(
+                base.to_owned(),
+                &Self::canonical_query(query, Some(&self.config.container_id)),
+            )),
+        }
+    }
+
     fn build_target_url(&self, req: &Request<EdgeBody>, path: &str) -> Option<GtmTarget> {
         let upstream_base = self.upstream_url();
         let query = req.uri().query();
 
         if path.ends_with("/gtm.js") {
-            // The container is fixed by configuration. Any client-supplied `id`
-            // is dropped, so this origin can only ever serve the publisher's
-            // own container.
-            let query = Self::canonical_query(query, Some(&self.config.container_id));
-            return Some(GtmTarget::Proxy(Self::with_query(
-                format!("{upstream_base}/gtm.js"),
-                &query,
-            )));
+            return Some(self.script_target(&format!("{upstream_base}/gtm.js"), query));
         }
 
         if path.ends_with("/gtag/js") || path.ends_with("/gtag.js") {
             // Always normalize to /gtag/js upstream as it's canonical.
-            let base = format!("{upstream_base}/gtag/js");
-            let tag_id = Self::requested_tag_id(query);
-            // `gtag/js` answers 200 for any tag ID, including ones that do not
-            // exist, so upstream cannot be relied on to reject an unknown tag.
-            if let Some(tag_id) = tag_id.as_deref()
-                && !self.tag_id_is_allowed(tag_id)
-            {
-                log::warn!("Redirecting unconfigured gtag tag ID to upstream");
-                // The redirect is not served from this origin, so the client's
-                // own query travels with it untouched.
-                return Some(GtmTarget::Redirect(Self::with_query(
-                    base,
-                    query.unwrap_or_default(),
-                )));
-            }
-            let query = Self::canonical_query(query, tag_id.as_deref());
-            return Some(GtmTarget::Proxy(Self::with_query(base, &query)));
+            return Some(self.script_target(&format!("{upstream_base}/gtag/js"), query));
         }
 
         // `/g/collect` also ends with `/collect`, so it must be matched first.
@@ -1181,7 +1217,7 @@ mod tests {
     }
 
     #[test]
-    fn gtm_js_ignores_a_client_supplied_container_id() {
+    fn gtm_js_refuses_a_container_the_publisher_has_not_configured() {
         let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
 
         let target = resolve_target(
@@ -1192,10 +1228,30 @@ mod tests {
 
         assert_eq!(
             target,
-            GtmTarget::Proxy(
-                "https://www.googletagmanager.com/gtm.js?id=GTM-CONFIGURED".to_string()
+            GtmTarget::Redirect(
+                "https://www.googletagmanager.com/gtm.js?id=GTM-ATTACKER".to_string()
             ),
-            "should serve only the configured container"
+            "an unconfigured container must not be served from this origin"
+        );
+    }
+
+    #[test]
+    fn gtm_js_serves_a_second_configured_container_rather_than_substituting() {
+        // A page may load more than one container. Substituting the primary one
+        // would leave the second container's tags silently never firing.
+        let integration =
+            GoogleTagManagerIntegration::new(tag_config("GTM-FIRST01", &["GTM-SECOND1"]));
+
+        let target = resolve_target(
+            &integration,
+            "https://edge.example.com/integrations/google_tag_manager/gtm.js?id=GTM-SECOND1",
+        )
+        .expect("should resolve a gtm.js target");
+
+        assert_eq!(
+            target,
+            GtmTarget::Proxy("https://www.googletagmanager.com/gtm.js?id=GTM-SECOND1".to_string()),
+            "a configured container is served as asked for"
         );
     }
 
@@ -1206,7 +1262,7 @@ mod tests {
         let target = resolve_target(
             &integration,
             "https://edge.example.com/integrations/google_tag_manager/gtm.js\
-?id=GTM-ATTACKER&l=dataLayer2&gtm_auth=abc&gtm_preview=env-3",
+?id=GTM-CONFIGURED&l=dataLayer2&gtm_auth=abc&gtm_preview=env-3",
         )
         .expect("should resolve a gtm.js target");
 
@@ -1214,7 +1270,7 @@ mod tests {
             into_proxy_url(target),
             "https://www.googletagmanager.com/gtm.js\
 ?l=dataLayer2&gtm_auth=abc&gtm_preview=env-3&id=GTM-CONFIGURED",
-            "should preserve environment parameters and replace only the container id"
+            "should preserve environment parameters"
         );
     }
 
@@ -1279,20 +1335,25 @@ mod tests {
     }
 
     #[test]
-    fn gtag_js_without_a_tag_id_is_proxied_unchanged() {
+    fn a_script_request_naming_no_tag_falls_back_to_the_configured_container() {
+        // Upstream answers 200 for anything, so a request naming no tag cannot
+        // be forwarded as-is. Pinning it to the configured container keeps the
+        // tag working without letting the request choose what is served.
         let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
 
-        let target = resolve_target(
-            &integration,
-            "https://edge.example.com/integrations/google_tag_manager/gtag/js",
-        )
-        .expect("should resolve a gtag target");
+        for path in ["/gtag/js", "/gtm.js"] {
+            let target = resolve_target(
+                &integration,
+                &format!("https://edge.example.com/integrations/google_tag_manager{path}"),
+            )
+            .expect("should resolve a target");
 
-        assert_eq!(
-            target,
-            GtmTarget::Proxy("https://www.googletagmanager.com/gtag/js".to_string()),
-            "should leave a tag-id-less request alone"
-        );
+            let url = into_proxy_url(target);
+            assert!(
+                url.ends_with("?id=GTM-CONFIGURED"),
+                "should pin `{path}` to the configured container: {url}"
+            );
+        }
     }
 
     #[test]
@@ -1428,11 +1489,12 @@ mod tests {
     }
 
     #[test]
-    fn gtag_js_reencodes_a_separator_the_upstream_might_split() {
+    fn a_smuggled_separator_cannot_choose_the_tag() {
         let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
 
-        // No `id` key is visible to this parser, so nothing is validated; the
-        // rebuilt query must not hand the upstream a splittable `id=` either.
+        // No `id` key is visible to this parser, so the request names no tag and
+        // the configured container is pinned; the smuggled text is re-encoded so
+        // the upstream cannot split it back out.
         let target = resolve_target(
             &integration,
             "https://edge.example.com/integrations/google_tag_manager/gtag/js\
@@ -1442,8 +1504,9 @@ mod tests {
 
         assert_eq!(
             into_proxy_url(target),
-            "https://www.googletagmanager.com/gtag/js?l=x%3Bid%3DGTM-ATTACKER",
-            "should re-encode the embedded separator rather than drop or split it"
+            "https://www.googletagmanager.com/gtag/js\
+?l=x%3Bid%3DGTM-ATTACKER&id=GTM-CONFIGURED",
+            "should pin the configured container and neutralise the separator"
         );
     }
 
@@ -1451,6 +1514,8 @@ mod tests {
     fn gtm_js_does_not_forward_a_second_cased_id_parameter() {
         let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
 
+        // The first `id`-like key decides, and it names nothing configured, so
+        // neither value is served from this origin.
         let target = resolve_target(
             &integration,
             "https://edge.example.com/integrations/google_tag_manager/gtm.js\
@@ -1458,12 +1523,9 @@ mod tests {
         )
         .expect("should resolve a gtm.js target");
 
-        assert_eq!(
-            target,
-            GtmTarget::Proxy(
-                "https://www.googletagmanager.com/gtm.js?id=GTM-CONFIGURED".to_string()
-            ),
-            "should drop every case variant of the id parameter"
+        assert!(
+            matches!(target, GtmTarget::Redirect(_)),
+            "should refuse rather than pick one of them, got {target:?}"
         );
     }
 
@@ -1582,23 +1644,18 @@ mod tests {
                 !proxy_config.allowed_domains.is_empty(),
                 "an empty allowlist would permit a redirect to any host"
             );
-            assert!(
-                proxy_config
-                    .allowed_domains
-                    .iter()
-                    .any(|domain| domain == "www.googletagmanager.com"),
-                "should permit the configured upstream: {:?}",
-                proxy_config.allowed_domains
-            );
-            assert!(
-                proxy_config
-                    .allowed_domains
-                    .iter()
-                    .all(|domain| domain == "www.googletagmanager.com"
-                        || domain == "www.google-analytics.com"),
-                "should permit nothing beyond the configured hosts: {:?}",
-                proxy_config.allowed_domains
-            );
+            // Every host the rewriter can point at must be reachable, or a
+            // redirect to it fails the allowlist and the beacon breaks.
+            for required in ["www.googletagmanager.com", GA_COLLECT_HOST, ANALYTICS_HOST] {
+                assert!(
+                    proxy_config
+                        .allowed_domains
+                        .iter()
+                        .any(|domain| domain == required),
+                    "should permit {required}: {:?}",
+                    proxy_config.allowed_domains
+                );
+            }
         });
     }
 
@@ -1854,15 +1911,26 @@ mod tests {
     }
 
     #[test]
-    fn proxy_allowlist_never_contains_a_wildcard() {
+    fn the_proxy_allowlist_never_widens_beyond_the_configured_upstream() {
         let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
 
+        // A wildcard is deliberate for the analytics host, which answers from
+        // regional endpoints. The configured upstream must never contribute one,
+        // since that would turn the pin into a suffix match on operator input.
+        let upstream_host = url::Url::parse(&integration.config.upstream_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .expect("the default upstream has a host");
+        assert!(
+            !upstream_host.contains('*'),
+            "the configured upstream host must be literal"
+        );
         assert!(
             integration
                 .proxy_allowed_domains
                 .iter()
-                .all(|domain| !domain.contains('*')),
-            "a wildcard entry would defeat the pin: {:?}",
+                .all(|domain| !domain.contains('*') || domain.ends_with(GA_COLLECT_HOST)),
+            "only the analytics host may be wildcarded: {:?}",
             integration.proxy_allowed_domains
         );
     }
@@ -2063,6 +2131,73 @@ mod tests {
         );
 
         assert_eq!(result, "/integrations/google_tag_manager/gtm.js#bootstrap");
+    }
+
+    #[test]
+    fn config_rejects_an_upstream_that_is_more_than_an_origin() {
+        // Targets are built by appending to this value, so a path, query or
+        // fragment silently redirects them somewhere else.
+        for upstream in [
+            "https://tags.example.com#f",
+            "https://tags.example.com?x=1",
+            "https://tags.example.com/sub",
+            "https://tags.example.com/sub/",
+        ] {
+            let config = GoogleTagManagerConfig {
+                upstream_url: upstream.to_string(),
+                ..tag_config("GTM-CONFIGURED", &[])
+            };
+
+            assert!(
+                config.validate().is_err(),
+                "should reject `{upstream}` as an upstream"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trailing_slash_on_the_upstream_does_not_double_the_separator() {
+        let config = GoogleTagManagerConfig {
+            upstream_url: "https://tags.example.com/".to_string(),
+            ..tag_config("GTM-CONFIGURED", &[])
+        };
+        assert!(
+            config.validate().is_ok(),
+            "a bare origin may end in a slash"
+        );
+        let integration = GoogleTagManagerIntegration::new(config);
+
+        let target = resolve_target(
+            &integration,
+            "https://edge.example.com/integrations/google_tag_manager/gtm.js",
+        )
+        .expect("should resolve a gtm.js target");
+
+        assert_eq!(
+            into_proxy_url(target),
+            "https://tags.example.com/gtm.js?id=GTM-CONFIGURED",
+            "should not produce a doubled separator"
+        );
+    }
+
+    #[test]
+    fn rewriter_rewrites_an_origin_a_script_will_build_a_path_onto() {
+        // gtag holds a base and concatenates the path at runtime, so leaving the
+        // origin alone sends the beacon direct to Google.
+        for (source, expected) in [
+            (
+                "var t = \"https://www.google-analytics.com\";",
+                "var t = \"/integrations/google_tag_manager\";",
+            ),
+            (
+                "var t = 'https://www.googletagmanager.com';",
+                "var t = '/integrations/google_tag_manager';",
+            ),
+        ] {
+            let result = GoogleTagManagerIntegration::rewrite_gtm_urls(source);
+
+            assert_eq!(result, expected, "should rewrite the origin in `{source}`");
+        }
     }
 
     #[test]
