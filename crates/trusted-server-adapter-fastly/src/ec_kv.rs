@@ -7,7 +7,8 @@
 use error_stack::{Report, ResultExt};
 use fastly::kv_store::{InsertMode, KVStore};
 use trusted_server_core::ec::kv_backend::{
-    EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome, contains_exact_key,
+    EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome, ExactKeyMatch,
+    contains_exact_key,
 };
 use trusted_server_core::ec::log_id;
 use trusted_server_core::error::TrustedServerError;
@@ -49,9 +50,10 @@ const EXACT_MATCH_PAGE_SIZE: u32 = 100;
 ///
 /// A well-formed identifier is the whole key, so at most a handful of keys can
 /// carry it as a prefix and one page is the normal case. The cap stops a short
-/// prefix from walking the keyspace on the response path; exceeding it yields
-/// no match rather than a wrong answer, and the caller treats that as
-/// unconfirmed.
+/// prefix from walking the keyspace on the response path. Exceeding it is
+/// reported as an error rather than as absence, so the caller re-checks by
+/// lookup instead of discarding a withdrawal for an identity that may be held
+/// on a page this never read.
 const EXACT_MATCH_MAX_PAGES: usize = 4;
 
 impl EcKvStore for FastlyEcKvStore {
@@ -147,7 +149,9 @@ impl EcKvStore for FastlyEcKvStore {
             .prefix(key)
             .limit(EXACT_MATCH_PAGE_SIZE)
             .iter()
-            .take(EXACT_MATCH_MAX_PAGES)
+            // Unbounded here on purpose: `contains_exact_key` stops reading at
+            // its budget, so the page count lives with the code that is tested
+            // against it rather than being recomputed at the call site.
             .map(|page| match page {
                 // A store that reports nothing under the prefix is telling us
                 // the key is absent, which is what `lookup` already does for a
@@ -162,7 +166,19 @@ impl EcKvStore for FastlyEcKvStore {
                     }),
             });
 
-        contains_exact_key(pages, key)
+        match contains_exact_key(pages, key, EXACT_MATCH_MAX_PAGES)? {
+            ExactKeyMatch::Found => Ok(true),
+            ExactKeyMatch::Absent => Ok(false),
+            // Not an answer, so it must not be returned as one. The caller
+            // falls back to a lookup on an error.
+            ExactKeyMatch::Undetermined => Err(Report::new(TrustedServerError::KvStore {
+                store_name: self.store_name.clone(),
+                message: format!(
+                    "Listing for key '{}' exceeded {EXACT_MATCH_MAX_PAGES} pages, so existence is undetermined",
+                    log_id(key)
+                ),
+            })),
+        }
     }
 
     fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {

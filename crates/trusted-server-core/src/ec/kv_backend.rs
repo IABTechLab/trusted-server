@@ -74,6 +74,14 @@ pub enum EcKvWriteOutcome {
 /// key lands in the first page when other keys share its prefix, and stopping
 /// early would report a held identity as missing.
 ///
+/// `max_pages` bounds how far the listing is followed. Running out of budget
+/// is reported as [`ExactKeyMatch::Undetermined`] rather than as absence: the
+/// key may sit on a page that was never read, and answering "absent" would
+/// discard a withdrawal for an identity the store actually holds. The listing
+/// is read lazily and at most one page beyond `max_pages` — just far enough to
+/// learn that it continues — so callers pass their listing untruncated rather
+/// than pre-trimming it to a count that has to agree with this one.
+///
 /// # Errors
 ///
 /// Returns the first page error, so a listing that cannot be read is never
@@ -81,13 +89,29 @@ pub enum EcKvWriteOutcome {
 pub fn contains_exact_key<E>(
     pages: impl IntoIterator<Item = Result<Vec<String>, E>>,
     key: &str,
-) -> Result<bool, E> {
-    for page in pages {
+    max_pages: usize,
+) -> Result<ExactKeyMatch, E> {
+    for (index, page) in pages.into_iter().enumerate() {
+        if index >= max_pages {
+            return Ok(ExactKeyMatch::Undetermined);
+        }
         if page?.iter().any(|listed| listed == key) {
-            return Ok(true);
+            return Ok(ExactKeyMatch::Found);
         }
     }
-    Ok(false)
+    Ok(ExactKeyMatch::Absent)
+}
+
+/// What a bounded prefix listing established about one exact key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExactKeyMatch {
+    /// The listing contained the key.
+    Found,
+    /// The listing was read to its end and did not contain the key.
+    Absent,
+    /// The listing was longer than the budget allowed, so the key's absence
+    /// was never established.
+    Undetermined,
 }
 
 /// Raw KV store primitives backing the EC identity graph.
@@ -310,7 +334,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::contains_exact_key;
+    use super::{ExactKeyMatch, contains_exact_key};
 
     /// Page iterator that records how many pages were consumed.
     struct CountingPages {
@@ -355,8 +379,9 @@ mod tests {
             page(&["wanted"]),
         ]);
 
-        assert!(
-            contains_exact_key(pages, "wanted").expect("should scan the pages"),
+        assert_eq!(
+            contains_exact_key(pages, "wanted", 8).expect("should scan the pages"),
+            ExactKeyMatch::Found,
             "a match on the last page must still be found"
         );
     }
@@ -365,8 +390,9 @@ mod tests {
     fn ignores_keys_that_only_start_with_the_one_asked_for() {
         let (pages, _) = counting(vec![page(&["wanted-suffix", "wantedx", "wanted2"])]);
 
-        assert!(
-            !contains_exact_key(pages, "wanted").expect("should scan the pages"),
+        assert_eq!(
+            contains_exact_key(pages, "wanted", 8).expect("should scan the pages"),
+            ExactKeyMatch::Absent,
             "a longer key is a different identity"
         );
     }
@@ -379,8 +405,9 @@ mod tests {
             page(&["never-read-either"]),
         ]);
 
-        assert!(
-            contains_exact_key(pages, "wanted").expect("should scan the pages"),
+        assert_eq!(
+            contains_exact_key(pages, "wanted", 8).expect("should scan the pages"),
+            ExactKeyMatch::Found,
             "should find the match"
         );
         assert_eq!(consumed.get(), 1, "should not read past the match");
@@ -391,9 +418,53 @@ mod tests {
         let (pages, _) = counting(vec![page(&["wanted-suffix"]), Err("list unavailable")]);
 
         assert_eq!(
-            contains_exact_key(pages, "wanted"),
+            contains_exact_key(pages, "wanted", 8),
             Err("list unavailable"),
             "an unreadable listing must not read as absent"
+        );
+    }
+
+    #[test]
+    fn reports_undetermined_when_the_listing_outruns_the_budget() {
+        // The key sits past the budget, which is exactly the case that must
+        // not read as absent: answering "absent" discards the withdrawal.
+        let (pages, consumed) = counting(vec![
+            page(&["wanted-suffix-a"]),
+            page(&["wanted-suffix-b"]),
+            page(&["wanted"]),
+        ]);
+
+        assert_eq!(
+            contains_exact_key(pages, "wanted", 2).expect("should scan the pages"),
+            ExactKeyMatch::Undetermined,
+            "a key beyond the budget must not read as absent"
+        );
+        assert_eq!(
+            consumed.get(),
+            3,
+            "should read one page past the budget to learn the listing continues"
+        );
+    }
+
+    #[test]
+    fn reports_absent_for_a_listing_that_ends_exactly_at_the_budget() {
+        let (pages, _) = counting(vec![page(&["wanted-suffix-a"]), page(&["wanted-suffix-b"])]);
+
+        assert_eq!(
+            contains_exact_key(pages, "wanted", 2).expect("should scan the pages"),
+            ExactKeyMatch::Absent,
+            "a listing that fits the budget is answered definitively"
+        );
+    }
+
+    #[test]
+    fn finds_a_match_on_the_last_page_within_the_budget() {
+        let (pages, _) = counting(vec![page(&["wanted-suffix-a"]), page(&["wanted"])]);
+
+        assert_eq!(
+            contains_exact_key(pages, "wanted", 2).expect("should scan the pages"),
+            ExactKeyMatch::Found,
+            "the final permitted page still counts"
         );
     }
 
@@ -401,8 +472,9 @@ mod tests {
     fn reports_absent_for_an_empty_listing() {
         let (pages, _) = counting(Vec::new());
 
-        assert!(
-            !contains_exact_key(pages, "wanted").expect("should scan the pages"),
+        assert_eq!(
+            contains_exact_key(pages, "wanted", 8).expect("should scan the pages"),
+            ExactKeyMatch::Absent,
             "nothing listed means nothing held"
         );
     }
