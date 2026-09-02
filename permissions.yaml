@@ -8,9 +8,11 @@
 # vocabulary this project invented, so a reader can check it against the
 # taxonomy rather than against us.
 #
-# This file is compiled into the build, not loaded at runtime. Editing it and
-# rebuilding is how a deployer changes the default policy, so the rules stay
-# visible and reviewable in version control.
+# No policy ever ships with Trusted Server. The builder of a deployment
+# chooses the permissions.yaml compiled into their image, an operator overlay
+# is the recorded follow-on, and the visitor's signals decide the rest at
+# runtime. This copy is the repository's test policy, compiled into test and
+# demo builds so the rules stay visible and reviewable in version control.
 #
 # There are three parts:
 #   groups   named permission baselines, defined once and referenced by rules
@@ -90,8 +92,8 @@
 # 11 (limited-data content selection) keeps its TCF identifier
 # `select-basic-content`. Both are flagged for an upstream taxonomy addition.
 #
-# Trusted Server is not the policy authority, and this shipped file is a demo
-# policy modeling common practice rather than legal advice. Service operations
+# Trusted Server is not the policy authority, and this repository file is a
+# test policy modeling common practice rather than legal advice. Service operations
 # and legal obligations are granted, the ad-tech Data Uses follow each
 # jurisdiction's regime through the `signals` mapping, umbrella Data Uses are
 # denied so every grant is named at the specific level, and Data Uses a web
