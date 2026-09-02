@@ -196,7 +196,7 @@ the neutral form.
 
 ### 3.6 Identity, geo and device as registration capabilities
 
-The rule. Things the host supplies are platform services, being the KV store, the HTTP client, and the host TLS and HTTP/2 signals. A host geo lookup is host data that a selected geo provider may consume; geo itself is a provider a deployer selects, never a platform service. Things a vendor supplies are capabilities of that vendor's module.
+The rule. Things the host supplies are platform services, being the KV store, the HTTP client, and the host TLS and HTTP/2 signals. A host geo lookup is host data that a selected geo provider may consume. Geo itself is a provider a deployer selects, never a platform service. The transport evidence types, being the client IP and the TLS, JA4 and HTTP/2 signals, are candidates to migrate behind an EdgeZero evidence contract when one exists. Things a vendor supplies are capabilities of that vendor's module.
 An identity provider, a geo provider and a device provider are supplied by
 vendors, with or without any host involved, so all three are module
 capabilities, and the same registration carries them alongside the module's
