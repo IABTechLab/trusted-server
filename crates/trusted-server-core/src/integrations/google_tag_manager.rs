@@ -38,6 +38,11 @@ const GTM_INTEGRATION_ID: &str = "google_tag_manager";
 const DEFAULT_UPSTREAM: &str = "https://www.googletagmanager.com";
 /// Host serving the GA beacon endpoints the `/collect` paths are pinned to.
 const GA_COLLECT_HOST: &str = "www.google-analytics.com";
+/// Registrable domain shared by [`GA_COLLECT_HOST`] and the regional beacon
+/// endpoints GA4 redirects to, which are siblings of it rather than
+/// subdomains — `region1.google-analytics.com`, not
+/// `region1.www.google-analytics.com`.
+const GA_COLLECT_DOMAIN: &str = "google-analytics.com";
 /// Host serving the tag scripts.
 const GTM_SCRIPT_HOST: &str = "www.googletagmanager.com";
 /// Alternate analytics host that appears in tag script bodies.
@@ -374,11 +379,13 @@ impl GoogleTagManagerIntegration {
     fn proxy_allowed_domains(config: &GoogleTagManagerConfig) -> Vec<String> {
         // Every host the rewriter will point at must be fetchable, or a
         // redirect to it is refused by the allowlist and the beacon fails.
-        // GA4 answers from regional endpoints, so the collect host is allowed
-        // with its subdomains.
+        // GA4 answers from regional endpoints, which are siblings of the
+        // collect host, so the wildcard has to sit on the shared domain: a
+        // pattern built from the collect host would only match below it and
+        // would refuse every regional redirect.
         let mut domains = vec![
             GA_COLLECT_HOST.to_string(),
-            format!("*.{GA_COLLECT_HOST}"),
+            format!("*.{GA_COLLECT_DOMAIN}"),
             ANALYTICS_HOST.to_string(),
         ];
         if let Some(host) = url::Url::parse(&config.upstream_url)
@@ -1911,6 +1918,42 @@ mod tests {
     }
 
     #[test]
+    fn the_proxy_allowlist_permits_a_regional_beacon_redirect() {
+        let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
+        let domains = &integration.proxy_allowed_domains;
+
+        // GA4 answers the beacon from a regional endpoint, so a redirect to
+        // one has to pass the allowlist or the beacon fails closed.
+        for host in [
+            GA_COLLECT_HOST,
+            "region1.google-analytics.com",
+            GA_COLLECT_DOMAIN,
+            ANALYTICS_HOST,
+        ] {
+            assert!(
+                domains
+                    .iter()
+                    .any(|pattern| crate::proxy::is_host_allowed(host, pattern)),
+                "should permit {host}: {domains:?}"
+            );
+        }
+
+        // The wildcard must not reach a lookalike registered elsewhere.
+        for host in [
+            "evil-google-analytics.com",
+            "google-analytics.com.evil.example",
+            "notgoogle-analytics.com",
+        ] {
+            assert!(
+                !domains
+                    .iter()
+                    .any(|pattern| crate::proxy::is_host_allowed(host, pattern)),
+                "should refuse {host}: {domains:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_proxy_allowlist_never_widens_beyond_the_configured_upstream() {
         let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
 
@@ -1929,8 +1972,8 @@ mod tests {
             integration
                 .proxy_allowed_domains
                 .iter()
-                .all(|domain| !domain.contains('*') || domain.ends_with(GA_COLLECT_HOST)),
-            "only the analytics host may be wildcarded: {:?}",
+                .all(|domain| !domain.contains('*') || domain.ends_with(GA_COLLECT_DOMAIN)),
+            "only the analytics domain may be wildcarded: {:?}",
             integration.proxy_allowed_domains
         );
     }
