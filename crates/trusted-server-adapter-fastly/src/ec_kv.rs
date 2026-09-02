@@ -9,6 +9,7 @@ use fastly::kv_store::{InsertMode, KVStore};
 use trusted_server_core::ec::kv_backend::{
     EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
 };
+use trusted_server_core::ec::log_id;
 use trusted_server_core::error::TrustedServerError;
 
 /// Fastly KV Store backend for the EC identity graph.
@@ -56,7 +57,7 @@ impl EcKvStore for FastlyEcKvStore {
                 return Err(
                     Report::new(err).change_context(TrustedServerError::KvStore {
                         store_name: self.store_name.clone(),
-                        message: format!("Failed to read key '{}'", key.get(..8).unwrap_or(key),),
+                        message: format!("Failed to read key '{}'", log_id(key),),
                     }),
                 );
             }
@@ -117,10 +118,7 @@ impl EcKvStore for FastlyEcKvStore {
             .execute()
             .change_context(TrustedServerError::KvStore {
                 store_name: self.store_name.clone(),
-                message: format!(
-                    "Failed to list keys with prefix '{}'",
-                    prefix.get(..8).unwrap_or(prefix),
-                ),
+                message: format!("Failed to list keys with prefix '{}'", log_id(prefix),),
             })?;
 
         #[allow(clippy::cast_possible_truncation)]
@@ -141,7 +139,7 @@ impl EcKvStore for FastlyEcKvStore {
         for page in store.build_list().prefix(key).iter() {
             let page = page.change_context(TrustedServerError::KvStore {
                 store_name: self.store_name.clone(),
-                message: format!("Failed to check key '{}'", key.get(..8).unwrap_or(key)),
+                message: format!("Failed to check key '{}'", log_id(key)),
             })?;
             if page.keys().iter().any(|listed| listed == key) {
                 return Ok(true);

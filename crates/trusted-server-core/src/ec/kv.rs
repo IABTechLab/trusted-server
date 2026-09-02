@@ -1427,25 +1427,35 @@ mod tests {
     }
 
     #[test]
-    fn key_exists_confirmed_refuses_a_value_no_key_could_be() {
-        let kv = KvIdentityGraph::in_memory("test_store");
-        kv.create(&format!("{}.ABC123", "e".repeat(64)), &live_entry())
-            .expect("should create");
+    fn an_out_of_bounds_value_is_refused_without_reaching_the_store() {
+        let (store, checks) = CountingEcKv::new();
+        let kv = KvIdentityGraph::new(store);
+        let count = || *checks.lock().expect("should lock the check counter");
 
-        // The check is exact, so a malformed value is simply absent. Only an
-        // empty or over-long value is refused ahead of the store, and that is
-        // to bound the work a cookie can ask for, not for correctness.
-        for value in ["", &"z".repeat(257), "not-an-ec-id", &"E".repeat(64)] {
+        for value in ["", &"z".repeat(257)] {
             assert!(
                 !kv.key_exists_confirmed(value)
                     .expect("should resolve the check"),
                 "should not report `{value}` as held"
             );
         }
+        assert_eq!(
+            count(),
+            0,
+            "a value no key could be must not cost a store round trip"
+        );
+
+        // A value that is within bounds but simply absent does reach the store.
+        let absent = format!("{}.ABC123", "e".repeat(64));
+        assert!(
+            !kv.key_exists_confirmed(&absent).expect("should check"),
+            "an absent identity is not held"
+        );
+        assert_eq!(count(), 1, "an in-bounds value is checked exactly once");
     }
 
     #[test]
-    fn write_withdrawal_tombstone_refuses_a_value_that_is_not_an_ec_id() {
+    fn write_withdrawal_tombstone_refuses_an_empty_identifier() {
         let kv = KvIdentityGraph::in_memory("test_store");
         kv.create(&format!("{}.ABC123", "f".repeat(64)), &live_entry())
             .expect("should create");
@@ -1454,7 +1464,7 @@ mod tests {
             kv.write_withdrawal_tombstone("")
                 .expect("should resolve the withdrawal"),
             TombstoneOutcome::UnknownIdentity,
-            "an empty identifier must not be treated as a match-all prefix"
+            "an empty identifier names no key and must not withdraw anything"
         );
         let (held, _) = kv
             .get(&format!("{}.ABC123", "f".repeat(64)))
@@ -1464,6 +1474,65 @@ mod tests {
             held.consent.ok,
             "should not have withdrawn an unrelated row"
         );
+    }
+
+    /// Store double that records how many existence checks reach it.
+    struct CountingEcKv {
+        inner: super::super::kv_backend::test_support::InMemoryEcKv,
+        existence_checks: std::sync::Arc<std::sync::Mutex<usize>>,
+    }
+
+    impl CountingEcKv {
+        /// Returns the store and a handle to its counter, which stays readable
+        /// after the store moves into the graph.
+        fn new() -> (Self, std::sync::Arc<std::sync::Mutex<usize>>) {
+            let counter = std::sync::Arc::new(std::sync::Mutex::new(0));
+            (
+                Self {
+                    inner: super::super::kv_backend::test_support::InMemoryEcKv::new("test_store"),
+                    existence_checks: std::sync::Arc::clone(&counter),
+                },
+                counter,
+            )
+        }
+    }
+
+    impl EcKvStore for CountingEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+
+        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.inner.lookup(key)
+        }
+
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            self.inner.insert(key, write)
+        }
+
+        fn count_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<u32, Report<TrustedServerError>> {
+            self.inner.count_keys_with_prefix(prefix, limit)
+        }
+
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            *self
+                .existence_checks
+                .lock()
+                .expect("should lock the check counter") += 1;
+            self.inner.key_exists(key)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key)
+        }
     }
 
     /// Store double whose list API always fails while writes still work.
