@@ -112,6 +112,14 @@ const MAX_CSS_NESTING_DEPTH: usize = 64;
 /// is accepted everywhere the other forms are. Anything not rewritten keeps
 /// its original bytes.
 ///
+/// A URL that only exists after custom-property substitution is out of reach:
+/// `--c:"https://t.example/a.png"` used as `image-set(var(--c) 1x)` is a URL to
+/// the browser, but the string and its use are separate declarations and
+/// resolving one against the other is the cascade's job, not a rewriter's. The
+/// inline fallback form, `image-set(var(--c, "https://t.example/a.png") 1x)`,
+/// is substituted in place and is rewritten. A `url()` token in a custom
+/// property is also rewritten, since it is a URL wherever it lands.
+///
 /// CSS nested past [`MAX_CSS_NESTING_DEPTH`] is rejected outright (empty string
 /// returned), matching [`MAX_CREATIVE_SIZE`]. The alternative — keeping the
 /// rewrite of everything above the cap and passing the deeper bytes through —
@@ -207,10 +215,16 @@ impl CssUrlRewriter<'_> {
                     CssToken::Url(value.as_ref().to_owned())
                 }
                 Ok(cssparser::Token::Function(name)) if is_url_function(name.as_ref()) => {
-                    CssToken::UrlFunction
+                    CssToken::UrlFunction(url_function_name(name.as_ref()))
                 }
                 Ok(cssparser::Token::Function(name)) => CssToken::Block(
                     if takes_bare_string_urls(name.as_ref()) {
+                        BareStringUrls::Every
+                    } else if bare_strings == BareStringUrls::Every
+                        && name.eq_ignore_ascii_case("var")
+                    {
+                        // A `var()` fallback is substituted in place, so a
+                        // string there is read in the context around it.
                         BareStringUrls::Every
                     } else {
                         BareStringUrls::Never
@@ -245,13 +259,13 @@ impl CssUrlRewriter<'_> {
 
             match found {
                 CssToken::Url(value) => self.rewrite(&value, token_start, parser),
-                CssToken::UrlFunction => {
+                CssToken::UrlFunction(function) => {
                     if depth >= MAX_CSS_NESTING_DEPTH {
                         self.depth_exceeded = true;
                         return;
                     }
                     if let Some(value) = quoted_url_argument(parser) {
-                        self.rewrite(&value, token_start, parser);
+                        self.rewrite_as(&value, token_start, parser, function);
                     }
                 }
                 CssToken::ImportPrelude => {
@@ -302,12 +316,30 @@ impl CssUrlRewriter<'_> {
 
     /// Replaces the span just consumed with a proxied `url()`, or leaves it.
     fn rewrite(&mut self, value: &str, token_start: usize, parser: &cssparser::Parser<'_, '_>) {
+        self.rewrite_as(value, token_start, parser, "url");
+    }
+
+    /// Replaces the span just consumed with a proxied reference named
+    /// `function`, or leaves it.
+    ///
+    /// The name is preserved rather than normalized to `url`, because the two
+    /// are not interchangeable to a browser: rewriting a `src()` the engine
+    /// ignores into a `url()` it honours would start a request the origin
+    /// never made.
+    fn rewrite_as(
+        &mut self,
+        value: &str,
+        token_start: usize,
+        parser: &cssparser::Parser<'_, '_>,
+        function: &str,
+    ) {
         let Some(absolute) = to_abs(self.settings, value) else {
             return;
         };
         let token_end = parser.position().byte_index();
         self.out.push_str(&self.style[self.write_pos..token_start]);
-        self.out.push_str("url(");
+        self.out.push_str(function);
+        self.out.push('(');
         cssparser::serialize_string(
             &build_proxy_url(self.settings, &absolute, self.base_origin),
             &mut self.out,
@@ -322,8 +354,9 @@ impl CssUrlRewriter<'_> {
 enum CssToken {
     /// An unquoted `url(...)`, carrying its resolved value.
     Url(String),
-    /// The opening of a `url(` function, whose argument has yet to be read.
-    UrlFunction,
+    /// The opening of a `url(` or `src(` function, whose argument has yet to
+    /// be read. Carries the name to re-emit, which is not always `url`.
+    UrlFunction(&'static str),
     /// A block or other function, whose body may contain a `url()`. Carries
     /// whether a bare string inside it is itself a URL and whether its closing
     /// returns the outer parser to a top-level rule boundary.
@@ -349,6 +382,15 @@ enum BareStringUrls {
     /// one stylesheet URL, and anything after it is a layer, a supports
     /// condition or a media query.
     FirstValue,
+}
+
+/// The name to re-emit for a URL function, preserving `src()` as itself.
+fn url_function_name(name: &str) -> &'static str {
+    if name.eq_ignore_ascii_case("src") {
+        "src"
+    } else {
+        "url"
+    }
 }
 
 /// Whether a function's argument is a URL, as `url()` and `src()` both are.
@@ -2115,6 +2157,98 @@ b{background:url(\"https://cdn.example/c.png\")}";
                 ""
             )),
             "should proxy a candidate following an unexpected token: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_keeps_a_src_function_as_src() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // `src()` and `url()` are not interchangeable: an engine that ignores
+        // `src()` makes the declaration inert, so emitting `url()` would start
+        // a request the origin never made.
+        let out = rewrite_style_urls(
+            &settings,
+            "background-image:src(\"https://tracker.example/a.png\")",
+            "",
+        );
+
+        assert!(
+            out.starts_with("background-image:src("),
+            "should re-emit the function it read: {out}"
+        );
+        assert!(
+            out.contains(&super::build_proxy_url(
+                &settings,
+                "https://tracker.example/a.png",
+                ""
+            )),
+            "should still proxy the value: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_proxies_a_var_fallback_in_a_bare_string_context() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // A `var()` fallback is substituted in place, so inside `image-set()`
+        // the fallback string is a URL candidate the browser fetches.
+        let out = rewrite_style_urls(
+            &settings,
+            "background-image:image-set(var(--missing, \"https://tracker.example/a.png\") 1x)",
+            "",
+        );
+
+        assert!(
+            out.contains(&super::build_proxy_url(
+                &settings,
+                "https://tracker.example/a.png",
+                ""
+            )),
+            "should proxy a var() fallback candidate: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_leaves_a_var_fallback_outside_a_url_context_alone() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // The same fallback in a non-URL context is ordinary text, and an
+        // `@import` prelude takes no substitution at all.
+        for css in [
+            "content:var(--missing, \"https://tracker.example/a.png\")",
+            "@import var(--missing, \"https://tracker.example/x.css\");",
+        ] {
+            let out = rewrite_style_urls(&settings, css, "");
+
+            assert_eq!(
+                out, css,
+                "should not read a fallback as a URL outside a URL context: {css}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_style_urls_cannot_resolve_a_custom_property_used_as_a_candidate() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // Documents a known limit: the string and its use are separate
+        // declarations, and pairing them is the cascade's job. A `url()` token
+        // in a custom property is still rewritten, since it is a URL anywhere.
+        let indirect = rewrite_style_urls(
+            &settings,
+            "a{--c:\"https://tracker.example/a.png\";background-image:image-set(var(--c) 1x)}",
+            "",
+        );
+        assert!(
+            !indirect.contains("/first-party/proxy?tsurl="),
+            "substitution is out of reach, so nothing is claimed: {indirect}"
+        );
+
+        let token = rewrite_style_urls(&settings, "a{--c:url(https://tracker.example/a.png)}", "");
+        assert!(
+            token.contains(&super::build_proxy_url(
+                &settings,
+                "https://tracker.example/a.png",
+                ""
+            )),
+            "a url() token in a custom property is still a URL: {token}"
         );
     }
 
