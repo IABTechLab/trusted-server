@@ -578,13 +578,28 @@ impl GoogleTagManagerIntegration {
     /// Resolves a script request to a target, refusing to serve a tag the
     /// publisher has not configured.
     ///
-    /// A page may legitimately load more than one container, so a request that
-    /// names a configured tag is served with that tag rather than substituted
-    /// for `container_id` — substituting would make the second container's tags
-    /// silently never fire. A request naming anything else is redirected to the
-    /// upstream so this origin never serves it, and a request naming no tag at
-    /// all is redirected too: upstream answers `200` for anything, so nothing
-    /// downstream would reject it.
+    /// A page may legitimately measure more than one property, so a `gtag/js`
+    /// request naming a configured tag is served with that tag rather than
+    /// substituted for `container_id` — substituting would make the second
+    /// tag's measurement silently never arrive. A request naming anything else
+    /// is redirected to the upstream so this origin never serves it. A request
+    /// naming no tag falls back to `container_id`: upstream answers `200` for
+    /// anything, so nothing downstream would reject a wrong one.
+    /// Resolves a `gtm.js` request, which is always answered with the
+    /// configured container.
+    ///
+    /// The id the client names is not consulted at all. `container_id` is the
+    /// container this origin serves, and `allowed_tag_ids` widens `gtag/js`
+    /// only, so serving a second container here would quietly extend a setting
+    /// documented for the other endpoint. A page that needs another container
+    /// is a configuration change rather than a request parameter.
+    fn container_target(&self, base: &str, query: Option<&str>) -> GtmTarget {
+        GtmTarget::Proxy(Self::with_query(
+            base.to_owned(),
+            &Self::canonical_query(query, Some(&self.config.container_id)),
+        ))
+    }
+
     fn script_target(&self, base: &str, query: Option<&str>) -> GtmTarget {
         match Self::requested_tag_id(query) {
             Some(tag_id) if self.tag_id_is_allowed(&tag_id) => GtmTarget::Proxy(Self::with_query(
@@ -607,7 +622,7 @@ impl GoogleTagManagerIntegration {
         let query = req.uri().query();
 
         if path.ends_with("/gtm.js") {
-            return Some(self.script_target(&format!("{upstream_base}/gtm.js"), query));
+            return Some(self.container_target(&format!("{upstream_base}/gtm.js"), query));
         }
 
         if path.ends_with("/gtag/js") || path.ends_with("/gtag.js") {
@@ -1224,7 +1239,7 @@ mod tests {
     }
 
     #[test]
-    fn gtm_js_refuses_a_container_the_publisher_has_not_configured() {
+    fn gtm_js_answers_with_the_configured_container_whatever_is_asked_for() {
         let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
 
         let target = resolve_target(
@@ -1235,17 +1250,18 @@ mod tests {
 
         assert_eq!(
             target,
-            GtmTarget::Redirect(
-                "https://www.googletagmanager.com/gtm.js?id=GTM-ATTACKER".to_string()
+            GtmTarget::Proxy(
+                "https://www.googletagmanager.com/gtm.js?id=GTM-CONFIGURED".to_string()
             ),
-            "an unconfigured container must not be served from this origin"
+            "the container this origin serves is the configured one, not a requested one"
         );
     }
 
     #[test]
-    fn gtm_js_serves_a_second_configured_container_rather_than_substituting() {
-        // A page may load more than one container. Substituting the primary one
-        // would leave the second container's tags silently never firing.
+    fn gtm_js_is_not_widened_by_allowed_tag_ids() {
+        // `allowed_tag_ids` is documented for `gtag/js`. Honouring it here too
+        // would extend it silently, and would make `container_id` mean
+        // "whichever configured container the client asked for".
         let integration =
             GoogleTagManagerIntegration::new(tag_config("GTM-FIRST01", &["GTM-SECOND1"]));
 
@@ -1257,8 +1273,8 @@ mod tests {
 
         assert_eq!(
             target,
-            GtmTarget::Proxy("https://www.googletagmanager.com/gtm.js?id=GTM-SECOND1".to_string()),
-            "a configured container is served as asked for"
+            GtmTarget::Proxy("https://www.googletagmanager.com/gtm.js?id=GTM-FIRST01".to_string()),
+            "an allowed tag id must not select the container gtm.js serves"
         );
     }
 
@@ -1521,8 +1537,8 @@ mod tests {
     fn gtm_js_does_not_forward_a_second_cased_id_parameter() {
         let integration = GoogleTagManagerIntegration::new(tag_config("GTM-CONFIGURED", &[]));
 
-        // The first `id`-like key decides, and it names nothing configured, so
-        // neither value is served from this origin.
+        // Google honours only an exact-case `id`, so these are inert to it.
+        // Neither value may reach the upstream request this origin makes.
         let target = resolve_target(
             &integration,
             "https://edge.example.com/integrations/google_tag_manager/gtm.js\
@@ -1530,9 +1546,12 @@ mod tests {
         )
         .expect("should resolve a gtm.js target");
 
-        assert!(
-            matches!(target, GtmTarget::Redirect(_)),
-            "should refuse rather than pick one of them, got {target:?}"
+        assert_eq!(
+            target,
+            GtmTarget::Proxy(
+                "https://www.googletagmanager.com/gtm.js?id=GTM-CONFIGURED".to_string()
+            ),
+            "should drop both cased keys and pin the configured container"
         );
     }
 
