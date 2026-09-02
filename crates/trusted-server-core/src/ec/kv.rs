@@ -131,19 +131,12 @@ impl fmt::Debug for KvIdentityGraph {
 const MAX_EC_ID_LEN: usize = 256;
 
 /// Result of [`KvIdentityGraph::write_withdrawal_tombstone`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TombstoneOutcome {
     /// The identity was found and is now tombstoned.
     Written,
     /// No such identity is held, so there was nothing to mark withdrawn.
     UnknownIdentity,
-    /// The store could not say whether the identity exists, so nothing was
-    /// written. The browser cookie is still expired by the caller, which is the
-    /// primary enforcement; only the batch-sync revocation marker is missing.
-    ///
-    /// Carries why, so the caller can log it once rather than each layer
-    /// reporting the same incident.
-    Unconfirmed { reason: String },
 }
 
 impl KvIdentityGraph {
@@ -236,13 +229,16 @@ impl KvIdentityGraph {
         let entry: KvEntry =
             serde_json::from_slice(body_bytes).change_context(TrustedServerError::KvStore {
                 store_name: store_name.to_owned(),
-                message: format!("Failed to deserialize entry for key '{ec_id}'"),
+                message: format!("Failed to deserialize entry for key '{}'", log_id(ec_id)),
             })?;
 
         entry.validate().map_err(|message| {
             Report::new(TrustedServerError::KvStore {
                 store_name: store_name.to_owned(),
-                message: format!("Loaded invalid entry for key '{ec_id}': {message}"),
+                message: format!(
+                    "Loaded invalid entry for key '{}': {message}",
+                    log_id(ec_id)
+                ),
             })
         })?;
 
@@ -271,7 +267,7 @@ impl KvIdentityGraph {
         let meta: KvMetadata =
             serde_json::from_slice(&meta_bytes).change_context(TrustedServerError::KvStore {
                 store_name: self.store_name().to_owned(),
-                message: format!("Failed to deserialize metadata for key '{ec_id}'"),
+                message: format!("Failed to deserialize metadata for key '{}'", log_id(ec_id)),
             })?;
 
         Ok(Some(meta))
@@ -694,17 +690,17 @@ impl KvIdentityGraph {
     /// lookup. A lookup may lag, so it can miss a very recent write, and it can
     /// return a row already deleted or expired at the primary — but it cannot
     /// report an identifier this deployment never issued, which is what the
-    /// gate is for. If that cannot answer either, nothing is written and
-    /// [`TombstoneOutcome::Unconfirmed`] is returned with the reason; the caller
-    /// still expires the browser cookie, which is the primary enforcement.
+    /// gate is for. If that cannot answer either, nothing is written and an
+    /// error is returned; the caller still expires the browser cookie, which is
+    /// the primary enforcement.
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::KvStore`] when the tombstone write itself
-    /// fails. A failure to determine whether the identity exists is reported as
-    /// [`TombstoneOutcome::Unconfirmed`] rather than an error, since nothing was
-    /// written. Callers on the browser path should log at `error` level and
-    /// continue — cookie deletion is the primary enforcement mechanism.
+    /// Returns [`TrustedServerError::KvStore`] when the tombstone write fails,
+    /// and when it cannot be determined whether the identity exists — in that
+    /// case nothing is written. Callers on the browser path should log at
+    /// `error` level and continue: cookie deletion is the primary enforcement
+    /// mechanism.
     pub fn write_withdrawal_tombstone(
         &self,
         ec_id: &str,
@@ -721,22 +717,28 @@ impl KvIdentityGraph {
                 //
                 // The raw form is deliberate: a row whose body no longer
                 // deserializes is still a row, and presence is all that matters.
+                //
+                // Failing to determine existence is an error, not a third
+                // outcome. A caller that only inspects the error case still
+                // reports it, where an extra `Ok` variant would be discarded in
+                // silence.
                 match self.lookup_raw(ec_id) {
-                    Ok(Some(_)) => {}
+                    Ok(Some(_)) => {
+                        log::warn!(
+                            "Confirmed EC ID '{}' by lookup after a list failure",
+                            log_id(ec_id),
+                        );
+                    }
                     Ok(None) => {
-                        return Ok(TombstoneOutcome::Unconfirmed {
-                            reason: format!(
-                                "existence check failed and a lookup found nothing: {list_error:?}"
-                            ),
-                        });
+                        return Err(list_error.attach(
+                            "a lookup found nothing, but it may lag behind a recent write",
+                        ));
                     }
                     Err(lookup_error) => {
-                        return Ok(TombstoneOutcome::Unconfirmed {
-                            reason: format!(
-                                "neither the existence check nor a lookup could be read: \
-                                 {list_error:?}; {lookup_error:?}"
-                            ),
-                        });
+                        return Err(lookup_error.attach(format!(
+                            "the exact check also failed: {}",
+                            list_error.current_context()
+                        )));
                     }
                 }
             }
@@ -755,7 +757,7 @@ impl KvIdentityGraph {
             Ok(_) => Ok(TombstoneOutcome::Written),
             Err(report) => Err(report.change_context(TrustedServerError::KvStore {
                 store_name: self.store_name().to_owned(),
-                message: format!("Failed to write tombstone for key '{ec_id}'"),
+                message: format!("Failed to write tombstone for key '{}'", log_id(ec_id)),
             })),
         }
     }
@@ -1366,6 +1368,24 @@ mod tests {
     }
 
     #[test]
+    fn a_store_error_never_carries_the_whole_identifier() {
+        // Every message in this module goes through `log_id`, so a report that
+        // reaches a log cannot disclose the identifier it is about.
+        let kv = KvIdentityGraph::failing("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+
+        let report = kv
+            .create(&ec_id, &live_entry())
+            .expect_err("the failing store should error");
+
+        let rendered = format!("{report:?}");
+        assert!(
+            !rendered.contains(&ec_id),
+            "a store error must not disclose the identifier: {rendered}"
+        );
+    }
+
+    #[test]
     fn write_withdrawal_tombstone_overwrites_live_entry() {
         let kv = KvIdentityGraph::in_memory("test_store");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
@@ -1619,16 +1639,33 @@ mod tests {
         let ec_id = format!("{}.ABC123", "8".repeat(64));
 
         assert!(
-            matches!(
-                kv.write_withdrawal_tombstone(&ec_id)
-                    .expect("should resolve the withdrawal"),
-                TombstoneOutcome::Unconfirmed { .. }
-            ),
-            "should refuse to write when existence cannot be established"
+            kv.write_withdrawal_tombstone(&ec_id).is_err(),
+            "an undetermined check is a fault, so a caller inspecting only the \
+             error case still reports it"
         );
         assert!(
             kv.get(&ec_id).expect("should read back").is_none(),
             "should not create a row while the store is degraded"
+        );
+    }
+
+    #[test]
+    fn a_caller_that_only_inspects_the_error_case_still_sees_an_undetermined_check() {
+        // The withdrawal call site is edited by more than one branch. Reporting
+        // an undetermined check through `Err` means the common
+        // `if let Err(..) = ...` shape cannot discard it, where a third `Ok`
+        // variant would be dropped without a compiler complaint.
+        let kv = KvIdentityGraph::new(ListFailingEcKv::new());
+        let ec_id = format!("{}.ABC123", "6".repeat(64));
+
+        let mut reported = false;
+        if let Err(_err) = kv.write_withdrawal_tombstone(&ec_id) {
+            reported = true;
+        }
+
+        assert!(
+            reported,
+            "an undetermined check must reach an error-only caller"
         );
     }
 

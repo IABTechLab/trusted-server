@@ -173,10 +173,9 @@ fn finalize_unusable_consent(
 ///
 /// An unknown identity is expected traffic rather than a fault: the identifier
 /// comes from a client-supplied cookie, so it may name something this
-/// deployment never issued. An unconfirmed identity is different: the store
-/// could not answer, so a real row may have gone unmarked and that is logged as
-/// an error. The browser cookie is expired in every case, and that is the
-/// primary enforcement.
+/// deployment never issued. An error is different: nothing was recorded, so a
+/// real row may have gone unmarked, and that is logged as a fault. The browser
+/// cookie is expired in every case, and that is the primary enforcement.
 fn log_tombstone_outcome(
     ec_id: &str,
     outcome: Result<TombstoneOutcome, Report<TrustedServerError>>,
@@ -189,20 +188,14 @@ fn log_tombstone_outcome(
                 log_id(ec_id),
             );
         }
-        Ok(TombstoneOutcome::Unconfirmed { reason }) => {
-            // Unlike an unknown identity, this is a fault worth surfacing: the
-            // store could not be read, so a real identity may have gone
-            // untombstoned for the batch-sync window. Reported once, here,
-            // with the detail the store layer handed back.
-            log::error!(
-                "Could not confirm EC ID '{}' to tombstone it, so a withdrawal may go \
-                 unrecorded; the browser cookie is still expired. {reason}",
-                log_id(ec_id),
-            );
-        }
         Err(err) => {
+            // Covers both a failed write and a check that could not determine
+            // whether the identity exists. Either way no marker was recorded,
+            // so a withdrawal may go unrecorded for the batch-sync window; the
+            // browser cookie is expired regardless.
             log::error!(
-                "Failed to write withdrawal tombstone for EC ID '{}': {err:?}",
+                "Could not record the withdrawal of EC ID '{}', so it may go unrecorded \
+                 for the batch-sync window; the browser cookie is still expired: {err:?}",
                 log_id(ec_id),
             );
         }

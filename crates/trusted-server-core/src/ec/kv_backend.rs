@@ -64,12 +64,6 @@ pub enum EcKvWriteOutcome {
     PreconditionFailed,
 }
 
-/// Raw KV store primitives backing the EC identity graph.
-///
-/// Implementations map these operations onto the platform KV API.
-/// Infrastructure failures are reported as [`TrustedServerError::KvStore`];
-/// write precondition failures are part of the normal control flow and are
-/// returned as [`EcKvWriteOutcome::PreconditionFailed`] instead of errors.
 /// Whether `key` appears exactly in a paged listing.
 ///
 /// Backends that can only match by prefix use this to decide existence: a
@@ -96,6 +90,12 @@ pub fn contains_exact_key<E>(
     Ok(false)
 }
 
+/// Raw KV store primitives backing the EC identity graph.
+///
+/// Implementations map these operations onto the platform KV API.
+/// Infrastructure failures are reported as [`TrustedServerError::KvStore`];
+/// write precondition failures are part of the normal control flow and are
+/// returned as [`EcKvWriteOutcome::PreconditionFailed`] instead of errors.
 pub trait EcKvStore {
     /// Returns the platform store name, used in log and error messages.
     fn store_name(&self) -> &str;
