@@ -107,10 +107,11 @@ const MAX_CSS_NESTING_DEPTH: usize = 64;
 /// a malformed value — which the tokenizer reports as a bad URL or bad string,
 /// exactly what a browser discards — is left untouched rather than guessed at.
 ///
-/// A rewritten reference is re-emitted as `url("…")` whichever form it came
-/// in as, so the output is normalized rather than byte-preserved — `url()`
-/// is accepted everywhere the other forms are. Anything not rewritten keeps
-/// its original bytes.
+/// A rewritten reference keeps the shape it was read in — `url()` as `url()`,
+/// `src()` as `src()`, a bare string as a bare string — because the forms are
+/// not interchangeable to a browser. Only the value inside is replaced, and
+/// it is re-quoted, so the output is normalized in that respect rather than
+/// byte-preserved. Anything not rewritten keeps its original bytes.
 ///
 /// A URL that only exists after custom-property substitution is out of reach:
 /// `--c:"https://t.example/a.png"` used as `image-set(var(--c) 1x)` is a URL to
@@ -207,12 +208,12 @@ impl CssUrlRewriter<'_> {
             // a block or function is read.
             let found = match parser.next_including_whitespace_and_comments() {
                 Ok(cssparser::Token::UnquotedUrl(value)) => {
-                    CssToken::Url(value.as_ref().to_owned())
+                    CssToken::Url(value.as_ref().to_owned(), UrlShape::Function("url"))
                 }
                 Ok(cssparser::Token::QuotedString(value))
                     if bare_strings != BareStringUrls::Never =>
                 {
-                    CssToken::Url(value.as_ref().to_owned())
+                    CssToken::Url(value.as_ref().to_owned(), UrlShape::BareString)
                 }
                 Ok(cssparser::Token::Function(name)) if is_url_function(name.as_ref()) => {
                     CssToken::UrlFunction(url_function_name(name.as_ref()))
@@ -258,15 +259,13 @@ impl CssUrlRewriter<'_> {
             let ends_rule = matches!(found, CssToken::RuleBoundary | CssToken::Block(_, true));
 
             match found {
-                CssToken::Url(value) => self.rewrite(&value, token_start, parser),
+                CssToken::Url(value, shape) => self.rewrite(&value, token_start, parser, shape),
                 CssToken::UrlFunction(function) => {
                     if depth >= MAX_CSS_NESTING_DEPTH {
                         self.depth_exceeded = true;
                         return;
                     }
-                    if let Some(value) = quoted_url_argument(parser) {
-                        self.rewrite_as(&value, token_start, parser, function);
-                    }
+                    self.rewrite_url_function(parser, token_start, function, depth);
                 }
                 CssToken::ImportPrelude => {
                     if depth >= MAX_CSS_NESTING_DEPTH {
@@ -314,49 +313,80 @@ impl CssUrlRewriter<'_> {
         }
     }
 
-    /// Replaces the span just consumed with a proxied `url()`, or leaves it.
-    fn rewrite(&mut self, value: &str, token_start: usize, parser: &cssparser::Parser<'_, '_>) {
-        self.rewrite_as(value, token_start, parser, "url");
-    }
-
-    /// Replaces the span just consumed with a proxied reference named
-    /// `function`, or leaves it.
-    ///
-    /// The name is preserved rather than normalized to `url`, because the two
-    /// are not interchangeable to a browser: rewriting a `src()` the engine
-    /// ignores into a `url()` it honours would start a request the origin
-    /// never made.
-    fn rewrite_as(
+    /// Replaces the span just consumed with a proxied reference in `shape`, or
+    /// leaves it.
+    fn rewrite(
         &mut self,
         value: &str,
         token_start: usize,
         parser: &cssparser::Parser<'_, '_>,
-        function: &str,
+        shape: UrlShape,
     ) {
         let Some(absolute) = to_abs(self.settings, value) else {
             return;
         };
         let token_end = parser.position().byte_index();
         self.out.push_str(&self.style[self.write_pos..token_start]);
-        self.out.push_str(function);
-        self.out.push('(');
-        cssparser::serialize_string(
-            &build_proxy_url(self.settings, &absolute, self.base_origin),
-            &mut self.out,
-        )
-        .expect("should write a serialized URL into a String");
-        self.out.push(')');
+        let proxied = build_proxy_url(self.settings, &absolute, self.base_origin);
+        if let UrlShape::Function(name) = shape {
+            self.out.push_str(name);
+            self.out.push('(');
+        }
+        cssparser::serialize_string(&proxied, &mut self.out)
+            .expect("should write a serialized URL into a String");
+        if matches!(shape, UrlShape::Function(_)) {
+            self.out.push(')');
+        }
         self.write_pos = token_end;
+    }
+
+    /// Rewrites a `url(` or `src(` call, or descends into its argument.
+    ///
+    /// The argument is normally a single string. A `src()` may instead hold a
+    /// `var()`, whose fallback is substituted in place, so that is walked and
+    /// the fallback rewritten where it sits — leaving the call's own shape
+    /// alone, since a substituted `src()` argument has to stay a string. A
+    /// `url()` argument is not walked: an engine does not substitute inside
+    /// it, so a fallback there is never the URL that gets requested.
+    fn rewrite_url_function(
+        &mut self,
+        parser: &mut cssparser::Parser<'_, '_>,
+        token_start: usize,
+        function: &'static str,
+        depth: usize,
+    ) {
+        let substitutes = function == "src";
+        let mut single_string = None;
+        let _ = parser.parse_nested_block(|inner| -> Result<(), cssparser::ParseError<'_, ()>> {
+            let start = inner.state();
+            if let Ok(cssparser::Token::QuotedString(read)) = inner.next() {
+                let read = read.as_ref().to_owned();
+                if inner.is_exhausted() {
+                    single_string = Some(read);
+                    return Ok(());
+                }
+            }
+            inner.reset(&start);
+            if substitutes {
+                self.walk(inner, depth + 1, BareStringUrls::Every);
+            }
+            Ok(())
+        });
+        if let Some(value) = single_string {
+            self.rewrite(&value, token_start, parser, UrlShape::Function(function));
+        }
     }
 }
 
 /// What a token turned out to be while scanning for `url()` references.
 enum CssToken {
-    /// An unquoted `url(...)`, carrying its resolved value.
-    Url(String),
+    /// A reference read as a value in its own right, carrying its resolved
+    /// value and the shape to write back.
+    Url(String, UrlShape),
     /// The opening of a `url(` or `src(` function, whose argument has yet to
     /// be read. Carries the name to re-emit, which is not always `url`.
     UrlFunction(&'static str),
+
     /// A block or other function, whose body may contain a `url()`. Carries
     /// whether a bare string inside it is itself a URL and whether its closing
     /// returns the outer parser to a top-level rule boundary.
@@ -384,6 +414,21 @@ enum BareStringUrls {
     FirstValue,
 }
 
+/// How a rewritten reference is written back.
+///
+/// The shape is preserved rather than normalized, because the forms are not
+/// interchangeable: `src()` is honoured where `url()` is not, and a bare
+/// string is the only form an `image-set()` candidate may take once it has
+/// been substituted into a `src()` argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UrlShape {
+    /// A function call, written with the name it was read as.
+    Function(&'static str),
+    /// A bare quoted string, as an `image-set()` candidate or an `@import`
+    /// prelude uses.
+    BareString,
+}
+
 /// The name to re-emit for a URL function, preserving `src()` as itself.
 fn url_function_name(name: &str) -> &'static str {
     if name.eq_ignore_ascii_case("src") {
@@ -404,26 +449,6 @@ fn is_url_function(name: &str) -> bool {
 /// and the browser fetches the string form just the same.
 fn takes_bare_string_urls(name: &str) -> bool {
     name.eq_ignore_ascii_case("image-set") || name.eq_ignore_ascii_case("-webkit-image-set")
-}
-
-/// Reads the argument of a `url(` or `src(` function when it is a single string.
-///
-/// Returns `None` for any other shape — a bad string, or a string carrying
-/// anything after it — leaving the original bytes in place rather than
-/// guessing at the intended value. The trailing case covers both a malformed
-/// value and the `<url-modifier>` grammar, which no engine acts on today; if
-/// one does, such a value would need proxying rather than skipping.
-fn quoted_url_argument(parser: &mut cssparser::Parser<'_, '_>) -> Option<String> {
-    parser
-        .parse_nested_block(
-            |inner| -> Result<Option<String>, cssparser::ParseError<'_, ()>> {
-                Ok(match inner.next() {
-                    Ok(cssparser::Token::QuotedString(value)) => Some(value.as_ref().to_owned()),
-                    _ => None,
-                })
-            },
-        )
-        .unwrap_or(None)
 }
 
 #[inline]
@@ -2249,6 +2274,68 @@ b{background:url(\"https://cdn.example/c.png\")}";
                 ""
             )),
             "a url() token in a custom property is still a URL: {token}"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_proxies_a_var_fallback_inside_src() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // `src()` takes a normal value list, so a `var()` there is substituted
+        // and its fallback is the string the engine ends up with.
+        let out = rewrite_style_urls(
+            &settings,
+            "@font-face{src:src(var(--missing, \"https://tracker.example/a.woff2\"))}",
+            "",
+        );
+
+        assert!(
+            out.contains(&super::build_proxy_url(
+                &settings,
+                "https://tracker.example/a.woff2",
+                ""
+            )),
+            "should proxy the fallback: {out}"
+        );
+        // Both calls must survive: substitution replaces the `var()` with the
+        // string, and a `src()` argument has to stay a string.
+        assert!(
+            out.contains("src:src(var(--missing, \"") && !out.contains("src(url("),
+            "should rewrite in place and keep both calls: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_style_urls_leaves_a_var_fallback_inside_url_alone() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // An engine does not substitute inside `url()`, so a fallback there is
+        // never the URL it requests, and rewriting it would claim otherwise.
+        let css = "background:url(var(--missing, \"https://tracker.example/a.png\"))";
+
+        let out = rewrite_style_urls(&settings, css, "");
+
+        assert_eq!(out, css, "should leave a url() argument unsubstituted");
+    }
+
+    #[test]
+    fn rewrite_style_urls_re_emits_a_bare_string_as_a_bare_string() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // Wrapping these in `url()` would be valid here, but it stops being
+        // valid once the same candidate is substituted into a `src()`.
+        let candidate = rewrite_style_urls(
+            &settings,
+            "background:image-set(\"https://tracker.example/a.png\" 1x)",
+            "",
+        );
+        assert!(
+            candidate.starts_with("background:image-set(\"") && !candidate.contains("set(url("),
+            "an image-set candidate stays a string: {candidate}"
+        );
+
+        let prelude =
+            rewrite_style_urls(&settings, "@import \"https://tracker.example/s.css\";", "");
+        assert!(
+            prelude.starts_with("@import \"") && !prelude.contains("@import url("),
+            "an @import prelude stays a string: {prelude}"
         );
     }
 
