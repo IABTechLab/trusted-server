@@ -90,7 +90,6 @@ use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
-use edgezero_adapter_fastly::env_config_from_runtime_dictionary;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::env_config::EnvConfig;
@@ -144,7 +143,9 @@ use trusted_server_core::request_signing::{
 };
 use trusted_server_core::request_timing::{Phase, RequestTimings};
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
-use trusted_server_core::settings_data::{DEFAULT_CONFIG_STORE_ID, get_settings_from_config_store};
+use trusted_server_core::settings_data::{
+    DEFAULT_CONFIG_STORE_ID, config_key, config_store_name, get_settings_from_config_store,
+};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
@@ -167,8 +168,8 @@ pub(crate) struct RuntimeStoreConfig {
 impl RuntimeStoreConfig {
     pub(crate) fn from_env(env: &EnvConfig) -> Self {
         Self {
-            config_store_name: StoreName::from(env.store_name("config", DEFAULT_CONFIG_STORE_ID)),
-            config_key: env.store_key("config", DEFAULT_CONFIG_STORE_ID),
+            config_store_name: config_store_name(env),
+            config_key: config_key(env),
             secret_store_name: StoreName::from(env.store_name("secrets", DEFAULT_SECRET_STORE_ID)),
         }
     }
@@ -1520,7 +1521,7 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        let runtime_env = env_config_from_runtime_dictionary(Self::stores());
+        let runtime_env = EnvConfig::from_env();
         let stores = RuntimeStoreConfig::from_env(&runtime_env);
         Self::router_with_state(&stores).0
     }
@@ -1559,7 +1560,7 @@ mod tests {
     };
     use base64::Engine as _;
     use bytes::Bytes;
-    use edgezero_core::app::Hooks as _;
+    use edgezero_core::app::{Hooks as _, StoreMetadata};
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
     use edgezero_core::env_config::EnvConfig;
@@ -1784,6 +1785,33 @@ mod tests {
     fn test_router() -> RouterService {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         TrustedServerApp::routes_for_state(&state)
+    }
+
+    #[test]
+    fn trusted_server_app_declares_runtime_store_metadata() {
+        let stores = TrustedServerApp::stores();
+
+        assert_eq!(
+            stores.config,
+            Some(StoreMetadata {
+                default: "trusted_server_config",
+                ids: &["trusted_server_config"],
+            })
+        );
+        assert_eq!(
+            stores.kv,
+            Some(StoreMetadata {
+                default: "trusted_server_kv",
+                ids: &["trusted_server_kv"],
+            })
+        );
+        assert_eq!(
+            stores.secrets,
+            Some(StoreMetadata {
+                default: "trusted_server_secrets",
+                ids: &["trusted_server_secrets"],
+            })
+        );
     }
 
     #[test]

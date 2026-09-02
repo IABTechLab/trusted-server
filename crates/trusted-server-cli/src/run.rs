@@ -2,8 +2,8 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 use edgezero_cli::args::{
-    AuthArgs, BuildArgs, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DeployArgs,
-    ProvisionArgs, ServeArgs,
+    ActiveVersionArgs, AuthArgs, BuildArgs, ConfigDiffArgs, ConfigGcArgs, ConfigPushArgs,
+    ConfigValidateArgs, DeployArgs, HealthcheckArgs, ProvisionArgs, RollbackArgs, ServeArgs,
 };
 use trusted_server_core::config::TrustedServerAppConfig;
 
@@ -13,7 +13,7 @@ use crate::commands::config::init::{ConfigInitArgs, run_config_init};
 use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
 
 #[derive(Debug, Parser)]
-#[command(name = "ts", about = "Trusted Server CLI")]
+#[command(name = "ts", version, about = "Trusted Server CLI")]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -21,6 +21,8 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print the currently active deployment version for a target adapter.
+    ActiveVersion(ActiveVersionArgs),
     /// Browser-backed page and ad-template audits.
     Audit(Box<AuditArgs>),
     /// Sign in / out / status against an `EdgeZero` adapter.
@@ -32,10 +34,14 @@ enum Command {
     Config(ConfigCommand),
     /// Deploy the project through a target adapter.
     Deploy(DeployArgs),
+    /// Probe a deployed version until it reports healthy.
+    Healthcheck(HealthcheckArgs),
     /// Trusted Server Prebid commands.
     Prebid(PrebidArgs),
     /// Provision platform resources through a target adapter.
     Provision(ProvisionArgs),
+    /// Roll a service back to a previously active deployment version.
+    Rollback(RollbackArgs),
     /// Serve the project locally through a target adapter.
     Serve(ServeArgs),
     /// Local developer tools (e.g. the macOS-only production-hostname proxy).
@@ -52,6 +58,8 @@ enum ConfigCommand {
     Init(ConfigInitArgs),
     /// Diff `trusted-server.toml` against the live `EdgeZero` config.
     Diff(ConfigDiffArgs),
+    /// Reclaim orphaned chunk entries leaked from prior oversized pushes.
+    Gc(ConfigGcArgs),
     /// Push `trusted-server.toml` as a blob envelope through `EdgeZero`.
     Push(ConfigPushArgs),
     /// Validate `edgezero.toml` and the typed Trusted Server config.
@@ -102,6 +110,9 @@ pub fn run_from_env() -> Result<RunOutcome, String> {
 
 fn dispatch(args: Args) -> Result<RunOutcome, String> {
     match args.command {
+        Command::ActiveVersion(args) => {
+            edgezero_cli::run_active_version(&args).map(|()| RunOutcome::Success)
+        }
         Command::Auth(args) => edgezero_cli::run_auth(&args).map(|()| RunOutcome::Success),
         Command::Audit(args) => run_audit(&args),
         Command::Build(args) => edgezero_cli::run_build(&args).map(|()| RunOutcome::Success),
@@ -117,6 +128,9 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
                 Err(err) => Err(err),
             }
         }
+        Command::Config(ConfigCommand::Gc(args)) => {
+            edgezero_cli::run_config_gc(&args).map(|()| RunOutcome::Success)
+        }
         Command::Config(ConfigCommand::Push(args)) => {
             edgezero_cli::run_config_push_typed::<TrustedServerAppConfig>(&args)
                 .map(|()| RunOutcome::Success)
@@ -126,6 +140,9 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
                 .map(|()| RunOutcome::Success)
         }
         Command::Deploy(args) => edgezero_cli::run_deploy(&args).map(|()| RunOutcome::Success),
+        Command::Healthcheck(args) => {
+            edgezero_cli::run_healthcheck(&args).map(|()| RunOutcome::Success)
+        }
         Command::Prebid(prebid) => {
             let mut generator = NpmPrebidBundleGenerator;
             let mut stdout = std::io::stdout();
@@ -140,6 +157,7 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
         Command::Provision(args) => {
             edgezero_cli::run_provision(&args).map(|()| RunOutcome::Success)
         }
+        Command::Rollback(args) => edgezero_cli::run_rollback(&args).map(|()| RunOutcome::Success),
         Command::Serve(args) => edgezero_cli::run_serve(&args).map(|()| RunOutcome::Success),
         Command::Dev(command) => crate::commands::dev::run(command).map(|()| RunOutcome::Success),
     }
@@ -162,6 +180,216 @@ mod tests {
     fn run_outcomes_use_documented_exit_codes() {
         assert_eq!(RunOutcome::Success.exit_code(), 0);
         assert_eq!(RunOutcome::AssertionFailed.exit_code(), 1);
+    }
+
+    #[test]
+    fn top_level_version_flag_is_available() {
+        let err = Args::try_parse_from(["ts", "--version"])
+            .expect_err("should short-circuit parsing on --version");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::DisplayVersion,
+            "should print the version rather than fail to parse"
+        );
+    }
+
+    #[test]
+    fn parses_active_version() {
+        let args = parse(&[
+            "ts",
+            "active-version",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+        ]);
+        let Command::ActiveVersion(active_version) = args.command else {
+            panic!("expected active-version command");
+        };
+        assert_eq!(active_version.adapter, "fastly");
+        assert_eq!(active_version.service_id, "service-123");
+    }
+
+    #[test]
+    fn parses_healthcheck_with_retry_defaults() {
+        let args = parse(&[
+            "ts",
+            "healthcheck",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+            "--version",
+            "7",
+            "--domain",
+            "edge.example",
+        ]);
+        let Command::Healthcheck(healthcheck) = args.command else {
+            panic!("expected healthcheck command");
+        };
+        assert_eq!(healthcheck.domain, "edge.example");
+        assert_eq!(healthcheck.version, "7");
+        assert_eq!(healthcheck.path, "/", "should default to probing `/`");
+        assert_eq!(
+            healthcheck.retry, 3,
+            "should default to 3 total attempts, not 3 retries after a first try"
+        );
+        assert_eq!(
+            healthcheck.retry_delay, 5,
+            "should default to a 5s retry delay"
+        );
+        assert_eq!(healthcheck.timeout, 10, "should default to a 10s timeout");
+        assert!(!healthcheck.staging, "should probe production by default");
+    }
+
+    #[test]
+    fn parses_healthcheck_with_staging_overrides() {
+        let args = parse(&[
+            "ts",
+            "healthcheck",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+            "--version",
+            "7",
+            "--domain",
+            "edge.example",
+            "--path",
+            "/ready",
+            "--staging",
+            "--retry",
+            "9",
+            "--retry-delay",
+            "2",
+            "--timeout",
+            "30",
+        ]);
+        let Command::Healthcheck(healthcheck) = args.command else {
+            panic!("expected healthcheck command");
+        };
+        assert_eq!(healthcheck.path, "/ready");
+        assert!(healthcheck.staging);
+        assert_eq!(healthcheck.retry, 9);
+        assert_eq!(healthcheck.retry_delay, 2);
+        assert_eq!(healthcheck.timeout, 30);
+    }
+
+    #[test]
+    fn healthcheck_requires_domain() {
+        Args::try_parse_from([
+            "ts",
+            "healthcheck",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+            "--version",
+            "7",
+        ])
+        .expect_err("should reject healthcheck without a domain");
+    }
+
+    #[test]
+    fn parses_rollback_with_explicit_target() {
+        let args = parse(&[
+            "ts",
+            "rollback",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+            "--version",
+            "8",
+            "--rollback-to",
+            "7",
+        ]);
+        let Command::Rollback(rollback) = args.command else {
+            panic!("expected rollback command");
+        };
+        assert_eq!(rollback.version, "8");
+        assert_eq!(rollback.rollback_to, Some("7".to_owned()));
+        assert!(!rollback.staging);
+    }
+
+    #[test]
+    fn parses_staging_rollback_without_target() {
+        let args = parse(&[
+            "ts",
+            "rollback",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+            "--version",
+            "8",
+            "--staging",
+        ]);
+        let Command::Rollback(rollback) = args.command else {
+            panic!("expected rollback command");
+        };
+        assert!(rollback.staging);
+        assert_eq!(
+            rollback.rollback_to, None,
+            "staging rollback should not need an explicit target"
+        );
+    }
+
+    #[test]
+    fn rollback_requires_service_id() {
+        Args::try_parse_from(["ts", "rollback", "--adapter", "fastly", "--version", "8"])
+            .expect_err("should reject rollback without a service id");
+    }
+
+    #[test]
+    fn parses_deploy_with_staging_flags() {
+        let args = parse(&[
+            "ts",
+            "deploy",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+            "--staging",
+        ]);
+        let Command::Deploy(deploy) = args.command else {
+            panic!("expected deploy command");
+        };
+        assert_eq!(deploy.service_id, Some("service-123".to_owned()));
+        assert!(deploy.staging);
+    }
+
+    #[test]
+    fn deploy_rejects_renamed_stage_flag_before_separator() {
+        // `--stage` was renamed to `--staging`, and adapter passthrough is
+        // `last = true` (only captured after `--`). A stray `--stage` before the
+        // separator must fail closed at parse time rather than being swallowed as
+        // passthrough, which would leave `staging` false and route a
+        // staging-intended deploy to production.
+        Args::try_parse_from(["ts", "deploy", "--adapter", "fastly", "--stage"])
+            .expect_err("should reject the renamed-away --stage flag, not route it to production");
+    }
+
+    #[test]
+    fn deploy_captures_adapter_passthrough_after_separator() {
+        let args = parse(&[
+            "ts",
+            "deploy",
+            "--adapter",
+            "fastly",
+            "--",
+            "--comment",
+            "ci",
+        ]);
+        let Command::Deploy(deploy) = args.command else {
+            panic!("expected deploy command");
+        };
+        assert!(!deploy.staging, "should default to a production deploy");
+        assert_eq!(
+            deploy.adapter_args,
+            vec!["--comment", "ci"],
+            "should capture args after -- as adapter passthrough"
+        );
     }
 
     #[test]
@@ -243,6 +471,130 @@ mod tests {
         assert!(!diff.local);
         assert!(!diff.exit_code);
         assert!(!diff.no_env);
+    }
+
+    #[test]
+    fn config_push_parses_staging_and_rejects_explicit_key() {
+        let args = parse(&["ts", "config", "push", "--adapter", "fastly", "--staging"]);
+        let Command::Config(ConfigCommand::Push(push)) = args.command else {
+            panic!("expected config push command");
+        };
+        assert!(push.staging, "should target the derived staging key");
+
+        Args::try_parse_from([
+            "ts",
+            "config",
+            "push",
+            "--adapter",
+            "fastly",
+            "--staging",
+            "--key",
+            "custom",
+        ])
+        .expect_err("should reject --key with --staging; the staging key is derived");
+    }
+
+    #[test]
+    fn config_diff_parses_staging_and_rejects_explicit_key() {
+        let args = parse(&["ts", "config", "diff", "--adapter", "fastly", "--staging"]);
+        let Command::Config(ConfigCommand::Diff(diff)) = args.command else {
+            panic!("expected config diff command");
+        };
+        assert!(
+            diff.staging,
+            "should compare against the derived staging key"
+        );
+
+        Args::try_parse_from([
+            "ts",
+            "config",
+            "diff",
+            "--adapter",
+            "fastly",
+            "--staging",
+            "--key",
+            "custom",
+        ])
+        .expect_err("should reject --key with --staging; the staging key is derived");
+    }
+
+    #[test]
+    fn config_gc_previews_by_default() {
+        let args = parse(&["ts", "config", "gc", "--adapter", "fastly"]);
+        let Command::Config(ConfigCommand::Gc(gc)) = args.command else {
+            panic!("expected config gc command");
+        };
+        assert_eq!(gc.adapter, "fastly");
+        assert_eq!(
+            gc.older_than, None,
+            "should not require an older-than window to preview"
+        );
+        assert!(!gc.dry_run);
+        assert!(!gc.no_env);
+        assert_eq!(
+            gc.store, None,
+            "should default to the manifest's config-store id"
+        );
+        assert!(
+            !gc.yes,
+            "should not delete without an explicit --yes; --yes is the only destructive gate"
+        );
+    }
+
+    #[test]
+    fn config_gc_parses_store_override() {
+        let args = parse(&[
+            "ts",
+            "config",
+            "gc",
+            "--adapter",
+            "fastly",
+            "--store",
+            "other_config_store",
+            "--no-env",
+        ]);
+        let Command::Config(ConfigCommand::Gc(gc)) = args.command else {
+            panic!("expected config gc command");
+        };
+        assert_eq!(
+            gc.store,
+            Some("other_config_store".to_owned()),
+            "should retarget which store a sweep inspects"
+        );
+        assert!(gc.no_env, "should disable environment overlays");
+    }
+
+    #[test]
+    fn config_gc_parses_destructive_sweep() {
+        let args = parse(&[
+            "ts",
+            "config",
+            "gc",
+            "--adapter",
+            "fastly",
+            "--yes",
+            "--older-than",
+            "7d",
+        ]);
+        let Command::Config(ConfigCommand::Gc(gc)) = args.command else {
+            panic!("expected config gc command");
+        };
+        assert!(gc.yes);
+        assert_eq!(gc.older_than, Some("7d".to_owned()));
+    }
+
+    #[test]
+    fn config_gc_rejects_dry_run_with_yes() {
+        Args::try_parse_from([
+            "ts",
+            "config",
+            "gc",
+            "--adapter",
+            "fastly",
+            "--dry-run",
+            "--yes",
+        ])
+        .expect_err("should reject conflicting --dry-run and --yes");
     }
 
     #[test]

@@ -129,6 +129,10 @@ fn resolve_field(
             }
             Ok(())
         }
+        Some((segment, _)) => Err(configuration_error(format!(
+            "unsupported EdgeZero secret path segment `{segment:?}` in `{}`",
+            field.dotted_path()
+        ))),
         None => Ok(()),
     }
 }

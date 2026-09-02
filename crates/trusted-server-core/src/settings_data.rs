@@ -30,16 +30,28 @@ struct FastlyChunkRef {
     sha256: String,
 }
 
+/// Resolves the `EdgeZero` app-config store name from runtime configuration.
+#[must_use]
+pub fn config_store_name(env: &EnvConfig) -> StoreName {
+    StoreName::from(env.store_name("config", DEFAULT_CONFIG_STORE_ID))
+}
+
+/// Resolves the config-store key containing the app-config blob.
+#[must_use]
+pub fn config_key(env: &EnvConfig) -> String {
+    env.store_key("config", DEFAULT_CONFIG_STORE_ID)
+}
+
 /// Returns the default `EdgeZero` app-config store name.
 #[must_use]
 pub fn default_config_store_name() -> StoreName {
-    StoreName::from(EnvConfig::from_env().store_name("config", DEFAULT_CONFIG_STORE_ID))
+    config_store_name(&EnvConfig::from_env())
 }
 
 /// Returns the default config-store key containing the app-config blob.
 #[must_use]
 pub fn default_config_key() -> String {
-    EnvConfig::from_env().store_key("config", DEFAULT_CONFIG_STORE_ID)
+    config_key(&EnvConfig::from_env())
 }
 
 /// Returns the default `EdgeZero` secret-store name for Trusted Server secrets.
@@ -266,6 +278,47 @@ mod tests {
             key,
             &StoreName::from("trusted_server_secrets"),
         )
+    }
+
+    #[test]
+    fn config_selectors_default_to_the_logical_store_id() {
+        let env = EnvConfig::default();
+
+        assert_eq!(
+            config_store_name(&env),
+            StoreName::from("trusted_server_config")
+        );
+        assert_eq!(config_key(&env), "trusted_server_config");
+    }
+
+    #[test]
+    fn config_key_selects_the_staging_key() {
+        let env = EnvConfig::from_vars([(
+            "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY",
+            "trusted_server_config_staging",
+        )]);
+
+        assert_eq!(config_key(&env), "trusted_server_config_staging");
+    }
+
+    #[test]
+    fn config_store_name_override_preserves_the_independently_selected_key() {
+        let env = EnvConfig::from_vars([
+            (
+                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME",
+                "publisher-config-store",
+            ),
+            (
+                "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY",
+                "trusted_server_config_staging",
+            ),
+        ]);
+
+        assert_eq!(
+            config_store_name(&env),
+            StoreName::from("publisher-config-store")
+        );
+        assert_eq!(config_key(&env), "trusted_server_config_staging");
     }
 
     #[test]

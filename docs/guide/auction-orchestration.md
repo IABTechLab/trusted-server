@@ -811,8 +811,8 @@ not belong to the browser integration.
 ### Environment variable overrides
 
 The typed `ts config validate`, `ts config diff`, and `ts config push` flows can
-override existing scalar leaves. EdgeZero v0.0.4 does not create missing leaves
-or replace arrays, tables, maps, or rules. Existing configs must add
+override existing scalar leaves. EdgeZero's env overlay does not create missing
+leaves or replace arrays, tables, maps, or rules. Existing configs must add
 `rewrite_creatives = true` and `sanitize_creatives = false` before relying on
 those scalar overrides. Edit and re-push TOML for other values. Provider map
 keys preserve hyphens, so `pbs-main` uses the `PBS-MAIN` segment and needs
