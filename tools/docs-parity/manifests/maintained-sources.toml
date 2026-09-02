@@ -4027,7 +4027,25 @@ mode = "whole"
 disposition = "include"
 
 [[sources]]
+path = "tools/docs-parity/manifests/diagrams.toml"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "non_documentation"
+
+[[sources]]
 path = "tools/docs-parity/manifests/maintained-sources.toml"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "non_documentation"
+
+[[sources]]
+path = "tools/docs-parity/manifests/orphans.toml"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "non_documentation"
+
+[[sources]]
+path = "tools/docs-parity/manifests/pages.toml"
 mode = "whole"
 disposition = "exclude"
 exclude_kind = "non_documentation"
@@ -4069,6 +4087,12 @@ disposition = "exclude"
 exclude_kind = "source_code"
 
 [[sources]]
+path = "tools/docs-parity/src/markdown.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
 path = "tools/docs-parity/src/model.rs"
 mode = "whole"
 disposition = "exclude"
@@ -4094,6 +4118,18 @@ exclude_kind = "source_code"
 
 [[sources]]
 path = "tools/docs-parity/tests/cli.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
+path = "tools/docs-parity/tests/links.rs"
+mode = "whole"
+disposition = "exclude"
+exclude_kind = "source_code"
+
+[[sources]]
+path = "tools/docs-parity/tests/markdown.rs"
 mode = "whole"
 disposition = "exclude"
 exclude_kind = "source_code"

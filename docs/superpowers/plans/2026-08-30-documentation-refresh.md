@@ -328,6 +328,7 @@ git commit -m "Enforce documentation source classification"
 
 - Modify as dependencies are introduced: `tools/docs-parity/Cargo.toml`
 - Modify as dependencies are introduced: `tools/docs-parity/Cargo.lock`
+- Modify: `tools/docs-parity/README.md`
 - Create: `tools/docs-parity/src/markdown.rs`
 - Modify: `tools/docs-parity/src/main.rs`
 - Modify: `tools/docs-parity/src/lib.rs`
@@ -340,6 +341,9 @@ git commit -m "Enforce documentation source classification"
 - Modify: `tools/docs-parity/manifests/maintained-sources.toml`
 - Create/Test: `tools/docs-parity/tests/markdown.rs`
 - Create/Test: `tools/docs-parity/tests/links.rs`
+- Modify for exact verification/staging scope: `docs/superpowers/plans/2026-08-30-documentation-refresh.md`
+- Modify for package receipts: `docs/internal/audits/documentation-refresh-evidence.md`
+- Modify if scanner offsets change: `tools/docs-parity/manifests/sensitive-allowlist.toml`
 
 - [ ] **Step 1: Write generated-region failure tests**
 
@@ -375,8 +379,8 @@ its lockfile, and require `git diff --quiet -- Cargo.lock` before the commands
 below.
 
 ```bash
-cargo test --manifest-path tools/docs-parity/Cargo.toml markdown
-cargo test --manifest-path tools/docs-parity/Cargo.toml links
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test markdown
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test links
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- links --local --check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- generate --check
 ```
@@ -386,7 +390,7 @@ Expected: focused tests and current local repository checks pass; external netwo
 - [ ] **Step 7: Commit**
 
 ```bash
-git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-parity/src/markdown.rs tools/docs-parity/src/main.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/model.rs tools/docs-parity/src/repository.rs tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/diagrams.toml tools/docs-parity/manifests/orphans.toml tools/docs-parity/tests/markdown.rs tools/docs-parity/tests/links.rs docs/internal/audits/documentation-refresh-evidence.md
+git add tools/docs-parity/Cargo.toml tools/docs-parity/Cargo.lock tools/docs-parity/README.md tools/docs-parity/src/markdown.rs tools/docs-parity/src/main.rs tools/docs-parity/src/lib.rs tools/docs-parity/src/model.rs tools/docs-parity/src/repository.rs tools/docs-parity/manifests/tracked-files.toml tools/docs-parity/manifests/maintained-sources.toml tools/docs-parity/manifests/sensitive-allowlist.toml tools/docs-parity/manifests/pages.toml tools/docs-parity/manifests/diagrams.toml tools/docs-parity/manifests/orphans.toml tools/docs-parity/tests/markdown.rs tools/docs-parity/tests/links.rs docs/superpowers/plans/2026-08-30-documentation-refresh.md docs/internal/audits/documentation-refresh-evidence.md
 git commit -m "Add checked documentation regions and links"
 ```
 

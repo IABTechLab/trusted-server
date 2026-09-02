@@ -1,0 +1,9 @@
+version = 1
+reviewed = true
+
+[[exceptions]]
+kind = "manual"
+path = "docs/guide/integrations/google_tag_manager.md"
+owner = "documentation-maintainers"
+reason = "Published integration detail is intentionally retained while navigation ownership is resolved."
+expires_at = "2027-03-01T00:00:00Z"

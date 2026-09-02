@@ -2502,7 +2502,73 @@ PY
 
 #### Task 6 — Implement generated regions, Markdown ownership, and link checks
 
-Pending. Record each atomic fixture cycle and generated second-run no-diff.
+- Package start on 2026-09-01 was
+  `53a5a9e1d42d4dc78e4583d1b5d40ebdcc9c242a`, equal to the then-current
+  `origin/spec-docs-refresh`. Work remained in the existing
+  `spec-docs-refresh` worktree and PR #1049.
+- The first exact focused commands,
+  `cargo test --manifest-path tools/docs-parity/Cargo.toml --test markdown`
+  and the corresponding `--test links` command, both failed with `E0432`
+  because `docs_parity::markdown` did not exist. The generated-command leaf
+  then failed with exit 2 for the missing `generate` subcommand rather than
+  the expected drift exit 1. Later focused red fixtures reproduced
+  repository-root link misresolution, VitePress punctuation-slug mismatch,
+  and a missing Setext anchor before their individual implementations.
+- Generated-region fixtures cover duplicate, missing, mismatched, nested,
+  unknown, and non-standalone markers; unknown records; duplicate row keys;
+  wrong cell counts; deterministic row sorting; hand drift; exact CRLF and
+  outside-byte preservation; exact owner identity; check-mode no-write;
+  same-directory stale-stage interruption; symlink, unsafe-mode, traversal,
+  and oversized-target rejection; and byte-identical second update. The final
+  focused Markdown target contains 9 passing tests.
+- Semantic Markdown fixtures cover one dead relative link in each of the
+  repository, maintained-internal, and public sets; repository-root paths;
+  VitePress routes; queries; inline/fenced-code exclusion; inline and
+  reference links; ATX and Setext headings; duplicate heading slugs; explicit
+  anchors; strict percent-decoded fragments; tombstones; unlisted pages;
+  excluded-source links; page/navigation equality; reachability; and diagram
+  prose ownership. The live check covers 77 maintained Markdown sources:
+  42 public pages, 4 maintained-internal sources, and 31 other repository
+  sources.
+- `pages.toml` is exact for the 42 currently built VitePress Markdown pages
+  and 38 distinct local navigation routes parsed from the checked config.
+  Reachability leaves one typed manual exception,
+  `docs/guide/integrations/google_tag_manager.md`, owned by
+  `documentation-maintainers` and expiring 2027-03-01. `diagrams.toml` is exact
+  for 13 public Mermaid blocks; every record names an existing prose heading
+  anchor and owner. No tombstone exception is currently needed.
+- External fixtures use injected transport, clock, and sleeper seams. They
+  cover all three source sets, HTTPS and credential rejection, HEAD-to-GET
+  fallback only for unsupported HEAD, final status, five-redirect depth,
+  loops, relative redirects, three total 429/5xx attempts, 1-second and
+  2-second local delays, valid bounded delta and HTTP-date `Retry-After`,
+  malformed and over-30-second fallback, request time/body bounds, retry
+  exhaustion, and exact owned/reasoned expiry at the boundary. The production
+  curl transport is reachable only through explicit
+  `links --external --check`; no external network check was run or represented
+  as a pull-request gate.
+- The final focused links target contains 14 passing tests. A fresh standalone
+  full suite contained 150 passing tests: 2 library unit, 35 classification,
+  19 CLI, 14 links, 9 Markdown, and 71 scanner tests. Fresh local
+  `links --local --check`, `generate --check`, and `classify --check` commands
+  exited 0 before final scanner regeneration.
+- Only the standalone dependency graph changed: `url` and its transitive
+  packages were added to `tools/docs-parity/Cargo.lock`. Root `Cargo.lock`
+  remained byte-identical with SHA-256
+  `9bb34225c5b8d1da39c75c3a8143d905f4b7d228a8986dc93d7e58a4196b4bba`.
+- The reviewed sensitive inventory contains 5,343 exact occurrences, 28 more
+  than Task 5. All 28 additions are the exact GitHub registry host in new
+  `registry+https` source fields introduced by the standalone `url`
+  dependency graph; every one is classed `vendor_url`. Synthetic plain `.md`
+  link inputs are assembled from split literals, so repository filenames are
+  not misclassified as vendor domains. No prior semantic finding was removed.
+  Two classification updates retained identical tracked/source hashes
+  (`9d907be9...` and `d30a510e...`), and repeated scanner bootstraps retained
+  sensitive-manifest SHA-256
+  `981c5a607220bc5b3b837fd1859848e0673357b492c1013e06ff262a1616ab05`
+  with `reviewed = true`. Two generated updates were byte-stable; subsequent
+  generated, scanner, classification, and local-link check commands all
+  exited 0.
 
 #### Task 7 — Extract settings semantics and execute the example harness
 

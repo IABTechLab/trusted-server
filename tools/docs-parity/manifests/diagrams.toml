@@ -1,0 +1,80 @@
+version = 1
+reviewed = true
+
+[[diagrams]]
+path = "docs/guide/architecture.md"
+selector = "mermaid:1"
+prose_anchor = "high-level-overview"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/edge-cookies.md"
+selector = "mermaid:1"
+prose_anchor = "request-lifecycle"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/edge-cookies.md"
+selector = "mermaid:2"
+prose_anchor = "response-finalization"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/edge-cookies.md"
+selector = "mermaid:3"
+prose_anchor = "consent-model"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/edge-cookies.md"
+selector = "mermaid:4"
+prose_anchor = "partner-sync-channels"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/edge-cookies.md"
+selector = "mermaid:5"
+prose_anchor = "prebid-eid-cookie-flow"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/edge-cookies.md"
+selector = "mermaid:6"
+prose_anchor = "eid-seeding-and-prebid-bidstream-forwarding"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/auction-orchestration.md"
+selector = "mermaid:1"
+prose_anchor = "system-flow-prebid--aps"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/integrations/datadome.md"
+selector = "mermaid:1"
+prose_anchor = "how-it-works"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/first-party-proxy.md"
+selector = "mermaid:1"
+prose_anchor = "how-it-works"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/collective-sync.md"
+selector = "mermaid:1"
+prose_anchor = "overview"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/integrations/google_tag_manager.md"
+selector = "mermaid:1"
+prose_anchor = "how-it-works"
+owner = "documentation-maintainers"
+
+[[diagrams]]
+path = "docs/guide/integrations/prebid.md"
+selector = "mermaid:1"
+prose_anchor = "identity-flow"
+owner = "documentation-maintainers"

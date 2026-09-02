@@ -138,6 +138,12 @@ pub(crate) struct ClassifiedFile {
     pub(crate) kind: FileKind,
 }
 
+pub(crate) struct MarkdownClassification {
+    pub(crate) included_paths: BTreeSet<String>,
+    pub(crate) excluded_paths: BTreeSet<String>,
+    pub(crate) known_paths: BTreeSet<String>,
+}
+
 /// Validate that every tracked path and expected text surface is classified.
 ///
 /// # Errors
@@ -163,6 +169,41 @@ pub(crate) fn checked_files(
             kind: record.kind,
         })
         .collect())
+}
+
+pub(crate) fn checked_markdown_sources(
+    repository: &Repository,
+) -> Result<MarkdownClassification, Report<ClassificationError>> {
+    let tracked_manifest: TrackedManifest = read_manifest(repository, TRACKED_MANIFEST)?;
+    let maintained_manifest: MaintainedManifest = read_manifest(repository, MAINTAINED_MANIFEST)?;
+    validate(repository, &tracked_manifest, &maintained_manifest)?;
+    let known_paths = tracked_manifest
+        .files
+        .iter()
+        .map(|record| record.path.clone())
+        .collect::<BTreeSet<_>>();
+    let text_paths = tracked_manifest
+        .files
+        .into_iter()
+        .filter(|record| record.kind == FileKind::Text && record.path.ends_with(".md"))
+        .map(|record| record.path)
+        .collect::<BTreeSet<_>>();
+    let included_paths = maintained_manifest
+        .sources
+        .into_iter()
+        .filter(|record| {
+            record.mode == SourceMode::Whole
+                && record.disposition == Some(Disposition::Include)
+                && record.path.ends_with(".md")
+        })
+        .map(|record| record.path)
+        .collect::<BTreeSet<_>>();
+    let excluded_paths = text_paths.difference(&included_paths).cloned().collect();
+    Ok(MarkdownClassification {
+        included_paths,
+        excluded_paths,
+        known_paths,
+    })
 }
 
 /// Refresh deterministic classification candidates while preserving reviewed records.

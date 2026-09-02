@@ -50,6 +50,14 @@ path = "tests/classification.rs"
 name = "scanner"
 path = "tests/scanner.rs"
 
+[[test]]
+name = "markdown"
+path = "tests/markdown.rs"
+
+[[test]]
+name = "links"
+path = "tests/links.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 derive_more = { version = "2.0", features = ["display"] }
@@ -61,6 +69,7 @@ serde_json = "1"
 sha2 = "0.10"
 toml = "0.9"
 toml_edit = "0.23"
+url = "2.5"
 
 [dev-dependencies]
 tempfile = "3.24"

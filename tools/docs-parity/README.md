@@ -17,6 +17,11 @@ cargo run --manifest-path tools/docs-parity/Cargo.toml -- classify --check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- classify --update
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- scan --check
 cargo run --manifest-path tools/docs-parity/Cargo.toml -- scan --bootstrap
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- generate --check
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- generate --update
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- links --local --check
+# Scheduled or manual only; this command performs bounded network requests.
+cargo run --manifest-path tools/docs-parity/Cargo.toml -- links --external --check
 ```
 
 The tool may also be launched from any nested worktree directory. Derive and
@@ -76,6 +81,29 @@ for review when findings change. It never approves candidates. The five allowed
 exception classes do not assert that mechanical detection is complete for
 human semantic sensitivity.
 
+## Generated regions and links
+
+`generate --check` renders the typed records in `manifests/pages.toml` and
+returns exit code `1` when a named Markdown region differs. Check mode performs
+no writes. `generate --update` validates every target first, then atomically
+replaces only drifted region bodies; exact bytes outside the paired markers are
+preserved. Region names, rows, ownership markers, paths, file modes, sizes, and
+marker placement all fail closed. A second update is byte-identical.
+
+`links --local --check` validates semantic Markdown destinations over all
+maintained public, internal, and repository source sets. It checks relative
+files, VitePress routes, queries, strict percent decoding, duplicate heading
+slugs, explicit anchors, excluded-source links, tombstones, page/navigation
+set equality, reachable pages, and diagram prose equivalents. The command is
+offline and is suitable for pull-request validation.
+
+`links --external --check` is the only command that performs network I/O. It is
+reserved for scheduled or explicit manual execution. Requests require HTTPS,
+reject URL credentials, follow at most five redirects, use HEAD with GET only
+for unsupported HEAD responses, and make at most three attempts for 429/5xx.
+Response size and time are bounded. Exact exceptions require an owner, reason,
+and unexpired timestamp.
+
 ## Repository boundary
 
 Generated paths must be normalized, non-empty relative paths. Absolute paths,
@@ -104,6 +132,8 @@ compile time; there is no non-atomic or mode-blind fallback.
 cargo test --manifest-path tools/docs-parity/Cargo.toml --test cli
 cargo test --manifest-path tools/docs-parity/Cargo.toml --test classification
 cargo test --manifest-path tools/docs-parity/Cargo.toml --test scanner
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test markdown
+cargo test --manifest-path tools/docs-parity/Cargo.toml --test links
 cargo test --manifest-path tools/docs-parity/Cargo.toml
 cargo fmt --manifest-path tools/docs-parity/Cargo.toml -- --check
 cargo clippy --manifest-path tools/docs-parity/Cargo.toml --all-targets -- -D warnings

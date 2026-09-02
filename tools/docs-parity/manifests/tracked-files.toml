@@ -2767,7 +2767,19 @@ path = "tools/docs-parity/README.md"
 kind = "text"
 
 [[files]]
+path = "tools/docs-parity/manifests/diagrams.toml"
+kind = "text"
+
+[[files]]
 path = "tools/docs-parity/manifests/maintained-sources.toml"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/manifests/orphans.toml"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/manifests/pages.toml"
 kind = "text"
 
 [[files]]
@@ -2795,6 +2807,10 @@ path = "tools/docs-parity/src/main.rs"
 kind = "text"
 
 [[files]]
+path = "tools/docs-parity/src/markdown.rs"
+kind = "text"
+
+[[files]]
 path = "tools/docs-parity/src/model.rs"
 kind = "text"
 
@@ -2812,6 +2828,14 @@ kind = "text"
 
 [[files]]
 path = "tools/docs-parity/tests/cli.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/links.rs"
+kind = "text"
+
+[[files]]
+path = "tools/docs-parity/tests/markdown.rs"
 kind = "text"
 
 [[files]]
