@@ -7,7 +7,7 @@
 use error_stack::{Report, ResultExt};
 use fastly::kv_store::{InsertMode, KVStore};
 use trusted_server_core::ec::kv_backend::{
-    EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
+    EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome, contains_exact_key,
 };
 use trusted_server_core::ec::log_id;
 use trusted_server_core::error::TrustedServerError;
@@ -129,24 +129,17 @@ impl EcKvStore for FastlyEcKvStore {
     fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
         let store = self.open_store()?;
         // The list is strongly consistent, unlike a lookup, but it matches by
-        // prefix — so the returned keys are compared for equality rather than
-        // counted. A longer key carrying this one as a prefix is a different
-        // identity and must not answer for it.
-        //
-        // Every page is followed. Nothing guarantees the exact key lands in the
-        // first one when other keys share its prefix, and stopping early would
-        // report a held identity as missing and discard its withdrawal.
-        for page in store.build_list().prefix(key).iter() {
-            let page = page.change_context(TrustedServerError::KvStore {
-                store_name: self.store_name.clone(),
-                message: format!("Failed to check key '{}'", log_id(key)),
-            })?;
-            if page.keys().iter().any(|listed| listed == key) {
-                return Ok(true);
-            }
-        }
+        // prefix, so the decision of what counts as a match belongs to
+        // `contains_exact_key` — which is where that behaviour is tested.
+        let pages = store.build_list().prefix(key).iter().map(|page| {
+            page.map(fastly::kv_store::ListPage::into_keys)
+                .change_context(TrustedServerError::KvStore {
+                    store_name: self.store_name.clone(),
+                    message: format!("Failed to check key '{}'", log_id(key)),
+                })
+        });
 
-        Ok(false)
+        contains_exact_key(pages, key)
     }
 
     fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {

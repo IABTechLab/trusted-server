@@ -70,6 +70,32 @@ pub enum EcKvWriteOutcome {
 /// Infrastructure failures are reported as [`TrustedServerError::KvStore`];
 /// write precondition failures are part of the normal control flow and are
 /// returned as [`EcKvWriteOutcome::PreconditionFailed`] instead of errors.
+/// Whether `key` appears exactly in a paged listing.
+///
+/// Backends that can only match by prefix use this to decide existence: a
+/// longer key carrying `key` as a prefix is a different identity and must not
+/// answer for it, so the listed keys are compared for equality.
+///
+/// Every page is visited until a match is found. Nothing guarantees the exact
+/// key lands in the first page when other keys share its prefix, and stopping
+/// early would report a held identity as missing.
+///
+/// # Errors
+///
+/// Returns the first page error, so a listing that cannot be read is never
+/// mistaken for a listing that does not contain the key.
+pub fn contains_exact_key<E>(
+    pages: impl IntoIterator<Item = Result<Vec<String>, E>>,
+    key: &str,
+) -> Result<bool, E> {
+    for page in pages {
+        if page?.iter().any(|listed| listed == key) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub trait EcKvStore {
     /// Returns the platform store name, used in log and error messages.
     fn store_name(&self) -> &str;
@@ -279,5 +305,105 @@ pub(crate) mod test_support {
         fn delete(&self, _key: &str) -> Result<(), Report<TrustedServerError>> {
             Err(self.error("delete"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_exact_key;
+
+    /// Page iterator that records how many pages were consumed.
+    struct CountingPages {
+        pages: std::vec::IntoIter<Result<Vec<String>, &'static str>>,
+        consumed: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Iterator for CountingPages {
+        type Item = Result<Vec<String>, &'static str>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let page = self.pages.next();
+            if page.is_some() {
+                self.consumed.set(self.consumed.get() + 1);
+            }
+            page
+        }
+    }
+
+    fn counting(
+        pages: Vec<Result<Vec<String>, &'static str>>,
+    ) -> (CountingPages, std::rc::Rc<std::cell::Cell<usize>>) {
+        let consumed = std::rc::Rc::new(std::cell::Cell::new(0));
+        (
+            CountingPages {
+                pages: pages.into_iter(),
+                consumed: std::rc::Rc::clone(&consumed),
+            },
+            consumed,
+        )
+    }
+
+    fn page(keys: &[&str]) -> Result<Vec<String>, &'static str> {
+        Ok(keys.iter().map(|key| (*key).to_owned()).collect())
+    }
+
+    #[test]
+    fn finds_a_match_on_a_later_page() {
+        let (pages, _) = counting(vec![
+            page(&["wanted-suffix-a", "wanted-suffix-b"]),
+            page(&["wanted-suffix-c"]),
+            page(&["wanted"]),
+        ]);
+
+        assert!(
+            contains_exact_key(pages, "wanted").expect("should scan the pages"),
+            "a match on the last page must still be found"
+        );
+    }
+
+    #[test]
+    fn ignores_keys_that_only_start_with_the_one_asked_for() {
+        let (pages, _) = counting(vec![page(&["wanted-suffix", "wantedx", "wanted2"])]);
+
+        assert!(
+            !contains_exact_key(pages, "wanted").expect("should scan the pages"),
+            "a longer key is a different identity"
+        );
+    }
+
+    #[test]
+    fn stops_at_the_first_match() {
+        let (pages, consumed) = counting(vec![
+            page(&["wanted"]),
+            page(&["never-read"]),
+            page(&["never-read-either"]),
+        ]);
+
+        assert!(
+            contains_exact_key(pages, "wanted").expect("should scan the pages"),
+            "should find the match"
+        );
+        assert_eq!(consumed.get(), 1, "should not read past the match");
+    }
+
+    #[test]
+    fn propagates_a_page_error_rather_than_reporting_absent() {
+        let (pages, _) = counting(vec![page(&["wanted-suffix"]), Err("list unavailable")]);
+
+        assert_eq!(
+            contains_exact_key(pages, "wanted"),
+            Err("list unavailable"),
+            "an unreadable listing must not read as absent"
+        );
+    }
+
+    #[test]
+    fn reports_absent_for_an_empty_listing() {
+        let (pages, _) = counting(Vec::new());
+
+        assert!(
+            !contains_exact_key(pages, "wanted").expect("should scan the pages"),
+            "nothing listed means nothing held"
+        );
     }
 }
