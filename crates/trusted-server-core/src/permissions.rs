@@ -424,19 +424,36 @@ impl SignalPolicy {
     }
 }
 
+/// Errors when a Data Use is granted by more than one TCF purpose, because the
+/// grant-and-revoke rule needs a single purpose to answer for each Data Use.
+fn ensure_none_signal_duplicate(
+    previous: Option<u8>,
+    data_use: &str,
+) -> Result<(), PermissionsError> {
+    match previous {
+        None => Ok(()),
+        Some(_) => Err(PermissionsError::DuplicateTcfDataUse {
+            name: data_use.to_owned(),
+        }),
+    }
+}
+
 /// Builds a validated [`SignalPolicy`] from the parsed `signals` section,
 /// erroring when it names an unknown Data Use or revoke rule.
 fn build_signal_policy(spec: &SignalsSpec) -> Result<SignalPolicy, PermissionsError> {
     let mut policy = SignalPolicy::default();
     if let Some(tcf) = &spec.tcf {
         policy.tcf_authoritative = tcf.authoritative;
-        for (purpose, data_use) in &tcf.purposes {
-            let permission = Permission::from_identifier(data_use).ok_or_else(|| {
-                PermissionsError::UnknownPermission {
-                    name: data_use.clone(),
-                }
-            })?;
-            policy.tcf_purpose.insert(permission.index(), *purpose);
+        for (purpose, data_uses) in &tcf.purposes {
+            for data_use in data_uses.identifiers() {
+                let permission = Permission::from_identifier(data_use).ok_or_else(|| {
+                    PermissionsError::UnknownPermission {
+                        name: data_use.clone(),
+                    }
+                })?;
+                let previous = policy.tcf_purpose.insert(permission.index(), *purpose);
+                ensure_none_signal_duplicate(previous, data_use)?;
+            }
         }
     }
     if let Some(opt_out) = &spec.us_opt_out {
@@ -872,10 +889,30 @@ struct TcfSignalSpec {
     /// Whether a present TCF record's grants and revokes apply.
     #[serde(default = "default_true")]
     authoritative: bool,
-    /// TCF purpose number to the Data Use it grants (and revokes when the record
-    /// does not consent to that purpose).
+    /// TCF purpose number to the Data Use, or list of Data Uses, it grants
+    /// (and revokes when the record does not consent to that purpose).
     #[serde(default)]
-    purposes: BTreeMap<u8, String>,
+    purposes: BTreeMap<u8, DataUseList>,
+}
+
+/// One Data Use, or a list of Data Uses, granted by a single TCF purpose.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DataUseList {
+    /// A single Data Use identifier.
+    One(String),
+    /// A list of Data Use identifiers.
+    Many(Vec<String>),
+}
+
+impl DataUseList {
+    /// The Data Use identifiers this value names, in written order.
+    fn identifiers(&self) -> &[String] {
+        match self {
+            DataUseList::One(one) => core::slice::from_ref(one),
+            DataUseList::Many(many) => many,
+        }
+    }
 }
 
 /// The `signals.us_opt_out` block.
@@ -1257,6 +1294,11 @@ pub enum PermissionsError {
     /// A permission flag or modification named an unknown permission.
     #[display("unknown permission `{name}`")]
     UnknownPermission { name: String },
+    /// A Data Use appeared under more than one TCF purpose in `signals.tcf`.
+    #[display(
+        "Data Use `{name}` is granted by more than one TCF purpose; map each Data Use to a single purpose"
+    )]
+    DuplicateTcfDataUse { name: String },
     /// An acquisition rule was not `granted`, `requires_signal`, or `denied`.
     #[display("unknown acquisition rule `{value}` (expected granted, requires_signal, or denied)")]
     UnknownAcquisition { value: String },
