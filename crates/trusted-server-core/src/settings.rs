@@ -5665,12 +5665,12 @@ mod tests {
 
     #[test]
     fn the_compiled_permission_policy_validates_at_startup() {
-        // The shipped permissions.yaml declares its top node, so startup
+        // The compiled-in sample declares its top node, so startup
         // accepts it. A policy that omitted `group` or `jurisdiction` would be
         // rejected here rather than panicking on the first lookup, which the
         // parser tests in `permissions` cover directly.
         GeoConfig::validate_permission_policy()
-            .expect("the shipped permissions.yaml should validate at startup");
+            .expect("the compiled-in sample should validate at startup");
     }
 
     #[test]

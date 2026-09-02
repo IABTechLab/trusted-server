@@ -502,7 +502,7 @@ pub struct PermissionMaps {
 /// The default permission rules, compiled into the build from the human-editable
 /// `permissions.yaml` at the repository root. A deployer edits or replaces that
 /// file to change the default policy; it is not read at runtime.
-const DEFAULT_PERMISSION_RULES: &str = include_str!("../../../permissions.yaml");
+const DEFAULT_PERMISSION_RULES: &str = include_str!("../../../config/permissions/vanilla.yaml");
 
 /// Builds the upper-cased `COUNTRY:REGION` key for [`PermissionMaps::by_region`].
 fn region_key(country: &str, region: &str) -> String {

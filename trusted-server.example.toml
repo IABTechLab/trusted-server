@@ -137,7 +137,8 @@ pull_sync_concurrency = 3
 #
 # The permission baseline for a request the geo provider leaves unmatched
 # (and, with no geo provider, for every request) is the top of the rules tree
-# in permissions.yaml, which is compiled into the build. Edit that file to
+# in the permissions.yaml compiled into the build (the repository sample is
+# config/permissions/vanilla.yaml). Edit that file to
 # change it.
 #
 # With no geo provider, every request is treated as that top node, so a

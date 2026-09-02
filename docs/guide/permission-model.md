@@ -174,7 +174,7 @@ The Edge Cookie `Set-Cookie` operation always requires `necessary.operations.sto
 
 ## Groups and rules
 
-The policy lives in a human-editable `permissions.yaml` at the repository root,
+The policy lives in a human-editable permissions YAML document. The repository sample is `config/permissions/vanilla.yaml`,
 compiled into the build, so policy owners read and change it in version control.
 It has two parts. **Groups** are named baselines, each a set of permission flags.
 **Rules** are a single tree that says which group applies where.

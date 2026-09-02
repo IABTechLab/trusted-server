@@ -1,5 +1,6 @@
 # The place rules for Trusted Server's permission model, and the jurisdiction
-# each place falls under.
+# each place falls under. The `name` at the top is the display name a tool
+# such as the permissions inspector shows for this file.
 #
 # The vocabulary is not ours. The permissions are the IAB Tech Lab Privacy
 # Taxonomy Data Uses, with the IAB TCF Europe purposes mapped onto them where
@@ -11,8 +12,10 @@
 # No policy ever ships with Trusted Server. The builder of a deployment
 # chooses the permissions.yaml compiled into their image, an operator overlay
 # is the recorded follow-on, and the visitor's signals decide the rest at
-# runtime. This copy is the repository's test policy, compiled into test and
-# demo builds so the rules stay visible and reviewable in version control.
+# runtime. This copy is the repository's plain vanilla sample, compiled into
+# test and demo builds so the rules stay visible and reviewable in version
+# control. The samples live in config/permissions, and choosing one is always
+# an explicit choice by whoever builds, configures, or inspects.
 #
 # There are three parts:
 #   groups   named permission baselines, defined once and referenced by rules
@@ -93,7 +96,7 @@
 # `select-basic-content`. Both are flagged for an upstream taxonomy addition.
 #
 # Trusted Server is not the policy authority, and this repository file is a
-# test policy modeling common practice rather than legal advice. Service operations
+# sample modeling common practice rather than legal advice. Service operations
 # and legal obligations are granted, the ad-tech Data Uses follow each
 # jurisdiction's regime through the `signals` mapping, umbrella Data Uses are
 # denied so every grant is named at the specific level, and Data Uses a web
@@ -103,6 +106,8 @@
 # Named baselines. Each group lists every Data Use and its flag, so a group's
 # meaning is explicit. (A `default: <flag>` shorthand is also accepted for any
 # Data Use a group omits.)
+name: Vanilla
+
 groups:
   # European Union and EEA, where the model is opt-in, so every modeled ad-tech
   # Data Use requires a TCF consent signal.
