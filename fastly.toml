@@ -67,7 +67,9 @@ build = """
         [local_server.config_stores.edgezero_runtime_env]
             format = "inline-toml"
         [local_server.config_stores.edgezero_runtime_env.contents]
-            EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME = "ts_secrets"
+            # Viceroy reports this fixed synthetic service id. The pinned EdgeZero
+            # feature branch scopes Fastly runtime mappings by service id.
+            EDGEZERO__SERVICES__0000000000000000000000__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME = "ts_secrets"
 
         [local_server.config_stores.trusted_server_config]
             format = "inline-toml"

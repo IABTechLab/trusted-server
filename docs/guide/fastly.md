@@ -272,11 +272,11 @@ export EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
 ts provision --adapter fastly
 ```
 
-Provisioning creates or reuses the physical store and persists this runtime
-mapping in Fastly Config Store `edgezero_runtime_env`:
+Provisioning creates or reuses the physical store and persists a service-scoped
+runtime mapping in Fastly Config Store `edgezero_runtime_env`:
 
 ```text
-EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
+EDGEZERO__SERVICES__<FASTLY_SERVICE_ID>__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
 ```
 
 The Fastly service must link both `ts_secrets` and `edgezero_runtime_env` to the
