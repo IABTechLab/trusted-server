@@ -11,9 +11,11 @@
 Make explicit EC withdrawal idempotent across repeated and concurrent requests
 without weakening the existing-key-only privacy invariant introduced by PR
 #885. The first successful withdrawal of a live row writes a CAS-protected
-24-hour tombstone. A request that already has authoritative tombstone state
-returns without reading or writing KV, so it cannot refresh the tombstone's
-entry timestamp or TTL.
+24-hour tombstone and a same-TTL completion marker. A request that already has
+authoritative tombstone state returns without reading or writing KV. When an
+eventually consistent point read instead misses the existing tombstone, the
+strongly read completion marker prevents an unconditional replacement write,
+so neither path refreshes the tombstone's entry timestamp or TTL.
 
 Browser-cookie deletion remains synchronous and best-effort KV failure must
 never block the response.
@@ -35,7 +37,12 @@ never block the response.
 - A later re-consent may legitimately win when it linearizes after a completed
   or no-op withdrawal. Idempotency does not impose global withdrawal priority.
 - Repeated withdrawal preserves the original tombstone expiration because it
-  performs no second write.
+  performs no second root write. A completion-marker insert is attempted only
+  after the first successful tombstone write.
+- A repeated stale point-read miss uses the strongly consistent completion
+  marker to avoid another unconditional root write.
+- Completion-marker failure never suppresses the privacy write, and revival or
+  hard deletion clears the marker before the key can become live again.
 - When cookie and active EC IDs differ, every valid existing row is withdrawn
   independently; missing or malformed IDs are never created.
 - `ts-ec` and the pull-completeness marker are expired before best-effort KV
@@ -44,10 +51,11 @@ never block the response.
 ## Non-Goals
 
 - Do not recreate missing roots from browser cookies.
-- Do not add a cross-request lock, deduplication store, or withdrawal cookie.
+- Do not add a separate deduplication store, cross-request lock, or withdrawal
+  cookie. The stale-miss completion marker lives in the existing EC store.
 - Do not restrict withdrawal handling to document navigations.
-- Do not change the 24-hour tombstone duration or KV schema.
-- Do not change EC generation, marker behavior, batch sync, pull sync, or
+- Do not change the 24-hour tombstone duration or root-entry KV schema.
+- Do not change EC generation, browser pull-marker behavior, batch sync, pull sync, or
   partner-upsert semantics beyond preserving tombstone rejection.
 - Do not make withdrawal dominate a re-consent that occurs after withdrawal's
   linearization point.
@@ -62,9 +70,10 @@ snapshot is `Present`, including when that entry is already a tombstone. Paralle
 withdrawals therefore converge safely but still perform a redundant CAS write,
 and repeated requests reset the tombstone's 24-hour TTL.
 
-The older public `write_withdrawal_tombstone` unconditional-overwrite helper is
-now dead in production but remains available and could bypass the conditional
-path in future code.
+The unconditional `write_withdrawal_tombstone` helper remains necessary when
+point reads miss a root that the strong list still sees. Without durable
+completion state, repeated stale misses bypass the `Present` fast path and keep
+rewriting that root.
 
 Finalization already:
 
@@ -92,29 +101,38 @@ match a `Present` snapshot only when its `ec_id` equals the requested ID.
 
 Then retain the existing state machine:
 
-| Initial/refreshed state                   | Action                              |
-| ----------------------------------------- | ----------------------------------- |
-| Matching tombstone                        | Return unchanged; zero backend work |
-| Matching live entry + generation          | CAS-write a 24-hour tombstone       |
-| Matching live entry without generation    | Reread                              |
-| Matching `Missing`                        | Return unchanged; never create      |
-| `Failed`, `NotRead`, or wrong-ID snapshot | Reread requested ID                 |
-| CAS precondition failure                  | Reread and retry                    |
-| Row disappears during retry               | Return `Missing`                    |
-| Store failure or retry exhaustion         | Return ID-bound `Failed`            |
+| Initial/refreshed state                   | Action                                |
+| ----------------------------------------- | ------------------------------------- |
+| Matching tombstone                        | Return unchanged; zero backend work   |
+| Matching live entry + generation          | CAS-write a 24-hour tombstone         |
+| Matching live entry without generation    | Reread                                |
+| Refreshed `Missing`                       | Prove absence or use guarded fallback |
+| `Failed`, `NotRead`, or wrong-ID snapshot | Reread requested ID                   |
+| CAS precondition failure                  | Reread and retry                      |
+| Row disappears during retry               | Return `Missing`                      |
+| Store failure or retry exhaustion         | Return ID-bound `Failed`              |
 
 A successful tombstone remains `consent.ok = false`, has empty partner IDs, and
 uses `TOMBSTONE_TTL`.
 
-### 2. Remove the unconditional bypass
+Each successful root tombstone also creates an add-only completion marker in the
+same EC store with `TOMBSTONE_TTL`. The marker namespace cannot collide with EC
+IDs and is excluded from hash-prefix cluster counts. If a later point read
+misses but the strong root-existence check and marker check both succeed,
+withdrawal returns without rewriting the root. Marker read or write failures
+fall back to the root privacy write. Same-key revival and hard deletion remove
+the marker.
 
-Delete the now-unused public `write_withdrawal_tombstone` method and its obsolete
-overwrite test. Update `KvIdentityGraph::delete` documentation so it describes
-the snapshot-aware conditional withdrawal path without linking to the removed
-API.
+### 2. Contain the unconditional fallback
 
-Repository search must confirm there is no live Rust caller before removal.
-Historical design documents may remain unchanged.
+Keep `write_withdrawal_tombstone` only for the case where eventually consistent
+point reads miss a root that the strong list still sees. Record completion after
+that write so another stale miss cannot refresh the root. The marker is
+best-effort after a successful root write; marker failure is logged and cannot
+turn a completed privacy write into a reported failure.
+
+Update hard deletion and same-key revival to remove completion state. Historical
+design documents may remain unchanged.
 
 ### 3. Prove operation-level idempotency
 
@@ -125,9 +143,13 @@ precondition failure, and record each write's mode and TTL. Tests must show:
 - a supplied matching tombstone returns with zero lookups and zero insert
   attempts;
 - generation-unavailable tombstone state also performs no backend operation;
-- the first live withdrawal performs exactly one `IfGenerationMatch` insert
-  with `TOMBSTONE_TTL`, while the second causes zero additional insert attempts
-  and leaves stored generation and `consent.updated` unchanged;
+- the first live withdrawal performs one `IfGenerationMatch` root insert and
+  one add-only completion-marker insert with `TOMBSTONE_TTL`, while a repeated
+  authoritative tombstone causes zero additional insert attempts and leaves
+  stored root generation and `consent.updated` unchanged;
+- two consecutive stale point-read misses cause one unconditional root write;
+  the second request observes the strong completion marker and leaves the root
+  generation and `consent.updated` unchanged;
 - two stale live snapshots model parallel requests: the first writes the
   tombstone; the second conflicts, rereads the tombstone, and performs no
   replacement write;
@@ -178,9 +200,10 @@ Production finalization should not change unless these tests expose a defect.
 
 - `crates/trusted-server-core/src/ec/kv.rs`
   - Add the matching-tombstone no-op branch.
-  - Remove the unconditional overwrite helper.
+  - Gate the stale-miss fallback with a same-store completion marker.
+  - Clear completion markers on same-key revival and hard deletion.
   - Update withdrawal documentation.
-  - Add operation-count, repetition, and concurrency tests.
+  - Add operation-count, repetition, stale-read, and concurrency tests.
 - `crates/trusted-server-core/src/ec/finalize.rs`
   - Add two-ID, repeated-withdrawal, and KV-failure integration coverage.
 
@@ -190,7 +213,7 @@ Production finalization should not change unless these tests expose a defect.
   - Record the reviewed design and verification contract.
 
 No dependency, configuration, adapter, JavaScript, or public wire-format change
-is expected.
+is expected. The EC store gains an internal completion-marker key namespace.
 
 ## Implementation Tasks
 
@@ -207,13 +230,14 @@ is expected.
 - [x] Run `cargo test-fastly tombstone_existing_from_snapshot` and confirm the
       new repeated/no-backend tests fail before implementation.
 
-### Task 2 — Implement the no-op branch and remove the bypass
+### Task 2 — Implement the no-op branch and guard the fallback
 
 - [x] Return a matching tombstone snapshot before generation lookup,
       serialization, or write.
 - [x] Keep live/missing/failed/mismatched/CAS behavior unchanged.
-- [x] Remove `write_withdrawal_tombstone` and update the `delete` documentation.
-- [x] Search for remaining Rust references to the removed helper.
+- [x] Record completion after successful tombstone writes.
+- [x] Suppress repeated stale-miss overwrites when the completion marker exists.
+- [x] Clear completion state on same-key revival and hard deletion.
 - [x] Run focused KV tests until green.
 
 ### Task 3 — Cover concurrent state changes
@@ -248,7 +272,7 @@ is expected.
 | Issue requirement                                | Planned evidence                                                              |
 | ------------------------------------------------ | ----------------------------------------------------------------------------- |
 | First withdrawal establishes a 24-hour tombstone | Live-entry CAS test and existing `TOMBSTONE_TTL` assertion                    |
-| Repeated requests avoid overwrite writes         | Operation counts plus unchanged generation and `consent.updated`              |
+| Repeated requests avoid overwrite writes         | Present and stale-miss operation counts plus unchanged root generation/time   |
 | Concurrent withdrawal cannot restore IDs         | Stale-snapshot and concurrent-live-update conflict tests                      |
 | Both differing valid IDs are withdrawn           | Finalization test with both rows seeded                                       |
 | Missing/unverified IDs create no root            | Existing-key-only and invalid-ID tests                                        |
@@ -295,7 +319,10 @@ git diff --check
 - The first live-row withdrawal writes one CAS-protected 24-hour tombstone.
 - Repeated and concurrent withdrawals observing that tombstone perform no
   replacement write and do not refresh its expiration.
-- Missing IDs remain absent; the unconditional overwrite API no longer exists.
+- Repeated stale point-read misses use the completion marker and do not rewrite
+  the root tombstone.
+- Missing IDs remain absent; unconditional overwrite remains confined to the
+  strongly confirmed stale-miss fallback.
 - Concurrent live updates before successful withdrawal are tombstoned on retry.
 - Later partner writes cannot repopulate tombstones.
 - Both valid differing IDs are handled independently.
@@ -308,11 +335,15 @@ git diff --check
   the requested EC ID; a tombstone for another ID cannot suppress withdrawal.
 - **Linearization:** Returning an observed tombstone linearizes withdrawal at
   that observation. A later re-consent may legitimately win.
-- **TTL visibility:** Record the first insert's TTL and every subsequent insert
-  attempt at the wrapper boundary; stable generation/timestamp alone is not
-  sufficient evidence.
-- **Dead API removal:** Compile and repository-search after deletion to catch any
-  hidden caller.
+- **TTL visibility:** Record the first root and completion-marker TTLs and every
+  subsequent insert attempt at the wrapper boundary; stable root
+  generation/timestamp alone is not sufficient evidence.
+- **Stale-miss completion:** Write the marker only after the root tombstone
+  succeeds. Marker failures must fall back to the privacy write, while revival
+  and hard deletion must remove stale completion state.
+- **Fallback containment:** Keep unconditional overwrite behind strong root
+  existence and completion-marker checks so no other path can refresh a
+  completed tombstone.
 - **Conflict-test realism:** Inject actual generation changes and persisted
   state, not endless synthetic precondition failures.
 - **Stack dependency:** Reconcile changes if PR #885 or draft PR #900 modifies
