@@ -241,6 +241,13 @@ function generateExternalEntry(entryFile, adapters, bidderCodes) {
     "import 'prebid.js/modules/consentManagementTcf.js';",
     "import 'prebid.js/modules/consentManagementGpp.js';",
     "import 'prebid.js/modules/consentManagementUsp.js';",
+    // consentManagement* only retrieves the consent signal. tcfControl is what
+    // registers the activity controls (accessDevice, syncUser, enrichEids,
+    // transmitEids, fetchBids) that act on it, so without it a TC string that
+    // denies a purpose changes nothing: User ID submodules still write storage
+    // and still call their vendor endpoints. Keep it bundled whenever
+    // consentManagementTcf is bundled.
+    "import 'prebid.js/modules/tcfControl.js';",
     "import 'prebid.js/modules/userId.js';",
     "import './_adapters.generated';",
     "import { INCLUDED_PREBID_USER_ID_MODULES } from './_user_ids.generated';",

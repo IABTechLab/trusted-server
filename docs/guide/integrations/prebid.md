@@ -39,6 +39,17 @@ excluded_gam_ad_unit_path_suffixes = ["/trackingonly"]
 # Script interception patterns (optional - defaults shown below)
 script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
 
+# Optional operator-owned Prebid User ID modules, forwarded to Prebid verbatim.
+[[integrations.prebid.managed_user_ids]]
+name = "identityLink"
+params = { pid = "999", notUse3P = false }
+
+[integrations.prebid.managed_user_ids.storage]
+type = "cookie"
+name = "idl_env"
+expires = 15
+refresh_in_seconds = 1800
+
 # Required when external_bundle_url is configured. Include the bundle host and
 # any HTTPS redirect targets used by that host.
 [proxy]
@@ -47,7 +58,7 @@ allowed_domains = ["assets.example"]
 # External bundle generation inputs used by `ts prebid bundle`.
 [integrations.prebid.bundle]
 adapters = ["rubicon"]
-user_id_modules = ["sharedIdSystem"]
+user_id_modules = ["sharedIdSystem", "identityLinkIdSystem"]
 
 # Optional static per-bidder param overrides (shallow merge)
 [integrations.prebid.bid_param_overrides.criteo]
@@ -68,28 +79,34 @@ set = { placementId = "_s2sHeaderPlacement" }
 
 ### Configuration Options
 
-| Field                                | Type          | Default                                                                | Description                                                                                                                                                      |
-| ------------------------------------ | ------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enabled`                            | Boolean       | `true`                                                                 | Enable Prebid integration                                                                                                                                        |
-| `server_url`                         | String        | Required                                                               | Prebid Server endpoint URL                                                                                                                                       |
-| `timeout_ms`                         | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                                                                                  |
-| `bidders`                            | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                                                                          |
-| `external_bundle_url`                | String        | Required when enabled                                                  | Absolute HTTPS URL of the generated external Prebid bundle, proxied through `/integrations/prebid/bundle.js`; its host must be listed in `proxy.allowed_domains` |
-| `external_bundle_sha256`             | String        | `None`                                                                 | Optional 64-character hex SHA-256 used for versioned first-party URLs, immutable cache headers, and `sha256:` ETags                                              |
-| `external_bundle_sri`                | String        | `None`                                                                 | Optional Subresource Integrity metadata added to the same-origin bundle script tag when configured                                                               |
-| `bid_param_overrides`                | Table         | `{}`                                                                   | Static per-bidder param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                                      |
-| `bid_param_zone_overrides`           | Table         | `{}`                                                                   | Per-bidder, per-zone param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                                   |
-| `bid_param_override_rules`           | Array[Table]  | `[]`                                                                   | Canonical ordered override rules with `when` matchers and `set` objects; evaluated after compatibility fields so later rules win on conflicts                    |
-| `suppress_nurl`                      | Boolean       | `false`                                                                | Strip `nurl` and `burl` from every PBS bid when the PBS deployment fires win/billing notifications server-side                                                   |
-| `suppress_nurl_bidders`              | Array[String] | `[]`                                                                   | Bidder seats whose `nurl` and `burl` should be stripped while preserving client-side win/billing pixels for other bidders                                        |
-| `debug`                              | Boolean       | `false`                                                                | Enable Prebid debug mode (sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus`; surfaces debug metadata in auction responses)                             |
-| `test_mode`                          | Boolean       | `false`                                                                | Set the OpenRTB `test: 1` flag so bidders treat the auction as non-billable test traffic. Separate from `debug` to avoid suppressing real demand                 |
-| `debug_query_params`                 | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                                        |
-| `client_side_bidders`                | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side. See [Client-Side Bidders](#client-side-bidders)                               |
-| `excluded_gam_ad_unit_path_suffixes` | Array[String] | `[]`                                                                   | Exact, case-sensitive GAM ad-unit-path suffixes excluded from Trusted Server's Prebid refresh auction; matching slots still refresh through GAM                  |
-| `script_patterns`                    | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                                      |
-| `bundle.adapters`                    | Array[String] | Required for `ts prebid bundle`                                        | Prebid.js bidder adapter modules imported into the generated external browser bundle                                                                             |
-| `bundle.user_id_modules`             | Array[String] | Generator default preset when omitted                                  | Prebid User ID modules imported into the generated external browser bundle                                                                                       |
+| Field                                           | Type          | Default                                                                | Description                                                                                                                                                      |
+| ----------------------------------------------- | ------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                                       | Boolean       | `true`                                                                 | Enable Prebid integration                                                                                                                                        |
+| `server_url`                                    | String        | Required                                                               | Prebid Server endpoint URL                                                                                                                                       |
+| `timeout_ms`                                    | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                                                                                  |
+| `bidders`                                       | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                                                                          |
+| `external_bundle_url`                           | String        | Required when enabled                                                  | Absolute HTTPS URL of the generated external Prebid bundle, proxied through `/integrations/prebid/bundle.js`; its host must be listed in `proxy.allowed_domains` |
+| `external_bundle_sha256`                        | String        | `None`                                                                 | Optional 64-character hex SHA-256 used for versioned first-party URLs, immutable cache headers, and `sha256:` ETags                                              |
+| `external_bundle_sri`                           | String        | `None`                                                                 | Optional Subresource Integrity metadata added to the same-origin bundle script tag when configured                                                               |
+| `bid_param_overrides`                           | Table         | `{}`                                                                   | Static per-bidder param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                                      |
+| `bid_param_zone_overrides`                      | Table         | `{}`                                                                   | Per-bidder, per-zone param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                                   |
+| `bid_param_override_rules`                      | Array[Table]  | `[]`                                                                   | Canonical ordered override rules with `when` matchers and `set` objects; evaluated after compatibility fields so later rules win on conflicts                    |
+| `suppress_nurl`                                 | Boolean       | `false`                                                                | Strip `nurl` and `burl` from every PBS bid when the PBS deployment fires win/billing notifications server-side                                                   |
+| `suppress_nurl_bidders`                         | Array[String] | `[]`                                                                   | Bidder seats whose `nurl` and `burl` should be stripped while preserving client-side win/billing pixels for other bidders                                        |
+| `debug`                                         | Boolean       | `false`                                                                | Enable Prebid debug mode (sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus`; surfaces debug metadata in auction responses)                             |
+| `test_mode`                                     | Boolean       | `false`                                                                | Set the OpenRTB `test: 1` flag so bidders treat the auction as non-billable test traffic. Separate from `debug` to avoid suppressing real demand                 |
+| `debug_query_params`                            | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                                        |
+| `client_side_bidders`                           | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side. See [Client-Side Bidders](#client-side-bidders)                               |
+| `excluded_gam_ad_unit_path_suffixes`            | Array[String] | `[]`                                                                   | Exact, case-sensitive GAM ad-unit-path suffixes excluded from Trusted Server's Prebid refresh auction; matching slots still refresh through GAM                  |
+| `script_patterns`                               | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                                      |
+| `bundle.adapters`                               | Array[String] | Required for `ts prebid bundle`                                        | Prebid.js bidder adapter modules imported into the generated external browser bundle                                                                             |
+| `bundle.user_id_modules`                        | Array[String] | Generator default preset when omitted                                  | Prebid User ID modules imported into the generated external browser bundle                                                                                       |
+| `managed_user_ids[].name`                       | String        | Required                                                               | Prebid `userSync.userIds` entry name that Trusted Server installs and keeps installed; unique across entries                                                     |
+| `managed_user_ids[].params`                     | Table         | `{}`                                                                   | Module-specific parameters, forwarded to Prebid.js unchanged                                                                                                     |
+| `managed_user_ids[].storage.type`               | String        | `cookie`                                                               | Browser storage for the module's value: `cookie` or `html5`                                                                                                      |
+| `managed_user_ids[].storage.name`               | String        | Required when `storage` exists                                         | Cookie or local-storage key the module reads and writes                                                                                                          |
+| `managed_user_ids[].storage.expires`            | Integer       | Prebid's own default                                                   | Storage lifetime in days; at least 1. Any per-module ceiling is the module's own                                                                                 |
+| `managed_user_ids[].storage.refresh_in_seconds` | Integer       | Prebid's own default                                                   | Seconds before the module may refresh the stored value; at least 1                                                                                               |
 
 ## External Bundle Generation
 
@@ -117,6 +134,27 @@ regenerating and re-uploading the bundle (and pushing the updated
 `external_bundle_sha256`/`external_bundle_sri` config) as part of the same
 rollout. The shim refuses to install twice on one page via the
 `window.__tsjsPrebidShimInstalled` sentinel.
+
+The consent modules include Prebid's `tcfControl`, so a regenerated bundle can
+enforce the TCF signal it collects rather than only reporting it. Its default
+rules are activity-specific and depend on which module a managed entry selects.
+For an `identityLink` entry, for example, Purpose 1 and LiveRamp's GVL vendor
+consent gate browser resolution and storage; Purpose 3 has no standalone default
+rule, and Purpose 4 controls user-provided-data activity rather than
+IdentityLink resolution. Validate a regenerated bundle against a live CMP before
+rolling it out broadly.
+
+When managed User IDs are configured and the page exposes a callable
+`window.__tcfapi`, the Trusted Server shim activates Prebid's standard IAB GDPR
+collector by adding only `consentManagement.gdpr.cmpApi = "iab"`. It does not
+set a timeout or force `defaultGdprScope`. An existing publisher-owned `gdpr`
+value always wins, sibling consent settings are preserved, and pages without a
+TCF API are unchanged. If queued or late publisher configuration later supplies
+its own `gdpr` value, the shim first deactivates the collector it created so the
+old IAB listener cannot overwrite the publisher's consent state. Ownership
+transfers once; the automatic collector is not re-enabled afterward. A delayed
+first CMP response is also ignored after transfer and removes its listener when
+the CMP finally supplies the listener ID.
 
 ## Debug Mode
 
@@ -457,6 +495,187 @@ Example EID source mapping:
 
 User ID module selection is separate from `--adapters`, which controls
 client-side bidder adapter modules.
+
+## Managed User ID modules
+
+Trusted Server can own one or more Prebid `userSync.userIds` entries so
+operators configure identity centrally instead of asking publishers to edit
+their Prebid JavaScript.
+
+Each `[[integrations.prebid.managed_user_ids]]` entry is forwarded to Prebid.js
+verbatim. Trusted Server validates only what Prebid needs to address the module
+— a usable entry name and storage key, positive expiry and refresh values — and
+never interprets `params`. Supported names come from the checked-in
+`user_id_modules.json` registry, so Trusted Server core needs no
+vendor-specific code and names no identity vendor itself.
+
+### Prerequisites
+
+The module must be present in the built bundle. Name it under
+`bundle.user_id_modules`, or omit that list to take the generator's default
+preset, which covers the commonly used modules.
+
+`ts prebid bundle` resolves every managed `name` through the checked-in
+`user_id_modules.json` registry. An unknown name, or a name that maps to more
+than one module, fails before bundle generation. After generation, the command
+reads the new manifest and confirms that every resolved module is present. A
+missing module reports both the managed name and required module and leaves the
+existing bundle hash and SRI unchanged.
+
+The browser-side diagnostic remains useful when a bundle is hosted externally,
+is stale, or was modified after generation. Core remains vendor-neutral: it
+forwards each managed entry's `params` to Prebid.js without interpreting them.
+
+```toml
+[integrations.prebid.bundle]
+adapters = ["rubicon"]
+user_id_modules = ["identityLinkIdSystem"]
+
+[[integrations.prebid.managed_user_ids]]
+name = "identityLink"
+params = { pid = "999", notUse3P = false }
+
+[integrations.prebid.managed_user_ids.storage]
+type = "cookie"
+name = "idl_env"
+expires = 15
+refresh_in_seconds = 1800
+```
+
+Run `ts prebid bundle`, upload the generated content-addressed bundle, copy its
+hash metadata into `[integrations.prebid]`, and validate the configuration
+before rollout.
+
+### Worked example: LiveRamp RampID
+
+The configuration above selects Prebid's `identityLink` submodule, which
+resolves a LiveRamp RampID identity envelope and forwards it through the
+existing EID path. It is presented here as the reference example; the mechanism
+is the same for any User ID module.
+
+Trusted Server does not collect email addresses, hash identifiers, call a
+server-to-server ATS API, or add a new application-facing envelope API.
+
+Before configuring it, obtain a test or production Placement ID from LiveRamp,
+have the exact publisher origin approved by LiveRamp, and confirm the
+publisher's CMP and LiveRamp contract permit the intended recognition mode.
+`idl_env` is IdentityLink's documented storage key and `pid` its documented
+Placement ID parameter; both are operator configuration here, not values Trusted
+Server supplies.
+
+The generated bundle carries Prebid's `tcfControl` module alongside the
+`consentManagement*` modules. That pairing is what makes the TCF signal
+enforceable: `consentManagement*` retrieves the consent data, while `tcfControl`
+registers activity controls that act on it. For managed User IDs, the shim
+activates the collector when `window.__tcfapi` is callable and the publisher has
+not already supplied a `consentManagement.gdpr` value. Under pinned Prebid's
+defaults, a later publisher `gdpr` value takes ownership after the shim removes
+its automatically registered IAB listener. Purpose 1 and LiveRamp's GVL vendor
+consent (vendor 97) gate IdentityLink resolution and storage. Purpose 3 has no
+standalone default rule. Purpose 4 controls user-provided-data activity, but
+denying it alone does not block IdentityLink resolution or storage.
+
+Default EID transmission accepts a qualifying purpose and vendor basis from any
+of Purposes 2–10. Publishers can require Purpose 4 specifically by enabling
+Prebid's `eidsRequireP4Consent` setting. These are the generated bundle's TCF
+defaults; equivalent GPP/US-state browser activity-control modules are not
+bundled, so US-state opt-outs remain enforced at Trusted Server's forwarding
+gate.
+
+When entries are configured, Trusted Server owns one deterministic entry per
+configured `name` for publisher configuration applied through the public
+`pbjs.setConfig` and `pbjs.mergeConfig` APIs. Other publisher-configured User ID
+entries are preserved, but calls through those APIs that add, remove, or replace
+a managed name are normalized back to the operator-managed values. This is a
+configuration-ownership convention, not a security boundary against same-origin
+code that retained a pre-wrapper function reference or directly mutates Prebid's
+internal configuration. Including a module in a bundle is inert until a managed
+entry selects it.
+
+### Resolution timing and data flow
+
+IdentityLink resolves asynchronously. A new browser's first auction can run
+before RampID is available; later auctions can include it without blocking the
+page or auction. When available, the opaque value follows the standard path:
+
+1. `pbjs.getUserIdsAsEids()` exposes an entry whose source is `liveramp.com`.
+2. The current `/auction` request includes that entry.
+3. Trusted Server merges and consent-gates it, then forwards it to Prebid
+   Server as `user.ext.eids`.
+4. The browser persists the same opaque value in the bounded `ts-eids` cookie.
+5. A later request can ingest it into an EC/KV partner configured with
+   `source_domain = "liveramp.com"`.
+
+Trusted Server treats the RampID envelope as an opaque string. Do not log,
+decode, publish, or dimension metrics by the value. Source names, counts,
+booleans, and status codes are sufficient for diagnostics.
+
+### Browser network and storage footprint
+
+With `notUse3P` unset or false, the IdentityLink submodule performs
+third-party recognition from the browser. Operators should plan for this before
+configuring the entry:
+
+| Effect                  | Detail                                                                                                                                            |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Outbound request        | A credentialed `GET` from the page to LiveRamp's envelope endpoint (`api.rlcdn.com`). Trusted Server does not proxy it.                           |
+| Content Security Policy | Publishers running a strict CSP must allow that host in `connect-src`, or recognition fails silently.                                             |
+| Browser storage         | `idl_env` plus IdentityLink's bookkeeping entries (`idl_env_cst`, `idl_env_last`, `_lr_retry_request`, `_lr_env_src_ats`).                        |
+| Recognition opt-out     | `notUse3P = true` suppresses the third-party request. RampID then resolves only where an authenticated envelope is already available on the page. |
+
+Because the request leaves the browser directly rather than through the edge,
+this integration is not a first-party replacement for LiveRamp recognition; it
+configures Prebid's client-side submodule on the operator's behalf. Server-side
+resolution is tracked separately (see the design document's out-of-scope
+section).
+
+If the publisher's page already loads LiveRamp's ATS library, the submodule
+prefers `window.ats.retrieveEnvelope` over the third-party endpoint. That is
+the submodule's own behavior — Trusted Server neither loads ATS nor calls a
+server-to-server ATS API.
+
+### Degraded behavior
+
+| Condition                                          | Result                                                                  |
+| -------------------------------------------------- | ----------------------------------------------------------------------- |
+| TCF Purpose 1 or LiveRamp vendor consent is denied | Default `tcfControl` blocks IdentityLink resolution and storage         |
+| TCF Purpose 3 or 4 alone is denied                 | Resolution/storage continues under defaults; publisher rules may differ |
+| The user opts out under a US state signal          | No LiveRamp EID is forwarded; the auction continues                     |
+| LiveRamp cannot recognize the browser              | IdentityLink yields no EID; the auction continues                       |
+| LiveRamp network resolution fails                  | The current auction continues without RampID                            |
+| The managed module is missing from the bundle      | Existing diagnostics report the missing module; auctions continue       |
+| The origin is not approved by LiveRamp             | Resolution yields no usable EID; the auction continues                  |
+| EC/KV is unavailable                               | A current-request EID can still reach `/auction`; persistence degrades  |
+
+The TCF rows assume either the managed-ID automatic setup described above or a
+publisher-owned Prebid GDPR configuration. A CMP API and its policy remain
+publisher responsibilities; Trusted Server does not synthesize consent or GDPR
+applicability.
+
+### Credential-based validation
+
+Live validation must run outside CI on a LiveRamp-approved non-production
+origin. Never commit a live Placement ID or envelope. Record only the approved
+domain, booleans, source names, counts, and status codes:
+
+1. Build a bundle containing `identityLinkIdSystem` and configure a managed
+   `identityLink` entry with the test Placement ID.
+2. With positive consent, confirm `idl_env` is created or refreshed.
+3. Confirm `pbjs.getUserIdsAsEids()` reports source `liveramp.com` without
+   recording its value.
+4. Confirm a controlled Prebid Server request contains that source in
+   `user.ext.eids`.
+5. Confirm a later request ingests the source into the configured
+   `liveramp.com` EC partner.
+6. Repeat with denied consent and confirm the envelope endpoint is not called,
+   `idl_env` is not written, and no LiveRamp EID is forwarded.
+7. Repeat on an unapproved origin and confirm identity resolution degrades
+   without blocking the auction.
+
+This integration forwards RampID identity envelopes through the Prebid auction
+path. LiveRamp ATS Direct audience segments, including `_lr_atsDirect` storage
+and GAM or Prebid segment activation, require a separate integration and are
+not passed by this implementation.
 
 ## Identity Forwarding
 
