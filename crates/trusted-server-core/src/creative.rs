@@ -222,10 +222,10 @@ impl CssUrlRewriter<'_> {
                     if takes_bare_string_urls(name.as_ref()) {
                         BareStringUrls::Every
                     } else if bare_strings == BareStringUrls::Every
-                        && name.eq_ignore_ascii_case("var")
+                        && substitutes_a_fallback(name.as_ref())
                     {
-                        // A `var()` fallback is substituted in place, so a
-                        // string there is read in the context around it.
+                        // The fallback is substituted in place, so a string
+                        // there is read in the context around it.
                         BareStringUrls::Every
                     } else {
                         BareStringUrls::Never
@@ -441,6 +441,18 @@ fn url_function_name(name: &str) -> &'static str {
 /// Whether a function's argument is a URL, as `url()` and `src()` both are.
 fn is_url_function(name: &str) -> bool {
     name.eq_ignore_ascii_case("url") || name.eq_ignore_ascii_case("src")
+}
+
+/// Whether a function substitutes a fallback argument in place.
+///
+/// `var()` and `env()` both resolve to their fallback when the name they
+/// reference is not set, so a string written there is a string the engine ends
+/// up with. `env()` matters as much as `var()` despite being the rarer of the
+/// two: an unrecognised name is exactly the case its fallback exists for, and
+/// `image-set()` — where such a fallback is a URL candidate — is supported
+/// everywhere today.
+fn substitutes_a_fallback(name: &str) -> bool {
+    name.eq_ignore_ascii_case("var") || name.eq_ignore_ascii_case("env")
 }
 
 /// Whether a function accepts a bare string as a URL, rather than only `url()`.
@@ -2337,6 +2349,64 @@ b{background:url(\"https://cdn.example/c.png\")}";
             prelude.starts_with("@import \"") && !prelude.contains("@import url("),
             "an @import prelude stays a string: {prelude}"
         );
+    }
+
+    #[test]
+    fn rewrite_style_urls_proxies_an_env_fallback_like_a_var_fallback() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // `env()` resolves to its fallback when the name is not recognised,
+        // which is the usual case for a custom name, and `image-set()` is
+        // supported everywhere — so this candidate is really fetched.
+        for css in [
+            "background:image-set(env(--nope, \"https://tracker.example/a.png\") 1x)",
+            "background:image-set(env(--a, var(--b, \"https://tracker.example/a.png\")) 1x)",
+        ] {
+            let out = rewrite_style_urls(&settings, css, "");
+
+            assert!(
+                out.contains(&super::build_proxy_url(
+                    &settings,
+                    "https://tracker.example/a.png",
+                    ""
+                )),
+                "should proxy a substituted fallback: {css} -> {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_style_urls_only_follows_functions_that_substitute() {
+        let settings = crate::test_support::tests::create_test_settings();
+        // Inside `image-set()` a bare string is a URL, but that does not carry
+        // into any function nested there — only into one whose fallback is
+        // substituted in its place. A gradient's string is not a URL.
+        for css in [
+            "background:image-set(linear-gradient(\"https://tracker.example/a.png\") 1x)",
+            "background:image-set(counter(x, \"https://tracker.example/a.png\") 1x)",
+        ] {
+            let out = rewrite_style_urls(&settings, css, "");
+
+            assert_eq!(
+                out, css,
+                "should not read a nested function's string as a URL: {css}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_style_urls_leaves_an_env_fallback_outside_a_url_context_alone() {
+        let settings = crate::test_support::tests::create_test_settings();
+        for css in [
+            "content:env(--nope, \"https://tracker.example/a.png\")",
+            "background:url(env(--nope, \"https://tracker.example/a.png\"))",
+        ] {
+            let out = rewrite_style_urls(&settings, css, "");
+
+            assert_eq!(
+                out, css,
+                "a fallback is only a URL where the surrounding context makes it one: {css}"
+            );
+        }
     }
 
     #[test]
