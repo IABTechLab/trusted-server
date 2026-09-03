@@ -23,7 +23,7 @@ use crate::constants::{
     HEADER_USER_AGENT, HEADER_X_FORWARDED_FOR,
 };
 use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor};
-use crate::edge_cookie::get_ec_id;
+use crate::edge_cookie::recognized_ec_id;
 use crate::error::TrustedServerError;
 use crate::platform::{
     DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, PlatformHttpRequest, PlatformResponse,
@@ -788,7 +788,7 @@ pub async fn proxy_request(
     })?;
 
     if forward_ec_id {
-        append_ec_id(&req, &mut target_url_parsed);
+        append_ec_id(settings, services, &req, &mut target_url_parsed);
     }
 
     proxy_with_redirects(
@@ -1260,8 +1260,19 @@ fn upsert_ec_query_param(url: &mut url::Url, ec_id: &str) {
     url.set_query(Some(&serializer.finish()));
 }
 
-fn append_ec_id(req: &Request<EdgeBody>, target_url_parsed: &mut url::Url) {
-    let ec_id_param = match get_ec_id(req) {
+/// Forwards the request's Edge Cookie identifier to the outbound target URL.
+///
+/// Only an identifier the selected provider recognizes is forwarded. A value
+/// carrying another deployment's provider code, and any value at all in a
+/// stateless deployment, is withheld, so nothing this deployment did not issue
+/// reaches the origin.
+fn append_ec_id(
+    settings: &Settings,
+    services: &RuntimeServices,
+    req: &Request<EdgeBody>,
+    target_url_parsed: &mut url::Url,
+) {
+    let ec_id_param = match recognized_ec_id(settings, services, req) {
         Ok(id) => id,
         Err(e) => {
             log::warn!("failed to extract EC ID for forwarding: {:?}", e);
@@ -1597,7 +1608,7 @@ pub async fn handle_first_party_proxy(
 /// Returns an error if the signed target cannot be reconstructed or validation fails.
 pub async fn handle_first_party_click(
     settings: &Settings,
-    _services: &RuntimeServices,
+    services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let SignedTarget {
@@ -1606,7 +1617,10 @@ pub async fn handle_first_party_click(
         had_params,
     } = reconstruct_and_validate_signed_target(settings, &req.uri().to_string())?;
 
-    let ec_id = match get_ec_id(&req) {
+    // The redirect target is a third party's URL, so only an identifier the
+    // selected provider recognizes is added to it. A stateless deployment adds
+    // nothing.
+    let ec_id = match recognized_ec_id(settings, services, &req) {
         Ok(id) => id,
         Err(e) => {
             log::warn!("failed to extract EC ID for forwarding: {:?}", e);
@@ -2220,17 +2234,18 @@ mod tests {
 
     use super::{
         AssetProxyCachePolicy, IMAGE_FALLBACK_CONTENT_TYPE, ProxyRequestConfig,
-        SUPPORTED_ENCODINGS, asset_origin_host_header, asset_path_skips_image_optimizer,
-        build_asset_proxy_target_url, clear_s3_credentials_cache_for_tests,
-        handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
-        handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, is_host_allowed,
-        is_host_permitted, proxy_request, rebuild_response_with_body,
+        SUPPORTED_ENCODINGS, append_ec_id, asset_origin_host_header,
+        asset_path_skips_image_optimizer, build_asset_proxy_target_url,
+        clear_s3_credentials_cache_for_tests, handle_asset_proxy_request, handle_first_party_click,
+        handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
+        is_host_allowed, is_host_permitted, proxy_request, rebuild_response_with_body,
         reconstruct_and_validate_signed_target, stream_asset_body,
     };
     use crate::cache_policy::{CachePolicy, EdgeCacheHeader};
     use crate::constants::{HEADER_ACCEPT, HEADER_X_FORWARDED_FOR};
     use crate::creative;
     use crate::error::{IntoHttpResponse, TrustedServerError};
+    use crate::platform::RuntimeServices;
     use crate::platform::test_support::{
         HashMapSecretStore, StubHttpClient, build_services_with_http_client,
         build_services_with_secret_and_http_client, noop_services,
@@ -2249,6 +2264,7 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::response_builder as edge_response_builder;
     use error_stack::Report;
+    use http::Request;
     use http::{HeaderValue, Method, Request as HttpRequest, Response, StatusCode, header};
 
     #[test]
@@ -2962,7 +2978,8 @@ mod tests {
             );
             req.headers_mut().insert(
                 crate::constants::HEADER_X_TS_EC,
-                HeaderValue::from_static("ec-123"),
+                HeaderValue::from_str(&recognized_hmac_ec_id())
+                    .expect("should build EC header value"),
             );
 
             let resp = handle_first_party_click(&settings, &noop_services(), req)
@@ -2980,9 +2997,164 @@ mod tests {
                 .map(|(k, v)| (k.into_owned(), v.into_owned()))
                 .collect();
             assert_eq!(pairs.remove("foo").as_deref(), Some("1"));
-            assert_eq!(pairs.remove("ts-ec").as_deref(), Some("ec-123"));
+            assert_eq!(
+                pairs.remove("ts-ec").as_deref(),
+                Some(recognized_hmac_ec_id().as_str())
+            );
             assert!(pairs.is_empty());
         });
+    }
+
+    /// An identifier the built-in HMAC provider, the provider
+    /// `create_test_settings` selects, recognizes as its own.
+    fn recognized_hmac_ec_id() -> String {
+        format!("hmac~{}", crate::test_support::tests::VALID_SYNTHETIC_ID)
+    }
+
+    /// A well-formed identifier carrying a provider code no deployment here
+    /// reads, the shape a partner or another deployment would hand back.
+    const FOREIGN_CODED_EC_ID: &str = "zz00~someone-elses-identifier";
+
+    fn stateless_settings() -> Settings {
+        let mut settings = create_test_settings();
+        settings.ec.provider = None;
+        settings.ec.providers.hmac = None;
+        settings
+    }
+
+    fn signed_click_request(settings: &Settings, ec_id: &str) -> Request<EdgeBody> {
+        let tsurl = "https://cdn.example/a.png";
+        let full = format!("{tsurl}?foo=1");
+        let sig = crate::http_util::compute_encrypted_sha256_token(settings, &full);
+        let mut req = build_http_request(
+            Method::GET,
+            format!(
+                "https://edge.example/first-party/click?tsurl={}&foo=1&tstoken={}",
+                url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+                sig
+            ),
+        );
+        req.headers_mut().insert(
+            crate::constants::HEADER_X_TS_EC,
+            HeaderValue::from_str(ec_id).expect("should build EC header value"),
+        );
+        req
+    }
+
+    fn click_ts_ec_param(
+        settings: &Settings,
+        services: &RuntimeServices,
+        req: Request<EdgeBody>,
+    ) -> Option<String> {
+        let resp = futures::executor::block_on(handle_first_party_click(settings, services, req))
+            .expect("should redirect");
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|h| h.to_str().ok())
+            .expect("Location header should be present and valid")
+            .to_owned();
+        url::Url::parse(&loc)
+            .expect("Location should be a valid URL")
+            .query_pairs()
+            .find(|(k, _)| k == "ts-ec")
+            .map(|(_, v)| v.into_owned())
+    }
+
+    #[test]
+    fn click_withholds_an_ec_id_the_provider_does_not_recognize() {
+        let settings = create_test_settings();
+        let param = click_ts_ec_param(
+            &settings,
+            &noop_services(),
+            signed_click_request(&settings, FOREIGN_CODED_EC_ID),
+        );
+
+        assert_eq!(
+            param, None,
+            "a value carrying another deployment's provider code should not reach the click target"
+        );
+    }
+
+    #[test]
+    fn click_withholds_every_ec_id_in_a_stateless_deployment() {
+        let settings = stateless_settings();
+        // The value is one the built-in provider would recognize, so only the
+        // absence of a selected provider can withhold it.
+        let param = click_ts_ec_param(
+            &settings,
+            &noop_services(),
+            signed_click_request(&settings, &recognized_hmac_ec_id()),
+        );
+
+        assert_eq!(
+            param, None,
+            "a deployment that creates no identifier should hand none to the click target"
+        );
+    }
+
+    #[test]
+    fn append_ec_id_forwards_only_what_the_provider_recognizes() {
+        let settings = create_test_settings();
+        let services = noop_services();
+        let recognized = recognized_hmac_ec_id();
+
+        let mut url =
+            url::Url::parse("https://origin.example/page?foo=1").expect("should parse origin URL");
+        append_ec_id(
+            &settings,
+            &services,
+            &request_with_ec_cookie(&recognized),
+            &mut url,
+        );
+        assert_eq!(
+            ts_ec_param(&url),
+            Some(recognized.clone()),
+            "the deployment's own identifier should still reach the origin"
+        );
+
+        let mut url =
+            url::Url::parse("https://origin.example/page?foo=1").expect("should parse origin URL");
+        append_ec_id(
+            &settings,
+            &services,
+            &request_with_ec_cookie(FOREIGN_CODED_EC_ID),
+            &mut url,
+        );
+        assert_eq!(
+            ts_ec_param(&url),
+            None,
+            "a foreign provider code should not reach the origin"
+        );
+
+        let mut url =
+            url::Url::parse("https://origin.example/page?foo=1").expect("should parse origin URL");
+        append_ec_id(
+            &stateless_settings(),
+            &services,
+            &request_with_ec_cookie(&recognized),
+            &mut url,
+        );
+        assert_eq!(
+            ts_ec_param(&url),
+            None,
+            "a stateless deployment should forward nothing to the origin"
+        );
+    }
+
+    fn request_with_ec_cookie(ec_id: &str) -> Request<EdgeBody> {
+        let mut req = build_http_request(Method::GET, "https://edge.example/page");
+        req.headers_mut().insert(
+            http::header::COOKIE,
+            HeaderValue::from_str(&format!("ts-ec={ec_id}")).expect("should build cookie header"),
+        );
+        req
+    }
+
+    fn ts_ec_param(url: &url::Url) -> Option<String> {
+        url.query_pairs()
+            .find(|(k, _)| k == "ts-ec")
+            .map(|(_, v)| v.into_owned())
     }
 
     #[test]

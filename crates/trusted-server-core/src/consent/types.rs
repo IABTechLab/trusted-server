@@ -149,6 +149,21 @@ pub struct ConsentContext {
 }
 
 impl ConsentContext {
+    /// Whether any consent record is present in raw form but failed to decode.
+    ///
+    /// A malformed record is not the same as no record: the visitor expressed
+    /// a preference that could not be read, so the permission mapping blocks
+    /// baseline grants (fail-closed) instead of degrading to the no-signal
+    /// baseline. An expired TCF record is excluded because expiry is its own
+    /// explicit state ([`expired`](Self::expired)): the raw string is kept for
+    /// proxy forwarding while the decoded record is deliberately cleared.
+    #[must_use]
+    pub fn has_malformed_record(&self) -> bool {
+        (self.raw_tc_string.is_some() && self.tcf.is_none() && !self.expired)
+            || (self.raw_gpp_string.is_some() && self.gpp.is_none())
+            || (self.raw_us_privacy.is_some() && self.us_privacy.is_none())
+    }
+
     /// Returns `true` when no consent signals are present.
     #[must_use]
     pub fn is_empty(&self) -> bool {

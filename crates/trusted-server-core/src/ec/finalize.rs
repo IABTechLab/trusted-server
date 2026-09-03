@@ -8,33 +8,29 @@ use std::collections::HashSet;
 use edgezero_core::body::Body as EdgeBody;
 use http::Response;
 
-use super::consent::{ec_consent_granted, ec_consent_withdrawn};
+use crate::constants::EC_RESPONSE_HEADERS;
 use crate::settings::Settings;
 
 use super::EcContext;
 use super::cookies::{expire_ec_cookie, set_ec_cookie};
-use super::generation::is_valid_ec_id;
 use super::kv::KvIdentityGraph;
 use super::log_id;
 use super::prebid_eids::ingest_eid_cookies;
+use super::provider::apply_provider_response_headers;
 use super::registry::PartnerRegistry;
-
-/// TS-managed response headers tied to EC identity output.
-const EC_RESPONSE_HEADERS: &[&str] = &[
-    "x-ts-ec",
-    "x-ts-eids",
-    "x-ts-ec-consent",
-    "x-ts-eids-truncated",
-];
 
 /// Finalizes EC response behavior for all routes.
 ///
-/// Applies withdrawal handling, last-seen updates, cookie reconciliation,
-/// Prebid EID ingestion, and cookie writes for new EC generation.
+/// Applies the resolved permission state, cookie reconciliation, Prebid EID
+/// ingestion, and cookie writes for new EC generation.
 ///
-/// On consent withdrawal, the browser response clears the EC cookie
-/// immediately and the EC identity-graph KV tombstone is the authoritative
-/// revocation marker. There is no separate consent KV store to clean up.
+/// When the request carries an explicit withdrawal signal (a storage opt-out or
+/// a TCF record refusing storage) and the client presented a cookie, the browser
+/// response clears the EC cookie immediately and the EC identity-graph KV
+/// tombstone is the authoritative revocation marker. A request that is merely
+/// not permitted (pre-consent or fail-closed) strips EC response headers but
+/// leaves an already-issued cookie intact. There is no separate consent KV
+/// store to clean up.
 ///
 /// `eids_cookie` should be the raw value of the `ts-eids` cookie extracted
 /// from the request *before* routing consumes it.
@@ -47,32 +43,47 @@ pub fn ec_finalize_response(
     sharedid_cookie: Option<&str>,
     response: &mut Response<EdgeBody>,
 ) {
-    let consent_allows_ec = ec_consent_granted(ec_context.consent());
-    let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
+    // Apply any response headers the active provider asked for during
+    // generation (for example to request more client evidence). This is empty
+    // unless a provider produced headers, so it is safe on every path. Each
+    // one was checked against core's reserved response surface at capture
+    // time in `EcContext::generate_with_provider`, so nothing here can set a
+    // managed `ts-` cookie, an `x-ts-` header, or a framing or hop-by-hop
+    // header. They accumulate with whatever the origin returned rather than
+    // replacing it, for the reasons on
+    // `provider::apply_provider_response_headers`.
+    apply_provider_response_headers(
+        response.headers_mut(),
+        ec_context.response_headers().iter().cloned(),
+    );
 
-    if !consent_allows_ec {
-        // Always strip EC-specific response headers when consent is not
-        // currently usable for this request. This covers both explicit
-        // revocation and fail-closed cases such as missing geo or undecodable
-        // consent input.
+    let ec_permitted = ec_context.ec_allowed();
+
+    if !ec_permitted {
+        // Always strip EC-specific response headers when EC is not permitted for
+        // this request, covering both an explicit withdrawal and fail-closed
+        // cases such as missing geo or undecodable consent input.
         clear_ec_headers_on_response(response, Some(registry));
 
         // Only expire the browser cookie and tombstone the identity-graph row
-        // when the request carries an explicit withdrawal signal.
-        if consent_withdrawn && ec_context.cookie_was_present() {
+        // when the request carries an explicit withdrawal signal. A pre-consent
+        // or fail-closed state (the permission is simply not set) strips headers
+        // but must not destroy an already-issued identifier, or a returning user
+        // would be permanently withdrawn before they ever get to consent.
+        if ec_context.storage_withdrawn() && ec_context.cookie_was_present() {
             expire_ec_cookie(settings, response);
 
             // Compute once for the authoritative identity-graph tombstones.
-            let ids_to_withdraw = withdrawal_ec_ids(ec_context);
+            let keys_to_withdraw = withdrawal_kv_keys(ec_context);
 
             // The identity-graph tombstone is the authoritative withdrawal marker
             // for subsequent EC behavior.
             if let Some(graph) = kv {
-                apply_withdrawal_tombstones(&ids_to_withdraw, |ec_id| {
-                    if let Err(err) = graph.write_withdrawal_tombstone(ec_id) {
+                apply_withdrawal_tombstones(&keys_to_withdraw, |kv_key| {
+                    if let Err(err) = graph.write_withdrawal_tombstone(kv_key) {
                         log::error!(
                             "Failed to write withdrawal tombstone for EC ID '{}': {err:?}",
-                            log_id(ec_id),
+                            log_id(kv_key),
                         );
                     }
                 });
@@ -82,10 +93,14 @@ pub fn ec_finalize_response(
         return;
     }
 
-    // Returning user: consent is granted and EC came from request.
-    if ec_context.ec_was_present() && !ec_context.ec_generated() && consent_allows_ec {
-        if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value()) {
-            ingest_eid_cookies(eids_cookie, sharedid_cookie, ec_id, graph, registry);
+    // Returning user: EC is permitted and came from the request.
+    if ec_context.ec_was_present() && !ec_context.ec_generated() && ec_permitted {
+        // Key EID ingestion by the provider's canonical form of the identifier,
+        // the key the identity-graph row is stored under, so an ingested EID
+        // lands on the live row rather than creating a second one keyed by the
+        // value the browser carries.
+        if let (Some(graph), Some(kv_key)) = (kv, ec_context.ec_kv_key()) {
+            ingest_eid_cookies(eids_cookie, sharedid_cookie, &kv_key, graph, registry);
         }
 
         // Ordinary returning-user page views no longer refresh the browser
@@ -97,12 +112,15 @@ pub fn ec_finalize_response(
     // there is no KV graph: that would mint a browser cookie with no backing
     // identity-graph row, producing a phantom ID on later requests.
     if ec_context.ec_generated() {
-        let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value()) else {
-            log::info!("Skipping generated EC response write because KV graph is unavailable");
+        let (Some(graph), Some(kv_key)) = (kv, ec_context.ec_kv_key()) else {
+            log::info!(
+                "Skipping generated EC response write because the KV graph or the \
+                 identity-graph key is unavailable"
+            );
             return;
         };
 
-        ingest_eid_cookies(eids_cookie, sharedid_cookie, ec_id, graph, registry);
+        ingest_eid_cookies(eids_cookie, sharedid_cookie, &kv_key, graph, registry);
         set_ec_cookie_on_response(settings, ec_context, response);
     }
 }
@@ -152,30 +170,35 @@ pub fn clear_ec_on_response(settings: &Settings, response: &mut Response<EdgeBod
     clear_ec_headers_on_response(response, None);
 }
 
-fn withdrawal_ec_ids(ec_context: &EcContext) -> HashSet<String> {
-    let mut hashes = HashSet::new();
+/// The identity-graph keys a withdrawal must tombstone.
+///
+/// Both the `ts-ec` cookie the request carried and the active identifier are
+/// turned into keys by the provider that owns them, so the tombstone lands on
+/// the row the live identifier is stored under rather than on the raw cookie
+/// value. An identifier no provider this deployment reads owns produces no key
+/// and is dropped, which is the same filtering the previous shape check did.
+/// The two collapse to one key when they are the same identity written two
+/// ways.
+fn withdrawal_kv_keys(ec_context: &EcContext) -> HashSet<String> {
+    let mut keys = HashSet::new();
 
-    if let Some(cookie_ec_id) = ec_context.existing_cookie_ec_id()
-        && is_valid_ec_id(cookie_ec_id)
-    {
-        hashes.insert(cookie_ec_id.to_owned());
+    if let Some(cookie_kv_key) = ec_context.cookie_ec_kv_key() {
+        keys.insert(cookie_kv_key);
     }
 
-    if let Some(active_ec_id) = ec_context.ec_value()
-        && is_valid_ec_id(active_ec_id)
-    {
-        hashes.insert(active_ec_id.to_owned());
+    if let Some(active_kv_key) = ec_context.ec_kv_key() {
+        keys.insert(active_kv_key);
     }
 
-    hashes
+    keys
 }
 
-fn apply_withdrawal_tombstones<F>(ec_ids: &HashSet<String>, mut write_tombstone: F)
+fn apply_withdrawal_tombstones<F>(kv_keys: &HashSet<String>, mut write_tombstone: F)
 where
     F: FnMut(&str),
 {
-    for ec_id in ec_ids {
-        write_tombstone(ec_id);
+    for kv_key in kv_keys {
+        write_tombstone(kv_key);
     }
 }
 
@@ -219,6 +242,7 @@ mod tests {
         ec_was_present: bool,
         ec_generated: bool,
         jurisdiction: Jurisdiction,
+        ec_allowed: bool,
     ) -> EcContext {
         let consent = ConsentContext {
             jurisdiction,
@@ -232,6 +256,7 @@ mod tests {
             ec_was_present,
             ec_generated,
             consent,
+            ec_allowed,
         )
     }
 
@@ -241,6 +266,7 @@ mod tests {
         ec_was_present: bool,
         ec_generated: bool,
         consent: ConsentContext,
+        ec_allowed: bool,
     ) -> EcContext {
         EcContext::new_for_test_with_cookie(
             ec_value.map(str::to_owned),
@@ -248,7 +274,52 @@ mod tests {
             ec_was_present,
             ec_generated,
             consent,
+            ec_allowed,
         )
+    }
+
+    /// The identifier [`CanonicalizingProvider`] creates, as the browser carries
+    /// it in the `ts-ec` cookie.
+    const CANONICAL_COOKIE_VALUE: &str = "t0ca~MiXeD.CaseId";
+
+    /// The identity-graph key generation writes that identifier's row under.
+    /// Pinned to the creation path by
+    /// `generate_keys_the_identity_graph_by_the_normalized_identifier` in the
+    /// `ec` module tests.
+    const CANONICAL_KV_KEY: &str = "t0ca~mixed.caseid";
+
+    fn canonicalizing_context(
+        ec_was_present: bool,
+        ec_generated: bool,
+        consent: ConsentContext,
+        ec_allowed: bool,
+    ) -> EcContext {
+        make_context_with_consent(
+            Some(CANONICAL_COOKIE_VALUE),
+            Some(CANONICAL_COOKIE_VALUE),
+            ec_was_present,
+            ec_generated,
+            consent,
+            ec_allowed,
+        )
+        .with_provider_for_test(std::sync::Arc::new(
+            crate::ec::tests::CanonicalizingProvider,
+        ))
+    }
+
+    fn graph_with_live_canonical_row() -> KvIdentityGraph {
+        let graph = KvIdentityGraph::in_memory("finalize-canonical-store");
+        graph
+            .create(
+                CANONICAL_KV_KEY,
+                &crate::ec::kv_types::KvEntry::minimal(
+                    "ssp.example.com",
+                    "partner-uid-123",
+                    1_741_824_000,
+                ),
+            )
+            .expect("should write the row generation keys by the canonical form");
+        graph
     }
 
     fn sample_ec_id(suffix: &str) -> String {
@@ -273,11 +344,18 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_ec_ids_returns_cookie_ec_only_when_active_missing() {
+    fn withdrawal_kv_keys_returns_cookie_ec_only_when_active_missing() {
         let cookie_ec = sample_ec_id("cook1e");
-        let ec_context = make_context(None, Some(&cookie_ec), true, false, Jurisdiction::Unknown);
+        let ec_context = make_context(
+            None,
+            Some(&cookie_ec),
+            true,
+            false,
+            Jurisdiction::Unknown,
+            false,
+        );
 
-        let ids = withdrawal_ec_ids(&ec_context);
+        let ids = withdrawal_kv_keys(&ec_context);
 
         assert_eq!(ids.len(), 1, "should include exactly one EC ID");
         assert!(
@@ -287,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_ec_ids_deduplicates_matching_cookie_and_active_ec() {
+    fn withdrawal_kv_keys_deduplicates_matching_cookie_and_active_ec() {
         let ec_id = sample_ec_id("same01");
         let ec_context = make_context(
             Some(&ec_id),
@@ -295,16 +373,17 @@ mod tests {
             true,
             false,
             Jurisdiction::Unknown,
+            false,
         );
 
-        let ids = withdrawal_ec_ids(&ec_context);
+        let ids = withdrawal_kv_keys(&ec_context);
 
         assert_eq!(ids.len(), 1, "should deduplicate identical EC IDs");
         assert!(ids.contains(&ec_id), "should retain the shared EC ID");
     }
 
     #[test]
-    fn withdrawal_ec_ids_includes_both_cookie_and_active_when_different() {
+    fn withdrawal_kv_keys_includes_both_cookie_and_active_when_different() {
         let active_ec = sample_ec_id("activ1");
         let cookie_ec = sample_ec_id("cook1e");
         let ec_context = make_context(
@@ -313,9 +392,10 @@ mod tests {
             true,
             false,
             Jurisdiction::Unknown,
+            false,
         );
 
-        let ids = withdrawal_ec_ids(&ec_context);
+        let ids = withdrawal_kv_keys(&ec_context);
 
         assert_eq!(ids.len(), 2, "should include both distinct EC IDs");
         assert!(ids.contains(&active_ec), "should include active EC ID");
@@ -323,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_ec_ids_filters_invalid_values() {
+    fn withdrawal_kv_keys_filters_invalid_values() {
         let valid_ec = sample_ec_id("valid1");
         let ec_context = make_context(
             Some(&valid_ec),
@@ -331,9 +411,10 @@ mod tests {
             true,
             false,
             Jurisdiction::Unknown,
+            false,
         );
 
-        let ids = withdrawal_ec_ids(&ec_context);
+        let ids = withdrawal_kv_keys(&ec_context);
 
         assert_eq!(ids.len(), 1, "should ignore malformed EC values");
         assert!(ids.contains(&valid_ec), "should keep the valid EC ID");
@@ -395,14 +476,17 @@ mod tests {
     fn finalize_withdrawal_clears_cookie_and_headers() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("aBc123");
+        // A TCF record refusing storage is the withdrawal trigger. The test
+        // context resolves the storage baseline at the requires-signal floor,
+        // where refusing the signal storage depends on is destructive.
         let consent = ConsentContext {
-            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
-            gpc: true,
+            jurisdiction: Jurisdiction::Gdpr,
+            tcf: Some(refusing_tcf()),
             source: ConsentSource::Cookie,
             ..Default::default()
         };
         let ec_context =
-            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent);
+            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent, false);
         let mut response = empty_response();
         set_header(&mut response, "x-ts-ec", "stale");
         set_header(&mut response, "x-ts-eids", "[]");
@@ -448,6 +532,65 @@ mod tests {
         );
     }
 
+    /// A decoded TCF record refusing every purpose, storage included.
+    fn refusing_tcf() -> crate::consent::TcfConsent {
+        crate::consent::TcfConsent {
+            version: 2,
+            cmp_id: 0,
+            cmp_version: 0,
+            consent_screen: 0,
+            consent_language: "EN".to_owned(),
+            vendor_list_version: 0,
+            tcf_policy_version: 2,
+            created_ds: 0,
+            last_updated_ds: 0,
+            purpose_consents: vec![false; 24],
+            purpose_legitimate_interests: vec![false; 24],
+            vendor_consents: Vec::new(),
+            vendor_legitimate_interests: Vec::new(),
+            special_feature_opt_ins: vec![false; 12],
+        }
+    }
+
+    #[test]
+    fn finalize_gpc_suppresses_headers_but_keeps_the_cookie() {
+        // A US-style opt-out suppresses use (headers cleared, nothing egressed)
+        // but is never destructive: the browser cookie is not expired, so a
+        // visitor who later withdraws the opt-out keeps their identity.
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("aBc123");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let ec_context =
+            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent, false);
+        let mut response = empty_response();
+        set_header(&mut response, "x-ts-ec", "stale");
+
+        let test_registry = PartnerRegistry::empty();
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            None,
+            &test_registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        assert!(
+            get_header(&response, "x-ts-ec").is_none(),
+            "the opt-out should clear the EC header"
+        );
+        assert!(
+            get_header(&response, "set-cookie").is_none(),
+            "the opt-out should not expire the browser cookie"
+        );
+    }
+
     #[test]
     fn finalize_returning_user_with_cookie_mismatch_sets_no_header_or_cookie() {
         let settings = create_test_settings();
@@ -459,6 +602,7 @@ mod tests {
             true,
             false,
             Jurisdiction::NonRegulated,
+            true,
         );
         let mut response = empty_response();
 
@@ -493,6 +637,7 @@ mod tests {
             true,
             false,
             Jurisdiction::NonRegulated,
+            true,
         );
         let mut response = empty_response();
 
@@ -527,6 +672,7 @@ mod tests {
             false,
             true,
             Jurisdiction::NonRegulated,
+            true,
         );
         let mut response = empty_response();
 
@@ -554,7 +700,7 @@ mod tests {
     #[test]
     fn finalize_denied_without_cookie_is_noop() {
         let settings = create_test_settings();
-        let ec_context = make_context(None, None, false, false, Jurisdiction::Unknown);
+        let ec_context = make_context(None, None, false, false, Jurisdiction::Unknown, false);
         let mut response = empty_response();
 
         let test_registry = PartnerRegistry::empty();
@@ -579,7 +725,12 @@ mod tests {
     }
 
     #[test]
-    fn finalize_unknown_jurisdiction_strips_headers_without_expiring_cookie() {
+    fn finalize_not_permitted_without_withdrawal_keeps_cookie() {
+        // When EC is not permitted (here a fail-closed unknown jurisdiction with
+        // no geo) but the request carries no explicit withdrawal signal, the
+        // response strips EC headers yet must leave an already-issued cookie
+        // intact. A pre-consent or transient fail-closed request must not
+        // permanently withdraw a returning user before they get to consent.
         let settings = create_test_settings();
         let ec_id = sample_ec_id("unk001");
         let ec_context = make_context(
@@ -588,6 +739,7 @@ mod tests {
             true,
             false,
             Jurisdiction::Unknown,
+            false,
         );
         let mut response = empty_response();
         set_header(&mut response, "x-ts-ec", &ec_id);
@@ -606,15 +758,421 @@ mod tests {
 
         assert!(
             get_header(&response, "x-ts-ec").is_none(),
-            "should strip EC header when consent cannot be verified"
+            "should strip EC header when EC is not permitted"
         );
         assert!(
             get_header(&response, "x-ts-eids").is_none(),
-            "should strip EID header when consent cannot be verified"
+            "should strip EID header when EC is not permitted"
         );
         assert!(
             get_header(&response, "set-cookie").is_none(),
-            "should not expire the cookie without an explicit withdrawal signal"
+            "a not-permitted request without a withdrawal signal should keep the cookie"
+        );
+    }
+
+    #[test]
+    fn set_ec_cookie_on_response_writes_the_ts_ec_cookie() {
+        // The positive case: when an EC value is present, the finalize path
+        // writes the ts-ec cookie to the browser, carrying the EC id.
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("setck1");
+        let ec_context = make_context(
+            Some(&ec_id),
+            None,
+            false,
+            true,
+            Jurisdiction::NonRegulated,
+            true,
+        );
+        let mut response = empty_response();
+
+        set_ec_cookie_on_response(&settings, &ec_context, &mut response);
+
+        let set_cookie =
+            get_header_str(&response, "set-cookie").expect("an EC value should write a Set-Cookie");
+        assert!(
+            set_cookie.contains("ts-ec=") && set_cookie.contains(&ec_id),
+            "should write the ts-ec cookie carrying the EC id, got: {set_cookie}"
+        );
+    }
+
+    #[test]
+    fn closed_permission_gate_writes_no_ec_cookie() {
+        // The gate: with the permission gate closed (ec_allowed = false), no
+        // ts-ec cookie is written, even when an EC value and a generated flag are
+        // present. The permission model is what suppresses the cookie.
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("gated1");
+        let ec_context = make_context(
+            Some(&ec_id),
+            None,
+            false,
+            true,
+            Jurisdiction::NonRegulated,
+            false,
+        );
+        let mut response = empty_response();
+
+        // Pass a KV graph so the missing-graph guard cannot be the reason the
+        // cookie is suppressed; the closed gate must be doing the work.
+        let kv = KvIdentityGraph::failing("test_store");
+        let test_registry = PartnerRegistry::empty();
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            Some(&kv),
+            &test_registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        assert!(
+            get_header(&response, "set-cookie").is_none(),
+            "a closed permission gate must not write a ts-ec cookie"
+        );
+    }
+
+    #[test]
+    fn withdrawal_tombstones_the_canonical_row_not_the_cookie_value() {
+        // The tombstone is the authoritative revocation marker, so it has to
+        // land on the key the live row uses. Written under the raw cookie
+        // value it creates a second row nothing reads, and the revocation
+        // never takes effect for a provider whose canonical form differs.
+        //
+        // Destructive withdrawal is narrow, so the trigger here is a TCF record
+        // refusing storage, the same one
+        // `finalize_withdrawal_clears_cookie_and_headers` uses. An opt-out such
+        // as GPC suppresses use without destroying an issued identifier, so it
+        // would write no tombstone for this test to place.
+        let settings = create_test_settings();
+        let graph = graph_with_live_canonical_row();
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            tcf: Some(refusing_tcf()),
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let ec_context = canonicalizing_context(true, false, consent, false);
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let (live_row, _) = graph
+            .get(CANONICAL_KV_KEY)
+            .expect("should read the canonical row")
+            .expect("the canonical row should still exist");
+        assert!(
+            !live_row.consent.ok,
+            "withdrawal should tombstone the row the live identifier is keyed by"
+        );
+        assert!(
+            graph
+                .get(CANONICAL_COOKIE_VALUE)
+                .expect("should read the graph")
+                .is_none(),
+            "withdrawal should not write a tombstone under the raw cookie value"
+        );
+    }
+
+    #[test]
+    fn eid_ingestion_keys_by_the_providers_canonical_form() {
+        // An ingested EID must join the row the identifier already has. Keyed
+        // by the raw cookie value the upsert finds no row and the partner ID
+        // is dropped.
+        let settings = create_test_settings();
+        let graph = graph_with_live_canonical_row();
+        let partners = vec![make_partner("sharedid.org")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let ec_context = canonicalizing_context(true, false, consent, true);
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            Some("shared-cookie-id"),
+            &mut response,
+        );
+
+        let (row, _) = graph
+            .get(CANONICAL_KV_KEY)
+            .expect("should read the canonical row")
+            .expect("the canonical row should still exist");
+        assert_eq!(
+            row.ids.get("sharedid.org").map(|id| id.uid.as_str()),
+            Some("shared-cookie-id"),
+            "the ingested EID should land on the row keyed by the canonical form"
+        );
+        assert!(
+            graph
+                .get(CANONICAL_COOKIE_VALUE)
+                .expect("should read the graph")
+                .is_none(),
+            "EID ingestion should not create a row under the raw cookie value"
+        );
+    }
+
+    /// A provider that sets one cookie of its own and one `Vary` entry, the
+    /// two response effects a provider realistically asks for, so a test can
+    /// watch both land on a response the origin already wrote headers to.
+    #[derive(Debug)]
+    struct EvidenceHeaderProvider;
+
+    impl crate::ec::provider::EdgeCookieProvider for EvidenceHeaderProvider {
+        fn id(&self) -> &'static str {
+            "evidence-header"
+        }
+
+        fn code(&self) -> crate::ec::provider::ProviderCode {
+            crate::provider_code!("t0eh")
+        }
+
+        fn generate(
+            &self,
+            _request_info: &dyn crate::evidence::RequestInfo,
+            _input: &crate::ec::provider::IdentityInput<'_>,
+        ) -> Result<
+            crate::ec::provider::GeneratedEdgeCookie,
+            error_stack::Report<crate::error::TrustedServerError>,
+        > {
+            Ok(crate::ec::provider::GeneratedEdgeCookie {
+                id: Some("evidence-id".to_owned()),
+                response_headers: vec![
+                    (
+                        http::header::SET_COOKIE,
+                        HeaderValue::from_static("vendor-ev=abc; Path=/"),
+                    ),
+                    (http::header::VARY, HeaderValue::from_static("sec-ch-ua")),
+                ],
+            })
+        }
+
+        fn accepts_id(&self, value: &str) -> bool {
+            !value.is_empty()
+        }
+
+        fn normalize_id_for_kv(&self, value: &str) -> String {
+            value.to_owned()
+        }
+    }
+
+    #[test]
+    fn provider_response_headers_reach_the_response_without_dropping_the_origins() {
+        // The response finalization runs on is the finished one, so it already
+        // carries the publisher origin's own headers. A provider effect must
+        // add to those, never replace them: replacing `Set-Cookie` would drop
+        // the publisher's session and sign-in cookies, and replacing `Vary`
+        // would break the caching the origin asked for.
+        let settings = create_test_settings();
+        let graph = KvIdentityGraph::in_memory("finalize-provider-headers-store");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context = make_context_with_consent(None, None, false, false, consent, true)
+            .with_provider_for_test(std::sync::Arc::new(EvidenceHeaderProvider));
+        ec_context
+            .generate_if_needed(&settings, Some(&graph))
+            .expect("should create the identifier through the provider");
+
+        // What the publisher's origin returned, before EC finalization runs.
+        let mut response = empty_response();
+        response.headers_mut().append(
+            http::header::SET_COOKIE,
+            HeaderValue::from_static("publisher_session=origin-value; Path=/; HttpOnly"),
+        );
+        response.headers_mut().append(
+            http::header::VARY,
+            HeaderValue::from_static("accept-encoding"),
+        );
+
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let cookies: Vec<&str> = response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("should render set-cookie as utf-8"))
+            .collect();
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("publisher_session=origin-value")),
+            "the origin's own cookie must survive a provider effect, got {cookies:?}"
+        );
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("vendor-ev=abc")),
+            "the provider's cookie must reach the response, got {cookies:?}"
+        );
+        assert!(
+            cookies.iter().any(|cookie| cookie.starts_with("ts-ec=")),
+            "core's own managed cookie must still be written, got {cookies:?}"
+        );
+
+        let vary: Vec<&str> = response
+            .headers()
+            .get_all(http::header::VARY)
+            .iter()
+            .map(|value| value.to_str().expect("should render vary as utf-8"))
+            .collect();
+        assert!(
+            vary.contains(&"accept-encoding"),
+            "the origin's Vary must survive a provider effect, got {vary:?}"
+        );
+        assert!(
+            vary.contains(&"sec-ch-ua"),
+            "the provider's Vary must reach the response, got {vary:?}"
+        );
+    }
+
+    /// A provider standing in for the one a deployment switched *to*, with a
+    /// different registered code from the provider that created the live row.
+    #[derive(Debug)]
+    struct SwitchedProvider;
+
+    impl crate::ec::provider::EdgeCookieProvider for SwitchedProvider {
+        fn id(&self) -> &'static str {
+            "switched"
+        }
+
+        fn code(&self) -> crate::ec::provider::ProviderCode {
+            crate::provider_code!("t0sw")
+        }
+
+        fn generate(
+            &self,
+            _request_info: &dyn crate::evidence::RequestInfo,
+            _input: &crate::ec::provider::IdentityInput<'_>,
+        ) -> Result<
+            crate::ec::provider::GeneratedEdgeCookie,
+            error_stack::Report<crate::error::TrustedServerError>,
+        > {
+            Ok(crate::ec::provider::GeneratedEdgeCookie::default())
+        }
+
+        fn accepts_id(&self, value: &str) -> bool {
+            !value.is_empty()
+        }
+
+        fn normalize_id_for_kv(&self, value: &str) -> String {
+            value.to_ascii_lowercase()
+        }
+    }
+
+    #[test]
+    fn switching_provider_leaves_the_previous_providers_row_beyond_withdrawal() {
+        // Pins what a provider switch really does, which the switching
+        // section of the pluggable-providers spec now states plainly. The
+        // retired provider's identifier is owned by nobody this deployment
+        // reads, so a later withdrawal expires the browser cookie but cannot
+        // tombstone the row, and the identifier is never adopted either. If
+        // the deferred `legacy_providers` reader list ever lands, this test
+        // is meant to fail, so that the spec sentence a deployer acts on is
+        // revisited in the same change.
+        let settings = create_test_settings();
+        let graph = graph_with_live_canonical_row();
+        // A TCF record consenting to nothing, under GDPR, so the request
+        // carries an explicit refusal of storage. That is the narrow,
+        // destructive kind of withdrawal, the one that tombstones rather than
+        // merely suppressing, which is the behavior under test.
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            tcf: Some(crate::consent::TcfConsent {
+                version: 2,
+                cmp_id: 0,
+                cmp_version: 0,
+                consent_screen: 0,
+                consent_language: "EN".to_owned(),
+                vendor_list_version: 0,
+                tcf_policy_version: 2,
+                created_ds: 0,
+                last_updated_ds: 0,
+                purpose_consents: vec![false; 24],
+                purpose_legitimate_interests: vec![false; 24],
+                vendor_consents: Vec::new(),
+                vendor_legitimate_interests: Vec::new(),
+                special_feature_opt_ins: vec![false; 12],
+            }),
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        // The browser still carries the identifier the previous provider
+        // created, but the deployment now runs a provider with a different
+        // code, so read-back treats the cookie as absent and the active
+        // identifier is empty.
+        let ec_context = make_context_with_consent(
+            None,
+            Some(CANONICAL_COOKIE_VALUE),
+            false,
+            false,
+            consent,
+            false,
+        )
+        .with_provider_for_test(std::sync::Arc::new(SwitchedProvider));
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        assert!(
+            ec_context.ec_value().is_none(),
+            "the retired provider's identifier must never be adopted by the new one"
+        );
+
+        let (row, _) = graph
+            .get(CANONICAL_KV_KEY)
+            .expect("should read the previous provider's row")
+            .expect("the previous provider's row should still exist");
+        assert!(
+            row.consent.ok,
+            "withdrawal cannot reach a retired provider's row without the provider that owns the code"
+        );
+
+        let cookies: Vec<&str> = response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("should render set-cookie as utf-8"))
+            .collect();
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("ts-ec=") && cookie.contains("Max-Age=0")),
+            "withdrawal should still expire the browser cookie after a switch, got {cookies:?}"
         );
     }
 }
