@@ -51,7 +51,7 @@ Behavior is covered by an extensive test suite in `crates/trusted-server-core/sr
 
 - The `ec/` module owns the EC identity subsystem:
     - `ec/generation.rs` — creates HMAC-based IDs using the client IP and publisher passphrase (format: `64hex.6alnum`).
-    - `ec/mod.rs` — `EcContext` struct with two-phase lifecycle (`read_from_request` + `generate_if_needed`), `get_ec_id` helper.
+    - `ec/mod.rs` — `EcContext` struct with two-phase lifecycle (`read_from_request` + `generate_if_needed`).
     - `ec/consent.rs` — EC-specific consent gating wrapper.
     - `ec/cookies.rs` — `Set-Cookie` header creation and expiration helpers.
 - `publisher.rs::handle_publisher_request` issues the `ts-ec` cookie when absent so the browser keeps the identifier on subsequent requests.

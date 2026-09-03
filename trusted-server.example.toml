@@ -6,10 +6,13 @@
 # `trusted-server.toml`. Copy it (`ts config init`), fill in the required
 # values, and push it (`ts config push`) as an EdgeZero app-config blob.
 #
-# Only three sections are REQUIRED for the server to start and pass validation:
+# Only two sections are REQUIRED for the server to start and pass validation:
 #   1. [[handlers]] covering /_ts/admin  (admin authentication)
 #   2. [publisher]                       (domain + origin)
-#   3. [ec] passphrase                   (Edge Cookie identity secret)
+#
+# Edge Cookie identity is optional and stays off until an [ec] provider is
+# selected, so no identity secret is needed to start. See the Edge Cookie
+# section below.
 #
 # Everything below those is OPTIONAL. Most optional blocks are commented out —
 # uncomment and edit one to enable it — but a few integrations are kept as active
@@ -70,12 +73,19 @@ proxy_secret = "change-me-proxy-secret"
 
 
 # -----------------------------------------------------------------------------
-# REQUIRED — Edge Cookie (EC) identity
+# OPTIONAL — Edge Cookie (EC) identity
 # -----------------------------------------------------------------------------
 [ec]
-# Secret used to derive EC identifiers. Must be >= 32 chars and non-placeholder
-# in production (deploy validation rejects known placeholders).
-passphrase = "trusted-server-placeholder-secret"
+# Edge Cookie identity is OFF by default: with no provider selected, Trusted
+# Server runs statelessly and generates no Edge Cookie. Activate one by
+# uncommenting the selector AND its [ec.providers.<key>] block together (a
+# block with no selector is rejected at startup). Deployment tooling can merge
+# a TRUSTED_SERVER__EC__PROVIDER environment value into the published
+# configuration before it is loaded; the running server itself reads its
+# settings from the platform config store, not the environment. The built-in
+# hmac provider is host-neutral, and a vendor provider ships in its own crate
+# that the adapter composes in.
+# provider = "hmac"
 # KV store that persists EC identity state. This is the physical store name
 # bound per adapter (e.g. `ec_identity_store` in fastly.toml); edgezero.toml's
 # logical KV id is `trusted_server_kv`.
@@ -85,6 +95,13 @@ pull_sync_concurrency = 3
 # Optional cluster-heuristic tuning (defaults shown):
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
+
+# Built-in HMAC provider block. Uncomment it together with the
+# `provider = "hmac"` selector above. The secret used to derive EC identifiers
+# must be >= 32 bytes and non-placeholder in production (deploy validation
+# rejects known placeholders).
+# [ec.providers.hmac]
+# passphrase = "replace-with-32-plus-byte-random-secret"
 
 # Optional identity partners (SSP/DSP/identity vendors). Each needs a real,
 # non-placeholder api_token (>= 32 bytes) at deploy. Configure real partners via
@@ -105,6 +122,18 @@ pull_sync_concurrency = 3
 # =============================================================================
 # OPTIONAL — Core features (disabled/omitted by default)
 # =============================================================================
+
+# Device detection provider selection. The built-in provider classifies from
+# the User-Agent alone and makes no host-specific call. The opt-in "fastly"
+# provider strengthens the browser/bot gate with the host's TLS/H2 signals.
+# [device]
+# provider = "builtin"
+
+# Geo / IP intelligence provider selection. The platform host geo is the
+# default. Set provider = "none" to resolve no location and make no host geo
+# call.
+# [geo]
+# provider = "platform"
 
 # Custom headers added to every response (e.g. X-Robots-Tag: noindex).
 # [response_headers]

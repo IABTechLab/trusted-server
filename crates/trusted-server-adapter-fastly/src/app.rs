@@ -113,6 +113,8 @@ use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::provider::request_provider;
+use trusted_server_core::ec::provider::{EdgeCookieProvider, build_reusable_provider};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
@@ -120,7 +122,11 @@ use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
 };
-use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
+use trusted_server_core::platform::{
+    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, build_geo_provider,
+};
+use trusted_server_device_fastly::FastlyHostSignals;
+
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
@@ -160,6 +166,16 @@ pub(crate) struct AppState {
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
+    /// The Edge Cookie provider `[ec] provider` selects, resolved once here.
+    ///
+    /// This adapter runs a fresh instance per request, so application state and
+    /// the request path used to resolve the same selection twice for every
+    /// request, once to check it could be satisfied and once to use it.
+    /// Resolving reads no request data, so the result is kept and handed to
+    /// every request through
+    /// [`RuntimeServices::resolved_ec_provider`](trusted_server_core::platform::RuntimeServices::resolved_ec_provider).
+    /// `None` for a deployment that selects no provider.
+    pub(crate) ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -180,10 +196,36 @@ pub(crate) fn load_settings_from_config_store(
     get_settings_from_config_store(&FastlyPlatformConfigStore, &store_name, &key)
 }
 
+/// Build the application state from explicit settings.
+///
+/// # Errors
+///
+/// Returns an error when the selected Edge Cookie provider cannot be built for
+/// this adapter, or when the auction orchestrator or the integration registry
+/// fail to initialize.
 pub(crate) fn build_state_from_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     warn_if_certificate_check_disabled(&settings);
+
+    // Composition root: resolve the provider selection once, before any request
+    // is served, so a selection this adapter can never supply fails here rather
+    // than on the first request, and keep what the resolution produced so the
+    // request path does not resolve the same settings again. This adapter
+    // injects no vendor Edge Cookie provider, so `None` is the injected
+    // argument, and one is passed here once this adapter supplies it.
+    //
+    // This adapter injects host signals on every request, so a startup instance
+    // with no captured signals answers the only question the check asks,
+    // which is whether the service exists at all. That same emptiness is why
+    // `build_reusable_provider` hands back nothing for a provider built from
+    // those signals, leaving it to be resolved per request against the
+    // signals that request actually carried.
+    let ec_provider = build_reusable_provider(
+        &settings.ec,
+        Some(Arc::new(FastlyHostSignals::default())),
+        None,
+    )?;
 
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
@@ -197,6 +239,7 @@ pub(crate) fn build_state_from_settings(
         registry: Arc::new(registry),
         default_kv_store,
         auction_telemetry_sink,
+        ec_provider,
     }))
 }
 
@@ -264,7 +307,24 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
             ..ClientInfo::default()
         });
 
-    RuntimeServices::builder()
+    // The TLS JA4 and HTTP/2 signals arrive as trusted internal headers
+    // injected by the entry point. They build the host-signal service a
+    // host-signal provider reads. Fastly always supplies the capability, so the
+    // service is always set even when a request carried no signal.
+    let tls_ja4 = ctx
+        .request()
+        .headers()
+        .get("x-ts-tls-ja4")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let h2_fingerprint = ctx
+        .request()
+        .headers()
+        .get("x-ts-h2-fingerprint")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    let builder = RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(Arc::clone(&state.default_kv_store))
@@ -275,10 +335,23 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
-        .geo(Arc::new(FastlyPlatformGeo))
+        .geo(build_geo_provider(
+            &state.settings,
+            Arc::new(FastlyPlatformGeo),
+        ))
         .auction_telemetry_sink(Arc::clone(&state.auction_telemetry_sink))
         .client_info(client_info)
-        .build()
+        .host_signals(Arc::new(FastlyHostSignals::new(tls_ja4, h2_fingerprint)));
+
+    // Hand every request the provider resolved at the composition root, so the
+    // request path reuses that instance instead of resolving `[ec] provider`
+    // again. Nothing is set for a deployment that selects no provider, or one
+    // whose provider is built from this request's own host signals, and both
+    // are resolved on the request path instead.
+    match state.ec_provider.clone() {
+        Some(provider) => builder.resolved_ec_provider(provider).build(),
+        None => builder.build(),
+    }
 }
 
 fn publisher_fallback_methods() -> [Method; 7] {
@@ -400,7 +473,7 @@ fn build_ec_request_state(
     req: &Request,
 ) -> EcRequestState {
     let device_signals = device_signals_for(req);
-    let is_real_browser = device_signals.looks_like_browser();
+    let is_real_browser = device_signals.looks_like_browser;
     if !is_real_browser {
         log::info!(
             "Bot gate: blocking EC operations (ja4={:?}, platform={:?}, is_mobile={})",
@@ -555,7 +628,12 @@ async fn execute_named(
                     // copy is bot-gated, while operators use curl for this
                     // authenticated diagnostic.
                     let kv = crate::maybe_identity_graph(&state.settings);
-                    handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
+                    // The selected provider decides which identifiers this
+                    // deployment recognizes, so build it here rather than
+                    // assuming the built-in HMAC shape. The read-only
+                    // diagnostic builds no EC request state to borrow it from.
+                    let provider = request_provider(&state.settings.ec, &services)?;
+                    handle_admin_ec_lookup(kv.as_ref(), &registry, provider.as_deref(), &req)
                 }
                 NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
                 _ => unreachable!("admin diagnostics should use early dispatch"),
@@ -712,14 +790,18 @@ async fn run_named_route(
 /// response finalization.
 fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
     let device_signals = device_signals_for(&req);
-    let is_real_browser = device_signals.looks_like_browser();
+    let is_real_browser = device_signals.looks_like_browser;
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
     let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
         let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
         let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-        handle_batch_sync(&kv, &partner_registry, &limiter, req)
+        // A partner echoes back an identifier the deployment's own provider
+        // created, so validation and KV normalization are dispatched through
+        // that provider rather than the built-in HMAC grammar.
+        let provider = request_provider(&state.settings.ec, services)?;
+        handle_batch_sync(&kv, &partner_registry, &limiter, provider.as_deref(), req)
     });
 
     let mut response = result.unwrap_or_else(|e| http_error(&e));
@@ -825,7 +907,7 @@ async fn dispatch_fallback(
                 .ec_context
                 .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
         {
-            log::warn!("EC generation failed for publisher proxy: {err:?}");
+            log::error!("EC generation failed for publisher proxy: {err:?}");
         }
 
         // Publisher pages read consent data, so the consent KV store must be
@@ -1372,6 +1454,9 @@ mod tests {
                 allowed_domains = ["*.example", "*.example.com"]
 
                 [ec]
+                provider = "hmac"
+
+                [ec.providers.hmac]
                 passphrase = "test-passphrase-at-least-32-bytes!!"
 
                 [request_signing]
@@ -1441,6 +1526,9 @@ mod tests {
             allowed_domains = ["*.example", "*.example.com"]
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]
@@ -1524,6 +1612,11 @@ mod tests {
         let registry = IntegrationRegistry::from_request_filters(filters);
         let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
+        // Resolved the same way the composition root resolves it, so this
+        // router behaves like a served one.
+        let ec_provider =
+            trusted_server_core::ec::provider::build_reusable_provider(&settings.ec, None, None)
+                .expect("should resolve the Edge Cookie provider selection");
         let state = Arc::new(super::AppState {
             auction_telemetry_sink: Arc::new(
                 trusted_server_core::auction::NoopAuctionTelemetrySink,
@@ -1532,6 +1625,7 @@ mod tests {
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
             default_kv_store,
+            ec_provider,
         });
         TrustedServerApp::routes_for_state(&state)
     }
@@ -1888,6 +1982,9 @@ mod tests {
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
             "#,
         )
@@ -2541,6 +2638,9 @@ mod tests {
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]
@@ -2956,6 +3056,9 @@ mod tests {
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]

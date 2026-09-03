@@ -138,6 +138,13 @@ pub trait PlatformBackend: Send + Sync {
 pub trait PlatformGeo: Send + Sync {
     /// Look up geographic information for the given client IP address.
     ///
+    /// An implementation must return [`GeoInfo`] with the country as an
+    /// ISO 3166-1 alpha-2 code (for example `US`) and the region as the
+    /// ISO 3166-2 subdivision code without the country prefix (for example
+    /// `CA`). The permission model keys its country and region rules on these
+    /// codes, matched case-insensitively, so the Fastly and other geo
+    /// providers feed the same rules without translation.
+    ///
     /// # Errors
     ///
     /// Returns [`PlatformError::Geo`] when the platform geo lookup fails
