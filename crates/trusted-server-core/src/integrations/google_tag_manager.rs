@@ -568,23 +568,6 @@ impl GoogleTagManagerIntegration {
                 .any(|allowed| allowed == tag_id)
     }
 
-    /// Resolves what this request should be answered with.
-    ///
-    /// This is the decision point that keeps the origin from serving a tag the
-    /// publisher did not configure: `gtm.js` is pinned to `container_id`,
-    /// `gtag/js` is checked against the allowlist and redirected when it does
-    /// not match, and the beacon paths are pinned to [`GA_COLLECT_HOST`].
-    /// Returns `None` for a path this integration does not route.
-    /// Resolves a script request to a target, refusing to serve a tag the
-    /// publisher has not configured.
-    ///
-    /// A page may legitimately measure more than one property, so a `gtag/js`
-    /// request naming a configured tag is served with that tag rather than
-    /// substituted for `container_id` — substituting would make the second
-    /// tag's measurement silently never arrive. A request naming anything else
-    /// is redirected to the upstream so this origin never serves it. A request
-    /// naming no tag falls back to `container_id`: upstream answers `200` for
-    /// anything, so nothing downstream would reject a wrong one.
     /// Resolves a `gtm.js` request, which is always answered with the
     /// configured container.
     ///
@@ -600,6 +583,16 @@ impl GoogleTagManagerIntegration {
         ))
     }
 
+    /// Resolves a script request to a target, refusing to serve a tag the
+    /// publisher has not configured.
+    ///
+    /// A page may legitimately measure more than one property, so a `gtag/js`
+    /// request naming a configured tag is served with that tag rather than
+    /// substituted for `container_id` — substituting would make the second
+    /// tag's measurement silently never arrive. A request naming anything else
+    /// is redirected to the upstream so this origin never serves it. A request
+    /// naming no tag falls back to `container_id`: upstream answers `200` for
+    /// anything, so nothing downstream would reject a wrong one.
     fn script_target(&self, base: &str, query: Option<&str>) -> GtmTarget {
         match Self::requested_tag_id(query) {
             Some(tag_id) if self.tag_id_is_allowed(&tag_id) => GtmTarget::Proxy(Self::with_query(
@@ -617,6 +610,13 @@ impl GoogleTagManagerIntegration {
         }
     }
 
+    /// Resolves what this request should be answered with.
+    ///
+    /// This is the decision point that keeps the origin from serving a tag the
+    /// publisher did not configure: `gtm.js` is pinned to `container_id`,
+    /// `gtag/js` is checked against the allowlist and redirected when it does
+    /// not match, and the beacon paths are pinned to [`GA_COLLECT_HOST`].
+    /// Returns `None` for a path this integration does not route.
     fn build_target_url(&self, req: &Request<EdgeBody>, path: &str) -> Option<GtmTarget> {
         let upstream_base = self.upstream_url();
         let query = req.uri().query();
