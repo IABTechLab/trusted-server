@@ -20,6 +20,10 @@ use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
+use crate::ec::provider::{
+    EcProviderSelection, HMAC_PROVIDER_KEY, HOST_SIGNALS_PROVIDER_KEY,
+    check_named_provider_configuration,
+};
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
@@ -476,9 +480,59 @@ impl EcPartner {
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Ec {
-    /// Publisher passphrase used as HMAC key for EC generation.
-    #[validate(custom(function = Ec::validate_passphrase))]
-    pub passphrase: Redacted<String>,
+    /// The key of the Edge Cookie identity provider to activate.
+    ///
+    /// Names one of the blocks under [`providers`](Self::providers), for
+    /// example `"hmac"`. Set it in the `[ec]` TOML section. Deployment tooling
+    /// can merge a `TRUSTED_SERVER__EC__PROVIDER` environment value into the
+    /// published configuration before it is loaded, so the same compiled
+    /// WebAssembly can switch providers at deployment. The running server reads
+    /// its settings from the platform config store, not the environment. When
+    /// absent, no Edge Cookie is generated and Trusted Server runs statelessly,
+    /// and the explicit `"none"` spells the same choice. Selecting a provider
+    /// whose block is missing is rejected at startup by
+    /// [`validate_provider_selection`](Self::validate_provider_selection).
+    ///
+    /// Typed as [`EcProviderSelection`], which reads and writes the same
+    /// string, so every check that asks which provider is selected matches on
+    /// one vocabulary rather than comparing string literals.
+    #[serde(default)]
+    pub provider: Option<EcProviderSelection>,
+
+    /// Deprecated location of the HMAC passphrase, read so a configuration
+    /// written for the previous release still starts.
+    ///
+    /// [`migrate_legacy_ec_layout`](Self::migrate_legacy_ec_layout) maps it
+    /// to `provider = "hmac"` with the passphrase in the `[ec.providers.hmac]`
+    /// block and logs a deprecation warning, so a fleet can move configuration
+    /// and binaries independently. A configuration carrying both the old and
+    /// the new form is rejected rather than guessed at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase: Option<Redacted<String>>,
+
+    /// Configuration blocks for the available Edge Cookie identity providers.
+    ///
+    /// Each provider has its own optional `[ec.providers.<key>]` block. The
+    /// [`provider`](Self::provider) selector names which one is active. Exactly
+    /// one block may be present, and it must be the one the selector names, so
+    /// [`validate_provider_selection`](Self::validate_provider_selection)
+    /// rejects an unselected block.
+    /// Extra exact origins allowed to POST the client resolve endpoint.
+    ///
+    /// The endpoint always accepts `https://{publisher.domain}` and nothing
+    /// else by default. A publisher whose pages are served from another origin,
+    /// `www` being the common case, lists those origins here. Each entry is a
+    /// serialized origin (RFC 6454 §6.1) and is compared with the request's
+    /// `Origin` by the same-origin test of RFC 6454 §5, so the scheme, the host
+    /// and the port all have to match, with a missing port meaning the scheme's
+    /// default. A suffix or subdomain match is never performed, because control
+    /// of a DNS namespace does not make every host under it a trusted
+    /// identity-setting origin.
+    #[serde(default)]
+    pub resolve_allowed_origins: Vec<String>,
+    #[serde(default)]
+    #[validate(nested)]
+    pub providers: EcProviders,
 
     /// Fastly KV store name for the EC identity graph.
     #[serde(default)]
@@ -563,6 +617,408 @@ impl Ec {
         }
         if passphrase.expose().len() < Self::MIN_PASSPHRASE_LENGTH {
             return Err(ValidationError::new("short_passphrase"));
+        }
+        Ok(())
+    }
+
+    /// Validates that the selected provider can be configured in this build.
+    ///
+    /// When [`provider`](Self::provider) is set, this build must be able to
+    /// honor the name and whatever that name needs from
+    /// [`providers`](Self::providers) must be present, so a deployment that
+    /// selects a provider (in TOML or via the environment override) but has not
+    /// configured it fails fast at startup rather than silently running
+    /// stateless. When no provider is selected, Trusted Server runs statelessly
+    /// and this check passes.
+    ///
+    /// What a name needs is answered by `check_named_provider_configuration`
+    /// in [`crate::ec::provider`], beside the resolution it belongs to, rather
+    /// than by a block lookup here, because the settings cannot know which
+    /// names read a block, which are built from nothing, and which are compiled
+    /// out of this build. Only the resolution knows that.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when the selected provider
+    /// is not compiled into this build, when the `[ec.providers.<key>]` block
+    /// it needs is absent, or when a configured block is not the selected one.
+    pub fn validate_provider_selection(&self) -> Result<(), Report<TrustedServerError>> {
+        let Some(selection) = self.provider.as_ref() else {
+            if !self.providers.is_empty() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: "[ec.providers.*] blocks are configured but no [ec] provider is \
+                              selected. Set [ec] provider = \"<key>\" to activate one, or \
+                              remove the blocks to run statelessly"
+                        .to_owned(),
+                }));
+            }
+            return Ok(());
+        };
+
+        // `"none"` is explicit statelessness: the same meaning as omitting the
+        // selector, spelled out. It is subject to the same rule that no
+        // provider blocks may be left configured.
+        let EcProviderSelection::Named(key) = selection else {
+            if !self.providers.is_empty() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: "[ec] provider = \"none\" selects stateless operation, but \
+                              [ec.providers.*] blocks are configured. Remove the blocks, or \
+                              select the provider they configure"
+                        .to_owned(),
+                }));
+            }
+            return Ok(());
+        };
+
+        // Whether this deployment can honor the name is the resolution's
+        // question, not the settings', so it is asked there. A provider the
+        // adapter injects has the contents of its block validated by that
+        // adapter when it builds the provider.
+        let key = key.as_str();
+        check_named_provider_configuration(key, self)?;
+
+        // Every configured block must be the selected one. An unreferenced
+        // block is almost always a mistake (a mistyped selector or a stale
+        // block), and accepting it silently invites configuration drift.
+        let unreferenced: Vec<String> = self
+            .providers
+            .configured_keys()
+            .filter(|configured| *configured != key)
+            .map(str::to_owned)
+            .collect();
+        if unreferenced.is_empty() {
+            Ok(())
+        } else {
+            Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[ec.providers.{}] is configured but `{key}` is selected. Remove the \
+                     unselected block, or correct the selector",
+                    unreferenced.join("], [ec.providers.")
+                ),
+            }))
+        }
+    }
+
+    /// Migrates the deprecated `[ec] passphrase` form to the provider layout.
+    ///
+    /// A configuration still carrying the old key keeps working for one
+    /// release cycle: it maps to `provider = "hmac"` with the passphrase in
+    /// the `[ec.providers.hmac]` block, and a deprecation warning names the
+    /// new location. A configuration carrying both forms is rejected so a
+    /// half-edited file fails loudly instead of one form silently winning.
+    ///
+    /// The deprecated key is held to the same passphrase rules as the new
+    /// `[ec.providers.hmac]` block. Derive validation runs before this
+    /// migration and the deprecated field carries no `#[validate]` attribute of
+    /// its own, so without the check here a short or empty passphrase in the old
+    /// location would start a deployment that the new location rejects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when both the deprecated
+    /// key and any part of the provider configuration are present, or when the
+    /// deprecated passphrase fails [`Self::validate_passphrase`].
+    pub fn migrate_legacy_ec_layout(&mut self) -> Result<(), Report<TrustedServerError>> {
+        let Some(passphrase) = self.passphrase.take() else {
+            return Ok(());
+        };
+        if self.provider.is_some() || !self.providers.is_empty() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "[ec] passphrase (deprecated) and the [ec] provider configuration \
+                          are both present. Keep exactly one form: move the passphrase to \
+                          [ec.providers.hmac] and delete the old key"
+                    .to_owned(),
+            }));
+        }
+        Self::validate_passphrase(&passphrase).map_err(|err| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[ec] passphrase (deprecated) is invalid ({err}): use a random secret \
+                     of at least {} bytes, placed in [ec.providers.hmac]",
+                    Self::MIN_PASSPHRASE_LENGTH,
+                ),
+            })
+        })?;
+        log::warn!(
+            "[ec] passphrase is deprecated; move it to [ec.providers.hmac] passphrase and \
+             set [ec] provider = \"hmac\""
+        );
+        self.provider = Some(EcProviderSelection::from(HMAC_PROVIDER_KEY));
+        self.providers.hmac = Some(HmacProviderConfig { passphrase });
+        Ok(())
+    }
+}
+
+/// Configuration blocks for the available Edge Cookie identity providers.
+///
+/// Each provider is configured in its own `[ec.providers.<key>]` block, for
+/// example:
+///
+/// ```toml
+/// [ec.providers.hmac]
+/// passphrase = "replace-with-32-plus-byte-random-secret"
+/// ```
+///
+/// The active provider is chosen by the [`Ec::provider`] selector, and the one
+/// block present must be the one it names (see
+/// [`Ec::validate_provider_selection`]).
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+pub struct EcProviders {
+    /// The built-in HMAC-over-client-IP provider, keyed `hmac`.
+    #[serde(default)]
+    #[validate(nested)]
+    pub hmac: Option<HmacProviderConfig>,
+
+    /// The built-in host-signal provider, keyed `host-signals`. Creates the Edge
+    /// Cookie from the host's TLS and HTTP/2 signals plus the client IP, so it
+    /// requires a host that supplies those signals.
+    #[serde(default, rename = "host-signals")]
+    #[validate(nested)]
+    pub host_signals: Option<HostSignalsProviderConfig>,
+
+    /// Configuration blocks for vendor or host providers that live in their own
+    /// crates and are injected by the adapter. Any `[ec.providers.<key>]` block
+    /// whose key is not a built-in is captured here as raw values, and the
+    /// adapter that constructs the provider deserializes its own block into the
+    /// vendor crate's config type. Core never names a vendor, so a new provider
+    /// adds nothing here.
+    #[serde(flatten)]
+    vendor: HashMap<String, JsonValue>,
+}
+
+impl EcProviders {
+    /// Returns the raw configuration block for a vendor provider `key`, or
+    /// `None` when no `[ec.providers.<key>]` block is present. The adapter that
+    /// builds the provider deserializes this into its own config type.
+    #[must_use]
+    pub fn vendor_config(&self, key: &str) -> Option<&JsonValue> {
+        self.vendor.get(key)
+    }
+
+    /// Whether a `[ec.providers.<key>]` block is present for `key`.
+    ///
+    /// The answer is the same question for every provider, whichever crate
+    /// supplies it, so nothing calling this has to know which providers are
+    /// built into core.
+    #[must_use]
+    pub fn has_block(&self, key: &str) -> bool {
+        self.configured_keys().any(|configured| configured == key)
+    }
+
+    /// The keys of every configured `[ec.providers.<key>]` block.
+    ///
+    /// Each typed built-in block is reported under the name it is configured
+    /// with, so it appears alongside the vendor blocks rather than being
+    /// counted separately by each caller. This is the one place that mapping is
+    /// made, and each entry goes away when its built-in provider becomes a
+    /// module and its block joins the others.
+    pub(crate) fn configured_keys(&self) -> impl Iterator<Item = &str> {
+        self.hmac
+            .iter()
+            .map(|_| HMAC_PROVIDER_KEY)
+            .chain(self.host_signals.iter().map(|_| HOST_SIGNALS_PROVIDER_KEY))
+            .chain(self.vendor.keys().map(String::as_str))
+    }
+
+    /// Whether any provider configuration block is present.
+    ///
+    /// Used by [`Ec::validate_provider_selection`] to reject a half-migrated
+    /// configuration that carries provider blocks with no selector, which
+    /// would otherwise silently run stateless.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.configured_keys().next().is_none()
+    }
+}
+
+/// Configuration for the built-in HMAC Edge Cookie provider.
+///
+/// Mapped from the `[ec.providers.hmac]` TOML block. Unknown keys are
+/// rejected, so a mistyped setting fails at startup instead of being accepted
+/// silently and leaving the intended setting at its default.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct HmacProviderConfig {
+    /// Publisher passphrase used as the HMAC key for EC generation.
+    #[validate(custom(function = Ec::validate_passphrase))]
+    pub passphrase: Redacted<String>,
+}
+
+/// Configuration for the built-in host-signal Edge Cookie provider.
+///
+/// Mapped from the `[ec.providers.host-signals]` TOML block.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct HostSignalsProviderConfig {
+    /// Passphrase used as the HMAC key over the host signals and client IP.
+    #[validate(custom(function = Ec::validate_passphrase))]
+    pub passphrase: Redacted<String>,
+}
+
+/// Device-detection configuration.
+///
+/// Mapped from the `[device]` TOML section. Selects which device-detection
+/// provider classifies a request into device signals, mirroring the Edge
+/// Cookie provider selection in [`Ec`].
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceConfig {
+    /// The key of the device-detection provider to activate.
+    ///
+    /// Defaults to the built-in `builtin` provider when absent, which classifies
+    /// from the User-Agent alone, so device classification itself makes no
+    /// host-specific call. The opt-in `fastly` provider strengthens the
+    /// browser/bot gate with the host's TLS and HTTP/2 signals, which the Fastly
+    /// entry point reads on every request regardless of this selector. Override
+    /// it with the
+    /// `TRUSTED_SERVER__device__provider` environment variable so the same
+    /// compiled WebAssembly can switch providers at deployment. An unknown key is
+    /// rejected at startup by
+    /// [`validate_provider_selection`](Self::validate_provider_selection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+}
+
+impl DeviceConfig {
+    /// Returns the active device-detection provider key, defaulting to the
+    /// built-in heuristic.
+    #[must_use]
+    pub fn provider_key(&self) -> &str {
+        self.provider.as_deref().unwrap_or("builtin")
+    }
+
+    /// Validates that the selected device-detection provider is available in
+    /// this build.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when the selected provider
+    /// key is not one this build provides.
+    pub fn validate_provider_selection(&self) -> Result<(), Report<TrustedServerError>> {
+        match self.provider_key() {
+            "builtin" | "fastly" => Ok(()),
+            key => Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "Device detection provider `{key}` is not available in this build"
+                ),
+            })),
+        }
+    }
+}
+
+/// Geo / IP intelligence configuration.
+///
+/// Mapped from the `[geo]` TOML section. Selects which provider resolves a
+/// client IP into [`GeoInfo`](crate::platform::GeoInfo), mirroring the Edge
+/// Cookie provider selection in [`Ec`].
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct GeoConfig {
+    /// The key of the geo provider to activate.
+    ///
+    /// No provider is the default: Trusted Server resolves no geolocation and
+    /// makes no host geo call, so a default deployment is not tied to any host
+    /// geo service, and the permission baseline comes from the top of the
+    /// `rules` tree in `permissions.yaml`. `provider = "none"` spells
+    /// the same choice explicitly. The host platform's own geo lookup is
+    /// opt-in via `provider = "platform"`. Override it with the
+    /// `TRUSTED_SERVER__geo__provider` environment variable so the same compiled
+    /// WebAssembly can switch providers at deployment. An unknown key is rejected
+    /// at startup by
+    /// [`validate_provider_selection`](Self::validate_provider_selection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
+    /// Acknowledges that, with no geo provider, every request is treated as
+    /// coming from the place at the top of the `permissions.yaml` `rules` tree.
+    ///
+    /// With geolocation off, a visitor from any other jurisdiction silently
+    /// receives that top node's permission rules. A deployment that
+    /// runs an Edge Cookie provider without a geo provider must set this to
+    /// `true`, checked at startup by
+    /// [`validate_jurisdiction_acknowledgment`](Self::validate_jurisdiction_acknowledgment),
+    /// so serving a single jurisdiction is an explicit operator decision rather
+    /// than an accident of the default configuration.
+    #[serde(default)]
+    pub assume_single_jurisdiction: bool,
+}
+
+impl GeoConfig {
+    /// Validates that the selected geo provider is available in this build.
+    ///
+    /// No selector is valid and is the default, running without geolocation,
+    /// the same way the Edge Cookie provider runs statelessly when none is
+    /// selected. The explicit `"none"` spells the same choice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when the selected provider
+    /// key is not one this build provides.
+    pub fn validate_provider_selection(&self) -> Result<(), Report<TrustedServerError>> {
+        match self.provider.as_deref() {
+            None | Some("platform") | Some("none") => Ok(()),
+            Some(key) => Err(Report::new(TrustedServerError::Configuration {
+                message: format!("Geo provider `{key}` is not available in this build"),
+            })),
+        }
+    }
+
+    /// Validates that the compiled `permissions.yaml` parses and declares its
+    /// top node.
+    ///
+    /// The top node is required: its `group` is the permission baseline for a
+    /// request the geo provider leaves unmatched, and its `jurisdiction` is the
+    /// consent handling for that same request, so there must always be one.
+    /// Checking it here turns a malformed policy into a configuration error at
+    /// startup rather than a panic on the first lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when the compiled policy
+    /// fails to parse, most usefully when its top node omits `group` or
+    /// `jurisdiction`.
+    pub fn validate_permission_policy() -> Result<(), Report<TrustedServerError>> {
+        crate::permissions::validate_default_policy().map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("permissions.yaml is not usable: {error}"),
+            })
+        })
+    }
+
+    /// Validates that running jurisdiction consumers without geolocation is
+    /// explicitly acknowledged.
+    ///
+    /// With no geo provider, every request resolves to the permission baseline
+    /// at the top of the `permissions.yaml` `rules` tree, so a visitor from any
+    /// other jurisdiction silently receives that node's rules. That is
+    /// acceptable only as an explicit operator
+    /// decision. When an Edge Cookie provider is configured (the permission
+    /// model gates it by jurisdiction) and no geo provider is selected,
+    /// [`assume_single_jurisdiction`](Self::assume_single_jurisdiction) must be
+    /// `true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when an Edge Cookie
+    /// provider is configured, no geo provider is selected, and
+    /// `assume_single_jurisdiction` is not set.
+    pub fn validate_jurisdiction_acknowledgment(
+        &self,
+        ec: &Ec,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let geo_disabled = !matches!(self.provider.as_deref(), Some("platform"));
+        // The selector is a typed enum on this branch, so statelessness is the
+        // absent selector or the explicit `none`, matched rather than compared
+        // as a string.
+        let ec_active = !matches!(ec.provider, None | Some(EcProviderSelection::None));
+        if geo_disabled && ec_active && !self.assume_single_jurisdiction {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "[ec] provider is configured but no [geo] provider is selected, so \
+                          every request would be treated as the top of the permissions.yaml \
+                          rules tree. Set [geo] assume_single_jurisdiction = true to \
+                          acknowledge single-jurisdiction operation, or select a geo provider"
+                    .to_owned(),
+            }));
         }
         Ok(())
     }
@@ -2540,6 +2996,18 @@ fn is_default_auction_debug_comment_options(value: &AuctionDebugCommentOptions) 
     *value == AuctionDebugCommentOptions::default()
 }
 
+// The provider selectors are new sections, so a serialized blob that carries
+// them is rejected by a base-revision binary that has never heard of them.
+// Omitting the default table keeps an unchanged `ts config push` readable
+// across a rollout or a rollback.
+fn is_default_device_config(value: &DeviceConfig) -> bool {
+    *value == DeviceConfig::default()
+}
+
+fn is_default_geo_config(value: &GeoConfig) -> bool {
+    *value == GeoConfig::default()
+}
+
 /// Behavior of the `<!-- ts-debug: ... -->` auction dump. Only consulted when
 /// [`DebugConfig::auction_html_comment`] is true.
 ///
@@ -2830,6 +3298,12 @@ pub struct Settings {
     pub tinybird: TinybirdSettings,
     #[serde(default)]
     pub debug: DebugConfig,
+    #[serde(default, skip_serializing_if = "is_default_device_config")]
+    #[validate(nested)]
+    pub device: DeviceConfig,
+    #[serde(default, skip_serializing_if = "is_default_geo_config")]
+    #[validate(nested)]
+    pub geo: GeoConfig,
 }
 
 impl Settings {
@@ -2917,6 +3391,14 @@ impl Settings {
             })
         })?;
 
+        settings.ec.migrate_legacy_ec_layout()?;
+        settings.ec.validate_provider_selection()?;
+        settings.device.validate_provider_selection()?;
+        settings.geo.validate_provider_selection()?;
+        GeoConfig::validate_permission_policy()?;
+        settings
+            .geo
+            .validate_jurisdiction_acknowledgment(&settings.ec)?;
         settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
 
@@ -2925,6 +3407,22 @@ impl Settings {
                 "Auction creative rewriting disabled; creative assets and clicks may contact third-party hosts directly"
             );
         }
+
+        // Log the policy's declared default once per settings load, so an
+        // operator can see which permissions an unmatched request is granted
+        // without a signal, and which jurisdiction its consent gates apply.
+        let maps = crate::permissions::PermissionMaps::standard();
+        let granted: Vec<String> = maps
+            .baseline(None, None)
+            .permissions()
+            .iter()
+            .map(|permission| permission.to_string())
+            .collect();
+        log::info!(
+            "Permission baseline: permissions.yaml top node, jurisdiction {}; granted without a signal: [{}]",
+            maps.default_jurisdiction(),
+            granted.join(", ")
+        );
 
         Ok(settings)
     }
@@ -3007,8 +3505,15 @@ impl Settings {
     pub fn reject_placeholder_secrets(&self) -> Result<(), Report<TrustedServerError>> {
         let mut insecure_fields: Vec<String> = Vec::new();
 
-        if Ec::is_placeholder_passphrase(self.ec.passphrase.expose()) {
-            insecure_fields.push("ec.passphrase".to_owned());
+        if let Some(hmac) = &self.ec.providers.hmac
+            && Ec::is_placeholder_passphrase(hmac.passphrase.expose())
+        {
+            insecure_fields.push("ec.providers.hmac.passphrase".to_owned());
+        }
+        if let Some(host_signals) = &self.ec.providers.host_signals
+            && Ec::is_placeholder_passphrase(host_signals.passphrase.expose())
+        {
+            insecure_fields.push("ec.providers.host-signals.passphrase".to_owned());
         }
         if Publisher::is_placeholder_proxy_secret(self.publisher.proxy_secret.expose()) {
             insecure_fields.push("publisher.proxy_secret".to_owned());
@@ -3662,8 +4167,17 @@ mod tests {
 
     #[test]
     fn serialized_default_config_stays_readable_by_the_base_revision_schema() {
-        let settings = Settings::from_toml(&crate_test_settings_str())
+        let mut settings = Settings::from_toml(&crate_test_settings_str())
             .expect("should parse settings without trusted client IP configuration");
+
+        // The guarantee covers a config that configures none of the sections
+        // added since the base revision. A configured section is serialized and,
+        // like a configured `trusted_client_ip`, needs a compatible blob restored
+        // before rolling back to a binary that predates it. The shared test
+        // config sets `[geo]` because the permission model requires a default
+        // country, so both selector tables are reset to unset here.
+        settings.geo = GeoConfig::default();
+        settings.device = DeviceConfig::default();
 
         let value = serde_json::to_value(&settings).expect("should serialize settings");
 
@@ -4371,9 +4885,14 @@ mod tests {
         );
         assert_eq!(settings.publisher.origin_host_header_override, None);
         assert_eq!(
-            settings.ec.passphrase.expose(),
-            "test-secret-key-32-bytes-minimum"
+            settings.ec.provider.as_ref(),
+            Some(&EcProviderSelection::from(HMAC_PROVIDER_KEY)),
+            "test settings should select the hmac EC provider"
         );
+        let Some(hmac) = &settings.ec.providers.hmac else {
+            panic!("test settings should configure the hmac EC provider");
+        };
+        assert_eq!(hmac.passphrase.expose(), "test-secret-key-32-bytes-minimum");
 
         settings.validate().expect("Failed to validate settings");
     }
@@ -4541,6 +5060,34 @@ mod tests {
     }
 
     #[test]
+    fn provider_selection_allows_no_provider_for_stateless_operation() {
+        let ec = Ec::default();
+        assert!(ec.provider.is_none(), "default Ec selects no provider");
+        ec.validate_provider_selection()
+            .expect("should allow no provider selected and run statelessly");
+    }
+
+    #[test]
+    fn provider_selection_rejects_a_selector_without_a_configured_block() {
+        // Point the selector at a provider whose `[ec.providers.<key>]` block is
+        // absent, mirroring a deployment that sets the env override to a
+        // provider it never configured.
+        let toml_str =
+            crate_test_settings_str().replace(r#"provider = "hmac""#, r#"provider = "acme""#);
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("selecting an unconfigured provider should fail at startup");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "unconfigured provider selection should be a configuration error, got: {:?}",
+            err.current_context()
+        );
+    }
+
+    #[test]
     fn cache_asset_rule_globs_respect_path_separators() {
         let toml_str = format!(
             r#"{}
@@ -4643,6 +5190,29 @@ mod tests {
                 .expect("should evaluate disabled cache rules")
                 .is_none(),
             "disabled rules should never match"
+        );
+    }
+
+    #[test]
+    fn provider_blocks_without_a_selector_are_rejected() {
+        // A half-migrated configuration that carries an [ec.providers.hmac]
+        // block but never selects it would silently run stateless; reject it
+        // at startup instead.
+        let toml_str = crate_test_settings_str().replace(
+            "provider = \"hmac\"
+",
+            "",
+        );
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("a provider block with no selector should fail at startup");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should be a configuration error, got: {:?}",
+            err.current_context()
         );
     }
 
@@ -4760,6 +5330,97 @@ mod tests {
     }
 
     #[test]
+    fn legacy_passphrase_migrates_to_the_hmac_provider() {
+        let mut ec = Ec {
+            passphrase: Some(Redacted::new("test-secret-key-32-bytes-minimum".to_owned())),
+            ..Ec::default()
+        };
+        ec.migrate_legacy_ec_layout()
+            .expect("should migrate the deprecated form");
+        assert_eq!(
+            ec.provider.as_ref(),
+            Some(&EcProviderSelection::from(HMAC_PROVIDER_KEY)),
+            "the deprecated passphrase should select the hmac provider"
+        );
+        assert_eq!(
+            ec.providers
+                .hmac
+                .as_ref()
+                .expect("should configure the hmac block")
+                .passphrase
+                .expose(),
+            "test-secret-key-32-bytes-minimum",
+            "the passphrase should move into the hmac block"
+        );
+        assert!(
+            ec.passphrase.is_none(),
+            "the deprecated field should be consumed by the migration"
+        );
+    }
+
+    /// The crate test configuration with its `[ec]` section rewritten to the
+    /// deprecated single-passphrase form.
+    fn legacy_ec_settings_str(passphrase: &str) -> String {
+        let base = crate_test_settings_str();
+        let (before, rest) = base
+            .split_once("[ec]")
+            .expect("should find the [ec] section in the test settings");
+        let (_, after) = rest
+            .split_once("[request_signing]")
+            .expect("should find the [request_signing] section in the test settings");
+        let legacy =
+            format!("{before}[ec]\npassphrase = \"{passphrase}\"\n\n[request_signing]{after}");
+        assert!(
+            !legacy.contains("[ec.providers.hmac]"),
+            "the legacy configuration should carry no provider block"
+        );
+        legacy
+    }
+
+    #[test]
+    fn a_legacy_passphrase_is_held_to_the_passphrase_rules() {
+        // Derive validation runs before the migration and the deprecated field
+        // carries no `#[validate]` attribute, so the migration itself has to
+        // apply the passphrase rules. Without that, a value the new
+        // `[ec.providers.hmac]` block rejects would still start a deployment
+        // from the old location.
+        let short = Settings::from_toml(&legacy_ec_settings_str("short"))
+            .expect_err("a short legacy passphrase should be rejected");
+        assert!(
+            format!("{short:?}").contains("passphrase (deprecated) is invalid"),
+            "should name the deprecated passphrase as the fault: {short:?}"
+        );
+
+        let empty = Settings::from_toml(&legacy_ec_settings_str(""))
+            .expect_err("an empty legacy passphrase should be rejected");
+        assert!(
+            format!("{empty:?}").contains("passphrase (deprecated) is invalid"),
+            "should name the deprecated passphrase as the fault: {empty:?}"
+        );
+
+        let settings =
+            Settings::from_toml(&legacy_ec_settings_str("test-secret-key-32-bytes-minimum"))
+                .expect("a legacy passphrase of adequate length should still start");
+        assert_eq!(
+            settings.ec.provider.as_ref(),
+            Some(&EcProviderSelection::from(HMAC_PROVIDER_KEY)),
+            "an adequate legacy passphrase should still select the hmac provider"
+        );
+        assert_eq!(
+            settings
+                .ec
+                .providers
+                .hmac
+                .as_ref()
+                .expect("should configure the hmac block")
+                .passphrase
+                .expose(),
+            "test-secret-key-32-bytes-minimum",
+            "an adequate legacy passphrase should still move into the hmac block"
+        );
+    }
+
+    #[test]
     fn cache_asset_rule_validation_rejects_invalid_config() {
         let duplicate_ids = format!(
             r#"{}
@@ -4834,6 +5495,230 @@ mod tests {
             format!("{missing_matcher_err:?}").contains("exactly one matcher"),
             "should explain missing matcher: {missing_matcher_err:?}"
         );
+    }
+
+    #[test]
+    fn legacy_passphrase_alongside_provider_config_is_rejected() {
+        let mut ec = Ec {
+            passphrase: Some(Redacted::new("test-secret-key-32-bytes-minimum".to_owned())),
+            provider: Some(EcProviderSelection::from(HMAC_PROVIDER_KEY)),
+            ..Ec::default()
+        };
+        let err = ec
+            .migrate_legacy_ec_layout()
+            .expect_err("both forms present should be rejected");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should be a configuration error, got: {:?}",
+            err.current_context()
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_in_the_hmac_provider_block_is_rejected() {
+        // A mistyped key in a provider block used to be dropped silently, which
+        // leaves the setting the operator meant to change at its default.
+        let toml_str = crate_test_settings_str().replace(
+            "passphrase = \"test-secret-key-32-bytes-minimum\"",
+            "passphrase = \"test-secret-key-32-bytes-minimum\"\n            typo_key = \"x\"",
+        );
+        assert!(
+            toml_str.contains("typo_key"),
+            "the test configuration should carry the unknown key"
+        );
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("an unknown key in [ec.providers.hmac] should be rejected");
+        assert!(
+            format!("{err:?}").contains("typo_key"),
+            "should name the unknown key: {err:?}"
+        );
+    }
+
+    #[test]
+    fn provider_none_is_explicit_stateless() {
+        let ec = Ec {
+            provider: Some(EcProviderSelection::None),
+            ..Ec::default()
+        };
+        ec.validate_provider_selection()
+            .expect("explicit none with no blocks should be valid");
+    }
+
+    #[test]
+    fn provider_none_with_configured_blocks_is_rejected() {
+        let ec = Ec {
+            provider: Some(EcProviderSelection::None),
+            providers: EcProviders {
+                hmac: Some(HmacProviderConfig {
+                    passphrase: Redacted::new("test-secret-key-32-bytes-minimum".to_owned()),
+                }),
+                ..EcProviders::default()
+            },
+            ..Ec::default()
+        };
+        assert!(
+            ec.validate_provider_selection().is_err(),
+            "none alongside configured blocks should be rejected"
+        );
+    }
+
+    #[test]
+    fn device_provider_defaults_to_builtin_and_rejects_unknown() {
+        let config = DeviceConfig::default();
+        assert_eq!(
+            config.provider_key(),
+            "builtin",
+            "no selector should default to the built-in provider"
+        );
+        config
+            .validate_provider_selection()
+            .expect("should validate the built-in default");
+
+        let fastly = DeviceConfig {
+            provider: Some("fastly".to_owned()),
+        };
+        fastly
+            .validate_provider_selection()
+            .expect("should validate the fastly opt-in");
+
+        let unknown = DeviceConfig {
+            provider: Some("acme".to_owned()),
+        };
+        assert!(
+            unknown.validate_provider_selection().is_err(),
+            "an unknown device provider should be rejected at startup"
+        );
+    }
+
+    #[test]
+    fn an_unselected_provider_block_is_rejected() {
+        // A vendor selector with the vendor block present, plus a stray hmac
+        // block, is almost always a stale or mistyped configuration.
+        let toml_str = crate_test_settings_str().replace(
+            "provider = \"hmac\"",
+            "provider = \"acme\"\n\n            [ec.providers.acme]\n            api_key = \"example\"",
+        );
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("a configured but unselected block should fail at startup");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should be a configuration error, got: {:?}",
+            err.current_context()
+        );
+    }
+
+    #[test]
+    fn geo_provider_accepts_default_platform_and_none_and_rejects_unknown() {
+        let config = GeoConfig::default();
+        assert!(
+            config.provider.is_none(),
+            "geo should default to no selector, which selects no geo provider"
+        );
+        config
+            .validate_provider_selection()
+            .expect("should validate the default of running without geolocation");
+
+        let platform = GeoConfig {
+            provider: Some("platform".to_owned()),
+            assume_single_jurisdiction: false,
+        };
+        platform
+            .validate_provider_selection()
+            .expect("should validate the explicit platform selection");
+
+        let none = GeoConfig {
+            provider: Some("none".to_owned()),
+            assume_single_jurisdiction: false,
+        };
+        none.validate_provider_selection()
+            .expect("should validate the explicit opt-out of geolocation");
+
+        let unknown = GeoConfig {
+            provider: Some("acme".to_owned()),
+            assume_single_jurisdiction: false,
+        };
+        assert!(
+            unknown.validate_provider_selection().is_err(),
+            "an unknown geo provider should be rejected at startup"
+        );
+    }
+
+    #[test]
+    fn unknown_keys_in_provider_sections_are_rejected() {
+        // A mistyped key must fail at startup rather than silently selecting
+        // a default behind the operator's back.
+        for (section, bad_key) in [
+            ("[geo]", "providr = \"platform\""),
+            ("[device]", "providr = \"builtin\""),
+        ] {
+            let toml_str = format!(
+                "{}\n\n            {section}\n            {bad_key}\n",
+                crate_test_settings_str()
+            );
+            assert!(
+                Settings::from_toml(&toml_str).is_err(),
+                "an unknown key in {section} should be rejected"
+            );
+        }
+
+        let toml_str = crate_test_settings_str().replace(
+            "[ec.providers.hmac]",
+            "[ec.providers.hmac]\n            unexpected = \"value\"",
+        );
+        assert!(
+            Settings::from_toml(&toml_str).is_err(),
+            "an unknown key in [ec.providers.hmac] should be rejected"
+        );
+    }
+
+    #[test]
+    fn the_compiled_permission_policy_validates_at_startup() {
+        // The compiled-in sample declares its top node, so startup
+        // accepts it. A policy that omitted `group` or `jurisdiction` would be
+        // rejected here rather than panicking on the first lookup, which the
+        // parser tests in `permissions` cover directly.
+        GeoConfig::validate_permission_policy()
+            .expect("the compiled-in sample should validate at startup");
+    }
+
+    #[test]
+    fn ec_without_geo_requires_the_single_jurisdiction_acknowledgment() {
+        // The base test settings acknowledge single-jurisdiction operation.
+        // Removing the acknowledgment while an EC provider is configured and
+        // no geo provider is selected must fail at startup.
+        let toml_str = crate_test_settings_str().replace("assume_single_jurisdiction = true\n", "");
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("an EC provider with no geo provider needs the acknowledgment");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should be a configuration error, got: {:?}",
+            err.current_context()
+        );
+
+        // Selecting a geo provider removes the requirement.
+        let toml_str = crate_test_settings_str()
+            .replace("assume_single_jurisdiction = true\n", "")
+            .replace("[geo]", "[geo]\n            provider = \"platform\"");
+        Settings::from_toml(&toml_str)
+            .expect("a geo provider resolves jurisdictions, so no acknowledgment is needed");
+
+        // With no EC provider there is no jurisdiction consumer to protect.
+        let toml_str = crate_test_settings_str()
+            .replace("assume_single_jurisdiction = true\n", "")
+            .replace("provider = \"hmac\"", "")
+            .replace("[ec.providers.hmac]\n            passphrase = \"test-secret-key-32-bytes-minimum\"", "");
+        Settings::from_toml(&toml_str)
+            .expect("stateless operation needs no jurisdiction acknowledgment");
     }
 
     #[test]
@@ -5230,7 +6115,9 @@ origin_host_header_overide = "www.example.com""#,
         let mut settings =
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
-        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
+        settings.ec.providers.hmac = Some(HmacProviderConfig {
+            passphrase: Redacted::new("test-secret-key-32-bytes-minimum".to_owned()),
+        });
         settings.handlers[0].password =
             Redacted::new("replace-with-admin-password-32-bytes".to_owned());
 
@@ -5869,7 +6756,13 @@ origin_host_header_overide = "www.example.com""#,
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
             "#,
         )
         .expect("should parse settings without max_buffered_body_bytes");
@@ -5899,13 +6792,20 @@ origin_host_header_overide = "www.example.com""#,
             proxy_secret = "unit-test-proxy-secret"
             max_buffered_body_bytes = 0
 
+            [geo]
+            assume_single_jurisdiction = true
+
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
             "#,
         );
+        let error = result.expect_err("should reject a zero buffered-body cap");
         assert!(
-            result.is_err(),
-            "publisher.max_buffered_body_bytes = 0 must fail config validation"
+            error.to_string().contains("max_buffered_body_bytes"),
+            "the rejection should be for the zero cap, not another validation, got: {error}"
         );
     }
 
@@ -7054,7 +7954,13 @@ origin_host_header_overide = "www.example.com""#,
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
 
             [request_signing]
             config_store_id = "test-config-store-id"
@@ -7386,7 +8292,13 @@ cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
+[geo]
+assume_single_jurisdiction = true
+
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
@@ -7470,7 +8382,13 @@ cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
+[geo]
+assume_single_jurisdiction = true
+
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
@@ -7506,7 +8424,13 @@ cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
+[geo]
+assume_single_jurisdiction = true
+
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
@@ -7548,7 +8472,13 @@ cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
+[geo]
+assume_single_jurisdiction = true
+
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
 
 [creative_opportunities]
@@ -7646,6 +8576,29 @@ formats = [{{ width = 300, height = 250 }}]
         assert_creative_opportunity_slot_config_rejected(
             &slot_body,
             "must render to at most 100 UTF-8 bytes",
+        );
+    }
+
+    /// An unset selector must not serialize as `"provider": null`.
+    ///
+    /// The section as a whole is skipped while every field is default, so this
+    /// serializes the struct directly. Once a later change makes another field
+    /// required, the section is always emitted and a null selector would then
+    /// reach a config blob, where a binary that predates the field rejects it.
+    #[test]
+    fn an_unset_provider_selector_is_omitted_from_the_serialized_section() {
+        let geo = GeoConfig::default();
+        let json = serde_json::to_string(&geo).expect("should serialize the geo section");
+        assert!(
+            !json.contains("provider"),
+            "an unset geo selector should be omitted rather than serialized as null, got {json}"
+        );
+
+        let device = DeviceConfig::default();
+        let json = serde_json::to_string(&device).expect("should serialize the device section");
+        assert!(
+            !json.contains("provider"),
+            "an unset device selector should be omitted rather than serialized as null, got {json}"
         );
     }
 

@@ -1,30 +1,84 @@
-//! Jurisdiction detection for consent observability.
+//! Jurisdiction detection: which privacy regime a request falls under.
 //!
-//! Determines the applicable privacy regime based on geolocation data and
-//! publisher configuration. Used for **logging and monitoring only** — the
-//! detected jurisdiction never causes consent to be synthesized (see proposal
-//! Key Decision #3).
+//! The regime comes from the request's location, resolved through the same
+//! place tree in `permissions.yaml` that decides the permission baseline, so
+//! one file states the policy for both. The detected jurisdiction never causes
+//! consent to be synthesized (see proposal Key Decision #3), but it is not
+//! only observability either: the server-side auction gate
+//! (`consent_allows_server_side_auction`) fails closed on a GDPR or unknown
+//! jurisdiction, and a US state jurisdiction is what lets a GPC header be
+//! turned into a US Privacy string.
 
 use core::fmt;
 
-use crate::consent_config::ConsentConfig;
 use crate::geo::GeoInfo;
+use crate::permissions::PermissionMaps;
 
 /// The privacy jurisdiction applicable to a request.
 ///
-/// Derived from the user's geolocation and the publisher's configured
-/// country/state lists. Used for observability — not for consent synthesis.
+/// Resolved from the request's place through the `rules` tree in
+/// `permissions.yaml`, where each node may name the jurisdiction that applies
+/// there and a node without one inherits from the node above it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Jurisdiction {
-    /// GDPR applies (EU/EEA/UK per `consent.gdpr.applies_in`).
+    /// GDPR applies (the EU, EEA and UK regime).
     Gdpr,
     /// A US state with an active comprehensive privacy law.
     UsState(String),
-    /// Geolocation is known but no matching regulation was found.
+    /// The place is known but no matching regulation was found.
     NonRegulated,
-    /// No geolocation data available — jurisdiction cannot be determined.
+    /// No jurisdiction could be determined, for example after a failed geo
+    /// lookup.
     #[default]
     Unknown,
+}
+
+impl Jurisdiction {
+    /// Parses a `jurisdiction:` value written in the `permissions.yaml`
+    /// `rules` tree.
+    ///
+    /// The vocabulary covers exactly the states this type can represent, so a
+    /// policy owner cannot write a jurisdiction the consent code has no way of
+    /// applying:
+    ///
+    /// - `gdpr` for [`Jurisdiction::Gdpr`], the EU, EEA and UK regime.
+    /// - `us-state` for [`Jurisdiction::UsState`]. It carries no code, because
+    ///   the node that names it is itself a region, so `region` supplies the
+    ///   state (upper-cased). A node with no region of its own, meaning the top
+    ///   of the tree or a country, cannot name it, and `None` is returned.
+    /// - `non-regulated` for [`Jurisdiction::NonRegulated`], a place with no
+    ///   matching regulation.
+    /// - `unknown` for [`Jurisdiction::Unknown`], declining to name one.
+    ///
+    /// `region` is the ISO 3166-2 subdivision code of the node carrying the
+    /// value, or `None` for the top of the tree and for a country.
+    ///
+    /// Returns `None` for anything else, which the permission policy parser
+    /// reports as a configuration error rather than silently defaulting.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trusted_server_core::consent::jurisdiction::Jurisdiction;
+    ///
+    /// assert_eq!(Jurisdiction::from_policy_name("gdpr", None), Some(Jurisdiction::Gdpr));
+    /// assert_eq!(
+    ///     Jurisdiction::from_policy_name("us-state", Some("ca")),
+    ///     Some(Jurisdiction::UsState("CA".to_owned()))
+    /// );
+    /// assert_eq!(Jurisdiction::from_policy_name("us-state", None), None);
+    /// assert_eq!(Jurisdiction::from_policy_name("nonsense", None), None);
+    /// ```
+    #[must_use]
+    pub fn from_policy_name(value: &str, region: Option<&str>) -> Option<Self> {
+        match value {
+            "gdpr" => Some(Self::Gdpr),
+            "us-state" => region.map(|code| Self::UsState(code.to_uppercase())),
+            "non-regulated" => Some(Self::NonRegulated),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Jurisdiction {
@@ -38,44 +92,29 @@ impl fmt::Display for Jurisdiction {
     }
 }
 
-/// Detects the privacy jurisdiction for a request based on geolocation.
+/// Detects the privacy jurisdiction for a request from its location.
 ///
-/// Checks the user's country against `config.gdpr.applies_in`, and for US
-/// users checks the region against `config.us_states.privacy_states`.
+/// Walks the `permissions.yaml` place tree the same way the permission
+/// baseline is resolved: the request's region when it is listed, otherwise its
+/// country, otherwise the top of the tree. A node that names no jurisdiction of
+/// its own inherits the one above it, which is resolved when the file is
+/// parsed.
 ///
-/// Returns [`Jurisdiction::Unknown`] when no geo data is available.
+/// The tree also settles the `DE` collision on its own, because ISO 3166-1
+/// `DE` is Germany and sits at the country level, while ISO 3166-2 `DE` is
+/// Delaware and sits under `US`.
+///
+/// With no location this returns the top node's jurisdiction, the policy's
+/// declared answer for a visitor whose place is not resolved. A caller that
+/// must not apply that declaration, such as one holding a failed geo lookup,
+/// resolves [`Jurisdiction::Unknown`] itself rather than calling this.
 #[must_use]
-pub fn detect_jurisdiction(geo: Option<&GeoInfo>, config: &ConsentConfig) -> Jurisdiction {
-    let Some(geo) = geo else {
-        return Jurisdiction::Unknown;
-    };
-
-    // Check GDPR countries first (EU/EEA/UK). This ordering also resolves
-    // the `DE` code collision: ISO 3166-1 `DE` is Germany (GDPR), while
-    // US-Delaware uses ISO 3166-2 `US-DE`. The US state check below only
-    // triggers when `country == "US"`, so there is no actual ambiguity.
-    if config
-        .gdpr
-        .applies_in
-        .iter()
-        .any(|code| code.eq_ignore_ascii_case(&geo.country))
-    {
-        return Jurisdiction::Gdpr;
+pub fn detect_jurisdiction(geo: Option<&GeoInfo>) -> Jurisdiction {
+    let maps = PermissionMaps::standard();
+    match geo {
+        Some(geo) => maps.jurisdiction_for(Some(&geo.country), geo.region.as_deref()),
+        None => maps.default_jurisdiction(),
     }
-
-    // For US users, check if the region is a state with a privacy law.
-    if geo.country.eq_ignore_ascii_case("US")
-        && let Some(region) = &geo.region
-        && config
-            .us_states
-            .privacy_states
-            .iter()
-            .any(|state| state.eq_ignore_ascii_case(region))
-    {
-        return Jurisdiction::UsState(region.to_uppercase());
-    }
-
-    Jurisdiction::NonRegulated
 }
 
 // ---------------------------------------------------------------------------
@@ -85,14 +124,13 @@ pub fn detect_jurisdiction(geo: Option<&GeoInfo>, config: &ConsentConfig) -> Jur
 #[cfg(test)]
 mod tests {
     use super::{Jurisdiction, detect_jurisdiction};
-    use crate::consent_config::ConsentConfig;
     use crate::geo::GeoInfo;
 
     fn make_geo(country: &str, region: Option<&str>) -> GeoInfo {
         GeoInfo {
-            city: "Test".to_owned(),
+            city: "Test City".to_owned(),
             country: country.to_owned(),
-            continent: "Test".to_owned(),
+            continent: "EU".to_owned(),
             latitude: 0.0,
             longitude: 0.0,
             metro_code: 0,
@@ -103,10 +141,9 @@ mod tests {
 
     #[test]
     fn gdpr_detected_for_eu_country() {
-        let config = ConsentConfig::default();
         let geo = make_geo("DE", None);
         assert_eq!(
-            detect_jurisdiction(Some(&geo), &config),
+            detect_jurisdiction(Some(&geo)),
             Jurisdiction::Gdpr,
             "Germany should trigger GDPR"
         );
@@ -114,10 +151,9 @@ mod tests {
 
     #[test]
     fn gdpr_detected_for_eea_country() {
-        let config = ConsentConfig::default();
         let geo = make_geo("NO", None);
         assert_eq!(
-            detect_jurisdiction(Some(&geo), &config),
+            detect_jurisdiction(Some(&geo)),
             Jurisdiction::Gdpr,
             "Norway (EEA) should trigger GDPR"
         );
@@ -125,77 +161,98 @@ mod tests {
 
     #[test]
     fn gdpr_detected_for_uk() {
-        let config = ConsentConfig::default();
         let geo = make_geo("GB", None);
         assert_eq!(
-            detect_jurisdiction(Some(&geo), &config),
+            detect_jurisdiction(Some(&geo)),
             Jurisdiction::Gdpr,
-            "UK should trigger GDPR"
+            "the UK should trigger GDPR"
         );
     }
 
     #[test]
     fn us_state_detected_for_california() {
-        let config = ConsentConfig::default();
         let geo = make_geo("US", Some("CA"));
         assert_eq!(
-            detect_jurisdiction(Some(&geo), &config),
+            detect_jurisdiction(Some(&geo)),
             Jurisdiction::UsState("CA".to_owned()),
             "California should trigger US state privacy"
         );
     }
 
     #[test]
-    fn us_non_privacy_state_is_non_regulated() {
-        let config = ConsentConfig::default();
+    fn delaware_is_a_us_state_and_germany_is_not() {
+        // ISO 3166-1 `DE` is Germany and ISO 3166-2 `DE` is Delaware. The tree
+        // keeps them apart by where they sit, so no ordering rule is needed.
+        let delaware = make_geo("US", Some("DE"));
+        assert_eq!(
+            detect_jurisdiction(Some(&delaware)),
+            Jurisdiction::UsState("DE".to_owned()),
+            "US/DE should be Delaware"
+        );
+        let germany = make_geo("DE", None);
+        assert_eq!(
+            detect_jurisdiction(Some(&germany)),
+            Jurisdiction::Gdpr,
+            "DE at the country level should be Germany"
+        );
+    }
+
+    #[test]
+    fn us_non_privacy_state_inherits_the_country_node() {
         let geo = make_geo("US", Some("WY"));
         assert_eq!(
-            detect_jurisdiction(Some(&geo), &config),
+            detect_jurisdiction(Some(&geo)),
             Jurisdiction::NonRegulated,
-            "Wyoming should be non-regulated"
+            "Wyoming is not listed, so it inherits the US node"
         );
     }
 
     #[test]
     fn us_no_region_is_non_regulated() {
-        let config = ConsentConfig::default();
         let geo = make_geo("US", None);
         assert_eq!(
-            detect_jurisdiction(Some(&geo), &config),
+            detect_jurisdiction(Some(&geo)),
             Jurisdiction::NonRegulated,
-            "US without region should be non-regulated"
+            "the US without a region should be non-regulated"
         );
     }
 
     #[test]
-    fn non_gdpr_non_us_is_non_regulated() {
-        let config = ConsentConfig::default();
+    fn an_unlisted_country_inherits_the_top_of_the_tree() {
+        // Nothing is written for Japan, so it inherits the top node, which the
+        // shipped policy sets to GDPR. That is the same node an unresolved
+        // place gets, so an unlisted country is treated no more loosely than a
+        // visitor with no place at all.
         let geo = make_geo("JP", None);
         assert_eq!(
-            detect_jurisdiction(Some(&geo), &config),
-            Jurisdiction::NonRegulated,
-            "Japan should be non-regulated"
+            detect_jurisdiction(Some(&geo)),
+            Jurisdiction::Gdpr,
+            "an unlisted country should inherit the top of the tree"
         );
     }
 
     #[test]
-    fn no_geo_returns_unknown() {
-        let config = ConsentConfig::default();
+    fn no_geo_uses_the_top_of_the_tree() {
         assert_eq!(
-            detect_jurisdiction(None, &config),
-            Jurisdiction::Unknown,
-            "missing geo should return unknown"
+            detect_jurisdiction(None),
+            Jurisdiction::Gdpr,
+            "with no place the policy's declared top node applies"
         );
     }
 
     #[test]
-    fn case_insensitive_country_matching() {
-        let config = ConsentConfig::default();
+    fn case_insensitive_place_matching() {
         let geo = make_geo("de", None);
         assert_eq!(
-            detect_jurisdiction(Some(&geo), &config),
+            detect_jurisdiction(Some(&geo)),
             Jurisdiction::Gdpr,
-            "lowercase country code should still match"
+            "a lowercase country code should still match"
+        );
+        let state = make_geo("us", Some("ca"));
+        assert_eq!(
+            detect_jurisdiction(Some(&state)),
+            Jurisdiction::UsState("CA".to_owned()),
+            "a lowercase region code should still match and upper-case the state"
         );
     }
 

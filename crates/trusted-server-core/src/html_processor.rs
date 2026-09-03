@@ -186,6 +186,14 @@ pub struct HtmlProcessorConfig {
     pub request_host: String,
     pub request_scheme: String,
     pub integrations: IntegrationRegistry,
+    /// Pre-computed
+    /// `<script>(window.tsjs=window.tsjs||{}).permissions=...;</script>`.
+    /// Injected at `<head>` open, ahead of [`Self::ad_slots_script`] and the
+    /// tsjs bundle, so page code can read the request's permission state before
+    /// anything runs. `None` under a shared-template mode, where the head is
+    /// cached and served to many readers and nothing request-scoped may appear
+    /// in it, so the seam carries the state there instead.
+    pub permissions_script: Option<String>,
     /// Pre-computed `<script>(window.tsjs=window.tsjs||{}).adSlots=...;</script>`.
     /// Injected at `<head>` open. `None` when no slots matched.
     pub ad_slots_script: Option<String>,
@@ -226,6 +234,7 @@ impl HtmlProcessorConfig {
             request_host: request_host.to_owned(),
             request_scheme: request_scheme.to_owned(),
             integrations: integrations.clone(),
+            permissions_script: None,
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: settings.publisher.max_buffered_body_bytes,
@@ -251,6 +260,17 @@ impl HtmlProcessorConfig {
     ) -> Self {
         self.ad_slots_script = ad_slots_script;
         self.ad_bids_state = ad_bids_state;
+        self
+    }
+
+    /// Attach the head script carrying this request's permission state.
+    ///
+    /// Separate from [`with_ad_state`](Self::with_ad_state) because the two are
+    /// independent decisions: the permission state travels on every HTML
+    /// document the processor handles, whether or not the ad stack ran.
+    #[must_use]
+    pub fn with_permissions_script(mut self, permissions_script: Option<String>) -> Self {
+        self.permissions_script = permissions_script;
         self
     }
 
@@ -372,6 +392,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let integration_registry = config.integrations.clone();
     let script_rewriters = integration_registry.script_rewriters();
     let ad_slots_script = config.ad_slots_script.clone();
+    let permissions_script = config.permissions_script.clone();
     let body_close = config.body_close.clone();
     let ad_bids_state = config.ad_bids_state.clone();
     let gpt_diagnostics = config.gpt_diagnostics.clone();
@@ -404,10 +425,17 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let patterns = patterns.clone();
             let document_state = document_state.clone();
             let ad_slots_script = ad_slots_script.clone();
+            let permissions_script = permissions_script.clone();
             let gpt_diagnostics = gpt_diagnostics.clone();
             move |el| {
                 if !injected_tsjs.get() {
                     let mut snippet = String::new();
+                    // The permission state goes first, ahead of the slots and
+                    // the bundle, because both of those and any vendor module
+                    // may read it as soon as they run.
+                    if let Some(ref state_script) = permissions_script {
+                        snippet.push_str(state_script);
+                    }
                     // Inject ad slots script first so it appears before tsjs bundle.
                     if let Some(ref slots_script) = ad_slots_script {
                         snippet.push_str(slots_script);
@@ -829,6 +857,7 @@ mod tests {
             request_scheme: "https".to_owned(),
             integrations: IntegrationRegistry::default(),
             ad_slots_script: None,
+            permissions_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
@@ -1805,6 +1834,7 @@ mod tests {
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                     .to_string(),
             ),
+            permissions_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
@@ -1882,6 +1912,7 @@ mod tests {
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=[];</script>"#.to_string(),
             ),
+            permissions_script: None,
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
@@ -1921,6 +1952,7 @@ mod tests {
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=[];</script>"#.to_string(),
             ),
+            permissions_script: None,
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
@@ -1959,6 +1991,7 @@ mod tests {
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::default(),
             ad_slots_script: None,
+            permissions_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
@@ -2015,6 +2048,7 @@ mod tests {
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=[];</script>"#.to_string(),
             ),
+            permissions_script: None,
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
@@ -2045,6 +2079,7 @@ mod tests {
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::empty_for_tests(),
             ad_slots_script: None,
+            permissions_script: None,
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
@@ -2070,6 +2105,7 @@ mod tests {
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::empty_for_tests(),
             ad_slots_script: None,
+            permissions_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
@@ -2206,6 +2242,7 @@ mod tests {
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::empty_for_tests(),
             ad_slots_script: None,
+            permissions_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
