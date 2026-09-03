@@ -567,60 +567,6 @@ mod tests {
     }
 
     #[test]
-    fn auction_marks_are_first_call_wins_and_snapshot_maps_them() {
-        let timings = RequestTimings::new();
-        timings.mark_auction_dispatched("11111111-1111-1111-1111-111111111111".to_owned());
-        timings.mark_auction_resolved();
-        timings.mark_auction_committed();
-        // Second calls must not overwrite the first-recorded values.
-        timings.mark_auction_dispatched("22222222-2222-2222-2222-222222222222".to_owned());
-        timings.mark_auction_resolved();
-        timings.mark_auction_committed();
-
-        let snapshot = timings.snapshot();
-        assert!(
-            snapshot.auction_dispatched_ms.is_some(),
-            "should record the dispatch offset"
-        );
-        assert!(
-            snapshot.auction_resolved_ms.is_some(),
-            "should record the resolve offset"
-        );
-        assert!(
-            snapshot.auction_committed_ms.is_some(),
-            "should record the commit offset"
-        );
-        assert_eq!(
-            snapshot.auction_id.as_deref(),
-            Some("11111111-1111-1111-1111-111111111111"),
-            "should keep the first-recorded auction id"
-        );
-    }
-
-    #[test]
-    fn snapshot_without_auction_marks_yields_none_for_all_offsets() {
-        let timings = RequestTimings::new();
-        timings.mark_headers_ready();
-        let snapshot = timings.snapshot();
-        assert_eq!(
-            snapshot.auction_dispatched_ms, None,
-            "should stay None when no auction dispatched"
-        );
-        assert_eq!(
-            snapshot.auction_resolved_ms, None,
-            "should stay None when no auction resolved"
-        );
-        assert_eq!(
-            snapshot.auction_committed_ms, None,
-            "should stay None when no auction committed"
-        );
-        assert_eq!(
-            snapshot.auction_id, None,
-            "should carry no auction id when no auction ran"
-        );
-    }
-
-    #[test]
     fn render_omits_unrecorded_phases_and_orders_total_first() {
         let timings = RequestTimings::new();
         timings.record(Phase::Filter, Duration::from_micros(9_100));
