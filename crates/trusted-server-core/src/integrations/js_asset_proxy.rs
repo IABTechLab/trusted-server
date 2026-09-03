@@ -52,6 +52,7 @@ pub struct JsAssetProxyConfig {
 
 /// One configured JavaScript asset mapping.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct JsAssetProxyAsset {
     /// Exact first-party request path handled by Trusted Server.
     pub path: String,
@@ -1566,5 +1567,20 @@ mod tests {
         .expect("should deserialize asset");
 
         assert_eq!(parsed.proxy, JsAssetProxyMode::Enabled);
+    }
+
+    #[test]
+    fn rejects_unknown_asset_fields() {
+        let error = serde_json::from_value::<JsAssetProxyAsset>(json!({
+            "path": "/assets/vendor.js",
+            "origin_url": "https://cdn.example.com/vendor.js",
+            "mode": "blocked"
+        }))
+        .expect_err("should reject unknown asset fields");
+
+        assert!(
+            error.to_string().contains("unknown field `mode`"),
+            "should identify the unknown asset field"
+        );
     }
 }

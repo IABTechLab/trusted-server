@@ -689,10 +689,21 @@ fn replace_js_asset_proxy_section(document: &str, replacement: &str) -> CliResul
         end += 1;
     }
 
+    // Blank lines and comments directly above the next section header document
+    // that section, not this one, so leave them in the draft.
+    while end > start + 1 {
+        let trimmed = lines[end - 1].trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+
     let mut output_lines = Vec::new();
     output_lines.extend_from_slice(&lines[..start]);
     output_lines.extend(replacement.trim_end_matches('\n').lines());
-    if end < lines.len() {
+    if end < lines.len() && !lines[end].trim().is_empty() {
         output_lines.push("");
     }
     output_lines.extend_from_slice(&lines[end..]);
@@ -2417,6 +2428,12 @@ mod tests {
         assert!(
             !draft.toml.contains("example-vendor-loader"),
             "should remove the starter placeholder asset"
+        );
+        assert!(
+            draft.toml.contains(
+                "# Proxy behavior and first-party asset routing. Kept active with defaults.\n[proxy]"
+            ),
+            "should preserve documentation for the section following the replaced block"
         );
         toml::from_str::<toml::Value>(&draft.toml).expect("draft should parse as TOML");
     }

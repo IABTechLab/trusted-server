@@ -80,6 +80,21 @@ mod tests {
         .expect("should initialize config");
         assert!(path.exists(), "should write config file");
 
+        let config = fs::read_to_string(&path).expect("should read initialized config");
+        let parsed = toml::from_str::<toml::Value>(&config).expect("config should parse as TOML");
+        assert!(
+            parsed["integrations"]["js_asset_proxy"]
+                .get("cache_ttl_seconds")
+                .is_none(),
+            "JS asset proxy should preserve upstream cache policy by default"
+        );
+        assert!(
+            config.contains(
+                "[integrations.js_asset_proxy]\nenabled = false\n# Uncomment to override upstream cache headers for every asset below.\n# cache_ttl_seconds = 3600"
+            ),
+            "initialized config should document the optional cache override"
+        );
+
         let err = run_config_init_with_writer(
             &ConfigInitArgs {
                 app_config: path,

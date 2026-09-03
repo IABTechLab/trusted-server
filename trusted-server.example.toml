@@ -165,7 +165,8 @@ pull_sync_concurrency = 3
 
 [integrations.js_asset_proxy]
 enabled = false
-cache_ttl_seconds = 3600
+# Uncomment to override upstream cache headers for every asset below.
+# cache_ttl_seconds = 3600
 
 [[integrations.js_asset_proxy.assets]]
 path = "/assets/example-vendor-loader.js"
