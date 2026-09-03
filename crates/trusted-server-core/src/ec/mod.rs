@@ -68,6 +68,7 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
 use http::Request;
 
+use crate::consent::jurisdiction::Jurisdiction;
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
 use crate::constants::COOKIE_TS_EC;
 use crate::cookies::handle_request_cookies;
@@ -344,9 +345,18 @@ impl EcContext {
         };
 
         if !self.ec_allowed {
+            // The jurisdiction class is logged rather than the value. The
+            // value carries a configured US state code, and the full
+            // jurisdiction is already logged once when the EC context is
+            // built, so naming the class here loses nothing.
+            let jurisdiction = match &self.consent.jurisdiction {
+                Jurisdiction::Gdpr => "gdpr",
+                Jurisdiction::UsState(_) => "us-state",
+                Jurisdiction::NonRegulated => "non-regulated",
+                Jurisdiction::Unknown => "unknown",
+            };
             log::info!(
-                "EC generation skipped: EC creation not permitted (jurisdiction={})",
-                self.consent.jurisdiction,
+                "EC generation skipped: EC creation not permitted (jurisdiction={jurisdiction})"
             );
             return Ok(());
         }
