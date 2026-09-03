@@ -3340,6 +3340,7 @@ mod tests {
 
                     [auction]
                     enabled = true
+                    providers = {}
 
                     [creative_opportunities]
                     gam_network_id = "99999"

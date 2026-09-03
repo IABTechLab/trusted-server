@@ -513,6 +513,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+    use crate::auction_config_types::{NotificationConfig, ProviderConfig, RoutingMode};
     use crate::redacted::Redacted;
     use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig};
     use crate::test_support::tests::crate_test_settings_str;
@@ -571,6 +572,21 @@ formats = [{ width = 300, height = 250 }]
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
         settings
+    }
+
+    fn insert_aps_provider(settings: &mut Settings, account_id: &str) {
+        settings.auction.providers.insert(
+            "aps-main".parse().expect("should parse APS provider ID"),
+            ProviderConfig {
+                protocol: "openrtb-2.6".to_string(),
+                profile: "aps".to_string(),
+                endpoint: "https://aps.example.com/e/pb/bid".to_string(),
+                timeout_ms: None,
+                routing: RoutingMode::AllEligible,
+                notifications: NotificationConfig::default(),
+                profile_config: serde_json::json!({ "account_id": account_id }),
+            },
+        );
     }
 
     /// Source-controlled operator-facing config template.
@@ -1075,6 +1091,31 @@ password = "production-admin-password-32-bytes"
                 && text.contains("request_signing.secret_store_id"),
             "should flag both request-signing store ids: {err:?}"
         );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_blank_aps_account_id() {
+        for (label, account_id) in [("empty", ""), ("whitespace-only", "   ")] {
+            let mut settings = valid_settings();
+            insert_aps_provider(&mut settings, account_id);
+
+            let err = validate_settings_for_deploy(&settings)
+                .expect_err("should reject blank APS account_id");
+
+            assert!(
+                format!("{err:?}").contains("account_id"),
+                "should mention the APS profile account_id for {label}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_validation_normalizes_padded_aps_account_id() {
+        let mut settings = valid_settings();
+        insert_aps_provider(&mut settings, "  example-account  ");
+
+        validate_settings_for_deploy(&settings)
+            .expect("should accept a padded APS profile account_id after trimming it");
     }
 
     #[test]

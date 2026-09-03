@@ -226,7 +226,6 @@ import sys
 src, out, mode, origin_port, bid_port = sys.argv[1:6]
 s = open(src).read()
 
-
 def replace_once(content, old, new, description):
     if content.count(old) != 1:
         raise SystemExit(f"expected one {description} replacement target")
