@@ -1466,6 +1466,13 @@ mod tests {
                 .upsert_partner_ids(&ec_id, &[PartnerIdUpdate::new("partner", "uid")])
                 .expect_err("should exhaust CAS retries")
         };
+        let cas_if_exists = {
+            let store = ConflictInjectingEcKv::new(MAX_CAS_RETRIES + 1, false);
+            store.seed_live(&ec_id);
+            KvIdentityGraph::new(store)
+                .upsert_partner_id_if_exists(&ec_id, "partner", "uid")
+                .expect_err("should exhaust CAS retries")
+        };
 
         for (label, report) in [
             ("duplicate create", duplicate),
@@ -1476,6 +1483,7 @@ mod tests {
             ("CAS exhaustion reviving", cas_revive),
             ("CAS exhaustion upserting", cas_upsert),
             ("CAS exhaustion batch upserting", cas_batched),
+            ("CAS exhaustion upserting if present", cas_if_exists),
         ] {
             let rendered = format!("{report:?}");
             assert!(
