@@ -129,6 +129,10 @@ fn resolve_field(
             }
             Ok(())
         }
+        Some(_) => Err(configuration_error(format!(
+            "unsupported secret path segment in `{}`",
+            field.dotted_path()
+        ))),
         None => Ok(()),
     }
 }

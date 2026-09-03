@@ -90,7 +90,7 @@ use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
-use edgezero_adapter_fastly::env_config_from_runtime_dictionary;
+use edgezero_adapter_fastly::runtime_env_config;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::env_config::EnvConfig;
@@ -1324,7 +1324,7 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        let runtime_env = env_config_from_runtime_dictionary(Self::stores());
+        let runtime_env = runtime_env_config(Self::stores());
         let stores = RuntimeStoreConfig::from_env(&runtime_env);
         Self::router_with_state(&stores).0
     }
@@ -1355,9 +1355,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AppState, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
-        RuntimeStoreConfig, TrustedServerApp, build_per_request_services,
-        build_state_from_settings, startup_error_router,
+        AppState, AuctionDispatch, EcContext, EdgeCacheHeader, HandlerFuture, NAMED_ROUTES,
+        NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RuntimeStoreConfig,
+        TrustedServerApp, build_per_request_services, build_state_from_settings,
+        handle_publisher_request, publisher_response_into_streaming_response, startup_error_router,
     };
     use base64::Engine as _;
     use bytes::Bytes;
@@ -1577,21 +1578,6 @@ mod tests {
     fn test_router() -> RouterService {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         TrustedServerApp::routes_for_state(&state)
-    }
-
-    #[test]
-    fn trusted_server_app_declares_config_store_metadata() {
-        let stores = TrustedServerApp::stores();
-
-        assert_eq!(
-            stores.config,
-            Some(StoreMetadata {
-                default: "trusted_server_config",
-                ids: &["trusted_server_config"],
-            })
-        );
-        assert_eq!(stores.kv, None);
-        assert_eq!(stores.secrets, None);
     }
 
     #[test]

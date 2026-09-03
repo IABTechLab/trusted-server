@@ -81,11 +81,7 @@ fn remove_inactive_secret_references(data: &mut serde_json::Value) {
             let Some(partner) = partner.as_object_mut() else {
                 continue;
             };
-            if partner
-                .get("pull_sync_enabled")
-                .and_then(serde_json::Value::as_bool)
-                != Some(true)
-            {
+            if !json_bool_or_string_is_true(partner.get("pull_sync_enabled")) {
                 partner.remove("ts_pull_token");
             }
         }
@@ -124,12 +120,19 @@ fn remove_inactive_secret_references(data: &mut serde_json::Value) {
     }
 }
 
+fn json_bool_or_string_is_true(value: Option<&serde_json::Value>) -> bool {
+    matches!(value, Some(serde_json::Value::Bool(true)))
+        || matches!(value, Some(serde_json::Value::String(value)) if value == "true")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
-    use crate::settings::{AssetOriginAuth, EcPartner, ProxyAssetRoute, S3SigV4AuthConfig};
+    use crate::settings::{
+        AssetOriginAuth, EcPartner, ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig,
+    };
     use crate::test_support::tests::crate_test_settings_str;
     use serde::Deserialize;
 
@@ -211,6 +214,7 @@ mod tests {
                 "s3-session-key" => "resolved-session-token",
                 "partner-api-token-key" => "resolved-partner-api-token-32-bytes-ok",
                 "partner-pull-token-key" => "resolved-partner-pull-token-32-bytes-ok",
+                "trusted-client-ip-key" => "resolved-trusted-client-ip-secret-32-bytes",
                 _ => key,
             };
             Ok(value.as_bytes().to_vec())
@@ -398,6 +402,61 @@ mod tests {
     }
 
     #[test]
+    fn resolves_trusted_client_ip_shared_secret_from_default_store() {
+        let mut original = test_settings();
+        original.trusted_client_ip = Some(TrustedClientIpConfig {
+            ip_header: "x-ts-client-ip".to_owned(),
+            auth_header: "x-ts-client-ip-auth".to_owned(),
+            shared_secret: Redacted::new("trusted-client-ip-key".to_owned()),
+        });
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should resolve the trusted client IP shared secret");
+
+        assert_eq!(
+            reconstructed
+                .trusted_client_ip
+                .as_ref()
+                .expect("should retain trusted client IP configuration")
+                .shared_secret
+                .expose(),
+            "resolved-trusted-client-ip-secret-32-bytes",
+            "should replace the key reference with the resolved shared secret"
+        );
+    }
+
+    #[test]
+    fn missing_trusted_client_ip_shared_secret_fails_resolution() {
+        let mut original = test_settings();
+        original.trusted_client_ip = Some(TrustedClientIpConfig {
+            ip_header: "x-ts-client-ip".to_owned(),
+            auth_header: "x-ts-client-ip-auth".to_owned(),
+            shared_secret: Redacted::new("unused-trusted-client-ip-key".to_owned()),
+        });
+
+        let error = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect_err("should reject a missing trusted client IP shared secret");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("trusted_client_ip.shared_secret"),
+            "should identify the unresolved secret field: {error:?}"
+        );
+        assert!(
+            !message.contains("unused-trusted-client-ip-key"),
+            "should not expose the secret key reference: {error:?}"
+        );
+    }
+
+    #[test]
     fn omitted_s3_secret_references_resolve_default_store_keys() {
         let mut original = test_settings();
         let mut route = ProxyAssetRoute::new(
@@ -448,6 +507,63 @@ mod tests {
         assert!(
             reconstructed.ec.partners[0].api_token.is_none(),
             "should preserve omitted API token"
+        );
+    }
+
+    #[test]
+    fn string_true_pull_sync_flag_retains_and_resolves_its_token() {
+        let mut original = test_settings();
+        original
+            .ec
+            .partners
+            .push(partner_with_pull_sync(true, "partner-pull-token-key"));
+        let mut data = serde_json::to_value(original).expect("should serialize settings");
+        data["ec"]["partners"][0]["pull_sync_enabled"] =
+            serde_json::Value::String("true".to_owned());
+        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
+        let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json,
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should resolve a pull token enabled by a string boolean");
+
+        assert_eq!(
+            reconstructed.ec.partners[0]
+                .ts_pull_token
+                .as_ref()
+                .map(Redacted::expose)
+                .map(String::as_str),
+            Some("resolved-partner-pull-token-32-bytes-ok"),
+            "should retain and resolve the active pull token"
+        );
+    }
+
+    #[test]
+    fn string_false_pull_sync_flag_removes_a_stale_token() {
+        let mut original = test_settings();
+        original
+            .ec
+            .partners
+            .push(partner_with_pull_sync(false, "unused-partner-pull-token"));
+        let mut data = serde_json::to_value(original).expect("should serialize settings");
+        data["ec"]["partners"][0]["pull_sync_enabled"] =
+            serde_json::Value::String("false".to_owned());
+        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
+        let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
+
+        let reconstructed = settings_from_config_blob(
+            &envelope_json,
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should skip a pull token disabled by a string boolean");
+
+        assert!(
+            reconstructed.ec.partners[0].ts_pull_token.is_none(),
+            "should remove the inactive pull token"
         );
     }
 

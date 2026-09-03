@@ -53,15 +53,26 @@ build = """
             key = "api_key"
             env = "FASTLY_KEY"
 
+        # Local-only values for the three secret references in
+        # trusted-server.example.toml. These are public development fixtures.
+        [[local_server.secret_stores.ts_secrets]]
+            key = "publisher_proxy_secret"
+            data = "local-only-publisher-proxy-secret"
+
+        [[local_server.secret_stores.ts_secrets]]
+            key = "ec_passphrase"
+            data = "local-only-ec-passphrase-32-bytes"
+
+        [[local_server.secret_stores.ts_secrets]]
+            key = "handler_password"
+            data = "local-only-handler-password"
+
         [[local_server.secret_stores.ts_secrets]]
             key = "tinybird_auction_append_token"
             data = "test-tinybird-auction-append-token"
 
         # App-config references use logical `trusted_server_secrets`; the
         # edgezero_runtime_env mapping below resolves it to physical `ts_secrets`.
-        [[local_server.secret_stores.ts_secrets]]
-            key = "placeholder"
-            data = "placeholder"
 
     [local_server.config_stores]
         [local_server.config_stores.edgezero_runtime_env]

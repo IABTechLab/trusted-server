@@ -928,25 +928,15 @@ mod tests {
     }
 
     #[test]
-    fn spin_variable_name_encodes_trusted_server_keys() {
+    fn spin_variable_name_encodes_secret_key_components() {
         assert_eq!(
-            spin_variable_name("current-kid", PlatformError::ConfigStore)
-                .expect("should encode current kid key"),
-            "v_current_x2dkid"
-        );
-        assert_eq!(
-            spin_variable_name("active-kids", PlatformError::ConfigStore)
-                .expect("should encode active kids key"),
-            "v_active_x2dkids"
-        );
-        assert_eq!(
-            spin_variable_name("ts-2026-05-25", PlatformError::ConfigStore)
+            spin_variable_name("ts-2026-05-25", PlatformError::SecretStore)
                 .expect("should encode generated kid"),
             "v_ts_x2d2026_x2d05_x2d25"
         );
         // Digit-leading keys are rejected at the encoder boundary.
         assert!(
-            spin_variable_name("2026-key", PlatformError::ConfigStore).is_err(),
+            spin_variable_name("2026-key", PlatformError::SecretStore).is_err(),
             "should reject digit-leading key"
         );
     }
@@ -954,8 +944,8 @@ mod tests {
     #[test]
     fn spin_encoder_accepts_every_creatable_kid() {
         // Portability contract: core's create/rotate validation (kid_is_creatable)
-        // must never admit a kid the Spin variable encoder rejects — otherwise such
-        // a kid would 400 on create across every adapter yet 5xx at storage on Spin.
+        // must never admit a kid the Spin secret-variable encoder rejects — otherwise
+        // that kid could be created but its private signing key could not be stored.
         // This pins core >= encoder strictness so the duplicated lowercase-leading
         // rule in validate_kid and spin_variable_name cannot silently drift.
         use trusted_server_core::request_signing::kid_is_creatable;
@@ -981,7 +971,7 @@ mod tests {
         for kid in samples {
             if kid_is_creatable(kid) {
                 assert!(
-                    spin_variable_name(kid, PlatformError::ConfigStore).is_ok(),
+                    spin_variable_name(kid, PlatformError::SecretStore).is_ok(),
                     "core accepts kid `{kid}` but the Spin encoder rejects it \
                      (portability contract broken)"
                 );
@@ -1001,7 +991,7 @@ mod tests {
     #[test]
     fn spin_variable_name_rejects_unsupported_characters() {
         assert!(
-            spin_variable_name("kid/name", PlatformError::ConfigStore).is_err(),
+            spin_variable_name("kid/name", PlatformError::SecretStore).is_err(),
             "should reject characters outside the supported Spin variable mapping"
         );
     }

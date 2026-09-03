@@ -69,4 +69,26 @@ mod tests {
             "fastly.toml should preserve the pre-seeded local EC test row"
         );
     }
+
+    #[test]
+    fn local_fastly_config_defines_starter_secret_references() {
+        let parsed: toml::Value =
+            toml::from_str(FASTLY_CONFIG).expect("should parse root fastly.toml");
+        let entries = parsed["local_server"]["secret_stores"]["ts_secrets"]
+            .as_array()
+            .expect("fastly.toml should define ts_secrets");
+
+        for key in [
+            "publisher_proxy_secret",
+            "ec_passphrase",
+            "handler_password",
+        ] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry["key"].as_str() == Some(key)),
+                "fastly.toml should define local value for starter secret `{key}`"
+            );
+        }
+    }
 }

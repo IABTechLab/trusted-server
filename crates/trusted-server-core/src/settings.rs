@@ -2714,7 +2714,7 @@ pub struct TrustedClientIpConfig {
     /// Header containing the shared-secret authentication value.
     pub auth_header: String,
     /// Shared secret required before accepting the forwarded client IP address.
-    #[validate(custom(function = validate_redacted_not_empty))]
+    #[validate(custom(function = validate_trusted_client_ip_shared_secret))]
     pub shared_secret: Redacted<String>,
 }
 
@@ -2788,7 +2788,13 @@ fn validate_trusted_client_ip(config: &TrustedClientIpConfig) -> Result<(), Vali
         return Err(ValidationError::new("unsafe_trusted_client_ip_auth_header"));
     }
 
-    let shared_secret = config.shared_secret.expose();
+    Ok(())
+}
+
+fn validate_trusted_client_ip_shared_secret(
+    shared_secret: &Redacted<String>,
+) -> Result<(), ValidationError> {
+    let shared_secret = shared_secret.expose();
     if shared_secret.len() < TrustedClientIpConfig::MIN_SHARED_SECRET_LENGTH {
         return Err(ValidationError::new(
             "short_trusted_client_ip_shared_secret",

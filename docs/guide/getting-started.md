@@ -53,12 +53,18 @@ Install and configure the Fastly CLI using the [Fastly setup guide](/guide/fastl
 cargo install viceroy --version 0.17.0 --locked --force
 ```
 
-Start the local Fastly simulator:
+Create and push the starter config, then start the local Fastly simulator:
 
 ```bash
+cp trusted-server.example.toml trusted-server.toml
+set -a && source .env.dev && set +a
+
+ts config push --adapter fastly --local --yes --no-diff
 fastly compute serve
 ```
 
+The local manifest provides public development-only values for the starter
+config's three secret references. Do not reuse them outside local development.
 The server will be available at `http://localhost:7676`.
 
 ### Option B — Axum dev server
@@ -72,8 +78,7 @@ the variables into your shell before starting the server.
 ```bash
 # Create the local app config and apply the non-secret development overlay.
 cp trusted-server.example.toml trusted-server.toml
-cp .env.dev .env
-set -a && source .env && set +a
+set -a && source .env.dev && set +a
 
 # Create the local blob-backed config-store entry.
 ts config push --adapter axum --local --yes
@@ -158,9 +163,10 @@ Edit `trusted-server.toml` to configure:
 - Consent settings (`[gdpr]`)
 - Stable key names for `trusted_server_secrets`
 
-Provision the physical store mapped from logical `trusted_server_secrets` with
-the existing credential values before pushing a migrated config. On Fastly,
-`ts_secrets` is the documented example physical name. Then validate and push:
+Before the first push, provision the physical store mapped from logical
+`trusted_server_secrets` with the credential values referenced by the config.
+On Fastly, `ts_secrets` is the documented example physical name. Then validate
+and push:
 
 ```bash
 ts config validate

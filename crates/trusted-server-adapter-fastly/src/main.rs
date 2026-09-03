@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
-use edgezero_adapter_fastly::env_config_from_runtime_dictionary;
 use edgezero_adapter_fastly::request::into_core_request;
+use edgezero_adapter_fastly::runtime_env_config;
 use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
-use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Request as HttpRequest, Response as HttpResponse};
 use edgezero_core::response::IntoResponse;
@@ -29,7 +28,6 @@ use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::config_store_name;
 
 mod app;
 mod backend;
@@ -92,7 +90,7 @@ fn main() {
 
 /// Handles a request through the `EdgeZero` router path.
 fn edgezero_main(mut req: FastlyRequest) {
-    let runtime_env = env_config_from_runtime_dictionary(TrustedServerApp::stores());
+    let runtime_env = runtime_env_config(TrustedServerApp::stores());
     let runtime_stores = RuntimeStoreConfig::from_env(&runtime_env);
 
     // Short-circuit the JA4 debug probe before app construction. Must run here

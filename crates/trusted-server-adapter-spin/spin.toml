@@ -4,32 +4,26 @@ spin_manifest_version = 2
 name = "trusted-server-adapter-spin"
 version = "0.1.0"
 
-# EdgeZero's Spin config and secret stores read from Spin component variables.
-# The adapter encodes Trusted Server store keys into a Spin-safe, collision-resistant
-# variable name. Every generated name starts with "v_"; lowercase ASCII letters
-# and digits are kept as-is, while uppercase letters and punctuation are encoded
-# as "_xhh" lowercase hex bytes.
+# EdgeZero's Spin config stores are KV-backed and read keys verbatim. Request-signing
+# metadata such as `current-kid`, `active-kids`, and public JWK entries therefore
+# belongs directly in the component's `default` key-value store.
 #
-# Request-signing config examples:
-#   "current-kid" -> v_current_x2dkid
-#   "active-kids" -> v_active_x2dkids
-#   "ts-2026-05-25" -> v_ts_x2d2026_x2d05_x2d25
-#
-# Secret variables include the encoded store name to avoid collisions with
-# config variables in Spin's flat variable namespace:
+# Secret stores read Spin component variables. The adapter encodes the store and
+# key into a collision-resistant variable name. Every generated name starts with
+# "v_"; lowercase ASCII letters and digits are kept as-is, while uppercase letters
+# and punctuation are encoded as "_xhh" lowercase hex bytes. For example:
 #   store "signing_keys", key "ts-2026-05-25"
 #   -> v_signing_x5fkeys_v_ts_x2d2026_x2d05_x2d25
 #
-# Operators enabling request_signing must declare and map one config variable
-# for each public JWK kid, plus one secret variable for each signing key.
+# Operators enabling request_signing must declare one encoded secret variable for
+# each private signing key. Public signing metadata remains in the KV store.
 [variables]
-v_current_x2dkid = { default = "" }
-v_active_x2dkids = { default = "" }
 # These declared variables match the example config's secret key names. Regenerate
 # or extend them for deployment-specific keys, including handler key names such as
 # `admin_password` or `api_handler_password`. Replace the empty defaults with values
 # supplied by the deployment's secret provider; never commit values here.
 v_trusted_x5fserver_x5fsecrets_v_publisher_x5fproxy_x5fsecret = { default = "", secret = true }
+v_trusted_x5fserver_x5fsecrets_v_trusted_x5fclient_x5fip_x5fshared_x5fsecret = { default = "", secret = true }
 v_trusted_x5fserver_x5fsecrets_v_ec_x5fpassphrase = { default = "", secret = true }
 v_trusted_x5fserver_x5fsecrets_v_partner_x5fapi_x5ftoken = { default = "", secret = true }
 v_trusted_x5fserver_x5fsecrets_v_partner_x5fts_x5fpull_x5ftoken = { default = "", secret = true }
@@ -50,9 +44,8 @@ allowed_outbound_hosts = ["https://*:*", "http://*:*"]
 key_value_stores = ["default"]
 
 [component.trusted-server.variables]
-v_current_x2dkid = "{{ v_current_x2dkid }}"
-v_active_x2dkids = "{{ v_active_x2dkids }}"
 v_trusted_x5fserver_x5fsecrets_v_publisher_x5fproxy_x5fsecret = "{{ v_trusted_x5fserver_x5fsecrets_v_publisher_x5fproxy_x5fsecret }}"
+v_trusted_x5fserver_x5fsecrets_v_trusted_x5fclient_x5fip_x5fshared_x5fsecret = "{{ v_trusted_x5fserver_x5fsecrets_v_trusted_x5fclient_x5fip_x5fshared_x5fsecret }}"
 v_trusted_x5fserver_x5fsecrets_v_ec_x5fpassphrase = "{{ v_trusted_x5fserver_x5fsecrets_v_ec_x5fpassphrase }}"
 v_trusted_x5fserver_x5fsecrets_v_partner_x5fapi_x5ftoken = "{{ v_trusted_x5fserver_x5fsecrets_v_partner_x5fapi_x5ftoken }}"
 v_trusted_x5fserver_x5fsecrets_v_partner_x5fts_x5fpull_x5ftoken = "{{ v_trusted_x5fserver_x5fsecrets_v_partner_x5fts_x5fpull_x5ftoken }}"

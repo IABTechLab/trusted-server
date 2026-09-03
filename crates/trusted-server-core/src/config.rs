@@ -173,6 +173,13 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                 false,
             ),
             field(
+                vec![
+                    optional_object("trusted_client_ip"),
+                    object("shared_secret"),
+                ],
+                false,
+            ),
+            field(
                 vec![optional_object("tinybird"), object("auction_token_secret")],
                 true,
             ),
@@ -406,6 +413,13 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
         )?;
     }
 
+    if let Some(trusted_client_ip) = &settings.trusted_client_ip {
+        validate_secret_key_reference(
+            "trusted_client_ip.shared_secret",
+            trusted_client_ip.shared_secret.expose(),
+        )?;
+    }
+
     if settings.tinybird.enabled {
         let token = settings
             .tinybird
@@ -474,7 +488,7 @@ fn validate_secret_key_reference(
     path: &str,
     key_name: &str,
 ) -> Result<(), Report<TrustedServerError>> {
-    if key_name.is_empty() {
+    if key_name.trim().is_empty() {
         return Err(missing_secret_key_reference(path));
     }
     Ok(())
@@ -525,7 +539,7 @@ fn report_to_validation_error(
 mod tests {
     use super::*;
     use crate::redacted::Redacted;
-    use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig};
+    use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig};
     use crate::test_support::tests::crate_test_settings_str;
     use edgezero_core::app_config::AppConfigMeta;
 
@@ -756,6 +770,7 @@ formats = [{ width = 300, height = 250 }]
                 ("ec.partners[*].api_token".to_owned(), true),
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
                 ("handlers[*].password".to_owned(), false),
+                ("trusted_client_ip.shared_secret".to_owned(), false),
                 ("tinybird.auction_token_secret".to_owned(), true),
                 (
                     "integrations.datadome.server_side_key_secret_name".to_owned(),
@@ -957,6 +972,33 @@ gam_network_id = "99999"
         assert!(
             err.to_string().contains("publisher.proxy_secret"),
             "error should identify the empty secret reference: {err:?}"
+        );
+    }
+
+    #[test]
+    fn app_config_new_accepts_trusted_client_ip_secret_key_reference() {
+        let mut settings = valid_settings();
+        settings.trusted_client_ip = Some(TrustedClientIpConfig {
+            ip_header: "x-ts-client-ip".to_owned(),
+            auth_header: "x-ts-client-ip-auth".to_owned(),
+            shared_secret: Redacted::new("trusted_client_ip_shared_secret".to_owned()),
+        });
+
+        TrustedServerAppConfig::new(settings)
+            .expect("should validate the shared-secret key name without treating it as the value");
+    }
+
+    #[test]
+    fn app_config_new_rejects_whitespace_secret_key_reference() {
+        let mut settings = valid_settings();
+        settings.publisher.proxy_secret = Redacted::new(" \t ".to_owned());
+
+        let err = TrustedServerAppConfig::new(settings)
+            .expect_err("should reject a whitespace-only secret key reference");
+
+        assert!(
+            err.to_string().contains("publisher.proxy_secret"),
+            "error should identify the whitespace-only secret reference: {err:?}"
         );
     }
 

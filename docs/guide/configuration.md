@@ -45,12 +45,13 @@ ts config validate
 ts config push --adapter fastly
 ```
 
-### Secret-store migration
+### Static secret references
 
 Static app-config credentials contain stable key names only. This includes
-publisher, EC, handler, Tinybird, DataDome, and S3 credential fields:
+publisher, trusted-client-IP, EC, handler, Tinybird, DataDome, and S3 fields:
 
 - `publisher.proxy_secret`
+- `trusted_client_ip.shared_secret`, when trusted client-IP forwarding is configured
 - `ec.passphrase`
 - `ec.partners[*].api_token`, when inbound identify or batch sync is used
 - `ec.partners[*].ts_pull_token`, when pull sync is enabled
@@ -65,19 +66,17 @@ resolved only while an instance builds runtime settings. An adapter can map the
 logical ID to a different physical name. For example, Fastly commonly maps
 `trusted_server_secrets` to physical store `ts_secrets`.
 
-Migrate an existing deployment in this order:
+Prepare an initial reference-based deployment in this order:
 
-1. Populate the physical store mapped from `trusted_server_secrets` with the
-   existing credential values without printing them in shell history, logs, or
-   CI output.
-2. Replace each active credential value with a stable key name and remove the
-   legacy Tinybird, DataDome, and S3 `secret_store` selectors.
-3. Run `ts config validate`, then `ts config push --adapter fastly --no-diff`.
-4. Restart/redeploy instances as needed to load the new values. Rotation is
-   startup-scoped; changing a store value does not alter already-built state.
+1. Create the physical store and configure its `trusted_server_secrets` mapping.
+2. Choose a stable key name for each active credential field in the app config.
+3. Write each credential value under its referenced key without exposing it in
+   command arguments, shell history, logs, or CI output.
+4. Run `ts config validate`, then `ts config push --adapter fastly`.
+5. Start or deploy instances after the store and pushed config are both ready.
 
-`--no-diff` prevents `config push` from rendering the previous plaintext
-configuration during this migration.
+Changing a store value does not alter already-built state. Restart or redeploy
+instances when rotating static credentials.
 
 Keep `publisher.proxy_secret` and `ec.passphrase` stable unless intentionally
 rotating signed URLs or EC identifiers. On Spin, the app-config blob is stored
@@ -429,11 +428,11 @@ it but keep using their own runtime client address.
 
 ### `[trusted_client_ip]`
 
-| Field           | Type   | Required | Description                                                                       |
-| --------------- | ------ | -------- | --------------------------------------------------------------------------------- |
-| `ip_header`     | String | Yes      | Header containing exactly one reader IP address                                   |
-| `auth_header`   | String | Yes      | Header containing exactly one shared-secret value                                 |
-| `shared_secret` | String | Yes      | Secret shared with the trusted front door, 32+ ASCII graphic bytes, no whitespace |
+| Field           | Type   | Required | Description                                                      |
+| --------------- | ------ | -------- | ---------------------------------------------------------------- |
+| `ip_header`     | String | Yes      | Header containing exactly one reader IP address                  |
+| `auth_header`   | String | Yes      | Header containing exactly one shared-secret value                |
+| `shared_secret` | String | Yes      | Key in `trusted_server_secrets` for the front-door shared secret |
 
 All three fields are required when the section exists. When the section is
 absent, Trusted Server continues to use the immediate peer address, and
@@ -453,7 +452,7 @@ this order wrong takes the service down rather than degrading it.
 [trusted_client_ip]
 ip_header = "x-ts-client-ip"
 auth_header = "x-ts-client-ip-auth"
-shared_secret = "replace-with-a-random-shared-secret"
+shared_secret = "trusted_client_ip_shared_secret"
 ```
 
 Prefer a dedicated `x-` name for `ip_header`, as shown. `fastly-client-ip` is
@@ -465,8 +464,9 @@ front-door configuration this section depends on.
 
 The front door must overwrite both headers on every request it forwards to
 Trusted Server, and must remove client-supplied copies on its other routes.
-Trusted Server accepts the forwarded address only when the request has exactly
-one `auth_header` value that matches `shared_secret` byte-for-byte and exactly
+Trusted Server resolves `shared_secret` from `trusted_server_secrets` at startup.
+It accepts the forwarded address only when the request has exactly one
+`auth_header` value that matches the resolved secret byte-for-byte and exactly
 one `ip_header` value that parses directly as IPv4 or IPv6. Values are not
 trimmed or normalized. Missing, empty, duplicate, non-UTF-8, mismatched, or malformed
 values do not reject the request; Trusted Server safely falls back to the
@@ -484,12 +484,12 @@ sensitive headers such as `Host`, `Content-Length`, `Cookie`, and
 dedicated `x-` names that no other application or routing logic uses, because
 Trusted Server removes the configured headers before routing.
 
-Generate `shared_secret` with a cryptographically secure random generator,
-encode it as hex or base64url, store the same value only in the front door and
-Trusted Server configuration, and never commit it. The value is redacted from
-configuration debug output. Configuration requires at least 32 ASCII graphic
-bytes (`!` through `~`) with no whitespace, controls, DEL, or non-ASCII bytes,
-and startup fails when the value is still the documented placeholder.
+Generate the referenced secret value with a cryptographically secure random
+generator, encode it as hex or base64url, and store the same value only in the
+front door and the physical store mapped from `trusted_server_secrets`. Put only
+the key name in Trusted Server configuration. The resolved value must contain at
+least 32 ASCII graphic bytes (`!` through `~`) with no whitespace, controls, DEL,
+or non-ASCII bytes.
 
 Independently of this section, the Fastly adapter treats `fastly-client-ip` as
 client-spoofable and strips it at request entry, so Trusted Server no longer
@@ -497,18 +497,17 @@ forwards an inbound `Fastly-Client-IP` to the publisher origin. This applies
 even when `[trusted_client_ip]` is absent. Check whether the origin reads that
 header before deploying.
 
-Redaction protects debug output and validation errors; it does not move the
-value into a platform secret store. `ts config push` serializes the value in the
-Trusted Server application-config blob, so restrict access to that configuration
-store. Every adapter removes the configured IP and authentication headers before
-routing, although only Fastly uses them for client-IP resolution.
+Startup fails closed if the configured key is missing, empty, invalid UTF-8, or
+resolves to an invalid shared-secret value. Every adapter removes the configured
+IP and authentication headers before routing, although only Fastly uses them for
+client-IP resolution.
 
 **Environment Overrides**:
 
 ```bash
 TRUSTED_SERVER__TRUSTED_CLIENT_IP__IP_HEADER=x-ts-client-ip
 TRUSTED_SERVER__TRUSTED_CLIENT_IP__AUTH_HEADER=x-ts-client-ip-auth
-TRUSTED_SERVER__TRUSTED_CLIENT_IP__SHARED_SECRET=replace-with-a-random-shared-secret
+TRUSTED_SERVER__TRUSTED_CLIENT_IP__SHARED_SECRET=trusted_client_ip_shared_secret
 ```
 
 Because the typed environment overlay cannot create a missing section, add
